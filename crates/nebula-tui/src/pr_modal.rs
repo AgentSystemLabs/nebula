@@ -37,7 +37,7 @@ use crate::app::{clamp_selection, window_start, App, Overlay, PendingPrDetail, P
 use crate::keymap::{Action, KeyChord, Scope};
 use crate::pr_preview::fit;
 use crate::pull_request::{OpenPr, PrDetail};
-use crate::quick_prompt::{QuickLaunch, QuickReturn};
+use crate::quick_prompt::{ModalUnder, QuickLaunch, QuickReturn};
 use crate::theme::Theme;
 use crate::ui::{
     centered_rect_pct, empty_list_row, panel_block, render_row, row_rect, truncate,
@@ -347,11 +347,13 @@ fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
 }
 
 /// `Enter` / `p`: the QUICK PROMPT for a PR SESSION on the pull request.
-/// The box replaces the modal; Esc from it lands on the panels, and the
-/// hotkey reopens the list.
+/// The box goes up over the modal, which stays on screen under it: Esc
+/// puts the modal back on the row (`QuickLaunch::under`), and the launch
+/// closes it onto the new session's card.
 fn open_prompt_for_selected(app: &mut App) {
+    let under = ModalUnder::of(app.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
-        crate::quick_prompt::open_pr_box(app, launch);
+        crate::quick_prompt::open_pr_box(app, launch.with_under(under));
     }
 }
 
@@ -606,8 +608,16 @@ fn row_spans(pr: &OpenPr, budget: usize, th: Theme) -> Vec<Span<'static>> {
 }
 
 /// The PULL REQUESTS MODAL: the list down the left, the reading pane on
-/// the right.
-pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &PullRequestsView, th: Theme) {
+/// the right. `backdrop` draws it as the layer under a QUICK PROMPT box
+/// opened from it (`QuickLaunch::under`): dim frames and an unfocused
+/// cursor row, the box in front having the eye.
+pub(crate) fn draw(
+    f: &mut Frame,
+    app: &mut App,
+    view: &PullRequestsView,
+    th: Theme,
+    backdrop: bool,
+) {
     let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
     f.render_widget(Clear, area);
     let list_w = (area.width * LIST_PCT / 100)
@@ -631,7 +641,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &PullRequestsView, th: Th
         rows.len(),
         if inflight { ", refreshing…" } else { "" }
     );
-    let block = panel_block(&title, true, th).title_bottom(
+    let block = panel_block(&title, !backdrop, th).title_bottom(
         Line::from(Span::styled(
             // The launches; the footer spells out the rest.
             " Enter/p: prompt  e: preset  n: harness ",
@@ -660,7 +670,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &PullRequestsView, th: Th
             row_area,
             row_spans(pr, budget, th),
             i == selected,
-            true,
+            !backdrop,
             th,
         );
     }
@@ -798,7 +808,7 @@ mod tests {
             let Some(Overlay::PullRequests(v)) = app.overlay.clone() else {
                 panic!("no pull requests modal");
             };
-            draw(f, app, &v, app.theme);
+            draw(f, app, &v, app.theme, false);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -1015,6 +1025,67 @@ mod tests {
             let mut out = Vec::new();
             crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Esc), &mut out);
             assert_eq!(view(&app).selected, 1, "back on #41");
+        });
+    }
+
+    /// `Enter` puts the QUICK PROMPT up over the modal, not in its place:
+    /// the list stays on screen under the box, the box's Esc leaves the
+    /// modal on the pull request it was opened on, and its launch closes
+    /// the modal with it.
+    #[test]
+    fn enter_stacks_the_box_over_the_modal() {
+        pinned(|| {
+            let (mut app, _) = app_with(
+                vec![pr(42, "Fix login", false), pr(41, "Spike", true)],
+                true,
+            );
+            open(&mut app);
+            handle_key(&mut app, key(KeyCode::Char('j')));
+            handle_key(&mut app, key(KeyCode::Enter));
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("expected the box, got {:?}", app.overlay);
+            };
+            let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert!(
+                matches!(&launch.under, Some(ModalUnder::PullRequests(v)) if v.selected == 1),
+                "{:?}",
+                launch.under
+            );
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+            term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
+            assert!(
+                screen.contains("Pull requests — demo"),
+                "the modal under the box"
+            );
+            assert!(screen.contains("New session · PR #41"), "the box over it");
+            assert!(
+                screen.contains("Esc: back to pull requests"),
+                "and says where Esc goes"
+            );
+
+            let mut out = Vec::new();
+            crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Esc), &mut out);
+            assert_eq!(view(&app).selected, 1, "Esc: back on #41");
+
+            handle_key(&mut app, key(KeyCode::Enter));
+            for c in "review it".chars() {
+                crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Char(c)), &mut out);
+            }
+            crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Enter), &mut out);
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    nebula_core::ClientRequest::CreatePrAgent { pr_url, .. }
+                        if pr_url == "https://github.com/o/r/pull/41"
+                )),
+                "the PR session is created: {out:?}"
+            );
+            assert!(app.overlay.is_none(), "the launch closes the modal");
         });
     }
 

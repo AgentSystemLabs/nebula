@@ -2958,6 +2958,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::FocusLeft => walk_focus_back(app),
         Action::Hosts => open_hosts_picker(app),
         Action::AgentPresets => crate::preset_overlays::open_agent_presets(app),
+        // Full-screen over a session with a project anywhere: the same box
+        // the GRID's `p` opens, on the root branch or a fresh worktree —
+        // never the checkout of the session on screen.
+        Action::QuickPrompt if app.launcher_active() => launcher::open_box(app),
         Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
         Action::Issues => crate::issues::open_issues(app),
         Action::PullRequests => crate::pr_modal::open(app),
@@ -5304,8 +5308,10 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     *menu = *parent;
                 }
             }
-            // The root picker's Claude row owns Tab as a launch-mode
-            // toggle. Submenus and every other menu leave it untouched.
+            // The NEW SESSION PICKER's Claude row — and the QUICK PROMPT
+            // `Tab` picker's, for a box that can go to the cloud — owns
+            // Tab as a launch-mode toggle. Submenus and every other menu
+            // leave it untouched.
             KeyCode::Tab if menu.toggle_hovered_claude_cloud() => {}
             KeyCode::Enter => {
                 let hover = menu.hover;
@@ -5337,6 +5343,12 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     PromptKind::PrComment { back, .. } => back.clone(),
                     _ => None,
                 };
+                // A QUICK PROMPT opened over either modal stood on it: Esc
+                // takes the box off and leaves the modal on its row.
+                let back_to_modal = match &prompt.kind {
+                    PromptKind::QuickPrompt(launch) => launch.under.clone(),
+                    _ => None,
+                };
                 // Esc on a box with something typed in it is the accident
                 // that costs nothing: the box is parked as a DRAFT, and the
                 // next QUICK PROMPT opens on it.
@@ -5351,6 +5363,8 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     crate::issues::reopen(app, view);
                 } else if let Some(view) = back_to_prs {
                     crate::pr_modal::reopen(app, *view);
+                } else if let Some(under) = back_to_modal {
+                    under.reopen(app);
                 } else if let Some((worktree, name)) = back_to_presets {
                     let index = crate::agent_presets::load()
                         .iter()
@@ -5363,20 +5377,14 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             // Ctrl+J, as in Claude Code's prompt — is the line editor's
             // (the `_` arm below); the guard keeps the send off it. Enter
             // on a highlighted listing row adds that directory; on the
-            // input row it submits the typed path as before. `⌘Enter` in
-            // the QUICK PROMPT launches and takes the new session's pane
-            // (`quick_launch::submit`); `^Enter` is the same, unadvertised,
-            // for the terminal that keeps `⌘Enter` (Ghostty's fullscreen).
+            // input row it submits the typed path as before.
             KeyCode::Enter if !prompt.input.takes_newline(&key) => {
                 let mut prompt = prompt.clone();
                 if let Some(path) = prompt.hovered_path() {
                     prompt.input.set_text(path);
                 }
                 app.overlay = None;
-                let take_pane = key
-                    .modifiers
-                    .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL);
-                submit_prompt(app, prompt, take_pane, out);
+                submit_prompt(app, prompt, out);
             }
             // The LAUNCHER VIEW's box chords: `^P` the project, `^O` the
             // model, and a `^N` that flips between a fresh worktree and the
@@ -6150,6 +6158,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.focus_tint = cfg.focus_tint;
+    app.black_background = cfg.black_background;
     app.launcher_pane_at = cfg.pane_side();
     set_projects_config(app, cfg.projects.clone(), cfg.project_fallback());
     set_hide_draft_prs(app, cfg.hide_draft_prs);
@@ -6344,18 +6353,11 @@ fn toggle_hide_draft_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
 pub(crate) fn submit_prompt_now(app: &mut App, kind: PromptKind, out: &mut Vec<ClientRequest>) {
     open_prompt(app, kind);
     if let Some(Overlay::Prompt(prompt)) = app.overlay.take() {
-        submit_prompt(app, prompt, false, out);
+        submit_prompt(app, prompt, out);
     }
 }
 
-/// `take_pane` is the QUICK PROMPT's `⌘Enter` — launch, and step down into
-/// the new session (`quick_launch::submit`). Every other prompt ignores it.
-fn submit_prompt(
-    app: &mut App,
-    prompt: PromptDialog,
-    take_pane: bool,
-    out: &mut Vec<ClientRequest>,
-) {
+fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
     let value = prompt.input.trim().to_string();
     // An ISSUE SESSION's box may be sent empty: the issue is the task.
     let value = match &prompt.kind {
@@ -6437,12 +6439,18 @@ fn submit_prompt(
         _ => false,
     };
     if value.is_empty() && !empty_is_a_default {
-        // An empty comment box goes back to the modal it stood in for.
+        // An empty comment box goes back to the modal it stood in for, and
+        // an empty QUICK PROMPT to the one it stood on.
         match &prompt.kind {
             PromptKind::IssueComment { view, .. } => crate::issues::reopen(app, view.clone()),
             PromptKind::PrComment {
                 back: Some(view), ..
             } => crate::pr_modal::reopen(app, (**view).clone()),
+            PromptKind::QuickPrompt(launch) => {
+                if let Some(under) = launch.under.clone() {
+                    under.reopen(app);
+                }
+            }
             _ => {}
         }
         app.flash = Some("cancelled: empty input".into());
@@ -6531,7 +6539,12 @@ fn submit_prompt(
             };
             create_agent(app, draft, out);
         }
-        PromptKind::QuickPrompt(launch) => quick_launch::submit(app, launch, value, take_pane, out),
+        // A box opened over the ISSUES MODAL or the PULL REQUESTS MODAL
+        // takes the modal with it when it launches: the new session's card
+        // is what the user wants to see, and the Ack puts the grid's cursor
+        // on it (`attach_created`). Only a box that goes without launching
+        // hands the modal back.
+        PromptKind::QuickPrompt(launch) => quick_launch::submit(app, launch, value, out),
         PromptKind::PrComment {
             number,
             url,
@@ -6775,7 +6788,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     &crate::config::Config::load(),
                 )
                 .with_issue(back.launch.issue.clone())
-                .with_pr(back.launch.pr.clone());
+                .with_pr(back.launch.pr.clone())
+                // The Claude row's `Tab` toggle rides the pick: the box
+                // comes back a CLAUDE CLOUD one, where it can be one.
+                .with_cloud(cloud)
+                .with_under(back.launch.under.clone());
                 crate::quick_prompt::reopen(app, launch, &back.text);
                 return;
             }
@@ -10066,7 +10083,10 @@ fn attach_created(
 }
 
 /// A refused request's prompt comes back with what was typed in it.
-pub(crate) fn reopen_prompt_with(app: &mut App, kind: PromptKind, text: String) {
+pub(crate) fn reopen_prompt_with(app: &mut App, mut kind: PromptKind, text: String) {
+    if let PromptKind::QuickPrompt(launch) = &mut kind {
+        crate::quick_prompt::restack(app, launch);
+    }
     open_prompt(app, kind);
     if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
         prompt.input.set_text(text);
@@ -25538,6 +25558,208 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
     }
 
+    /// The ISSUES MODAL's box lands where every new session's box does:
+    /// the project's ROOT BRANCH, whatever card the cursor was on — or,
+    /// with the `quick_prompt_new_worktree` SETTING on, a fresh worktree
+    /// named after the issue.
+    #[test]
+    fn the_issue_quick_prompt_starts_on_the_root_branch_or_a_fresh_worktree() {
+        use crate::quick_prompt::QuickTarget;
+        let target = |json: &str| {
+            with_config_json(json, || {
+                let mut app = App::new();
+                seed_tree(&mut app);
+                seed_feat_worktree(&mut app, "w2", "feat");
+                app.sel_worktree = 1;
+                assert_eq!(
+                    app.selected_worktree().map(|w| w.branch.as_str()),
+                    Some("feat")
+                );
+                let mut out = Vec::new();
+                let project = nebula_core::ProjectId("p1".into());
+                app.overlay = Some(Overlay::Issues(crate::issues::IssuesView::new(
+                    project.clone(),
+                    "demo".into(),
+                    "/tmp/demo".into(),
+                )));
+                crate::issues::land_answer(
+                    &mut app,
+                    crate::issues::IssuesAnswer::List {
+                        project,
+                        list: Some(vec![crate::issues::Issue {
+                            number: 15,
+                            url: "https://github.com/o/r/issues/15".into(),
+                            title: "Login fails".into(),
+                            author: "webdevcody".into(),
+                            created_at: "2026-09-10T12:00:00Z".into(),
+                            updated_at: "2026-09-11T12:00:00Z".into(),
+                            labels: vec![],
+                            body: String::new(),
+                        }]),
+                    },
+                );
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+                match &app.overlay {
+                    Some(Overlay::Prompt(prompt)) => match &prompt.kind {
+                        PromptKind::QuickPrompt(launch) => launch.target.clone(),
+                        other => panic!("{other:?}"),
+                    },
+                    other => panic!("Enter: expected the box, got {other:?}"),
+                }
+            })
+        };
+        assert_eq!(
+            target("{}"),
+            QuickTarget::Worktree(WorktreeId("w1".into())),
+            "not the selected card's checkout"
+        );
+        match target(r#"{"quick_prompt_new_worktree": true}"#) {
+            QuickTarget::NewWorktree { branch, .. } => {
+                assert!(branch.starts_with("issue-15"), "{branch}")
+            }
+            other => panic!("the setting cuts a fresh worktree: {other:?}"),
+        }
+    }
+
+    /// `Enter` in the ISSUES MODAL puts the QUICK PROMPT up over the modal
+    /// rather than in its place — both on screen, the box on top. A box
+    /// that goes without launching (Esc, a click outside it) leaves the
+    /// modal on its row; the launch closes the modal too, and its Ack puts
+    /// the grid's cursor on the new session's card, the keys still there.
+    #[test]
+    fn the_issue_quick_prompt_stands_on_the_modal() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let focus = app.focus;
+            let mut out = Vec::new();
+            let project = nebula_core::ProjectId("p1".into());
+            app.overlay = Some(Overlay::Issues(crate::issues::IssuesView::new(
+                project.clone(),
+                "demo".into(),
+                "/tmp/demo".into(),
+            )));
+            let issue = |number: u64| crate::issues::Issue {
+                number,
+                url: format!("https://github.com/o/r/issues/{number}"),
+                title: format!("issue {number}"),
+                author: "webdevcody".into(),
+                created_at: "2026-09-10T12:00:00Z".into(),
+                updated_at: "2026-09-11T12:00:00Z".into(),
+                labels: vec![],
+                body: String::new(),
+            };
+            crate::issues::land_answer(
+                &mut app,
+                crate::issues::IssuesAnswer::List {
+                    project,
+                    list: Some(vec![issue(15), issue(14)]),
+                },
+            );
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            let on_row =
+                |app: &App| matches!(&app.overlay, Some(Overlay::Issues(v)) if v.selected == 1);
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("Enter: expected the box, got {:?}", app.overlay);
+            };
+            let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert!(
+                matches!(&launch.under, Some(crate::quick_prompt::ModalUnder::Issues(v)) if v.selected == 1),
+                "the box carries the modal it stands on: {:?}",
+                launch.under
+            );
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let screen = buffer_text(&terminal);
+            assert!(
+                screen.contains("Issues — demo"),
+                "the modal under:\n{screen}"
+            );
+            assert!(screen.contains("issue #14"), "the box over it:\n{screen}");
+            assert!(screen.contains("Esc: back to issues"), "{screen}");
+
+            // Esc: the box goes, the modal stays.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(on_row(&app), "Esc leaves the modal: {:?}", app.overlay);
+
+            // A click outside the box: the same.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            crate::overlay_close::click_outside(&mut app, &mut out);
+            assert!(on_row(&app), "a click outside: {:?}", app.overlay);
+
+            // The launch, through the loop's own entry point (so a follow
+            // it may not take is caught): the create goes out, and the
+            // modal goes with the box.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            type_text(&mut app, "look into it", &mut out);
+            out.clear();
+            let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            handle_terminal_event(&mut app, enter, &mut out);
+            let (req_id, worktree) = match out.as_slice() {
+                [ClientRequest::CreateAgent {
+                    req_id,
+                    worktree,
+                    issue_url: Some(url),
+                    ..
+                }] if url == "https://github.com/o/r/issues/14" => (*req_id, worktree.clone()),
+                other => panic!("one create, for the issue: {other:?}"),
+            };
+            assert!(
+                app.overlay.is_none(),
+                "the launch closes the modal: {:?}",
+                app.overlay
+            );
+
+            // The DAEMON's side: the row, then the Ack — and the cursor is
+            // on the new card, the keys on the grid.
+            let fresh = AgentId("a9".into());
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: nebula_core::Entity::Agent(nebula_core::Agent {
+                        id: fresh.clone(),
+                        worktree_id: worktree,
+                        name: "agent-2".into(),
+                        status: nebula_core::AgentStatus::Fresh,
+                        archived: false,
+                        archived_at: 0,
+                        unseen: false,
+                        kind: nebula_core::AgentKind::Claude,
+                        custom_harness: None,
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        cloud_session_id: None,
+                        sort_order: 0,
+                        status_changed_at: crate::app::now_ms(),
+                        alive: true,
+                        recent_prompts: Vec::new(),
+                    }),
+                },
+            );
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(nebula_core::EntityId::Agent(fresh.clone())),
+                },
+                &mut out,
+            );
+            assert!(app.overlay.is_none(), "nothing comes back up");
+            assert_eq!(
+                app.selected_session().map(|a| a.id),
+                Some(fresh),
+                "the cursor is on the new card"
+            );
+            assert_eq!(app.focus, focus, "the keys stay on the grid");
+            assert!(!app.term_locked);
+        });
+    }
+
     #[test]
     fn presets_a_fills_the_editor_and_enter_persists() {
         use crate::preset_overlays::PresetField;
@@ -27019,6 +27241,65 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// `Tab` on the Claude row of the box's own `Tab` picker is the NEW
+    /// SESSION PICKER's cloud toggle: the pick hands back a CLAUDE CLOUD
+    /// box with the text kept, the next `Tab` opens on the toggle as the
+    /// box left it, and Enter sends the text as the cloud task — never as
+    /// a STARTING PROMPT, and with no warm slot consumed or refilled.
+    #[test]
+    fn tab_on_claude_in_the_quick_prompt_picker_launches_in_the_cloud() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let worktree = app.selected_worktree().unwrap().id.clone();
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("Tab should toggle the row in place, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Quick prompt agent"));
+            assert_eq!(menu.items[menu.hover].label, "Claude · cloud");
+            assert_eq!(menu.hovered_claude_cloud(), Some(true));
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the pick should hand the box back, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth", "the text came back");
+            assert_eq!(prompt.title, "Quick prompt (claude · cloud)");
+            assert!(out.is_empty(), "nothing sent yet: {out:?}");
+
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            assert_eq!(menu.hovered_claude_cloud(), Some(true), "opens as left");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree: w,
+                        kind: AgentKind::Claude,
+                        custom_harness: None,
+                        cloud_prompt: Some(task),
+                        starting_prompt: None,
+                        ..
+                    }] if *w == worktree && task == "Fix auth"
+                ),
+                "a cloud launch, no prewarm behind it: {out:?}"
+            );
+        });
+    }
+
     /// Backing out of either picker is a return trip: the box comes back
     /// exactly as it left.
     #[test]
@@ -27051,7 +27332,8 @@ diff --git a/src/c.rs b/src/c.rs
     /// Closing the box is not throwing the prompt away: Esc, a click
     /// outside and the HARDWIRED UNLOCK park what was typed, and the next
     /// QUICK PROMPT takes it back — whole, harness pick and all, when it
-    /// is aimed at the same checkout, and text-only into a box aimed
+    /// is aimed at the same checkout (whichever card is selected: the box
+    /// is on the root branch either way), and text-only into a box aimed
     /// somewhere else. Clearing the box and closing it is how a draft is
     /// thrown away; an empty box parks nothing.
     #[test]
@@ -27100,8 +27382,11 @@ diff --git a/src/c.rs b/src/c.rs
             assert!(app.overlay.is_none(), "^q closes the box");
             assert!(app.quick_draft.is_some(), "and parks it");
 
-            // A box aimed at another checkout keeps its own aim and spec;
-            // the text is the user's, so it still comes back.
+            // The cursor on a card in another checkout does not move the
+            // aim: the box still lands on the root branch, so it is the
+            // same box and comes back whole.
+            let root =
+                crate::quick_prompt::QuickTarget::Worktree(nebula_core::WorktreeId("w1".into()));
             app.sel_worktree = 1;
             assert_eq!(
                 app.selected_worktree().map(|w| w.branch.as_str()),
@@ -27112,13 +27397,33 @@ diff --git a/src/c.rs b/src/c.rs
                 panic!("p should open the box, got {:?}", app.overlay);
             };
             assert_eq!(prompt.input.as_str(), "Fix auth");
+            assert_eq!(prompt.title, "Quick prompt (codex)", "the pick too");
+            assert!(matches!(&prompt.kind, PromptKind::QuickPrompt(launch)
+                if launch.target == root));
+
+            // A box aimed somewhere else — `^N` flipped it onto a fresh
+            // worktree before it was closed — does not hand its aim and
+            // spec to the next box; the text is the user's, so it still
+            // comes back.
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.quick_draft.is_some(), "Esc parks the flipped box");
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("p should open the box, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth");
             assert_eq!(
                 prompt.title, "Quick prompt (claude)",
-                "another checkout's box is the settings' harness again"
+                "a differently aimed box is the settings' harness again"
             );
             assert!(matches!(&prompt.kind, PromptKind::QuickPrompt(launch)
-                if launch.target == crate::quick_prompt::QuickTarget::Worktree(
-                    nebula_core::WorktreeId("w2".into()))));
+                if launch.target == root));
 
             // Cleared and closed: nothing is parked, and the next box is
             // the empty one it should be.

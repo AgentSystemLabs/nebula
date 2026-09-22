@@ -22,19 +22,10 @@ use nebula_core::{AgentId, ClientRequest, WorktreeId};
 
 /// Enter in the box, with `text` already sized — and non-empty, unless
 /// the box `launches_empty` (one an AGENT PRESET is on, sent as it is).
-///
-/// `take_pane` is `⌘Enter`: the same launch, with FOCUS going down into
-/// the new session's pane once it is acked, whatever the
-/// `quick_prompt_focus` SETTING says. It is never a BACKGROUND LAUNCH:
-/// from a box re-aimed at another project, asking to be put in the
-/// session is asking to be taken there, so the grid goes to that project
-/// first — through the PROJECT TAB click's own `open_tab` — and the
-/// launch is an ordinary one into the project on screen.
 pub(super) fn submit(
     app: &mut App,
     launch: QuickLaunch,
     text: String,
-    take_pane: bool,
     out: &mut Vec<ClientRequest>,
 ) {
     // REMEMBER HARNESS (Settings → Experimental): a box fired on a harness
@@ -50,23 +41,16 @@ pub(super) fn submit(
             launch.effort.as_deref(),
         );
     }
-    let project = crate::launcher::project_of(app, &launch.target);
-    let elsewhere = project
-        .as_ref()
-        .is_some_and(|project| crate::launcher::is_background(app, project));
-    if let Some(project) = project.as_ref().filter(|_| take_pane && elsewhere) {
-        super::launcher::open_tab(app, project, out);
-        // An empty project's "no sessions yet" is about to be untrue.
-        app.flash = None;
-    }
+    // A box re-aimed with `^P` fires into a project the screen is not
+    // showing: the session starts there and the user keeps working here,
+    // so nothing this launch does may move a cursor, a tab or the pane.
+    // The Acks are born left behind for it, and the stand-in rows stop at
+    // going up (`placeholder::stage_agent`).
+    let background = crate::launcher::project_of(app, &launch.target)
+        .is_some_and(|project| crate::launcher::is_background(app, &project));
     // The launch lands on a card, so the GRID has an aim again whether or
     // not it had one when the box went up (`launcher::clear_aim`).
     super::launcher::take_aim(app);
-    // A box re-aimed with `^P` fires into a project the screen is not
-    // showing: the session starts there and the user keeps working here,
-    // so nothing this launch does may move a cursor, a tab or the pane. The Acks are born left behind for it, and the stand-in rows
-    // stop at going up (`placeholder::stage_agent`).
-    let background = elsewhere && !take_pane;
     if background {
         announce_background(app, &launch.target);
     } else {
@@ -74,9 +58,9 @@ pub(super) fn submit(
     }
     // The box is the one launch that stays out of the way by default:
     // `p`, type, Enter, keep working, the new session in the pane but the
-    // keys still on the cards. `⌘Enter` takes the pane instead, as a
-    // picker-walked launch (`n`) does.
-    let focus_pane = !background && (take_pane || crate::config::Config::load().quick_prompt_focus);
+    // keys still on the cards — unless the `quick_prompt_focus` SETTING
+    // says to take the pane, as a picker-walked launch (`n`) does.
+    let focus_pane = !background && crate::config::Config::load().quick_prompt_focus;
     match launch.target.clone() {
         QuickTarget::Worktree(worktree) => {
             let draft = AgentLaunchDraft {
@@ -131,8 +115,7 @@ pub(super) fn submit(
 /// under the grid unfolds if `^~` had folded it away, and comes off any
 /// TERMINAL tab it was pinned to — a shell in the same checkout would
 /// otherwise go on standing in front of the session the Ack attaches.
-/// Where FOCUS goes is `focus_pane`'s alone (`⌘Enter`,
-/// `quick_prompt_focus`).
+/// Where FOCUS goes is `focus_pane`'s alone (`quick_prompt_focus`).
 fn reveal_pane(app: &mut App) {
     app.launcher_pane_hidden = false;
     app.launcher_terminal = None;
@@ -218,11 +201,17 @@ pub(super) fn draft(
     );
     AgentLaunchDraft {
         custom: launch.custom.clone(),
+        // A CLAUDE CLOUD box sends the text as the cloud task instead —
+        // `claude --cloud <task>` — and no STARTING PROMPT beside it, which
+        // the DAEMON refuses (`QuickLaunch::with_cloud` keeps a preset, an
+        // issue and a PR off a cloud box).
+        cloud_prompt: launch.cloud.then(|| text.clone()),
         // Sized in `submit_prompt`, with the task — composing cannot fail.
         // An empty box (`launches_empty`) sends a preset's prefix + postfix
         // alone; with nothing to wrap it either, there is no first prompt,
         // the CLI's own input is it.
-        starting_prompt: Some(launch.compose(&text)).filter(|prompt| !prompt.is_empty()),
+        starting_prompt: Some(launch.compose(&text))
+            .filter(|prompt| !launch.cloud && !prompt.is_empty()),
         // An ISSUE SESSION's context, persisted by the DAEMON with the row.
         issue_url: launch.issue.as_ref().map(|issue| issue.url.clone()),
         // A PR SESSION's: the create goes to the PROJECT as a
@@ -237,9 +226,9 @@ pub(super) fn draft(
 
 #[cfg(test)]
 mod tests {
-    //! The box's two sends in the LAUNCHER VIEW, through the loop's own
-    //! entry points: Enter puts the new session in the pane and leaves the
-    //! keys on the cards; `⌘Enter` steps down into it.
+    //! The box's send in the LAUNCHER VIEW, through the loop's own entry
+    //! points: Enter puts the new session in the pane and leaves the keys
+    //! on the cards.
     use super::super::tests::{buffer_text, hse, seed_tree, with_default_config};
     use super::super::{handle_server_event, handle_terminal_event};
     use crate::app::{App, Focus};
@@ -359,9 +348,9 @@ mod tests {
         });
     }
 
-    /// The box says `⌘Enter` exists: nothing else in it does.
+    /// The box's border no longer offers a launch that takes the pane.
     #[test]
-    fn the_box_border_names_cmd_enter() {
+    fn the_box_border_names_no_cmd_enter() {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
@@ -370,13 +359,8 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(130, 34)).unwrap();
             terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
             let screen = buffer_text(&terminal);
-            if std::env::var_os("SHOW_BOX").is_some() {
-                eprintln!("{screen}");
-            }
-            assert!(
-                screen.contains("⌘Enter launch + focus"),
-                "the hint is on the border:\n{screen}"
-            );
+            assert!(screen.contains("Enter launch"), "{screen}");
+            assert!(!screen.contains('⌘'), "{screen}");
         });
     }
 
@@ -412,33 +396,30 @@ mod tests {
         });
     }
 
-    /// `⌘Enter` is the same launch, stepping down into the new session's
-    /// pane with its input locked — `^Enter` too, for the terminal that
-    /// keeps `⌘Enter` for itself.
+    /// `⌘Enter` and `^Enter` are no longer their own launch: either one is
+    /// the plain Enter, the keys staying on the cards.
     #[test]
-    fn cmd_enter_launches_and_steps_down_into_the_new_session() {
+    fn cmd_enter_is_the_plain_launch() {
         for mods in [KeyModifiers::SUPER, KeyModifiers::CONTROL] {
             with_default_config(|| {
                 let mut app = App::new();
                 seed_tree(&mut app);
                 draw(&mut app);
                 let (req_id, worktree) = launch(&mut app, mods);
-                assert!(!app.launcher_pane_hidden);
                 acked(&mut app, req_id, &worktree);
 
                 assert_eq!(pane(&app), new_session(), "{mods:?}");
-                assert_eq!(app.focus, Focus::Terminal, "{mods:?} takes the pane");
-                assert!(app.term_locked, "{mods:?} locks it");
+                assert_eq!(app.focus, Focus::Sessions, "{mods:?} keeps the keys");
+                assert!(!app.term_locked, "{mods:?}");
             });
         }
     }
 
-    /// From a box re-aimed with `^P`, Enter is a BACKGROUND LAUNCH, but
-    /// `⌘Enter` asks to be put in the session — so it goes there: no
-    /// footer note, not born left behind, and the Ack lands the grid on
-    /// that project with the pane taken.
+    /// From a box re-aimed with `^P`, `⌘Enter` is the BACKGROUND LAUNCH
+    /// Enter is: the footer names the project, the Ack is born left
+    /// behind, and the grid stays on the project in front of the user.
     #[test]
-    fn cmd_enter_from_a_box_aimed_elsewhere_goes_there() {
+    fn cmd_enter_from_a_box_aimed_elsewhere_stays_in_the_background() {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
@@ -480,17 +461,17 @@ mod tests {
             let (req_id, worktree) = send(&mut app, KeyModifiers::SUPER);
 
             assert_eq!(worktree.0, "w2root", "into the project the box aimed at");
-            assert!(!app.left_behind.contains(&req_id), "the Ack may follow");
-            assert_ne!(app.flash.as_deref(), Some("started a session in web"));
+            assert!(app.left_behind.contains(&req_id), "the Ack stays put");
+            assert_eq!(app.flash.as_deref(), Some("started a session in web"));
             acked(&mut app, req_id, &worktree);
 
             assert_eq!(
                 app.selected_project().map(|p| p.name.as_str()),
-                Some("web"),
-                "the grid went to the new session's project"
+                Some("demo"),
+                "the grid stayed where it was"
             );
-            assert_eq!(pane(&app), new_session());
-            assert_eq!(app.focus, Focus::Terminal);
+            assert_ne!(pane(&app), new_session());
+            assert_eq!(app.focus, Focus::Sessions);
         });
     }
 }

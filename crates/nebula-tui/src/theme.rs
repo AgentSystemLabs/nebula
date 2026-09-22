@@ -4,12 +4,18 @@
 //! by the event loop when the setting changes.
 //!
 //! Presets stick to ANSI-16 and 256-color indexed values so they render
-//! everywhere. One exception: `focus_tint` needs a ~10%-opacity accent
-//! shade that the 256 palette simply doesn't have (its darkest chromatic
+//! everywhere. One exception: `focus_tint` needs a near-black shade of the
+//! accent that the 256 palette simply doesn't have (its darkest chromatic
 //! steps start around 40%), so it's truecolor RGB — supported by modern
 //! terminals including Terminal.app since macOS Tahoe.
 
 use ratatui::style::Color;
+
+/// What the BLACK BACKGROUND setting paints under every cell nothing else
+/// colored. Truecolor rather than ANSI `Black`, which a terminal palette is
+/// free to map to a dark gray (a stock Ghostty's is #1d1f21) — the very
+/// gray the setting exists to get away from.
+pub const BLACK_BACKGROUND: Color = Color::Rgb(0, 0, 0);
 
 /// Names the settings overlay cycles through; `by_name` accepts them
 /// case-insensitively and falls back to the first entry.
@@ -103,11 +109,13 @@ pub struct Theme {
     /// for a few seconds after a turn finishes unread, then holds still.
     /// Rests on `done`, so a preset that moves `done` moves this with it.
     pub done_sweep: [Color; 3],
-    /// Focused-panel background: a dark neutral-gray floor with a faint
-    /// lean toward the accent, filling the whole focused panel (and the
-    /// rounded corners of a selected PILL ROW's pad rows) so it reads as
-    /// a faintly lit gray surface rather than plain black. Truecolor by
-    /// necessity (see module docs).
+    /// Focused-surface background, behind the session pane or the card
+    /// keys land in: the accent's own hue taken down to a near-black —
+    /// OKLCH lightness 0.20 and chroma 0.04 in every preset (mono's is
+    /// the one gray). On a black window it reads as the accent glowing
+    /// faintly rather than as a gray slab, and it is darker than the gray
+    /// it replaced, so dim text on it keeps more of its contrast.
+    /// Truecolor by necessity (see module docs).
     pub focus_tint: Color,
 }
 
@@ -149,7 +157,7 @@ impl Default for Theme {
                 Color::Indexed(183),
             ],
             done_sweep: [Color::Indexed(75), Color::Indexed(111), Color::Indexed(153)],
-            focus_tint: Color::Rgb(22, 33, 34),
+            focus_tint: Color::Rgb(0, 27, 28),
         }
     }
 }
@@ -166,13 +174,13 @@ impl Theme {
                 // hue a blue preset leaves free.
                 done: DONE_PINK[0],
                 done_sweep: DONE_PINK,
-                focus_tint: Color::Rgb(21, 31, 38),
+                focus_tint: Color::Rgb(3, 24, 38),
                 ..base
             },
             "forest" => Self {
                 accent: Color::Indexed(114),  // pale green
                 special: Color::Indexed(108), // sage
-                focus_tint: Color::Rgb(26, 34, 27),
+                focus_tint: Color::Rgb(10, 27, 10),
                 ..base
             },
             "rose" => Self {
@@ -183,13 +191,13 @@ impl Theme {
                 // hue this preset leaves free.
                 done: DONE_TURQUOISE[0],
                 done_sweep: DONE_TURQUOISE,
-                focus_tint: Color::Rgb(37, 28, 32),
+                focus_tint: Color::Rgb(36, 14, 21),
                 ..base
             },
             "amber" => Self {
                 accent: Color::Indexed(214),  // orange
                 special: Color::Indexed(173), // copper
-                focus_tint: Color::Rgb(37, 32, 22),
+                focus_tint: Color::Rgb(32, 19, 1),
                 ..base
             },
             "lavender" => Self {
@@ -199,7 +207,7 @@ impl Theme {
                 // so done goes turquoise here, as in rose.
                 done: DONE_TURQUOISE[0],
                 done_sweep: DONE_TURQUOISE,
-                focus_tint: Color::Rgb(30, 28, 38),
+                focus_tint: Color::Rgb(20, 19, 39),
                 ..base
             },
             "coral" => Self {
@@ -208,7 +216,7 @@ impl Theme {
                 // magenta: a terminated session in a warm preset reads as
                 // gone cold rather than as a faded needs-feedback red.
                 special: Color::Indexed(73), // cadet teal
-                focus_tint: Color::Rgb(38, 28, 26),
+                focus_tint: Color::Rgb(37, 15, 8),
                 ..base
             },
             "slate" => Self {
@@ -218,13 +226,13 @@ impl Theme {
                 // blues, so done goes pink here, as in ocean.
                 done: DONE_PINK[0],
                 done_sweep: DONE_PINK,
-                focus_tint: Color::Rgb(27, 30, 36),
+                focus_tint: Color::Rgb(6, 23, 39),
                 ..base
             },
             "sand" => Self {
                 accent: Color::Indexed(180),  // tan
                 special: Color::Indexed(137), // bronze
-                focus_tint: Color::Rgb(36, 32, 27),
+                focus_tint: Color::Rgb(34, 18, 2),
                 ..base
             },
             "mono" => Self {
@@ -239,7 +247,7 @@ impl Theme {
                 // secondary next to the text.
                 muted: Color::Indexed(247),
                 special: Color::Indexed(245),
-                focus_tint: Color::Rgb(30, 30, 30),
+                focus_tint: Color::Rgb(22, 22, 22),
                 ..base
             },
             _ => base,
@@ -446,23 +454,51 @@ mod tests {
         }
     }
 
-    /// `focus_tint` paints over every untouched cell of the focused panel,
-    /// including the rounded pad-row corners of a selected PILL ROW — a
-    /// channel much below this floor reads as plain black there instead of
-    /// a gray tint (issue #6).
+    /// `focus_tint` fills the surface keys land in, so it has to be seen —
+    /// much darker and it reads as plain black (issue #6) — read as the
+    /// accent rather than as gray, which every channel near one value is
+    /// on a black window, and stay dark enough that dim text keeps its
+    /// contrast: `#666` holds over 3.1:1 of the 3.7:1 it has on black.
+    /// Mono is the one gray preset, and takes the one gray tint.
     #[test]
-    fn focus_tint_has_a_visible_gray_floor() {
-        const MIN_CHANNEL: u8 = 18;
+    fn focus_tint_is_visible_hued_and_dark() {
+        // WCAG relative luminance.
+        let luminance = |rgb: [u8; 3]| {
+            let lin = |c: u8| {
+                let c = f64::from(c) / 255.0;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+        };
         for name in THEMES {
             let th = Theme::by_name(name);
             let Color::Rgb(r, g, b) = th.focus_tint else {
                 panic!("{name}: focus_tint must be truecolor RGB");
             };
+            let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
             assert!(
-                r >= MIN_CHANNEL && g >= MIN_CHANNEL && b >= MIN_CHANNEL,
-                "{name}: focus_tint {:?} is too close to black",
+                hi >= 22,
+                "{name}: focus_tint {:?} reads as black",
                 (r, g, b)
             );
+            assert!(
+                luminance([r, g, b]) <= 0.009,
+                "{name}: focus_tint {:?} costs dim text its contrast",
+                (r, g, b)
+            );
+            if *name == "mono" {
+                assert_eq!(hi, lo, "mono: a gray preset takes a gray tint");
+            } else {
+                assert!(
+                    hi - lo >= 15,
+                    "{name}: focus_tint {:?} reads as gray",
+                    (r, g, b)
+                );
+            }
         }
     }
 }

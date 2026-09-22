@@ -346,7 +346,7 @@ pub const AGENTS_HEAD: &[SettingSpec] = &[
     SettingSpec {
         kind: SettingKind::QuickPromptNewWorktree,
         label: "New worktree",
-        hint: "Each new quick prompt starts on a fresh worktree (off = the selected checkout; ^N flips one box)",
+        hint: "Each new session's box starts on a fresh worktree (off = the project's root branch; ^N flips one box)",
         group: "Quick prompt",
     },
     SettingSpec {
@@ -384,6 +384,7 @@ pub enum SettingKind {
     Theme,
     Animations,
     FocusTint,
+    BlackBackground,
     SessionPane,
     HideProjects,
     HideWorktrees,
@@ -561,7 +562,13 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::FocusTint,
                 label: "Focused panel tint",
-                hint: "Faint accent wash behind the focused panel (off shows the terminal's background)",
+                hint: "Faint accent wash behind the focused card or pane (off shows the terminal's background)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::BlackBackground,
+                label: "Black background",
+                hint: "Paint the window pure black instead of the terminal's own background (off keeps the terminal's, transparency included)",
                 group: "",
             },
             SettingSpec {
@@ -995,6 +1002,12 @@ pub struct Config {
     /// transparency or image configured in the terminal shows through
     /// the whole frame instead of stopping at the focused panel.
     pub focus_tint: bool,
+    /// BLACK BACKGROUND: paint every cell nothing else colored pure black
+    /// — the grid, the cards, the session pane, the overlays — instead of
+    /// leaving it on the terminal's own background, which in a stock
+    /// Ghostty is a dark gray. On by default; off lets a transparency or
+    /// image configured in the terminal show through.
+    pub black_background: bool,
     /// Where the LAUNCHER VIEW's PANE — the session under the cursor, live
     /// — sits against the GRID of cards: `bottom` (under them, the
     /// default), `right` or `left` (down that side of them). Read through
@@ -1165,9 +1178,10 @@ pub struct Config {
     /// still enters the pane.
     pub quick_prompt_focus: bool,
     /// Whether each new QUICK PROMPT starts aimed at a fresh worktree
-    /// rather than an existing checkout. `^N` flips the one box that is
-    /// up; the next box starts from this again. Off by default: most
-    /// launches are more work on a checkout that already exists.
+    /// rather than the project's ROOT BRANCH — never the checkout of the
+    /// card under the cursor, whose session takes more work as a
+    /// FOLLOW-UP. `^N` flips the one box that is up; the next box starts
+    /// from this again. Off by default.
     pub quick_prompt_new_worktree: bool,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
@@ -1298,6 +1312,7 @@ impl Default for Config {
             theme: "default".into(),
             animations: true,
             focus_tint: true,
+            black_background: true,
             session_pane: crate::launcher::PaneSide::Bottom.as_str().into(),
             show_workspaces: true,
             hide_projects: false,
@@ -2122,6 +2137,7 @@ impl Config {
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
+            SettingKind::BlackBackground => on_off(self.black_background).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
@@ -2222,6 +2238,9 @@ impl Config {
             }
             SettingKind::FocusTint => {
                 self.focus_tint = !self.focus_tint;
+            }
+            SettingKind::BlackBackground => {
+                self.black_background = !self.black_background;
             }
             SettingKind::SessionPane => {
                 // Cycled from the resolved side, so a hand edit off the
@@ -3287,6 +3306,34 @@ mod tests {
         assert!(
             older.focus_tint,
             "a config predating the key keeps the tint"
+        );
+    }
+
+    /// The BLACK BACKGROUND: on out of the box, toggled off from its
+    /// Appearance row (the terminal's own background shows), persisted
+    /// under `black_background`; a config predating the key turns it on,
+    /// and a saved `false` is honoured.
+    #[test]
+    fn black_background_default_on_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(cfg.black_background);
+        let (tab, row) = locate(SettingKind::BlackBackground).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.black_background);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).black_background);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.get("black_background"), Some(&serde_json::json!(false)));
+
+        let older: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            older.black_background,
+            "a config predating the key turns it on"
         );
     }
 

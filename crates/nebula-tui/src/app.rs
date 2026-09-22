@@ -474,14 +474,17 @@ impl ContextMenu {
             .any(|i| matches!(i.action, MenuAction::PickLaunchWorktree { .. }))
     }
 
-    /// Cloud mode is a root new-session-picker modifier, not another agent
-    /// kind. Returning Some only while the Claude row itself is highlighted
+    /// Cloud mode is a root-picker modifier, not another agent kind.
+    /// Returning Some only while the Claude row itself is highlighted
     /// keeps Tab free everywhere else (including model/effort submenus).
-    /// The `"New session"` title is the gate on purpose: the PR SESSION and
-    /// QUICK PROMPT pickers share these rows (`agent_picker`) but never
-    /// launch cloud — the daemon refuses a PR launch with a cloud task.
+    /// Two pickers offer it: the NEW SESSION PICKER (its `"New session"`
+    /// title is the gate — the PR SESSION picker and a PR row's menu share
+    /// these rows but never launch cloud, the daemon refusing a PR launch
+    /// with a cloud task) and the QUICK PROMPT's `Tab` picker, whose pick
+    /// makes the box a cloud one — unless the box is for an issue or a PR
+    /// (`QuickLaunch::takes_cloud`).
     pub fn hovered_claude_cloud(&self) -> Option<bool> {
-        if self.parent.is_some() || self.title.as_deref() != Some("New session") {
+        if self.parent.is_some() {
             return None;
         }
         match &self.items.get(self.hover)?.action {
@@ -489,8 +492,16 @@ impl ContextMenu {
                 kind: AgentKind::Claude,
                 custom: None,
                 cloud,
+                pr: None,
+                quick,
                 ..
-            } => Some(*cloud),
+            } => {
+                let offered = match quick {
+                    Some(back) => back.launch.takes_cloud(),
+                    None => self.title.as_deref() == Some("New session"),
+                };
+                offered.then_some(*cloud)
+            }
             _ => None,
         }
     }
@@ -1964,8 +1975,8 @@ pub enum PendingIntent {
         text: String,
         /// The stand-in rows on screen meanwhile.
         placeholder: PlaceholderRows,
-        /// The session's Ack takes the pane — `⌘Enter`, or the
-        /// `quick_prompt_focus` SETTING, as the box's Enter found them.
+        /// The session's Ack takes the pane — the `quick_prompt_focus`
+        /// SETTING, as the box's Enter found it.
         focus: bool,
     },
     /// A PR SESSION whose head branch had no checkout yet: the DAEMON
@@ -3648,6 +3659,12 @@ pub struct App {
     /// the config, refreshed at startup and when the settings overlay
     /// applies a change.
     pub focus_tint: bool,
+    /// The `black_background` setting: every cell still on the terminal's
+    /// default background is painted pure black at the end of a frame
+    /// (`ui::draw`). On in the config by default; off here until startup
+    /// applies it. Mirrors the config, refreshed at startup and when the
+    /// settings overlay applies a change.
+    pub black_background: bool,
     /// The ROWS MEMO, armed by the frame and by [`App::reading_url`].
     pub rows_memo: RowsMemo,
 }
@@ -3808,6 +3825,7 @@ impl App {
             welcome_on_screen: false,
             animations: true,
             focus_tint: true,
+            black_background: false,
             rows_memo: RowsMemo::default(),
         }
     }

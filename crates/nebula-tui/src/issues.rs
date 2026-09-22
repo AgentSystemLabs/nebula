@@ -59,7 +59,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::{clamp_selection, window_start, App, Overlay};
 use crate::markdown::{self, Breaks};
 use crate::pr_preview::fit;
-use crate::quick_prompt::{QuickLaunch, QuickReturn, QuickTarget};
+use crate::quick_prompt::{ModalUnder, QuickLaunch, QuickReturn, QuickTarget};
 use crate::text_input::{TextInput, TextView};
 use crate::theme::Theme;
 use crate::ui::{
@@ -1324,16 +1324,19 @@ pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
 
 // ---- launching ----
 
-/// Where a launch from the modal lands: the selected WORKTREE when it is
-/// one of this project's real checkouts (not a stand-in git is still
-/// cutting, not an OPEN PRS row), else the project's ROOT WORKTREE — which
-/// every project has whether the panel shows it or not. `Ctrl+N` in the box
-/// flips to a fresh worktree named after the issue.
-fn launch_target(app: &App, project: &ProjectId) -> Option<QuickTarget> {
-    if let Some(w) = app.selected_worktree() {
-        if &w.project_id == project && !app.is_placeholder_worktree(&w.id) {
-            return Some(QuickTarget::Worktree(w.id.clone()));
-        }
+/// Where a launch from the modal lands: the project's ROOT WORKTREE —
+/// which every project has whether the panel shows it or not — as every
+/// new session's box does, never the checkout of the card under the
+/// cursor; or, with the `quick_prompt_new_worktree` SETTING on, a fresh
+/// worktree named after the issue. `Ctrl+N` in the box flips between the
+/// two.
+fn launch_target(app: &App, project: &ProjectId, issue: &IssueRef) -> Option<QuickTarget> {
+    if crate::config::Config::load().quick_prompt_new_worktree {
+        let taken = app.project_branches(project);
+        return Some(QuickTarget::NewWorktree {
+            project: project.clone(),
+            branch: crate::branch_name::issue_name(issue.number, &issue.title, &taken),
+        });
     }
     app.tree
         .worktrees
@@ -1353,21 +1356,22 @@ fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
         app.flash = Some("no issue selected".into());
         return None;
     };
-    let Some(target) = launch_target(app, &project) else {
+    let issue = issue.launch_ref();
+    let Some(target) = launch_target(app, &project, &issue) else {
         app.flash = Some("issues: the project has no worktree to launch into".into());
         return None;
     };
-    Some(
-        QuickLaunch::from_config(target, &crate::config::Config::load())
-            .with_issue(Some(issue.launch_ref())),
-    )
+    Some(QuickLaunch::from_config(target, &crate::config::Config::load()).with_issue(Some(issue)))
 }
 
-/// `Enter` / `p`: the QUICK PROMPT for the issue. The box replaces the
-/// modal; Esc from it lands on the panels, `i` reopens the list.
+/// `Enter` / `p`: the QUICK PROMPT for the issue. The box goes up over the
+/// modal, which stays on screen under it: Esc puts the modal back on the
+/// row (`QuickLaunch::under`), and the launch closes it onto the new
+/// session's card.
 fn open_prompt_for_selected(app: &mut App) {
+    let under = ModalUnder::of(app.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
-        crate::quick_prompt::open_box(app, launch);
+        crate::quick_prompt::open_box(app, launch.with_under(under));
     }
 }
 
@@ -1389,12 +1393,11 @@ fn open_preset_for_selected(app: &mut App) {
 
 /// The launch the PROJECT ISSUES GROUP row under the Worktrees cursor
 /// describes — the modal's for that row: the `quick_prompt_kind`
-/// SETTING's harness aimed at [`launch_target`] (an issue row has no
-/// checkout, so that is the project's root), carrying the issue.
+/// SETTING's harness aimed at [`launch_target`], carrying the issue.
 fn launch_for_row(app: &mut App) -> Option<QuickLaunch> {
     let issue = app.selected_worktree_issue()?.launch_ref();
     let project = app.selected_project()?.id.clone();
-    let Some(target) = launch_target(app, &project) else {
+    let Some(target) = launch_target(app, &project, &issue) else {
         app.flash = Some("issues: the project has no worktree to launch into".into());
         return None;
     };
@@ -1655,7 +1658,12 @@ pub fn lines(
 }
 
 /// The ISSUES MODAL: the list down the left, the reading pane on the right.
-pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
+/// `backdrop` draws it as the layer under a QUICK PROMPT box opened from it
+/// (`QuickLaunch::under`): dim frames and an unfocused cursor row, the box
+/// in front having the eye.
+pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, backdrop: bool) {
+    // The list holds the keys unless the editor or a box over the modal does.
+    let list_focused = view.editor.is_none() && !backdrop;
     let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
     f.render_widget(Clear, area);
     let list_w = (area.width * LIST_PCT / 100)
@@ -1683,7 +1691,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
         rows.len(),
         if inflight { ", refreshing…" } else { "" }
     );
-    let block = panel_block(&title, view.editor.is_none(), th).title_bottom(
+    let block = panel_block(&title, list_focused, th).title_bottom(
         Line::from(Span::styled(
             " Enter/p: prompt  e: preset  E: edit  c: comment  o: browser  r: refresh ",
             Style::default().fg(th.dim),
@@ -1727,7 +1735,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
             spans.push(Span::raw(" ".repeat(budget - used - opened_w)));
             spans.push(Span::styled(opened, Style::default().fg(th.dim)));
         }
-        render_row(f, row_area, spans, i == selected, view.editor.is_none(), th);
+        render_row(f, row_area, spans, i == selected, list_focused, th);
     }
 
     // ---- right: the editor, while it is up ----
@@ -2828,7 +2836,7 @@ mod tests {
             let Some(Overlay::Issues(v)) = app.overlay.clone() else {
                 panic!("no issues modal");
             };
-            draw(f, app, &v, app.theme);
+            draw(f, app, &v, app.theme, false);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();

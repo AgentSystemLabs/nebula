@@ -203,6 +203,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.rows_memo.arm();
     draw_screen(f, app);
     app.rows_memo.disarm();
+    if app.black_background {
+        let area = f.area();
+        draw_black_background(f.buffer_mut(), area);
+    }
 }
 
 fn draw_screen(f: &mut Frame, app: &mut App) {
@@ -584,6 +588,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
     let Some(overlay) = app.overlay.clone() else {
         return;
     };
+    // A box opened from the ISSUES MODAL or the PULL REQUESTS MODAL stands
+    // on it rather than taking it away: the modal is the bottom layer, the
+    // box — and any picker the box has up — is drawn over it.
+    use crate::quick_prompt::ModalUnder;
+    match crate::quick_prompt::modal_under(&overlay) {
+        Some(ModalUnder::Issues(view)) => crate::issues::draw(f, app, &view, th, true),
+        Some(ModalUnder::PullRequests(view)) => crate::pr_modal::draw(f, app, &view, th, true),
+        None => {}
+    }
     match overlay {
         Overlay::ProjectPicker(picker) => {
             // `^P` layers the project list over the box rather than
@@ -2177,8 +2190,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::AgentPresetEditor(editor) => {
             crate::preset_overlays::draw_editor(f, app, &editor, th)
         }
-        Overlay::Issues(view) => crate::issues::draw(f, app, &view, th),
-        Overlay::PullRequests(view) => crate::pr_modal::draw(f, app, &view, th),
+        Overlay::Issues(view) => crate::issues::draw(f, app, &view, th, false),
+        Overlay::PullRequests(view) => crate::pr_modal::draw(f, app, &view, th, false),
         Overlay::BranchSwitch(view) => crate::branch_switch::draw(f, app, &view, th),
         Overlay::FileTabs(mut view) => {
             // The TREE BROWSER's footprint: the editor Enter opens wants the
@@ -2694,8 +2707,8 @@ fn draw_launcher_pane_grip(
 }
 
 /// Subtle focus cue: fill the whole focused panel with the theme's
-/// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
-/// faintly lit surface. Painted after content, and only onto cells whose
+/// `focus_tint` — a near-black shade of the accent, so the panel reads as
+/// a faintly lit surface. Painted after content, and only onto cells whose
 /// background is still untouched, so selection fills and PTY-drawn
 /// colors sit on top of the tint instead of under it. The `focus_tint`
 /// setting decides whether the callers paint it at all.
@@ -2705,6 +2718,23 @@ fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 if cell.bg == Color::Reset {
                     cell.bg = th.focus_tint;
+                }
+            }
+        }
+    }
+}
+
+/// The BLACK BACKGROUND setting: paint every cell still on the terminal's
+/// default background pure black. Runs last in a frame, after the overlays
+/// and the focus tint, and — like the tint — only touches `Reset` cells, so
+/// selection fills, the tint and the colors a session draws itself stay on
+/// top of it.
+fn draw_black_background(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if cell.bg == Color::Reset {
+                    cell.bg = crate::theme::BLACK_BACKGROUND;
                 }
             }
         }
@@ -3808,11 +3838,22 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
     {
         // `^P`, `^O`, `Tab` and `^N` are on the box itself now, each
         // beside the thing it changes — a third copy down here was most
-        // of what made this screen read as a wall of chords.
-        Span::styled(
-            "Enter: launch  ⇧Tab: preset  Esc: back to sessions",
-            Style::default().fg(th.dim),
-        )
+        // of what made this screen read as a wall of chords. A box
+        // standing on a modal goes back to it.
+        let hint = match app
+            .overlay
+            .as_ref()
+            .and_then(crate::quick_prompt::modal_under)
+        {
+            Some(crate::quick_prompt::ModalUnder::Issues(_)) => {
+                "Enter: launch  ⇧Tab: preset  Esc: back to issues"
+            }
+            Some(crate::quick_prompt::ModalUnder::PullRequests(_)) => {
+                "Enter: launch  ⇧Tab: preset  Esc: back to pull requests"
+            }
+            None => "Enter: launch  ⇧Tab: preset  Esc: back to sessions",
+        };
+        Span::styled(hint, Style::default().fg(th.dim))
     } else if matches!(&app.overlay, Some(Overlay::ProjectPicker(_))) {
         Span::styled(
             "type: filter projects  ↑/↓: move  Enter: aim the box there  Esc: clear/back to the box",
@@ -4632,6 +4673,31 @@ mod tests {
         assert!(reversed_rows(&mut app).is_empty());
     }
 
+    /// The BLACK BACKGROUND setting leaves nothing on the terminal's own
+    /// background once a frame is drawn, and paints only what was: a cell
+    /// something else filled keeps its color.
+    #[test]
+    fn black_background_paints_every_default_cell_and_nothing_else() {
+        let resets = |app: &mut App| -> usize {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            buf.content.iter().filter(|c| c.bg == Color::Reset).count()
+        };
+        let mut app = App::new();
+        assert!(resets(&mut app) > 0, "off: the terminal's background shows");
+        app.black_background = true;
+        assert_eq!(resets(&mut app), 0, "on: every default cell goes black");
+
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf[(1, 0)].bg = app.theme.sel_bg;
+        draw_black_background(&mut buf, area);
+        assert_eq!(buf[(0, 0)].bg, crate::theme::BLACK_BACKGROUND);
+        assert_eq!(buf[(1, 0)].bg, app.theme.sel_bg, "a fill stays on top");
+    }
+
     #[test]
     fn truncate_clips_to_max_chars_with_an_ellipsis() {
         assert_eq!(truncate("short", 10), "short");
@@ -4763,6 +4829,8 @@ mod tests {
             preset: None,
             issue: None,
             pr: None,
+            under: None,
+            cloud: false,
         });
         let cloud = PromptKind::CloudMessage {
             id: nebula_core::AgentId::from("a".to_string()),

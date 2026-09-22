@@ -207,7 +207,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
 
 - **The box** starts on the selected project and on a fresh worktree cut for the session, launching
   the harness, model and effort the Agents tab defaults name — the row at the top of the box spells
-  them out, `project demo ^P · worktree main ▾ · agent claude Tab · model opus high ^O`, the branch
+  them out, `project demo ^P · worktree main ▾ · harness claude Tab · model opus high ^O`, the branch
   in green while Enter will cut it as a fresh worktree.
   `^P` puts the PROJECT PICKER over it — literally over it: the list floats inside the box, which
   stays on screen under it with its title, its details row and the task already typed into it, so
@@ -219,7 +219,9 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   lights the project when the box is aimed away, and the footer names it once Enter lands.
   `^O` opens the harness's model list straight away (`→` on a model reaches its efforts) and `Tab`
   the harness picker — both over the box, as the project picker is, so the task stays in front of
-  you while you pick what will run it. `⇧Tab` takes a preset, and `^N` flips between a fresh
+  you while you pick what will run it. `Tab` again on the picker's Claude row is the new-session
+  picker's Claude Cloud toggle: the box comes back as a cloud one (`harness claude · cloud`) and
+  Enter sends your text as the cloud task — not offered in a box for an issue or a pull request. `⇧Tab` takes a preset, and `^N` flips between a fresh
   worktree and the project's own checkout — the choice sticks for the next box. None of the four
   needs the chord: the details row is a row of buttons, and a click on `project …`, `agent …` or
   `model …` — or on the `[ ] new worktree` toggle across from the question — opens exactly what
@@ -356,7 +358,7 @@ dim with the rest rather than carrying its merged purple or a red conflict acros
 filed-away work. The badge on the right counts from when the session was archived (`2h ago`), not
 from its last turn — a session archived before nebula kept that stamp simply has no badge. Under the
 cursor the whole card lifts a step, so the one you are about to unarchive stays legible on the
-selection fill, and with color off entirely the two shapes still tell the grids apart. No card says
+focus tint, and with color off entirely the two shapes still tell the grids apart. No card says
 the word `archived`: the header says it once, for all of them.
 
 ## The PROJECT OPEN PRS group
@@ -495,13 +497,17 @@ intact, so nothing typed is lost. Labels, assignees and milestones stay GitHub's
 
 Two keys put an agent on the issue. `Enter` (or `p`) opens the QUICK PROMPT for it — the same box
 `p` opens anywhere, titled `Quick prompt · issue #15 (claude · opus)`, launching the `Agent` row's
-harness from Settings → Agents into the selected worktree (or the PROJECT's ROOT WORKTREE when the
-cursor is not on one of its checkouts). `e` opens the AGENT PRESETS list as a picker instead, and
+harness from Settings → Agents on the PROJECT's ROOT WORKTREE, whatever card the cursor is on — or
+on a fresh worktree named after the issue, with `New worktree` on under **Quick prompt**. `e` opens the AGENT PRESETS list as a picker instead, and
 `Enter` on a preset hands the same box back with that preset's harness, model, effort and
 prefix/postfix applied. Inside the box `Tab` and `Shift+Tab` still switch the harness or the preset
 and `Ctrl+N` still flips to a fresh worktree — named `issue-15-fix-login-redirect` here, the number
 first and the title slugified, rather than a random name — and the issue survives every one of those
-round trips. Send the box empty and the task is `Fix GitHub issue #15: <title> (<url>)`.
+round trips. Send the box empty and the task is `Fix GitHub issue #15: <title> (<url>)`. The box
+goes up over the modal rather than in its place — the list and the issue you were reading stay on
+screen under it. `Esc`, or a click outside the box, puts you back in the modal on the same row; the
+launch closes the modal as well, so the new session's card is in front of you with the grid's cursor
+on it.
 
 Either way the launch is an ISSUE SESSION. The create carries the issue's URL
 (`CreateAgent::issue_url`); the DAEMON validates it, keeps it with the AGENT row beside a PR
@@ -537,7 +543,10 @@ PR SESSION on the pull request — the box `p` opens on its group row, titled `Q
 `→` drilling into the MODEL / EFFORT submenus. Every one of them is the group row's launch: a
 `CreatePrAgent` that runs in the project's checkout of the pull request's head branch, reused when
 one is there and cut by the DAEMON otherwise, its stand-in rows up under the pull request from the
-moment you launch, and the PR's URL and work rule in the harness's context. `c` (or `y`) opens the
+moment you launch, and the PR's URL and work rule in the harness's context. The QUICK PROMPT stands
+on the modal as the ISSUES MODAL's does: the list stays under the box, `Esc` or a click outside puts
+you back on the pull request you opened it on, and the launch closes the modal onto the new
+session's card, the grid's cursor on it. `c` (or `y`) opens the
 COMMENT BOX on the pull request and comes back to the modal on the row — after `Enter` posts, after
 `Esc`, and after a post `gh` refused, with your text back in the box — `g` opens the pull request's
 whole diff, `o` opens it in the browser, and `Esc`, `q` or `v` closes the modal. The hotkey is

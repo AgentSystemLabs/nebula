@@ -584,9 +584,9 @@ const ARCHIVED_MARK: &str = "▪ ";
 /// One session's card: its name and how long since it last moved, where
 /// it runs — with that checkout's uncommitted file count — and with what,
 /// its pull request, and the last thing it was
-/// asked to do. The cursor's card takes an accent border and no fill — the
-/// outline alone marks it; every other card's frame answers to its status
-/// ([`card_edge`]).
+/// asked to do. The cursor's card takes an accent border, and — while the
+/// grid has the keys — the FOCUSED PANEL TINT behind it; every other
+/// card's frame answers to its status ([`card_edge`]).
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
     f: &mut Frame,
@@ -637,7 +637,7 @@ fn draw_card(
     } else {
         th.edge
     };
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         // Square corners on an archived card, round on a live one: the one
         // difference between the two grids that survives a terminal with
@@ -648,6 +648,13 @@ fn draw_card(
             BorderType::Rounded
         })
         .border_style(Style::default().fg(border));
+    // The card keys land in wears the same wash the session pane wears
+    // when it has them, so one surface on screen is lit and it follows the
+    // focus between the grid and the pane. The `focus_tint` setting turns
+    // both off together.
+    if selected && focused && app.focus_tint {
+        block = block.style(Style::default().bg(th.focus_tint));
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     // One cell of air inside the border, so the text never touches it.
@@ -1550,7 +1557,7 @@ const MIN_PROJECT: usize = 8;
 const MIN_BRANCH: usize = 12;
 
 /// The gap between two of [`detail_line`]'s fields — wide enough that
-/// `api-server ^P` and `agent claude` never read as one phrase — and the
+/// `api-server ^P` and `harness claude` never read as one phrase — and the
 /// one a box too narrow for that falls back to.
 const DETAIL_GAP: &str = "   ·   ";
 const DETAIL_TIGHT: &str = " · ";
@@ -1573,11 +1580,15 @@ struct Details {
 
 impl Details {
     fn of(app: &App, launch: &QuickLaunch) -> Self {
-        let harness = launch
+        let mut harness = launch
             .custom
             .as_deref()
             .unwrap_or_else(|| launch.kind.as_str())
             .to_string();
+        // A CLAUDE CLOUD box says so on the button that toggles it.
+        if launch.cloud {
+            harness.push_str(" · cloud");
+        }
         let mut model = launch.model.clone().unwrap_or_else(|| "default".into());
         if let Some(effort) = launch.effort.as_deref().filter(|e| !e.is_empty()) {
             model.push(' ');
@@ -1655,7 +1666,7 @@ impl Details {
             ),
             (
                 BoxField::Agent,
-                "agent",
+                "harness",
                 &self.harness,
                 th.text,
                 Some("Tab"),
@@ -1791,24 +1802,23 @@ pub(super) fn box_title(launch: &QuickLaunch) -> String {
     if let Some(preset) = &launch.preset {
         head.push(preset.name.clone());
     }
+    if launch.cloud {
+        head.push("Claude Cloud".into());
+    }
     head.join(" · ")
 }
 
 /// The view's box hints, widest that fits in `width`. `^P`, `Tab`, `^O`
 /// and `^N` are not here: each one is now inside the box beside the thing
 /// it changes, and a second copy along the border was most of what made
-/// this box read as a wall of text. `⌘Enter` — launch and step down into
-/// the new session — outlasts the newline and the preset, since nothing
-/// else in the box says it exists.
+/// this box read as a wall of text.
 pub(super) fn box_hint(width: u16) -> &'static str {
-    if width >= 84 {
-        " Enter launch · ⌘Enter launch + focus · ⇧Enter newline · ⇧Tab preset · Esc cancel "
-    } else if width >= 67 {
-        " Enter launch · ⌘Enter launch + focus · ⇧Tab preset · Esc cancel "
-    } else if width >= 46 {
-        " Enter launch · ⌘Enter + focus · Esc cancel "
+    if width >= 60 {
+        " Enter launch · ⇧Enter newline · ⇧Tab preset · Esc cancel "
+    } else if width >= 43 {
+        " Enter launch · ⇧Tab preset · Esc cancel "
     } else if width >= 29 {
-        " ↵ launch · ⌘↵ focus · Esc "
+        " Enter launch · Esc cancel "
     } else if width >= 25 {
         " ↵ launch · Esc cancel "
     } else {
@@ -1974,7 +1984,7 @@ mod tests {
         }
         // And the box at its own size names every key it has.
         let full = box_hint(BOX_SIZE.0);
-        for key in ["Enter launch", "⌘Enter launch + focus", "⇧Enter newline"] {
+        for key in ["Enter launch", "⇧Enter newline", "⇧Tab preset"] {
             assert!(full.contains(key), "{full:?} lost {key}");
         }
     }
@@ -2027,7 +2037,7 @@ mod tests {
             "^P",
             "worktree ",
             "▾",
-            "agent ",
+            "harness ",
             "claude",
             "Tab",
             "model ",
@@ -2055,7 +2065,7 @@ mod tests {
 
     /// Every field the row draws hands back the columns it was drawn in,
     /// and those columns hold exactly that field's own text — so a click
-    /// on `agent claude Tab` cannot open the model list. A tier that drops
+    /// on `harness claude Tab` cannot open the model list. A tier that drops
     /// a field hands back nothing for it: what is not drawn is no button.
     #[test]
     fn every_drawn_detail_hands_back_its_own_columns() {
@@ -3115,6 +3125,61 @@ mod tests {
             th.muted
         );
         assert_ne!(th.warn_edge, th.accent);
+    }
+
+    /// The card keys land in is filled with the FOCUSED PANEL TINT, frame
+    /// and all; the cursor's card off the grid, any other card, and every
+    /// card with the setting off stay on the terminal's background.
+    #[test]
+    fn only_the_focused_card_wears_the_focus_tint() {
+        use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
+        let row = LauncherRow {
+            agent: Agent {
+                id: AgentId("a1".into()),
+                worktree_id: WorktreeId("w1".into()),
+                name: "fix login".into(),
+                status: AgentStatus::Finished,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: 0,
+                alive: true,
+                recent_prompts: Vec::new(),
+            },
+            project: "nebula".into(),
+            branch: "feat-x".into(),
+            is_main: false,
+            pr: None,
+        };
+        let th = Theme::by_name("coral");
+        let mut app = App::new();
+        app.theme = th;
+        let fill = |app: &App, selected: bool, focused: bool| {
+            let area = Rect::new(0, 0, 40, crate::launcher::CARD_H);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .unwrap();
+            terminal
+                .draw(|f| draw_card(f, app, area, &row, selected, focused, th, &mut None))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let corner = buf.cell((0, 0)).unwrap().bg;
+            let inside = buf.cell((20, area.height - 2)).unwrap().bg;
+            assert_eq!(corner, inside, "one fill, frame and all");
+            inside
+        };
+        assert_eq!(fill(&app, true, true), th.focus_tint);
+        assert_eq!(fill(&app, true, false), Color::Reset);
+        assert_eq!(fill(&app, false, true), Color::Reset);
+        app.focus_tint = false;
+        assert_eq!(fill(&app, true, true), Color::Reset);
     }
 
     /// CARD LINE COUNTS: with the setting on and a count read, the lines

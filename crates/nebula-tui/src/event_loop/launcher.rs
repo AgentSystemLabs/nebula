@@ -54,8 +54,7 @@ const NO_PROJECTS: &str = "no projects yet — o opens a folder";
 
 /// What folding the PANE away says, and what bringing it back says. The
 /// first names what went with it: the card under the cursor is let go of
-/// too, so the same `p` that takes the root branch after an Esc takes it
-/// after this.
+/// too, as an Esc lets it go.
 const PANE_HIDDEN: &str = "pane hidden, nothing selected — ^` brings it back";
 const PANE_SHOWN: &str = "pane back under the cards";
 
@@ -64,18 +63,19 @@ const PANE_SHOWN: &str = "pane back under the cards";
 const BACK_TO_CARD: &str = "Back to the card";
 
 /// What letting the card under the cursor go says: nothing in the GRID is
-/// selected any more, so the box `p` opens has no checkout to read off a
-/// card and lands on the project's ROOT BRANCH instead.
-pub(super) const UNAIMED: &str = "nothing selected — p starts on the project's root branch";
+/// selected any more, and the PANE has no session to read.
+pub(super) const UNAIMED: &str = "nothing selected — j/k or a click picks a card again";
 
 /// The box: the QUICK PROMPT, aimed at the project under the list's cursor
-/// (the selected project). The `quick_prompt_new_worktree` SETTING alone
-/// picks a fresh worktree or an existing checkout; `^N` flips only the box
-/// that is up. `p`, `n`, and the boot.
+/// (the selected project). It lands on the project's ROOT BRANCH, or on a
+/// fresh worktree when the `quick_prompt_new_worktree` SETTING says so
+/// (`view::target_for`); `^N` flips only the box that is up. `p`, `n`, and
+/// the boot.
 ///
-/// On an existing checkout with the aim let go of ([`clear_aim`]) there is
-/// no card to read one off, so the box lands on the project's ROOT BRANCH
-/// (`view::root_target_for`).
+/// Never the checkout of the card under the cursor: more work in that
+/// session's worktree is its FOLLOW-UP (Space on the card), so which card
+/// is selected — or whether any is — does not move where a new session
+/// starts.
 pub(super) fn open_box(app: &mut App) {
     let project = app.selected_project().map(|p| p.id.clone()).or_else(|| {
         app.project_rows()
@@ -87,13 +87,8 @@ pub(super) fn open_box(app: &mut App) {
         app.flash = Some("add a project first".into());
         return;
     };
-    let target = if crate::config::Config::load().quick_prompt_new_worktree {
-        view::target_for(app, &project, true)
-    } else if app.launcher_unaimed {
-        view::root_target_for(app, &project)
-    } else {
-        view::target_for(app, &project, false)
-    };
+    let new_worktree = crate::config::Config::load().quick_prompt_new_worktree;
+    let target = view::target_for(app, &project, new_worktree);
     crate::quick_prompt::open_for(app, target);
 }
 
@@ -111,8 +106,7 @@ pub(super) fn take_aim(app: &mut App) {
 }
 
 /// Let the card under the cursor go: no card is drawn wearing the cursor,
-/// the box has no checkout to read off one, and the PANE along the bottom
-/// collapses — it is the selected session, so with nothing selected there
+/// and the PANE along the bottom collapses — it is the selected session, so with nothing selected there
 /// is nothing for it to be and the grid takes the whole body back
 /// ([`App::launcher_split`]). What the cursor was on is only let go of and
 /// not forgotten: [`take_aim`] brings both the card and the pane back, and
@@ -326,11 +320,9 @@ pub(super) fn tab_after(app: &App, closing: &TerminalId) -> Option<Option<Termin
     )
 }
 
-/// Esc in the GRID: let the card under the cursor go ([`clear_aim`]) —
-/// the selection the box reads, so the next `p` starts its session on the
-/// project's root branch instead of in whichever checkout the cursor was
-/// parked in. With nothing selected already there is nothing left to let
-/// go of, and Esc does nothing: the grid is the top of the view.
+/// Esc in the GRID: let the card under the cursor go ([`clear_aim`]).
+/// With nothing selected already there is nothing left to let go of, and
+/// Esc does nothing: the grid is the top of the view.
 ///
 /// With the PROJECT TABS holding the keys ([`focus_tabs`]) Esc is only
 /// the way back down: the cards get the keys again, on the project the
@@ -1381,7 +1373,8 @@ fn open_model_picker(app: &mut App, back: QuickReturn) {
             custom,
             model: None,
             effort: None,
-            cloud: false,
+            // A model picked for a CLAUDE CLOUD box keeps it one.
+            cloud: back.launch.cloud,
             pr,
             quick: Some(Box::new(back)),
         },
@@ -1406,9 +1399,9 @@ pub(super) fn click_new_worktree(app: &mut App) {
 }
 
 /// `^N` in the view's box: flip this launch between a fresh worktree and
-/// the project's own checkout — the project the box is aimed at, which is
-/// not always the one under the list's cursor (`^P` moves it). Only this
-/// box: the next one starts from the `quick_prompt_new_worktree` SETTING.
+/// the ROOT BRANCH of the project the box is aimed at, which is not
+/// always the one under the list's cursor (`^P` moves it). Only this box:
+/// the next one starts from the `quick_prompt_new_worktree` SETTING.
 /// A PR SESSION's checkout is the DAEMON's to pick, so it has nothing to
 /// flip.
 fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
@@ -1425,10 +1418,10 @@ fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
     let target = if fresh {
         fresh_worktree(app, project, &launch)
     } else {
-        match view::checkout_for(app, &project) {
+        match view::root_checkout(app, &project) {
             Some(worktree) => QuickTarget::Worktree(worktree),
             None => {
-                app.flash = Some("no checkout to reuse — keeping the new worktree".into());
+                app.flash = Some("no root branch to launch on — keeping the new worktree".into());
                 return;
             }
         }
@@ -1626,8 +1619,8 @@ pub(super) fn click_picker_row(app: &mut App, index: usize) {
 }
 
 /// Enter in the PROJECT PICKER: the box comes back aimed at the project
-/// under the cursor, text kept, a fresh worktree or its checkout as the
-/// box had it. Aiming the box is not navigation: the grid behind it stays
+/// under the cursor, text kept, a fresh worktree or its root branch as
+/// the box had it. Aiming the box is not navigation: the grid behind it stays
 /// on the project you are working in. The launch that follows is a
 /// BACKGROUND LAUNCH (`view::is_background`) — it starts the session over
 /// there and leaves the screen here.
@@ -5890,7 +5883,7 @@ mod tests {
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             let text = buffer_text(&draw(&mut app));
             assert!(text.contains("project demo ^P"), "{text}");
-            assert!(text.contains("agent claude Tab"), "{text}");
+            assert!(text.contains("harness claude Tab"), "{text}");
             assert!(text.contains("model default ^O"), "{text}");
             assert!(text.contains("new worktree ^N"), "{text}");
             assert!(
@@ -6274,24 +6267,36 @@ mod tests {
         });
     }
 
-    /// With nothing selected, `p` asks nothing: no PROJECT PICKER goes
-    /// up, the box does — aimed at the project's ROOT BRANCH, the one
-    /// place every project has, rather than at the checkout the cursor
-    /// was parked in. `^P` in the
-    /// box is still the way to another project.
+    /// `p` lands the box on the project's ROOT BRANCH whatever the grid's
+    /// cursor is on — a card in a linked worktree, or nothing at all — so
+    /// where a new session starts never depends on which card was last
+    /// selected: more work in a card's own checkout is its FOLLOW-UP
+    /// (Space). Nothing selected asks nothing either: no PROJECT PICKER
+    /// goes up, the box does, and `^P` in it is still the way to another
+    /// project.
     #[test]
-    fn p_with_nothing_selected_opens_the_box_on_the_root_branch() {
+    fn p_opens_the_box_on_the_root_branch_whatever_card_is_selected() {
         with_default_config(|| {
             let mut app = two_sessions();
             draw(&mut app);
+            let root = QuickTarget::Worktree(WorktreeId("w1".into()));
 
-            // Aimed at a card, the box reuses a checkout — the new-worktree
-            // SETTING is off by default.
-            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
-            assert!(
-                !launch(&app).0.is_new_worktree(),
-                "an aimed p cut a worktree with the setting off"
+            // On polish-nav, whose card runs in the `feat` worktree.
+            super::select(&mut app, AgentId("a2".into()), &mut Vec::new());
+            assert_eq!(
+                app.selected_worktree().map(|w| w.branch.as_str()),
+                Some("feat")
             );
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(
+                launch(&app).0.target,
+                root,
+                "the box took the selected card's checkout"
+            );
+            app.overlay = None;
+            // `n` is the same box.
+            key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+            assert_eq!(launch(&app).0.target, root, "n");
             app.overlay = None;
 
             // Let the aim go with the first Esc.
@@ -6303,16 +6308,46 @@ mod tests {
                 !matches!(&app.overlay, Some(Overlay::ProjectPicker(_))),
                 "the picker went up instead of the box"
             );
-            let (launch, _) = launch(&app);
             assert_eq!(
-                launch.target,
-                QuickTarget::Worktree(WorktreeId("w1".into())),
+                launch(&app).0.target,
+                root,
                 "the box did not land on demo's root branch"
             );
 
             // And it is the box itself, drawn with its own chrome.
             let text = buffer_text(&draw(&mut app));
             assert!(text.contains("new worktree ^N"), "{text}");
+
+            // `^N` flips it onto a fresh worktree and back onto the root,
+            // not onto the card's checkout.
+            key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            assert!(launch(&app).0.is_new_worktree());
+            key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            assert_eq!(launch(&app).0.target, root, "^N came back off the root");
+        });
+    }
+
+    /// With the `quick_prompt_new_worktree` SETTING on, every box starts
+    /// on a fresh worktree in the selected project instead — the card
+    /// under the cursor does not matter here either.
+    #[test]
+    fn the_new_worktree_setting_starts_every_box_on_a_fresh_worktree() {
+        with_config_json(r#"{"quick_prompt_new_worktree": true}"#, || {
+            let mut app = two_sessions();
+            draw(&mut app);
+            for agent in ["a1", "a2"] {
+                super::select(&mut app, AgentId(agent.into()), &mut Vec::new());
+                key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+                assert!(
+                    matches!(
+                        &launch(&app).0.target,
+                        QuickTarget::NewWorktree { project, .. } if project.0 == "p1"
+                    ),
+                    "{agent}: {:?}",
+                    launch(&app).0.target
+                );
+                app.overlay = None;
+            }
         });
     }
 

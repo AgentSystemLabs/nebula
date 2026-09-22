@@ -803,10 +803,11 @@ pub fn project_tabs(app: &App) -> Vec<ProjectTab> {
         .collect()
 }
 
-/// The checkout a launch into `project`'s existing work lands in — the
-/// box with `^N` off: the one the panels would restore for it (the
-/// selected worktree when the cursor is in that project, else the one it
-/// was last left on), else its ROOT WORKTREE, else any checkout it has.
+/// The checkout `project`'s own menu runs and opens — the one the panels
+/// would restore for it (the selected worktree when the cursor is in that
+/// project, else the one it was last left on), else its ROOT WORKTREE,
+/// else any checkout it has. Not where the box launches: that is the
+/// root or a fresh worktree ([`target_for`]).
 /// Never a stand-in git is still cutting, nor a root the project hides.
 /// None for a project with no usable checkout.
 pub fn checkout_for(app: &App, project: &ProjectId) -> Option<WorktreeId> {
@@ -842,28 +843,31 @@ pub fn checkout_for(app: &App, project: &ProjectId) -> Option<WorktreeId> {
 }
 
 /// Where a launch from the box lands for `project`: a fresh worktree off
-/// the project's default base (`new_worktree`, the view's default — a
-/// session of its own per task), or the project's existing checkout
-/// ([`checkout_for`]). A project with no checkout to reuse gets a fresh
-/// one either way.
+/// the project's default base (`new_worktree` — the
+/// `quick_prompt_new_worktree` SETTING, or `^N` in the box), or the
+/// project's ROOT BRANCH ([`root_checkout`]). Never the checkout of the
+/// card under the cursor: more work in a session's own worktree is a
+/// FOLLOW-UP (Space on its card), not a new session. A project with no
+/// usable root — hidden, or still being cut — gets a fresh worktree
+/// either way.
 pub fn target_for(app: &App, project: &ProjectId, new_worktree: bool) -> QuickTarget {
-    let fresh = || QuickTarget::NewWorktree {
-        project: project.clone(),
-        branch: crate::branch_name::random_name(&app.project_branches(project)),
-    };
-    if new_worktree {
-        return fresh();
-    }
-    match checkout_for(app, project) {
+    let root = (!new_worktree)
+        .then(|| root_checkout(app, project))
+        .flatten();
+    match root {
         Some(worktree) => QuickTarget::Worktree(worktree),
-        None => fresh(),
+        None => QuickTarget::NewWorktree {
+            project: project.clone(),
+            branch: crate::branch_name::random_name(&app.project_branches(project)),
+        },
     }
 }
 
 /// `project`'s ROOT WORKTREE — the checkout its ROOT BRANCH lives in,
-/// which is where a launch from an UNAIMED box lands ([`root_target_for`]).
-/// None for a project that hides its root, whose root git is still
-/// cutting, or that has no root checkout of its own.
+/// which is where a launch from the box lands unless it cuts a fresh
+/// worktree ([`target_for`]). None for a project that hides its root,
+/// whose root git is still cutting, or that has no root checkout of its
+/// own.
 pub fn root_checkout(app: &App, project: &ProjectId) -> Option<WorktreeId> {
     let p = app.tree.projects.iter().find(|p| &p.id == project)?;
     if app.root_hidden(p) {
@@ -874,19 +878,6 @@ pub fn root_checkout(app: &App, project: &ProjectId) -> Option<WorktreeId> {
         .iter()
         .find(|w| &w.project_id == project && w.is_main && !app.is_placeholder_worktree(&w.id))
         .map(|w| w.id.clone())
-}
-
-/// Where a launch from an UNAIMED box lands
-/// (`event_loop::launcher::open_box`): `project`'s ROOT BRANCH — the root checkout, not the worktree the
-/// cursor was last parked in and not a fresh branch. Nothing is selected,
-/// so there is no card to read a checkout off and the box takes the one
-/// place every project has. A project with no usable root falls back to
-/// the aimed rule ([`target_for`]).
-pub fn root_target_for(app: &App, project: &ProjectId) -> QuickTarget {
-    match root_checkout(app, project) {
-        Some(worktree) => QuickTarget::Worktree(worktree),
-        None => target_for(app, project, false),
-    }
 }
 
 /// The PROJECT a launch target is in.
@@ -1466,41 +1457,33 @@ mod tests {
         assert_eq!(g.page(), 1);
     }
 
-    /// With `^N` off the box reuses the project's checkout: the one the
-    /// cursor is on in that project, else the one it was last left on,
-    /// else its root; a hidden root is never it, and a project with no
-    /// usable checkout gets a fresh worktree after all.
+    /// With `^N` off the box lands on the project's ROOT BRANCH, whatever
+    /// card the cursor is on and whatever checkout the project was last
+    /// left on; a hidden root is never it, and a project with no usable
+    /// root gets a fresh worktree after all.
     #[test]
-    fn a_launch_into_existing_work_picks_the_projects_checkout() {
+    fn a_launch_into_existing_work_lands_on_the_root_branch() {
         let mut app = app();
         let api = ProjectId("p1".into());
-        assert_eq!(
-            app.selected_worktree().map(|w| w.id.0.as_str()),
-            Some("w1"),
-            "the cursor is on api's root"
-        );
+        let root = QuickTarget::Worktree(WorktreeId("w1".into()));
         app.last_worktree_for_project
             .insert(api.clone(), WorktreeId("w2".into()));
         assert_eq!(
             target_for(&app, &api, false),
-            QuickTarget::Worktree(WorktreeId("w1".into())),
-            "the checkout under the cursor wins"
+            root,
+            "not the remembered one"
         );
-        // The cursor over in web: api's is the one it was last left on.
-        app.sel_project = app
-            .project_rows()
+        // The cursor on api's other checkout: still the root.
+        app.sel_worktree = app
+            .worktree_rows()
             .iter()
-            .position(|i| app.tree.projects[*i].id.0 == "p2")
-            .unwrap();
+            .position(|r| r.checkout().is_some_and(|w| w.id.0 == "w2"))
+            .expect("api has a second checkout to park the cursor on");
+        assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w2"));
         assert_eq!(
             target_for(&app, &api, false),
-            QuickTarget::Worktree(WorktreeId("w2".into()))
-        );
-        app.last_worktree_for_project.clear();
-        assert_eq!(
-            target_for(&app, &api, false),
-            QuickTarget::Worktree(WorktreeId("w1".into())),
-            "the root, with nothing remembered"
+            root,
+            "not the checkout under the cursor"
         );
         assert!(matches!(
             target_for(&app, &api, true),
@@ -1508,13 +1491,12 @@ mod tests {
         ));
 
         app.project_fallback.hide_root_worktree = true;
-        let web = ProjectId("p2".into());
         assert!(
             matches!(
-                target_for(&app, &web, false),
+                target_for(&app, &api, false),
                 QuickTarget::NewWorktree { .. }
             ),
-            "web's only checkout is a hidden root"
+            "a hidden root is never the target"
         );
     }
 

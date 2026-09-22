@@ -143,27 +143,12 @@ pub(crate) fn force_close(app: &mut App) -> bool {
 }
 
 /// The QUICK PROMPT text `overlay` is holding, as a DRAFT: the box's own,
-/// or the box a picker opened from one still owes back — the picker menus
-/// pin it to their rows, and a nested submenu is reached through its
-/// parent.
+/// or the box a picker opened from one still owes back
+/// (`quick_prompt::held_return`).
 fn quick_draft(overlay: &Overlay) -> Option<crate::quick_prompt::QuickDraft> {
     match overlay {
         Overlay::Prompt(prompt) => crate::quick_prompt::draft_of(prompt),
-        Overlay::ProjectPicker(picker) => crate::quick_prompt::draft_of_return(&picker.back),
-        Overlay::AgentPresets(view) => view
-            .quick
-            .as_ref()
-            .and_then(crate::quick_prompt::draft_of_return),
-        Overlay::Menu(menu) => {
-            let mut menu = menu;
-            loop {
-                if let Some(back) = crate::event_loop::menu_quick_return(menu) {
-                    return crate::quick_prompt::draft_of_return(&back);
-                }
-                menu = menu.parent.as_ref()?;
-            }
-        }
-        _ => None,
+        other => crate::quick_prompt::draft_of_return(&crate::quick_prompt::held_return(other)?),
     }
 }
 
