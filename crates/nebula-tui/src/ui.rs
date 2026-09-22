@@ -198,6 +198,14 @@ pub(crate) const NO_MATCHES: &str = "no matches";
 const MIN_PREVIEW_TEXT_W: usize = 16;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // A frame asks where the cursor is a dozen times over and moves it
+    // none of them: the ROWS MEMO works it out once.
+    app.rows_memo.arm();
+    draw_screen(f, app);
+    app.rows_memo.disarm();
+}
+
+fn draw_screen(f: &mut Frame, app: &mut App) {
     app.hits.clear();
     app.host_cursor = None;
     app.welcome_on_screen = false;

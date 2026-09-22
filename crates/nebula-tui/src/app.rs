@@ -2950,6 +2950,105 @@ pub struct FollowUp {
     pub input: TextInput,
 }
 
+/// The ROWS MEMO: where the cursor is, worked out once for a stretch that
+/// asks it over and over and changes none of what the answer is built
+/// from — one frame (`ui::draw`), one [`App::reading_url`].
+///
+/// A frame asks a dozen times: the grid and the pane's strip for the card
+/// under the cursor, the pane for whether it is reading a pull request,
+/// an issue or a cloud row, the footer for its breadcrumb. Every asking
+/// re-sorted the projects and the selected project's checkouts from a
+/// roll-up of every session on the machine, and cloned the checkout's
+/// session rows to hand back one of them — on a machine with a few
+/// hundred sessions, most of a debug build's frame, and a wheel notch
+/// over the pane waited behind it.
+///
+/// Off outside a stretch, where everything is built fresh as it always
+/// was: a handler that moves the cursor and then asks where it is must
+/// get the new answer. Within one, the kept rows also answer only for the
+/// cursor and the tree's shape they were built for ([`RowsKey`]), so a
+/// stretch that moved either would rebuild rather than read stale rows.
+#[derive(Default)]
+pub struct RowsMemo {
+    armed: std::cell::Cell<bool>,
+    key: std::cell::Cell<Option<RowsKey>>,
+    /// [`App::project_rows`].
+    projects: std::cell::RefCell<Option<Vec<usize>>>,
+    /// [`App::visible_worktrees`], as indices into `tree.worktrees`.
+    worktrees: std::cell::RefCell<Option<Vec<usize>>>,
+    /// [`App::visible_session_rows`].
+    sessions: std::cell::RefCell<Option<Vec<SessionRow>>>,
+}
+
+/// What the kept rows were built for: the three cursors and how many of
+/// each thing the tree holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RowsKey {
+    cursor: (usize, usize, usize),
+    shape: [usize; 5],
+    show_archived: bool,
+}
+
+impl RowsMemo {
+    /// Start a stretch: nothing kept yet, everything asked from here on
+    /// is kept until [`RowsMemo::disarm`].
+    pub fn arm(&self) {
+        self.clear();
+        self.armed.set(true);
+    }
+
+    /// End the stretch and let go of what it kept.
+    pub fn disarm(&self) {
+        self.armed.set(false);
+        self.clear();
+    }
+
+    /// Run `f` as a stretch of its own, or as part of the one already
+    /// running.
+    pub fn hold<R>(&self, f: impl FnOnce() -> R) -> R {
+        if self.armed.get() {
+            return f();
+        }
+        self.arm();
+        let out = f();
+        self.disarm();
+        out
+    }
+
+    fn clear(&self) {
+        self.key.set(None);
+        self.projects.take();
+        self.worktrees.take();
+        self.sessions.take();
+    }
+
+    /// `read` what `slot` keeps for `key`, building it the first time the
+    /// stretch asks; outside a stretch, `read` a fresh build.
+    fn with<T, R>(
+        &self,
+        slot: fn(&Self) -> &std::cell::RefCell<Option<T>>,
+        key: RowsKey,
+        build: impl FnOnce() -> T,
+        read: impl FnOnce(&T) -> R,
+    ) -> R {
+        if !self.armed.get() {
+            return read(&build());
+        }
+        if self.key.get() != Some(key) {
+            self.clear();
+            self.key.set(Some(key));
+        }
+        if slot(self).borrow().is_none() {
+            // Built before it is stored: a build asks the slots below it
+            // (the session rows ask for the checkout, which asks for the
+            // project), never its own.
+            let built = build();
+            *slot(self).borrow_mut() = Some(built);
+        }
+        read(slot(self).borrow().as_ref().expect("built above"))
+    }
+}
+
 pub struct App {
     pub tree: Tree,
     pub focus: Focus,
@@ -3549,6 +3648,8 @@ pub struct App {
     /// the config, refreshed at startup and when the settings overlay
     /// applies a change.
     pub focus_tint: bool,
+    /// The ROWS MEMO, armed by the frame and by [`App::reading_url`].
+    pub rows_memo: RowsMemo,
 }
 
 impl Default for App {
@@ -3707,6 +3808,7 @@ impl App {
             welcome_on_screen: false,
             animations: true,
             focus_tint: true,
+            rows_memo: RowsMemo::default(),
         }
     }
 
@@ -4193,12 +4295,15 @@ impl App {
         let Some(term) = &self.term else {
             return mouseless;
         };
-        if term.exited
-            || self.pane_shows_placeholder()
-            || self.previewed_pr().is_some()
-            || self.previewed_issue().is_some()
-            || self.previewed_cloud().is_some()
-        {
+        // Asked on every wheel notch over the pane: one reading of the
+        // cursor for all four (`RowsMemo`).
+        let reading_something_else = self.rows_memo.hold(|| {
+            self.pane_shows_placeholder()
+                || self.previewed_pr().is_some()
+                || self.previewed_issue().is_some()
+                || self.previewed_cloud().is_some()
+        });
+        if term.exited || reading_something_else {
             return mouseless;
         }
         let screen = term.parser.screen();
@@ -4217,6 +4322,30 @@ impl App {
     /// sort is stable, so never-run projects keep tree order at the bottom
     /// instead of shuffling between frames.
     pub fn project_rows(&self) -> Vec<usize> {
+        self.rows_memo.with(
+            |m| &m.projects,
+            self.rows_key(),
+            || self.build_project_rows(),
+            Vec::clone,
+        )
+    }
+
+    /// What [`RowsMemo::with`] keys the kept rows on.
+    fn rows_key(&self) -> RowsKey {
+        RowsKey {
+            cursor: (self.sel_project, self.sel_worktree, self.sel_session),
+            shape: [
+                self.tree.projects.len(),
+                self.tree.worktrees.len(),
+                self.tree.agents.len(),
+                self.tree.terminals.len(),
+                self.tree.links.len(),
+            ],
+            show_archived: self.show_archived,
+        }
+    }
+
+    fn build_project_rows(&self) -> Vec<usize> {
         let now = now_ms();
         let mut rows: Vec<usize> = self
             .tree
@@ -4393,6 +4522,22 @@ impl App {
 
     /// The full row list the panel shows — `sel_session` indexes this.
     pub fn visible_session_rows(&self) -> Vec<SessionRow> {
+        self.with_session_rows(<[SessionRow]>::to_vec)
+    }
+
+    /// `read` the rows [`App::visible_session_rows`] lists.
+    fn with_session_rows<R>(&self, read: impl FnOnce(&[SessionRow]) -> R) -> R {
+        self.rows_memo.hold(|| {
+            self.rows_memo.with(
+                |m| &m.sessions,
+                self.rows_key(),
+                || self.build_session_rows(),
+                |rows| read(rows),
+            )
+        })
+    }
+
+    fn build_session_rows(&self) -> Vec<SessionRow> {
         // All four groups below hang off the SAME checkout, and each one
         // asking `selected_worktree` for it re-sorts every checkout of the
         // project — four sorts to build one list of rows. Asked once here
@@ -4469,9 +4614,7 @@ impl App {
     }
 
     pub fn selected_session_row(&self) -> Option<SessionRow> {
-        self.visible_session_rows()
-            .into_iter()
-            .nth(self.sel_session)
+        self.with_session_rows(|rows| rows.get(self.sel_session).cloned())
     }
 
     /// The selected row's agent, when it is one (terminal rows return None).
@@ -4561,6 +4704,20 @@ impl App {
     /// sessions list). The stamp is the newest of the checkout's sessions;
     /// a stable sort keeps never-run worktrees in tree order at the bottom.
     pub fn visible_worktrees(&self) -> Vec<&Worktree> {
+        self.rows_memo
+            .with(
+                |m| &m.worktrees,
+                self.rows_key(),
+                || self.build_visible_worktrees(),
+                Vec::clone,
+            )
+            .into_iter()
+            .map(|i| &self.tree.worktrees[i])
+            .collect()
+    }
+
+    /// [`App::visible_worktrees`], as indices into `tree.worktrees`.
+    fn build_visible_worktrees(&self) -> Vec<usize> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
@@ -4571,16 +4728,18 @@ impl App {
         // so nothing launched from this panel ever lands in the shared
         // checkout.
         let hide_root = self.root_hidden(project);
-        let mut rows: Vec<&Worktree> = self
-            .tree
-            .worktrees
-            .iter()
-            .filter(|w| w.project_id == project.id && !(hide_root && w.is_main))
+        let worktrees = &self.tree.worktrees;
+        let mut rows: Vec<usize> = (0..worktrees.len())
+            .filter(|&i| {
+                let w = &worktrees[i];
+                w.project_id == project.id && !(hide_root && w.is_main)
+            })
             .collect();
         // Rolled up once for every checkout rather than re-walked per
         // comparison the sort makes (`worktree_recencies`).
         let recencies = worktree_recencies(&self.tree, now);
-        rows.sort_by_key(|w| {
+        rows.sort_by_key(|&i| {
+            let w = &worktrees[i];
             // The raw stamp breaks the tie every checkout with a session
             // mid-turn shares — see `recency_key`.
             let r = recencies.get(&w.id).copied().unwrap_or_default();
@@ -4699,6 +4858,12 @@ impl App {
     /// row each under the pull requests, none while their group is
     /// folded. An issue nests nothing — it has no branch to check out.
     pub fn worktree_rows(&self) -> Vec<WorktreeRow<'_>> {
+        // The checkouts, the pull requests and the issues each ask for
+        // the selected project: one sort of the projects between them.
+        self.rows_memo.hold(|| self.build_worktree_rows())
+    }
+
+    fn build_worktree_rows(&self) -> Vec<WorktreeRow<'_>> {
         let checkouts = self.visible_worktrees();
         let prs = self.visible_open_prs();
         // Which listed pull request each checkout nests under, if any.
@@ -4835,9 +5000,13 @@ impl App {
     /// under a cursor — so the loop can tell a turn that changed it
     /// (`note_preview_change`) from one that left the reader in place.
     pub fn reading_url(&self) -> Option<String> {
-        self.previewed_pr()
-            .map(|pr| pr.url)
-            .or_else(|| self.previewed_issue().map(|i| i.url.clone()))
+        // Twice a turn of the event loop, and three walks to the same
+        // cursor each time (`RowsMemo`).
+        self.rows_memo.hold(|| {
+            self.previewed_pr()
+                .map(|pr| pr.url)
+                .or_else(|| self.previewed_issue().map(|i| i.url.clone()))
+        })
     }
 
     /// The Claude Cloud row the pane should be describing: the SESSIONS
@@ -5198,6 +5367,134 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the ROWS MEMO ----
+
+    /// Two projects: `api` with its root `w0` and a `feat` checkout `w1`,
+    /// `web` with its root `w2`; one session in each checkout, stamped in
+    /// that order so `web` is the project used most recently.
+    fn a_memo_tree() -> App {
+        let mut app = App::new();
+        app.tree.projects = ["api", "web"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Project {
+                id: ProjectId(format!("p{i}")),
+                name: (*name).into(),
+                repo_path: format!("/tmp/{name}").into(),
+                sort_order: 0,
+            })
+            .collect();
+        app.tree.worktrees = [("w0", "p0", true), ("w1", "p0", false), ("w2", "p1", true)]
+            .iter()
+            .map(|(id, project, is_main)| Worktree {
+                id: WorktreeId((*id).into()),
+                project_id: ProjectId((*project).into()),
+                path: format!("/tmp/{id}").into(),
+                branch: if *is_main {
+                    "main".into()
+                } else {
+                    "feat".into()
+                },
+                is_main: *is_main,
+                sort_order: 0,
+            })
+            .collect();
+        app.tree.agents = (0..3)
+            .map(|i| Agent {
+                id: AgentId(format!("a{i}")),
+                worktree_id: WorktreeId(format!("w{i}")),
+                name: format!("s{i}"),
+                status: AgentStatus::Finished,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: 1_000 * (i as i64 + 1),
+                alive: true,
+                recent_prompts: Vec::new(),
+            })
+            .collect();
+        app
+    }
+
+    fn project_names(app: &App) -> Vec<String> {
+        app.project_rows()
+            .iter()
+            .map(|&i| app.tree.projects[i].name.clone())
+            .collect()
+    }
+
+    /// Outside a stretch nothing is kept: a handler that changes the tree
+    /// and then asks gets the answer for the tree it just changed.
+    #[test]
+    fn outside_a_stretch_every_answer_is_fresh() {
+        let mut app = a_memo_tree();
+        assert_eq!(project_names(&app), ["web", "api"]);
+        app.tree.agents[0].status_changed_at = 9_000;
+        assert_eq!(project_names(&app), ["api", "web"], "api just saw a turn");
+    }
+
+    /// A stretch keeps its rows only for the cursor and the tree's shape
+    /// they were built for: moving a cursor or adding a row inside one
+    /// is answered anew, never from the rows kept before it.
+    #[test]
+    fn a_stretch_rebuilds_for_a_moved_cursor_or_a_new_row() {
+        let mut app = a_memo_tree();
+        app.sel_project = 1; // `api`, behind `web`
+        app.rows_memo.arm();
+        let ids = |app: &App| -> Vec<String> {
+            app.visible_worktrees()
+                .iter()
+                .map(|w| w.id.0.clone())
+                .collect()
+        };
+        assert_eq!(ids(&app), ["w0", "w1"]);
+        let session = |app: &App| match app.selected_session_row() {
+            Some(SessionRow::Agent(a)) => Some(a.id.0),
+            _ => None,
+        };
+        assert_eq!(session(&app).as_deref(), Some("a0"));
+        app.sel_worktree = 1;
+        assert_eq!(
+            session(&app).as_deref(),
+            Some("a1"),
+            "the cursor moved to `feat` inside the stretch: its session, not the root's"
+        );
+        app.tree.worktrees.push(Worktree {
+            id: WorktreeId("w3".into()),
+            project_id: ProjectId("p0".into()),
+            path: "/tmp/w3".into(),
+            branch: "fix".into(),
+            is_main: false,
+            sort_order: 0,
+        });
+        assert_eq!(
+            ids(&app),
+            ["w0", "w1", "w3"],
+            "a checkout arrived inside it"
+        );
+        app.rows_memo.disarm();
+    }
+
+    /// A frame is a stretch that ends with the frame: once it is drawn,
+    /// the next question is answered fresh.
+    #[test]
+    fn a_frame_keeps_nothing_past_itself() {
+        let mut app = a_memo_tree();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(project_names(&app), ["web", "api"]);
+        app.tree.agents[0].status_changed_at = 9_000;
+        assert_eq!(project_names(&app), ["api", "web"]);
+    }
 
     // ---- the pane's screen ----
 
