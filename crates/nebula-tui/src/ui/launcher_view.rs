@@ -528,7 +528,8 @@ fn pad_x(r: Rect) -> Rect {
 fn draw_grid(f: &mut Frame, app: &mut App, g: crate::launcher::Grid, rows: &[LauncherRow]) {
     let th = app.theme;
     // The keys are in the pane, or up on the PROJECT TABS: the card under
-    // the cursor keeps it, unfocused.
+    // the cursor keeps its accent outline — it still says which session
+    // the pane reads — but the tint goes with the keys.
     let focused = app.focus != Focus::Terminal && app.launcher_tab_cursor.is_none();
     let cursor = crate::launcher::cursor(app, rows);
     // Nothing selected (`App::launcher_unaimed`): no card wears the
@@ -546,7 +547,24 @@ fn draw_grid(f: &mut Frame, app: &mut App, g: crate::launcher::Grid, rows: &[Lau
         let Some(cell) = fitting_cell(&g, slot) else {
             break;
         };
-        draw_card(f, app, cell, row, on == Some(index), focused, th, &mut cfg);
+        let pr_hovered = app.hover_crumb == Some(HitTarget::LauncherCardPr(index));
+        let pr_line = draw_card(
+            f,
+            app,
+            cell,
+            row,
+            on == Some(index),
+            focused,
+            pr_hovered,
+            th,
+            &mut cfg,
+        );
+        // The card's PULL REQUEST LINE ahead of the card itself, so the
+        // first-match scan in `hit_at` hands a click on the line to the
+        // pull request and one anywhere else on the card to the card.
+        if let Some(line) = pr_line {
+            app.hits.push((line, HitTarget::LauncherCardPr(index)));
+        }
         app.hits.push((cell, HitTarget::LauncherRow(index)));
     }
     draw_more_below(f, &g, shown, rows.len().saturating_sub(start + shown), th);
@@ -556,13 +574,11 @@ fn draw_grid(f: &mut Frame, app: &mut App, g: crate::launcher::Grid, rows: &[Lau
 }
 
 /// A card's frame color when its status wants one: red for a turn waiting
-/// on you, blue for one finished and unread, a faint yellow (`warn_edge`)
-/// for one still running — the three the PROJECT TABS count, and no other.
-/// A read finish, a fresh or terminated session and a `quiet` card (cold,
-/// pending or archived: nothing on it is live) keep the plain edge. The
-/// focused card's accent outranks all three, which is why running is the
-/// faint one: in a warm preset a full-strength yellow frame sits a shade
-/// off the focus.
+/// on you, blue for one finished and unread, yellow for one still running
+/// — the three the PROJECT TABS count, each in the color its STATUS DOT
+/// wears, and no other. A read finish, a fresh or terminated session and a
+/// `quiet` card (cold, pending or archived: nothing on it is live) keep
+/// the plain edge. The focused card's accent outranks all three.
 fn card_edge(a: &nebula_core::Agent, quiet: bool, th: Theme) -> Option<Color> {
     use nebula_core::AgentStatus;
     if quiet {
@@ -571,7 +587,7 @@ fn card_edge(a: &nebula_core::Agent, quiet: bool, th: Theme) -> Option<Color> {
     match a.status {
         AgentStatus::NeedsFeedback => Some(th.err),
         AgentStatus::Finished if a.unseen => Some(th.done),
-        AgentStatus::Running => Some(th.warn_edge),
+        AgentStatus::Running => Some(th.warn),
         _ => None,
     }
 }
@@ -584,9 +600,12 @@ const ARCHIVED_MARK: &str = "▪ ";
 /// One session's card: its name and how long since it last moved, where
 /// it runs — with that checkout's uncommitted file count — and with what,
 /// its pull request, and the last thing it was
-/// asked to do. The cursor's card takes an accent border, and — while the
-/// grid has the keys — the FOCUSED PANEL TINT behind it; every other
-/// card's frame answers to its status ([`card_edge`]).
+/// asked to do. The cursor's card takes an accent border wherever the
+/// keys are, and — while the grid has them — the FOCUSED PANEL TINT
+/// behind it; every other card's frame answers to its status
+/// ([`card_edge`]). Returns the cell its PULL REQUEST LINE was drawn in,
+/// for [`draw_grid`] to register as the card's
+/// [`HitTarget::LauncherCardPr`] — None on a card without one.
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
     f: &mut Frame,
@@ -595,9 +614,10 @@ fn draw_card(
     row: &LauncherRow,
     selected: bool,
     focused: bool,
+    pr_hovered: bool,
     th: Theme,
     cfg: &mut Option<crate::config::Config>,
-) {
+) -> Option<Rect> {
     let a = &row.agent;
     let pending = app.is_placeholder_agent(&a.id);
     let cold = !a.alive && a.cloud_session_id.is_none();
@@ -628,12 +648,10 @@ fn draw_card(
     } else {
         status_dot(Some(a.status), a.unseen, th)
     };
-    let border = if selected && focused {
+    let border = if selected {
         th.accent
     } else if let Some(edge) = card_edge(a, archived || pending || cold, th) {
         edge
-    } else if selected {
-        th.muted
     } else {
         th.edge
     };
@@ -650,9 +668,8 @@ fn draw_card(
         .border_style(Style::default().fg(border));
     // The card keys land in wears the same wash the session pane wears
     // when it has them, so one surface on screen is lit and it follows the
-    // focus between the grid and the pane. The `focus_tint` setting turns
-    // both off together.
-    if selected && focused && app.focus_tint {
+    // focus between the grid and the pane.
+    if selected && focused {
         block = block.style(Style::default().bg(th.focus_tint));
     }
     let inner = block.inner(area);
@@ -665,7 +682,7 @@ fn draw_card(
     };
     let width = inner.width as usize;
     if width == 0 {
-        return;
+        return None;
     }
 
     // How long ago it was filed, on an archived card, rather than when its
@@ -809,14 +826,37 @@ fn draw_card(
             } else {
                 format!("#{} {}", pr.number, pr.title)
             };
-            crate::pr_row::spans(
+            let mut spans = crate::pr_row::spans(
                 look,
                 &label,
                 width,
                 Some((format!(" {}", pr.badge()), look.badge)),
-            )
+            );
+            // Nothing about a line says it is a link, so the one the
+            // pointer rests on is underlined — its `#42 title`, the way
+            // the header's tabs underline their name — and a click on it
+            // opens the pull request (`HitTarget::LauncherCardPr`).
+            if pr_hovered {
+                if let Some(label) = spans.get_mut(1) {
+                    label.style = label.style.add_modifier(Modifier::UNDERLINED);
+                }
+            }
+            spans
         }
         None => Vec::new(),
+    };
+    // The line's own cell — as wide as its text, so the air after a short
+    // title is the card's — for `draw_grid` to register as the card's
+    // `HitTarget::LauncherCardPr`. None on a card with no pull request, or
+    // one too short to reach the line.
+    let pr_line = if third.is_empty() {
+        None
+    } else {
+        let text: usize = third.iter().map(|s| s.width()).sum();
+        row_rect(inner, 2).map(|r| Rect {
+            width: u16::try_from(text).unwrap_or(u16::MAX).min(r.width),
+            ..r
+        })
     };
 
     // The last thing it was asked to do, on the prompt's own `›`, over
@@ -837,6 +877,7 @@ fn draw_card(
         let Some(r) = row_rect(inner, i) else { break };
         f.render_widget(Paragraph::new(Line::from(spans)), r);
     }
+    pr_line
 }
 
 /// Which card wears the cursor: the one the cursor is on, or none at all
@@ -1131,6 +1172,13 @@ const MORE_ROOM: usize = 5;
 /// folds the pane away, as `^~` does. A cell of air either side, so the
 /// target is wider than the glyph.
 const PANE_CLOSE: &str = " × ";
+/// The PANE's SIDE BUTTON, just before the CLOSE BUTTON: a picture of the
+/// layout one click moves it to — the pane down the right of the cards on
+/// a pane along the bottom, the pane along the bottom on one down the
+/// right. The click writes Settings → Appearance → **Session pane**, so
+/// the move lasts. Aired like the close button.
+const PANE_TO_RIGHT: &str = " ◨ ";
+const PANE_TO_BOTTOM: &str = " ⬓ ";
 
 /// The PANE's own header in the LAUNCHER VIEW: the TAB STRIP that says
 /// what the pane is reading and is how it gets swapped — the `SESSION`
@@ -1156,11 +1204,19 @@ pub(super) fn pane_frame(
     let th = app.theme;
     if let Some(r) = row_rect(area, 1) {
         let r = pad_x(r);
-        // The CLOSE BUTTON holds the right end of the row and the state
-        // tag (`scroll 4`, exited) is right-aligned just before it: the
-        // strip gets what those two leave.
+        // The CLOSE BUTTON holds the right end of the row, the SIDE
+        // BUTTON stands before it — unless there is nowhere to move the
+        // pane (`App::launcher_pane_move_to`) — and the state tag
+        // (`scroll 4`, exited) is right-aligned before those: the strip
+        // gets what the three leave.
+        let side_button = app.launcher_pane_move_to().map(|to| match to {
+            crate::launcher::PaneSide::Right => PANE_TO_RIGHT,
+            crate::launcher::PaneSide::Bottom => PANE_TO_BOTTOM,
+        });
+        let side_w = side_button.map_or(0, |b| b.chars().count() as u16);
         let close_w = PANE_CLOSE.chars().count() as u16;
-        let taken = usize::from(close_w)
+        let buttons_w = side_w + close_w;
+        let taken = usize::from(buttons_w)
             + right
                 .as_ref()
                 .map_or(0, |tag| tag.content.chars().count() + 2);
@@ -1185,7 +1241,7 @@ pub(super) fn pane_frame(
         }
         f.render_widget(Paragraph::new(Line::from(spans)), r);
         let tag_r = Rect {
-            width: r.width.saturating_sub(close_w),
+            width: r.width.saturating_sub(buttons_w),
             ..r
         };
         if let Some(tag) = right {
@@ -1195,9 +1251,30 @@ pub(super) fn pane_frame(
                 tag_r,
             );
         }
-        if r.width >= close_w {
+        if r.width >= buttons_w {
+            let mut x = tag_r.x + tag_r.width;
+            if let Some(glyph) = side_button {
+                let side = Rect {
+                    x,
+                    width: side_w,
+                    ..r
+                };
+                // Lit under the pointer as the header's other buttons are:
+                // a half-filled square does not say it is one until then.
+                let fg = if app.hover_crumb == Some(HitTarget::LauncherPaneSide) {
+                    th.accent
+                } else {
+                    th.muted
+                };
+                f.render_widget(
+                    Paragraph::new(Span::styled(glyph, Style::default().fg(fg))),
+                    side,
+                );
+                app.hits.push((side, HitTarget::LauncherPaneSide));
+                x += side_w;
+            }
             let close = Rect {
-                x: tag_r.x + tag_r.width,
+                x,
                 width: close_w,
                 ..r
             };
@@ -1297,14 +1374,25 @@ fn pane_tabs(app: &App, room: usize) -> Vec<PaneTab> {
     let terminals = app.pane_terminals();
     if terminals.is_empty() {
         // Nothing to tab to yet: the strip says which key opens one
-        // rather than trailing off after the divider.
-        tabs.push(PaneTab::plain(vec![Span::styled(
-            format!(
-                "{} opens a terminal here",
-                super::key_hint(app, crate::keymap::Action::NewTerminal)
-            ),
-            Style::default().fg(th.dim),
-        )]));
+        // rather than trailing off after the divider — and is a button
+        // for it, marked under the pointer as the header's others are.
+        let style = if app.hover_crumb == Some(HitTarget::LauncherPaneNewTerminal) {
+            Style::default()
+                .fg(th.accent)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        tabs.push(PaneTab {
+            spans: vec![Span::styled(
+                format!(
+                    "{} opens a terminal here",
+                    super::key_hint(app, crate::keymap::Action::NewTerminal)
+                ),
+                style,
+            )],
+            hit: Some(HitTarget::LauncherPaneNewTerminal),
+        });
         return tabs;
     }
     // The tabs that fit, from `start`, within `budget` columns: the tabs
@@ -1920,6 +2008,20 @@ pub(super) fn draw_project_picker(f: &mut Frame, app: &mut App, picker: &Project
 mod tests {
     use super::*;
 
+    /// [`draw_card`] with the pointer off its pull request line and the
+    /// cell it hands back dropped, for the tests that draw one card alone.
+    fn draw_one(
+        f: &mut Frame,
+        app: &App,
+        area: Rect,
+        row: &LauncherRow,
+        selected: bool,
+        focused: bool,
+        th: Theme,
+    ) {
+        draw_card(f, app, area, row, selected, focused, false, th, &mut None);
+    }
+
     /// `^P` opens the PROJECT PICKER *over* the box, so the rect it takes
     /// is strictly inside the box's on all four sides — the frame, the
     /// title and the details row above the list stay on screen however
@@ -2169,6 +2271,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             })
             .collect();
@@ -2919,6 +3022,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 },
                 project: "nebula".into(),
@@ -2936,7 +3040,7 @@ mod tests {
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                     .unwrap();
             terminal
-                .draw(|f| draw_card(f, &app, area, row, false, true, th, &mut None))
+                .draw(|f| draw_one(f, &app, area, row, false, true, th))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             // Row 2 of the buffer is the card's second line: one row of
@@ -2981,6 +3085,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             },
             project: "nebula".into(),
@@ -3000,7 +3105,7 @@ mod tests {
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, area.height))
                     .unwrap();
             terminal
-                .draw(|f| draw_card(f, &app, area, &row, false, true, th, &mut None))
+                .draw(|f| draw_one(f, &app, area, &row, false, true, th))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             let cells = || (0..width).filter_map(|x| buf.cell((x, 2)));
@@ -3046,6 +3151,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         let th = Theme::by_name("amber");
@@ -3064,7 +3170,7 @@ mod tests {
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                     .unwrap();
             terminal
-                .draw(|f| draw_card(f, &app, area, &row, selected, focused, th, &mut None))
+                .draw(|f| draw_one(f, &app, area, &row, selected, focused, th))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             let corner = buf.cell((0, 0)).unwrap().fg;
@@ -3088,7 +3194,7 @@ mod tests {
         );
         assert_eq!(
             frame(with(AgentStatus::Running, false), false, true),
-            th.warn_edge
+            th.warn
         );
         assert_eq!(
             frame(with(AgentStatus::Finished, false), false, true),
@@ -3106,8 +3212,9 @@ mod tests {
         };
         assert_eq!(frame(archived, false, true), th.edge);
 
-        // The focus wins over every status; off the grid, the cursor's
-        // card shows its status like any other.
+        // The cursor wins over every status, and keeps winning with the
+        // keys off the grid: the outline still says which card the pane
+        // reads while the wash has moved to the pane.
         assert_eq!(
             frame(with(AgentStatus::Running, false), true, true),
             th.accent
@@ -3118,18 +3225,18 @@ mod tests {
         );
         assert_eq!(
             frame(with(AgentStatus::Running, false), true, false),
-            th.warn_edge
+            th.accent
         );
         assert_eq!(
             frame(with(AgentStatus::Finished, false), true, false),
-            th.muted
+            th.accent
         );
-        assert_ne!(th.warn_edge, th.accent);
+        assert_ne!(th.warn, th.accent);
     }
 
     /// The card keys land in is filled with the FOCUSED PANEL TINT, frame
-    /// and all; the cursor's card off the grid, any other card, and every
-    /// card with the setting off stay on the terminal's background.
+    /// and all; the cursor's card off the grid (outlined, the wash gone to
+    /// the pane) and any other card stay on the terminal's background.
     #[test]
     fn only_the_focused_card_wears_the_focus_tint() {
         use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
@@ -3151,6 +3258,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             },
             project: "nebula".into(),
@@ -3167,7 +3275,7 @@ mod tests {
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                     .unwrap();
             terminal
-                .draw(|f| draw_card(f, app, area, &row, selected, focused, th, &mut None))
+                .draw(|f| draw_one(f, app, area, &row, selected, focused, th))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             let corner = buf.cell((0, 0)).unwrap().bg;
@@ -3178,8 +3286,6 @@ mod tests {
         assert_eq!(fill(&app, true, true), th.focus_tint);
         assert_eq!(fill(&app, true, false), Color::Reset);
         assert_eq!(fill(&app, false, true), Color::Reset);
-        app.focus_tint = false;
-        assert_eq!(fill(&app, true, true), Color::Reset);
     }
 
     /// CARD LINE COUNTS: with the setting on and a count read, the lines
@@ -3207,6 +3313,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             },
             project: "nebula".into(),
@@ -3233,7 +3340,7 @@ mod tests {
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, area.height))
                     .unwrap();
             terminal
-                .draw(|f| draw_card(f, app, area, &row, false, true, th, &mut None))
+                .draw(|f| draw_one(f, app, area, &row, false, true, th))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             let cells = || (0..width).filter_map(|x| buf.cell((x, 2)));
@@ -3304,6 +3411,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: crate::app::now_ms() - 60_000,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 },
                 project: "nebula".into(),
@@ -3321,7 +3429,7 @@ mod tests {
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                     .unwrap();
             terminal
-                .draw(|f| draw_card(f, &app, area, row, false, true, th, &mut None))
+                .draw(|f| draw_one(f, &app, area, row, false, true, th))
                 .unwrap();
             terminal.backend().buffer().clone()
         };

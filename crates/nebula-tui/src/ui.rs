@@ -221,7 +221,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
 
     if app.collapsed {
         draw_terminal(f, app, body);
-        if app.focus_tint && app.focus == Focus::Terminal {
+        if app.focus == Focus::Terminal {
             draw_focus_tint(f.buffer_mut(), body, app.theme);
         }
         draw_footer(f, app, footer);
@@ -238,9 +238,8 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
     // walked onto. A body too short for both is all grid.
     //
     // Any project on the machine puts it up; with none, the splash below
-    // is the first run's "open a project". The summoned splash (`N`)
-    // still wins — it is a preview the next key dismisses.
-    if app.launcher_active() && !app.splash_preview {
+    // is the first run's "open a project".
+    if app.launcher_active() {
         // `launcher_view::draw` takes `body_area` for the grid's half, so
         // the whole body is kept here for the pane drag to measure against.
         app.launcher_body = body;
@@ -260,7 +259,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         launcher_view::draw(f, app, view_a);
         if let Some(pane_a) = pane_a {
             draw_terminal(f, app, crate::launcher::pane_content(side, pane_a));
-            if app.focus_tint && app.focus == Focus::Terminal {
+            if app.focus == Focus::Terminal {
                 draw_focus_tint(f.buffer_mut(), pane_a, app.theme);
             }
             draw_launcher_pane_grip(f.buffer_mut(), app, side, pane_a);
@@ -271,9 +270,9 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Nothing in the tree yet (first run), or the splash summoned with
-    // `N`: the animated nebula takes the whole body until a project
-    // lands, which is what the view above needs to draw at all.
+    // Nothing in the tree yet (first run): the animated nebula takes the
+    // whole body until a project lands, which is what the view above
+    // needs to draw at all.
     crate::splash::draw_splash(f, app, body);
     draw_footer(f, app, footer);
     draw_overlay(f, app);
@@ -942,6 +941,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Act(&[OpenRepo, OpenGhosttyTab]),
                             "repo on GitHub / Ghostty tab",
                         ),
+                        (
+                            Act(&[OpenPullRequest, OpenIssue]),
+                            "card's PR / issue on GitHub",
+                        ),
                         (Act(&[RefreshPullRequests]), "refresh pull requests now"),
                         (
                             Act(&[CommentPullRequest]),
@@ -1008,7 +1011,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
                         (Act(&[Settings]), "settings (Hotkeys tab rebinds these)"),
                         (Act(&[Metrics]), "memory usage (nebula + agents)"),
-                        (Act(&[Splash]), "nebula splash (any key returns)"),
                         (Act(&[Quit, Help]), "quit / toggle this help"),
                     ],
                 ),
@@ -2710,8 +2712,9 @@ fn draw_launcher_pane_grip(
 /// `focus_tint` — a near-black shade of the accent, so the panel reads as
 /// a faintly lit surface. Painted after content, and only onto cells whose
 /// background is still untouched, so selection fills and PTY-drawn
-/// colors sit on top of the tint instead of under it. The `focus_tint`
-/// setting decides whether the callers paint it at all.
+/// colors sit on top of the tint instead of under it. The pane wears it
+/// whenever it has the keys; while the grid has them, the cursor's card
+/// wears the same wash instead (`launcher_view::draw_card`).
 fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
@@ -3458,17 +3461,10 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         terminal_frame(f, area, left, right, focused, th)
     };
-    // One cell of inset so PTY content doesn't hug the sessions rule — and,
-    // with the LAUNCHER VIEW's pane on the left of the cards, one on the
-    // right too, where the rule down its edge is.
-    let right_air = u16::from(
-        app.launcher_active()
-            && !app.collapsed
-            && app.launcher_pane_side() == crate::launcher::PaneSide::Left,
-    );
+    // One cell of inset so PTY content doesn't hug the sessions rule.
     let inner = Rect {
         x: inner.x + 1,
-        width: inner.width.saturating_sub(1 + right_air),
+        width: inner.width.saturating_sub(1),
         ..inner
     };
     app.term_area = inner;
@@ -3535,6 +3531,10 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
                 crate::links::visible_file_links(term.parser.screen()),
             )
         }
+        // The LAUNCHER VIEW's pane with nothing in it — a project with no
+        // session yet — is an empty panel: the strip over it already says
+        // which key opens a terminal here, and is a button for it.
+        None if app.launcher_active() => (Vec::new(), Vec::new()),
         None => {
             // Empty-pane hero: vertically centered wordmark + a compact
             // key cheat-sheet, so the big blank pane earns its keep.
@@ -3863,12 +3863,9 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("Esc: close  Enter: confirm", Style::default().fg(th.dim))
     } else if app.splash_showing() {
         // The splash covers the panels, so every panel hotkey is dead here.
-        // List only what actually fires — and in preview, that's one thing:
-        // the next key dismisses it (q included).
+        // List only what actually fires.
         Span::styled(
-            if app.splash_preview {
-                "any key: back to the sessions".to_string()
-            } else {
+            {
                 let k = |a| key_hint(app, a);
                 // Launched inside a repo: Enter opens it, and `o` is for
                 // any other folder.

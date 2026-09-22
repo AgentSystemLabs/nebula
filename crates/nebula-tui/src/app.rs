@@ -82,6 +82,14 @@ pub enum HitTarget {
     /// A card in the LAUNCHER VIEW's GRID, by its place in
     /// `launcher::rows`.
     LauncherRow(usize),
+    /// The PULL REQUEST LINE on that card — its `↗ #42 title` row, by the
+    /// same place in `launcher::rows` — registered ahead of the card, so
+    /// it wins: a click lands the cursor on the card and opens the pull
+    /// request in the browser, through the very
+    /// `launcher::open_pull_request` `⇧V` runs. Only a card with a pull
+    /// request has one, and it is only as wide as the line's text, so the
+    /// air after a short title is still the card's.
+    LauncherCardPr(usize),
     /// The `‹ sessions` crumb in a full-screen session's header
     /// (LAUNCHER VIEW): a click leaves the session for the grid, as `^q`
     /// does.
@@ -116,10 +124,18 @@ pub enum HitTarget {
     /// tab's, so a click on the cross can never read as a click on the
     /// tab it closes.
     LauncherPaneCloseTerminal(usize),
+    /// `t opens a terminal here`, where the strip's terminal tabs would
+    /// be in a checkout with none: a click opens one, the way `t` does.
+    LauncherPaneNewTerminal,
     /// The CLOSE BUTTON at the right end of that header: a click folds
     /// the pane away, the same `event_loop::launcher::toggle_pane` `^~`
     /// runs.
     LauncherPaneClose,
+    /// The SIDE BUTTON just before it: a click moves the pane to the
+    /// other side of the cards — under them to the right, the right back
+    /// under them — by writing Settings → Appearance → **Session pane**
+    /// (`event_loop::launcher::move_pane`).
+    LauncherPaneSide,
     /// The PR COUNT on the right of the LAUNCHER VIEW's header (`2 prs`):
     /// a click opens the open pull requests of the project in front of
     /// you — the modal `v` opens.
@@ -543,8 +559,8 @@ pub enum PendingAction {
     /// AddProject aimed at a path that doesn't exist yet: create the
     /// directory (daemon-side, `git init` per its config) and add it.
     CreateProjectDir(std::path::PathBuf),
-    /// `a` (or the row menu's Archive) with the `confirm_on_archive`
-    /// SETTING on: archive the agent once the dialog is answered.
+    /// `a` (or the row menu's Archive): archive the agent once the dialog
+    /// is answered.
     ArchiveAgent(AgentId),
     DeleteAgent(AgentId),
     CloseTerminal(TerminalId),
@@ -3144,6 +3160,9 @@ pub struct App {
     /// jumps the boundary the way ⇧Tab / Tab would. Any other key in
     /// between clears it.
     pub edge_tap: Option<(crate::keymap::Action, std::time::Instant)>,
+    /// The key that just unarchived a card, watched until the host reports
+    /// it let go, so a held `u` unarchives once (event_loop/release_watch.rs).
+    pub release_watch: Option<crate::event_loop::ReleaseWatch>,
     pub overlay: Option<Overlay>,
     /// The expanded session card's FOLLOW-UP COMPOSER, or None with every
     /// card folded. Not an `Overlay`: it draws inside the SESSIONS PANEL
@@ -3202,13 +3221,13 @@ pub struct App {
     /// never squeezes the cards out.
     pub launcher_pane_h: Option<u16>,
     /// Width the PANE was dragged to while it stands beside the cards, in
-    /// columns: [`App::launcher_pane_h`]'s twin for a pane on the right or
-    /// the left, kept apart from it so switching sides never reads a
-    /// height as a width. Re-clamped the same way (`launcher::pane_width`).
+    /// columns: [`App::launcher_pane_h`]'s twin for a pane on the right,
+    /// kept apart from it so switching sides never reads a height as a
+    /// width. Re-clamped the same way (`launcher::pane_width`).
     pub launcher_pane_w: Option<u16>,
     /// Where the PANE sits against the GRID — along the bottom, or down
-    /// the right or the left side — as Settings → Appearance → **Session
-    /// pane** has it (`event_loop::apply_config`). What a frame lays out
+    /// the right side — as Settings → Appearance → **Session pane** has it
+    /// (`event_loop::apply_config`). What a frame lays out
     /// is [`App::launcher_pane_side`], which falls back to the bottom on a
     /// window too narrow to stand the pane beside the cards.
     pub launcher_pane_at: crate::launcher::PaneSide,
@@ -3251,10 +3270,11 @@ pub struct App {
     /// header rests plain.
     pub hover_crumb: Option<HitTarget>,
     /// The LAUNCHER VIEW's PROJECT TABS: every project opened on the
-    /// SESSIONS level since its tab was last closed, the most recently
-    /// opened first — the far left of the header. Kept up by
-    /// [`App::settle_project_tabs`], closed one at a time by
-    /// `event_loop::launcher::close_tab`, and remembered across restarts.
+    /// SESSIONS level since its tab was last closed, the one last worked
+    /// in first — the far left of the header. Kept up by
+    /// [`App::settle_project_tabs`] and [`App::bring_tab_forward`], closed
+    /// one at a time by `event_loop::launcher::close_tab`, and remembered
+    /// across restarts.
     pub launcher_tabs: Vec<ProjectId>,
     /// The PROJECT TABS have the keyboard, and this is the tab their
     /// cursor is on: `k`,`k` (↑,↑) on the GRID's top row walks up into the
@@ -3636,13 +3656,8 @@ pub struct App {
     /// (the daemon can't see us).
     pub client_rss_bytes: u64,
     /// Launch instant; the first-run splash animation and the status-sweep
-    /// text animation are pure functions of time elapsed since this. (The
-    /// N-key splash preview resets it to restart the fade-in — the sweep
-    /// isn't visible under the splash, so the phase jump never shows.)
+    /// text animation are pure functions of time elapsed since this.
     pub splash_epoch: std::time::Instant,
-    /// Splash summoned on demand (N) with a populated tree; any key
-    /// dismisses it.
-    pub splash_preview: bool,
     /// The last frame drew the empty GRID's welcome, nebula and all
     /// (`ui::launcher_view`). Cleared at the top of every `ui::draw` and
     /// set again by the welcome itself, so between frames it says what is
@@ -3653,12 +3668,6 @@ pub struct App {
     /// and the splash's motion (off = fewer repaints). Mirrors the config,
     /// refreshed at startup and when the settings overlay applies a change.
     pub animations: bool,
-    /// The `focus_tint` setting: paints the focused panel's background
-    /// with a faint accent wash. On by default; off leaves the terminal's
-    /// own background (transparency included) showing through. Mirrors
-    /// the config, refreshed at startup and when the settings overlay
-    /// applies a change.
-    pub focus_tint: bool,
     /// The `black_background` setting: every cell still on the terminal's
     /// default background is painted pure black at the end of a frame
     /// (`ui::draw`). On in the config by default; off here until startup
@@ -3705,6 +3714,7 @@ impl App {
             flash: None,
             update_available: None,
             edge_tap: None,
+            release_watch: None,
             overlay: None,
             show_archived: false,
             open_prs_collapsed: false,
@@ -3719,7 +3729,7 @@ impl App {
             launcher_unaimed: false,
             launcher_pane_h: None,
             launcher_pane_w: None,
-            launcher_pane_at: crate::launcher::PaneSide::Bottom,
+            launcher_pane_at: crate::launcher::PaneSide::default(),
             launcher_pane_hidden: false,
             launcher_terminal: None,
             launcher_pane_drag: None,
@@ -3821,10 +3831,8 @@ impl App {
             last_metrics: None,
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),
-            splash_preview: false,
             welcome_on_screen: false,
             animations: true,
-            focus_tint: true,
             black_background: false,
             rows_memo: RowsMemo::default(),
         }
@@ -3957,8 +3965,16 @@ impl App {
     /// stale by things that happen elsewhere — the cursor walking into
     /// another checkout, a terminal closing — rather than by anything the
     /// pane itself does, so there is no one place to clear it from.
+    ///
+    /// A pin on a terminal just created is kept while its row is still
+    /// being followed onto (`select_when_seen`): the Ack that pins it can
+    /// beat the upsert that puts it on the strip.
     pub fn settle_pane_tab(&mut self) {
-        if self.launcher_terminal.is_some() && self.pinned_terminal().is_none() {
+        let arriving = matches!(
+            (&self.select_when_seen, &self.launcher_terminal),
+            (Some(SessionRef::Terminal(seen)), Some(pin)) if seen == pin
+        );
+        if self.launcher_terminal.is_some() && self.pinned_terminal().is_none() && !arriving {
             self.launcher_terminal = None;
         }
     }
@@ -3967,7 +3983,9 @@ impl App {
     /// goes, and the project the grid is on gets one at the far left if it
     /// has none — however it got there, whether a tab, the `+` dropdown, a
     /// `/` jump, a folder just opened or the restore at boot. A project
-    /// already open keeps its place. Run by the view's draw, as
+    /// already open keeps its place: switching to a tab only looks, and
+    /// only working in it moves it ([`App::bring_tab_forward`]). Run by
+    /// the view's draw, as
     /// [`App::settle_pane_tab`] is, and by the tab keys before they read
     /// the list.
     pub fn settle_project_tabs(&mut self) {
@@ -3990,6 +4008,49 @@ impl App {
             self.launcher_tabs.insert(0, id);
             self.dirty = true;
         }
+    }
+
+    /// Something was just done in `project` — a session launched, a
+    /// checkout cut, a turn sent, a key typed into one of its sessions —
+    /// so its PROJECT TAB goes to the far left, and the header reads from
+    /// the project last worked in to the one worked in longest ago. One
+    /// with no tab gets one there: a launch fired into a project from
+    /// another's grid is work in it too. The lit tab stays the lit tab;
+    /// only the order moves. Cheap enough for every keystroke typed at an
+    /// agent: a project already at the front is one comparison.
+    pub fn bring_tab_forward(&mut self, project: &ProjectId) {
+        if self.launcher_tabs.first() == Some(project)
+            || !self.tree.projects.iter().any(|p| &p.id == project)
+        {
+            return;
+        }
+        self.launcher_tabs.retain(|id| id != project);
+        self.launcher_tabs.insert(0, project.clone());
+        self.dirty = true;
+    }
+
+    /// The project `session` runs in, None for a row this client has not
+    /// seen.
+    pub fn project_of_session(&self, session: &SessionRef) -> Option<&ProjectId> {
+        let worktree = match session {
+            SessionRef::Agent(id) => self
+                .tree
+                .agents
+                .iter()
+                .find(|a| &a.id == id)
+                .map(|a| &a.worktree_id),
+            SessionRef::Terminal(id) => self
+                .tree
+                .terminals
+                .iter()
+                .find(|t| &t.id == id)
+                .map(|t| &t.worktree_id),
+        }?;
+        self.tree
+            .worktrees
+            .iter()
+            .find(|w| &w.id == worktree)
+            .map(|w| &w.project_id)
     }
 
     /// The GRID is what the body is showing: the LAUNCHER VIEW is on and
@@ -4055,11 +4116,11 @@ impl App {
     }
 
     /// The splash is what the body is showing: no project on this machine
-    /// yet (first run) or summoned with N, and no session full-screen over
-    /// it. True whether it's animating or drawn as a still frame, so the
-    /// footer can key its hints off it.
+    /// yet (first run), and no session full-screen over it. True whether
+    /// it's animating or drawn as a still frame, so the footer can key its
+    /// hints off it.
     pub fn splash_showing(&self) -> bool {
-        !self.collapsed && (!self.tree.has_projects() || self.splash_preview)
+        !self.collapsed && !self.tree.has_projects()
     }
 
     /// The animated splash is on screen and should be ticking: nothing in
@@ -4190,7 +4251,7 @@ impl App {
     /// No card wearing the cursor, no pane: the pane is the selected
     /// session, so with nothing selected there is nothing for it to be
     /// and the grid takes the whole body back. Clicking a card selects
-    /// it and the pane opens under the cards; letting the card go —
+    /// it and the pane opens beside the cards; letting the card go —
     /// Esc, a click on the air between them — collapses it again.
     pub fn launcher_split(&self, body: Rect) -> (Rect, Option<Rect>) {
         if self.launcher_pane_hidden || !self.launcher_aimed() {
@@ -4212,6 +4273,16 @@ impl App {
     /// draw about which way the pane's edge runs.
     pub fn launcher_pane_side(&self) -> crate::launcher::PaneSide {
         crate::launcher::fitted_side(self.launcher_body, self.launcher_pane_at)
+    }
+
+    /// Where the PANE's SIDE BUTTON would move it: the side the pane is
+    /// not on this frame. None while it is along the bottom of a body too
+    /// narrow to stand it beside the cards — a move there would change the
+    /// setting and nothing on screen, so no button is drawn for it. The
+    /// draw and the click both read this one.
+    pub fn launcher_pane_move_to(&self) -> Option<crate::launcher::PaneSide> {
+        let to = self.launcher_pane_side().other();
+        (crate::launcher::fitted_side(self.launcher_body, to) == to).then_some(to)
     }
 
     /// Where the edge between the cards and the PANE sits on this frame,
@@ -4240,7 +4311,6 @@ impl App {
         let want = match side {
             PaneSide::Bottom => i32::from(body.y) + i32::from(body.height) - boundary,
             PaneSide::Right => i32::from(body.x) + i32::from(body.width) - boundary,
-            PaneSide::Left => boundary - i32::from(body.x),
         };
         let want = want.clamp(0, i32::from(u16::MAX)) as u16;
         if side.beside() {
@@ -4260,13 +4330,25 @@ impl App {
     }
 
     /// Is the left button down, as far as nebula knows — a press came and
-    /// its release has not: a panel splitter being dragged, a program in
-    /// the pane holding the button, or a drag-selection under way? While
-    /// it is, the host terminal is left exactly as it is (re-asking it for
-    /// its modes mid-drag is a change under a gesture in progress), and a
-    /// motion report with no button named is still the drag.
+    /// its release has not: a panel splitter being dragged (the LAUNCHER
+    /// VIEW's pane edge, the diff and tree modals' file-list border), a
+    /// program in the pane holding the button, or a drag-selection under
+    /// way? While it is, the host terminal is left exactly as it is:
+    /// re-asking it for its modes mid-drag is a change under a gesture in
+    /// progress, and xterm.js (`nebula browser`) takes the `?1000h` in
+    /// that re-ask as the end of the drag — it drops its motion listener
+    /// and reports nothing more until the next press. A motion report
+    /// with no button named is still the drag.
     pub fn mouse_held(&self) -> bool {
-        self.term_mouse_grab.is_some() || self.term_selection.is_some_and(|s| s.dragging)
+        let splitter = self.launcher_pane_drag.is_some()
+            || match &self.overlay {
+                Some(Overlay::Diff(view)) => view.files_drag.is_some(),
+                Some(Overlay::Tree(view)) => view.files_drag.is_some(),
+                _ => false,
+            };
+        splitter
+            || self.term_mouse_grab.is_some()
+            || self.term_selection.is_some_and(|s| s.dragging)
     }
 
     /// Is this worktree row a stand-in (a QUICK PROMPT's, or the NEW
@@ -5436,6 +5518,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 1_000 * (i as i64 + 1),
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             })
             .collect();
@@ -5723,6 +5806,7 @@ mod tests {
             cloud_session_id: None,
             sort_order: 0,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         });
         app.tree.agents.push(Agent {
@@ -5959,6 +6043,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 100 * (i as i64 + 1),
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             });
         }

@@ -498,10 +498,11 @@ impl Store {
         self.insert_agent_with_launch_context(a, auto_title, None, None)
     }
 
-    /// Persist an AGENT plus the launch-only context that must be rebuilt
-    /// on every process spawn. `pr_url` and `issue_url` are intentionally
-    /// not part of the shared Agent entity: they constrain the CLI's
-    /// launch, not row display.
+    /// Persist an AGENT plus the launch context that must be rebuilt on
+    /// every process spawn. `pr_url` is intentionally not part of the
+    /// shared Agent entity: it constrains the CLI's launch, not row
+    /// display. `issue_url` is launch context too, and also rides the
+    /// entity (`Agent::issue_url`) so the TUI's `⇧I` can open the issue.
     pub fn insert_agent_with_launch_context(
         &self,
         a: &Agent,
@@ -1031,7 +1032,8 @@ const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order";
 const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_order";
 const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
-                             archived_at, unseen, cloud_session_id, recent_prompts, custom_harness";
+                             archived_at, unseen, cloud_session_id, recent_prompts, custom_harness, \
+                             issue_url";
 const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order, run_command";
 const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
 
@@ -1074,6 +1076,7 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         unseen: r.get::<_, i64>(12)? != 0,
         cloud_session_id: r.get(13)?,
         alive: false,
+        issue_url: r.get(16)?,
         recent_prompts: parse_prompts(r.get::<_, Option<String>>(14)?.as_deref()),
         custom_harness: r.get(15)?,
     })
@@ -1171,6 +1174,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
@@ -1194,6 +1198,7 @@ mod tests {
             sort_order: 1,
             status_changed_at: 0,
             alive: false,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&codex_agent).unwrap();
@@ -1214,6 +1219,7 @@ mod tests {
             sort_order: 2,
             status_changed_at: 0,
             alive: false,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&cursor_agent).unwrap();
@@ -1235,6 +1241,7 @@ mod tests {
             sort_order: 3,
             status_changed_at: 0,
             alive: false,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         store
@@ -1276,6 +1283,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&custom).unwrap();
@@ -1295,6 +1303,9 @@ mod tests {
             Some(issue_url)
         );
         assert_eq!(store.agent_pr_url(&agents[3].id).unwrap(), None);
+        // …and the loaded row carries the issue to the TUI (`⇧I` opens it).
+        assert_eq!(agents[0].issue_url, None);
+        assert_eq!(agents[3].issue_url.as_deref(), Some(issue_url));
     }
 
     /// Read marks are keyed by PR URL and outlive the worktree they were
@@ -1781,6 +1792,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
 
@@ -1868,6 +1880,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 },
                 true,
@@ -1996,6 +2009,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 })
                 .unwrap();
@@ -2061,6 +2075,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             };
             store.insert_agent(&agent).unwrap();
@@ -2160,6 +2175,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             })
             .unwrap();

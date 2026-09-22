@@ -226,6 +226,12 @@ pub struct Agent {
     /// `claude` with no link to the work.
     #[serde(default)]
     pub cloud_session_id: Option<String>,
+    /// The GitHub issue this session was started from — an ISSUE SESSION,
+    /// launched out of the ISSUES MODAL — or None. The daemon folds it into
+    /// every spawn's context; the TUI reads it for `⇧I`, which opens the
+    /// issue in the browser.
+    #[serde(default)]
+    pub issue_url: Option<String>,
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,

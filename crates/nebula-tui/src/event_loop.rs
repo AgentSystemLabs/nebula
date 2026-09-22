@@ -37,13 +37,16 @@ mod optimistic;
 mod pacing;
 mod placeholder;
 mod quick_launch;
+mod release_watch;
 use focus_walk::{
     double_tapped, enter_terminal_pane, land_click_focus, walk_focus_back, walk_focus_forward,
 };
 pub use host_terminal::restore_terminal;
 use host_terminal::{
-    on_host_resize, reassert_modes, repaint, setup_terminal, take_worker_panic, MODE_REASSERT,
+    on_host_resize, reassert_modes, repaint, setup_terminal, take_worker_panic, watch_held_key,
+    MODE_REASSERT,
 };
+pub use release_watch::ReleaseWatch;
 
 /// Wheel step for the pull-request reading pane, in lines. Prose wants a
 /// bigger bite than a session list of two-row pills.
@@ -484,6 +487,11 @@ async fn main_loop(
             // stops growing a couple of seconds into every long drag. The
             // beat resumes on the release.
             _ = tokio::time::sleep_until(next_mode_reassert), if !app.mouse_held() => {
+                // A RELEASE WATCH nothing has touched for a while goes
+                // first, so the beat re-asks the resting flags, not its.
+                if release_watch::expire(&mut app.release_watch, std::time::Instant::now()) {
+                    let _ = watch_held_key(terminal.backend_mut(), false);
+                }
                 let _ = reassert_modes(terminal.backend_mut());
                 next_mode_reassert = tokio::time::Instant::now() + MODE_REASSERT;
             }
@@ -534,7 +542,14 @@ async fn main_loop(
                         .as_ref()
                         .and_then(|_| crate::perf::label(&event))
                         .map(|label| (label, std::time::Instant::now()));
+                    let watching = app.release_watch.is_some();
                     handle_terminal_event(&mut app, event, &mut out);
+                    // A RELEASE WATCH armed by this key flips the host's
+                    // keyboard flags now, ahead of the key's first repeat;
+                    // one ended by it flips them back (release_watch.rs).
+                    if watching != app.release_watch.is_some() {
+                        let _ = watch_held_key(terminal.backend_mut(), !watching);
+                    }
                     if let (Some(perf), Some((label, arrived))) = (&mut perf, probe) {
                         perf.input(label, arrived, &app);
                     }
@@ -2321,6 +2336,10 @@ fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequ
 /// [`dispatch_terminal_event`]'s body: the event to its handler.
 fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
     match event {
+        // The RELEASE WATCH reads every key first: a held unarchive key's
+        // repeats end here, one unarchive per press (release_watch.rs).
+        Event::Key(key)
+            if release_watch::take(&mut app.release_watch, &key, std::time::Instant::now()) => {}
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             let typing = typing_into_pane(app);
             app.flash = None;
@@ -2360,10 +2379,11 @@ fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
             if app.focus == Focus::Terminal && app.term_locked && !app.pane_shows_placeholder() {
-                if let Some(term) = &app.term {
+                if let Some(session) = app.term.as_ref().map(|t| t.sref.clone()) {
+                    typed_into(app, &session);
                     // Bracketed paste so the child (claude, vim…) knows.
                     out.push(ClientRequest::Input {
-                        session: term.sref.clone(),
+                        session,
                         data: bracketed(&text),
                     });
                 }
@@ -2679,12 +2699,35 @@ fn send_turn(app: &mut App, id: &AgentId, text: &str, out: &mut Vec<ClientReques
         session: sref.clone(),
         data,
     });
+    typed_into(app, &sref);
     out.push(ClientRequest::Input {
         session: sref,
         data: b"\r".to_vec(),
     });
     app.flash = Some(format!("sent to {}", agent.name));
     TurnSent::Sent
+}
+
+/// A key, a paste or a turn is going down `session`'s PTY: that is work in
+/// its project, whose PROJECT TAB comes to the far left
+/// ([`App::bring_tab_forward`]). Runs on every keystroke typed at an agent,
+/// so the project already at the front costs a lookup and no allocation.
+fn typed_into(app: &mut App, session: &SessionRef) {
+    if let Some(project) = app
+        .project_of_session(session)
+        .filter(|p| app.launcher_tabs.first() != Some(*p))
+        .cloned()
+    {
+        app.bring_tab_forward(&project);
+    }
+}
+
+/// A session launched, a shell opened or a checkout cut in `worktree`'s
+/// project: [`typed_into`]'s work, by the checkout.
+fn worked_in(app: &mut App, worktree: &WorktreeId) {
+    if let Some(project) = project_of_worktree(app, worktree) {
+        app.bring_tab_forward(&project);
+    }
 }
 
 /// The LAUNCHER VIEW's FOLLOW-UP MODAL for `id`, carrying `text`: opened
@@ -2812,10 +2855,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     return;
                 }
                 if let Some(data) = keys::encode_key(&key, term.kitty_flags) {
-                    out.push(ClientRequest::Input {
-                        session: term.sref.clone(),
-                        data,
-                    });
+                    let session = term.sref.clone();
+                    typed_into(app, &session);
+                    out.push(ClientRequest::Input { session, data });
                 }
             }
             return;
@@ -2828,18 +2870,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             leave_terminal_lock(app);
             return;
         }
-    }
-
-    // Splash preview up: the next key just dismisses it, back to the
-    // panels — even q, which asks to quit on the press after.
-    if app.splash_preview {
-        crate::key_combo::note(
-            app,
-            &[crate::keymap::KeyChord::from_event(&key)],
-            Some("Back to panels"),
-        );
-        app.splash_preview = false;
-        return;
     }
 
     // A session card expanded into its FOLLOW-UP COMPOSER: the box owns
@@ -2930,12 +2960,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Help => app.overlay = Some(Overlay::Help(HelpView::default())),
         Action::Settings => open_settings(app),
         Action::Metrics => open_metrics(app, out),
-        // Replay the first-run nebula splash, fade-in included.
-        Action::Splash => {
-            app.splash_epoch = std::time::Instant::now();
-            app.splash_preview = true;
-            app.collapsed = false;
-        }
         // Tab / ^⇧L walk forward and stop dead at the terminal pane —
         // leaning on the key can't spill past the pane and back round to
         // the first column. Landing on the pane takes the input lock:
@@ -3131,9 +3155,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Archive => {
             if app.focus == Focus::Sessions {
                 match app.selected_session_row() {
-                    Some(SessionRow::Agent(a)) if !a.archived => {
-                        archive_agent(app, a.id, out);
-                    }
+                    Some(SessionRow::Agent(a)) if !a.archived => archive_agent(app, a.id),
                     Some(SessionRow::Terminal(_)) => {
                         app.flash = Some("terminals can't be archived — d closes them".into());
                     }
@@ -3149,6 +3171,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 if let Some(a) = app.selected_session() {
                     if a.archived {
                         activate::unarchive(app, a.id, out);
+                        // One card per press of `u`, however long it is held.
+                        release_watch::arm(
+                            &mut app.release_watch,
+                            chord,
+                            std::time::Instant::now(),
+                        );
                     }
                 }
             }
@@ -3209,6 +3237,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // reaches here over a full-screen session the keys got past, which
         // is still the selected session's card.
         Action::OpenPullRequest => launcher::open_pull_request(app, out),
+        Action::OpenIssue => launcher::open_issue(app, out),
         Action::OpenGhosttyTab => open_ghostty_tab(app),
         // Shift+Enter / Shift+O: the selected worktree's OPEN COMMAND, from
         // any panel — the cursor's worktree is the context wherever the
@@ -4304,31 +4333,26 @@ fn handle_vim_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Archive is cheap to undo (u), so by default it skips the confirm
-/// dialog `d` goes behind. The `confirm_on_archive` SETTING puts one in
-/// front of it — for anyone whose typing keeps landing on the panel and
-/// archiving the session under the cursor. The `a` key and the row menu
-/// both come through here, so the two never differ.
-fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
-    if crate::config::Config::load().confirm_on_archive {
-        if let Some(a) = app.tree.agents.iter().find(|a| a.id == id) {
-            app.overlay = Some(Overlay::Confirm(confirm_archive_agent(&a.name, id)));
-        }
-        return;
+/// Archive asks first, always — the CONFIRM DIALOG `d` goes behind — so
+/// a letter aimed at an agent that lands on the grid archives nothing
+/// until it is answered. The `a` key and the row menu's Archive both
+/// come through here, so the two never differ; the archive itself runs
+/// on the dialog's Enter ([`archive_agent_now`]).
+fn archive_agent(app: &mut App, id: AgentId) {
+    if let Some(a) = app.tree.agents.iter().find(|a| a.id == id) {
+        app.overlay = Some(Overlay::Confirm(confirm_archive_agent(&a.name, id)));
     }
-    archive_agent_now(app, id, out);
 }
 
 /// The archive itself: release the pane if it shows the agent, then ask
-/// the daemon. Straight from `a` with the confirm off, or from the
-/// dialog's Enter with it on.
+/// the daemon. From the dialog's Enter (`run_pending_action`).
 fn archive_agent_now(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
     optimistic::set_archived(app, id, true, out);
 }
 
-/// The confirm before an agent is archived, when the setting asks for
-/// one. The message says why saying yes is cheap: `u` undoes it.
+/// The confirm before an agent is archived. The message says why saying
+/// yes is cheap: `u` undoes it.
 fn confirm_archive_agent(name: &str, id: AgentId) -> ConfirmDialog {
     ConfirmDialog {
         title: "Archive agent".into(),
@@ -4441,6 +4465,7 @@ fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequ
         app.flash = Some(WORKTREE_STILL_CREATING.into());
         return;
     }
+    worked_in(app, &worktree);
     send_with(
         app,
         out,
@@ -4740,16 +4765,23 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
 /// menu is where they go.
 fn menu_items_for_session_in(app: &App, a: &nebula_core::Agent) -> Vec<MenuItem> {
     let mut items = menu_items_for_session(a);
-    // The card's pull request, what `⇧P` opens (`launcher::open_pull_request`):
+    // The card's pull request and the issue it was started from, what `⇧V`
+    // and `⇧I` open (`launcher::open_pull_request`, `launcher::open_issue`):
     // ahead of the trailing Delete on an archived card, which keeps no
     // checkout verbs, and after the checkout's Open on a live one.
-    let pr = crate::launcher::row(app, &a.id)
+    let links: Vec<MenuItem> = crate::launcher::row(app, &a.id)
         .and_then(|row| row.pr)
-        .map(|pr| MenuItem::new("Open pull request", MenuAction::OpenLink(pr.url)));
+        .map(|pr| MenuItem::new("Open pull request", MenuAction::OpenLink(pr.url)))
+        .into_iter()
+        .chain(
+            a.issue_url
+                .clone()
+                .map(|url| MenuItem::new("Open issue", MenuAction::OpenLink(url))),
+        )
+        .collect();
     if a.archived {
-        if let Some(pr) = pr {
-            items.insert(items.len().saturating_sub(1), pr);
-        }
+        let at = items.len().saturating_sub(1);
+        items.splice(at..at, links);
         return items;
     }
     let Some(w) = app
@@ -4773,7 +4805,7 @@ fn menu_items_for_session_in(app: &App, a: &nebula_core::Agent) -> Vec<MenuItem>
         "Open",
         MenuAction::OpenWorktree(w.id.clone()),
     ));
-    items.extend(pr);
+    items.extend(links);
     if w.is_main {
         items.push(MenuItem::new(
             "Switch branch…",
@@ -5124,10 +5156,13 @@ fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
 /// CONTEXT MENU. The right button used to set the cursor fields itself, so
 /// a right-click on another checkout left the pane on the old one's
 /// session under a cursor that had moved away. False for a target that is
-/// not a row.
+/// not a row. A card's PULL REQUEST LINE is the card to this button: the
+/// menu it opens carries **Open pull request** already.
 fn select_clicked_row(app: &mut App, target: &HitTarget, out: &mut Vec<ClientRequest>) -> bool {
     match *target {
-        HitTarget::LauncherRow(i) => launcher::select_row(app, i, out),
+        HitTarget::LauncherRow(i) | HitTarget::LauncherCardPr(i) => {
+            launcher::select_row(app, i, out)
+        }
         _ => false,
     }
 }
@@ -6157,7 +6192,6 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
 fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.theme = cfg.theme();
     app.animations = cfg.animations;
-    app.focus_tint = cfg.focus_tint;
     app.black_background = cfg.black_background;
     app.launcher_pane_at = cfg.pane_side();
     set_projects_config(app, cfg.projects.clone(), cfg.project_fallback());
@@ -6475,6 +6509,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             // panel never waits on the DAEMON's fetch and `git worktree
             // add`. An Error takes it down and hands this box back.
             let focus = app.focus;
+            app.bring_tab_forward(&project);
             let placeholder =
                 placeholder::stage_worktree(app, project.clone(), branch.clone(), out);
             send_with(
@@ -6744,9 +6779,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::SendCloudMessage(id) => open_prompt(app, PromptKind::CloudMessage { id }),
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
-        MenuAction::ArchiveAgent(id) => {
-            archive_agent(app, id, out);
-        }
+        MenuAction::ArchiveAgent(id) => archive_agent(app, id),
         MenuAction::UnarchiveAgent(id) => activate::unarchive(app, id, out),
         MenuAction::DeleteAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
@@ -7111,19 +7144,25 @@ pub(super) fn select_worktree_by_id(
     true
 }
 
-/// Land on a project we just added, the way a `/` palette pick of it
-/// would: select its row, show its main checkout, and step into the next
-/// visible child panel. False when its upsert hasn't arrived yet.
+/// Land on a project we just added, the way a pick of it from the PROJECT
+/// DROPDOWN would (`launcher::open_project`): its tab lit, and — with no
+/// session in it yet, which is every project just added — the empty grid,
+/// the pane folded away under it rather than left reading the session or
+/// terminal it was on in the project before. False when its upsert hasn't
+/// arrived yet.
 fn select_created_project(
     app: &mut App,
     id: &nebula_core::ProjectId,
     out: &mut Vec<ClientRequest>,
 ) -> bool {
-    if !select_project_row_by_id(app, id) {
+    if !app
+        .project_rows()
+        .iter()
+        .any(|i| &app.tree.projects[*i].id == id)
+    {
         return false;
     }
-    restore_context(app, out);
-    app.focus = app.next_visible_focus(Focus::Projects);
+    launcher::open_project(app, id, out);
     true
 }
 
@@ -7171,17 +7210,10 @@ fn jump_to_target_inner(
     out: &mut Vec<ClientRequest>,
 ) {
     match target {
-        PaletteTarget::Project(id) => {
-            let changed = app.selected_project().map(|p| p.id != id).unwrap_or(true);
-            if !select_project_row_by_id(app, &id) {
-                app.flash = Some("project no longer exists".into());
-                return;
-            }
-            if changed {
-                restore_context(app, out);
-            }
-            app.focus = app.next_visible_focus(Focus::Projects);
-        }
+        // A project picked by name lands as its tab would
+        // (`launcher::open_tab`): the card it was last left on, or with no
+        // session in it the empty grid and no pane.
+        PaletteTarget::Project(id) => launcher::open_tab(app, &id, out),
         PaletteTarget::Worktree(id) => {
             if app.selected_worktree().is_some_and(|w| w.id == id) {
                 app.focus = Focus::Sessions;
@@ -7910,6 +7942,14 @@ fn project_of_worktree(app: &App, worktree: &WorktreeId) -> Option<ProjectId> {
 }
 
 fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequest>) {
+    // Every launch is work in its project, whose tab goes to the far left
+    // — a BACKGROUND LAUNCH's too, though nothing else it does moves. Not
+    // a create that already carries its stand-in row: that is the second
+    // half of a launch counted when its Enter was pressed, and the user
+    // may have gone on to work somewhere else while the checkout was cut.
+    if draft.placeholder.is_none() {
+        worked_in(app, &draft.worktree);
+    }
     // A stand-in checkout is not a place the DAEMON knows. A launch that
     // made it (a QUICK PROMPT's, a PR SESSION's) follows on its own Ack;
     // one fired into the NEW WORKTREE modal's row waits on that Ack
@@ -8653,14 +8693,19 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
     // in `ui::launcher_view`). Only those take it: every other target is
     // a card, which has its own highlight, or the background.
     // The header's PR & ISSUE COUNTS are buttons of the same kind, and
-    // take the same underline; so are the pane's CLOSE BUTTON and the
-    // footer's memory readout.
+    // take the same underline; so are the pane's CLOSE and SIDE BUTTONS
+    // and the footer's memory readout. A card's PULL REQUEST LINE is a
+    // link on a card whose own highlight marks the cursor, not the
+    // pointer, so the line takes it for itself.
     let crumb = hit.filter(|h| {
         matches!(
             h,
             HitTarget::LauncherTab(_)
+                | HitTarget::LauncherCardPr(_)
                 | HitTarget::LauncherTabClose(_)
                 | HitTarget::LauncherPaneClose
+                | HitTarget::LauncherPaneSide
+                | HitTarget::LauncherPaneNewTerminal
                 | HitTarget::LauncherTabAdd
                 | HitTarget::LauncherCrumb
                 | HitTarget::LauncherPullRequests
@@ -9235,6 +9280,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // which comes back first if it was folded away. `z` is
                 // the only way to the whole screen.
                 Some(HitTarget::LauncherRow(i)) => launcher::click_row(app, i, out),
+                // Its PULL REQUEST LINE: the cursor lands on the card and
+                // the pull request opens in the browser, through the very
+                // `open_pull_request` `⇧V` runs.
+                Some(HitTarget::LauncherCardPr(i)) => launcher::click_pull_request(app, i, out),
                 // `‹ sessions` in a full-screen session's header: back to
                 // the grid, the same way `^q` goes back.
                 Some(HitTarget::LauncherCrumb) => leave_terminal_lock(app),
@@ -9269,11 +9318,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // The strip need not be on the tab first — a click on any
                 // cross closes the terminal it belongs to.
                 Some(HitTarget::LauncherPaneCloseTerminal(i)) => launcher::close_pane_tab(app, i),
+                // `t opens a terminal here` on a strip with no terminals:
+                // the one `create_terminal_for_context` the key runs.
+                Some(HitTarget::LauncherPaneNewTerminal) => create_terminal_for_context(app, out),
                 // The CLOSE BUTTON at the strip's right end: the pane
                 // folds away through the one `toggle_pane` `^~` runs. It
                 // is only drawn on a pane that is showing, so the toggle
                 // can only ever fold.
                 Some(HitTarget::LauncherPaneClose) => launcher::toggle_pane(app),
+                // The SIDE BUTTON beside it: the pane moves to the other
+                // side of the cards, written to Settings as the
+                // **Session pane** row's own cycling writes it.
+                Some(HitTarget::LauncherPaneSide) => launcher::move_pane(app),
                 Some(HitTarget::PanelBg(focus)) => {
                     // The LAUNCHER VIEW's GRID lies on the same
                     // background, and a click on the air between its
@@ -9401,7 +9457,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             if app.launcher_grid()
                 && matches!(
                     over,
-                    Some(HitTarget::LauncherRow(_) | HitTarget::PanelBg(Focus::Sessions))
+                    Some(
+                        HitTarget::LauncherRow(_)
+                            | HitTarget::LauncherCardPr(_)
+                            | HitTarget::PanelBg(Focus::Sessions)
+                    )
                 )
             {
                 return;
@@ -10068,6 +10128,11 @@ fn attach_created(
         }
         return;
     }
+    if let SessionRef::Terminal(id) = &sref {
+        if app.launcher_active() {
+            launcher::show_created_terminal(app, id.clone());
+        }
+    }
     app.select_when_seen = Some(sref.clone());
     // Its upsert usually lands just before this Ack; land the selection
     // now, or on the upsert otherwise.
@@ -10470,6 +10535,7 @@ mod tests {
                     sort_order: 9,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -10498,6 +10564,7 @@ mod tests {
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -10723,6 +10790,9 @@ mod tests {
         ));
         app.focus = Focus::Terminal;
         app.term_locked = true;
+        // The tabs as a draw leaves them: the pane's project already
+        // leads, so a key typed at it moves no tab.
+        app.settle_project_tabs();
         app.dirty = false;
         app
     }
@@ -11110,6 +11180,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -11557,33 +11628,27 @@ mod tests {
         assert!(!app.status_anim_active(), "no merged row on screen");
     }
 
-    /// N summons the splash as a preview over a populated tree — full-body
-    /// nebula with the "any key" hint instead of panel columns — and the
-    /// next keypress (even q) only dismisses it.
+    /// `⇧N` used to summon the splash over a populated tree. The key is
+    /// gone: the grid stays on screen, and the splash is the first run's
+    /// alone.
     #[test]
-    fn shift_n_previews_splash_and_any_key_dismisses() {
+    fn shift_n_no_longer_summons_the_splash() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('N'), KeyModifiers::SHIFT, &mut out);
-        assert!(app.splash_preview && app.splash_active());
+        assert!(!app.splash_showing());
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("any key returns"), "{text}");
-        let grid_head = |app: &App| {
+        assert!(!text.contains("any key returns"), "{text}");
+        assert!(
             app.hits
                 .iter()
-                .any(|(_, h)| *h == HitTarget::LauncherTabAdd)
-        };
-        assert!(!grid_head(&app), "the grid is hidden: {text}");
-
-        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut out);
-        assert!(!app.splash_preview, "any key dismisses");
-        assert!(!app.should_quit, "the dismissing key is swallowed");
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        assert!(grid_head(&app), "{}", buffer_text(&terminal));
+                .any(|(_, h)| *h == HitTarget::LauncherTabAdd),
+            "the grid is on screen: {text}"
+        );
     }
 
     /// While the tree is empty, `n` opens the add-project prompt from any
@@ -11602,8 +11667,7 @@ mod tests {
     }
 
     /// The splash hides the panels, so the footer drops the panel keymap
-    /// for the handful of keys that still fire under it — and in preview,
-    /// for the only one there is.
+    /// for the handful of keys that still fire under it.
     #[test]
     fn splash_footer_lists_only_keys_that_work() {
         let mut app = App::new();
@@ -11622,18 +11686,10 @@ mod tests {
             );
         }
 
-        // Preview over a populated tree: the next key only dismisses.
+        // A project lands: the grid, the grid's keymap — without `o`,
+        // which the Help overlay lists; the footer keeps the keys a card
+        // takes.
         seed_tree(&mut app);
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('N'), KeyModifiers::SHIFT, &mut out);
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("any key: back to the sessions"), "{text}");
-        assert!(!text.contains("o: open a folder"), "{text}");
-
-        // The grid back, the grid's keymap back — without `o`, which the
-        // Help overlay lists; the footer keeps the keys a card takes.
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("new session"), "{text}");
@@ -15100,6 +15156,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: sort,
                     status_changed_at: changed_at,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             }
@@ -15154,6 +15211,7 @@ diff --git a/src/c.rs b/src/c.rs
                 sort_order: sort,
                 status_changed_at: at,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             }),
         };
@@ -15235,6 +15293,7 @@ diff --git a/src/c.rs b/src/c.rs
                 sort_order: sort,
                 status_changed_at: at,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             }),
         };
@@ -15294,6 +15353,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -15361,6 +15421,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -16846,12 +16907,6 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(!crate::config::Config::load().muse_enabled);
 
-            for _ in muse_row..opencode_row {
-                press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
-            }
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            let cfg = crate::config::Config::load();
-            assert!(!cfg.muse_enabled);
             for _ in muse_row..grok_row {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             }
@@ -17526,6 +17581,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -18049,6 +18105,7 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: sort,
             status_changed_at: 0,
             alive: false,
+            issue_url: None,
             recent_prompts: Vec::new(),
         })
     }
@@ -19225,6 +19282,9 @@ diff --git a/src/c.rs b/src/c.rs
     fn launcher_pane_edge_drags_the_pane_taller_and_shorter() {
         use crate::launcher::{pane_height, CARD_H, HEAD_H, PANE_MIN_H};
         let mut app = App::new();
+        // A pane along the bottom, whose edge trades rows; the one beside
+        // the cards has its own drag test in `event_loop::launcher`.
+        app.launcher_pane_at = crate::launcher::PaneSide::Bottom;
         // Tall enough that the default share, and a drag either side of
         // it, sit clear of both stops — the stops get their own drags below.
         let body = ratatui::layout::Rect::new(0, 0, 120, 60);
@@ -19264,6 +19324,10 @@ diff --git a/src/c.rs b/src/c.rs
             app.term_selection.is_none(),
             "a pane-edge grab must not arm a terminal selection"
         );
+        assert!(
+            app.mouse_held(),
+            "the edge is held: the host gets no mode re-ask under the drag"
+        );
 
         // Up five rows: the pane takes them off the cards.
         handle_mouse(
@@ -19272,6 +19336,15 @@ diff --git a/src/c.rs b/src/c.rs
             &mut out,
         );
         assert_eq!(app.launcher_pane_h, Some(body.height - boundary + 5));
+
+        // A motion report with no button named, mid-drag, is still the
+        // drag: a host that lost the button between two reports.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Moved, 60, boundary - 2),
+            &mut out,
+        );
+        assert_eq!(app.launcher_pane_h, Some(body.height - boundary + 2));
 
         // Down again: the cards get them back.
         handle_mouse(
@@ -19303,6 +19376,7 @@ diff --git a/src/c.rs b/src/c.rs
             &mut out,
         );
         assert!(app.launcher_pane_drag.is_none(), "mouse-up ends the drag");
+        assert!(!app.mouse_held(), "…and the mode re-ask beat resumes");
     }
 
     /// The ISSUES fold rides the UI-state blob like the OPEN PRS one, and
@@ -19398,6 +19472,7 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 0,
             status_changed_at: 0,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
 
@@ -19588,6 +19663,7 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 0,
             status_changed_at: at,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         })
     }
@@ -21102,6 +21178,10 @@ diff --git a/src/c.rs b/src/c.rs
             }
             _ => panic!("diff overlay gone"),
         }
+        assert!(
+            app.mouse_held(),
+            "the border is held: no mode re-ask mid-drag"
+        );
         handle_mouse(
             &mut app,
             mev(MouseEventKind::Drag(MouseButton::Left), bx + 9, area.y + 5),
@@ -21151,6 +21231,10 @@ diff --git a/src/c.rs b/src/c.rs
             Some(Overlay::Diff(v)) => assert!(v.files_drag.is_none(), "mouse-up ends the drag"),
             _ => panic!("diff overlay gone"),
         }
+        assert!(
+            !app.mouse_held(),
+            "mouse-up frees the host for the re-ask beat"
+        );
         assert!(out.is_empty(), "resizing never talks to the daemon");
     }
 
@@ -21204,6 +21288,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -21228,6 +21313,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -21540,6 +21626,7 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 5,
             status_changed_at: 500,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         for a in [
@@ -21996,6 +22083,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -22798,7 +22886,7 @@ diff --git a/src/c.rs b/src/c.rs
             let mut app = App::new();
             let mut out = Vec::new();
             open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
-            let row = crate::keymap::index_of(crate::keymap::Action::Splash).unwrap();
+            let row = crate::keymap::index_of(crate::keymap::Action::Metrics).unwrap();
             for _ in 0..row {
                 press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             }
@@ -24213,6 +24301,7 @@ diff --git a/src/c.rs b/src/c.rs
                         sort_order: 1,
                         status_changed_at: 0,
                         alive: true,
+                        issue_url: None,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -24285,15 +24374,16 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 1,
             status_changed_at: 0,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         })
     }
 
     /// Archiving the selected session lands the cursor on the next row AND
     /// attaches it — the pane must show the newly highlighted session, not
-    /// stay blank after the archive's detach. All of it on the keypress
-    /// (an OPTIMISTIC UPDATE): the DAEMON's upsert, when it lands, finds
-    /// the row already archived and changes nothing.
+    /// stay blank after the archive's detach. All of it on the confirm's
+    /// Enter (an OPTIMISTIC UPDATE): the DAEMON's upsert, when it lands,
+    /// finds the row already archived and changes nothing.
     #[test]
     fn archiving_selected_agent_previews_the_next_row() {
         let mut app = App::new();
@@ -24310,12 +24400,12 @@ diff --git a/src/c.rs b/src/c.rs
         app.term = Some(AttachedTerm::new(a1.clone(), 40, 10));
 
         let mut out = Vec::new();
-        // `a` reads `confirm_on_archive`; the default (off) archives at
-        // once, with no dialog in the way.
-        with_default_config(|| press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out));
+        // `a` asks first; Enter on the confirm is the archive.
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
             app.overlay.is_none(),
-            "no confirm by default: {:?}",
+            "Enter answered the confirm: {:?}",
             app.overlay
         );
         assert!(
@@ -24356,12 +24446,13 @@ diff --git a/src/c.rs b/src/c.rs
         assert_eq!(app.term.as_ref().map(|t| t.sref.clone()), Some(a2));
     }
 
-    /// With `confirm_on_archive` on, `a` asks first: nothing is sent until
-    /// the dialog is answered, Esc keeps the session, and Enter archives
-    /// it exactly as the bare key would have — pane released and all.
+    /// `a` asks first: nothing is sent until the dialog is answered, Esc
+    /// keeps the session, and Enter archives it — pane released and all.
+    /// Always, whatever `config.json` says: the retired
+    /// `confirm_on_archive` key is not read.
     #[test]
-    fn confirm_on_archive_puts_a_dialog_in_front_of_a() {
-        with_config_json(r#"{"confirm_on_archive": true}"#, || {
+    fn a_asks_before_archiving_whatever_the_config_says() {
+        with_config_json(r#"{"confirm_on_archive": false}"#, || {
             let mut app = App::new();
             seed_tree(&mut app); // p1 / w1(main) / a1
             app.focus = Focus::Sessions;
@@ -24415,10 +24506,10 @@ diff --git a/src/c.rs b/src/c.rs
         })
     }
 
-    /// The row menu's Archive goes through the same gate as `a`.
+    /// The row menu's Archive asks the same way `a` does.
     #[test]
-    fn confirm_on_archive_gates_the_row_menu_too() {
-        with_config_json(r#"{"confirm_on_archive": true}"#, || {
+    fn the_row_menus_archive_asks_too() {
+        with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
             let mut out = Vec::new();
@@ -24905,6 +24996,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -24971,6 +25063,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -25760,6 +25853,7 @@ diff --git a/src/c.rs b/src/c.rs
                         sort_order: 0,
                         status_changed_at: crate::app::now_ms(),
                         alive: true,
+                        issue_url: None,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -27158,6 +27252,7 @@ diff --git a/src/c.rs b/src/c.rs
                         sort_order: 1,
                         status_changed_at: 0,
                         alive: true,
+                        issue_url: None,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -28941,6 +29036,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 1,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },

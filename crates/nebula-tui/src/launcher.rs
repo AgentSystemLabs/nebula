@@ -287,16 +287,16 @@ pub fn split(body: Rect, want: Option<u16>) -> (Rect, Option<Rect>) {
     (view, Some(pane))
 }
 
-/// Where the PANE sits against the GRID: along the bottom, under the
-/// cards — where it has always been, and the default — or down the right
-/// or the left side of them. Settings → Appearance → **Session pane**
-/// (`session_pane`, read through `Config::pane_side`).
+/// Where the PANE sits against the GRID: down the right side of the
+/// cards — the default — or along the bottom, under them, where it sat
+/// before there was a choice. Settings → Appearance → **Session pane**
+/// (`session_pane`, read through `Config::pane_side`), or the SIDE BUTTON
+/// on the pane's own TAB STRIP, which writes that same setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneSide {
-    #[default]
     Bottom,
+    #[default]
     Right,
-    Left,
 }
 
 impl PaneSide {
@@ -305,18 +305,24 @@ impl PaneSide {
         match self {
             PaneSide::Bottom => "bottom",
             PaneSide::Right => "right",
-            PaneSide::Left => "left",
         }
     }
 
     /// A stored word read back. Anything else — a typo in a hand edit, a
-    /// side a newer build added — is the bottom, where the pane was before
-    /// there was a choice.
+    /// side a newer build added, the `left` older builds offered — is the
+    /// default, down the right.
     pub fn parse(word: &str) -> Self {
         match word.trim() {
-            "right" => PaneSide::Right,
-            "left" => PaneSide::Left,
-            _ => PaneSide::Bottom,
+            "bottom" => PaneSide::Bottom,
+            _ => PaneSide::default(),
+        }
+    }
+
+    /// The other side: where the pane's SIDE BUTTON moves it.
+    pub const fn other(self) -> Self {
+        match self {
+            PaneSide::Bottom => PaneSide::Right,
+            PaneSide::Right => PaneSide::Bottom,
         }
     }
 
@@ -387,18 +393,12 @@ pub fn split_at(body: Rect, side: PaneSide, want: Option<u16>) -> (Rect, Option<
         return (body, None);
     };
     let grid_w = body.width - pane_w;
-    let (view_x, pane_x) = if side == PaneSide::Right {
-        (body.x, body.x + grid_w)
-    } else {
-        (body.x + pane_w, body.x)
-    };
     let view = Rect {
-        x: view_x,
         width: grid_w,
         ..body
     };
     let pane = Rect {
-        x: pane_x,
+        x: body.x + grid_w,
         width: pane_w,
         ..body
     };
@@ -407,13 +407,11 @@ pub fn split_at(body: Rect, side: PaneSide, want: Option<u16>) -> (Rect, Option<
 
 /// Where the edge between the cards and `pane` sits, by the measure
 /// [`PaneSide::along`] reads a pointer with: the pane's first row under
-/// the cards, its first column right of them, and the grid's first column
-/// right of a pane on the left.
+/// the cards, or its first column right of them.
 pub fn pane_boundary(side: PaneSide, pane: Rect) -> i32 {
     match side {
         PaneSide::Bottom => i32::from(pane.y),
         PaneSide::Right => i32::from(pane.x),
-        PaneSide::Left => i32::from(pane.x) + i32::from(pane.width),
     }
 }
 
@@ -427,11 +425,6 @@ pub fn pane_edge(side: PaneSide, pane: Rect) -> Rect {
             ..pane
         },
         PaneSide::Right => Rect {
-            width: pane.width.min(1),
-            ..pane
-        },
-        PaneSide::Left => Rect {
-            x: pane.x + pane.width.saturating_sub(1),
             width: pane.width.min(1),
             ..pane
         },
@@ -454,7 +447,6 @@ pub fn pane_grab_zone(side: PaneSide, pane: Rect) -> Rect {
             width: 2,
             ..edge
         },
-        PaneSide::Left => Rect { width: 2, ..edge },
     }
 }
 
@@ -467,10 +459,6 @@ pub fn pane_content(side: PaneSide, pane: Rect) -> Rect {
         PaneSide::Bottom => pane,
         PaneSide::Right => Rect {
             x: pane.x + pane.width.min(1),
-            width: pane.width.saturating_sub(1),
-            ..pane
-        },
-        PaneSide::Left => Rect {
             width: pane.width.saturating_sub(1),
             ..pane
         },
@@ -778,11 +766,13 @@ pub struct ProjectTab {
 }
 
 /// The PROJECT TABS across the LAUNCHER VIEW's header: every project
-/// opened since it was last closed ([`App::launcher_tabs`]), the most
-/// recently opened at the far left. Opening a project that has no tab yet
-/// puts one there ([`App::settle_project_tabs`]); switching between tabs
-/// already open moves none of them, so a tab stays where the pointer last
-/// found it.
+/// opened since it was last closed ([`App::launcher_tabs`]), the one last
+/// worked in at the far left. Opening a project that has no tab yet puts
+/// one there ([`App::settle_project_tabs`]), and so does working in one —
+/// a session launched, a turn sent, a key typed at a session
+/// ([`App::bring_tab_forward`]). Switching between tabs only looks and
+/// moves none of them, so `[` / `]` and the header's cursor walk a row
+/// that holds still under them.
 ///
 /// A project gone from the tree drops out here, before the settle next
 /// prunes it.
@@ -1088,6 +1078,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         }
     }
@@ -1670,23 +1661,27 @@ mod tests {
         assert_eq!(split(short, Some(20)), (short, None));
     }
 
-    /// The **Session pane** words: the three sides round-trip, and a word
-    /// off the list is the bottom the pane had before there was a choice.
+    /// The **Session pane** words: both sides round-trip and are each
+    /// other's other, and a word off the list — `left` included, which
+    /// older builds offered — is the right side the pane has out of the
+    /// box.
     #[test]
-    fn pane_sides_read_back_and_default_to_the_bottom() {
-        for side in [PaneSide::Bottom, PaneSide::Right, PaneSide::Left] {
+    fn pane_sides_read_back_and_default_to_the_right() {
+        for side in [PaneSide::Bottom, PaneSide::Right] {
             assert_eq!(PaneSide::parse(side.as_str()), side);
+            assert_eq!(side.other().other(), side);
+            assert_ne!(side.other(), side);
         }
-        assert_eq!(PaneSide::parse(" right "), PaneSide::Right);
-        assert_eq!(PaneSide::parse("top"), PaneSide::Bottom);
-        assert_eq!(PaneSide::parse(""), PaneSide::Bottom);
-        assert_eq!(PaneSide::default(), PaneSide::Bottom);
+        assert_eq!(PaneSide::parse(" bottom "), PaneSide::Bottom);
+        assert_eq!(PaneSide::parse("left"), PaneSide::Right);
+        assert_eq!(PaneSide::parse("top"), PaneSide::Right);
+        assert_eq!(PaneSide::parse(""), PaneSide::Right);
+        assert_eq!(PaneSide::default(), PaneSide::Right);
     }
 
     /// A pane beside the cards splits the body's columns rather than its
     /// rows: half of them by default, all of the height, the grid on the
-    /// other side — and its edge, grip column and grab zone face the
-    /// cards, whichever side it is on.
+    /// left — and its edge, grip column and grab zone face the cards.
     #[test]
     fn a_side_pane_splits_the_columns() {
         let body = Rect::new(0, 3, 160, 40);
@@ -1707,19 +1702,10 @@ mod tests {
         let content = pane_content(PaneSide::Right, pane);
         assert_eq!((content.x, content.width), (81, 79), "clear of the grip");
 
-        let (view, pane) = split_at(body, PaneSide::Left, Some(50));
-        let pane = pane.expect("room on the left too");
-        assert_eq!((pane.x, pane.width), (0, 50), "as dragged");
-        assert_eq!((view.x, view.width), (50, 110), "the grid right of it");
-        assert_eq!(pane_boundary(PaneSide::Left, pane), 50);
-        assert_eq!(pane_edge(PaneSide::Left, pane).x, 49);
-        assert_eq!(
-            pane_grab_zone(PaneSide::Left, pane),
-            Rect::new(49, 3, 2, 40),
-            "the pane's last column and the grid's first"
-        );
-        let content = pane_content(PaneSide::Left, pane);
-        assert_eq!((content.x, content.width), (0, 49), "clear of the grip");
+        let (view, pane) = split_at(body, PaneSide::Right, Some(50));
+        let pane = pane.expect("room for a dragged width too");
+        assert_eq!((pane.x, pane.width), (110, 50), "as dragged");
+        assert_eq!((view.x, view.width), (0, 110), "the grid takes the rest");
 
         // The bottom is `split` itself, and its edge the pane's first row.
         let (_, pane) = split_at(body, PaneSide::Bottom, None);
@@ -1741,7 +1727,7 @@ mod tests {
             Some(160 - CARD_MIN_W - PAD_X * 2),
             "one column of cards kept"
         );
-        assert_eq!(fitted_side(body, PaneSide::Left), PaneSide::Left);
+        assert_eq!(fitted_side(body, PaneSide::Right), PaneSide::Right);
 
         let narrow = Rect::new(0, 0, CARD_MIN_W + PAD_X * 2 + PANE_MIN_W - 1, 40);
         assert_eq!(pane_width(narrow, None), None);

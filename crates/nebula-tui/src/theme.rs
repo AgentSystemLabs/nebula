@@ -51,14 +51,10 @@ pub struct Theme {
     /// row sits right above its unread session's, and the two dots say
     /// opposite things (come read this / this landed, delete it).
     pub done: Color,
-    /// Running / modified / flash messages / remote host.
+    /// Running — the STATUS DOT and, on the grid, the running card's
+    /// frame, one yellow for both — modified / flash messages / remote
+    /// host.
     pub warn: Color,
-    /// A running session's LAUNCHER CARD frame: `warn` turned down to a
-    /// faint yellow. The focused card's frame is the accent, and in a warm
-    /// preset (amber, sand, coral) a full-strength yellow frame sits a
-    /// shade off it — a grid of running cards would read as a grid of
-    /// cursors. Dark enough to recede behind the focus, still yellow.
-    pub warn_edge: Color,
     /// Needs feedback / deleted / destructive actions.
     pub err: Color,
     /// Terminated sessions and the session kind badge.
@@ -140,7 +136,6 @@ impl Default for Theme {
             ok: Color::Green,
             done: Color::Indexed(75), // sky blue — a hue away from merged's purple, not a shade
             warn: Color::Yellow,
-            warn_edge: Color::Indexed(100), // dark yellow — running, a step under the focus
             err: Color::Red,
             special: Color::Magenta,
             merged: Color::Indexed(135),  // purple — GitHub's merged
@@ -304,23 +299,16 @@ mod tests {
         }
     }
 
-    /// A running card's frame must never pass for the focused card's: it is
-    /// not the accent in any preset, and — when both sit in the 256-color
-    /// cube — at least three steps from it, so the amber preset's orange
-    /// focus and the faint yellow of a running card stay two colors.
+    /// A running card's frame is the running yellow itself — the color its
+    /// STATUS DOT wears — so no preset may hand `warn` to the accent or to
+    /// the quiet edge: a running card would then pass for the cursor's, or
+    /// for a card with nothing going on.
     #[test]
     fn a_running_frame_never_reads_as_the_focus() {
         for name in THEMES {
             let th = Theme::by_name(name);
-            assert_ne!(
-                th.warn_edge, th.accent,
-                "{name}: running reads as the cursor"
-            );
-            assert_ne!(th.warn_edge, th.warn, "{name}: not turned down");
-            assert_ne!(th.warn_edge, th.edge, "{name}: reads as a quiet card");
-            if let Some(steps) = cube_steps(th.warn_edge, th.accent) {
-                assert!(steps >= 3, "{name}: {steps} steps from the accent");
-            }
+            assert_ne!(th.warn, th.accent, "{name}: running reads as the cursor");
+            assert_ne!(th.warn, th.edge, "{name}: running reads as a quiet card");
         }
     }
 

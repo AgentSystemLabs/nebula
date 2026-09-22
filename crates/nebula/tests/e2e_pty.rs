@@ -3921,6 +3921,22 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     })
     .await;
 
+    // A turn is under way — the one about to run the command.
+    let hook = |event: &str| format!("/api/hooks/claude?agentId={}&hookEvent={event}", agent_id.0);
+    let payload = format!(
+        r#"{{"session_id":"s1","cwd":"{}","tool_name":"Bash"}}"#,
+        repo.display()
+    );
+    let (status, _) = hook_post_json(port, &hook("UserPromptSubmit"), &token, &payload).await;
+    assert_eq!(status, 200, "UserPromptSubmit");
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
     // The model obeys the guidance — `nebula worktree feat x` (the space
     // slugifies) with the session's env.
     let out = agent_cli(&env, &agent_id, &["worktree", "feat", "x"]);
@@ -3960,13 +3976,8 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     // Mid-turn the CLI's hooks keep reporting the old checkout's cwd; that
     // must not drag the row back. Then the Stop — same old cwd — ends the
     // turn and triggers the relocation.
-    let payload = format!(
-        r#"{{"session_id":"s1","cwd":"{}","tool_name":"Bash"}}"#,
-        repo.display()
-    );
     for event in ["PostToolUse", "Stop"] {
-        let path = format!("/api/hooks/claude?agentId={}&hookEvent={event}", agent_id.0);
-        let (status, _) = hook_post_json(port, &path, &token, &payload).await;
+        let (status, _) = hook_post_json(port, &hook(event), &token, &payload).await;
         assert_eq!(status, 200, "{event}");
     }
 
@@ -3987,6 +3998,25 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
             .iter()
             .any(|e| matches!(e, ServerEvent::Scrollback { session, .. } if session == &sref)),
         "the rebind replays the new PTY's ring: {events:#?}"
+    );
+    // The turn's Stop did not finish the row on its way to the respawn:
+    // the card would have dropped to the bottom of the grid and climbed
+    // back once the relocated CLI's first hook landed. The respawn opens
+    // on the relocation notice, so the row stays `running` throughout.
+    assert!(
+        !events.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
+                if *agent == agent_id)
+        }),
+        "no finish between the Stop and the respawn: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.worktree_id == feat.id && a.alive
+                    && a.status == nebula_core::AgentStatus::Running)
+        }),
+        "the relocated row reads running: {events:#?}"
     );
     let deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
     loop {

@@ -34,11 +34,11 @@ pub const DEFAULT_RECENT_PROMPTS_COUNT: usize = 3;
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 
 /// The **Session pane** choices (Settings → Appearance), in the order the
-/// row cycles them: the [`crate::launcher::PaneSide`] sides by name.
+/// row cycles them: the [`crate::launcher::PaneSide`] sides by name, the
+/// default first.
 pub const PANE_SIDES: &[&str] = &[
-    crate::launcher::PaneSide::Bottom.as_str(),
     crate::launcher::PaneSide::Right.as_str(),
-    crate::launcher::PaneSide::Left.as_str(),
+    crate::launcher::PaneSide::Bottom.as_str(),
 ];
 
 /// The **Preset text** choices (Settings → Sessions), in the order the row
@@ -374,7 +374,6 @@ pub enum SettingKind {
     Editor,
     CloseFinderOnOpen,
     SshSyncConfig,
-    ConfirmOnArchive,
     SessionIdleTimeout,
     PrewarmAgents,
     PrewarmSessions,
@@ -383,7 +382,6 @@ pub enum SettingKind {
     PresetText,
     Theme,
     Animations,
-    FocusTint,
     BlackBackground,
     SessionPane,
     HideProjects,
@@ -501,12 +499,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
         title: "Sessions",
         body: TabBody::Values(&[
             SettingSpec {
-                kind: SettingKind::ConfirmOnArchive,
-                label: "Confirm on archive",
-                hint: "a asks before archiving the selected session (off archives at once; u undoes)",
-                group: "",
-            },
-            SettingSpec {
                 kind: SettingKind::SessionIdleTimeout,
                 label: "Idle session timeout",
                 hint: "Kill idle sessions in unviewed worktrees (busy ones spared; off disables)",
@@ -560,12 +552,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 group: "",
             },
             SettingSpec {
-                kind: SettingKind::FocusTint,
-                label: "Focused panel tint",
-                hint: "Faint accent wash behind the focused card or pane (off shows the terminal's background)",
-                group: "",
-            },
-            SettingSpec {
                 kind: SettingKind::BlackBackground,
                 label: "Black background",
                 hint: "Paint the window pure black instead of the terminal's own background (off keeps the terminal's, transparency included)",
@@ -574,7 +560,7 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::SessionPane,
                 label: "Session pane",
-                hint: "Where the session under the cursor is read: under the cards, or beside them on the right or left",
+                hint: "Where the session under the cursor is read: beside the cards on the right, or under them",
                 group: "",
             },
             SettingSpec {
@@ -945,11 +931,12 @@ pub struct Config {
     /// it any more. Still loaded and written back as stored, so an older
     /// build sharing the file keeps the behavior its user chose.
     pub skip_session_naming: bool,
-    /// Put a CONFIRM DIALOG in front of archiving a session — the `a` key
-    /// and the row menu's Archive alike. Off by default: archive is cheap
-    /// to undo with `u`, so it is the one verb on the SESSIONS PANEL that
-    /// skips the dialog `d` goes behind. On, for anyone whose typing keeps
-    /// landing on the panel and archiving the session under the cursor.
+    /// RETIRED with the archive confirm made unconditional. Through 0.33,
+    /// on, it put a CONFIRM DIALOG in front of archiving a session — the
+    /// `a` key and the row menu's Archive alike — and off (the default)
+    /// archived at once. Every archive asks now, so no tab shows the row
+    /// and nothing reads it. Still loaded and written back as stored, so
+    /// an older build sharing the file keeps the behavior its user chose.
     pub confirm_on_archive: bool,
     /// How long an idle session in an unviewed worktree lives before the
     /// daemon reaps its PTY: "1m", "5m", "15m", "30m", "1h"; "off"
@@ -996,11 +983,14 @@ pub struct Config {
     /// status-text sweep and the splash's motion). Off trades them for
     /// fewer repaints on constrained machines.
     pub animations: bool,
-    /// Faint accent-tinted background fill on the focused panel. On by
-    /// default — it is the one cue that says which panel keys land in.
-    /// Off leaves every cell on the terminal's own background, so a
-    /// transparency or image configured in the terminal shows through
-    /// the whole frame instead of stopping at the focused panel.
+    /// The key of the **Focused panel tint** SETTING (Settings →
+    /// Appearance, through 0.33): whether the faint accent wash behind
+    /// whatever keys land in — the card under the cursor, or the session
+    /// pane — was painted at all. It always is now: the wash is the one
+    /// cue that says which surface keys land in, so this build never
+    /// reads the key and no tab edits it. Still loaded and written back
+    /// as stored, so an older build sharing the file keeps the choice its
+    /// user made.
     pub focus_tint: bool,
     /// BLACK BACKGROUND: paint every cell nothing else colored pure black
     /// — the grid, the cards, the session pane, the overlays — instead of
@@ -1009,11 +999,13 @@ pub struct Config {
     /// image configured in the terminal show through.
     pub black_background: bool,
     /// Where the LAUNCHER VIEW's PANE — the session under the cursor, live
-    /// — sits against the GRID of cards: `bottom` (under them, the
-    /// default), `right` or `left` (down that side of them). Read through
-    /// [`Config::pane_side`], so a word off the list is the bottom; a
-    /// window too narrow for the pane beside the cards lays it out along
-    /// the bottom until there is room (`launcher::fitted_side`).
+    /// — sits against the GRID of cards: `right` (down that side of them,
+    /// the default) or `bottom` (under them). Also written by the SIDE
+    /// BUTTON on the pane's own TAB STRIP. Read through
+    /// [`Config::pane_side`], so a word off the list — the `left` older
+    /// builds offered too — is the right; a window too narrow for the
+    /// pane beside the cards lays it out along the bottom until there is
+    /// room (`launcher::fitted_side`).
     pub session_pane: String,
     /// The key of the **Workspaces bar** SETTING (Settings → Appearance,
     /// through 0.33): whether the bar of WORKSPACE tabs was drawn across
@@ -1319,7 +1311,7 @@ impl Default for Config {
             animations: true,
             focus_tint: true,
             black_background: true,
-            session_pane: crate::launcher::PaneSide::Bottom.as_str().into(),
+            session_pane: crate::launcher::PaneSide::default().as_str().into(),
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
@@ -2145,7 +2137,6 @@ impl Config {
             SettingKind::Editor => self.editor.clone(),
             SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
             SettingKind::SshSyncConfig => on_off(self.ssh_sync_config).into(),
-            SettingKind::ConfirmOnArchive => on_off(self.confirm_on_archive).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::PrewarmAgents => on_off(self.prewarm_agents).into(),
             SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
@@ -2154,7 +2145,6 @@ impl Config {
             SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
-            SettingKind::FocusTint => on_off(self.focus_tint).into(),
             SettingKind::BlackBackground => on_off(self.black_background).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
@@ -2223,9 +2213,6 @@ impl Config {
             SettingKind::SshSyncConfig => {
                 self.ssh_sync_config = !self.ssh_sync_config;
             }
-            SettingKind::ConfirmOnArchive => {
-                self.confirm_on_archive = !self.confirm_on_archive;
-            }
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
@@ -2254,15 +2241,12 @@ impl Config {
             SettingKind::Animations => {
                 self.animations = !self.animations;
             }
-            SettingKind::FocusTint => {
-                self.focus_tint = !self.focus_tint;
-            }
             SettingKind::BlackBackground => {
                 self.black_background = !self.black_background;
             }
             SettingKind::SessionPane => {
                 // Cycled from the resolved side, so a hand edit off the
-                // list steps on from the bottom it reads as.
+                // list steps on from the right it reads as.
                 self.session_pane =
                     cycle_choice(self.pane_side().as_str(), PANE_SIDES, step).into();
             }
@@ -2682,11 +2666,11 @@ mod tests {
             BTreeSet::from(["recent_prompts_count".to_string()])
         );
 
-        cfg.focus_tint = false;
+        cfg.black_background = false;
         cfg.save_to(&path).unwrap();
         let saved = read_json_file(&path);
         assert_eq!(saved["recent_prompts_count"], "auto", "left as stored");
-        assert_eq!(saved["focus_tint"], false);
+        assert_eq!(saved["black_background"], false);
         assert_eq!(saved["theme"], "ocean");
 
         let (t, r) = locate(SettingKind::RecentPromptsCount).unwrap();
@@ -2890,35 +2874,35 @@ mod tests {
         assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
         assert!(cfg.skip_session_naming);
 
-        cfg.focus_tint = false;
+        cfg.black_background = false;
         cfg.save_to(&path).unwrap();
         assert_eq!(read_json_file(&path)["skip_session_naming"], true);
     }
 
+    /// Retired with the archive confirm made unconditional: no tab shows
+    /// the row, and a `true` an earlier release wrote still loads and is
+    /// written back unchanged for the older builds that read it.
     #[test]
-    fn confirm_on_archive_defaults_off_toggles_and_persists() {
-        assert!(
-            !Config::default().confirm_on_archive,
-            "archive skips the confirm by default; the dialog is opt-in"
-        );
+    fn confirm_on_archive_has_no_row_and_is_written_back_for_older_builds() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|row| row.label != "Confirm on archive")
+            }
+            TabBody::Hotkeys | TabBody::Agents => true,
+        }));
+        assert!(!Config::default().confirm_on_archive);
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.confirm_on_archive);
 
-        let mut cfg = Config::default();
-        let (tab, row) = locate(SettingKind::ConfirmOnArchive).unwrap();
-        assert_eq!(
-            SETTINGS_TABS[tab].title, "Sessions",
-            "lives on the Sessions tab"
-        );
-        assert_eq!(cfg.value_label(SettingKind::ConfirmOnArchive), "off");
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.confirm_on_archive);
-        assert_eq!(cfg.value_label(SettingKind::ConfirmOnArchive), "on");
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"confirm_on_archive": true}"#).unwrap();
+        let cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(cfg.confirm_on_archive);
+
         cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).confirm_on_archive);
+        assert_eq!(read_json_file(&path)["confirm_on_archive"], true);
     }
 
     #[test]
@@ -3206,7 +3190,7 @@ mod tests {
         assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
         assert!(!cfg.show_workspaces);
 
-        cfg.focus_tint = false;
+        cfg.black_background = false;
         cfg.save_to(&path).unwrap();
         assert_eq!(read_json_file(&path)["show_workspaces"], false);
     }
@@ -3300,35 +3284,28 @@ mod tests {
         assert!(!legacy.card_line_changes);
     }
 
-    /// The FOCUS TINT: on out of the box, toggled from its Appearance row,
-    /// persisted under `focus_tint`. A config.json written while the key
-    /// was ignored (2026-08-29 to v0.26) is honoured again: `false` in
-    /// it switches the tint off on the next launch (issue #51), and a
-    /// file predating the key keeps the default.
+    /// The tint is always on now, so **Focused panel tint** has no row to
+    /// be edited on — but the key an earlier release wrote still loads,
+    /// and is written back unchanged for the older builds that read it.
     #[test]
-    fn focus_tint_default_on_toggle_and_persist() {
-        let mut cfg = Config::default();
-        assert!(cfg.focus_tint);
-        let (tab, row) = locate(SettingKind::FocusTint).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
-        cfg.cycle(tab, row, 0);
-        assert!(!cfg.focus_tint);
+    fn focus_tint_has_no_row_and_is_written_back_for_older_builds() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|row| row.label != "Focused panel tint")
+            }
+            TabBody::Hotkeys | TabBody::Agents => true,
+        }));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        cfg.save_to(&path).unwrap();
-        assert!(!load_from(&path).focus_tint);
-        let raw: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(raw.get("focus_tint"), Some(&serde_json::json!(false)));
+        std::fs::write(&path, r#"{"focus_tint": false}"#).unwrap();
+        let mut cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(!cfg.focus_tint);
 
-        let legacy: Config = serde_json::from_str(r#"{"focus_tint": false}"#).unwrap();
-        assert!(!legacy.focus_tint, "a hand-edited key is honoured");
-        let older: Config = serde_json::from_str("{}").unwrap();
-        assert!(
-            older.focus_tint,
-            "a config predating the key keeps the tint"
-        );
+        cfg.black_background = false;
+        cfg.save_to(&path).unwrap();
+        assert_eq!(read_json_file(&path)["focus_tint"], false);
     }
 
     /// The BLACK BACKGROUND: on out of the box, toggled off from its
@@ -3359,42 +3336,43 @@ mod tests {
         );
     }
 
-    /// The **Session pane**: along the bottom out of the box, cycled from
-    /// its Appearance row through right and left and back, persisted
-    /// under `session_pane`. A config predating the key, or holding a
-    /// word off the list, reads as the bottom.
+    /// The **Session pane**: down the right out of the box, cycled from
+    /// its Appearance row to the bottom and back, persisted under
+    /// `session_pane`. A config predating the key, or holding a word off
+    /// the list — `left`, which older builds offered, included — reads as
+    /// the right.
     #[test]
-    fn session_pane_defaults_to_the_bottom_cycles_and_persists() {
+    fn session_pane_defaults_to_the_right_cycles_and_persists() {
         use crate::launcher::PaneSide;
         let mut cfg = Config::default();
-        assert_eq!(cfg.pane_side(), PaneSide::Bottom);
+        assert_eq!(cfg.pane_side(), PaneSide::Right);
         let (tab, row) = locate(SettingKind::SessionPane).unwrap();
         assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
-        assert_eq!(cfg.value_label(SettingKind::SessionPane), "bottom");
+        assert_eq!(cfg.value_label(SettingKind::SessionPane), "right");
         cfg.cycle(tab, row, 0);
-        assert_eq!(cfg.pane_side(), PaneSide::Right);
+        assert_eq!(cfg.pane_side(), PaneSide::Bottom);
+        assert_eq!(cfg.value_label(SettingKind::SessionPane), "bottom");
         cfg.cycle(tab, row, 1);
-        assert_eq!(cfg.pane_side(), PaneSide::Left);
-        assert_eq!(cfg.value_label(SettingKind::SessionPane), "left");
-        cfg.cycle(tab, row, 1);
-        assert_eq!(cfg.pane_side(), PaneSide::Bottom, "and round again");
+        assert_eq!(cfg.pane_side(), PaneSide::Right, "and round again");
         cfg.cycle(tab, row, -1);
-        assert_eq!(cfg.pane_side(), PaneSide::Left, "either arrow walks it");
+        assert_eq!(cfg.pane_side(), PaneSide::Bottom, "either arrow walks it");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        assert_eq!(load_from(&path).pane_side(), PaneSide::Left);
+        assert_eq!(load_from(&path).pane_side(), PaneSide::Bottom);
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(raw.get("session_pane"), Some(&serde_json::json!("left")));
+        assert_eq!(raw.get("session_pane"), Some(&serde_json::json!("bottom")));
 
         let older: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(older.pane_side(), PaneSide::Bottom, "predating the key");
+        assert_eq!(older.pane_side(), PaneSide::Right, "predating the key");
         let mut odd: Config = serde_json::from_str(r#"{"session_pane": "top"}"#).unwrap();
-        assert_eq!(odd.pane_side(), PaneSide::Bottom, "a word off the list");
+        assert_eq!(odd.pane_side(), PaneSide::Right, "a word off the list");
         odd.cycle(tab, row, 0);
-        assert_eq!(odd.pane_side(), PaneSide::Right, "steps on from the bottom");
+        assert_eq!(odd.pane_side(), PaneSide::Bottom, "steps on from the right");
+        let left: Config = serde_json::from_str(r#"{"session_pane": "left"}"#).unwrap();
+        assert_eq!(left.pane_side(), PaneSide::Right, "the retired left side");
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,

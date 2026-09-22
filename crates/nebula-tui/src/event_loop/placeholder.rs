@@ -186,6 +186,7 @@ pub(super) fn stage_agent(
         // the row does not jump when the real one replaces it.
         status_changed_at: now_ms(),
         alive: false,
+        issue_url: None,
         recent_prompts: Vec::new(),
     });
     if let Some(i) = project.and_then(|id| {
@@ -646,6 +647,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: crate::app::now_ms(),
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         }
     }

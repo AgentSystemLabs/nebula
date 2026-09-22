@@ -243,14 +243,23 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   the **selected project**, most recently touched first, as a wall
   of cards — up to four a row, fewer as the terminal narrows,
   under a header of **PROJECT TABS** — ` +   web ●1 ×   api ●2 ●1 ×` — one tab per project you
-  have opened, the most recently opened first, right after the `+`, and a count of the grid's cards on the
+  have opened, the one you last worked in first, right after the `+`, and a count of the grid's cards on the
   right. The tab the grid is on is lit, a raised chip with its name in the accent. The tabs are how
   you move between projects — there is no level above the grid to walk out to. Opening a project
-  that has no tab yet — from the `+`, a `/` jump, a folder just opened — puts one first, next to the `+`;
-  switching between tabs already open moves none of them, so a tab stays where you last found it.
+  that has no tab yet — from the `+`, a `/` jump, a folder just opened — puts one first, next to the `+`,
+  and so does working in one: launching a session there (a `^P` launch into another project included),
+  opening a shell or a worktree there, sending a follow-up, or typing into one of its sessions in the
+  pane moves its tab to the front, so the header reads from the project you last worked in, left to
+  right. Only switching to a tab moves none of them, so `[` / `]` walk a row that holds still.
   A click on a tab, `[` / `]` for the tab to the left / right (stopping at either end), or a digit `1`–`9` for
   the Nth from the left opens that project's sessions, on the card you last left it on — its session
-  back in the pane — or its first card on a first visit. From the keyboard the header can also be
+  back in the pane — or its first card on a first visit. A project with no sessions yet — a folder
+  just opened, or any other — opens on the empty grid with the pane folded away, however it was
+  opened (a tab, the `+`, a `/` jump), so the nebula has the whole body; whatever the pane was
+  reading, a session or a terminal, runs on in the project you left and is never shown here.
+  `` ^` `` brings the pane up empty — one press, since there was nothing on screen to fold — with
+  `t opens a terminal here` on its strip, a button as well as the key; the terminal comes up on
+  its own tab with the keys in it. From the keyboard the header can also be
   walked: `k`,`k` (`↑`,`↑`) on the top row of cards hands the keys up to the tabs, with a cursor of
   their own on the lit tab; `h`/`l` (`←`/`→`) move it and the grid switches with it, each project
   shown on its last-focused card as the cursor passes, and `Enter` — or `j`,`j` (`↓`,`↓`) back
@@ -265,8 +274,8 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   empty, so a quiet project is its bare name. The tab's name sweeps too, on the loudest of them:
   red while a session waits on you, else yellow while one is mid-turn, else blue while a finish is
   left unread — and holds still once the project is quiet. The sweep recolors the name in place,
-  so no tab moves; the animations setting turns it off. The `+` in front of the tabs — or `⌘P`, from the cards or from inside the pane under them, or
-  the key `+` where ⌘ never arrives —
+  so no tab moves; the animations setting turns it off. The `+` in front of the tabs — or the
+  key `+` from the cards, or `⌘P` from inside the pane where the terminal sends ⌘ —
   drops the PROJECT DROPDOWN: every project on the machine — the
   ones with a session waiting on you first, then the ones running, then the rest most recently
   worked in — the one in front of you ticked and each with how many sessions it holds, and a last
@@ -301,9 +310,10 @@ sentence reads as one (what still does not fit ends in an ellipsis). The pull re
   ends, `j` and `k` move down the column. The wheel moves nothing: a notch over the cards is
   ignored, so a trackpad cannot swap the pane out from under the card you are reading. The window
   scrolls only as far as it must to keep the cursor's card on screen.
-- **The pane** runs along the bottom, under the cards — or down the right or the left side of them,
-  full height and half the width, with Settings → Appearance → **Session pane** (`session_pane`; a
-  window too narrow for it beside a column of cards puts it back along the bottom until there is
+- **The pane** runs down the right side of the cards, full height and half the width — or along
+  the bottom, under them, with the `⬓` button just before the `×` on its tab strip (`◨` there moves
+  it back) or Settings → Appearance → **Session pane** (`session_pane`, which the button writes; a
+  window too narrow for it beside a column of cards lays it along the bottom until there is
   room) — and reads whichever card the cursor is on:
   `SESSION · polish-nav` on its header and that session live under it, swapping as you walk the grid,
   so stepping across a wall of cards reads each one's progress in turn. It is the selected session, so
@@ -329,7 +339,7 @@ sentence reads as one (what still does not fit ends in an ellipsis). The pull re
   the way to hand a wall of sessions their next instructions one after another without opening any of
   them. See [the FOLLOW-UP COMPOSER](#the-follow-up-composer).
 - **Stepping into one** is Enter (or `Tab`, `^→`, or a double-click): the keys cross into the pane
-  along the bottom, where that session is already running, with its input locked and the grid still
+  beside the cards, where that session is already running, with its input locked and the grid still
   up over it — the same place a click into the pane lands. `` ^` `` hands the keys back to the cards,
   and a second `` ^` `` folds the pane away.
 - **Opening one full-screen** is `z`: that session takes the whole screen — the grid and its pane
@@ -348,7 +358,13 @@ sentence reads as one (what still does not fit ends in an ellipsis). The pull re
   out to: `Esc` lets the card go and a second one does nothing, and `k` on the top row stays put.
 
 Every other key acts on the session under the cursor — `a` archives, `d` deletes, `g` opens its
-diff, `m` its menu, `/` jumps, `s` opens Settings.
+diff, `m` its menu, `/` jumps, `s` opens Settings. `a` asks first, always: a CONFIRM DIALOG names
+the session, `Enter` or `y` archives it and `Esc` or `n` keeps it, so a letter aimed at an agent
+that lands on the grid archives nothing — and saying yes is cheap, since `u` brings it back. The
+cursor lands on the card before the one archived. A held `a` opens one dialog and archives nothing
+by itself; a held `u` in the ARCHIVED VIEW unarchives one card, and the next needs the key let go
+and pressed again (on a terminal with the kitty keyboard protocol, which is what tells a held key's
+repeats from a fresh press; without it a long hold still walks the row).
 
 **`⇧A` is the ARCHIVED VIEW**: the same grid, of the project's archived sessions instead of its live
 ones, with the header counting them under their own word (`3 archived sessions`). `u` unarchives the
