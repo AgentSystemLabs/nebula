@@ -1,5 +1,7 @@
 <div align="center">
 
+*"Whatever you do, work heartily, as for the Lord and not for men."* — Colossians 3:23 (ESV)
+
 # nebula
 
 **Mission control for your coding agents.**
