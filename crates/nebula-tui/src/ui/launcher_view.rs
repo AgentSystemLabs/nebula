@@ -584,8 +584,9 @@ const ARCHIVED_MARK: &str = "▪ ";
 /// One session's card: its name and how long since it last moved, where
 /// it runs — with that checkout's uncommitted file count — and with what,
 /// its pull request, and the last thing it was
-/// asked to do. The cursor's card takes the selection fill and an accent
-/// border; every other card's frame answers to its status ([`card_edge`]).
+/// asked to do. The cursor's card takes an accent border and no fill — the
+/// outline alone marks it; every other card's frame answers to its status
+/// ([`card_edge`]).
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
     f: &mut Frame,
@@ -602,9 +603,9 @@ fn draw_card(
     let cold = !a.alive && a.cloud_session_id.is_none();
     // An ARCHIVED card is the same card put away, and it is drawn as such:
     // nothing on it is live, so nothing on it is colored. Every part of it
-    // takes `quiet` — dim on its own, lifted to muted under the selection
-    // fill the way `render_row` lifts a dim row, so the card the cursor is
-    // on stays legible — its name the plain `muted`, its STATUS DOT gives
+    // takes `quiet` — dim on its own, lifted to muted on the card the
+    // cursor is on, so that card reads a step brighter than its
+    // neighbours — its name the plain `muted`, its STATUS DOT gives
     // way to `ARCHIVED_MARK`, and its frame squares off (the `block`
     // below). The colors say it at a glance and the two shapes say it
     // again with the colors off, which is the whole grid's answer to
@@ -646,8 +647,7 @@ fn draw_card(
         } else {
             BorderType::Rounded
         })
-        .border_style(Style::default().fg(border))
-        .style(super::row_bar(selected, focused, th));
+        .border_style(Style::default().fg(border));
     let inner = block.inner(area);
     f.render_widget(block, area);
     // One cell of air inside the border, so the text never touches it.
@@ -686,8 +686,8 @@ fn draw_card(
     // An archived name is not the loud thing on the screen any more: it
     // gives up the bold with the rest of the card's weight and sits one
     // step above the quiet the rest of the card is in — muted over dim,
-    // and text over muted on the card the cursor is on, which is the same
-    // step drawn on the brighter fill.
+    // and text over muted on the card the cursor is on, the same one-step
+    // lift `quiet` takes there.
     let name_style = if archived {
         Style::default().fg(if selected { th.text } else { th.muted })
     } else {
