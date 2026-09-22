@@ -16720,7 +16720,7 @@ diff --git a/src/c.rs b/src/c.rs
             let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
             assert_eq!(
                 labels,
-                ["Claude", "Cursor", "Pi", "Muse"],
+                ["Claude", "Cursor", "Pi", "Muse", "Grok Build"],
                 "Codex is absent, not greyed"
             );
 
@@ -16744,7 +16744,7 @@ diff --git a/src/c.rs b/src/c.rs
     #[test]
     fn picker_with_every_harness_disabled_flashes_instead_of_opening() {
         with_config_json(
-            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false, "muse_enabled": false}"#,
+            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false, "muse_enabled":false,"harnesses":{"grok":{"enabled":false}}}"#,
             || {
                 let mut app = App::new();
                 seed_tree(&mut app);
@@ -16808,6 +16808,7 @@ diff --git a/src/c.rs b/src/c.rs
             let (_, cursor_row) = locate_agent("cursor", HarnessField::Enabled).unwrap();
             let (_, pi_row) = locate_agent("pi", HarnessField::Enabled).unwrap();
             let (_, muse_row) = locate_agent("muse", HarnessField::Enabled).unwrap();
+            let (_, grok_row) = locate_agent("grok", HarnessField::Enabled).unwrap();
             let mut app = App::new();
             let mut out = Vec::new();
             open_settings_on(&mut app, tab, &mut out);
@@ -16843,8 +16844,17 @@ diff --git a/src/c.rs b/src/c.rs
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
-            assert!(cfg.muse_enabled, "the last harness cannot be switched off");
-            assert_eq!(cfg.enabled_kinds(), vec![AgentKind::Muse]);
+            assert!(!cfg.muse_enabled);
+            for _ in muse_row..grok_row {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let cfg = crate::config::Config::load();
+            assert!(
+                cfg.kind_enabled(AgentKind::Grok),
+                "the last harness cannot be switched off"
+            );
+            assert_eq!(cfg.enabled_kinds(), vec![AgentKind::Grok]);
             let (text, level) = settings_view(&app).notice.clone().expect("a warning");
             assert!(matches!(level, crate::app::NoticeLevel::Warn));
             assert!(text.contains("at least one harness"), "{text}");

@@ -7,7 +7,7 @@ Everything that can start an AGENT, and what each launch path does differently.
 ## The NEW SESSION PICKER
 
 With a session card selected, pick **New agent** from its `m` menu. A menu asks what to
-run — **Claude**, **Codex**, **Cursor**, **Pi**, or **Muse** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
+run — **Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, or **Grok Build** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
 switched off on the settings overlay's Agents tab and drops out of the menu entirely. Turn on `Hide missing CLIs`
 on the Agents tab and the menu lists only enabled harnesses whose CLI is found on PATH (the daemon still
 checks through the login shell at launch). Your own CLIs join the menu too: add them to config.json
@@ -387,12 +387,12 @@ leaving nebula; `g` opens its diff in the same viewer your worktree diffs use, `
 whose `Enter` posts what you typed on the pull request through `gh pr comment` (the pane re-reads the
 conversation once it lands, and a post `gh` refused brings the box back with your text), `Enter` or a double-click
 opens it in the browser, and `/` finds it by title. Press `n` — or choose **New Claude session**, **New
-Codex session**, **New Cursor session**, **New Pi session** or **New Muse session** from `m` / right-click — to start a SESSION on any enabled
+Codex session**, **New Cursor session**, **New Pi session**, **New Muse session** or **New Grok Build session** from `m` / right-click — to start a SESSION on any enabled
 harness in a checkout of the pull request's head branch — the project's worktree already on that
 branch, or one the DAEMON cuts for it — through the same MODEL / EFFORT submenus as the NEW SESSION
 PICKER, and as directly (`Enter` on a row starts it; `p` or `e` on the row is the launch that takes a
 task first), with a rule that limits all work to that PR and includes its URL: Claude and Pi get it as an appended
-system prompt, Codex, Cursor and Muse as their first prompt. The URL is kept with the AGENT, so RESUME
+system prompt, Grok Build through `--rules`, and Codex, Cursor and Muse as their first prompt. The URL is kept with the AGENT, so RESUME
 reapplies the same scope. Only the row you actually stop on is fetched. While the cursor rests on a
 pull request the Sessions column folds to its bare rule — a pull request has no checkout, so it has
 no sessions to list, and the pane reading it takes the width — and opens again on the next checkout.
@@ -513,7 +513,7 @@ Either way the launch is an ISSUE SESSION. The create carries the issue's URL
 (`CreateAgent::issue_url`); the DAEMON validates it, keeps it with the AGENT row beside a PR
 SESSION's URL, refuses to hand the launch to a PREWARM POOL spare (which booted without it), and on
 every cold spawn and RESUME composes an issue-context rule naming the URL, the checkout and its
-branch — Claude and Pi receive it through `--append-system-prompt`, Codex, Cursor and Muse as the opening
+branch — Claude and Pi receive it through `--append-system-prompt`, Grok Build through `--rules`, and Codex, Cursor and Muse as the opening
 of their first prompt, exactly as the PR rule travels. The harness therefore knows which issue the
 session exists for before it reads your task, is told to read the issue with `gh issue view` first,
 and to reference it in commits and close it from the pull request. The row it creates is an
