@@ -4,7 +4,7 @@
 
 **Mission control for your coding agents.**
 
-Run **Claude Code**, **Codex**, **Cursor**, **Pi** and **Muse** across every project and git WORKTREE you own — from one
+Run **Claude Code**, **Codex**, **Cursor**, **Pi**, **Muse** and **OpenCode** across every project and git WORKTREE you own — from one
 terminal, one keyboard, one tree. They keep working when you close it.
 
 [![Release](https://img.shields.io/github/v/release/AgentSystemLabs/nebula?style=flat-square&color=e8c547&label=release)](https://github.com/AgentSystemLabs/nebula/releases)
@@ -70,6 +70,7 @@ re-checks through the login shell at launch.
 | <img src="https://www.google.com/s2/favicons?domain=cursor.com&sz=128" width="24" height="24" alt="Cursor"> | [Cursor](https://cursor.com/install) | `cursor-agent` | `curl -fsSL https://cursor.com/install \| bash` |
 | <img src="https://www.google.com/s2/favicons?domain=pi.dev&sz=128" width="24" height="24" alt="Pi"> | [Pi](https://pi.dev) | `pi` | `curl -fsSL https://pi.dev/install.sh \| sh` |
 | <img src="https://www.google.com/s2/favicons?domain=meta.com&sz=128" width="24" height="24" alt="Muse"> | [Muse](https://developer.meta.com/ai/lp/muse-code) | `muse` | `curl -fsSL https://dev.meta.ai/install.sh \| bash` |
+| <img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=128" width="24" height="24" alt="OpenCode"> | [OpenCode](https://opencode.ai/docs/) | `opencode` | `curl -fsSL https://opencode.ai/install \| bash` |
 | <img src="https://www.google.com/s2/favicons?domain=x.ai&sz=128" width="24" height="24" alt="Grok"> | [Grok](https://github.com/xai-org/grok-build) | `grok` | `curl -fsSL https://x.ai/cli/install.sh \| bash` |
 
 ## Install
@@ -90,7 +91,7 @@ build speaks a different protocol, in which case it can't attach until that rest
 says so and offers to do it for you. `nebula --version`
 (`-V`) says which binary you are on.
 
-> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, or `muse`.
+> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, or `opencode`.
 > nebula spawns them; it doesn't ship them.
 >
 > Three commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
@@ -120,7 +121,7 @@ in the WORKTREES PANEL to branch off into a real `git worktree`. That's the whol
 two agents in two WORKTREES edit two directories and never collide.
 
 **4. Start the agent.** `n` in the SESSIONS PANEL opens the NEW SESSION PICKER — **Claude**, **Codex**,
-**Cursor**, **Pi** or **Muse**, `→` for MODEL and EFFORT, `Enter` for your defaults — and the session starts, its
+**Cursor**, **Pi**, **Muse** or **OpenCode**, `→` for MODEL and EFFORT, `Enter` for your defaults — and the session starts, its
 pane yours to type the first prompt into. Or skip the picker entirely: `p` from any
 PANEL opens the QUICK PROMPT, you type the task, and an agent starts working on it in the selected
 WORKTREE — or, from the WORKTREES PANEL or with `Ctrl+N` inside the box, in a fresh worktree cut for the
@@ -151,7 +152,9 @@ Claude's prompt box and `/resume` picker on your next prompt.
 
 A Cursor SESSION never goes red: nebula runs `cursor-agent --force` and Cursor reports no permission
 event, so waiting-on-you is not detectable there. A Muse SESSION never goes red either yet: `muse`
-has no managed hooks, so its status is process-based until a hook dialect is mapped.
+has no managed hooks, so its status is process-based until a hook dialect is mapped. An OpenCode
+SESSION does go red: nebula passes no `--auto`, so `opencode` keeps its own permission prompts, and its
+managed plugin reports each one (and each `question` the agent asks you) as it opens and closes.
 
 WORKTREE and PROJECT rows ROLL UP their children: red beats yellow beats done, and a parent's dot is
 blue whenever anything UNSEEN finished under it — so the blue walks up the tree and turns green as
@@ -182,7 +185,8 @@ nebula doesn't poll the agents and it doesn't guess from the screen. At spawn it
 into the WORKTREE's `.claude/settings.local.json`, `.cursor/hooks.json` or `~/.codex/hooks.json` — tagged
 `_nebulaManaged`, your own hooks preserved, rebuilt every spawn — and each one is a fail-soft `curl` to
 the DAEMON's loopback HOOK RECEIVER, authenticated with a per-boot BEARER TOKEN. Pi has no shell hooks,
-so it gets one managed extension at `~/.pi/agent/extensions/nebula.ts` that posts the same events. For the one event no CLI
+so it gets one managed extension at `~/.pi/agent/extensions/nebula.ts` that posts the same events, and
+OpenCode gets one managed plugin at `~/.config/opencode/plugins/nebula.ts` that does the same. For the one event no CLI
 reports — a turn you cancelled with `Esc` — the PROGRESS SCANNER reads the CLI's own OSC 9;4 progress
 escapes straight off the PTY, a signal that survives the cancel and stays busy while a permission prompt
 is open.
@@ -212,9 +216,9 @@ hides the Effort row until you map effort. `nebula config harnesses` prints the 
 from, and a block that stops making sense refuses its launches with the reason while everything else
 keeps working. Ids use lowercase letters, digits and hyphens, and must not collide with a built-in.
 
-`hooks` names a built-in dialect, not your own scripts: `claude`, `codex`, `cursor` or `pi`. At spawn
+`hooks` names a built-in dialect, not your own scripts: `claude`, `codex`, `cursor`, `pi` or `opencode`. At spawn
 nebula installs that dialect's MANAGED HOOKS for the session (the same `.claude/settings.local.json`,
-`.cursor/hooks.json`, `~/.codex/hooks.json` or pi extension the built-in gets), so a CLI that speaks
+`.cursor/hooks.json`, `~/.codex/hooks.json`, pi extension or OpenCode plugin the built-in gets), so a CLI that speaks
 that protocol reports status, prompts and permission waits exactly like the real thing. A
 Claude-compatible CLI with `"hooks": "claude"` even gets title sync and auto-title. Leave `hooks` out
 and the sessions stay process-based: running while the PTY is live, never red. Either way your own

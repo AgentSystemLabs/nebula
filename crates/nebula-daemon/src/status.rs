@@ -116,10 +116,14 @@ pub enum HookEvent {
 }
 
 /// The tools whose call means the turn is waiting on you: Claude's
-/// `AskUserQuestion` and pi's `ask_question` (its managed extension posts
-/// the tool's own name).
+/// `AskUserQuestion`, pi's `ask_question` (its managed extension posts
+/// the tool's own name) and OpenCode's `question` (its managed plugin
+/// posts it on the `question.asked` event).
 fn asks_user(tool_name: Option<&str>) -> bool {
-    matches!(tool_name, Some("AskUserQuestion" | "ask_question"))
+    matches!(
+        tool_name,
+        Some("AskUserQuestion" | "ask_question" | "question")
+    )
 }
 
 impl HookEvent {
@@ -673,6 +677,55 @@ mod tests {
         assert_eq!(status_of(&fx), Some(AgentStatus::Running));
         assert!(fx.contains(&Effect::SaveSessionId("s1".into())));
         let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(10));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    /// OpenCode's question tool is the same wait, and a permission prompt
+    /// its managed plugin posts from a subagent session (the child's id as
+    /// the origin, under the root session's id) is answered by that
+    /// child's own next tool event — the reply the plugin posts as the
+    /// gated tool's PostToolUse.
+    #[test]
+    fn opencode_question_and_subagent_permission_read_as_waiting_on_you() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("ses_1"), now);
+        let fx = m.handle(
+            HookEvent::PreToolUse {
+                tool_name: Some("question".into()),
+                subagent_id: None,
+            },
+            Some("ses_1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        let fx = m.handle(
+            HookEvent::PostToolUse {
+                tool_name: Some("question".into()),
+                subagent_id: None,
+            },
+            Some("ses_1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+        let fx = m.handle(
+            HookEvent::PermissionRequest {
+                subagent_id: Some("ses_child".into()),
+            },
+            Some("ses_1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        let fx = m.handle(
+            HookEvent::PostToolUse {
+                tool_name: Some("bash".into()),
+                subagent_id: Some("ses_child".into()),
+            },
+            Some("ses_1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+        let fx = m.handle(HookEvent::Stop, Some("ses_1"), now);
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
     }
 

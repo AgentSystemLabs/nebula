@@ -1,15 +1,16 @@
 //! The harness registry: one behavior descriptor per agent CLI.
 //!
-//! The five known harnesses ship as a compiled-in table ([`builtin`]);
+//! The six known harnesses ship as a compiled-in table ([`builtin`]);
 //! the user's config adds a `harnesses` map of [`HarnessOverride`]s over
 //! it — disable one, repoint a program, rename a flag, or define a whole
 //! new CLI — and [`registry`] merges the two (plus the legacy
 //! [`CustomHarness`] list) into the effective [`HarnessDescriptor`]s every
 //! surface reads: the `n` picker, the `e` presets, spawn and resume, hooks,
 //! and the Agents tab. Adding a CLI is a config edit; the verification is
-//! that every behavior below is data, with the three genuinely bespoke arg
+//! that every behavior below is data, with the four genuinely bespoke arg
 //! shapings (Cursor's composed model id, Codex's `-c` config pair and its
-//! positional resume, Cloud's `--cloud=`) carried as descriptor fields.
+//! positional resume, OpenCode's `--prompt` flag, Cloud's `--cloud=`)
+//! carried as descriptor fields.
 //!
 //! [`AgentKind`](crate::AgentKind) stays the identity — built-ins by
 //! variant, customs by id beside `AgentKind::Custom` — so exhaustive
@@ -167,6 +168,11 @@ pub struct HarnessDescriptor {
     /// none and launches as-is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions_flag: Option<String>,
+    /// Flag carrying the first prompt (`--prompt`) where the CLI's
+    /// positional is not a prompt (OpenCode's is the project path). None =
+    /// the prompt rides trailing, like every other CLI's positional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_flag: Option<String>,
     /// How a stored session id resumes.
     #[serde(default)]
     pub resume: ResumeSpec,
@@ -174,7 +180,7 @@ pub struct HarnessDescriptor {
     #[serde(default)]
     pub system: SystemSpec,
     /// Hook dialect to install, naming the built-in CLI whose hooks this
-    /// harness speaks (`claude`, `codex`, `cursor`, `pi`). Sessions report
+    /// harness speaks (`claude`, `codex`, `cursor`, `pi`, `opencode`). Sessions report
     /// status, prompts and permission waits like that harness; without one
     /// they stay process-based. A Claude-compatible CLI gets title sync
     /// with `claude`.
@@ -288,6 +294,7 @@ impl HarnessDescriptor {
             Some("codex") => Some(crate::AgentKind::Codex),
             Some("cursor") => Some(crate::AgentKind::Cursor),
             Some("pi") => Some(crate::AgentKind::Pi),
+            Some("opencode") => Some(crate::AgentKind::OpenCode),
             _ => None,
         }
     }
@@ -347,10 +354,10 @@ impl HarnessDescriptor {
         }
         if let Some(dialect) = self.hooks.as_deref().map(str::trim) {
             match dialect {
-                "claude" | "codex" | "cursor" | "pi" => {}
+                "claude" | "codex" | "cursor" | "pi" | "opencode" => {}
                 _ => {
                     return Some(format!(
-                        "harness `{}` hooks `{dialect}`: name a built-in dialect (claude, codex, cursor, pi)",
+                        "harness `{}` hooks `{dialect}`: name a built-in dialect (claude, codex, cursor, pi, opencode)",
                         self.id.trim()
                     ));
                 }
@@ -382,6 +389,7 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
         model: ModelSpec::default(),
         effort: EffortSpec::default(),
         permissions_flag: None,
+        prompt_flag: None,
         resume: ResumeSpec::default(),
         system: SystemSpec::default(),
         hooks: None,
@@ -520,6 +528,38 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
             },
             ..base
         },
+        // OpenCode's model is a `provider/model` id (`opencode models`
+        // lists what this machine has credentials for; a hand-edited id
+        // passes verbatim). No effort flag: reasoning is a per-model
+        // variant chosen inside its own TUI. No permission flag either —
+        // its prompts drive NEEDS FEEDBACK through the managed plugin
+        // (`--auto` is one `permissions_flag` override away). The
+        // positional is the project path, so the first prompt rides
+        // `--prompt`; a resume's `--prompt` is not submitted (verified on
+        // opencode 1.18.32), so no relocation notice.
+        "opencode" => HarnessDescriptor {
+            label: "OpenCode".into(),
+            program: "opencode".into(),
+            model: ModelSpec {
+                flag: Some("--model".into()),
+                default: default_model_choice(),
+                models: models(&[
+                    "opencode/big-pickle",
+                    "anthropic/claude-fable-5-1",
+                    "anthropic/claude-opus-5",
+                    "anthropic/claude-sonnet-5",
+                    "openai/gpt-5.5",
+                ]),
+                catalog: None,
+            },
+            prompt_flag: Some("--prompt".into()),
+            resume: ResumeSpec {
+                flag: Some("--session".into()),
+                ..ResumeSpec::default()
+            },
+            hooks: Some("opencode".into()),
+            ..base
+        },
         _ => return None,
     })
 }
@@ -623,6 +663,8 @@ pub struct HarnessOverride {
     #[serde(default, skip_serializing_if = "Clearable::is_keep")]
     pub permissions_flag: Clearable<String>,
     #[serde(default, skip_serializing_if = "Clearable::is_keep")]
+    pub prompt_flag: Clearable<String>,
+    #[serde(default, skip_serializing_if = "Clearable::is_keep")]
     pub resume_flag: Clearable<String>,
     #[serde(default, skip_serializing_if = "Clearable::is_keep")]
     pub resume_subcommand: Clearable<String>,
@@ -678,6 +720,7 @@ impl HarnessDescriptor {
             self.effort.offered = offered;
         }
         over.permissions_flag.apply_to(&mut self.permissions_flag);
+        over.prompt_flag.apply_to(&mut self.prompt_flag);
         over.resume_flag.apply_to(&mut self.resume.flag);
         over.resume_subcommand.apply_to(&mut self.resume.subcommand);
         if let Some(cd) = over.resume_cd {
@@ -710,7 +753,7 @@ pub struct CustomHarness {
     /// is empty, and what persisted sessions point back at. Lowercase
     /// letters, digits and hyphens; must be unique within the list and
     /// must not collide with a built-in id (`claude`, `codex`, `cursor`,
-    /// `pi`, `muse`).
+    /// `pi`, `muse`, `opencode`).
     pub id: String,
     /// Display label for the picker and session rows. Empty falls back
     /// to the id.
@@ -771,6 +814,7 @@ impl CustomHarness {
             },
             effort: EffortSpec::default(),
             permissions_flag: None,
+            prompt_flag: None,
             resume: ResumeSpec::default(),
             system: SystemSpec::default(),
             hooks: self.hooks.clone(),
@@ -850,6 +894,7 @@ pub fn registry(
             model: ModelSpec::default(),
             effort: EffortSpec::default(),
             permissions_flag: None,
+            prompt_flag: None,
             resume: ResumeSpec::default(),
             system: SystemSpec::default(),
             hooks: None,
@@ -939,7 +984,7 @@ mod tests {
     #[test]
     fn builtins_cover_every_builtin_kind() {
         let all = builtins();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
                 continue;
@@ -975,6 +1020,15 @@ mod tests {
         assert!(!muse.resumes());
         assert_eq!(muse.hooks, None);
         assert!(muse.effort.offered, "muse keeps its reserved Effort row");
+        let opencode = builtin("opencode").unwrap();
+        assert_eq!(opencode.program, "opencode");
+        assert_eq!(opencode.prompt_flag.as_deref(), Some("--prompt"));
+        assert_eq!(opencode.resume.flag.as_deref(), Some("--session"));
+        assert_eq!(opencode.hook_dialect(), Some(AgentKind::OpenCode));
+        assert_eq!(opencode.permissions_flag, None, "its prompts drive red");
+        assert!(!opencode.effort.offered, "no effort flag, no Effort row");
+        assert!(!opencode.relocation_prompt);
+        assert!(!opencode.claude_like());
     }
 
     #[test]
@@ -1034,13 +1088,13 @@ mod tests {
         let ids: Vec<&str> = all.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["claude", "codex", "cursor", "pi", "muse", "zed", "agy"]
+            vec!["claude", "codex", "cursor", "pi", "muse", "opencode", "zed", "agy"]
         );
         assert!(!all[0].enabled, "the claude override applied");
-        assert_eq!(all[5].program, "agy", "legacy entry converts");
-        assert_eq!(all[6].program, "agy", "map-only entry resolves");
+        assert_eq!(all[6].program, "agy", "legacy entry converts");
+        assert_eq!(all[7].program, "agy", "map-only entry resolves");
         assert!(
-            !all[6].effort.offered,
+            !all[7].effort.offered,
             "a bare program stays Model-only like a legacy custom"
         );
     }
@@ -1103,7 +1157,7 @@ mod tests {
         broken.program = "  ".into();
         let all = registry(&BTreeMap::new(), &[broken]);
         assert!(resolve(&all, AgentKind::Custom, Some("broken")).is_err());
-        assert_eq!(usable(&all).len(), 5, "the broken entry is hidden");
+        assert_eq!(usable(&all).len(), 6, "the broken entry is hidden");
     }
 
     #[test]
@@ -1112,6 +1166,7 @@ mod tests {
         assert!(custom("Agy").problem().is_some());
         assert!(custom("claude").problem().is_some());
         assert!(custom("muse").problem().is_some());
+        assert!(custom("opencode").problem().is_some());
         let claude_hooks = CustomHarness {
             hooks: Some("claude".into()),
             ..custom("agy")

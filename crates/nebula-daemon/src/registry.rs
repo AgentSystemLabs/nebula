@@ -2363,6 +2363,12 @@ impl Daemon {
             Some(AgentKind::Pi) => {
                 hooks::pi_extension::install(&hooks::pi_extension::pi_agent_dir())
             }
+            // OpenCode runs TypeScript plugins, likewise: one managed
+            // plugin in its global config dir (globbed at startup, no
+            // trust prompt) serves every worktree.
+            Some(AgentKind::OpenCode) => {
+                hooks::opencode_plugin::install(&hooks::opencode_plugin::opencode_config_dir())
+            }
             _ => Ok(()),
         };
         if let Err(e) = install_result {
@@ -3085,8 +3091,13 @@ fn agent_spawn_command_with(
             });
         }
     }
-    // The starting prompt rides trailing, like every CLI's positional.
+    // The starting prompt rides trailing, like every CLI's positional —
+    // or its own flag where the positional is something else (OpenCode's
+    // `--prompt`: its positional is the project path).
     if let Some(p) = initial_prompt {
+        if let Some(flag) = harness.prompt_flag.as_deref() {
+            args.push(flag.to_string());
+        }
         args.push(p);
     }
     (program, args, resumed)
@@ -3519,6 +3530,21 @@ mod tests {
             agent_spawn_command(AgentKind::Muse, Some("sid-9"), None, None, None),
             ("muse".into(), vec![], false)
         );
+        // OpenCode boots bare like Codex (no system-prompt flag) and with
+        // no permission flag (its prompts drive NEEDS FEEDBACK through the
+        // managed plugin); a stored id resumes by `--session`.
+        assert_eq!(
+            agent_spawn_command(AgentKind::OpenCode, None, None, None, None),
+            ("opencode".into(), vec![], false)
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::OpenCode, Some("ses_9"), None, None, None),
+            (
+                "opencode".into(),
+                vec!["--session".to_string(), "ses_9".to_string()],
+                true
+            )
+        );
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None),
@@ -3640,6 +3666,25 @@ mod tests {
             (
                 "muse".into(),
                 vec!["--model".to_string(), "spark".to_string()],
+                false
+            )
+        );
+        // OpenCode takes a `provider/model` id verbatim and has no effort
+        // flag: effort is dropped, never sent.
+        assert_eq!(
+            agent_spawn_command(
+                AgentKind::OpenCode,
+                None,
+                Some("anthropic/claude-sonnet-5"),
+                Some("high"),
+                None
+            ),
+            (
+                "opencode".into(),
+                vec![
+                    "--model".to_string(),
+                    "anthropic/claude-sonnet-5".to_string()
+                ],
                 false
             )
         );
@@ -4068,13 +4113,58 @@ mod tests {
         );
     }
 
+    /// OpenCode's positional is the project path, so a starting prompt —
+    /// an AGENT PRESET's task, a PR SESSION's rule — rides `--prompt`
+    /// after the model flag, where every other CLI takes a trailing
+    /// positional; the field changes nothing for them.
+    #[test]
+    fn opencode_first_prompt_rides_its_flag() {
+        let all = test_registry();
+        let opencode = test_harness(&all, AgentKind::OpenCode);
+        let (program, args, resumed) = agent_spawn_command_with(
+            &opencode,
+            None,
+            Some(Path::new(TEST_CWD)),
+            Some("opencode/big-pickle"),
+            None,
+            None,
+            Some("Fix auth"),
+            None,
+            true,
+        );
+        assert_eq!(program, "opencode");
+        assert_eq!(
+            args,
+            ["--model", "opencode/big-pickle", "--prompt", "Fix auth"]
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert!(!resumed);
+        let claude = test_harness(&all, AgentKind::Claude);
+        let (_, args, _) = agent_spawn_command_with(
+            &claude,
+            None,
+            Some(Path::new(TEST_CWD)),
+            None,
+            None,
+            None,
+            Some("Fix auth"),
+            None,
+            false,
+        );
+        assert_eq!(args, vec!["Fix auth".to_string()]);
+    }
+
     /// The relocation notice reaches the CLIs whose resume submits a
     /// trailing prompt — Claude, codex and pi — and names the checkout;
-    /// cursor's is unverified, so its relocated session reopens silent.
-    /// (Codex was gated out until #39: `codex resume <id> --yolo` sat at
-    /// Ready in the worktree until the user typed "continue".)
+    /// cursor's is unverified and OpenCode's `--session <id> --prompt` is
+    /// not submitted (verified on opencode 1.18.32), so their relocated
+    /// sessions reopen silent. (Codex was gated out until #39: `codex
+    /// resume <id> --yolo` sat at Ready in the worktree until the user
+    /// typed "continue".)
     #[test]
-    fn relocation_prompt_reaches_every_kind_but_cursor() {
+    fn relocation_prompt_reaches_every_kind_but_cursor_and_opencode() {
         let feat = Worktree {
             id: WorktreeId("feat".into()),
             project_id: ProjectId("p".into()),
@@ -4095,6 +4185,8 @@ mod tests {
         }
         let cursor = test_harness(&all, AgentKind::Cursor);
         assert_eq!(relocation_prompt(cursor.relocation_prompt, &feat), None);
+        let opencode = test_harness(&all, AgentKind::OpenCode);
+        assert_eq!(relocation_prompt(opencode.relocation_prompt, &feat), None);
 
         // And the codex respawn it feeds: resumed, re-rooted in the
         // worktree, and opening on the notice.

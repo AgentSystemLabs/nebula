@@ -7,7 +7,7 @@ Everything that can start an AGENT, and what each launch path does differently.
 ## The NEW SESSION PICKER
 
 With a session card selected, pick **New agent** from its `m` menu. A menu asks what to
-run — **Claude**, **Codex**, **Cursor**, **Pi**, or **Muse** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
+run — **Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, or **OpenCode** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
 switched off on the settings overlay's Agents tab and drops out of the menu entirely. Turn on `Hide missing CLIs`
 on the Agents tab and the menu lists only enabled harnesses whose CLI is found on PATH (the daemon still
 checks through the login shell at launch). Your own CLIs join the menu too: add them to config.json
@@ -57,7 +57,9 @@ things it is configured to ask about. Codex is spawned with `--yolo` and Cursor 
 **neither of those two ever stops to ask**: they edit files and run commands on their own judgment for
 the life of the SESSION, and nothing in the picker or the settings overlay softens that. Pi has no
 permission gate to begin with — nebula passes no flag, and it runs its tools as it sees fit. Muse is
-the same: no flag mapped yet. Pick the
+the same: no flag mapped yet. OpenCode keeps its own permission prompts: nebula passes no `--auto`, so it
+stops and asks like Claude does, and a `permissions_flag` of `--auto` in its `harnesses` entry is how you
+opt out of that. Pick the
 harness with that in mind, especially in the ROOT WORKTREE.
 
 The same choice reaches the STATUS DOT, because an AGENT can only report what its hook set can see.
@@ -78,7 +80,14 @@ posts pi's `session_start`, `before_agent_start`, `agent_end` and `ask_question`
 `SessionStart`, `UserPromptSubmit`, `Stop` and `PreToolUse` / `PostToolUse`, and any blocking prompt an
 extension raises mid-run as `PermissionRequest` — so a Pi row goes yellow, red while its `ask_question`
 tool waits on you, and green when the run ends, a cancelled run included. Muse has no hooks at all yet:
-its row is yellow while the PTY is live and green when the process ends, and it never goes red.
+its row is yellow while the PTY is live and green when the process ends, and it never goes red. OpenCode
+runs TypeScript plugins, so nebula installs one managed plugin (`~/.config/opencode/plugins/nebula.ts`,
+inert outside nebula) that posts OpenCode's `chat.message` as `UserPromptSubmit`, its `session.status`
+/ `session.idle` as `Stop`, `permission.asked` / `permission.replied` as `PermissionRequest` and the
+gated tool's `PostToolUse`, and its `question` tool's `question.asked` / `question.replied` as
+`PreToolUse` / `PostToolUse` — so an OpenCode row goes yellow, red while a permission or a question
+waits on you (one raised from a subagent session included), and green when the turn ends, an aborted
+one included.
 
 ## AGENT PRESETS
 
@@ -190,7 +199,7 @@ newest ten per session, so raising the number later has history to draw from at 
 
 The text is the prompt as you typed it, not a paraphrase. The DAEMON reads it off the
 `UserPromptSubmit` hook payload every harness sends (Claude, Codex and Cursor name it `prompt`; Pi's
-managed extension posts the same field), collapses its whitespace and keeps the first 200 characters,
+managed extension and OpenCode's managed plugin post the same field), collapses its whitespace and keeps the first 200 characters,
 so a pasted file shows as its opening line. It costs the agent nothing — no extra turn, no tool call,
 nothing added to its context — which is why it is the prompt and not a summary the model wrote.
 Prompts nebula composes itself, such as a PR SESSION's scope or the note a `nebula worktree`
@@ -385,12 +394,12 @@ leaving nebula; `g` opens its diff in the same viewer your worktree diffs use, `
 whose `Enter` posts what you typed on the pull request through `gh pr comment` (the pane re-reads the
 conversation once it lands, and a post `gh` refused brings the box back with your text), `Enter` or a double-click
 opens it in the browser, and `/` finds it by title. Press `n` — or choose **New Claude session**, **New
-Codex session**, **New Cursor session**, **New Pi session** or **New Muse session** from `m` / right-click — to start a SESSION on any enabled
+Codex session**, **New Cursor session**, **New Pi session**, **New Muse session** or **New OpenCode session** from `m` / right-click — to start a SESSION on any enabled
 harness in a checkout of the pull request's head branch — the project's worktree already on that
 branch, or one the DAEMON cuts for it — through the same MODEL / EFFORT submenus as the NEW SESSION
 PICKER, and as directly (`Enter` on a row starts it; `p` or `e` on the row is the launch that takes a
 task first), with a rule that limits all work to that PR and includes its URL: Claude and Pi get it as an appended
-system prompt, Codex, Cursor and Muse as their first prompt. The URL is kept with the AGENT, so RESUME
+system prompt, Codex, Cursor, Muse and OpenCode as their first prompt. The URL is kept with the AGENT, so RESUME
 reapplies the same scope. Only the row you actually stop on is fetched. While the cursor rests on a
 pull request the Sessions column folds to its bare rule — a pull request has no checkout, so it has
 no sessions to list, and the pane reading it takes the width — and opens again on the next checkout.
@@ -507,7 +516,7 @@ Either way the launch is an ISSUE SESSION. The create carries the issue's URL
 (`CreateAgent::issue_url`); the DAEMON validates it, keeps it with the AGENT row beside a PR
 SESSION's URL, refuses to hand the launch to a PREWARM POOL spare (which booted without it), and on
 every cold spawn and RESUME composes an issue-context rule naming the URL, the checkout and its
-branch — Claude and Pi receive it through `--append-system-prompt`, Codex, Cursor and Muse as the opening
+branch — Claude and Pi receive it through `--append-system-prompt`, Codex, Cursor, Muse and OpenCode as the opening
 of their first prompt, exactly as the PR rule travels. The harness therefore knows which issue the
 session exists for before it reads your task, is told to read the issue with `gh issue view` first,
 and to reference it in commits and close it from the pull request. The row it creates is an
