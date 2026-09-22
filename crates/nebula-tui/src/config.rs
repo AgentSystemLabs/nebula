@@ -1132,6 +1132,11 @@ pub struct Config {
     /// documents a reasoning flag; it stores but sends nothing.
     pub muse_model: String,
     pub muse_effort: String,
+    /// OpenCode's `--model` id (`provider/model`, passed verbatim). No
+    /// effort key: OpenCode has no effort flag — reasoning is a per-model
+    /// variant picked inside its own TUI — so its Agents section has no
+    /// Effort row and nothing to store for one.
+    pub opencode_model: String,
     /// Which AGENT KINDS the NEW SESSION PICKER offers. Off leaves that
     /// harness out of the picker and the PR SESSION picker (and, for
     /// Claude, out of the standing PREWARM POOL slot); sessions that already
@@ -1142,6 +1147,7 @@ pub struct Config {
     pub cursor_enabled: bool,
     pub pi_enabled: bool,
     pub muse_enabled: bool,
+    pub opencode_enabled: bool,
     /// When on, the New session picker lists only enabled harnesses whose
     /// CLI is found on this machine's PATH. Off by default: a login shell
     /// (mise, brew shims) can see CLIs a plain PATH lookup misses, and the
@@ -1338,11 +1344,13 @@ impl Default for Config {
             pi_effort: DEFAULT_CHOICE.into(),
             muse_model: DEFAULT_CHOICE.into(),
             muse_effort: DEFAULT_CHOICE.into(),
+            opencode_model: DEFAULT_CHOICE.into(),
             claude_enabled: true,
             codex_enabled: true,
             cursor_enabled: true,
             pi_enabled: true,
             muse_enabled: true,
+            opencode_enabled: true,
             hide_uninstalled_harnesses: false,
             custom_harnesses: Vec::new(),
             harnesses: BTreeMap::new(),
@@ -1529,6 +1537,14 @@ impl Config {
             ),
             "pi" => (&self.pi_enabled, &self.pi_model, &self.pi_effort),
             "muse" => (&self.muse_enabled, &self.muse_model, &self.muse_effort),
+            // OpenCode has no effort key: nothing to fall back to there.
+            "opencode" => {
+                return (
+                    (!self.opencode_enabled).then_some(false),
+                    non_default(&self.opencode_model),
+                    None,
+                )
+            }
             _ => return (None, None, None),
         };
         (
@@ -1928,6 +1944,7 @@ impl Config {
             "cursor" => self.cursor_enabled = enabled,
             "pi" => self.pi_enabled = enabled,
             "muse" => self.muse_enabled = enabled,
+            "opencode" => self.opencode_enabled = enabled,
             _ => self.harness_override_mut(id).enabled = Some(enabled),
         }
     }
@@ -1939,6 +1956,7 @@ impl Config {
             "cursor" => self.cursor_model = model,
             "pi" => self.pi_model = model,
             "muse" => self.muse_model = model,
+            "opencode" => self.opencode_model = model,
             _ => self.harness_override_mut(id).model_default = Some(model),
         }
     }
@@ -4090,7 +4108,7 @@ mod tests {
     fn harness_toggles_default_on_and_persist() {
         let mut cfg = Config::default();
         assert!(cfg.claude_enabled && cfg.codex_enabled && cfg.cursor_enabled);
-        assert!(cfg.pi_enabled && cfg.muse_enabled);
+        assert!(cfg.pi_enabled && cfg.muse_enabled && cfg.opencode_enabled);
         let builtin: Vec<AgentKind> = AgentKind::ALL
             .into_iter()
             .filter(|kind| *kind != AgentKind::Custom)
@@ -4112,7 +4130,8 @@ mod tests {
                 AgentKind::Cursor,
                 AgentKind::Pi,
                 AgentKind::Muse,
-                AgentKind::Grok
+                AgentKind::Grok,
+                AgentKind::OpenCode
             ],
             "the disabled kind drops out, order kept"
         );
@@ -4140,7 +4159,7 @@ mod tests {
 
         // Every kind off is representable (a hand edit), and reads as empty.
         let cfg: Config = serde_json::from_str(
-            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false,"muse_enabled":false,"harnesses":{"grok":{"enabled":false}}}"#,
+            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false,"muse_enabled":false,"opencode_enabled":false,"harnesses":{"grok":{"enabled":false}}}"#,
         )
         .unwrap();
         assert!(cfg.enabled_kinds().is_empty());
@@ -4225,6 +4244,7 @@ mod tests {
                 (AgentKind::Pi, None),
                 (AgentKind::Muse, None),
                 (AgentKind::Grok, None),
+                (AgentKind::OpenCode, None),
             ]
         );
 
@@ -4239,8 +4259,8 @@ mod tests {
         )
         .unwrap();
         let offered = cfg.offered_harnesses();
-        assert_eq!(offered.len(), 7);
-        assert_eq!(offered[6], (AgentKind::Custom, Some("agy".into())));
+        assert_eq!(offered.len(), 8);
+        assert_eq!(offered[7], (AgentKind::Custom, Some("agy".into())));
         let rows = cfg.agent_rows();
         assert!(rows.contains(&("off".to_string(), HarnessField::Enabled)));
         assert!(rows.contains(&("broken".to_string(), HarnessField::Enabled)));
@@ -4369,6 +4389,23 @@ mod tests {
         assert_eq!(cfg.default_effort(AgentKind::Muse), None);
         assert_eq!(AgentKind::parse("muse"), Some(AgentKind::Muse));
         assert_eq!(AgentKind::Muse.cli_program(), "muse");
+        // OpenCode passes a `provider/model` id through verbatim and has
+        // no effort key at all: no Effort row to locate.
+        assert_eq!(cfg.default_model(AgentKind::OpenCode), None);
+        assert_eq!(cfg.default_effort(AgentKind::OpenCode), None);
+        cfg.opencode_model = "anthropic/claude-sonnet-5".into();
+        assert_eq!(
+            cfg.default_model(AgentKind::OpenCode).as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        assert_eq!(cfg.default_effort(AgentKind::OpenCode), None);
+        assert_eq!(AgentKind::parse("opencode"), Some(AgentKind::OpenCode));
+        assert_eq!(AgentKind::OpenCode.cli_program(), "opencode");
+        assert!(locate_in(&cfg, "opencode", HarnessField::Model).is_some());
+        assert!(
+            locate_in(&cfg, "opencode", HarnessField::Effort).is_none(),
+            "no Effort row"
+        );
         let (tab, row) = locate_in(&cfg, "pi", HarnessField::Effort).unwrap();
         cfg.cycle(tab, row, 1);
         assert_eq!(cfg.agent_value("pi", HarnessField::Effort), "max");
@@ -4728,6 +4765,10 @@ mod tests {
                             "Effort".to_string()
                         ]
                     ),
+                    (
+                        "OpenCode".to_string(),
+                        vec!["Enabled".to_string(), "Model".to_string()]
+                    ),
                 ]
             );
 
@@ -4782,6 +4823,7 @@ mod tests {
                         "Pi",
                         "Muse",
                         "Grok Build",
+                        "OpenCode",
                         "agy"
                     ]
                 );

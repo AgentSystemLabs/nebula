@@ -1,12 +1,14 @@
 //! Agent-CLI hook receiver: a loopback-only HTTP endpoint the shell hook
 //! one-liners POST to (`/api/hooks/claude`, `/api/hooks/codex`,
-//! `/api/hooks/cursor`, and `/api/hooks/pi`). Codex mirrors Claude's hook
+//! `/api/hooks/cursor`, `/api/hooks/pi` and `/api/hooks/opencode`). Codex
+//! mirrors Claude's hook
 //! events and payload shape; cursor speaks its own dialect, but its
 //! installer translates event names into the `hookEvent` query param and
 //! the payload fields are aliased here (`conversation_id`, `subagent_id`,
 //! `workspace_roots`); pi has no shell hooks at all — its managed extension
 //! (`pi_extension.rs`) maps pi's events onto the same names and POSTs
-//! Claude-shaped payloads — so one handler serves all four. Fail-soft on
+//! Claude-shaped payloads, and so does OpenCode's managed plugin
+//! (`opencode_plugin.rs`) — so one handler serves all five. Fail-soft on
 //! both sides — a malformed payload still gets a 200 so a broken hook never
 //! faults the user's agent turn.
 //!
@@ -16,6 +18,7 @@
 //! name is not the one Claude holds (CLAUDE TITLE SYNC, `session_title.rs`).
 
 pub mod installer;
+pub mod opencode_plugin;
 pub mod pi_extension;
 
 use crate::session_title::TranscriptRef;
@@ -82,7 +85,7 @@ enum HookDialect {
     /// CLI's stdout, where it lands in the model's context — so on that
     /// event the body must be empty or the instruction, never diagnostics.
     /// Pi's extension reads the same body out of the envelope and appends
-    /// it to the run's system prompt.
+    /// it to the run's system prompt, and so does OpenCode's plugin.
     Injectable,
     /// Cursor: every hook answers with its own gating JSON and drops the
     /// body, so the `{"ok": …}` diagnostics can stay.
@@ -97,12 +100,15 @@ enum HookCli {
     Codex,
     Cursor,
     Pi,
+    OpenCode,
 }
 
 impl HookCli {
     fn dialect(self) -> HookDialect {
         match self {
-            HookCli::Claude | HookCli::Codex | HookCli::Pi => HookDialect::Injectable,
+            HookCli::Claude | HookCli::Codex | HookCli::Pi | HookCli::OpenCode => {
+                HookDialect::Injectable
+            }
             HookCli::Cursor => HookDialect::Plain,
         }
     }
@@ -245,8 +251,9 @@ pub async fn start_hook_server(
     });
     // Claude and Codex UserPromptSubmit hooks pipe this server's response
     // body to the CLI's stdout, where it lands in the model's context —
-    // that's the auto-title instruction channel; pi's extension carries
-    // the same body into its run's system prompt. Cursor's dialect has no
+    // that's the auto-title instruction channel; pi's extension and
+    // OpenCode's plugin carry the same body into the run's system prompt.
+    // Cursor's dialect has no
     // such channel (its hooks answer with their own gating JSON), so it
     // takes the plain route.
     let app = Router::new()
@@ -254,6 +261,7 @@ pub async fn start_hook_server(
         .route("/api/hooks/codex", post(receive_codex_hook))
         .route("/api/hooks/cursor", post(receive_cursor_hook))
         .route("/api/hooks/pi", post(receive_pi_hook))
+        .route("/api/hooks/opencode", post(receive_opencode_hook))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -317,6 +325,18 @@ async fn receive_pi_hook(
     receive_hook(HookCli::Pi, state, query, headers, body).await
 }
 
+/// `/api/hooks/opencode`: OpenCode's managed plugin POSTs Claude-shaped
+/// payloads and carries the injectable reply body into the turn's system
+/// prompt through OpenCode's system-transform hook.
+async fn receive_opencode_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::OpenCode, state, query, headers, body).await
+}
+
 async fn receive_hook(
     cli: HookCli,
     state: Arc<HookServerState>,
@@ -365,7 +385,7 @@ async fn receive_hook(
             payload.transcript_path.as_deref(),
             payload.session_id.as_deref(),
         ),
-        HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
+        HookCli::Codex | HookCli::Cursor | HookCli::Pi | HookCli::OpenCode => None,
     };
     // The prompt rides only its own event, condensed here so the channel
     // never carries a pasted file whole.
@@ -412,7 +432,7 @@ async fn receive_hook(
                     // `TitleState::to_push`, which resolves the dialect).
                     s.to_push().map(str::to_string)
                 }),
-            HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
+            HookCli::Codex | HookCli::Cursor | HookCli::Pi | HookCli::OpenCode => None,
         };
         return (
             StatusCode::OK,
@@ -617,9 +637,9 @@ mod tests {
         assert_eq!(delivery.agent_id.as_str(), "pending");
         assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
 
-        // Codex shares the injectable dialect, and so does pi's extension,
-        // which unwraps the same envelope.
-        for route in ["codex", "pi"] {
+        // Codex shares the injectable dialect, and so do pi's extension
+        // and OpenCode's plugin, which unwrap the same envelope.
+        for route in ["codex", "pi", "opencode"] {
             let (_, body) = http_post(
                 env.port,
                 &format!("/api/hooks/{route}?agentId=pending&hookEvent=UserPromptSubmit"),

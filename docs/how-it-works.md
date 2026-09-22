@@ -115,7 +115,7 @@
   sweep leave that terminal alone, and a run that exits on its own keeps its PTY, so an attach replays
   the ending instead of respawning — a command starts only on the keypress. `Shift+Enter` (or `Shift+O`, from any panel) runs `open`
   once, from the TUI. See [Configuration](configuration.md#the-project-file-nebulajson).
-- **Agents boot `claude`, `codex`, `cursor-agent`, `pi`, `muse`, or a custom registry program.** Creating an agent (`n`) first asks which CLI to
+- **Agents boot `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `opencode`, or a custom registry program.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
   `claude --cloud <task>`; because Claude accepts that description as a process argument, don't put
   secrets in the Cloud task. That CLI prints the new session's id and exits, and the DAEMON reads the
@@ -124,7 +124,7 @@
   Restored agents resume with `claude --resume <session-id>` /
   `codex resume <session-id>` / `cursor-agent --resume <session-id>` (falling back to a fresh session
   when the old one is gone) / `pi --session-id <session-id>` (which creates a missing id instead of
-  dying); `muse` always boots fresh (no resume flag mapped yet). A session's id is saved only once a turn has run in it — the CLI writes the transcript a
+  dying) / `opencode --session <session-id>`; `muse` always boots fresh (no resume flag mapped yet). A session's id is saved only once a turn has run in it — the CLI writes the transcript a
   resume reads on the first prompt — so a CLI booted and never used resumes as nothing. Claude
   ids are checked against the transcripts on disk before the spawn, and one with none boots fresh;
   any resume that exits with an error within 10 s of its spawn is respawned fresh, unless its Claude
@@ -136,7 +136,7 @@
   before the spawn, and an id listed as a `background` session opens as `claude attach <id>`
   instead — the live conversation, which detaching (Ctrl+Z) or archiving the row leaves running. A
   refused resume the job-dir look missed is asked about the same way and re-opened attached. An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
-  work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex, Cursor and Muse as the first prompt of
+  work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex, Cursor, Muse and OpenCode as the first prompt of
   their cold spawn (their transcripts carry it through a resume); nebula persists that URL. An AGENT
   launched from the ISSUES MODAL (`i`) carries the GitHub issue's URL the same way — persisted with
   the row, rebuilt into an issue-context rule on every spawn and resume — so the harness knows which
@@ -202,14 +202,24 @@
   `agent_end` → `Stop` (it fires on an abort too, so a cancelled pi turn goes green on its own), the
   `ask_question` tool's start and end → `PreToolUse` / `PostToolUse`, and a blocking extension prompt
   mid-run → `PermissionRequest`. The file is env-guarded, so a `pi` you run outside nebula loads it and
-  does nothing.
+  does nothing. OpenCode runs TypeScript plugins the same way, so nebula writes one managed plugin into
+  its global config dir (`~/.config/opencode/plugins/nebula.ts`, or `$XDG_CONFIG_HOME/opencode/plugins/`
+  — globbed at startup with no trust prompt, and always on the list whatever `OPENCODE_CONFIG_DIR` adds)
+  that maps its server events onto the same names: `chat.message` → `UserPromptSubmit` (the typed text
+  along for RECENT PROMPTS), `session.status` idle / `session.idle` → `Stop` (an abort ends the same way,
+  so a cancelled turn goes green on its own), `permission.asked` → `PermissionRequest` and
+  `permission.replied` → the gated tool's `PostToolUse` (the one hook an approval fires), and the
+  `question` tool's `question.asked` / `question.replied` → `PreToolUse` / `PostToolUse`. A subagent
+  session's prompts post under the root session's id with the child as the origin, so its answer is its
+  own next tool event. The file is env-guarded like pi's.
 - **Sessions title themselves.** Create a session with the default name and the agent renames it after
   your first prompt — a 3-4 word title describing the ask (e.g. `Fix Login Redirect`), via a
   `nebula rename <title>` command the CLI runs in its own turn (no extra API calls, no MCP server).
   Claude Code and Codex get the instruction injected through the `UserPromptSubmit` hook response — as
   `hookSpecificOutput.additionalContext`, the one envelope both read (the daemon sends it only while the
   session is untitled) — Pi's extension reads the same envelope and appends it to that run's system
-  prompt; Cursor gets a managed `.cursor/rules/nebula-title.mdc` project rule instead,
+  prompt, and OpenCode's plugin carries it into the turn's system prompt through OpenCode's
+  system-transform hook; Cursor gets a managed `.cursor/rules/nebula-title.mdc` project rule instead,
   since its hooks can't inject context. Titling is one-shot and never clobbers a name you typed or set
   with `r` — a late agent attempt is politely declined. `nebula rename --force` overrides.
 - **A Claude session's own name and its row stay tied.** `/rename <name>` inside Claude Code retitles
@@ -253,15 +263,16 @@
   worktree, opening with a note saying where it now runs, so the conversation carries on there without
   you typing anything. Claude learns the rule from a short `--append-system-prompt` nebula passes at
   spawn, plus a `Bash(nebula worktree:*)` permission so the command never prompts; Pi gets the same
-  appended prompt and reopens on the same note. Codex, Cursor and Muse have no system-prompt flag to learn
+  appended prompt and reopens on the same note. Codex, Cursor, Muse and OpenCode have no system-prompt flag to learn
   the rule from, but run the same command when you ask. Codex then reopens on the same note —
   `codex resume <id> --cd <worktree> "<note>"`, the `--cd` because Codex otherwise reopens a resumed
-  session in the directory its transcript recorded, the old checkout. Cursor resumes silent and waits
-  for your next prompt; Muse reboots fresh with no note (no resume flag mapped). The restart is the only way there: an agent CLI can't `cd` out of the
+  session in the directory its transcript recorded, the old checkout. Cursor and OpenCode resume silent
+  and wait for your next prompt (`opencode --session <id> --prompt "<note>"` loads the session but never
+  submits the note); Muse reboots fresh with no note (no resume flag mapped). The restart is the only way there: an agent CLI can't `cd` out of the
   directory it was started in.
 - **Ask the agent for another session and it starts one.** Tell a Claude session "start a new nebula
   session that fixes the login redirect" and it runs `nebula spawn "<task>"`: the daemon starts a second
-  agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse|grok`
+  agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse|grok|opencode`
   names another — opening on that task as its first prompt, so it is working before you look. The new
   row appears in the sessions list on its own (default name, so it titles itself), and the session you
   asked from is untouched: no restart, no focus change. Claude learns this from the same appended system

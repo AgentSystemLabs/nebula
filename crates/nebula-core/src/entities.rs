@@ -63,6 +63,12 @@ pub enum AgentKind {
     /// xAI's Grok Build CLI. Status is process-based until managed hooks
     /// are supported.
     Grok,
+    /// OpenCode (opencode.ai): the `opencode` CLI. Status comes from a
+    /// managed TypeScript plugin rather than shell hooks (see the daemon's
+    /// `hooks::opencode_plugin`); the first prompt rides `--prompt`, since
+    /// its positional is the project path, and a session resumes by
+    /// `--session <id>`.
+    OpenCode,
     /// A user-defined harness from the `custom_harnesses` registry: the
     /// entry id travels beside the session (see `Agent::custom_harness`),
     /// never in this variant. Launches with the entry's program and model
@@ -75,13 +81,14 @@ impl AgentKind {
     /// boot-time CLI probe warm) and should fail to compile if one is added.
     /// `Custom` rides along: it never launches without its registry entry,
     /// so loops over ALL skip it explicitly where a bare kind is meaningless.
-    pub const ALL: [AgentKind; 7] = [
+    pub const ALL: [AgentKind; 8] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Cursor,
         AgentKind::Pi,
         AgentKind::Muse,
         AgentKind::Grok,
+        AgentKind::OpenCode,
         AgentKind::Custom,
     ];
 
@@ -93,6 +100,7 @@ impl AgentKind {
             AgentKind::Pi => "pi",
             AgentKind::Muse => "muse",
             AgentKind::Grok => "grok",
+            AgentKind::OpenCode => "opencode",
             AgentKind::Custom => "custom",
         }
     }
@@ -108,6 +116,7 @@ impl AgentKind {
             "pi" => AgentKind::Pi,
             "muse" => AgentKind::Muse,
             "grok" => AgentKind::Grok,
+            "opencode" => AgentKind::OpenCode,
             _ => return None,
         })
     }
@@ -126,6 +135,7 @@ impl AgentKind {
             AgentKind::Pi => "pi",
             AgentKind::Muse => "muse",
             AgentKind::Grok => "grok",
+            AgentKind::OpenCode => "opencode",
             AgentKind::Custom => "custom",
         }
     }
