@@ -1,9 +1,7 @@
-//! View layer: draws the visible panels + terminal pane + footer, and
-//! records hit regions for mouse interaction.
+//! View layer: draws the LAUNCHER VIEW's grid + terminal pane + footer,
+//! and records hit regions for mouse interaction.
 
-use crate::app::{
-    App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, PromptDialog, SessionRow, WorktreeRow,
-};
+use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, PromptDialog};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
 use crate::keymap::Action;
 use crate::text_input::{TextInput, TextView};
@@ -24,8 +22,8 @@ pub const VIM_MODAL_PCT: (u16, u16) = (94, 92);
 pub(crate) const SPLIT_MODAL_PCT: (u16, u16) = (92, 90);
 /// Outer size of the find-in-files modal, percent of the frame.
 const GREP_MODAL_PCT: (u16, u16) = (88, 76);
-/// Fixed (width, height) of the jump palette — tall enough for a few
-/// projects' headers with their recent sessions under them.
+/// Fixed (width, height) of the jump palette — tall enough for a screenful
+/// of recent sessions.
 const PALETTE_SIZE: (u16, u16) = (64, 22);
 /// Fixed (width, height) of the find-file modal.
 const FILES_SIZE: (u16, u16) = (72, 20);
@@ -33,6 +31,11 @@ const FILES_SIZE: (u16, u16) = (72, 20);
 /// QUICK PROMPT's full hint — `⇧Enter newline` spelled out — fits its
 /// border.
 const TASK_PROMPT_SIZE: (u16, u16) = (80, 14);
+/// The FOLLOW-UP MODAL's size — the LAUNCHER VIEW's next-turn box. Short
+/// and wide: four rows of typing, the same a card's own composer holds
+/// ([`FOLLOW_UP_MAX_LINES`]), since both are a turn's worth of instruction
+/// to a session already running.
+const FOLLOW_UP_PROMPT_SIZE: (u16, u16) = (76, 9);
 
 /// The key hints on a task box's bottom border, widest that fits inside
 /// `width` (the block's, so two columns go to its edges). The QUICK PROMPT
@@ -57,6 +60,17 @@ fn task_prompt_hint(kind: &crate::app::PromptKind, width: u16) -> &'static str {
             " Esc · ⇧↵ · Tab · ↵ "
         } else {
             " Esc · ⇧↵ · ↵ "
+        };
+    }
+    // The FOLLOW-UP MODAL sends a turn to a session already running: no
+    // picker, and Enter sends rather than launching anything.
+    if matches!(kind, crate::app::PromptKind::FollowUp { .. }) {
+        return if width >= 55 {
+            " Enter: send · Shift+Enter/^J: newline · Esc: cancel "
+        } else if width >= 40 {
+            " Enter send · ^J newline · Esc cancel "
+        } else {
+            " Esc · ^J · Enter "
         };
     }
     // A comment posts rather than launches, and Esc goes back to the
@@ -186,6 +200,7 @@ const MIN_PREVIEW_TEXT_W: usize = 16;
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
     app.host_cursor = None;
+    app.welcome_on_screen = false;
 
     // The bar gets a blank row above it so it breathes off the panel
     // borders, matching the terminal's own padding below the last row.
@@ -203,51 +218,40 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // First run (the default workspace is empty): no visible projects
-    // means three empty panels, so the whole body becomes the animated
-    // nebula splash until the first project lands. Other empty workspaces
-    // keep their panels. N summons the same splash as a dismissable
-    // preview.
-    // The LAUNCHER VIEW (Settings → Experimental): a grid of cards in
-    // place of the three panels and the Workspaces bar — sessions,
-    // projects or workspaces, whichever LEVEL the view is on — with the
-    // session under the cursor live in the pane along the bottom, so
-    // walking the session grid swaps what the pane reads. A body too
-    // short for both is all grid; the levels above the sessions have no
-    // pane at all and take every row.
+    // The LAUNCHER VIEW, which is the whole body: the PROJECT TABS over a
+    // grid of the lit project's session cards, with the session under the
+    // cursor live in the pane along the bottom, so walking the grid swaps
+    // what the pane reads. With no card under the cursor there is no
+    // pane: the grid takes the whole body until a card is clicked or
+    // walked onto. A body too short for both is all grid.
     //
-    // Ahead of the splash: with a project anywhere on the machine the
-    // view has a WORKSPACES level to walk out to, so an empty workspace is
-    // a level to step out of rather than a dead end that swaps the whole
-    // screen for the panels' "add a project". The summoned splash (`N`)
+    // Any project on the machine puts it up; with none, the splash below
+    // is the first run's "open a project". The summoned splash (`N`)
     // still wins — it is a preview the next key dismisses.
     if app.launcher_active() && !app.splash_preview {
         // `launcher_view::draw` takes `body_area` for the grid's half, so
         // the whole body is kept here for the pane drag to measure against.
         app.launcher_body = body;
-        let (view_a, pane_a) =
-            crate::launcher::split(body, app.launcher_level, app.launcher_pane_h);
-        // The pane's top edge is draggable, as the panels' boundaries are:
-        // its blank opening row and the grid row over it are the grab
-        // zone, registered first so they win `hit_at`'s first-match scan
-        // against a card whose last row lands there.
+        let (view_a, pane_a) = app.launcher_split(body);
+        let side = app.launcher_pane_side();
+        // The pane's edge facing the cards is draggable, as the panels'
+        // boundaries are: its opening row (the rule) — or, with the pane
+        // beside the cards, column — and the grid's one next to it are the
+        // grab zone (`launcher::pane_grab_zone`), registered first so they win
+        // `hit_at`'s first-match scan against a card that lands there.
         if let Some(pane_a) = pane_a {
             app.hits.push((
-                Rect {
-                    y: pane_a.y.saturating_sub(1),
-                    height: 2,
-                    ..pane_a
-                },
+                crate::launcher::pane_grab_zone(side, pane_a),
                 HitTarget::LauncherPaneSplitter,
             ));
         }
         launcher_view::draw(f, app, view_a);
         if let Some(pane_a) = pane_a {
-            draw_terminal(f, app, pane_a);
+            draw_terminal(f, app, crate::launcher::pane_content(side, pane_a));
             if app.focus_tint && app.focus == Focus::Terminal {
                 draw_focus_tint(f.buffer_mut(), pane_a, app.theme);
             }
-            draw_launcher_pane_grip(f.buffer_mut(), app, pane_a);
+            draw_launcher_pane_grip(f.buffer_mut(), app, side, pane_a);
         }
         draw_footer(f, app, footer);
         draw_overlay(f, app);
@@ -255,96 +259,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    if app.splash_showing() {
-        crate::splash::draw_splash(f, app, body);
-        draw_footer(f, app, footer);
-        draw_overlay(f, app);
-        draw_vim(f, app);
-        return;
-    }
-
-    app.body_area = body;
-    app.normalize_panel_widths(body.width);
-    // A Sessions focus the cursor's own move has folded out from under
-    // (see `App::settle_focus`) steps off the rail before the columns are
-    // laid out, so the tint and the keys land on an open column.
-    app.settle_focus();
-    // The Workspaces bar (Shift+W) runs across the top of the body (a
-    // one-row rail with an expand chevron when hidden); the three panels
-    // and the terminal pane take the full width of whatever is left
-    // under it.
-    let [workspaces_a, panels_a] = Layout::vertical([
-        Constraint::Length(app.workspaces_bar_h()),
-        Constraint::Min(0),
-    ])
-    .areas(body);
-    let visible_panels = app.visible_panel_indices();
-    let constraints = visible_panels
-        .iter()
-        .map(|idx| Constraint::Length(app.panel_draw_width(*idx)))
-        .chain(std::iter::once(Constraint::Min(crate::app::MIN_TERM_W)));
-    let areas = panels_a.layout_vec(&Layout::horizontal(constraints));
-    let mut panel_areas: [Option<Rect>; 3] = [None; 3];
-    for (idx, area) in visible_panels.iter().copied().zip(areas.iter().copied()) {
-        panel_areas[idx] = Some(area);
-    }
-    let term_a = areas[visible_panels.len()];
-
-    // Splitter grab zones: the two touching border cells at each panel
-    // boundary. Registered first so they win `hit_at`'s first-match scan —
-    // and only over the panels, so the tab bar above stays clickable.
-    // Beside a rail the zone stops at the rule: the rail's one column is
-    // its expand chevron, and a click on ▶ must reach the rail rather
-    // than arm a drag on its neighbor.
-    for i in app.splitter_indices() {
-        let x = app.splitter_x(i);
-        let width = if app.splitter_abuts_rail(i) { 1 } else { 2 };
-        app.hits.push((
-            Rect {
-                x: x.saturating_sub(1),
-                y: panels_a.y,
-                width,
-                height: panels_a.height,
-            },
-            HitTarget::Splitter(i),
-        ));
-    }
-
-    if app.show_workspaces {
-        draw_workspaces_bar(f, app, workspaces_a);
-    } else {
-        draw_collapsed_bar(f, app, workspaces_a);
-    }
-    if let Some(area) = panel_areas[0] {
-        draw_projects(f, app, area);
-    }
-    if let Some(area) = panel_areas[1] {
-        draw_worktrees(f, app, area);
-    }
-    if let Some(area) = panel_areas[2] {
-        draw_sessions(f, app, area);
-    }
-    draw_terminal(f, app, term_a);
-    draw_splitter_grips(f.buffer_mut(), app, panels_a);
-    // Focus cue (`focus_tint` setting, on by default): the focused
-    // panel's whole background picks up a faint accent tint. Off leaves
-    // the terminal's own background — a configured transparency included
-    // — showing through. The sidebar columns stop one cell short of
-    // their right rule so the tint stays inside the panel.
-    if app.focus_tint {
-        let tinted = match app.focus {
-            // The bar's last row is its rule, which belongs to the
-            // boundary rather than to the bar — leave it untinted.
-            Focus::Workspaces => Some(shrink_b(workspaces_a)),
-            Focus::Projects => panel_areas[0].map(shrink_r),
-            Focus::Worktrees => panel_areas[1].map(shrink_r),
-            Focus::Sessions => panel_areas[2].map(shrink_r),
-            Focus::Terminal => Some(term_a),
-        };
-        if let Some(tinted) = tinted {
-            draw_focus_tint(f.buffer_mut(), tinted, app.theme);
-        }
-    }
+    // Nothing in the tree yet (first run), or the splash summoned with
+    // `N`: the animated nebula takes the whole body until a project
+    // lands, which is what the view above needs to draw at all.
+    crate::splash::draw_splash(f, app, body);
     draw_footer(f, app, footer);
     draw_overlay(f, app);
     draw_vim(f, app);
@@ -422,10 +340,16 @@ const OVER_BOX_INSET: u16 = 4;
 /// The rect a multi-row task box is drawn in — one place, so a modal that
 /// floats over the box ([`over_box_rect`]) can ask where the box is
 /// before the box is drawn.
-fn multiline_prompt_rect(frame: Rect, app: &App, prompt: &PromptDialog) -> Rect {
+fn multiline_prompt_rect(frame: Rect, prompt: &PromptDialog) -> Rect {
     let quick = matches!(prompt.kind, crate::app::PromptKind::QuickPrompt(_));
-    if app.launcher && quick {
+    if quick {
         launcher_view::box_rect(frame)
+    } else if matches!(prompt.kind, crate::app::PromptKind::FollowUp { .. }) {
+        // Smaller than the task boxes: a follow-up is a sentence to a
+        // session that is already running, and a box this size leaves the
+        // grid it floats over readable around it — which card is being
+        // prompted is read off the cards, not off the box.
+        centered_rect(frame, FOLLOW_UP_PROMPT_SIZE.0, FOLLOW_UP_PROMPT_SIZE.1)
     } else {
         centered_rect(
             frame,
@@ -449,19 +373,21 @@ pub(crate) fn over_box_rect(frame: Rect, over: Option<Rect>, width: u16, height:
 }
 
 /// The box a menu floats over: the QUICK PROMPT its rows owe back, drawn
-/// under it (and its rect, for [`over_box_rect`]). A menu with no box
+/// under it — returned as its rect, for [`over_box_rect`], and where its
+/// branch landed this frame, for the WORKTREE PICKER that hangs from it
+/// (empty when the details row had no room for it). A menu with no box
 /// behind it — a context menu, a picker reached from a PR or an issue row
 /// with no box up — draws nothing and floats where it always did.
 fn draw_menu_backdrop(
     f: &mut Frame,
     app: &mut App,
     menu: &crate::app::ContextMenu,
-) -> Option<Rect> {
+) -> Option<(Rect, Rect)> {
     let back = crate::event_loop::menu_quick_return(menu).filter(|back| back.from_box)?;
     let box_behind = crate::quick_prompt::backdrop_box(&back);
-    let rect = multiline_prompt_rect(f.area(), app, &box_behind);
-    draw_multiline_prompt(f, app, &box_behind, true);
-    Some(rect)
+    let rect = multiline_prompt_rect(f.area(), &box_behind);
+    let branch = draw_multiline_prompt(f, app, &box_behind, true);
+    Some((rect, branch))
 }
 
 /// A multi-row task box — the QUICK PROMPT and its siblings — drawn
@@ -469,8 +395,14 @@ fn draw_menu_backdrop(
 /// the PROJECT PICKER floats over the box `^P` was pressed in, so the
 /// box is still on screen, dimmed, while you aim it somewhere. A
 /// backdrop records no click areas and no field view — the overlay
-/// drawn over it owns both.
-fn draw_multiline_prompt(f: &mut Frame, app: &mut App, prompt: &PromptDialog, backdrop: bool) {
+/// drawn over it owns both — but still hands back where its branch was
+/// drawn (empty when it was not), which a picker over it hangs from.
+fn draw_multiline_prompt(
+    f: &mut Frame,
+    app: &mut App,
+    prompt: &PromptDialog,
+    backdrop: bool,
+) -> Rect {
     let th = app.theme;
     // The QUICK PROMPT carries one row the other task boxes do not — where
     // the launch lands — and takes it in height rather than out of the
@@ -493,8 +425,8 @@ fn draw_multiline_prompt(f: &mut Frame, app: &mut App, prompt: &PromptDialog, ba
     };
     // The LAUNCHER VIEW's box is its front door: bigger, and with the
     // project on its target row and `^P` / `^O` in its hints.
-    let launcher = app.launcher && quick.is_some();
-    let area = multiline_prompt_rect(f.area(), app, prompt);
+    let launcher = quick.is_some();
+    let area = multiline_prompt_rect(f.area(), prompt);
     f.render_widget(Clear, area);
     // A backdrop's border says nothing: Enter and Esc belong to whatever
     // is drawn over it, and naming the box's own keys there would be a
@@ -534,25 +466,36 @@ fn draw_multiline_prompt(f: &mut Frame, app: &mut App, prompt: &PromptDialog, ba
     };
 
     let label = prompt.label.clone();
-    // The view's box leads with the row of chord-changed details, then a
-    // blank row, then the prompt header — the question with the checkout it
-    // lands in beside it. The blank row is the point: without it the details
-    // read as part of the question under them.
+    // The view's box leads with the row of details — the project, the
+    // checkout, the harness and its model — then a blank row, then the
+    // prompt header: the question, and the toggle that cuts a fresh
+    // worktree. The blank row is the point: without it the details read as
+    // part of the question under them.
     let mut toggle_area = Rect::default();
+    let mut detail_areas: Vec<(crate::launcher::BoxField, Rect)> = Vec::new();
+    let mut branch_area = Rect::default();
     let head_rows = match quick.filter(|_| launcher && inner.height >= 5) {
         Some(launch) => {
             let row = row_rect(inner, 0).expect("a five-row inner area has row 0");
-            f.render_widget(launcher_view::detail_line(app, launch, row.width, th), row);
+            let details = launcher_view::detail_line(app, launch, row.width, th);
+            f.render_widget(details.line, row);
+            // Each detail is a button: the columns it was drawn in, in
+            // screen coordinates, so a click there opens its own picker.
+            let cols = |row: Rect, (x, width): (u16, u16)| Rect {
+                x: row.x + x,
+                width,
+                ..row
+            };
+            detail_areas = details
+                .fields
+                .into_iter()
+                .map(|(field, x, width)| (field, cols(row, (x, width))))
+                .collect();
+            branch_area = details.branch.map(|at| cols(row, at)).unwrap_or_default();
             let row = row_rect(inner, 2).expect("a five-row inner area has row 2");
-            let (line, toggle) = launcher_view::target_line(app, launch, &label, row.width, th);
-            f.render_widget(line, row);
-            if let Some((x, width)) = toggle {
-                toggle_area = Rect {
-                    x: row.x + x,
-                    width,
-                    ..row
-                };
-            }
+            let header = launcher_view::target_line(launch, &label, row.width, th);
+            f.render_widget(header.line, row);
+            toggle_area = header.toggle.map(|at| cols(row, at)).unwrap_or_default();
             3
         }
         None => {
@@ -615,14 +558,17 @@ fn draw_multiline_prompt(f: &mut Frame, app: &mut App, prompt: &PromptDialog, ba
     // wheel and clicks walk the rows by. A backdrop records none of it: the
     // overlay that is up is the one drawn over it.
     if backdrop {
-        return;
+        return branch_area;
     }
     if let Some(Overlay::Prompt(p)) = &mut app.overlay {
         p.area = area;
         p.editor_area = editor_inner;
         p.toggle_area = toggle_area;
+        p.detail_areas = detail_areas;
+        p.branch_area = branch_area;
         p.input.set_view(view);
     }
+    branch_area
 }
 
 fn draw_overlay(f: &mut Frame, app: &mut App) {
@@ -646,7 +592,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // over the box rather than taking the box away, as `^P` does:
             // the task you typed is still in front of you while you pick
             // what will run it.
-            let over = draw_menu_backdrop(f, app, &menu);
+            let backdrop = draw_menu_backdrop(f, app, &menu);
+            let over = backdrop.map(|(rect, _)| rect);
+            // The WORKTREE PICKER hangs from the branch it was opened on,
+            // wherever the box has it this frame — a resize moves both —
+            // its rows' text in the branch's column (a border and a space
+            // in). Centered over the box when the details row found no
+            // room for the branch.
+            let at = menu.at.or_else(|| {
+                let (_, branch) = backdrop.filter(|_| menu.is_launch_worktree_picker())?;
+                (branch.width > 0).then(|| (branch.x.saturating_sub(2), branch.y + 1))
+            });
             // A type-ahead submenu shows its query in the title: `Cursor
             // model ⌕ opus`, the bare ⌕ while nothing is typed yet.
             let title_text = menu.title.as_deref().map(|t| match &menu.filter {
@@ -667,13 +623,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // Rows that expand into a submenu get a right-aligned ▸ in an
             // extra column so the affordance is visible before hovering.
             let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
-            // The workspace switcher carries its key verbs in the bottom
-            // border; the modal widens to fit. Session pickers add the
-            // `?` jump to the hovered harness's Agents section.
+            // A filtered list carries its keys in the bottom border; the
+            // modal widens to fit. Session pickers add the `?` jump to the
+            // hovered harness's Agents section.
             let agent_jump = menu.hovered_agent_kind().is_some();
-            let hint = if menu.is_workspace_picker() {
-                Some(" n: new  r: rename  d: delete ")
-            } else if menu.filter.is_some() {
+            let hint = if menu.filter.is_some() {
                 Some(if agent_jump {
                     " type to filter  ?: settings  ↑↓: move  Backspace  Esc: back "
                 } else {
@@ -694,7 +648,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .max(hint.map_or(0, |h| h.chars().count() + 2))
                 .min(f.area().width as usize) as u16;
             let height = menu.items.len() as u16 + 2;
-            let area = match menu.at {
+            let area = match at {
                 Some((ax, ay)) => {
                     let x = ax.min(f.area().width.saturating_sub(width));
                     let y = if ay + height > f.area().height {
@@ -1018,7 +972,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Lit("click / drag"), "an app that took the mouse gets it"),
                         (Lit("⌥click"), "open URL / file under cursor"),
                         (Lit("⇧drag"), "select via your terminal"),
-                        (Lit("drag border"), "resize panels"),
+                        (Lit("drag the pane edge"), "resize the pane"),
                         (Lit("click outside"), "dismiss any modal (= Esc)"),
                     ],
                 ),
@@ -1026,18 +980,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "GENERAL",
                     &[
                         (
-                            Act(&[Workspaces, ToggleWorkspaces]),
-                            "workspace switcher / workspaces bar",
+                            Act(&[ToggleLauncherPane, ToggleSidebars]),
+                            "fold the pane away / bring it back",
                         ),
-                        (
-                            Act(&[ToggleProjects, ToggleWorktrees, ToggleSessions]),
-                            "collapse / expand Projects / Worktrees / Sessions",
-                        ),
-                        (
-                            Act(&[ToggleSidebars]),
-                            "collapse every panel / bring them back",
-                        ),
-                        (Lit("⌘1-9 / 1-9"), "open that workspace tab"),
+                        (Lit("⌘1-9 / 1-9"), "open that project tab"),
                         (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
                         (Act(&[Settings]), "settings (Hotkeys tab rebinds these)"),
                         (Act(&[Metrics]), "memory usage (nebula + agents)"),
@@ -1869,14 +1815,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 // hollow variant standing in for the panels' `○` — come
                 // from the same status the row carries in its panel, so a
                 // running session reads as running here too. The row draws
-                // only its own name — a project header in bold, its rows
-                // stepped in under it, a dim "23m ago" pinned right — so
+                // the project it lives in dim, then its own name — a
+                // project row in bold, a dim "23m ago" pinned right — so
                 // the cyan-bold match highlight is the loudest thing in the
                 // list, and a title sweeps exactly like its panel row.
                 let (solid, hollow) = match &item.target {
-                    // The status bar's workspace glyph, so a `/` row and
-                    // the "◇ name" readout name the same thing.
-                    PaletteTarget::Workspace(_) => ("◆ ", "◇ "),
                     PaletteTarget::Project(_) => ("▪ ", "▫ "),
                     PaletteTarget::Worktree(_) => ("▸ ", "▹ "),
                     PaletteTarget::Session(_) => ("● ", "○ "),
@@ -1884,9 +1827,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     // since that row is where picking it lands.
                     PaletteTarget::PullRequest { .. } => ("↗ ", "↗ "),
                 };
-                // Archived rows stay quiet even if their last status was
-                // live — the Sessions panel's `⊘` rule.
-                let status = if item.archived { None } else { item.status };
+                let status = item.status;
                 // A pull request carries no status; its colors are its
                 // standing's, the look its Worktrees-panel row wears — the
                 // accent for one ready for review, the dim end to end for
@@ -1899,9 +1840,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let pr = item
                     .standing
                     .map(|standing| (standing, crate::pr_row::look(standing, item.trouble, th)));
-                let (glyph, glyph_color) = if item.archived {
-                    ("⊘ ", th.dim)
-                } else if let Some((_, look)) = pr {
+                let (glyph, glyph_color) = if let Some((_, look)) = pr {
                     (solid, look.glyph)
                 } else {
                     match status {
@@ -1918,25 +1857,37 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     let word = item.trouble.map_or(standing.label(), |t| t.label());
                     (format!(" {word}"), look.badge)
                 });
-                // The label is the row's own name; the path before it is
-                // still searched, but the header above already says it.
+                // The label is the row's own name, with the project it
+                // lives in drawn dim in front of it — `demo/fix-login`, one
+                // line, no header above it. The rest of the searched path
+                // (a session's branch) still narrows the list; it is simply
+                // not drawn.
                 let label: String = item.text.chars().skip(item.label_at).collect();
                 let label_positions: Vec<usize> = m
                     .positions
                     .iter()
                     .filter_map(|p| p.checked_sub(item.label_at))
                     .collect();
-                // Rows under a project step in two columns, under its name.
-                let indent = if m.nested { "  " } else { "" };
-                // Pinned right, dim: when a row under a project last ran —
-                // its panel row's "23m ago" — or, on a project header, the
-                // other workspace picking it switches to.
-                let tail = match &item.workspace {
-                    Some(ws) => format!("◇ {ws}"),
-                    None if m.nested && item.stamped > 0 => {
-                        crate::hosts::ago_label(crate::app::now_ms() - item.stamped)
-                    }
-                    None => String::new(),
+                let (crumb, crumb_hits) = match item.crumb {
+                    Some((at, end)) => (
+                        format!(
+                            "{}/",
+                            item.text.chars().take(end).skip(at).collect::<String>()
+                        ),
+                        m.positions
+                            .iter()
+                            .filter(|p| (at..end).contains(p))
+                            .map(|p| p - at)
+                            .collect(),
+                    ),
+                    None => (String::new(), Vec::new()),
+                };
+                // Pinned right, dim: when the row last ran — its panel
+                // row's "23m ago".
+                let tail = if item.stamped > 0 {
+                    crate::hosts::ago_label(crate::app::now_ms() - item.stamped)
+                } else {
+                    String::new()
                 };
                 let tail_w = tail.chars().count();
                 // The badge is billed before the text, as `pr_row::spans`
@@ -1945,15 +1896,18 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 // leaves the selection marker's column and a right margin.
                 let badge_len = badge.as_ref().map_or(0, |(b, _)| b.chars().count());
                 let width = (list_inner.width as usize).saturating_sub(2);
-                let lead = indent.len() + 2;
+                // The crumb never eats the row: a long project name gets a
+                // third of the width, the row's own name keeps the rest.
+                let crumb_shown = truncate(&crumb, width / 3);
+                let crumb_hits = visible_positions(&crumb_hits, &crumb_shown, &crumb);
+                let lead = 2 + crumb_shown.chars().count();
                 let budget = width
                     .saturating_sub(lead + badge_len)
                     .saturating_sub(if tail_w > 0 { tail_w + 2 } else { 0 });
                 let shown = truncate(&label, budget);
                 let positions = visible_positions(&label_positions, &shown, &label);
-                let quiet = item.archived
-                    || (item.trouble.is_none()
-                        && matches!(item.standing, Some(crate::pull_request::Standing::Draft)));
+                let quiet = item.trouble.is_none()
+                    && matches!(item.standing, Some(crate::pull_request::Standing::Draft));
                 let mut text = label_highlight_spans(
                     &shown,
                     positions,
@@ -1973,10 +1927,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         s.style = s.style.add_modifier(Modifier::BOLD);
                     }
                 }
-                let mut spans = vec![
-                    Span::raw(indent),
-                    Span::styled(glyph, Style::default().fg(glyph_color)),
-                ];
+                let mut spans = vec![Span::styled(glyph, Style::default().fg(glyph_color))];
+                if !crumb_shown.is_empty() {
+                    // Dim end to end, bar the chars the query hit: the crumb
+                    // places the row, the name is what you are reading for.
+                    spans.extend(label_highlight_spans(
+                        &crumb_shown,
+                        crumb_hits,
+                        true,
+                        None,
+                        0,
+                        th.dim,
+                        th,
+                    ));
+                }
                 spans.extend(text);
                 if let Some((badge, color)) = badge {
                     spans.push(Span::styled(badge, Style::default().fg(color)));
@@ -2663,43 +2627,60 @@ pub(crate) fn visible_positions<'a>(
     }
 }
 
-/// A sidebar column's rect minus its right rule column.
-fn shrink_r(area: Rect) -> Rect {
-    Rect {
-        width: area.width.saturating_sub(1),
-        ..area
-    }
-}
-
-/// The Workspaces bar's rect minus its bottom rule row.
-fn shrink_b(area: Rect) -> Rect {
-    Rect {
-        height: area.height.saturating_sub(1),
-        ..area
-    }
-}
-
-/// Drag affordance for the panel splitters: a short thick grip centered on
-/// each column rule, one step brighter than the rule so the boundary reads
-/// as grabbable without turning the chrome back up. Accent while that
-/// splitter is hovered (terminals that report motion) or mid-drag.
-fn draw_splitter_grips(buf: &mut ratatui::buffer::Buffer, app: &App, body: Rect) {
-    if body.height < 7 {
-        return; // no room for a grip plus breathing space
-    }
+/// The LAUNCHER VIEW's pane boundary: a rule along the whole edge the
+/// pane opens with — across its first row under the cards, or down the
+/// column it keeps clear beside them (`launcher::pane_edge`) — so the
+/// pane reads as a panel of its own even with the keys on the grid and no
+/// focus tint to set it apart — without it the TAB STRIP looked like more
+/// text under the cards. On it, the grip: a short heavy stretch across
+/// the middle, the one visible sign that the edge can be dragged, as the
+/// `┃` grips are on the panels' rules. Lit while the pointer rests on it
+/// or while it is being dragged.
+fn draw_launcher_pane_grip(
+    buf: &mut ratatui::buffer::Buffer,
+    app: &App,
+    side: crate::launcher::PaneSide,
+    pane: Rect,
+) {
+    /// Cells the grip runs across: wide enough to read as a handle rather
+    /// than as a stray mark on the rule.
+    const GRIP_W: u16 = 8;
+    /// Rows it runs down a pane beside the cards: a cell is about twice as
+    /// tall as it is wide, so half the width reads as the same handle.
+    const GRIP_H: u16 = GRIP_W / 2;
     let th = app.theme;
-    let mid = body.y + body.height / 2;
-    for i in app.splitter_indices() {
-        // The rule column: the left panel's `Borders::RIGHT` cell, one
-        // short of the boundary where the next panel starts.
-        let x = app.splitter_x(i).saturating_sub(1);
-        let active = app.splitter_drag.map(|d| d.idx) == Some(i) || app.hover_splitter == Some(i);
-        let fg = if active { th.accent } else { th.muted };
-        for y in mid - 1..=mid + 1 {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_symbol("┃");
-                cell.set_style(Style::default().fg(fg));
-            }
+    let edge = crate::launcher::pane_edge(side, pane);
+    let (cells, rule, grip, len): (Vec<(u16, u16)>, _, _, _) = if side.beside() {
+        let cells = (edge.y..edge.y + edge.height).map(|y| (edge.x, y));
+        (cells.collect(), "│", "┃", GRIP_H)
+    } else {
+        let cells = (edge.x..edge.x + edge.width).map(|x| (x, edge.y));
+        (cells.collect(), "─", "━", GRIP_W)
+    };
+    for &at in &cells {
+        if let Some(cell) = buf.cell_mut(at) {
+            cell.set_symbol(rule);
+            cell.set_style(Style::default().fg(th.edge));
+        }
+    }
+    // Beside the cards the rule crosses the one under both headers — the
+    // grid's and the pane's TAB STRIP's, on the same row — so it meets it.
+    if side.beside() && edge.height > 2 {
+        if let Some(cell) = buf.cell_mut((edge.x, edge.y + 2)) {
+            cell.set_symbol("┼");
+        }
+    }
+    let span = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+    if span < len + 2 {
+        return; // no room for the grip and rule either side of it
+    }
+    let active = app.launcher_pane_drag.is_some() || app.hover_launcher_pane;
+    let fg = if active { th.accent } else { th.muted };
+    let from = usize::from((span - len) / 2);
+    for &at in &cells[from..from + usize::from(len)] {
+        if let Some(cell) = buf.cell_mut(at) {
+            cell.set_symbol(grip);
+            cell.set_style(Style::default().fg(fg));
         }
     }
 }
@@ -2710,30 +2691,6 @@ fn draw_splitter_grips(buf: &mut ratatui::buffer::Buffer, app: &App, body: Rect)
 /// background is still untouched, so selection fills and PTY-drawn
 /// colors sit on top of the tint instead of under it. The `focus_tint`
 /// setting decides whether the callers paint it at all.
-/// The grip on the LAUNCHER VIEW's pane boundary: a short heavy rule
-/// across the middle of the blank row the pane opens with — the one
-/// visible sign that the edge can be dragged, as the `┃` grips are on the
-/// panels' rules. Lit while the pointer rests on it or while it is being
-/// dragged.
-fn draw_launcher_pane_grip(buf: &mut ratatui::buffer::Buffer, app: &App, pane: Rect) {
-    /// Cells the grip runs across: wide enough to read as a handle rather
-    /// than as a stray mark on an otherwise blank row.
-    const GRIP_W: u16 = 8;
-    if pane.width < GRIP_W + 2 {
-        return; // no room for the grip and air either side of it
-    }
-    let th = app.theme;
-    let active = app.launcher_pane_drag.is_some() || app.hover_launcher_pane;
-    let fg = if active { th.accent } else { th.muted };
-    let x0 = pane.x + (pane.width - GRIP_W) / 2;
-    for x in x0..x0 + GRIP_W {
-        if let Some(cell) = buf.cell_mut((x, pane.y)) {
-            cell.set_symbol("━");
-            cell.set_style(Style::default().fg(fg));
-        }
-    }
-}
-
 fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
@@ -2785,22 +2742,6 @@ pub(crate) fn empty_list_row(f: &mut Frame, list_inner: Rect, text: &str, th: Th
     }
 }
 
-/// An empty panel's one-line nudge: accent keys and dim prose alternating,
-/// the first key sitting in the row gutter so it lines up with row text.
-fn hint_line(pairs: &[(&str, &str)], th: Theme) -> Line<'static> {
-    let mut spans = Vec::with_capacity(pairs.len() * 2);
-    for (i, (key, prose)) in pairs.iter().enumerate() {
-        let key = if i == 0 {
-            format!("{ROW_GUTTER}{key}")
-        } else {
-            key.to_string()
-        };
-        spans.push(Span::styled(key, Style::default().fg(th.accent)));
-        spans.push(Span::styled(prose.to_string(), Style::default().fg(th.dim)));
-    }
-    Line::from(spans)
-}
-
 /// Bordered panel frame: rounded corners everywhere for a softer, modern
 /// look. Focus has to be unmissable, so the focused panel gets an accent
 /// border plus a solid accent-background title chip, versus a thin dim
@@ -2830,25 +2771,11 @@ pub(crate) fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
     }
 }
 
-/// Unwatched-finish count badge for a project or worktree row: how many
-/// sessions under it went green with nobody looking (`Agent::unseen`), as
-/// ` n done` in the done color — the same word and hue the Workspaces
-/// tabs use, so a count reads the same at every tier. The count is the number
-/// of terminals to go read; it drops as the cursor lands on each one, and
-/// the badge goes with it at zero.
-fn unseen_badge(unseen: usize, th: Theme) -> Option<(String, Style)> {
-    (unseen > 0).then(|| (format!(" {unseen} done"), Style::default().fg(th.done)))
-}
+/// One piece of the PR & ISSUE COUNTS badge: its text, its style, and the
+/// button it is, if it is one.
+pub(crate) type BadgePart = (String, Style, Option<HitTarget>);
 
-/// The trailing badges of a project or worktree row, and the columns they
-/// take together, so the name can be truncated around them.
-fn row_badges(unseen: usize, th: Theme) -> (Vec<(String, Style)>, usize) {
-    let badges: Vec<(String, Style)> = unseen_badge(unseen, th).into_iter().collect();
-    let len = badges.iter().map(|(s, _)| s.chars().count()).sum();
-    (badges, len)
-}
-
-/// The PR & ISSUE COUNTS badge of a project row (Settings → Experimental):
+/// The PR & ISSUE COUNTS badge (Settings → Experimental):
 /// ` 3 prs · 2 issues` — the pull requests in the accent the OPEN PRS rows
 /// wear (`pr_row::look`), the issues in the green the ISSUES MODAL paints
 /// `open` in, a dim `·` between — as spans, with the columns they take
@@ -2856,10 +2783,14 @@ fn row_badges(unseen: usize, th: Theme) -> (Vec<(String, Style)>, usize) {
 /// zero, or not known yet, leaves its word out, and the badge goes with
 /// both; one `pr` or `issue` is singular; a list cut off at the fetch cap
 /// counts `100+`, as the OPEN PRS header does.
-fn open_counts_badge(
+///
+/// Each count carries the button it is: `2 prs` opens the PULL REQUESTS
+/// MODAL and `1 issue` the ISSUES MODAL. The air before the first and the
+/// `·` between them carry none, so a click lands on a word or on nothing.
+pub(crate) fn open_counts_badge(
     counts: (Option<usize>, Option<usize>),
     th: Theme,
-) -> Option<(Vec<(String, Style)>, usize)> {
+) -> Option<(Vec<BadgePart>, usize)> {
     fn word(n: usize, one: &str, many: &str, cap: usize) -> Option<String> {
         match n {
             0 => None,
@@ -2871,24 +2802,21 @@ fn open_counts_badge(
     let (prs, issues) = counts;
     let parts = [
         prs.and_then(|n| word(n, "pr", "prs", crate::pull_request::LIST_LIMIT))
-            .map(|text| (text, th.accent)),
+            .map(|text| (text, th.accent, HitTarget::LauncherPullRequests)),
         issues
             .and_then(|n| word(n, "issue", "issues", crate::issues::LIST_LIMIT))
-            .map(|text| (text, th.ok)),
+            .map(|text| (text, th.ok, HitTarget::LauncherIssues)),
     ];
-    let mut spans: Vec<(String, Style)> = Vec::new();
-    for (text, color) in parts.into_iter().flatten() {
-        if spans.is_empty() {
-            spans.push((format!(" {text}"), Style::default().fg(color)));
-        } else {
-            spans.push((" · ".into(), Style::default().fg(th.dim)));
-            spans.push((text, Style::default().fg(color)));
-        }
+    let mut spans: Vec<BadgePart> = Vec::new();
+    for (text, color, hit) in parts.into_iter().flatten() {
+        let gap = if spans.is_empty() { " " } else { " · " };
+        spans.push((gap.into(), Style::default().fg(th.dim), None));
+        spans.push((text, Style::default().fg(color), Some(hit)));
     }
     if spans.is_empty() {
         return None;
     }
-    let len = spans.iter().map(|(s, _)| s.chars().count()).sum();
+    let len = spans.iter().map(|(s, _, _)| s.chars().count()).sum();
     Some((spans, len))
 }
 
@@ -2967,21 +2895,6 @@ fn status_name_spans(
 /// the space it costs. Below this the label drops and the name gets it all.
 const MIN_NAME_W: usize = 8;
 
-/// " 23m ago" for a list row, or empty for one that has never run. Reads
-/// the raw status stamp rather than the sort key, so a session that has
-/// been working for an hour says "1h ago" — when you last spoke to it —
-/// instead of a permanent "just now". Worktree and project rows pass the
-/// newest stamp under them and read the same way.
-/// The trailing badge of a QUICK PROMPT stand-in row, in the slot the
-/// ago label (worktree) or the harness name (session) takes on a real
-/// row.
-pub(crate) const PENDING_WORKTREE_BADGE: &str = " creating";
-/// What a checkout nested under its pull request's row is stepped in
-/// behind (`App::worktree_rows`): the child connector, running straight
-/// into the row's own STATUS DOT as into a node — one cell, so a
-/// nine-letter branch still keeps its ` creating` badge in the default
-/// twenty-two-cell column.
-pub(crate) const NESTED_WORKTREE_INDENT: &str = "└";
 pub(crate) const PENDING_SESSION_BADGE: &str = " starting";
 
 fn ago_badge(status_changed_at: i64) -> String {
@@ -3029,61 +2942,6 @@ fn status_color(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Color {
         Some(AgentStatus::NeedsFeedback) => th.err,
         Some(AgentStatus::Terminated) => th.special,
         Some(AgentStatus::Disconnected) | None => th.dim,
-    }
-}
-
-/// What a checkout row is colored on. Every other status-bearing row
-/// answers to its sessions alone; a checkout whose pull request has merged
-/// wears the merge instead (`App::worktree_wears_merge` decides — a live
-/// session still wins): purple dot, purple rail, purple branch name. The
-/// name sweeps on the merged ramp for the few seconds after the merge is
-/// seen to land (the ONE-SHOT SWEEP) and is solid purple from then on —
-/// nothing about a landed checkout is live, so it says its piece once:
-/// this one landed, archive or delete it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowState {
-    /// The sessions' rolled-up status, `None` for a checkout with none.
-    Sessions(Option<AgentStatus>),
-    /// The checkout's pull request has merged.
-    Merged,
-}
-
-impl RowState {
-    /// The STATUS DOT: [`status_dot`], or a solid purple one.
-    fn dot(self, unseen: bool, th: Theme) -> Span<'static> {
-        match self {
-            RowState::Sessions(status) => status_dot(status, unseen, th),
-            RowState::Merged => Span::styled("● ", Style::default().fg(th.merged)),
-        }
-    }
-
-    /// The dot's color on its own, for the selection rail.
-    fn color(self, unseen: bool, th: Theme) -> Color {
-        match self {
-            RowState::Sessions(status) => status_color(status, unseen, th),
-            RowState::Merged => th.merged,
-        }
-    }
-
-    /// The sweep the name rides: [`sweep_ramp`]'s, or the merged ramp
-    /// while the merge is `fresh` (`App::worktree_fresh` answers for
-    /// whichever story the row tells) — and nothing with animations off,
-    /// same as every other sweep.
-    fn ramp(self, fresh: bool, th: Theme, enabled: bool) -> Option<[Color; 3]> {
-        match self {
-            RowState::Sessions(status) => sweep_ramp(status, fresh, th, enabled),
-            RowState::Merged => (enabled && fresh).then_some(th.merged_sweep),
-        }
-    }
-
-    /// What the branch name wears at rest: nothing of its own on a sessions
-    /// row, the merged purple on a merged one — the color the sweep rests
-    /// on, so the sweep ending (or never running) changes no color.
-    fn name_style(self, th: Theme) -> Style {
-        match self {
-            RowState::Sessions(_) => Style::default(),
-            RowState::Merged => Style::default().fg(th.merged),
-        }
     }
 }
 
@@ -3179,1944 +3037,6 @@ fn render_button<'a>(
         Paragraph::new(lines).style(row_bar(selected, focused, th)),
         area,
     );
-}
-
-/// Borderless sidebar column: a single dim rule on the right edge, an
-/// uppercase header row, one blank spacer, then the list area (returned).
-/// The header carries the focus signal — accent when focused, muted
-/// otherwise — so the chrome itself can stay quiet.
-/// Header rows narrower than this keep title only: the collapse button
-/// would collide with the title text.
-const COLLAPSE_MIN_W: u16 = 16;
-
-/// How a sidebar column stands this frame: open at its remembered width,
-/// folded to a RAIL — the column rule with an expand chevron, hidden by
-/// its `Shift+` hotkey or header chevron and clickable back open — or
-/// folded to a bare RULE with no chevron and no click target, for a
-/// column that has nothing to expand into while it stands: the Sessions
-/// column under a pull request row (`App::sessions_collapsed`), which
-/// opens itself again the moment the cursor steps onto a checkout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Fold {
-    Open,
-    Rail,
-    Rule,
-}
-
-impl Fold {
-    /// The fold of a column that only ever hides by hand.
-    fn hidden(hidden: bool) -> Self {
-        if hidden {
-            Fold::Rail
-        } else {
-            Fold::Open
-        }
-    }
-}
-
-fn draw_column(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    count: Option<usize>,
-    focused: bool,
-    th: Theme,
-    collapse: Focus,
-    fold: Fold,
-    hits: &mut Vec<(Rect, HitTarget)>,
-) -> Rect {
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(th.edge));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if fold == Fold::Rule {
-        // The rule alone: the column folded of its own accord and opens
-        // the same way, so there is no chevron to click and no target
-        // under it — a click there would only write a preference the
-        // user did not set.
-        return Rect { height: 0, ..inner };
-    }
-    if fold == Fold::Rail {
-        // The rail is the column rule itself: the block above drew the
-        // right border into this one cell, and the expand chevron goes
-        // over it on the header row (row 1, under the blank spacer).
-        // Clickable along the whole strip; the remembered width is
-        // untouched, so expanding restores the panel exactly.
-        if area.height > 1 {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled("▶", Style::default().fg(th.dim)))),
-                Rect {
-                    x: area.x,
-                    y: area.y + 1,
-                    width: 1,
-                    height: 1,
-                },
-            );
-        }
-        hits.push((area, HitTarget::CollapsePanel(collapse)));
-        return Rect { height: 0, ..inner };
-    }
-    let header_style = if focused {
-        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
-    };
-    // Row 0 is a blank spacer so the title never sits flush against the
-    // very top of the screen; row 1 carries it. `ROW_GUTTER` is the same
-    // 3-column indent a list row gets from its 1-column selection marker
-    // plus a 2-column status glyph, so the title's text lines up with
-    // row text below it.
-    if let Some(r) = row_rect(inner, 1) {
-        let mut spans = vec![Span::styled(format!("{ROW_GUTTER}{title}"), header_style)];
-        if let Some(n) = count {
-            spans.push(Span::styled(format!(" · {n}"), Style::default().fg(th.dim)));
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)), r);
-        // Per-panel collapse button at the header row's right end: a
-        // quiet chevron that hides the panel on click. The panel's own
-        // `Shift+` hotkey (named in the footer's restore hint) brings it
-        // back, as does the all-sidebars toggle.
-        if r.width >= COLLAPSE_MIN_W {
-            let glyph = Rect {
-                x: r.x + r.width.saturating_sub(3),
-                y: r.y,
-                width: 2,
-                height: 1,
-            };
-            f.render_widget(
-                Paragraph::new(Span::styled("◀", Style::default().fg(th.dim))),
-                glyph,
-            );
-            hits.push((glyph, HitTarget::CollapsePanel(collapse)));
-        }
-    }
-    // One extra column of right padding so row text never touches the
-    // column rule.
-    Rect {
-        y: inner.y + 3,
-        height: inner.height.saturating_sub(3),
-        width: inner.width.saturating_sub(1),
-        ..inner
-    }
-}
-
-/// Left gutter every list row gets from its 1-column selection marker
-/// (`▌`/space) plus a 2-column status glyph (`● `/`○ `/`❯ `): headers and
-/// empty-panel hints use the same string so their text lines up with row
-/// text below them.
-const ROW_GUTTER: &str = "   ";
-
-/// Visual hierarchy of the sidebar lists, stepping down the tree.
-/// Projects are 3-row buttons (bold, text centered). Worktrees and
-/// sessions are ~2-row pills: a 3-row cell with half-block pads so the
-/// name stays vertically centered, stacked on a 2-row stride so pads
-/// overlap and items don't pick up an extra gap (the step down reads
-/// through text weight instead — bold, plain, muted).
-const PROJECT_BTN_H: u16 = 3;
-const PILL_H: u16 = 2;
-const PILL_HALF: (char, char) = ('▄', '▀');
-/// The selection rail owns the pill's first column outright: a solid `█`
-/// on the text row, the pad's own `PILL_HALF` glyph on the pads. A
-/// half-width `▌` can't run the pill's full height — a cell holds one
-/// glyph and two colors, so a quadrant cap on a pad row strands the fill
-/// quarter beside it on bare panel background, which `focus_tint` turns
-/// into a black notch at each of the pill's left corners.
-const PILL_RAIL: &str = "█";
-
-/// The fill and rail of a selected pill, `(fill, rail)`: in the focused
-/// panel the raised `sel_bg` with the row's `mark` on the rail (see
-/// `selection_mark`); elsewhere the barely-raised `sel_bg_dim` under a
-/// dim rail, so an unfocused cursor reads as a place, not a signal.
-fn pill_bar(focused: bool, mark: Color, th: Theme) -> (Color, Color) {
-    if focused {
-        (th.sel_bg, selection_mark(mark, th))
-    } else {
-        (th.sel_bg_dim, th.dim)
-    }
-}
-
-/// Render one list entry into a 3-row cell starting at `top`: half-block
-/// pad, text, half-block pad. The name sits on the middle row so it
-/// stays vertically centered in the ~2-row pill. The pads run the full
-/// width so the fill has no dark notch beside the status dot, and the
-/// `PILL_RAIL` column carries the pad's own half-block in the rail color
-/// so the rail spans the pill's full visual height without stranding a
-/// bare-background quarter at either left corner. On a focused selection
-/// the rail is `mark` — the row's STATUS DOT color, or the accent for a
-/// row without one (see `selection_mark`). Dim spans get lifted to muted
-/// on the fill, same as `render_button`.
-#[allow(clippy::too_many_arguments)]
-fn render_pill(
-    f: &mut Frame,
-    inner: Rect,
-    top: isize,
-    spans: Vec<Span>,
-    selected: bool,
-    focused: bool,
-    th: Theme,
-    mark: Color,
-) {
-    render_pill_body(f, inner, top, spans, selected, focused, th, mark, 0);
-}
-
-/// [`render_pill`] for a pill with `body` rows of its own between its
-/// text row and its bottom pad — a session's RECENT PROMPTS lines. The
-/// pads wrap the whole: pad, text, body, pad, so a selected row and what
-/// hangs under its name are one rounded slab on one fill rather than a
-/// pill with rows beneath it. The body rows themselves are the caller's
-/// to draw (see `draw_prompt_lines`, which takes the same `pill_bar`).
-#[allow(clippy::too_many_arguments)]
-fn render_pill_body(
-    f: &mut Frame,
-    inner: Rect,
-    top: isize,
-    mut spans: Vec<Span>,
-    selected: bool,
-    focused: bool,
-    th: Theme,
-    mark: Color,
-    body: usize,
-) {
-    let (fill, rail) = pill_bar(focused, mark, th);
-    if selected {
-        let mut pad = |glyph: char, row: isize| {
-            if let Some(r) = row_rect_at(inner, row) {
-                f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        glyph.to_string().repeat(inner.width as usize),
-                        Style::default().fg(fill),
-                    ))),
-                    r,
-                );
-                // Same half-block, rail-colored: the rail's cap and the
-                // fill quarter beside it are one cell, so they have to be
-                // one color, and the rail is the one worth keeping.
-                f.render_widget(
-                    Paragraph::new(Span::styled(glyph.to_string(), Style::default().fg(rail))),
-                    Rect { width: 1, ..r },
-                );
-            }
-        };
-        pad(PILL_HALF.0, top);
-        pad(PILL_HALF.1, top + 2 + body as isize);
-    }
-    let Some(text_area) = row_rect_at(inner, top + 1) else {
-        return;
-    };
-    let marker = if selected {
-        for s in &mut spans {
-            if s.style.fg == Some(th.dim) {
-                s.style.fg = Some(th.muted);
-            }
-        }
-        Span::styled(PILL_RAIL, Style::default().fg(rail))
-    } else {
-        Span::raw(" ")
-    };
-    spans.insert(0, marker);
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(row_bar(selected, focused, th)),
-        text_area,
-    );
-}
-
-/// The Workspaces bar: `WORKSPACES` on the left, on the same row-1 / x-3
-/// grid the panel headers use so it sits directly above `PROJECTS` and
-/// reads as the tier over it — then one tab per workspace to its right,
-/// each carrying the rolled-up status of every live agent underneath, so a
-/// run finishing (or asking for feedback) in a workspace you don't have
-/// open still shows at the top level. The open workspace is the selected
-/// tab, and picking a tab IS a switch, the way moving in the Projects
-/// column re-scopes the worktrees.
-///
-/// Tabs answer to `⌘1`..`⌘9` / `1`..`9` from anywhere, to `←`/`→` once the
-/// bar has focus, and to a click. A blank row sits above the tabs and
-/// another below them, so the bar reads as its own tier rather than as a
-/// header crowded against its rule. That rule — the bar's last row — closes
-/// it off from the panels, broken under the open tab, so that tab reads as
-/// attached to what's below it.
-/// One-row rail for the hidden workspaces bar: an expand chevron at the
-/// same right-end column the bar's collapse chevron sits in, clickable
-/// across the whole row. The side panels collapse to rails the same way,
-/// so no collapse ever leaves its panel without a way back.
-fn draw_collapsed_bar(f: &mut Frame, app: &mut App, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let th = app.theme;
-    // The rail reads as a collapsed bar (not an empty row): the same
-    // rule the expanded bar closes itself off with, carrying the expand
-    // chevron at its right end.
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(th.edge),
-        ))),
-        Rect {
-            y: area.y,
-            height: 1,
-            ..area
-        },
-    );
-    let chevron_x = (area.x + area.width).saturating_sub(1);
-    if area.width >= 8 && chevron_x > area.x {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled("▼", Style::default().fg(th.dim)))),
-            Rect {
-                x: chevron_x,
-                y: area.y,
-                width: 1,
-                height: 1,
-            },
-        );
-    }
-    app.hits
-        .push((area, HitTarget::CollapsePanel(Focus::Workspaces)));
-}
-
-fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
-    let th = app.theme;
-    let focused = app.focus == Focus::Workspaces;
-    if area.width == 0 || area.height < 3 {
-        return;
-    }
-    // Last row is the rule; the label and the tabs share `area.y + 1`,
-    // where a panel header lands too. Everything between that row and the
-    // rule is padding, so the tabs sit in air on both sides.
-    let rule_y = area.y + area.height - 1;
-    let row_y = area.y + 1;
-
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(th.edge),
-        ))),
-        Rect {
-            y: rule_y,
-            height: 1,
-            ..area
-        },
-    );
-
-    // The header carries the focus signal, exactly as a column title does.
-    let header_style = if focused {
-        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
-    };
-    let mut label = vec![Span::styled(
-        format!("{ROW_GUTTER}WORKSPACES"),
-        header_style,
-    )];
-    if !app.tree.workspaces.is_empty() {
-        label.push(Span::styled(
-            format!(" · {}", app.tree.workspaces.len()),
-            Style::default().fg(th.dim),
-        ));
-    }
-    let label_w: u16 = label.iter().map(|s| s.content.chars().count() as u16).sum();
-    f.render_widget(
-        Paragraph::new(Line::from(label)),
-        Rect {
-            y: row_y,
-            height: 1,
-            ..area
-        },
-    );
-
-    // Everything from here is drawn over that row, so the tabs win the
-    // cells they land on.
-    let tabs_x = area.x + label_w + TAB_GAP;
-    if app.tree.workspaces.is_empty() {
-        push_bar_collapse_chevron(f, app, area, row_y, th);
-        app.hits
-            .push((shrink_b(area), HitTarget::PanelBg(Focus::Workspaces)));
-        if tabs_x < area.x + area.width {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "no workspaces",
-                    Style::default().fg(th.dim),
-                ))),
-                Rect {
-                    x: tabs_x,
-                    y: row_y,
-                    width: area.x + area.width - tabs_x,
-                    height: 1,
-                },
-            );
-        }
-        return;
-    }
-
-    let active = app.tree.active_workspace_index();
-    // Per-tab display data, pre-collected to end the tree borrow: name,
-    // rollup, how many sessions under it finished unread — the same count
-    // the project and worktree rows carry, one tier up — and whether one
-    // of those finishes is fresh enough to still sweep.
-    let rows: Vec<(String, Option<AgentStatus>, usize, bool)> = app
-        .tree
-        .workspaces
-        .iter()
-        .map(|w| {
-            (
-                w.name.clone(),
-                app.workspace_rollup(&w.id),
-                app.workspace_unseen(&w.id),
-                app.workspace_fresh_done(&w.id),
-            )
-        })
-        .collect();
-    let (phase, anim) = (app.sweep_phase(), app.animations);
-    // Each tab: its spans, their width, and the rollup dot's color — the
-    // TAB UNDERLINE takes it, so the open tab's underline says what the
-    // dot says.
-    let tabs: Vec<(Vec<Span<'static>>, u16, Color)> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, (name, roll, done, fresh))| {
-            let selected = Some(i) == active;
-            // Only nine tabs have a shortcut; past that the slot stays
-            // blank so every name still starts on the same column.
-            let mut spans = vec![Span::styled(
-                if i < 9 {
-                    format!(" {} ", i + 1)
-                } else {
-                    "   ".to_string()
-                },
-                Style::default().fg(if selected { th.accent } else { th.dim }),
-            )];
-            spans.push(status_dot(*roll, *done > 0, th));
-            spans.extend(status_name_spans(
-                truncate(name, TAB_NAME_MAX),
-                Style::default().add_modifier(Modifier::BOLD),
-                sweep_ramp(*roll, *fresh, th, anim),
-                phase,
-            ));
-            if *done > 0 {
-                spans.push(Span::styled(
-                    format!(" {done} done"),
-                    Style::default().fg(th.done),
-                ));
-            }
-            spans.push(Span::raw(" "));
-            if selected {
-                for sp in &mut spans {
-                    if sp.style.fg == Some(th.dim) {
-                        sp.style.fg = Some(th.muted);
-                    }
-                }
-            }
-            let w = spans
-                .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>() as u16;
-            (spans, w, status_color(*roll, *done > 0, th))
-        })
-        .collect();
-
-    // Horizontal scroll: drop leading tabs until the open one fits. The
-    // last two columns are reserved: the `›` overflow mark, so a tab is
-    // never half-drawn under it, and the bar's collapse chevron past that.
-    // Stride is the tab plus the gap that follows it, which over-counts
-    // the last one by `TAB_SEP` (slack, not a bug).
-    let right = (area.x + area.width).saturating_sub(2);
-    let budget = right.saturating_sub(tabs_x);
-    let active_i = active.unwrap_or(0);
-    let stride = |t: &(Vec<Span<'static>>, u16, Color)| t.1 + TAB_SEP;
-    let mut start = 0usize;
-    while start < active_i && tabs[start..=active_i].iter().map(stride).sum::<u16>() > budget {
-        start += 1;
-    }
-
-    let mut x = tabs_x;
-    let mut drawn = start;
-    for (i, (spans, w, mark)) in tabs.iter().enumerate().skip(start) {
-        if x + w > right {
-            break;
-        }
-        let selected = Some(i) == active;
-        if selected {
-            // The open tab is a surface, not a highlighted row: its fill
-            // takes the bar's whole height above the rule, padding rows
-            // included, so it reads as one raised block carrying the name.
-            f.render_widget(
-                Block::default().style(Style::default().bg(th.sel_bg)),
-                Rect {
-                    x,
-                    y: area.y,
-                    width: *w,
-                    height: area.height - 1,
-                },
-            );
-        }
-        f.render_widget(
-            Paragraph::new(Line::from(spans.clone())).style(if selected {
-                Style::default().bg(th.sel_bg).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            }),
-            Rect {
-                x,
-                y: row_y,
-                width: *w,
-                height: 1,
-            },
-        );
-        if selected {
-            // The bottom border stays under the open tab — it just turns
-            // into that tab's underline, so the tab-to-content join reads
-            // as a join rather than a hole. It is a half block, not a
-            // heavy rule: a line glyph draws at the cell's midline, which
-            // leaves a strip of unpainted background between the tab's
-            // fill and the underline and reads as a gap. `▀` paints from
-            // the cell's top edge, flush against the block above it. Its
-            // color is the tab's rollup STATUS DOT — yellow while anything
-            // under the workspace runs, blue while a finish is UNSEEN —
-            // not the theme accent.
-            let underline = selection_mark(*mark, th);
-            for cx in x..x + w {
-                if let Some(cell) = f.buffer_mut().cell_mut((cx, rule_y)) {
-                    cell.set_symbol("▀").set_fg(underline);
-                }
-            }
-        }
-        // The whole column band clicks, rule row included — a 1-row target
-        // is a hard thing to hit with a mouse.
-        app.hits.push((
-            Rect {
-                x,
-                y: area.y,
-                width: *w,
-                height: area.height,
-            },
-            HitTarget::Workspace(i),
-        ));
-        x += w + TAB_SEP;
-        drawn = i + 1;
-    }
-    // Overflow marks, so a workspace scrolled off the bar isn't silently
-    // missing.
-    let mark = |f: &mut Frame, x: u16, g: &'static str| {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(g, Style::default().fg(th.dim)))),
-            Rect {
-                x,
-                y: row_y,
-                width: 1,
-                height: 1,
-            },
-        );
-    };
-    if start > 0 {
-        mark(f, tabs_x.saturating_sub(1), "‹");
-    }
-    if drawn < tabs.len() {
-        mark(f, right, "›");
-    }
-    // The bar's collapse chevron in the very last column: hides the bar
-    // on click, like `Shift+W`. Registered ahead of the background so it
-    // wins the cell.
-    push_bar_collapse_chevron(f, app, area, row_y, th);
-    // Last, so every tab wins the cells it covers.
-    app.hits
-        .push((shrink_b(area), HitTarget::PanelBg(Focus::Workspaces)));
-}
-
-/// Collapse chevron for the workspaces bar: last column of the tab row.
-/// Shared by the empty and tabbed branches so the bar always offers it.
-fn push_bar_collapse_chevron(f: &mut Frame, app: &mut App, area: Rect, row_y: u16, th: Theme) {
-    let chevron_x = (area.x + area.width).saturating_sub(1);
-    if area.width < 8 || chevron_x <= area.x {
-        return;
-    }
-    let cell = Rect {
-        x: chevron_x,
-        y: row_y,
-        width: 1,
-        height: 1,
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled("◀", Style::default().fg(th.dim)))),
-        cell,
-    );
-    app.hits
-        .push((cell, HitTarget::CollapsePanel(Focus::Workspaces)));
-}
-
-/// Per-row display data of the Projects panel, pre-collected to end the
-/// tree borrow: name, the folder name to show under it (Some only once the
-/// row has been renamed away from it), rollup, unwatched-finish count,
-/// last-turn stamp, whether one of those finishes still sweeps
-/// (`App::project_fresh_done`), and the PR & ISSUE COUNTS
-/// (`App::project_open_counts` — both `None` with the switch off).
-type ProjectRowData = (
-    String,
-    Option<String>,
-    Option<AgentStatus>,
-    usize,
-    i64,
-    bool,
-    (Option<usize>, Option<usize>),
-);
-
-/// The same for the Worktrees panel: branch, is-root, rollup,
-/// unwatched-finish count, last-turn stamp.
-/// One WORKTREES PANEL row: branch, root-ness, status rollup, unseen
-/// count, recency stamp, whether it is a QUICK PROMPT stand-in the
-/// DAEMON has not cut yet, and whether it wears its merged pull request
-/// (`App::worktree_wears_merge`), whether its RUN COMMAND is up
-/// (`App::worktree_running`), and whether the row is inside its ONE-SHOT
-/// SWEEP (`App::worktree_fresh`).
-type WorktreeRowData = (
-    String,
-    bool,
-    Option<AgentStatus>,
-    usize,
-    i64,
-    bool,
-    bool,
-    bool,
-    bool,
-);
-
-/// Columns between the `WORKSPACES` label and the first tab.
-const TAB_GAP: u16 = 2;
-/// Columns between two tabs. Outside either tab's fill, so the open one's
-/// selection surface never runs up against its neighbour.
-const TAB_SEP: u16 = 1;
-/// A workspace name is truncated to this before it becomes a tab.
-const TAB_NAME_MAX: usize = 20;
-
-fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
-    let th = app.theme;
-    let focused = app.focus == Focus::Projects;
-    let count = Some(app.tree.visible_project_count()).filter(|n| *n > 0);
-    // With the Workspaces bar hidden nothing else on screen names the open
-    // workspace, so this header takes the job — the column only ever lists
-    // that workspace's projects anyway. Upper-cased to stay in the header
-    // voice the other columns speak in, and trimmed to what's left of the
-    // row once the gutter, the ` · n` count and the column rule are paid for.
-    let title = if app.show_workspaces {
-        "PROJECTS".to_string()
-    } else {
-        let room = (area.width as usize)
-            .saturating_sub(ROW_GUTTER.len() + 1 + count.map_or(0, |n| 3 + n.to_string().len()));
-        truncate(&app.tree.active_workspace_name().to_uppercase(), room)
-    };
-    let inner = draw_column(
-        f,
-        area,
-        &title,
-        count,
-        focused,
-        th,
-        Focus::Projects,
-        Fold::hidden(app.hide_projects),
-        &mut app.hits,
-    );
-
-    if !app.tree.has_visible_projects() {
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    format!("{ROW_GUTTER}no projects yet"),
-                    Style::default().fg(th.dim),
-                )),
-                hint_line(&[("n", " adds one")], th),
-            ]),
-            inner,
-        );
-        app.hits.push((inner, HitTarget::PanelBg(Focus::Projects)));
-        return;
-    }
-
-    let rows: Vec<ProjectRowData> = app
-        .project_rows()
-        .into_iter()
-        .map(|i| {
-            let p = &app.tree.projects[i];
-            (
-                p.name.clone(),
-                p.folder_subtitle(),
-                app.project_rollup(&p.id),
-                app.project_unseen(&p.id),
-                app.project_recency(&p.id).stamped,
-                app.project_fresh_done(&p.id),
-                app.project_open_counts(&p.id),
-            )
-        })
-        .collect();
-    let mut screen_row = 0usize;
-    for (row_idx, (text, folder, roll, unseen, stamped, fresh, counts)) in rows.iter().enumerate() {
-        // A renamed row grows by the one line its folder name takes, so the
-        // pads above and below stay a row each either way.
-        let height = PROJECT_BTN_H + folder.is_some() as u16;
-        let Some(row_area) = rows_rect(inner, screen_row, height) else {
-            break;
-        };
-        // Same badge as worktree rows: sessions that finished unwatched
-        // anywhere under the project.
-        let (badges, badge_len) = row_badges(*unseen, th);
-        let mut free = (inner.width as usize).saturating_sub(3 + badge_len);
-        // PR & ISSUE COUNTS (Settings → Experimental), after the ago label
-        // and before the done badge. They take their columns first — the
-        // switch was turned on to see them — and drop out whole, the way
-        // the ago label does, before the name would be squeezed under
-        // `MIN_NAME_W`.
-        let counts = open_counts_badge(*counts, th).filter(|(_, len)| {
-            free.checked_sub(*len)
-                .is_some_and(|rest| rest >= MIN_NAME_W)
-        });
-        if let Some((_, len)) = &counts {
-            free -= len;
-        }
-        // How long since anything under the project last did something,
-        // dim after the name. The column is sorted on this stamp, so the
-        // label is what makes the order legible. With counts following it
-        // ends in a ` -`, so `3m ago - 4 prs` reads as two facts rather
-        // than one run of words; the dash is the label's and goes when the
-        // label goes.
-        let mut ago = ago_badge(*stamped);
-        if counts.is_some() && !ago.is_empty() {
-            ago.push_str(" -");
-        }
-        let (ago, name_max) = fit_ago(ago, free);
-        // Bold name: the top of the tree reads "biggest".
-        let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
-        spans.extend(status_name_spans(
-            truncate(text, name_max),
-            Style::default().add_modifier(Modifier::BOLD),
-            sweep_ramp(*roll, *fresh, th, app.animations),
-            app.sweep_phase(),
-        ));
-        if !ago.is_empty() {
-            spans.push(Span::styled(ago, Style::default().fg(th.dim)));
-        }
-        if let Some((counts, _)) = counts {
-            spans.extend(
-                counts
-                    .into_iter()
-                    .map(|(text, style)| Span::styled(text, style)),
-            );
-        }
-        for (text, style) in badges {
-            spans.push(Span::styled(text, style));
-        }
-        // Renaming a project is a label change, never a move on disk, so the
-        // folder keeps its name on the row underneath — as a child of the
-        // label, not a second label. A terminal cell has exactly one font
-        // size (Kitty's OSC 66 can render half-size text, but neither
-        // WezTerm nor Ghostty implements it), so "smaller" is spelled with
-        // the three signals that do work everywhere: the name above is
-        // BOLD at full strength, this line is the dimmest color the theme
-        // has *plus* DIM (SGR 2, faint, which blends fg toward bg), and a
-        // `└ ` hangs it off the name — the same tree glyph the metrics
-        // modal uses. The glyph lands under the name's first letter, so
-        // the folder text itself sits two columns further in.
-        let mut text = vec![spans];
-        if let Some(folder) = folder {
-            text.push(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!(
-                        "└ {}",
-                        truncate(folder, (inner.width as usize).saturating_sub(5))
-                    ),
-                    Style::default().fg(th.dim).add_modifier(Modifier::DIM),
-                ),
-            ]);
-        }
-        render_button(
-            f,
-            row_area,
-            text,
-            row_idx == app.sel_project,
-            focused,
-            th,
-            PROJECT_BTN_H / 2,
-            status_color(*roll, *unseen > 0, th),
-        );
-        app.hits.push((row_area, HitTarget::Project(row_idx)));
-        screen_row += height as usize;
-    }
-    app.hits.push((inner, HitTarget::PanelBg(Focus::Projects)));
-}
-
-/// One laid-out entry of the Worktrees panel. Checkout rows and pull-request
-/// rows share a single virtual-row layout, computed unbounded by the panel
-/// height, so a project with a long open-PR list scrolls as one column.
-enum WorktreeEntry {
-    /// The OPEN PRS group header, in whichever form the fold is in. A
-    /// click target.
-    PrHeader(String),
-    /// The ISSUES group header under it, the same way.
-    IssuesHeader(String),
-    /// Index into [`App::worktree_rows`].
-    Row(usize),
-}
-
-/// What one `WorktreeEntry::Row` draws: a checkout — plain, or nested
-/// under the pull request row above it — a pull request, or an issue.
-enum PanelRow {
-    Checkout {
-        data: WorktreeRowData,
-        nested: bool,
-    },
-    Pr(crate::pull_request::OpenPr),
-    /// An open issue: its `#15 title` label is all the row draws.
-    Issue {
-        label: String,
-    },
-}
-
-impl WorktreeEntry {
-    /// Rows the entry occupies: a header one, a pill its 3-row cell (they
-    /// stack on a `PILL_H` stride, so neighboring pads overlap).
-    fn height(&self) -> usize {
-        match self {
-            WorktreeEntry::Row(_) => PILL_H as usize + 1,
-            _ => 1,
-        }
-    }
-}
-
-fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
-    let th = app.theme;
-    let focused = app.focus == Focus::Worktrees;
-    // The title's count stays a worktree count: the open-PR rows below are
-    // links out of nebula, and counting them here would say "9 worktrees"
-    // over a list of two checkouts.
-    let wt_count = app.visible_worktrees().len();
-    let count = Some(wt_count).filter(|n| *n > 0);
-    let inner = draw_column(
-        f,
-        area,
-        "WORKTREES",
-        count,
-        focused,
-        th,
-        Focus::Worktrees,
-        Fold::hidden(app.hide_worktrees),
-        &mut app.hits,
-    );
-    // The page Ctrl+d / Ctrl+u jump by half of: how many pills the column
-    // has room for this frame (group headers and quiet rows not billed —
-    // "about half a panel" is the promise, not an exact line count).
-    app.worktrees_view_rows = (inner.height / PILL_H) as usize;
-
-    let row_data = |app: &App, w: &nebula_core::Worktree| -> WorktreeRowData {
-        (
-            w.branch.clone(),
-            w.is_main,
-            app.worktree_rollup(&w.id),
-            app.worktree_unseen(&w.id),
-            app.worktree_recency(&w.id).stamped,
-            app.is_placeholder_worktree(&w.id),
-            app.worktree_wears_merge(&w.id),
-            app.worktree_running(&w.id),
-            app.worktree_fresh(&w.id),
-        )
-    };
-    // The rows in cursor order: the plain checkouts, then each open pull
-    // request over the checkout on its head branch, when there is one.
-    let rows: Vec<PanelRow> = app
-        .worktree_rows()
-        .into_iter()
-        .map(|row| match row {
-            WorktreeRow::Checkout(w) => PanelRow::Checkout {
-                data: row_data(app, w),
-                nested: false,
-            },
-            WorktreeRow::PrCheckout { worktree, .. } => PanelRow::Checkout {
-                data: row_data(app, worktree),
-                nested: true,
-            },
-            WorktreeRow::Pr(pr) => PanelRow::Pr(pr.clone()),
-            WorktreeRow::Issue(issue) => PanelRow::Issue {
-                label: issue.label(),
-            },
-        })
-        .collect();
-    // The plain checkouts lead the list; everything after them belongs to
-    // the OPEN PRS group — pull requests and the checkouts under them.
-    let plain = rows
-        .iter()
-        .take_while(|r| matches!(r, PanelRow::Checkout { .. }))
-        .count();
-    // The header counts what the group lists — the whole answer, or the
-    // rows left once `hide_draft_prs` has kept the drafts out — even while
-    // the group is folded and the pull requests are off screen. The drafts
-    // kept out are owned up to beside it, so a pull request that is not
-    // where it was reads as a setting, not a loss.
-    let pr_total = app.listed_open_prs().len();
-    let drafts_hidden = app.hidden_draft_prs();
-    // The ISSUES header counts the same way: every open issue the list
-    // holds, folded or not.
-    let issue_total = app.listed_issues().len();
-    if wt_count == 0 && pr_total == 0 && drafts_hidden == 0 && issue_total == 0 {
-        if app.tree.has_visible_projects() {
-            f.render_widget(
-                Paragraph::new(hint_line(&[("n", " starts a worktree")], th)),
-                inner,
-            );
-        }
-        app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
-        return;
-    }
-
-    let dim = Style::default().fg(th.dim);
-
-    // ---- lay the column out in virtual rows ----
-    let mut layout: Vec<(usize, WorktreeEntry)> = Vec::new();
-    let mut vrow: usize = 0;
-    let header = |layout: &mut Vec<(usize, WorktreeEntry)>, vrow: &mut usize, e: WorktreeEntry| {
-        // A blank row above every group after the first keeps the groups
-        // scannable without drawing more chrome.
-        if *vrow > 0 {
-            *vrow += 1;
-        }
-        let h = e.height();
-        layout.push((*vrow, e));
-        *vrow += h;
-    };
-    for (i, row) in rows.iter().take(plain).enumerate() {
-        layout.push((vrow, WorktreeEntry::Row(i)));
-        vrow += PILL_H as usize;
-        // An extra quiet row separates the main checkout from the plain
-        // worktrees below it.
-        let is_main = matches!(row, PanelRow::Checkout { data, .. } if data.1);
-        if is_main && plain > 1 {
-            vrow += 1;
-        }
-    }
-    // The issue rows close the list; everything between the plain
-    // checkouts and them is the OPEN PRS group.
-    let pr_end = rows
-        .iter()
-        .position(|r| matches!(r, PanelRow::Issue { .. }))
-        .unwrap_or(rows.len());
-    if pr_total > 0 || drafts_hidden > 0 {
-        // A list cut off at the fetch cap says so rather than passing
-        // itself off as the whole set. The cap is on the answer, drafts
-        // and all, so it is measured there.
-        let open_total = app.all_open_prs().len();
-        let more = if open_total >= crate::pull_request::LIST_LIMIT {
-            "+"
-        } else {
-            ""
-        };
-        // With drafts hidden the count reads `9/12`: nine rows listed of
-        // twelve open. Short enough for a twenty-cell column, and honest
-        // about the three that are not on screen.
-        let count = if drafts_hidden > 0 {
-            format!("{pr_total}/{open_total}{more}")
-        } else {
-            format!("{pr_total}{more}")
-        };
-        // The disclosure triangle is the state: ▾ over the rows, ▸ when a
-        // click (or ↓ off the last checkout) would open them. Folded, the
-        // header is the whole group and its count says what it hides.
-        let fold = if app.open_prs_collapsed { "▸" } else { "▾" };
-        header(
-            &mut layout,
-            &mut vrow,
-            WorktreeEntry::PrHeader(format!("{fold} OPEN PRS · {count}")),
-        );
-        // A checkout under its pull request stacks straight onto the
-        // pull request's pill, no quiet row between: the two are one
-        // thing, and the indent says which is under which.
-        for i in plain..pr_end {
-            layout.push((vrow, WorktreeEntry::Row(i)));
-            vrow += PILL_H as usize;
-        }
-    }
-    if issue_total > 0 {
-        // The same `+` as the pull requests' when the answer hit the
-        // fetch cap: a hundred rows is not "a hundred issues".
-        let more = if issue_total >= crate::issues::LIST_LIMIT {
-            "+"
-        } else {
-            ""
-        };
-        let fold = if app.issues_collapsed { "▸" } else { "▾" };
-        header(
-            &mut layout,
-            &mut vrow,
-            WorktreeEntry::IssuesHeader(format!("{fold} ISSUES · {issue_total}{more}")),
-        );
-        for i in pr_end..rows.len() {
-            layout.push((vrow, WorktreeEntry::Row(i)));
-            vrow += PILL_H as usize;
-        }
-    }
-
-    // ---- resolve the scroll offset ----
-    let view_h = inner.height as usize;
-    let content_h = layout.last().map_or(0, |(top, e)| top + e.height());
-    // The cursor pulls the viewport, but only on the frames where it
-    // actually moved — otherwise a wheel scroll would snap straight back.
-    // The project is part of the anchor so switching projects re-homes the
-    // column even when the row index happens to be unchanged.
-    let anchor = (app.sel_project, app.sel_worktree);
-    if app.worktrees_anchor != Some(anchor) {
-        app.worktrees_anchor = Some(anchor);
-        if let Some(pos) = layout
-            .iter()
-            .position(|(_, e)| matches!(e, WorktreeEntry::Row(i) if *i == app.sel_worktree))
-        {
-            let (top, entry) = &layout[pos];
-            // Scrolling up to the first row of a group brings that group's
-            // header along, so the cursor never sits under a bare edge.
-            let up_to = match pos.checked_sub(1).map(|p| &layout[p]) {
-                Some((h, WorktreeEntry::PrHeader(_) | WorktreeEntry::IssuesHeader(_))) => *h,
-                _ => *top,
-            };
-            let bottom = top + entry.height();
-            if up_to < app.worktrees_scroll {
-                app.worktrees_scroll = up_to;
-            } else if bottom > app.worktrees_scroll + view_h {
-                app.worktrees_scroll = bottom - view_h;
-            }
-        }
-    }
-    // The wheel scrolls past the end freely; the clamp lands here so it
-    // can't run away from the list.
-    app.worktrees_scroll = app.worktrees_scroll.min(content_h.saturating_sub(view_h));
-    let scroll = app.worktrees_scroll as isize;
-
-    // ---- draw ----
-    // The main checkout renders as `branch ⌂ root` (dim badge — the branch
-    // is live, the badge marks root-ness). When the ago label leaves no
-    // room for the word, the glyph alone still marks the row: at the
-    // default column width `main ⌂ 23m ago` is what fits.
-    const ROOT_BADGE: &str = " ⌂ root";
-    const ROOT_GLYPH: &str = " ⌂";
-    // A checkout whose RUN COMMAND is up says so in green, straight after
-    // its branch: ` ▶ running`, or the bare ` ▶` where the word would cut
-    // the branch. The glyph never yields — it is the one thing on the row
-    // that says a process is serving from this checkout.
-    const RUN_BADGE: &str = " ▶ running";
-    const RUN_GLYPH: &str = " ▶";
-    for (pos, (top, entry)) in layout.iter().enumerate() {
-        let y = *top as isize - scroll;
-        if y >= view_h as isize {
-            break;
-        }
-        let hit_h = pill_hit_height(*top, layout.get(pos + 1).map(|(t, _)| *t));
-        let i = match entry {
-            WorktreeEntry::PrHeader(text) | WorktreeEntry::IssuesHeader(text) => {
-                // Both forms are click targets: a click folds or unfolds
-                // the group, like the ARCHIVED header in Sessions.
-                if let Some(r) = row_rect_at(inner, y) {
-                    f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
-                    let hit = match entry {
-                        WorktreeEntry::IssuesHeader(_) => HitTarget::IssuesHeader,
-                        _ => HitTarget::OpenPrsHeader,
-                    };
-                    app.hits.push((r, hit));
-                }
-                continue;
-            }
-            WorktreeEntry::Row(i) => *i,
-        };
-        match &rows[i] {
-            PanelRow::Checkout { data, nested } => {
-                let (branch, is_main, roll, unseen, stamped, pending, merged, running, fresh) =
-                    data;
-                let (badges, badge_len) = row_badges(*unseen, th);
-                // A stand-in checkout (QUICK PROMPT, git still cutting
-                // it) reads as not-there-yet: hollow dot, no sweep, and
-                // the word where the ago label would sit. A checkout
-                // whose pull request has merged wears that instead of
-                // its sessions' status (`RowState`).
-                let state = match (*pending, *merged) {
-                    (true, _) => RowState::Sessions(None),
-                    (false, true) => RowState::Merged,
-                    (false, false) => RowState::Sessions(*roll),
-                };
-                let ramp = state.ramp(*fresh, th, app.animations);
-                // A checkout under its pull request is stepped in behind
-                // a `└` that runs into its dot, the way a child row is
-                // anywhere: the row above is the pull request it is the
-                // checkout of.
-                let indent = nested.then_some(NESTED_WORKTREE_INDENT);
-                let indent_len = indent.map_or(0, |s| s.chars().count());
-                // 3, not 2: the dot's two cells plus the pill marker
-                // `render_pill` prepends — bill them here or the trailing
-                // badge is what falls off the end of a twenty-cell column.
-                let free = (inner.width as usize).saturating_sub(3 + badge_len + indent_len);
-                let run = running.then(|| {
-                    let wide = branch.chars().count() + RUN_BADGE.chars().count();
-                    if wide <= free {
-                        RUN_BADGE
-                    } else {
-                        RUN_GLYPH
-                    }
-                });
-                let free = free.saturating_sub(run.map_or(0, |r| r.chars().count()));
-                // How long since a session in this checkout last did
-                // something — the stamp the group is sorted on, so the
-                // label is what makes the order legible. It yields to the
-                // branch name first (same rule as the session rows)...
-                let ago = if *pending {
-                    PENDING_WORKTREE_BADGE.to_string()
-                } else {
-                    ago_badge(*stamped)
-                };
-                let (ago, free) = fit_ago(ago, free);
-                // ...and the root badge then yields to a branch it would push
-                // into an ellipsis: in a narrow column `main 1 done` beats
-                // `ma… ⌂ root 1 done` — the ⌂ is the least load-bearing
-                // thing on the row, the branch is the row's identity. It
-                // shrinks to the bare glyph before it goes.
-                let fits = |badge: &str| {
-                    branch.chars().count() <= free.saturating_sub(badge.chars().count())
-                };
-                let root = if !*is_main {
-                    None
-                } else if fits(ROOT_BADGE) {
-                    Some(ROOT_BADGE)
-                } else if fits(ROOT_GLYPH) {
-                    Some(ROOT_GLYPH)
-                } else {
-                    None
-                };
-                let max = free - root.map_or(0, |r| r.chars().count());
-                let mut spans = Vec::new();
-                if let Some(indent) = indent {
-                    spans.push(Span::styled(indent, dim));
-                }
-                spans.push(state.dot(*unseen > 0, th));
-                spans.extend(status_name_spans(
-                    truncate(branch, max),
-                    state.name_style(th),
-                    ramp,
-                    app.sweep_phase(),
-                ));
-                if let Some(run) = run {
-                    spans.push(Span::styled(
-                        run,
-                        Style::default().fg(th.ok).add_modifier(Modifier::BOLD),
-                    ));
-                }
-                if let Some(root) = root {
-                    spans.push(Span::styled(root, Style::default().fg(th.dim)));
-                }
-                if !ago.is_empty() {
-                    spans.push(Span::styled(ago, Style::default().fg(th.dim)));
-                }
-                for (text, style) in badges {
-                    spans.push(Span::styled(text, style));
-                }
-                render_pill(
-                    f,
-                    inner,
-                    y,
-                    spans,
-                    i == app.sel_worktree,
-                    focused,
-                    th,
-                    state.color(*unseen > 0, th),
-                );
-                if let Some(hit) = rows_rect_at(inner, y, hit_h) {
-                    app.hits.push((hit, HitTarget::Worktree(i)));
-                }
-            }
-            PanelRow::Pr(pr) => {
-                // A pull request reads like the Sessions panel's link rows —
-                // the arrow says "leaves nebula". The group header already
-                // says these are open, so only a draft earns a badge; in a
-                // column this narrow the width is better spent on the title.
-                // A draft is also dimmed end to end (`pr_row::look`) and
-                // sits below every finished pull request, so it reads as
-                // "not ready" from across the room. One GitHub says cannot
-                // merge — conflicts, a failing check — is red end to end
-                // instead, and its badge names the trouble (`conflicts`,
-                // `failing`): that row needs a person, draft or not.
-                let trouble = pr.trouble();
-                let look = crate::pr_row::look(pr.standing(), trouble, th);
-                let badge = match trouble {
-                    Some(trouble) => Some((format!(" {}", trouble.badge()), look.badge)),
-                    None => pr
-                        .is_draft
-                        .then(|| (format!(" {}", pr.badge()), look.badge)),
-                };
-                let spans = crate::pr_row::spans(look, &pr.label(), inner.width as usize, badge);
-                // No STATUS DOT on a pull request, so the rail is the look's.
-                render_pill(
-                    f,
-                    inner,
-                    y,
-                    spans,
-                    i == app.sel_worktree,
-                    focused,
-                    th,
-                    look.rail,
-                );
-                if let Some(hit) = rows_rect_at(inner, y, hit_h) {
-                    app.hits.push((hit, HitTarget::Worktree(i)));
-                }
-            }
-            PanelRow::Issue { label } => {
-                // An issue is a link out of nebula like a pull request, so
-                // it takes the same arrow — in the green the ISSUES MODAL
-                // paints `open` in and the project rows count issues in,
-                // so the two groups are told apart from across the room.
-                let look = crate::pr_row::Look {
-                    glyph: th.ok,
-                    label: th.muted,
-                    rail: th.ok,
-                    badge: th.dim,
-                };
-                let spans = crate::pr_row::spans(look, label, inner.width as usize, None);
-                render_pill(
-                    f,
-                    inner,
-                    y,
-                    spans,
-                    i == app.sel_worktree,
-                    focused,
-                    th,
-                    look.rail,
-                );
-                if let Some(hit) = rows_rect_at(inner, y, hit_h) {
-                    app.hits.push((hit, HitTarget::Worktree(i)));
-                }
-            }
-        }
-    }
-
-    // Panel background (registered last so rows win the hit-test).
-    app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
-}
-
-/// One laid-out entry of the Sessions panel. Group headers and session
-/// rows share a single virtual-row layout, computed unbounded by the
-/// panel height, so the whole column can scroll as one list.
-enum SessionEntry {
-    Header(String),
-    /// The ARCHIVED group header, in whichever form the toggle is in.
-    ArchivedHeader(String),
-    /// Index into `visible_session_rows()`, plus how many RECENT PROMPTS
-    /// lines hang under its pill (see [`session_prompt_lines`]) and how
-    /// many rows its FOLLOW-UP COMPOSER takes under those (see
-    /// [`follow_up_rows`]) — 0 on every folded card.
-    Row {
-        index: usize,
-        prompts: usize,
-        follow_up: usize,
-    },
-}
-
-impl SessionEntry {
-    /// Rows the entry occupies: a header one, a pill its 3-row cell (they
-    /// stack on a `PILL_H` stride, so neighboring pads overlap) plus any
-    /// prompt lines and FOLLOW-UP COMPOSER inside it.
-    fn height(&self) -> usize {
-        match self {
-            SessionEntry::Row {
-                prompts, follow_up, ..
-            } => PILL_H as usize + 1 + prompts + follow_up,
-            _ => 1,
-        }
-    }
-}
-
-/// The most text rows the FOLLOW-UP COMPOSER grows to before it scrolls
-/// under its own caret. Four is a paragraph of instruction in a 30-column
-/// panel; past that the box would own the column and push every card below
-/// it off the bottom for a prompt nobody reads back in full anyway.
-const FOLLOW_UP_MAX_LINES: usize = 4;
-
-/// Rows the FOLLOW-UP COMPOSER takes inside its card: the framed box —
-/// title row, text, hint row — or 0 for every card but the expanded one.
-/// The layout and the draw both ask, so the height they agree on is
-/// computed once here from the text as it wraps at this width.
-fn follow_up_rows(app: &App, index: usize, width: u16) -> usize {
-    if app.follow_up_row() != Some(index) {
-        return 0;
-    }
-    let Some(follow_up) = &app.follow_up else {
-        return 0;
-    };
-    let lines = multiline_input_lines(
-        &follow_up.input,
-        follow_up_text_width(width),
-        app.theme.accent,
-        app.theme,
-    )
-    .0
-    .len();
-    2 + lines.clamp(1, FOLLOW_UP_MAX_LINES)
-}
-
-/// Columns of typing inside the composer's frame, at a panel `width`: the
-/// pill's rail column, the box's two borders and a space either side of
-/// the text come off it first. Never 0 — a column dragged down to
-/// [`crate::app::MIN_PANEL_W`] still has to wrap somewhere.
-fn follow_up_text_width(width: u16) -> usize {
-    (width as usize).saturating_sub(5).max(1)
-}
-
-/// How many RECENT PROMPTS lines a row carries under its pill: the
-/// `recent_prompts` setting, capped at what the session has. None for a
-/// terminal or a link (they take no prompts), an archived session (its
-/// history is over, and the group is for scanning names) or a QUICK
-/// PROMPT stand-in (its row has not been created yet).
-fn session_prompt_lines(app: &App, row: &SessionRow) -> usize {
-    match row {
-        SessionRow::Agent(a) if !a.archived && !app.is_placeholder_agent(&a.id) => {
-            app.recent_prompts.min(a.recent_prompts.len())
-        }
-        _ => 0,
-    }
-}
-
-/// What a prompt line opens with, after the pill's rail column: a column
-/// to land under the name (past the status dot), and a bullet so the
-/// lines read as a list hanging off the row rather than as more rows.
-const PROMPT_INDENT: &str = " · ";
-
-/// The RECENT PROMPTS under a session's name, from `first_row`: the
-/// newest `count` of `prompts`, oldest first so the bottom line is the
-/// latest thing asked, each clipped to fit with its ago label pinned
-/// right. Dim, with the newest lifted to muted so the eye lands on it —
-/// these are context for the row, not rows of their own.
-///
-/// On the selected row `bar` is the pill's `(fill, rail)` from
-/// `pill_bar`: the lines sit on that fill and carry the rail down their
-/// first column, so the pill and its history are one slab and the list
-/// reads as part of the session the cursor is on. Dim lifts to muted on
-/// the fill there, the way the pill's own dim spans do.
-fn draw_prompt_lines(
-    f: &mut Frame,
-    inner: Rect,
-    first_row: isize,
-    prompts: &[nebula_core::PromptEntry],
-    count: usize,
-    bar: Option<(Color, Color)>,
-    th: Theme,
-) {
-    let skip = prompts.len().saturating_sub(count);
-    let free = (inner.width as usize).saturating_sub(1 + PROMPT_INDENT.chars().count());
-    let lift = |color: Color| match bar {
-        Some(_) if color == th.dim => th.muted,
-        _ => color,
-    };
-    let base = bar.map_or_else(Style::default, |(fill, _)| Style::default().bg(fill));
-    let marker = match bar {
-        Some((_, rail)) => Span::styled(PILL_RAIL, Style::default().fg(rail)),
-        None => Span::raw(" "),
-    };
-    for (i, entry) in prompts.iter().skip(skip).enumerate() {
-        let Some(area) = row_rect_at(inner, first_row + i as isize) else {
-            continue;
-        };
-        let newest = skip + i + 1 == prompts.len();
-        let text_color = lift(if newest { th.muted } else { th.dim });
-        let (ago, text_max) = fit_ago(ago_badge(entry.submitted_at), free);
-        let text = truncate(&entry.text, text_max);
-        let mut spans = vec![
-            marker.clone(),
-            Span::styled(PROMPT_INDENT, Style::default().fg(lift(th.dim))),
-            Span::styled(text.clone(), Style::default().fg(text_color)),
-        ];
-        if !ago.is_empty() {
-            let gap = text_max.saturating_sub(text.chars().count());
-            spans.push(Span::raw(" ".repeat(gap)));
-            spans.push(Span::styled(ago, Style::default().fg(lift(th.dim))));
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
-    }
-}
-
-fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
-    let th = app.theme;
-    let focused = app.focus == Focus::Sessions;
-    // The title's count is a session count: link rows are bookmarks, and
-    // counting them here would say "4 sessions" over a list of two.
-    let visible = app
-        .visible_session_rows()
-        .iter()
-        .filter(|r| r.as_link().is_none())
-        .count();
-    let count = Some(visible).filter(|n| *n > 0);
-    // Hidden by hand, the column is a rail with its chevron whatever row
-    // the Worktrees cursor is on; open by hand but under a pull request
-    // row, it folds to the bare rule — nothing to list, nothing to click.
-    let fold = if app.hide_sessions {
-        Fold::Rail
-    } else if app.sessions_collapsed() {
-        Fold::Rule
-    } else {
-        Fold::Open
-    };
-    let inner = draw_column(
-        f,
-        area,
-        "SESSIONS",
-        count,
-        focused,
-        th,
-        Focus::Sessions,
-        fold,
-        &mut app.hits,
-    );
-    // The page Ctrl+d / Ctrl+u jump by half of: how many pills the column
-    // has room for this frame. Group headers and RECENT PROMPTS lines are
-    // not billed, as the Worktrees column's headers aren't — "about half
-    // a panel" is the promise, and the long lists this is for are the
-    // archived rows, which carry no prompt lines.
-    app.sessions_view_rows = (inner.height / PILL_H) as usize;
-
-    let rows = app.visible_session_rows();
-    let (active_count, archived_count) = app.session_group_counts();
-    // The empty-column hint only when the column lists nothing at all —
-    // the ARCHIVED group included, folded or not, as the Worktrees column
-    // counts its folded OPEN PRS group. Folded, that group's header lands
-    // on the same top row the hint takes, and the two printed over each
-    // other: `… 5 archived` with the hint's `terminal` showing past it.
-    if rows.is_empty() && archived_count == 0 && app.selected_worktree().is_some() {
-        f.render_widget(
-            Paragraph::new(hint_line(&[("n", " agent · "), ("t", " terminal")], th)),
-            inner,
-        );
-    }
-    let terminal_count = rows
-        .iter()
-        .filter(|r| matches!(r, SessionRow::Terminal(_)))
-        .count();
-    let link_count = rows.iter().filter(|r| r.as_link().is_some()).count();
-    let dim = Style::default().fg(th.dim);
-
-    // ---- lay the column out in virtual rows ----
-    let mut layout: Vec<(usize, SessionEntry)> = Vec::new();
-    let mut vrow: usize = 0;
-    let header = |layout: &mut Vec<(usize, SessionEntry)>, vrow: &mut usize, e: SessionEntry| {
-        // A blank row above every group after the first keeps the groups
-        // scannable without drawing more chrome.
-        if *vrow > 0 {
-            *vrow += 1;
-        }
-        let h = e.height();
-        layout.push((*vrow, e));
-        *vrow += h;
-    };
-    let push_rows =
-        |layout: &mut Vec<(usize, SessionEntry)>, vrow: &mut usize, start: usize, len: usize| {
-            let end = (start + len).min(rows.len());
-            for (i, row) in rows.iter().enumerate().take(end).skip(start) {
-                let prompts = session_prompt_lines(app, row);
-                // The expanded card's FOLLOW-UP COMPOSER is laid out like
-                // its prompt lines — inside the pill, billed to this entry
-                // — so opening it pushes every card below it down the
-                // column and off the bottom, and the scroll follows.
-                let follow_up = follow_up_rows(app, i, inner.width);
-                layout.push((
-                    *vrow,
-                    SessionEntry::Row {
-                        index: i,
-                        prompts,
-                        follow_up,
-                    },
-                ));
-                // Pills stack on a `PILL_H` stride, sharing their pads;
-                // one with rows of its own inside it grows by them and
-                // keeps its bottom pad, so the next pill starts below that.
-                *vrow += PILL_H as usize;
-                if prompts + follow_up > 0 {
-                    *vrow += 1 + prompts + follow_up;
-                }
-            }
-        };
-
-    // The live agents are one flat list with no header of its own — the
-    // headers below name what *isn't* an agent.
-    push_rows(&mut layout, &mut vrow, 0, active_count);
-    if terminal_count > 0 {
-        header(
-            &mut layout,
-            &mut vrow,
-            SessionEntry::Header("TERMINALS".into()),
-        );
-        push_rows(&mut layout, &mut vrow, active_count, terminal_count);
-    }
-    if link_count > 0 {
-        // Not "OPEN PRS": the branch's pull request stays on its row after
-        // it is merged or closed (`pull_request::PullRequest`), so the
-        // header names the thing, not a state it may have left.
-        header(
-            &mut layout,
-            &mut vrow,
-            SessionEntry::Header("PULL REQUESTS".into()),
-        );
-        push_rows(
-            &mut layout,
-            &mut vrow,
-            active_count + terminal_count,
-            link_count,
-        );
-    }
-    if archived_count > 0 {
-        let text = if app.show_archived {
-            format!(" ARCHIVED · {archived_count}")
-        } else {
-            format!(" … {archived_count} archived")
-        };
-        header(&mut layout, &mut vrow, SessionEntry::ArchivedHeader(text));
-        if app.show_archived {
-            let start = active_count + terminal_count + link_count;
-            push_rows(
-                &mut layout,
-                &mut vrow,
-                start,
-                rows.len().saturating_sub(start),
-            );
-        }
-    }
-
-    // ---- resolve the scroll offset ----
-    let view_h = inner.height as usize;
-    let content_h = layout.last().map_or(0, |(top, e)| top + e.height());
-    // The cursor pulls the viewport, but only on the frames where it
-    // actually moved — otherwise a wheel scroll would snap straight back.
-    // Expanding a card, and every line typed into it, counts as a move:
-    // the box is what the user is looking at, and it has to stay on
-    // screen as it grows.
-    let composer = layout
-        .iter()
-        .find_map(|(_, e)| match e {
-            SessionEntry::Row { follow_up, .. } if *follow_up > 0 => Some(*follow_up),
-            _ => None,
-        })
-        .unwrap_or(0);
-    let anchor = (app.sel_worktree, app.sel_session, composer);
-    if app.sessions_anchor != Some(anchor) {
-        app.sessions_anchor = Some(anchor);
-        // The expanded card pulls the viewport ahead of the cursor's own
-        // row: the box is where the keyboard is pointed, and a cursor
-        // parked elsewhere (a click that moved it, a re-sort that did)
-        // must not scroll the box being typed into off the screen.
-        let wanted = app.follow_up_row().unwrap_or(app.sel_session);
-        if let Some(pos) = layout
-            .iter()
-            .position(|(_, e)| matches!(e, SessionEntry::Row { index, .. } if *index == wanted))
-        {
-            let (top, entry) = &layout[pos];
-            // Scrolling up to the first row of a group brings that group's
-            // header along, so the cursor never sits under a bare edge.
-            let up_to = match pos.checked_sub(1).map(|p| &layout[p]) {
-                Some((h, SessionEntry::Header(_) | SessionEntry::ArchivedHeader(_))) => *h,
-                _ => *top,
-            };
-            let bottom = top + entry.height();
-            if up_to < app.sessions_scroll {
-                app.sessions_scroll = up_to;
-            } else if bottom > app.sessions_scroll + view_h {
-                app.sessions_scroll = bottom - view_h;
-            }
-        }
-    }
-    // The wheel scrolls past the end freely; the clamp lands here so it
-    // can't run away from the list.
-    app.sessions_scroll = app.sessions_scroll.min(content_h.saturating_sub(view_h));
-    let scroll = app.sessions_scroll as isize;
-
-    // ---- draw ----
-    for (pos, (top, entry)) in layout.iter().enumerate() {
-        let y = *top as isize - scroll;
-        if y >= view_h as isize {
-            break;
-        }
-        let next_top = layout.get(pos + 1).map(|(t, _)| *t);
-        match entry {
-            SessionEntry::Header(text) => {
-                if let Some(r) = row_rect_at(inner, y) {
-                    f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
-                }
-            }
-            SessionEntry::ArchivedHeader(text) => {
-                // Both header forms are click targets: a click expands or
-                // collapses the group, same as the A key.
-                if let Some(r) = row_rect_at(inner, y) {
-                    f.render_widget(Paragraph::new(Span::styled(text.as_str(), dim)), r);
-                    app.hits.push((r, HitTarget::ArchivedHeader));
-                }
-            }
-            SessionEntry::Row {
-                index,
-                prompts,
-                follow_up,
-            } => {
-                let hit_h = row_hit_height(*top, next_top, *prompts + *follow_up);
-                draw_session_row(
-                    f,
-                    app,
-                    inner,
-                    y,
-                    hit_h,
-                    *index,
-                    *prompts,
-                    *follow_up,
-                    &rows[*index],
-                    focused,
-                )
-            }
-        }
-    }
-
-    // Panel background (registered last so rows win the hit-test).
-    app.hits.push((inner, HitTarget::PanelBg(Focus::Sessions)));
-}
-
-/// `hit_h` is the row's click target height (see [`row_hit_height`]);
-/// `prompts` how many RECENT PROMPTS lines to hang under the pill, and
-/// `follow_up` how many rows the FOLLOW-UP COMPOSER takes under those (see
-/// [`follow_up_rows`]) — 0 on every card but the expanded one.
-#[allow(clippy::too_many_arguments)]
-fn draw_session_row(
-    f: &mut Frame,
-    app: &mut App,
-    inner: Rect,
-    top: isize,
-    hit_h: u16,
-    index: usize,
-    prompts: usize,
-    follow_up: usize,
-    row: &SessionRow,
-    focused: bool,
-) {
-    let th = app.theme;
-    let width = inner.width;
-    // The FOLLOW-UP CHEVRON: the card's own toggle, two columns at the end
-    // of the name row, taken out of the name's budget before anything else
-    // is measured. Only on a card that can grow a box (`takes_follow_up`)
-    // — the rest of the column keeps its full width.
-    let chevron = if !app.takes_follow_up(row) {
-        None
-    } else if follow_up > 0 {
-        Some((" ▾", th.accent))
-    } else {
-        Some((" ▸", th.dim))
-    };
-    let chevron_w = chevron.map_or(0, |(glyph, _)| glyph.chars().count());
-    // Each arm yields its spans and the rail color: the STATUS DOT's on an
-    // agent row, the accent on the rows that have no dot.
-    let (spans, mark) = match row {
-        SessionRow::Agent(a) => {
-            // A stand-in session (QUICK PROMPT, its create still in
-            // flight) reads as not-there-yet: hollow dot, no sweep, and
-            // the word in the badge slot the harness would take.
-            let pending = app.is_placeholder_agent(&a.id);
-            // A cold session — no live PTY behind it: the IDLE REAPER took
-            // it, or nothing has booted it since the daemon started — goes
-            // gray whatever its last status was, dot and rail both, until an
-            // attach warms it again: that status is what it last did, not
-            // what it is doing. A Cloud row never has a local PTY to be warm.
-            let cold = !a.alive && a.cloud_session_id.is_none();
-            let dot = if a.archived {
-                Span::styled("⊘ ", Style::default().fg(th.dim))
-            } else if pending {
-                status_dot(None, false, th)
-            } else if cold {
-                Span {
-                    style: Style::default().fg(th.dim),
-                    ..status_dot(Some(a.status), false, th)
-                }
-            } else {
-                status_dot(Some(a.status), a.unseen && !a.archived, th)
-            };
-            // Muted names: sessions sit at the bottom of the tree, so
-            // their text reads "smallest" next to the bold project
-            // buttons.
-            let name_style = if a.archived {
-                Style::default().fg(th.dim)
-            } else {
-                Style::default().fg(th.muted)
-            };
-            // The CLI behind the session, as a dim trailing badge (same
-            // idiom as the worktree root row) — every kind, so the column
-            // reads as one consistent "name · when · harness" list. A turn
-            // that finished with nobody looking takes the slot over and
-            // goes loud (as a link row's unread count does): these rows
-            // are what the parent rows' counts are counting, so each one
-            // says so until the cursor lands on it.
-            let (badge, badge_style) = if pending {
-                (
-                    PENDING_SESSION_BADGE.to_string(),
-                    Style::default().fg(th.dim),
-                )
-            } else if a.unseen && !a.archived {
-                (" done".to_string(), Style::default().fg(th.done))
-            } else if a.cloud_session_id.is_some() {
-                // A Claude Cloud row: the harness that matters is the cloud
-                // sandbox, and the badge is how the user tells this row
-                // opens the session's page rather than a local CLI.
-                (" cloud".to_string(), Style::default().fg(th.dim))
-            } else {
-                (
-                    format!(" {}", crate::agent_picker::session_harness_badge(a)),
-                    Style::default().fg(th.dim),
-                )
-            };
-            // How long since this session last did anything, sat between
-            // the name and the harness. The list is sorted on this stamp,
-            // so the label is what makes the order legible.
-            // A stand-in carries the DAEMON's create stamp so it sorts
-            // where the real row will, but "just now" beside "starting"
-            // would say it has done something.
-            let ago = if pending {
-                String::new()
-            } else {
-                ago_badge(a.status_changed_at)
-            };
-            // 3 = the pill's selection marker plus the status dot, both of
-            // which render ahead of the name; the FOLLOW-UP CHEVRON, when
-            // the card has one, renders after the badge.
-            let free = (width.saturating_sub(3) as usize)
-                .saturating_sub(badge.chars().count() + chevron_w);
-            let (ago, name_max) = fit_ago(ago, free);
-            // Archived rows stay quiet even if their last status was live.
-            let ramp = if a.archived || pending || cold {
-                None
-            } else {
-                sweep_ramp(Some(a.status), app.agent_fresh_done(a), th, app.animations)
-            };
-            let mut spans = vec![dot];
-            spans.extend(status_name_spans(
-                truncate(&a.name, name_max),
-                name_style,
-                ramp,
-                app.sweep_phase(),
-            ));
-            if !ago.is_empty() {
-                spans.push(Span::styled(ago, Style::default().fg(th.dim)));
-            }
-            spans.push(Span::styled(badge, badge_style));
-            let mark = if a.archived || pending || cold {
-                th.dim
-            } else {
-                status_color(Some(a.status), a.unseen, th)
-            };
-            (spans, mark)
-        }
-        SessionRow::Terminal(t) => {
-            // Shell prompt glyph instead of a status dot; dim once the
-            // shell has exited (re-attach respawns it). A RUN TERMINAL wears
-            // the play glyph of its worktree's RUNNING badge and names its
-            // command, dim, after the row name; exited, re-attaching it
-            // replays how the run ended instead of respawning anything.
-            let glyph_color = if t.alive { th.ok } else { th.dim };
-            let glyph = if t.run_command.is_some() {
-                "▶ "
-            } else {
-                "❯ "
-            };
-            let name = truncate(&t.name, width.saturating_sub(3) as usize);
-            let room = (width as usize).saturating_sub(4 + name.chars().count());
-            let mut spans = vec![
-                Span::styled(glyph, Style::default().fg(glyph_color)),
-                Span::styled(name, Style::default().fg(th.muted)),
-            ];
-            if let Some(command) = t.run_command.as_deref().filter(|_| room > 1) {
-                spans.push(Span::styled(
-                    format!(" {}", truncate(command, room)),
-                    Style::default().fg(th.dim),
-                ));
-            }
-            (spans, th.accent)
-        }
-        SessionRow::Link(l) => {
-            // Same shape as an agent row — glyph, name, trailing badge — so
-            // the column reads as one list. The arrow says "leaves nebula";
-            // an open pull request earns the accent (a draft the dim, end
-            // to end, like its row in the PROJECT OPEN PRS GROUP; a merged
-            // or closed one the PR PREVIEW's state color), and a bare saved
-            // link is as quiet as a terminal row.
-            //
-            // The badge slot is normally the state word in the look's badge
-            // color — or the trouble word (`conflicts`, `failing`) on a
-            // pull request GitHub says cannot merge, whose whole row is
-            // red for it — but comments that landed since the row was last
-            // opened take it over and go loud: an unread count is the one
-            // thing here worth walking over to look at, and the state is
-            // already in the glyph (and the trouble in the row's red).
-            let pr = l.pull_request();
-            let unseen = l.unseen_comments(&app.pr_seen);
-            let look = match pr {
-                Some(pr) => crate::pr_row::look(pr.standing(), pr.trouble(), th),
-                None => crate::pr_row::Look {
-                    glyph: th.muted,
-                    label: th.muted,
-                    rail: th.accent,
-                    badge: th.dim,
-                },
-            };
-            let badge = match (pr, pr.and_then(|pr| pr.trouble())) {
-                (Some(_), _) if unseen > 0 => Some((format!(" {unseen} new"), th.warn)),
-                (Some(_), Some(trouble)) => Some((format!(" {}", trouble.badge()), look.badge)),
-                (Some(pr), None) => Some((format!(" {}", pr.badge()), look.badge)),
-                (None, _) => None,
-            };
-            let spans = crate::pr_row::spans(look, &l.label(), width as usize, badge);
-            (spans, look.rail)
-        }
-    };
-    let selected = index == app.sel_session;
-    let mut spans = spans;
-    if let Some((glyph, color)) = chevron {
-        spans.push(Span::styled(glyph, Style::default().fg(color)));
-    }
-    render_pill_body(
-        f,
-        inner,
-        top,
-        spans,
-        selected,
-        focused,
-        th,
-        mark,
-        prompts + follow_up,
-    );
-    let bar = selected.then(|| pill_bar(focused, mark, th));
-    if prompts > 0 {
-        if let SessionRow::Agent(a) = row {
-            // Inside the pill, straight under the name: its bottom pad
-            // closes under the last line, so a selected row's history
-            // sits on the row's own fill and reads as part of the session
-            // the cursor is on, not as rows of its own beneath it.
-            let first_row = top + PILL_H as isize;
-            draw_prompt_lines(f, inner, first_row, &a.recent_prompts, prompts, bar, th);
-        }
-    }
-    if follow_up > 0 {
-        // Under the history, still inside the pill: the card grows a box
-        // rather than putting one over the screen, which is the whole
-        // point of it — the session, what it was last asked, and what it
-        // is about to be asked read as one card.
-        let first_row = top + PILL_H as isize + prompts as isize;
-        draw_follow_up_box(f, app, inner, first_row, follow_up, bar, th);
-        // Ahead of the row's target: a click inside the box is a click on
-        // the box, not a second click on the card — which would attach the
-        // session and lock the pane out from under the typing.
-        if let Some(r) = rows_rect_at(inner, first_row, follow_up as u16) {
-            app.hits.push((r, HitTarget::FollowUpBox));
-        }
-    }
-    // The chevron's own target, ahead of the row's so a click on it
-    // toggles the card instead of selecting it twice.
-    if chevron.is_some() {
-        if let Some(r) = row_rect_at(inner, top + 1) {
-            let cell = Rect {
-                x: r.x + r.width.saturating_sub(chevron_w as u16),
-                width: (chevron_w as u16).min(r.width),
-                ..r
-            };
-            app.hits.push((cell, HitTarget::SessionFollowUp(index)));
-        }
-    }
-    if let Some(hit) = rows_rect_at(inner, top, hit_h) {
-        app.hits.push((hit, HitTarget::Session(index)));
-    }
-}
-
-/// The FOLLOW-UP COMPOSER, `rows` tall from `first_row` inside its card: a
-/// framed box with `follow-up` on its top border, the turn being typed
-/// inside it, and the keys that send it on the bottom one — the task box's
-/// shape, drawn a row at a time so a card straddling the top of the column
-/// loses only the rows that scrolled off.
-///
-/// `bar` is the pill's `(fill, rail)` when the card is the selected one, as
-/// [`draw_prompt_lines`] takes it: the box then sits on the row's own fill
-/// and carries the rail down its first column, so card and box are one
-/// slab. The frame is the accent — this is where the keyboard is pointed.
-fn draw_follow_up_box(
-    f: &mut Frame,
-    app: &App,
-    inner: Rect,
-    first_row: isize,
-    rows: usize,
-    bar: Option<(Color, Color)>,
-    th: Theme,
-) {
-    let Some(follow_up) = &app.follow_up else {
-        return;
-    };
-    let base = bar.map_or_else(Style::default, |(fill, _)| Style::default().bg(fill));
-    let marker = match bar {
-        Some((_, rail)) => Span::styled(PILL_RAIL, Style::default().fg(rail)),
-        None => Span::raw(" "),
-    };
-    let frame = Style::default().fg(th.accent);
-    // Everything but the rail column belongs to the box.
-    let box_w = (inner.width as usize).saturating_sub(1).max(2);
-    let text_w = follow_up_text_width(inner.width);
-    let put = |f: &mut Frame, row: isize, mut spans: Vec<Span<'static>>| {
-        if let Some(r) = row_rect_at(inner, row) {
-            spans.insert(0, marker.clone());
-            f.render_widget(Paragraph::new(Line::from(spans)).style(base), r);
-        }
-    };
-
-    // Top border: ╭─ follow-up ──────╮
-    let title = truncate(" follow-up ", box_w.saturating_sub(3));
-    let fill = box_w.saturating_sub(3 + title.chars().count());
-    put(
-        f,
-        first_row,
-        vec![Span::styled(
-            format!("╭─{title}{}╮", "─".repeat(fill)),
-            frame,
-        )],
-    );
-
-    // The text, windowed on the caret the way every other box windows it.
-    let visible = rows.saturating_sub(2).max(1);
-    let (lines, caret_row) = multiline_input_lines(&follow_up.input, text_w, th.accent, th);
-    let max_start = lines.len().saturating_sub(visible);
-    let start = caret_row.saturating_sub(visible / 2).min(max_start);
-    for i in 0..visible {
-        let mut spans = vec![Span::styled("│ ", frame)];
-        let mut used = 0usize;
-        if let Some(line) = lines.get(start + i) {
-            for span in &line.spans {
-                used += span.content.chars().count();
-                spans.push(Span::styled(span.content.to_string(), span.style));
-            }
-        }
-        spans.push(Span::raw(" ".repeat(text_w.saturating_sub(used))));
-        spans.push(Span::styled(" │", frame));
-        put(f, first_row + 1 + i as isize, spans);
-    }
-
-    // Bottom border, carrying the keys: ╰─ ↵ send · ^J nl · Esc ─╯
-    let hint = follow_up_hint(box_w);
-    let fill = box_w.saturating_sub(3 + hint.chars().count());
-    put(
-        f,
-        first_row + rows as isize - 1,
-        vec![Span::styled(
-            format!("╰─{hint}{}╯", "─".repeat(fill)),
-            frame,
-        )],
-    );
-}
-
-/// The keys on the composer's bottom border, widest that fits `width` (the
-/// box's own, borders included). The column is narrow and a hint wider
-/// than its border is silently chopped, so this steps down the way
-/// [`task_prompt_hint`] does.
-fn follow_up_hint(width: usize) -> &'static str {
-    if width >= 32 {
-        " ↵ send · ⇧↵ newline · Esc close "
-    } else if width >= 24 {
-        " ↵ send · ^J nl · Esc "
-    } else if width >= 14 {
-        " ↵ · ^J · Esc "
-    } else {
-        ""
-    }
 }
 
 /// The pull-request reading pane. Replaces the session view while the
@@ -5476,7 +3396,10 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             "starting…".to_string(),
             Style::default().fg(th.dim),
         )),
-        Some(_) if app.term_locked => Some(Span::styled(
+        // The LAUNCHER VIEW's pane says nothing of the lock: its header's
+        // right end is the CLOSE BUTTON, and the accent rule under the
+        // strip already says the keys are in there.
+        Some(_) if app.term_locked && !app.launcher_active() => Some(Span::styled(
             "INPUT".to_string(),
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         )),
@@ -5484,19 +3407,30 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     };
     // A LAUNCHER VIEW session full-screened over its grid gets a breadcrumb
     // back to the grid rather than the panels' `TERMINAL · name`; the pane
-    // under the grid keeps an ordinary frame, which names the card the
-    // cursor is on — and calls it a SESSION, the word that view uses.
+    // under the grid gets the TAB STRIP, which says what it is reading —
+    // the SESSION the cursor is on, or one of the checkout's TERMINALS —
+    // and is how that gets swapped. The strip names the card under the
+    // cursor itself, so the panels' ` · <attached>` is not added beside
+    // it: with the pane on a terminal the attachment IS that terminal,
+    // and the SESSION tab has to go on saying what it would come back to.
     let inner = if app.launcher_active() && app.collapsed {
         launcher_view::crumb_frame(f, app, area)
     } else if app.launcher_active() {
-        titled_frame(f, area, "SESSION", left, right, focused, th)
+        launcher_view::pane_frame(f, app, area, right, focused)
     } else {
         terminal_frame(f, area, left, right, focused, th)
     };
-    // One cell of inset so PTY content doesn't hug the sessions rule.
+    // One cell of inset so PTY content doesn't hug the sessions rule — and,
+    // with the LAUNCHER VIEW's pane on the left of the cards, one on the
+    // right too, where the rule down its edge is.
+    let right_air = u16::from(
+        app.launcher_active()
+            && !app.collapsed
+            && app.launcher_pane_side() == crate::launcher::PaneSide::Left,
+    );
     let inner = Rect {
         x: inner.x + 1,
-        width: inner.width.saturating_sub(1),
+        width: inner.width.saturating_sub(1 + right_air),
         ..inner
     };
     app.term_area = inner;
@@ -5692,14 +3626,10 @@ fn editor_name(cmd: &str) -> &str {
         .unwrap_or(cmd)
 }
 
-/// The bottom bar, plus its one clickable cell run: the `◇ workspace`
-/// nameplate registers as a hit target so a click on it opens the switcher.
-/// The bar is drawn under the splash and the collapsed view too, so the
-/// registration lives here rather than in `draw`'s panel branch.
+/// The bottom bar, drawn under the splash and the collapsed view too,
+/// with the KEY COMBO DISPLAY on the padding row above it.
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
-    if let Some(rect) = draw_footer_bar(f, app, area) {
-        app.hits.push((rect, HitTarget::FooterWorkspace));
-    }
+    draw_footer_bar(f, app, area);
     draw_key_combo(f, app, area);
 }
 
@@ -5742,9 +3672,8 @@ fn draw_key_combo(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), row);
 }
 
-/// Draw the bar; returns the screen rect of the workspace nameplate when
-/// it fit on the bar.
-fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
+/// Draw the bar.
+fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // `area` includes the blank padding row; the bar itself is its last row.
     let area = Rect {
         y: area.y + area.height.saturating_sub(1),
@@ -5862,13 +3791,12 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             crate::branch_switch::footer_hint(view),
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()) {
+    } else if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_project_picker()) {
         Span::styled(
-            "Enter: open  n: new  r: rename  d: delete  Esc: close",
+            "type: filter  Enter: open the project  ↑/↓: move  Esc: close",
             Style::default().fg(th.dim),
         )
-    } else if app.launcher
-        && matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::QuickPrompt(_)))
+    } else if matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::QuickPrompt(_)))
     {
         // `^P`, `^O`, `Tab` and `^N` are on the box itself now, each
         // beside the thing it changes — a third copy down here was most
@@ -5890,14 +3818,19 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
         // the next key dismisses it (q included).
         Span::styled(
             if app.splash_preview {
-                "any key: back to panels".to_string()
+                "any key: back to the sessions".to_string()
             } else {
                 let k = |a| key_hint(app, a);
+                // Launched inside a repo: Enter opens it, and `o` is for
+                // any other folder.
+                let here = app
+                    .launch_repo_name()
+                    .map(|name| format!("{}: open {name}  ", k(Action::Activate)))
+                    .unwrap_or_default();
                 format!(
-                    "{}/{}: add project  {}: workspaces  {}: ssh host  {}: settings  {}: help  {}: quit",
-                    k(Action::New),
+                    "{here}{}: open {}folder  {}: ssh host  {}: settings  {}: help  {}: quit",
                     k(Action::AddProject),
-                    k(Action::Workspaces),
+                    if here.is_empty() { "a " } else { "another " },
                     k(Action::Hosts),
                     k(Action::Settings),
                     k(Action::Help),
@@ -5906,12 +3839,32 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             },
             Style::default().fg(th.dim),
         )
+    } else if app.launcher_grid()
+        && app.focus != Focus::Terminal
+        && app.launcher_tab_cursor.is_some()
+    {
+        // The LAUNCHER VIEW's PROJECT TABS holding the keys (`k`,`k` off
+        // the top row of cards): walking the header's cursor, which
+        // switches the grid as it goes, and the ways back down.
+        let k = |a| key_hint(app, a);
+        let down = k(Action::MoveDown);
+        Span::styled(
+            format!(
+                "{}{}: switch project  {} or {down}{down}: into its cards  {}: close tab  esc: back to the cards  {}: help  {}: quit",
+                k(Action::FocusLeft),
+                k(Action::FocusRight),
+                k(Action::Activate),
+                k(Action::CloseProjectTab),
+                k(Action::Help),
+                k(Action::Quit),
+            ),
+            Style::default().fg(th.dim),
+        )
     } else if app.launcher_grid() && app.focus != Focus::Terminal {
         // The LAUNCHER VIEW's GRID: walking the cards, opening the one
-        // under the cursor, and the way back up the tree — each LEVEL
-        // says what its own Enter opens and what Esc steps out to, since
-        // that is the whole difference between them. Not while the pane
-        // under it has the keys — those are the pane's own hints, below.
+        // under the cursor, and the PROJECT TABS beside them. Not while
+        // the pane under it has the keys — those are the pane's own
+        // hints, below.
         let k = |a| key_hint(app, a);
         let move_keys = format!(
             "{}{}{}{}",
@@ -5921,36 +3874,35 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             k(Action::FocusRight),
         );
         Span::styled(
-            match app.launcher_level {
-                crate::launcher::Level::Sessions => format!(
-                    "{move_keys}: move  {}: open  {}: new session  {}: archive  {}: diff  Esc: projects  {}: jump  {}: settings  {}: help  {}: quit",
+            if app.show_archived {
+                // The ARCHIVED VIEW is a different list with different
+                // verbs on it: there is nothing to attach, prompt or
+                // archive there, only the two a card in it takes.
+                format!(
+                    "{move_keys}: move  {}: unarchive  {}: delete  {}: back to live sessions  {}: jump  {}: help  {}: quit",
+                    k(Action::Unarchive),
+                    k(Action::Delete),
+                    k(Action::ToggleArchived),
+                    k(Action::Palette),
+                    k(Action::Help),
+                    k(Action::Quit),
+                )
+            } else {
+                format!(
+                    "{move_keys}: move  {}: open  {}: new session  {}{}: project tabs  {}: terminals  {}: archive  {}: archived  {}: diff  {}: jump  {}: settings  {}: help  {}: quit",
                     k(Action::Activate),
                     k(Action::QuickPrompt),
+                    k(Action::PrevProjectTab),
+                    k(Action::NextProjectTab),
+                    k(Action::PaneTabs),
                     k(Action::Archive),
+                    k(Action::ToggleArchived),
                     k(Action::GitDiff),
                     k(Action::Palette),
                     k(Action::Settings),
                     k(Action::Help),
                     k(Action::Quit),
-                ),
-                crate::launcher::Level::Projects => format!(
-                    "{move_keys}: move  {}: open project  {}: new session  {}: issues  {}: pull requests  Esc: workspaces  {}: jump  {}: help  {}: quit",
-                    k(Action::Activate),
-                    k(Action::QuickPrompt),
-                    k(Action::Issues),
-                    k(Action::PullRequests),
-                    k(Action::Palette),
-                    k(Action::Help),
-                    k(Action::Quit),
-                ),
-                crate::launcher::Level::Workspaces => format!(
-                    "{move_keys}: move  {}: open workspace  1-9: open the Nth  {}: jump  {}: settings  {}: help  {}: quit",
-                    k(Action::Activate),
-                    k(Action::Palette),
-                    k(Action::Settings),
-                    k(Action::Help),
-                    k(Action::Quit),
-                ),
+                )
             },
             Style::default().fg(th.dim),
         )
@@ -5972,12 +3924,23 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             }
             Focus::Terminal if app.term_locked => format!(
                 "{}: {}  {}  ⌥click: open link",
-                app.keymap
-                    .first(Action::UnlockTerminal)
-                    .map(|c| c.display())
-                    .unwrap_or_else(|| "^q".into()),
+                // The pane under the cards is left by the fold's own key
+                // (`^``: back to the card, again: fold the pane).
+                if app.launcher_grid() {
+                    app.keymap
+                        .chords(Action::ToggleLauncherPane)
+                        .iter()
+                        .find(|c| !crate::key_combo::is_text_key(c))
+                        .map(|c| c.display())
+                } else {
+                    None
+                }
+                .or_else(|| app.keymap.first(Action::UnlockTerminal).map(|c| c.display()))
+                .unwrap_or_else(|| "^q".into()),
                 // The LAUNCHER VIEW has its grid of sessions to go back to.
-                if app.launcher_active() {
+                if app.launcher_grid() {
+                    "back to the card"
+                } else if app.launcher_active() {
                     "sessions"
                 } else {
                     "panels"
@@ -5996,17 +3959,6 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::FocusLeft)
             ),
             Focus::Terminal => "select a session and press Enter to attach".to_string(),
-            // The cursor here is the open workspace, so ←/→ already
-            // switches; the verbs are the switcher's, plus the way out.
-            Focus::Workspaces => format!(
-                "←/→ or 1-9: switch  {}: panels  {}: new  {}: rename  {}: delete  {}: hide bar  {}: help",
-                k(Action::Activate),
-                k(Action::New),
-                k(Action::Rename),
-                k(Action::Delete),
-                k(Action::ToggleWorkspaces),
-                k(Action::Help)
-            ),
             Focus::Projects => format!(
                 "{}/{}: add  {}: rename  {}: remove  {}: search  {}: menu  {}: help",
                 k(Action::New),
@@ -6112,43 +4064,14 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
         };
-        let mut text = text;
-        if !app.term_locked {
-            let mut restore = Vec::new();
-            let hint = |action, panel: &str| {
-                app.keymap.first(action).map_or_else(
-                    || format!("{}: show {panel} in settings", k(Action::Settings)),
-                    |chord| format!("{}: show {panel}", chord.display()),
-                )
-            };
-            if app.hide_projects {
-                restore.push(hint(Action::ToggleProjects, "projects"));
-            }
-            if app.hide_worktrees {
-                restore.push(hint(Action::ToggleWorktrees, "worktrees"));
-            }
-            if app.hide_sessions {
-                restore.push(hint(Action::ToggleSessions, "sessions"));
-            }
-            if !restore.is_empty() {
-                text = format!("{}  {text}", restore.join("  "));
-            }
-        }
         Span::styled(text, Style::default().fg(th.dim))
     };
     // Quiet footer: context on the left, live stats on the right. The
     // hostname only earns a slot when it's a remote session, and the
     // connection state only when something is wrong.
-    let mut spans = vec![Span::raw(" ")];
-    // The open workspace leads the bar — it scopes everything else shown.
-    // (The version nameplate is spliced in ahead of it further down, once
+    // (The version nameplate is spliced in at the front further down, once
     // the width left for the hints is known.)
-    let mut workspace_idx = spans.len();
-    spans.push(Span::styled(
-        format!("◇ {}", truncate(app.tree.active_workspace_name(), 20)),
-        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
+    let mut spans = vec![Span::raw(" ")];
     if app.is_remote {
         spans.push(Span::styled(
             truncate(&app.hostname, 24),
@@ -6163,14 +4086,8 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     let crumbs = breadcrumb(app);
     if !crumbs.is_empty() {
         spans.extend(crumbs);
-        // The selected checkout's dirty-file count rides the breadcrumb —
-        // it's context, not chrome.
-        if let Some(n) = app.selected_worktree_changes().filter(|n| *n > 0) {
-            spans.push(Span::styled(
-                format!("  +{n} file{}", if n == 1 { "" } else { "s" }),
-                Style::default().fg(th.warn),
-            ));
-        }
+        // No changed-file count here: it rides each card's branch, where
+        // it reads as that checkout's (`launcher_view::draw_card`).
         spans.push(Span::styled("    ", Style::default()));
     }
     let mut hints = hints;
@@ -6217,20 +4134,8 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             ));
         }
         plate_spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
-        workspace_idx += plate_spans.len();
         spans.splice(1..1, plate_spans);
     }
-    // Where the workspace nameplate landed: everything ahead of it on the
-    // bar is fixed-width chrome, so its cells are a prefix sum. Clipped
-    // off the bar (a very narrow screen) means no target.
-    let workspace_x: usize = spans[..workspace_idx].iter().map(|s| s.width()).sum();
-    let workspace_w = spans[workspace_idx].width();
-    let workspace_rect = (workspace_x + workspace_w <= left.width as usize).then(|| Rect {
-        x: left.x + workspace_x as u16,
-        y: left.y,
-        width: workspace_w as u16,
-        height: 1,
-    });
     f.render_widget(Paragraph::new(Line::from(spans)), left);
     if let Some(usage) = usage {
         let right = Rect {
@@ -6238,13 +4143,35 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             width: right_w,
             ..area
         };
+        // The readout is a button — a click opens the memory modal, as
+        // `⇧M` does — and nothing about a dim figure says so, so the
+        // pointer on it lifts it to full text and underlines it, as the
+        // header's buttons are. Only the words are the target, laid where
+        // the right alignment puts them, not the padding beside them.
+        let span = Span::styled(usage, Style::default().fg(th.dim));
+        let span = if app.hover_crumb == Some(HitTarget::FooterUsage) {
+            span.style(
+                Style::default()
+                    .fg(th.text)
+                    .add_modifier(Modifier::UNDERLINED),
+            )
+        } else {
+            span
+        };
+        let width = (span.width() as u16).min(right.width);
+        app.hits.push((
+            Rect {
+                x: right.x + right.width - width,
+                width,
+                ..right
+            },
+            HitTarget::FooterUsage,
+        ));
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(usage, Style::default().fg(th.dim))))
-                .alignment(ratatui::layout::Alignment::Right),
+            Paragraph::new(Line::from(span)).alignment(ratatui::layout::Alignment::Right),
             right,
         );
     }
-    workspace_rect
 }
 
 /// The footer's right-edge readout: live sessions, their process count,
@@ -6585,43 +4512,6 @@ pub(crate) fn search_line(
 /// The i-th single-height row inside `inner`, or None when it overflows.
 pub(crate) fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
     rows_rect(inner, i, 1)
-}
-
-/// [`row_rect`] for a row that may have scrolled off the top of the
-/// panel: negative indices land above it and draw nothing.
-fn row_rect_at(inner: Rect, i: isize) -> Option<Rect> {
-    rows_rect_at(inner, i, 1)
-}
-
-/// [`rows_rect`] for a scrolled rect: one straddling the panel top is
-/// clipped to the rows still on screen, one entirely above it is None.
-fn rows_rect_at(inner: Rect, i: isize, height: u16) -> Option<Rect> {
-    let visible = height as isize + i.min(0);
-    if visible <= 0 {
-        return None;
-    }
-    rows_rect(inner, i.max(0) as usize, visible as u16)
-}
-
-/// Rows a pill's click target spans. A pill is a 3-row cell stacked on
-/// a `PILL_H` stride, so its bottom pad is usually the next pill's top
-/// pad; that shared row goes to the lower pill (whose selection fill
-/// owns the cell's bottom half), and the upper one's target stops at
-/// `PILL_H`. A pill with nothing stacked under it — the root checkout
-/// over its quiet row, the last of a group, the last of the list — keeps
-/// its bottom pad, or the lower half of the pill would be a click on the
-/// panel background.
-fn pill_hit_height(top: usize, next_top: Option<usize>) -> u16 {
-    row_hit_height(top, next_top, 0)
-}
-
-/// [`pill_hit_height`] for a pill with `extra` rows of its own between
-/// its text row and its bottom pad — a session's RECENT PROMPTS lines —
-/// which the target runs over too, so a click on a prompt line lands on
-/// its session.
-fn row_hit_height(top: usize, next_top: Option<usize>, extra: usize) -> u16 {
-    let cell = PILL_H as usize + 1 + extra;
-    next_top.map_or(cell, |n| n.saturating_sub(top).min(cell)) as u16
 }
 
 /// A rect `height` rows tall starting at the i-th row inside `inner`:
@@ -7012,1500 +4902,5 @@ mod tests {
             None,
             "and then it holds still"
         );
-    }
-
-    /// A checkout wearing its merged pull request is purple at rest — dot,
-    /// rail and name — and rides the purple ramp only while the merge is
-    /// fresh (the ONE-SHOT SWEEP), which the animations setting stills like
-    /// any other sweep. A checkout on its sessions is exactly what
-    /// `status_dot` / `status_color` / `sweep_ramp` already say.
-    #[test]
-    fn merged_row_state_is_solid_purple_and_sweeps_only_while_fresh() {
-        let th = Theme::default();
-        let merged = RowState::Merged;
-        assert_eq!(merged.ramp(true, th, true), Some(th.merged_sweep));
-        assert_eq!(merged.ramp(false, th, true), None, "landed a while ago");
-        assert_eq!(merged.ramp(true, th, false), None, "animations off");
-        assert_eq!(merged.name_style(th).fg, Some(th.merged), "solid purple");
-        assert_eq!(merged.color(false, th), th.merged);
-        assert_eq!(
-            merged.color(true, th),
-            th.merged,
-            "unseen is a sessions thing"
-        );
-        let dot = merged.dot(false, th);
-        assert_eq!(dot.content, "● ", "solid: the checkout is very much there");
-        assert_eq!(dot.style.fg, Some(th.merged));
-
-        let running = RowState::Sessions(Some(AgentStatus::Running));
-        assert_eq!(running.ramp(false, th, true), Some(th.warn_sweep));
-        assert_eq!(running.color(false, th), th.warn);
-        assert_eq!(running.name_style(th), Style::default(), "no color at rest");
-        let done = RowState::Sessions(Some(AgentStatus::Finished));
-        assert_eq!(done.ramp(false, th, true), None);
-        assert_eq!(done.ramp(true, th, true), Some(th.done_sweep));
-        assert_eq!(done.color(true, th), th.done);
-        assert_eq!(done.color(false, th), th.ok);
-        assert_eq!(RowState::Sessions(None).dot(false, th).content, "○ ");
-    }
-
-    /// PR & ISSUE COUNTS (Settings → Experimental): with the switch on, a
-    /// project row counts its open pull requests and issues after its
-    /// name — the pull requests in the accent, the issues in green, a dim
-    /// dot between, and a dash closing the ago label when one precedes
-    /// them — drafts left out as `hide_draft_prs` says; a count still
-    /// unknown or zero leaves its word out; a column too narrow for the
-    /// badge drops it whole rather than squeezing the name, and one too
-    /// narrow for the ago label beside it drops the label first. Off, the
-    /// row is what it always was, whatever the lists hold. On out of the
-    /// box: the one Experimental row that starts on.
-    #[test]
-    fn project_row_counts_its_open_prs_and_issues_when_the_switch_is_on() {
-        let mut app = hit_test_app(&["main"], &["a"], &[]);
-        let pid = app.tree.projects[0].id.clone();
-        let now = std::time::Instant::now();
-        let pr = |number: u64, is_draft: bool| crate::pull_request::OpenPr {
-            number,
-            title: format!("pr {number}"),
-            url: format!("https://github.com/o/r/pull/{number}"),
-            is_draft,
-            health: Default::default(),
-            head: format!("b{number}"),
-        };
-        let issue = |number: u64| crate::issues::Issue {
-            number,
-            url: format!("https://github.com/o/r/issues/{number}"),
-            title: format!("issue {number}"),
-            author: "webdevcody".into(),
-            created_at: "2026-09-10T12:00:00Z".into(),
-            updated_at: "2026-09-11T12:00:00Z".into(),
-            labels: Vec::new(),
-            body: String::new(),
-        };
-        app.open_prs.insert(
-            pid.clone(),
-            crate::app::OpenPrs {
-                list: vec![pr(1, false), pr(2, false), pr(3, true)],
-                at: now,
-                due: now,
-                step: std::time::Duration::from_secs(15),
-            },
-        );
-        let render = |app: &mut App, width: u16| -> Vec<(Vec<String>, Vec<Color>)> {
-            let area = Rect::new(0, 0, width, 8);
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 8)).unwrap();
-            terminal.draw(|f| draw_projects(f, app, area)).unwrap();
-            let buf = terminal.backend().buffer().clone();
-            (0..8)
-                .map(|y| {
-                    let cells: Vec<_> = (0..width)
-                        .map(|x| buf.cell((x, y)).unwrap().clone())
-                        .collect();
-                    (
-                        cells.iter().map(|c| c.symbol().to_string()).collect(),
-                        cells.iter().map(|c| c.fg).collect(),
-                    )
-                })
-                .collect()
-        };
-        // The demo row's text, and the cell column its badge starts on.
-        let row = |app: &mut App, width: u16| -> (String, Vec<Color>) {
-            render(app, width)
-                .into_iter()
-                .map(|(cells, colors)| (cells.concat(), colors))
-                .find(|(line, _)| line.contains("demo"))
-                .expect("the demo row")
-        };
-        let th = app.theme;
-
-        assert!(app.pr_issue_counts, "on out of the box");
-        let (line, _) = row(&mut app, 40);
-        assert!(
-            line.contains("demo 3 prs") && !line.contains("issue"),
-            "issues not asked yet: only the pull requests: {line:?}"
-        );
-        app.issues.insert(
-            pid.clone(),
-            crate::issues::IssueList {
-                list: vec![issue(9)],
-                at: now,
-            },
-        );
-        let (line, colors) = row(&mut app, 40);
-        assert!(line.contains("demo 3 prs · 1 issue"), "{line:?}");
-        // Cell-wise: the rail and dot ahead of the name are multi-byte.
-        let column = |line: &str, word: &str| {
-            let cells: Vec<char> = line.chars().collect();
-            let word: Vec<char> = word.chars().collect();
-            cells
-                .windows(word.len())
-                .position(|w| w == word.as_slice())
-                .unwrap_or_else(|| panic!("{word:?} in {line:?}"))
-        };
-        assert_eq!(
-            colors[column(&line, "3 prs")],
-            th.accent,
-            "the accent the OPEN PRS rows wear"
-        );
-        assert_eq!(
-            colors[column(&line, "1 issue")],
-            th.ok,
-            "the green the ISSUES MODAL paints open in"
-        );
-        // The dot is chrome in the ago label's dim — lifted to muted on
-        // this row, the selected one, as `render_button` lifts every dim
-        // span off the selection fill.
-        assert_eq!(colors[column(&line, "·")], th.muted, "dim, lifted");
-
-        app.hide_draft_prs = true;
-        let (line, _) = row(&mut app, 40);
-        assert!(
-            line.contains("demo 2 prs · 1 issue"),
-            "drafts out, as the group header counts them: {line:?}"
-        );
-        app.hide_draft_prs = false;
-
-        // Under a session that has run, the ago label closes in a dash so
-        // the two facts read apart: `3m ago - 3 prs · 1 issue`.
-        app.tree.agents[0].status_changed_at = crate::app::now_ms() - 3 * 60_000;
-        let (line, colors) = row(&mut app, 40);
-        assert!(
-            line.contains("demo 3m ago - 3 prs · 1 issue"),
-            "the ago label ends in a dash when counts follow: {line:?}"
-        );
-        assert_eq!(
-            colors[column(&line, "-")],
-            colors[column(&line, "ago")],
-            "the dash is the label's"
-        );
-        // A column with room for the counts but not the label beside them
-        // drops the label, dash and all — the counts are what the switch
-        // was turned on for.
-        let (line, _) = row(&mut app, 30);
-        assert!(
-            line.contains("demo 3 prs · 1 issue") && !line.contains("ago") && !line.contains('-'),
-            "{line:?}"
-        );
-        app.tree.agents[0].status_changed_at = 0;
-
-        app.issues.get_mut(&pid).unwrap().list.clear();
-        let (line, _) = row(&mut app, 40);
-        assert!(
-            line.contains("demo 3 prs") && !line.contains("issue"),
-            "zero says nothing: {line:?}"
-        );
-        app.issues.get_mut(&pid).unwrap().list = (0..120).map(issue).collect();
-        let (line, _) = row(&mut app, 40);
-        assert!(
-            line.contains("demo 3 prs · 100+ issues"),
-            "cut off at the fetch cap: {line:?}"
-        );
-
-        let (line, _) = row(&mut app, 14);
-        assert!(
-            line.contains("demo") && !line.contains("prs"),
-            "too narrow: the badge drops before the name is squeezed: {line:?}"
-        );
-
-        app.pr_issue_counts = false;
-        let (line, _) = row(&mut app, 40);
-        assert!(
-            !line.contains("prs"),
-            "off: whatever the lists hold, the row is what it was: {line:?}"
-        );
-    }
-
-    /// A checkout whose RUN COMMAND is up wears a green `▶ running` after
-    /// its branch — the bare glyph where the word would cut the branch —
-    /// and a run that has exited wears nothing.
-    #[test]
-    fn worktree_row_wears_its_running_badge() {
-        use nebula_core::{TerminalId, TerminalTab, WorktreeId};
-        let mut app = hit_test_app(&["main", "feat"], &[], &[]);
-        app.focus = Focus::Worktrees;
-        app.tree.terminals.push(TerminalTab {
-            id: TerminalId("run".into()),
-            worktree_id: WorktreeId("w1".into()),
-            name: "run".into(),
-            sort_order: 0,
-            alive: true,
-            run_command: Some("npm run dev".into()),
-        });
-        let render = |app: &mut App, width: u16| -> Vec<(String, Vec<Color>)> {
-            let area = Rect::new(0, 0, width, 12);
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
-            terminal.draw(|f| draw_worktrees(f, app, area)).unwrap();
-            let buf = terminal.backend().buffer().clone();
-            (0..12)
-                .map(|y| {
-                    let cells: Vec<_> = (0..width)
-                        .map(|x| buf.cell((x, y)).unwrap().clone())
-                        .collect();
-                    (
-                        cells.iter().map(|c| c.symbol().to_string()).collect(),
-                        cells.iter().map(|c| c.fg).collect(),
-                    )
-                })
-                .collect()
-        };
-        let th = app.theme;
-
-        let lines = render(&mut app, 30);
-        let (feat, colors) = lines
-            .iter()
-            .find(|(l, _)| l.contains("feat"))
-            .expect("the feat row");
-        assert!(feat.contains("feat ▶ running"), "{feat:?}");
-        let glyph = feat.chars().position(|c| c == '▶').unwrap();
-        assert_eq!(colors[glyph], th.ok, "green");
-        let (main, _) = lines
-            .iter()
-            .find(|(l, _)| l.contains("main"))
-            .expect("the main row");
-        assert!(!main.contains('▶'), "only the running checkout: {main:?}");
-
-        let narrow = render(&mut app, 14);
-        let (feat, _) = narrow
-            .iter()
-            .find(|(l, _)| l.contains("feat"))
-            .expect("the feat row, narrow");
-        assert!(
-            feat.contains("feat ▶") && !feat.contains("running"),
-            "{feat:?}"
-        );
-
-        app.tree.terminals[0].alive = false;
-        let lines = render(&mut app, 30);
-        assert!(
-            lines.iter().all(|(l, _)| !l.contains('▶')),
-            "an exited run is not running"
-        );
-    }
-
-    /// The selected `feat` row of the WORKTREES PANEL, drawn: its rail
-    /// color, its dot color, and the color of each cell of its name.
-    fn feat_row_colors(app: &mut App) -> (Color, Color, Vec<Color>) {
-        let area = Rect::new(0, 0, 30, 12);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
-        terminal.draw(|f| draw_worktrees(f, app, area)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        // Cell-wise, not by byte offset: the rail and dot glyphs ahead of
-        // the name are multi-byte.
-        let cells = |y: u16| -> Vec<String> {
-            (0..30)
-                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
-                .collect()
-        };
-        let name_at = |y: u16| {
-            cells(y)
-                .windows(4)
-                .position(|w| w.concat() == "feat")
-                .map(|x| x as u16)
-        };
-        let (y, name_x) = (0..12)
-            .find_map(|y| name_at(y).map(|x| (y, x)))
-            .expect("the feat row");
-        let rail = buf.cell((0, y)).unwrap().clone();
-        assert_eq!(rail.symbol(), PILL_RAIL, "the cursor is on the row");
-        let dot = buf.cell((1, y)).unwrap().clone();
-        assert_eq!(dot.symbol(), "●", "solid dot");
-        let name: Vec<Color> = (name_x..name_x + 4)
-            .map(|x| buf.cell((x, y)).unwrap().fg)
-            .collect();
-        (rail.fg, dot.fg, name)
-    }
-
-    /// A stamp `ONE_SHOT_SWEEP` and a second old: a merge that landed, or a
-    /// turn that finished, long enough ago that its row has settled.
-    fn settled() -> std::time::Duration {
-        crate::app::ONE_SHOT_SWEEP + std::time::Duration::from_secs(1)
-    }
-
-    /// The WORKTREES row of a checkout whose pull request has merged is
-    /// purple end to end — dot, selection rail and branch name — so the
-    /// checkout to delete stands out. The name sweeps on the merged ramp
-    /// only for the few seconds after the merge is seen to land; a merge
-    /// met already landed (the cache, a first lookup) is solid from the
-    /// first frame, and so is every merge once its ONE-SHOT SWEEP has run
-    /// out or with animations off. A session still running there takes the
-    /// row back: yellow, as a checkout not to pull out from under it.
-    #[test]
-    fn worktree_row_wears_its_merged_pull_request() {
-        use nebula_core::{AgentStatus, WorktreeId};
-        let mut app = hit_test_app(&["main", "feat"], &["agent"], &[]);
-        app.focus = Focus::Worktrees;
-        app.sel_worktree = 1;
-        let w1 = WorktreeId("w1".into());
-        app.pull_requests.insert(
-            w1.clone(),
-            Some(crate::pull_request::PullRequest {
-                number: 7,
-                url: "https://github.com/o/r/pull/7".into(),
-                title: "Attach links".into(),
-                state: crate::pull_request::STATE_MERGED.into(),
-                is_draft: false,
-                health: Default::default(),
-                activity: Vec::new(),
-            }),
-        );
-        let th = app.theme;
-
-        // Met already merged: nobody saw it land, so nothing moves.
-        let (rail, dot, name) = feat_row_colors(&mut app);
-        assert_eq!(rail, th.merged, "the rail is the merge's purple");
-        assert_eq!(dot, th.merged, "so is the dot");
-        assert_eq!(name, vec![th.merged; 4], "and the name, solid");
-
-        // Seen to land: the name rides the merged sweep...
-        app.note_merge_landed(w1.clone());
-        let (rail, dot, name) = feat_row_colors(&mut app);
-        assert_eq!((rail, dot), (th.merged, th.merged));
-        assert!(
-            name.iter().all(|c| th.merged_sweep.contains(c)),
-            "the name rides the merged sweep: {name:?}"
-        );
-        // ...unless animations are off: the same purple, holding still...
-        app.animations = false;
-        let (rail, dot, name) = feat_row_colors(&mut app);
-        assert_eq!((rail, dot), (th.merged, th.merged), "still purple");
-        assert_eq!(name, vec![th.merged; 4], "the name holds still");
-        // ...which is also where the sweep ends up on its own.
-        app.animations = true;
-        let long_ago = std::time::Instant::now()
-            .checked_sub(settled())
-            .expect("uptime past the window");
-        app.merge_landed.insert(w1.clone(), long_ago);
-        let (rail, dot, name) = feat_row_colors(&mut app);
-        assert_eq!((rail, dot), (th.merged, th.merged));
-        assert_eq!(name, vec![th.merged; 4], "settled: solid purple");
-
-        // A running session in the checkout: not one to delete yet.
-        app.tree.agents[0].worktree_id = w1.clone();
-        app.tree.agents[0].status = AgentStatus::Running;
-        let (rail, dot, name) = feat_row_colors(&mut app);
-        assert_eq!((rail, dot), (th.warn, th.warn), "running wins");
-        assert!(name.iter().all(|c| th.warn_sweep.contains(c)), "{name:?}");
-
-        // Finished, though, and the merge is the story again.
-        app.tree.agents[0].status = AgentStatus::Finished;
-        let (rail, dot, _) = feat_row_colors(&mut app);
-        assert_eq!((rail, dot), (th.merged, th.merged));
-    }
-
-    /// A turn that finishes unread sweeps its checkout's row blue — the
-    /// done ramp, under a done dot — for `ONE_SHOT_SWEEP`, and then the row
-    /// is what an unread finish has always been: blue dot, plain name, no
-    /// motion. Reading it inside the window ends the sweep on the spot.
-    #[test]
-    fn worktree_row_sweeps_a_fresh_unread_finish_then_holds_still() {
-        use nebula_core::{AgentStatus, WorktreeId};
-        let mut app = hit_test_app(&["main", "feat"], &["agent"], &[]);
-        app.focus = Focus::Worktrees;
-        app.sel_worktree = 1;
-        let th = app.theme;
-        let now = crate::app::now_ms();
-        let agent = &mut app.tree.agents[0];
-        agent.worktree_id = WorktreeId("w1".into());
-        agent.status = AgentStatus::Finished;
-        agent.unseen = true;
-        agent.status_changed_at = now;
-
-        let (rail, dot, name) = feat_row_colors(&mut app);
-        assert_eq!((rail, dot), (th.done, th.done), "unread: the done color");
-        assert!(
-            name.iter().all(|c| th.done_sweep.contains(c)),
-            "just finished: the name rides the done sweep: {name:?}"
-        );
-
-        app.animations = false;
-        let (_, dot, name) = feat_row_colors(&mut app);
-        assert_eq!(dot, th.done);
-        assert_eq!(name, vec![Color::Reset; 4], "animations off: no sweep");
-        app.animations = true;
-
-        app.tree.agents[0].status_changed_at = now - settled().as_millis() as i64;
-        let (rail, dot, name) = feat_row_colors(&mut app);
-        assert_eq!((rail, dot), (th.done, th.done), "still unread");
-        assert_eq!(name, vec![Color::Reset; 4], "settled: the name holds still");
-
-        app.tree.agents[0].status_changed_at = now;
-        app.tree.agents[0].unseen = false;
-        let (_, dot, name) = feat_row_colors(&mut app);
-        assert_eq!(dot, th.ok, "read: green");
-        assert_eq!(name, vec![Color::Reset; 4], "and nothing left to sweep");
-    }
-
-    /// The tint fills every untouched cell of the panel rect — and only
-    /// those: a selection fill keeps its own, and cells outside the rect
-    /// stay untinted.
-    #[test]
-    fn focus_tint_fills_panel_and_skips_painted_cells() {
-        let th = Theme::default();
-        let area = Rect::new(1, 1, 3, 4);
-        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 5, 6));
-        buf.cell_mut((2, 2)).unwrap().bg = th.sel_bg;
-        draw_focus_tint(&mut buf, area, th);
-        let bg = |x, y| buf.cell((x, y)).unwrap().bg;
-        for y in 1..5 {
-            for x in 1..4 {
-                if (x, y) == (2, 2) {
-                    assert_eq!(bg(x, y), th.sel_bg, "painted cell must keep its fill");
-                } else {
-                    assert_eq!(bg(x, y), th.focus_tint, "({x},{y})");
-                }
-            }
-        }
-        assert_eq!(bg(0, 1), Color::Reset, "left of the panel");
-        assert_eq!(bg(4, 1), Color::Reset, "right of the panel");
-        assert_eq!(bg(1, 0), Color::Reset, "above the panel");
-        assert_eq!(bg(1, 5), Color::Reset, "below the panel");
-    }
-
-    /// The selected pill's rail column is solid rail color top to bottom:
-    /// the pad's own half-block on the pads, `█` on the text row. Nothing
-    /// in it may be left on bare background — a quadrant cap used to
-    /// strand the fill quarter beside it, which `focus_tint` then painted
-    /// near-black, reading as a notch at each left corner of the pill.
-    #[test]
-    fn pill_rail_leaves_no_untinted_quarter_at_the_corners() {
-        let th = Theme::default();
-        let inner = Rect::new(0, 0, 8, 3);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 3)).unwrap();
-        terminal
-            .draw(|f| {
-                render_pill(
-                    f,
-                    inner,
-                    0,
-                    vec![Span::raw("● ok")],
-                    true,
-                    true,
-                    th,
-                    th.warn,
-                );
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let cell = |x, y| buf.cell((x, y)).unwrap().clone();
-
-        // Pads: rail column carries the fill's own half-block, so the
-        // whole cell is glyph — no background quarter survives.
-        for (y, glyph) in [(0, PILL_HALF.0), (2, PILL_HALF.1)] {
-            let glyph = glyph.to_string();
-            let c = cell(0, y);
-            assert_eq!(c.symbol(), glyph, "pad row {y} rail glyph");
-            assert_eq!(c.fg, th.warn, "pad row {y} rail color");
-            // The rail cell covers exactly what the fill cells beside it
-            // do; a narrower glyph there is the notch coming back.
-            for x in 1..8 {
-                assert_eq!(
-                    cell(x, y).symbol(),
-                    glyph,
-                    "pad row {y} fill glyph at x={x}"
-                );
-                assert_eq!(cell(x, y).fg, th.sel_bg, "pad row {y} fill color at x={x}");
-            }
-        }
-        // Text row: a solid block, sitting on the fill, in the mark the
-        // caller passed (a RUNNING row's yellow here), not the accent.
-        let c = cell(0, 1);
-        assert_eq!(c.symbol(), PILL_RAIL);
-        assert_eq!(c.fg, th.warn);
-        assert_eq!(c.bg, th.sel_bg);
-    }
-
-    /// The selection rail of the focused SESSION row is its STATUS DOT's
-    /// color, not the accent: yellow while it runs, blue while its
-    /// finish is UNSEEN, green once read, and a FRESH or cold row's gray
-    /// lifted to muted so it still reads as the cursor on the fill.
-    #[test]
-    fn session_rail_takes_the_status_dot_color() {
-        use nebula_core::AgentStatus;
-        let mut app = hit_test_app(&["main"], &["agent"], &[]);
-        app.tree.agents[0].alive = true;
-        app.focus = Focus::Sessions;
-        let th = app.theme;
-        let area = Rect::new(0, 0, 30, 12);
-        let rail = |app: &mut App| {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
-            terminal.draw(|f| draw_sessions(f, app, area)).unwrap();
-            let buf = terminal.backend().buffer().clone();
-            // The agent's pill sits at rows 3..=5: pad, text, pad.
-            let text = buf.cell((0, 4)).unwrap().clone();
-            assert_eq!(text.symbol(), PILL_RAIL);
-            let pads = [buf.cell((0, 3)).unwrap().fg, buf.cell((0, 5)).unwrap().fg];
-            assert_eq!(pads, [text.fg, text.fg], "the pad caps match the rail");
-            text.fg
-        };
-        for (status, unseen, want) in [
-            (AgentStatus::Fresh, false, th.muted),
-            (AgentStatus::Running, false, th.warn),
-            (AgentStatus::Finished, true, th.done),
-            (AgentStatus::Finished, false, th.ok),
-            (AgentStatus::NeedsFeedback, false, th.err),
-        ] {
-            app.tree.agents[0].status = status;
-            app.tree.agents[0].unseen = unseen;
-            assert_eq!(rail(&mut app), want, "{status:?} unseen={unseen}");
-        }
-        // Cold (no live PTY): a running row's rail is the gray dot's too.
-        app.tree.agents[0].status = AgentStatus::Running;
-        app.tree.agents[0].alive = false;
-        assert_eq!(rail(&mut app), th.muted, "cold");
-        app.tree.agents[0].alive = true;
-        // Unfocused, the rail is the quiet gray whatever the status.
-        app.focus = Focus::Worktrees;
-        assert_eq!(rail(&mut app), th.dim, "unfocused panel");
-    }
-
-    /// The TAB UNDERLINE under the open WORKSPACE TAB is the tab's rollup
-    /// STATUS DOT color — the same color the dot in the tab shows.
-    #[test]
-    fn tab_underline_takes_the_rollup_dot_color() {
-        use nebula_core::{AgentStatus, Workspace, WorkspaceId};
-        let mut app = hit_test_app(&["main"], &["agent"], &[]);
-        app.tree.workspaces.push(Workspace {
-            id: WorkspaceId::default(),
-            name: "default".into(),
-        });
-        let th = app.theme;
-        let area = Rect::new(0, 0, 60, crate::app::WORKSPACES_BAR_H);
-        let underline = |app: &mut App| {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 4)).unwrap();
-            terminal
-                .draw(|f| draw_workspaces_bar(f, app, area))
-                .unwrap();
-            let buf = terminal.backend().buffer().clone();
-            let rule = area.height - 1;
-            let x = (0..60)
-                .find(|&x| buf.cell((x, rule)).unwrap().symbol() == "▀")
-                .expect("an underline under the open tab");
-            buf.cell((x, rule)).unwrap().fg
-        };
-        for (status, unseen, want) in [
-            (AgentStatus::Fresh, false, th.muted),
-            (AgentStatus::Running, false, th.warn),
-            (AgentStatus::Finished, true, th.done),
-            (AgentStatus::NeedsFeedback, false, th.err),
-        ] {
-            app.tree.agents[0].status = status;
-            app.tree.agents[0].unseen = unseen;
-            assert_eq!(underline(&mut app), want, "{status:?} unseen={unseen}");
-        }
-    }
-
-    /// Each grip sits on its rule column (one left of the boundary), three
-    /// cells centered vertically: muted at rest, accent under hover. All
-    /// three visible sidebar boundaries get one.
-    #[test]
-    fn splitter_grips_center_on_the_rules() {
-        let th = Theme::default();
-        let mut app = App::new();
-        let body = Rect::new(0, 0, 120, 35);
-        let mut buf = ratatui::buffer::Buffer::empty(body);
-        draw_splitter_grips(&mut buf, &app, body);
-        let mid = body.height / 2; // 17
-        assert_eq!(app.splitter_indices(), vec![0, 1, 2]);
-        for i in app.splitter_indices() {
-            let x = app.splitter_x(i) - 1;
-            for y in mid - 1..=mid + 1 {
-                let cell = buf.cell((x, y)).unwrap();
-                assert_eq!(cell.symbol(), "┃", "splitter {i} y={y}");
-                assert_eq!(cell.fg, th.muted, "splitter {i} rests muted");
-            }
-            assert_eq!(buf.cell((x, mid - 2)).unwrap().symbol(), " ");
-            assert_eq!(buf.cell((x, mid + 2)).unwrap().symbol(), " ");
-        }
-
-        // Hover lights only that splitter's grip.
-        app.hover_splitter = Some(0);
-        draw_splitter_grips(&mut buf, &app, body);
-        assert_eq!(
-            buf.cell((app.splitter_x(0) - 1, mid)).unwrap().fg,
-            th.accent
-        );
-        assert_eq!(buf.cell((app.splitter_x(1) - 1, mid)).unwrap().fg, th.muted);
-
-        // The Workspaces bar runs across the top and owns no boundary, so
-        // hiding it leaves every grip exactly where it was.
-        app.show_workspaces = false;
-        app.hover_splitter = None;
-        let mut buf = ratatui::buffer::Buffer::empty(body);
-        draw_splitter_grips(&mut buf, &app, body);
-        assert_eq!(
-            buf.cell((app.splitter_x(0) - 1, mid)).unwrap().symbol(),
-            "┃"
-        );
-        app.show_workspaces = true;
-
-        // A body too short for a grip plus breathing space draws nothing.
-        let tiny = Rect::new(0, 0, 120, 6);
-        let mut buf = ratatui::buffer::Buffer::empty(tiny);
-        draw_splitter_grips(&mut buf, &app, tiny);
-        assert!(buf.content().iter().all(|c| c.symbol() == " "));
-    }
-
-    /// A test tree: one project, `branches` as its worktrees (the first is
-    /// the root checkout), `agents` and `terminals` under the first worktree.
-    fn hit_test_app(branches: &[&str], agents: &[&str], terminals: &[&str]) -> App {
-        use nebula_core::{Agent, AgentId, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
-        let mut app = App::new();
-        let project_id = ProjectId("p1".into());
-        app.tree.projects.push(Project {
-            workspace_id: Default::default(),
-            id: project_id.clone(),
-            name: "demo".into(),
-            repo_path: "/tmp/demo".into(),
-            sort_order: 0,
-        });
-        for (i, branch) in branches.iter().enumerate() {
-            app.tree.worktrees.push(Worktree {
-                id: WorktreeId(format!("w{i}")),
-                project_id: project_id.clone(),
-                path: format!("/tmp/{branch}").into(),
-                branch: (*branch).into(),
-                is_main: i == 0,
-                sort_order: i as i64,
-            });
-        }
-        for (i, name) in agents.iter().enumerate() {
-            app.tree.agents.push(Agent {
-                id: AgentId(format!("a{i}")),
-                worktree_id: WorktreeId("w0".into()),
-                name: (*name).into(),
-                status: AgentStatus::Fresh,
-                archived: false,
-                archived_at: 0,
-                unseen: false,
-                status_changed_at: 0,
-                kind: nebula_core::AgentKind::Claude,
-                custom_harness: None,
-                model: None,
-                effort: None,
-                session_id: None,
-                cloud_session_id: None,
-                sort_order: i as i64,
-                alive: false,
-                recent_prompts: Vec::new(),
-            });
-        }
-        for (i, name) in terminals.iter().enumerate() {
-            app.tree.terminals.push(nebula_core::TerminalTab {
-                id: nebula_core::TerminalId(format!("t{i}")),
-                worktree_id: WorktreeId("w0".into()),
-                name: (*name).into(),
-                sort_order: i as i64,
-                alive: false,
-                run_command: None,
-            });
-        }
-        app
-    }
-
-    /// A pull request GitHub says cannot merge — its branch conflicting
-    /// with the base, or a check failing — is red end to end on both
-    /// sidebar rows, the PROJECT OPEN PRS GROUP's and the checkout's own
-    /// PR ROW in the SESSIONS PANEL: arrow, title and badge, the badge
-    /// naming the trouble (`conflicts`, `failing`) in place of the state.
-    /// A healthy pull request beside it keeps its accent, so the red is
-    /// the one thing that changed; and comments that landed since the
-    /// row was opened still take the badge slot, loud, on a row that
-    /// stays red around them.
-    #[test]
-    fn pull_request_rows_go_red_for_conflicts_and_failing_checks() {
-        use crate::pull_request::{Checks, Health, OpenPr, PullRequest, STATE_OPEN};
-        use nebula_core::WorktreeId;
-        let mut app = hit_test_app(&["main", "feat"], &[], &[]);
-        let th = app.theme;
-        let pid = app.tree.projects[0].id.clone();
-        let now = std::time::Instant::now();
-        let conflicting = Health {
-            conflicts: true,
-            checks: Checks::Passing,
-        };
-        let failing = Health {
-            conflicts: false,
-            checks: Checks::Failing,
-        };
-        let pr = |number: u64, title: &str, health: Health| OpenPr {
-            number,
-            title: title.into(),
-            url: format!("https://github.com/o/r/pull/{number}"),
-            is_draft: false,
-            health,
-            head: format!("b{number}"),
-        };
-        app.open_prs.insert(
-            pid,
-            crate::app::OpenPrs {
-                list: vec![
-                    pr(7, "Fine", Health::default()),
-                    pr(8, "Stuck", conflicting),
-                    pr(9, "Broken", failing),
-                ],
-                at: now,
-                due: now,
-                step: std::time::Duration::from_secs(15),
-            },
-        );
-        app.pull_requests.insert(
-            WorktreeId("w1".into()),
-            Some(PullRequest {
-                number: 8,
-                url: "https://github.com/o/r/pull/8".into(),
-                title: "Stuck".into(),
-                state: STATE_OPEN.into(),
-                is_draft: false,
-                health: conflicting,
-                activity: Vec::new(),
-            }),
-        );
-        app.sel_worktree = 1;
-
-        const W: u16 = 36;
-        const H: u16 = 16;
-        // Every row of a panel: its text, and the color of each cell.
-        let paint = |app: &mut App, draw: fn(&mut Frame, &mut App, Rect)| {
-            let area = Rect::new(0, 0, W, H);
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
-            terminal.draw(|f| draw(f, app, area)).unwrap();
-            let buf = terminal.backend().buffer().clone();
-            (0..H)
-                .map(|y| {
-                    let cells: Vec<_> = (0..W).map(|x| buf.cell((x, y)).unwrap().clone()).collect();
-                    (
-                        cells
-                            .iter()
-                            .map(|c| c.symbol().to_string())
-                            .collect::<String>(),
-                        cells.iter().map(|c| c.fg).collect::<Vec<Color>>(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let row = |rows: &[(String, Vec<Color>)], needle: &str| {
-            rows.iter()
-                .find(|(line, _)| line.contains(needle))
-                .cloned()
-                .unwrap_or_else(|| {
-                    let screen: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
-                    panic!("{needle} on screen:\n{}", screen.join("\n"))
-                })
-        };
-        // Cell-wise: the arrow ahead of the title is multi-byte.
-        let col = |line: &str, word: &str| {
-            let chars: Vec<char> = line.chars().collect();
-            let word: Vec<char> = word.chars().collect();
-            chars
-                .windows(word.len())
-                .position(|w| w == word.as_slice())
-                .unwrap_or_else(|| panic!("{word:?} in {line:?}"))
-        };
-        // The arrow's, the title's first letter's and the badge word's
-        // colors on the row that holds `needle` (`#8 Stuck`: the letter
-        // after the number and its space).
-        let colors = |rows: &[(String, Vec<Color>)], needle: &str, badge: Option<&str>| {
-            let (line, fg) = row(rows, needle);
-            let arrow = fg[col(&line, "↗")];
-            let title = fg[col(&line, needle) + 3];
-            let badge = badge.map(|b| fg[col(&line, b)]);
-            (arrow, title, badge, line)
-        };
-
-        app.focus = Focus::Worktrees;
-        let rows = paint(&mut app, draw_worktrees);
-        let (arrow, title, _, line) = colors(&rows, "#7 Fine", None);
-        assert_eq!(
-            (arrow, title),
-            (th.accent, th.muted),
-            "healthy: the accent arrow, the plain title: {line:?}"
-        );
-        assert!(
-            !line.contains("conflicts") && !line.contains("failing"),
-            "and no badge: {line:?}"
-        );
-        let (arrow, title, badge, line) = colors(&rows, "#8 Stuck", Some("conflicts"));
-        assert_eq!(
-            (arrow, title, badge),
-            (th.err, th.err, Some(th.err)),
-            "conflicts: red end to end: {line:?}"
-        );
-        let (arrow, title, badge, line) = colors(&rows, "#9 Broken", Some("failing"));
-        assert_eq!(
-            (arrow, title, badge),
-            (th.err, th.err, Some(th.err)),
-            "a failing check: red end to end: {line:?}"
-        );
-
-        app.focus = Focus::Sessions;
-        let rows = paint(&mut app, draw_sessions);
-        let (arrow, title, badge, line) = colors(&rows, "#8 Stuck", Some("conflicts"));
-        assert_eq!(
-            (arrow, title, badge),
-            (th.err, th.err, Some(th.err)),
-            "the checkout's PR ROW: red end to end: {line:?}"
-        );
-        let (line, fg) = row(&rows, "#8 Stuck");
-        if line.starts_with(PILL_RAIL) {
-            assert_eq!(fg[0], th.err, "the selected row's rail is red too");
-        }
-        // Comments landed since the row was opened: the count takes the
-        // badge slot, in its own loud color, and the row stays red.
-        if let Some(Some(pr)) = app.pull_requests.get_mut(&WorktreeId("w1".into())) {
-            pr.activity.push("2026-09-18T12:00:00Z".into());
-        }
-        let rows = paint(&mut app, draw_sessions);
-        let (arrow, title, badge, line) = colors(&rows, "#8 Stuck", Some("1 new"));
-        assert_eq!(
-            (arrow, title, badge),
-            (th.err, th.err, Some(th.warn)),
-            "unread comments on a red row: {line:?}"
-        );
-        assert!(
-            !line.contains("conflicts"),
-            "the count took the badge slot: {line:?}"
-        );
-    }
-
-    /// A checkout on an open pull request's head branch draws under that
-    /// pull request's row — stacked straight onto it, stepped in behind a
-    /// `└` that runs into its STATUS DOT — not among the plain checkouts
-    /// above the group, so the checkout a PR SESSION works in and the
-    /// pull request it is for read as one thing. A click on it lands on
-    /// the checkout's own row: it is a worktree, not the pull request.
-    #[test]
-    fn a_checkout_under_its_pull_request_draws_indented_beneath_it() {
-        let mut app = hit_test_app(&["main", "feat"], &[], &[]);
-        let pid = app.tree.projects[0].id.clone();
-        let now = std::time::Instant::now();
-        app.open_prs.insert(
-            pid,
-            crate::app::OpenPrs {
-                list: vec![crate::pull_request::OpenPr {
-                    number: 7,
-                    title: "Attach links".into(),
-                    url: "https://github.com/o/r/pull/7".into(),
-                    is_draft: false,
-                    health: Default::default(),
-                    head: "feat".into(),
-                }],
-                at: now,
-                due: now,
-                step: std::time::Duration::from_secs(15),
-            },
-        );
-        app.focus = Focus::Worktrees;
-        let area = Rect::new(0, 0, 30, 14);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 14)).unwrap();
-        terminal
-            .draw(|f| draw_worktrees(f, &mut app, area))
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let lines: Vec<String> = (0..14)
-            .map(|y| {
-                (0..30)
-                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
-                    .collect()
-            })
-            .collect();
-        let row_at = |needle: &str| {
-            lines
-                .iter()
-                .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} on screen:\n{}", lines.join("\n")))
-        };
-        let pr = row_at("#7 Attach links");
-        let feat = row_at("feat");
-        assert!(
-            row_at("main") < row_at("OPEN PRS"),
-            "the root stays above the group"
-        );
-        assert!(pr < feat, "the checkout is under its pull request");
-        assert_eq!(
-            feat,
-            pr + PILL_H as usize,
-            "stacked straight onto it, no quiet row between:\n{}",
-            lines.join("\n")
-        );
-        assert!(lines[feat].contains("└○ feat"), "{:?}", lines[feat]);
-        assert!(
-            !lines[row_at("main")].contains('└'),
-            "a plain row has no connector"
-        );
-
-        // Row 1 is the pull request, row 2 the checkout under it.
-        assert_eq!(app.hit_at(1, pr as u16), Some(HitTarget::Worktree(1)));
-        assert_eq!(app.hit_at(1, feat as u16), Some(HitTarget::Worktree(2)));
-        app.sel_worktree = 2;
-        assert_eq!(
-            app.selected_worktree().map(|w| w.branch.as_str()),
-            Some("feat")
-        );
-        assert!(app.selected_worktree_pr().is_none());
-    }
-
-    /// Pills are 3-row cells on a 2-row stride, so a pill's bottom pad is
-    /// normally the next pill's top pad and clicks there select the lower
-    /// one. The root checkout sits over a quiet row and the last pill
-    /// over nothing: their bottom pads — the lower half of the pill as
-    /// drawn — must still hit the pill, not the panel background.
-    #[test]
-    fn worktree_pills_are_clickable_over_their_whole_height() {
-        let mut app = hit_test_app(&["main", "feature", "other"], &[], &[]);
-        let area = Rect::new(0, 0, 30, 20);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
-        terminal
-            .draw(|f| draw_worktrees(f, &mut app, area))
-            .unwrap();
-
-        // `draw_column` hands the list rows from y=3: root at 3..=5, then a
-        // quiet row, `feature` at 6..=8 sharing its bottom pad with
-        // `other` at 8..=10.
-        let at = |y: u16| app.hit_at(1, y);
-        for y in 3..=5 {
-            assert_eq!(at(y), Some(HitTarget::Worktree(0)), "root row y={y}");
-        }
-        assert_eq!(at(6), Some(HitTarget::Worktree(1)));
-        assert_eq!(at(7), Some(HitTarget::Worktree(1)));
-        assert_eq!(
-            at(8),
-            Some(HitTarget::Worktree(2)),
-            "shared pad goes to the lower pill"
-        );
-        assert_eq!(at(9), Some(HitTarget::Worktree(2)));
-        assert_eq!(
-            at(10),
-            Some(HitTarget::Worktree(2)),
-            "last pill keeps its bottom pad"
-        );
-        assert_eq!(at(11), Some(HitTarget::PanelBg(Focus::Worktrees)));
-    }
-
-    /// Every draw of the Worktrees column writes back how many pills it
-    /// had room for — the page Ctrl+d / Ctrl+u halve — so the key handler
-    /// sizes its jump to the column as it is on screen, not to a guess.
-    /// `draw_column` keeps three rows for the title, and a pill is two
-    /// rows tall, so a 20-row area fits eight pills and a half page is
-    /// four; a shorter window shrinks both, never below one row.
-    #[test]
-    fn drawing_the_worktrees_column_records_its_page_size() {
-        let mut app = hit_test_app(&["main", "feature", "other"], &[], &[]);
-        assert_eq!(app.worktrees_view_rows, 0, "nothing drawn yet");
-        assert_eq!(app.worktrees_half_page(), 1);
-
-        let area = Rect::new(0, 0, 30, 20);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
-        terminal
-            .draw(|f| draw_worktrees(f, &mut app, area))
-            .unwrap();
-        assert_eq!(app.worktrees_view_rows, 8);
-        assert_eq!(app.worktrees_half_page(), 4);
-
-        let area = Rect::new(0, 0, 30, 6);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 6)).unwrap();
-        terminal
-            .draw(|f| draw_worktrees(f, &mut app, area))
-            .unwrap();
-        assert_eq!(app.worktrees_view_rows, 1, "three title rows, one pill");
-        assert_eq!(app.worktrees_half_page(), 1, "never less than a row");
-    }
-
-    /// A card expanded into its FOLLOW-UP COMPOSER grows a framed box
-    /// inside the pill, and everything under it in the column moves down
-    /// by exactly what the box took — off the bottom if the column runs
-    /// out, which is what the scroll is for.
-    #[test]
-    fn the_expanded_card_grows_a_box_and_pushes_the_cards_below_it_down() {
-        let mut app = hit_test_app(&["main"], &["alpha", "beta", "gamma"], &[]);
-        let area = Rect::new(0, 0, 34, 20);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).unwrap();
-        let rows_of = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| -> Vec<String> {
-            let buf = terminal.backend().buffer().clone();
-            (0..20)
-                .map(|y| {
-                    (0..34)
-                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
-                        .collect()
-                })
-                .collect()
-        };
-        let row_at = |lines: &[String], needle: &str| {
-            lines
-                .iter()
-                .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} on screen:\n{}", lines.join("\n")))
-        };
-
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        let folded = rows_of(&terminal);
-        let (alpha, beta, gamma) = (
-            row_at(&folded, "alpha"),
-            row_at(&folded, "beta"),
-            row_at(&folded, "gamma"),
-        );
-        assert!(
-            folded[alpha].contains('▸'),
-            "every card wears its toggle: {:?}",
-            folded[alpha]
-        );
-        assert!(!folded.iter().any(|l| l.contains("follow-up")));
-
-        app.follow_up = Some(crate::app::FollowUp {
-            agent: nebula_core::AgentId("a0".into()),
-            input: crate::text_input::TextInput::multiline(),
-        });
-        app.hits.clear();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        let open = rows_of(&terminal);
-
-        assert_eq!(row_at(&open, "alpha"), alpha, "the card itself stays put");
-        assert!(
-            open[alpha].contains('▾'),
-            "its toggle flipped: {:?}",
-            open[alpha]
-        );
-        let title = row_at(&open, "follow-up");
-        assert_eq!(title, alpha + 1, "the box opens straight under the name");
-        assert!(open[title].contains("╭─ follow-up"), "{:?}", open[title]);
-        assert!(
-            open[title + 2].contains('╰') && open[title + 2].contains("Esc"),
-            "the keys ride the bottom border: {:?}",
-            open[title + 2]
-        );
-
-        // An empty box is three rows — border, one line of typing, border
-        // — and the card also gives up the bottom pad it was sharing with
-        // the next one, exactly as a card with RECENT PROMPTS does.
-        let grew = 4;
-        assert_eq!(row_at(&open, "beta"), beta + grew);
-        assert_eq!(row_at(&open, "gamma"), gamma + grew);
-    }
-
-    /// The box grows with what is typed into it, up to its cap, and the
-    /// cards below keep moving down with it.
-    #[test]
-    fn the_box_grows_by_the_lines_typed_into_it() {
-        let mut app = hit_test_app(&["main"], &["alpha", "beta"], &[]);
-        let area = Rect::new(0, 0, 34, 24);
-        let width = 32; // draw_column's inner width at 34
-
-        let mut input = crate::text_input::TextInput::multiline();
-        assert_eq!(follow_up_rows(&app, 0, width), 0, "nothing expanded yet");
-        app.follow_up = Some(crate::app::FollowUp {
-            agent: nebula_core::AgentId("a0".into()),
-            input: input.clone(),
-        });
-        assert_eq!(follow_up_rows(&app, 0, width), 3, "empty: one line of room");
-        assert_eq!(follow_up_rows(&app, 1, width), 0, "only the expanded card");
-
-        input.insert_str("one\ntwo\nthree");
-        app.follow_up.as_mut().unwrap().input = input.clone();
-        assert_eq!(follow_up_rows(&app, 0, width), 5);
-
-        input.insert_str("\nfour\nfive\nsix");
-        app.follow_up.as_mut().unwrap().input = input;
-        assert_eq!(
-            follow_up_rows(&app, 0, width),
-            2 + FOLLOW_UP_MAX_LINES,
-            "past the cap the box scrolls under its own caret instead"
-        );
-
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 24)).unwrap();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let lines: Vec<String> = (0..24)
-            .map(|y| {
-                (0..34)
-                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
-                    .collect()
-            })
-            .collect();
-        let beta = lines
-            .iter()
-            .position(|l| l.contains("beta"))
-            .expect("beta still listed");
-        let alpha = lines
-            .iter()
-            .position(|l| l.contains("alpha"))
-            .expect("alpha listed");
-        assert_eq!(
-            beta - alpha,
-            PILL_H as usize + 1 + 2 + FOLLOW_UP_MAX_LINES,
-            "the pill, its bottom pad, and a box at its cap"
-        );
-    }
-
-    /// The chevron is its own click target, ahead of the card's, and the
-    /// open box is another: a click inside what you are typing into must
-    /// not read as a second click on the card, which attaches the session
-    /// and locks the pane.
-    #[test]
-    fn the_chevron_and_the_open_box_are_their_own_click_targets() {
-        let mut app = hit_test_app(&["main"], &["alpha", "beta"], &[]);
-        let area = Rect::new(0, 0, 34, 20);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).unwrap();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-
-        // draw_column hands the list rows from y=3, so the first card's
-        // name row is y=4 and its chevron the last two columns of it (the
-        // panel's inner width is 32 inside a 34-column area).
-        assert_eq!(app.hit_at(1, 4), Some(HitTarget::Session(0)));
-        assert_eq!(app.hit_at(30, 4), Some(HitTarget::SessionFollowUp(0)));
-        assert_eq!(app.hit_at(31, 4), Some(HitTarget::SessionFollowUp(0)));
-
-        app.follow_up = Some(crate::app::FollowUp {
-            agent: nebula_core::AgentId("a0".into()),
-            input: crate::text_input::TextInput::multiline(),
-        });
-        app.hits.clear();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        for y in 5..=7 {
-            assert_eq!(app.hit_at(4, y), Some(HitTarget::FollowUpBox), "y={y}");
-        }
-        assert_eq!(
-            app.hit_at(4, 9),
-            Some(HitTarget::Session(1)),
-            "the card below starts under the box"
-        );
-    }
-
-    /// A terminal row, a pull request row and an archived agent have no
-    /// follow-up to make, so they wear no toggle and keep their full
-    /// width for the name.
-    #[test]
-    fn only_a_live_agent_card_wears_the_toggle() {
-        let mut app = hit_test_app(&["main"], &["alpha"], &["shell"]);
-        app.tree.agents.push(nebula_core::Agent {
-            archived: true,
-            id: nebula_core::AgentId("a1".into()),
-            name: "old".into(),
-            ..app.tree.agents[0].clone()
-        });
-        app.show_archived = true;
-        let area = Rect::new(0, 0, 34, 20);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).unwrap();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let lines: Vec<String> = (0..20)
-            .map(|y| {
-                (0..34)
-                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
-                    .collect()
-            })
-            .collect();
-        let line_with = |needle: &str| {
-            lines
-                .iter()
-                .find(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} on screen:\n{}", lines.join("\n")))
-        };
-        assert!(line_with("alpha").contains('▸'));
-        assert!(!line_with("shell").contains('▸'), "a terminal takes none");
-        assert!(!line_with("old").contains('▸'), "nor an archived session");
-    }
-
-    /// The Sessions column writes its page size back the same way, on
-    /// the same arithmetic: a 20-row area fits eight pills, a 6-row one
-    /// a single pill, and a half page is never less than a row.
-    #[test]
-    fn drawing_the_sessions_column_records_its_page_size() {
-        let mut app = hit_test_app(&["main"], &["a", "b", "c"], &[]);
-        assert_eq!(app.sessions_view_rows, 0, "nothing drawn yet");
-        assert_eq!(app.sessions_half_page(), 1);
-
-        let area = Rect::new(0, 0, 30, 20);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        assert_eq!(app.sessions_view_rows, 8);
-        assert_eq!(app.sessions_half_page(), 4);
-
-        let area = Rect::new(0, 0, 30, 6);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 6)).unwrap();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        assert_eq!(app.sessions_view_rows, 1, "three title rows, one pill");
-        assert_eq!(app.sessions_half_page(), 1, "never less than a row");
-    }
-
-    /// A worktree whose every session is archived: the folded ARCHIVED
-    /// header is the column's whole content, and the empty-column hint
-    /// stays away from it. Before, the hint was drawn whenever no row
-    /// was listed, and the header — laid out on the same top row — was
-    /// painted over it, leaving `… 1 archived` running straight into the
-    /// hint's `terminal`. Unfolded, the group's rows keep the hint away
-    /// as ever; with nothing at all under the worktree, the hint shows.
-    #[test]
-    fn folded_archived_header_is_not_drawn_over_the_empty_hint() {
-        let mut app = hit_test_app(&["main"], &["old"], &[]);
-        app.tree.agents[0].archived = true;
-        app.show_archived = false;
-        let area = Rect::new(0, 0, 32, 12);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 12)).unwrap();
-        let rows_text = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
-            let buf = terminal.backend().buffer();
-            (0..buf.area.height)
-                .map(|y| {
-                    (0..buf.area.width)
-                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-        };
-
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        let rows = rows_text(&terminal);
-        assert!(
-            rows[3].contains("… 1 archived") && !rows[3].contains("terminal"),
-            "folded header stands alone on its row: {:?}",
-            rows[3]
-        );
-        assert!(
-            !rows.concat().contains("terminal"),
-            "no hint under a folded archived group: {rows:?}"
-        );
-
-        app.show_archived = true;
-        app.hits.clear();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        let rows = rows_text(&terminal);
-        assert!(rows[3].contains("ARCHIVED · 1"), "{:?}", rows[3]);
-        assert!(!rows.concat().contains("terminal"), "{rows:?}");
-
-        // Nothing under the worktree at all: the hint is the column.
-        app.tree.agents.clear();
-        app.hits.clear();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        let rows = rows_text(&terminal);
-        assert!(
-            rows[3].contains("n agent · t terminal"),
-            "empty column keeps its hint: {:?}",
-            rows[3]
-        );
-    }
-
-    /// RECENT PROMPTS under a session's name. Off (the default), the list
-    /// is as it was; on, the newest N follow the name oldest-first inside
-    /// the pill, each with its ago label, the next group moves down by
-    /// that much, a click over the lines lands on their session, and a
-    /// session with fewer prompts than asked lists only what it has.
-    /// Archived rows and terminals list none.
-    #[test]
-    fn recent_prompts_hang_under_the_session_pill_newest_last() {
-        use nebula_core::PromptEntry;
-        let mut app = hit_test_app(&["main"], &["agent"], &["shell"]);
-        let now = crate::app::now_ms();
-        app.tree.agents[0].recent_prompts = (1..=4)
-            .map(|n| PromptEntry {
-                text: format!("prompt {n}"),
-                submitted_at: now - (5 - n) * 10 * 60_000,
-            })
-            .collect();
-        let area = Rect::new(0, 0, 32, 24);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 24)).unwrap();
-        let row_text = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, y: u16| {
-            let buf = terminal.backend().buffer();
-            (0..buf.area.width)
-                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
-                .collect::<String>()
-        };
-
-        // Off: the pill at 3..=5, the TERMINALS header at 6, as ever.
-        app.hits.clear();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
-        assert!(!all.contains("prompt"), "off draws no history");
-        assert!(row_text(&terminal, 6).contains("TERMINALS"));
-
-        // On, three of four: the newest three, oldest first, straight
-        // under the name — rows 5..=7, the pill's bottom pad at 8 —
-        // pushing the header (and the blank every header keeps above it)
-        // down to 10.
-        app.recent_prompts = 3;
-        app.hits.clear();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        assert!(row_text(&terminal, 4).contains("agent"));
-        for (y, n, ago) in [(5, 2, "30m ago"), (6, 3, "20m ago"), (7, 4, "10m ago")] {
-            let line = row_text(&terminal, y);
-            assert!(line.contains(&format!("prompt {n}")), "y={y}: {line:?}");
-            // Pinned to the column's right edge, just inside its border.
-            let inside = line.trim_end().trim_end_matches('│').trim_end();
-            assert!(inside.ends_with(ago), "y={y}: {line:?}");
-            assert!(line.contains(PROMPT_INDENT.trim_start()), "y={y}: {line:?}");
-        }
-        let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
-        assert!(!all.contains("prompt 1"), "only the newest three");
-        assert!(row_text(&terminal, 10).contains("TERMINALS"));
-        let at = |app: &App, y: u16| app.hit_at(1, y);
-        for y in 3..=8 {
-            assert_eq!(at(&app, y), Some(HitTarget::Session(0)), "y={y}");
-        }
-        for y in 9..=10 {
-            assert_eq!(at(&app, y), Some(HitTarget::PanelBg(Focus::Sessions)));
-        }
-        for y in 11..=13 {
-            assert_eq!(at(&app, y), Some(HitTarget::Session(1)), "y={y}");
-        }
-
-        // Asked for more than the session has: its four, and no blank.
-        app.recent_prompts = 5;
-        app.hits.clear();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        assert!(row_text(&terminal, 5).contains("prompt 1"));
-        assert!(row_text(&terminal, 8).contains("prompt 4"));
-        assert!(row_text(&terminal, 11).contains("TERMINALS"));
-
-        // Archived: the history is over and the row is back to a pill.
-        app.tree.agents[0].archived = true;
-        app.show_archived = true;
-        app.hits.clear();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
-        assert!(!all.contains("prompt"), "archived rows list none: {all}");
-    }
-
-    /// With the cursor on a row, its RECENT PROMPTS lines sit on the pill's
-    /// fill with the rail running down their first column and the bottom
-    /// pad closing under the last line: one slab, so the history reads as
-    /// part of the session under the cursor. Unfocused, the same shape on
-    /// the quiet fill under a dim rail; a row the cursor is not on keeps
-    /// its lines on bare background, dim as ever.
-    #[test]
-    fn selected_session_prompt_lines_sit_on_the_pill_fill() {
-        use nebula_core::{AgentStatus, PromptEntry};
-        let mut app = hit_test_app(&["main"], &["agent", "other"], &[]);
-        let now = crate::app::now_ms();
-        for a in &mut app.tree.agents {
-            a.status = AgentStatus::Running;
-            // Warm, or the rail is a cold row's gray rather than RUNNING's.
-            a.alive = true;
-            a.recent_prompts = (1..=2)
-                .map(|n| PromptEntry {
-                    text: format!("ask {n}"),
-                    submitted_at: now - (3 - n) * 60_000,
-                })
-                .collect();
-        }
-        app.recent_prompts = 2;
-        app.focus = Focus::Sessions;
-        let th = app.theme;
-        let area = Rect::new(0, 0, 30, 16);
-        let draw = |app: &mut App| {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 16)).unwrap();
-            terminal.draw(|f| draw_sessions(f, app, area)).unwrap();
-            terminal.backend().buffer().clone()
-        };
-        let text_x = |buf: &ratatui::buffer::Buffer, y: u16, needle: &str| {
-            let line: String = (0..30)
-                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
-                .collect();
-            line.find(needle)
-                .unwrap_or_else(|| panic!("{needle:?} on row {y}: {line:?}")) as u16
-        };
-
-        // Focused: the agent's pill is pad 3, name 4, lines 5..=6, pad 7 —
-        // one fill end to end, the rail in the RUNNING yellow all the way
-        // down, the pad's cap included.
-        let buf = draw(&mut app);
-        let cell =
-            |buf: &ratatui::buffer::Buffer, x: u16, y: u16| buf.cell((x, y)).unwrap().clone();
-        assert_eq!(cell(&buf, 0, 3).symbol(), PILL_HALF.0.to_string());
-        for y in 4..=6 {
-            let rail = cell(&buf, 0, y);
-            assert_eq!(rail.symbol(), PILL_RAIL, "y={y}");
-            assert_eq!(rail.fg, th.warn, "y={y}: the rail keeps the status color");
-            // The row's 28 cells: the column keeps a pad column and its
-            // rule past them, which no row paints.
-            for x in 0..28 {
-                assert_eq!(cell(&buf, x, y).bg, th.sel_bg, "({x},{y}) is on the fill");
-            }
-        }
-        let pad = cell(&buf, 0, 7);
-        assert_eq!(
-            pad.symbol(),
-            PILL_HALF.1.to_string(),
-            "the pad closes under the lines"
-        );
-        assert_eq!(pad.fg, th.warn);
-        assert_eq!(
-            cell(&buf, 5, 7).fg,
-            th.sel_bg,
-            "the pad row is the fill's half-block"
-        );
-        assert_eq!(
-            cell(&buf, text_x(&buf, 5, "ask 1"), 5).fg,
-            th.muted,
-            "an older line is lifted off dim on the fill"
-        );
-        assert_eq!(cell(&buf, text_x(&buf, 6, "ask 2"), 6).fg, th.muted);
-        // The other row — pad 8, name 9, lines 10..=11 — draws its lines
-        // on bare background with a plain gutter, older one dim.
-        for y in 10..=11 {
-            assert_eq!(
-                cell(&buf, 0, y).symbol(),
-                " ",
-                "y={y}: no rail off the cursor"
-            );
-            assert_eq!(
-                cell(&buf, 5, y).bg,
-                Color::Reset,
-                "y={y}: no fill off the cursor"
-            );
-        }
-        assert_eq!(cell(&buf, text_x(&buf, 10, "ask 1"), 10).fg, th.dim);
-        assert_eq!(cell(&buf, text_x(&buf, 11, "ask 2"), 11).fg, th.muted);
-
-        // Unfocused: the quiet fill, the dim rail, the same shape.
-        app.focus = Focus::Worktrees;
-        let buf = draw(&mut app);
-        for y in 4..=6 {
-            assert_eq!(cell(&buf, 0, y).symbol(), PILL_RAIL, "y={y}");
-            assert_eq!(cell(&buf, 0, y).fg, th.dim, "y={y}");
-            assert_eq!(cell(&buf, 5, y).bg, th.sel_bg_dim, "y={y}");
-        }
-        assert_eq!(cell(&buf, 0, 7).fg, th.dim, "the pad cap follows the rail");
-        assert_eq!(cell(&buf, 5, 7).fg, th.sel_bg_dim);
-    }
-
-    /// The same rule in the Sessions panel: the last pill of a group has
-    /// a header under it instead of another pill, and keeps its bottom pad.
-    #[test]
-    fn session_pills_are_clickable_over_their_whole_height() {
-        let mut app = hit_test_app(&["main"], &["agent"], &["shell"]);
-        let area = Rect::new(0, 0, 30, 20);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
-        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-
-        // The agent has no header: its pill at 3..=5 (the "blank" row above
-        // the next header is that pill's bottom pad), TERMINALS header at
-        // 6, the terminal's pill at 7..=9.
-        let at = |y: u16| app.hit_at(1, y);
-        for y in 3..=5 {
-            assert_eq!(at(y), Some(HitTarget::Session(0)), "agent row y={y}");
-        }
-        assert_eq!(at(6), Some(HitTarget::PanelBg(Focus::Sessions)), "header");
-        for y in 7..=9 {
-            assert_eq!(at(y), Some(HitTarget::Session(1)), "terminal row y={y}");
-        }
-        assert_eq!(at(10), Some(HitTarget::PanelBg(Focus::Sessions)));
     }
 }

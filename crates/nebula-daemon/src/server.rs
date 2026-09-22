@@ -6,7 +6,7 @@ use crate::pr_scope::CreatePrAgentSpec;
 use crate::registry::{CreateAgentSpec, Daemon};
 use anyhow::Result;
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{ClientRequest, ServerEvent, SessionRef, WorkspaceId, PROTOCOL_VERSION};
+use nebula_core::{ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -55,15 +55,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // Per-connection attach state: forward-task handles keyed by session.
     let mut attached: HashMap<SessionRef, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut handshaken = false;
-    // Which workspace THIS client is scoped to. Per-connection on purpose:
-    // two nebula instances are two independent views, so one switching
-    // workspaces must not move the other. Pinned at Subscribe to whatever
-    // the client was handed to boot into, because "the current default" is
-    // not a stable answer — another instance switching moves it, and a
-    // client that read it once must not silently follow. `None` outlives
-    // Subscribe only for connections that never subscribe: the one-shot
-    // `nebula add`, whose workspace genuinely is the current default.
-    let mut workspace: Option<WorkspaceId> = None;
 
     let result: Result<()> = async {
         while let Some(req) = read_frame::<ClientRequest, _>(&mut reader).await? {
@@ -97,8 +88,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::Subscribe => {
                     let snapshot = daemon.snapshot().unwrap_or(ServerEvent::Snapshot {
-                        workspaces: vec![],
-                        active_workspace: Default::default(),
                         projects: vec![],
                         worktrees: vec![],
                         agents: vec![],
@@ -107,17 +96,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         pr_seen: vec![],
                         ui_state: None,
                     });
-                    // Scope this client to the workspace it is being shown.
-                    // First Subscribe only — a re-subscribe must not undo a
-                    // switch the client made in between.
-                    if workspace.is_none() {
-                        if let ServerEvent::Snapshot {
-                            active_workspace, ..
-                        } = &snapshot
-                        {
-                            workspace = Some(active_workspace.clone());
-                        }
-                    }
                     let _ = out_tx.send(snapshot).await;
                     let mut rx = daemon.events.subscribe();
                     let tx = out_tx.clone();
@@ -247,25 +225,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     });
                 }
                 // ---- entity CRUD: run the op, reply Ack/Error ----
-                ClientRequest::AddWorkspace { req_id, name } => {
-                    reply(&out_tx, req_id, daemon.add_workspace(&name).map(Some)).await;
-                }
-                ClientRequest::RemoveWorkspace { req_id, id } => {
-                    reply_done(&out_tx, req_id, daemon.remove_workspace(&id)).await;
-                }
-                ClientRequest::RenameWorkspace { req_id, id, name } => {
-                    reply_done(&out_tx, req_id, daemon.rename_workspace(&id, &name)).await;
-                }
-                ClientRequest::OpenWorkspace { req_id, id } => {
-                    // Scope this connection, and leave the pick behind as the
-                    // default a fresh client boots into. A workspace that
-                    // doesn't exist scopes nothing.
-                    let result = daemon.set_default_workspace(&id);
-                    if result.is_ok() {
-                        workspace = Some(id);
-                    }
-                    reply_done(&out_tx, req_id, result).await;
-                }
                 ClientRequest::AddProject {
                     req_id,
                     path,
@@ -276,7 +235,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         &out_tx,
                         req_id,
                         daemon
-                            .add_project(&path, name, create_missing, workspace.clone())
+                            .add_project(&path, name, create_missing)
                             .await
                             .map(Some),
                     )

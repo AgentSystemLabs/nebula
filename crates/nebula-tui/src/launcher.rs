@@ -4,8 +4,8 @@
 //! — `^P` picks the PROJECT with type-ahead over every one this machine
 //! knows, `^O` the MODEL, `Tab` the harness, `^N` flips between a fresh
 //! worktree and the project's checkout — and once something has been sent
-//! the three panels are gone: a GRID of cards, one per session in the open
-//! workspace, most recent first, each card the session's name with the
+//! the three panels are gone: a GRID of cards, one per session in the
+//! project on screen, most recent first, each card the session's name with the
 //! worktree under it and its pull request under that, and the session
 //! under the cursor live in the PANE along the BOTTOM ([`split`]). Walking
 //! the cards walks the pane, so stepping through the grid reads each
@@ -24,57 +24,8 @@ use crate::app::App;
 use crate::pull_request::{Standing, Trouble};
 use crate::quick_prompt::{QuickReturn, QuickTarget};
 use crate::text_input::TextInput;
-use nebula_core::{Agent, AgentId, AgentStatus, ProjectId, WorkspaceId, WorktreeId};
+use nebula_core::{Agent, AgentId, AgentStatus, ProjectId, WorktreeId};
 use ratatui::layout::Rect;
-
-/// Which tier of the workspace tree the GRID is showing. The view is one
-/// path down it — `workspaces / projects / sessions` — walked into with
-/// Enter and back out with Esc (or `k`,`k` off the grid's top row). It
-/// opens on [`Level::Sessions`], scoped to the selected project, and a
-/// launch always lands back there.
-///
-/// Each level's cards are the same [`CARD_H`] tall, so the grid keeps one
-/// rhythm however deep the view is walked and `j` always moves by a row.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Level {
-    /// Every workspace this machine knows, each card naming its projects.
-    Workspaces,
-    /// The open workspace's projects, each card naming its sessions.
-    Projects,
-    /// The selected project's sessions — the view's home.
-    #[default]
-    Sessions,
-}
-
-impl Level {
-    /// One level out — what Esc takes. None at the top of the tree.
-    pub fn up(self) -> Option<Level> {
-        match self {
-            Level::Sessions => Some(Level::Projects),
-            Level::Projects => Some(Level::Workspaces),
-            Level::Workspaces => None,
-        }
-    }
-
-    /// The word this level takes as the header's last crumb, and as the
-    /// noun its count reads.
-    pub fn crumb(self) -> &'static str {
-        match self {
-            Level::Workspaces => "workspaces",
-            Level::Projects => "projects",
-            Level::Sessions => "sessions",
-        }
-    }
-
-    /// The same word for one of them, as a flash names it.
-    pub fn singular(self) -> &'static str {
-        match self {
-            Level::Workspaces => "workspace",
-            Level::Projects => "project",
-            Level::Sessions => "session",
-        }
-    }
-}
 
 /// One session in the launcher's list.
 #[derive(Debug, Clone)]
@@ -113,7 +64,7 @@ impl RowPr {
 }
 
 /// Every session the list shows, most recently touched first: the
-/// unarchived AGENTS of the open workspace's projects, ordered on the
+/// unarchived AGENTS of the project on screen, ordered on the
 /// SESSIONS panel's own `recency_key` so the grid reads the way that panel
 /// reads — newest at the top left, along the row and wrapping — instead of
 /// the creation order, which left a card that had sat for half an hour
@@ -133,18 +84,24 @@ impl RowPr {
 /// is left out, as the panels leave it out: the cursor cannot be put on
 /// it.
 ///
-/// The list is the SELECTED PROJECT's alone — the project this level was
-/// walked into, and the one the header's crumb names. Scoping to one
-/// project is what makes the level a level: every jump moves
-/// `sel_project` with it, so the cursor only ever rests on a session the
-/// list holds, and Esc is the way out to the projects beside it.
+/// The list is the SELECTED PROJECT's alone — the one whose PROJECT TAB is
+/// lit in the header. Every jump moves `sel_project` with it, so the
+/// cursor only ever rests on a session the list holds, and the tabs (or
+/// the `+` in front of them) are the way to the projects beside it.
 pub fn rows(app: &App) -> Vec<LauncherRow> {
     let scope = app.selected_project().map(|p| p.id.clone());
+    // The ARCHIVED VIEW (`⇧A`) is the grid, swapped: the same cards for
+    // the project's archived sessions instead of its live ones, so
+    // `u` unarchives one where it stands and `⇧A` again comes back. The
+    // two lists never mix — a grid of cards has no room for a group
+    // header to fold, and an archived card answers to none of the keys a
+    // live one does.
+    let want_archived = app.show_archived;
     let mut rows: Vec<LauncherRow> = app
         .tree
         .agents
         .iter()
-        .filter_map(|agent| row_of(app, agent, scope.as_ref()))
+        .filter_map(|agent| row_of(app, agent, scope.as_ref(), Some(want_archived)))
         .collect();
     let now = crate::app::now_ms();
     rows.sort_by(|a, b| {
@@ -165,17 +122,29 @@ pub fn rows(app: &App) -> Vec<LauncherRow> {
 /// header reads for the session it shows, without building the list.
 pub fn row(app: &App, id: &AgentId) -> Option<LauncherRow> {
     // Unscoped: this reads one named session — the one already on screen
-    // full-screen — not the level's list, and it must not go blank
+    // full-screen — not the grid's list, and it must not go blank
     // because the project cursor has moved off it.
-    row_of(app, app.tree.agents.iter().find(|a| &a.id == id)?, None)
+    row_of(
+        app,
+        app.tree.agents.iter().find(|a| &a.id == id)?,
+        None,
+        None,
+    )
 }
 
 /// `agent`'s row: its project and checkout looked up, or None for one the
-/// list leaves out — archived, outside `scope`, another workspace's, in a
-/// hidden root. `scope` is the project the SESSIONS level is showing;
-/// None reads the row whatever project it is in.
-fn row_of(app: &App, agent: &Agent, scope: Option<&ProjectId>) -> Option<LauncherRow> {
-    if agent.archived {
+/// list leaves out — on the wrong side of `archived`, outside `scope`,
+/// in a hidden root. `scope` is the project the grid is showing; None
+/// reads the row whatever project it is in. `archived` is which of the two grids is on (`App::show_archived`);
+/// None reads the row whether or not it has been archived, for the one
+/// caller that names a session rather than listing a grid.
+fn row_of(
+    app: &App,
+    agent: &Agent,
+    scope: Option<&ProjectId>,
+    archived: Option<bool>,
+) -> Option<LauncherRow> {
+    if archived.is_some_and(|want| agent.archived != want) {
         return None;
     }
     let worktree = app
@@ -191,7 +160,7 @@ fn row_of(app: &App, agent: &Agent, scope: Option<&ProjectId>) -> Option<Launche
     if scope.is_some_and(|id| id != &project.id) {
         return None;
     }
-    if !app.tree.in_active_workspace(project) || (worktree.is_main && app.root_hidden(project)) {
+    if worktree.is_main && app.root_hidden(project) {
         return None;
     }
     Some(LauncherRow {
@@ -293,19 +262,16 @@ pub fn pane_height(body: Rect, want: Option<u16>) -> Option<u16> {
     )
 }
 
-/// The body in two: the view's own area — the breadcrumb header and the
-/// GRID under it — and the PANE along the bottom that reads whichever card
+/// The body in two: the view's own area — the PROJECT TABS and the GRID
+/// under them — and the PANE along the bottom that reads whichever card
 /// the cursor is on, [`pane_height`] tall. None for a body too short to
 /// hold the header, a row of cards and a pane worth the name: the grid
 /// takes every row of it and a session is only ever seen full-screen there.
-pub fn split(body: Rect, level: Level, want: Option<u16>) -> (Rect, Option<Rect>) {
-    // Only the SESSIONS level has a session to read: a project or a
-    // workspace card is not something the pane can show, and previewing
-    // one would boot a PTY nobody is looking at. Those levels take the
-    // whole body for their cards.
-    if level != Level::Sessions {
-        return (body, None);
-    }
+///
+/// This is the geometry alone. Whether a pane is wanted at all — the fold
+/// (`^~`) and whether any card is wearing the cursor — is
+/// [`crate::app::App::launcher_split`]'s, the one place both are read.
+pub fn split(body: Rect, want: Option<u16>) -> (Rect, Option<Rect>) {
     let Some(pane_h) = pane_height(body, want) else {
         return (body, None);
     };
@@ -319,6 +285,196 @@ pub fn split(body: Rect, level: Level, want: Option<u16>) -> (Rect, Option<Rect>
         ..body
     };
     (view, Some(pane))
+}
+
+/// Where the PANE sits against the GRID: along the bottom, under the
+/// cards — where it has always been, and the default — or down the right
+/// or the left side of them. Settings → Appearance → **Session pane**
+/// (`session_pane`, read through `Config::pane_side`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneSide {
+    #[default]
+    Bottom,
+    Right,
+    Left,
+}
+
+impl PaneSide {
+    /// The word `config.json` stores, and the value the settings row shows.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PaneSide::Bottom => "bottom",
+            PaneSide::Right => "right",
+            PaneSide::Left => "left",
+        }
+    }
+
+    /// A stored word read back. Anything else — a typo in a hand edit, a
+    /// side a newer build added — is the bottom, where the pane was before
+    /// there was a choice.
+    pub fn parse(word: &str) -> Self {
+        match word.trim() {
+            "right" => PaneSide::Right,
+            "left" => PaneSide::Left,
+            _ => PaneSide::Bottom,
+        }
+    }
+
+    /// The pane stands beside the cards rather than under them: its edge
+    /// runs down the body, and is dragged sideways.
+    pub fn beside(self) -> bool {
+        self != PaneSide::Bottom
+    }
+
+    /// The coordinate a drag of the pane's edge reads off the pointer: its
+    /// row for an edge that runs across the body, its column for one that
+    /// runs down it. [`pane_boundary`] is measured the same way.
+    pub fn along(self, column: u16, row: u16) -> i32 {
+        i32::from(if self.beside() { column } else { row })
+    }
+}
+
+/// Narrowest the PANE beside the cards is worth drawing: room for an
+/// agent's own screen to lay out without folding every line it prints.
+pub const PANE_MIN_W: u16 = 40;
+/// What the GRID keeps beside a pane: one card and the margins either
+/// side of it, so a drag to that end rests against a column of cards
+/// instead of folding them away.
+const GRID_MIN_W: u16 = CARD_MIN_W + PAD_X * 2;
+
+/// How wide the PANE stands beside the cards: `want` — the width its edge
+/// was last dragged to — or half the body when it has never been dragged,
+/// held to [`PANE_MIN_W`] at one end and to one column of cards at the
+/// other, as [`pane_height`] holds a pane under them. None for a body
+/// with no room for both side by side, or too short for the pane's own
+/// header and a reply under it.
+///
+/// Half rather than [`pane_height`]'s third: a session read down the side
+/// is read in columns, and an agent's screen squeezed to a third of the
+/// width wraps every line it draws.
+pub fn pane_width(body: Rect, want: Option<u16>) -> Option<u16> {
+    if body.width < GRID_MIN_W + PANE_MIN_W || body.height < PANE_MIN_H {
+        return None;
+    }
+    Some(
+        want.unwrap_or(body.width / 2)
+            .max(PANE_MIN_W)
+            .min(body.width - GRID_MIN_W),
+    )
+}
+
+/// The side the pane is laid out on in `body`: the one `side` asks for,
+/// or the bottom when the body is too narrow to stand the pane beside a
+/// column of cards — a pane under the grid beats no pane at all on a
+/// narrow window, and the setting is picked up again once there is room.
+pub fn fitted_side(body: Rect, side: PaneSide) -> PaneSide {
+    if side.beside() && pane_width(body, None).is_none() {
+        PaneSide::Bottom
+    } else {
+        side
+    }
+}
+
+/// [`split`] for a pane on any side: `want` is the size the pane was last
+/// dragged to along the axis `side` splits the body on — rows under the
+/// cards, columns beside them. The side is taken as given; falling back
+/// to the bottom on a narrow body is [`fitted_side`]'s.
+pub fn split_at(body: Rect, side: PaneSide, want: Option<u16>) -> (Rect, Option<Rect>) {
+    if side == PaneSide::Bottom {
+        return split(body, want);
+    }
+    let Some(pane_w) = pane_width(body, want) else {
+        return (body, None);
+    };
+    let grid_w = body.width - pane_w;
+    let (view_x, pane_x) = if side == PaneSide::Right {
+        (body.x, body.x + grid_w)
+    } else {
+        (body.x + pane_w, body.x)
+    };
+    let view = Rect {
+        x: view_x,
+        width: grid_w,
+        ..body
+    };
+    let pane = Rect {
+        x: pane_x,
+        width: pane_w,
+        ..body
+    };
+    (view, Some(pane))
+}
+
+/// Where the edge between the cards and `pane` sits, by the measure
+/// [`PaneSide::along`] reads a pointer with: the pane's first row under
+/// the cards, its first column right of them, and the grid's first column
+/// right of a pane on the left.
+pub fn pane_boundary(side: PaneSide, pane: Rect) -> i32 {
+    match side {
+        PaneSide::Bottom => i32::from(pane.y),
+        PaneSide::Right => i32::from(pane.x),
+        PaneSide::Left => i32::from(pane.x) + i32::from(pane.width),
+    }
+}
+
+/// The pane's edge facing the cards, one cell deep: the blank row a pane
+/// under them opens with, or the column a pane beside them keeps clear
+/// on that side ([`pane_content`]). The GRIP is drawn along it.
+pub fn pane_edge(side: PaneSide, pane: Rect) -> Rect {
+    match side {
+        PaneSide::Bottom => Rect {
+            height: pane.height.min(1),
+            ..pane
+        },
+        PaneSide::Right => Rect {
+            width: pane.width.min(1),
+            ..pane
+        },
+        PaneSide::Left => Rect {
+            x: pane.x + pane.width.saturating_sub(1),
+            width: pane.width.min(1),
+            ..pane
+        },
+    }
+}
+
+/// What a press on the pane's edge is caught by: [`pane_edge`] and the
+/// grid's row or column next to it, so the pointer has two cells to find
+/// rather than one.
+pub fn pane_grab_zone(side: PaneSide, pane: Rect) -> Rect {
+    let edge = pane_edge(side, pane);
+    match side {
+        PaneSide::Bottom => Rect {
+            y: edge.y.saturating_sub(1),
+            height: 2,
+            ..edge
+        },
+        PaneSide::Right => Rect {
+            x: edge.x.saturating_sub(1),
+            width: 2,
+            ..edge
+        },
+        PaneSide::Left => Rect { width: 2, ..edge },
+    }
+}
+
+/// The part of the pane its header and the session's screen draw in: all
+/// of it under the cards, whose frame opens on the blank row the grip
+/// stands in; beside them, all but [`pane_edge`]'s column, so the screen
+/// never runs under the grip.
+pub fn pane_content(side: PaneSide, pane: Rect) -> Rect {
+    match side {
+        PaneSide::Bottom => pane,
+        PaneSide::Right => Rect {
+            x: pane.x + pane.width.min(1),
+            width: pane.width.saturating_sub(1),
+            ..pane
+        },
+        PaneSide::Left => Rect {
+            width: pane.width.saturating_sub(1),
+            ..pane
+        },
+    }
 }
 
 /// The grid as one frame draws it — the geometry the keys and the drawing
@@ -373,6 +529,54 @@ impl Grid {
     /// Cards the window holds at once.
     pub fn page(&self) -> usize {
         self.cols * self.rows_fit
+    }
+
+    /// The slice of `total` cards this window actually draws, with the
+    /// cursor on `cursor`: where it starts, and how many cards follow it
+    /// on screen. The count stops at the last WHOLE row the area has room
+    /// for — a card is drawn entire or not at all — so a body too short
+    /// for even one reports none rather than a clipped one.
+    ///
+    /// The grids and the header both read this, so the number the header
+    /// says is hidden is exactly the number the grid left off.
+    pub fn window(&self, cursor: Option<usize>, total: usize) -> (usize, usize) {
+        let start =
+            crate::app::window_start(cursor.unwrap_or(0) / self.cols, self.rows_fit) * self.cols;
+        let bottom = self.area.y + self.area.height;
+        let fits = (0..self.page())
+            .take_while(|&slot| {
+                let cell = self.cell(slot);
+                cell.y + cell.height <= bottom
+            })
+            .count();
+        (start, total.saturating_sub(start).min(fits))
+    }
+
+    /// How many of `total` cards the window leaves off screen, split by
+    /// which way they went: scrolled off the top, or past the bottom edge.
+    pub fn hidden(&self, cursor: Option<usize>, total: usize) -> Hidden {
+        let (start, shown) = self.window(cursor, total);
+        Hidden {
+            above: start.min(total),
+            below: total.saturating_sub(start + shown),
+        }
+    }
+}
+
+/// Cards a grid holds but does not draw — what the PANE along the bottom
+/// took the room for, or what a screenful of sessions simply outruns.
+/// Counted both ways round so the header can point at them: `above` are
+/// scrolled off the top, `below` are past the bottom edge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Hidden {
+    pub above: usize,
+    pub below: usize,
+}
+
+impl Hidden {
+    /// Cards off screen either way. Zero when the grid holds the lot.
+    pub fn total(self) -> usize {
+        self.above + self.below
     }
 }
 
@@ -430,52 +634,21 @@ pub fn agent_at(app: &App, index: usize) -> Option<AgentId> {
     rows(app).get(index).map(|row| row.agent.id.clone())
 }
 
-// ---- the PROJECTS and WORKSPACES levels ----
+// ---- the PROJECT DROPDOWN's list ----
 
-/// Rows a PROJECT or WORKSPACE card gives to what is under it — the
-/// sessions in the project, the projects in the workspace. One less than
-/// a card's text rows, the first being its own name, so every level's
-/// card is exactly [`CARD_H`] tall and the grid keeps one rhythm however
-/// deep the view is walked.
-pub const CARD_LIST: usize = CARD_TEXT_H as usize - 1;
-
-/// One project as the PROJECTS level draws it.
+/// One project as the PROJECT DROPDOWN lists it.
 #[derive(Debug, Clone)]
 pub struct ProjectCard {
     pub id: ProjectId,
     pub name: String,
-    /// Its unarchived sessions, the ones wanting a human first — the
-    /// names the card lists under its own, and what its counts read.
+    /// Its unarchived sessions, the ones wanting a human first — what the
+    /// row's count reads.
     pub sessions: Vec<Agent>,
-    /// How many of those are waiting on a human.
-    pub needs_you: usize,
-    /// The loudest status under it, the one its dot takes; None for a
-    /// project with no session at all.
+    /// The loudest status under it; None for a project with no session.
     pub status: Option<AgentStatus>,
-    /// One of its sessions finished unread — the `done` blue its dot
-    /// takes, as an unread session row takes it.
-    pub unseen: bool,
-    /// When it was last worked in: the ago badge, and the order two
-    /// projects with the same standing come in.
+    /// When it was last worked in: the order two projects with the same
+    /// standing come in.
     pub recency: crate::app::Recency,
-}
-
-/// One workspace as the WORKSPACES level draws it.
-#[derive(Debug, Clone)]
-pub struct WorkspaceCard {
-    pub id: WorkspaceId,
-    pub name: String,
-    /// Its projects in the PROJECTS level's own order — the names the
-    /// card lists under its own.
-    pub projects: Vec<ProjectCard>,
-    pub sessions: usize,
-    pub needs_you: usize,
-    pub status: Option<AgentStatus>,
-    pub unseen: bool,
-    pub recency: crate::app::Recency,
-    /// This is the open workspace — the card the cursor is on, since the
-    /// cursor here IS `Tree::active_workspace` (see [`workspace_cursor`]).
-    pub open: bool,
 }
 
 /// How far up a card its status lifts it: the rollup's own priority, and
@@ -484,35 +657,22 @@ fn attention(status: Option<AgentStatus>) -> u8 {
     status.map_or(0, crate::app::status_rank)
 }
 
-/// The PROJECTS level's cards: every project of the open workspace, the
+/// Every project on this machine — what the PROJECT DROPDOWN lists: the
 /// ones with a session waiting on a human first, then the ones with one
-/// running, then the rest most recently worked in first — the PROJECTS
-/// PANEL's own order with whatever wants an answer lifted over it, so the
-/// card to look at is the one the eye lands on top left.
+/// running, then the rest most recently worked in first, so the project
+/// to look at is the one the eye lands on at the top.
 pub fn project_cards(app: &App) -> Vec<ProjectCard> {
-    cards_in(app, &app.tree.active_workspace)
-}
-
-/// The same over one named workspace — what a WORKSPACE card lists, and
-/// what [`project_cards`] is for the open one.
-fn cards_in(app: &App, workspace: &WorkspaceId) -> Vec<ProjectCard> {
     let now = crate::app::now_ms();
     let mut cards: Vec<ProjectCard> = app
         .tree
         .projects
         .iter()
-        .filter(|p| &p.workspace_id == workspace)
         .map(|p| {
             let sessions = project_sessions(app, &p.id);
             ProjectCard {
                 id: p.id.clone(),
                 name: p.name.clone(),
-                needs_you: sessions
-                    .iter()
-                    .filter(|a| a.status == AgentStatus::NeedsFeedback)
-                    .count(),
                 status: crate::app::rollup(sessions.iter().map(|a| a.status)),
-                unseen: sessions.iter().any(|a| a.unseen),
                 recency: crate::app::project_recency(&app.tree, &p.id, now),
                 sessions,
             }
@@ -532,11 +692,12 @@ fn cards_in(app: &App, workspace: &WorkspaceId) -> Vec<ProjectCard> {
     cards
 }
 
-/// A project's sessions as its card lists them: the unarchived ones in
-/// its checkouts, the ones wanting a human first, then the ones most
-/// recently interacted with — the SESSIONS level's own `recency_key`, so
-/// a card names the same session that level opens on. A session in a
-/// hidden ROOT WORKTREE is left out, as that level leaves it out.
+/// A project's sessions as its tab and its dropdown row count them: the
+/// unarchived ones in its checkouts, the ones wanting a human first, then
+/// the ones most recently interacted with — the grid's own
+/// `recency_key`, so the first is the session the grid opens on. A
+/// session in a hidden ROOT WORKTREE is left out, as the grid leaves it
+/// out.
 fn project_sessions(app: &App, project: &ProjectId) -> Vec<Agent> {
     let hide_root = app
         .tree
@@ -544,8 +705,8 @@ fn project_sessions(app: &App, project: &ProjectId) -> Vec<Agent> {
         .iter()
         .find(|p| &p.id == project)
         .is_some_and(|p| app.root_hidden(p));
-    // The project's checkouts once, not once per session: these levels
-    // build every project's card on every frame, and a scan per agent
+    // The project's checkouts once, not once per session: the tabs count
+    // every open project's sessions on every frame, and a scan per agent
     // turned that into the tree squared.
     let checkouts: std::collections::HashSet<&WorktreeId> = app
         .tree
@@ -571,77 +732,12 @@ fn project_sessions(app: &App, project: &ProjectId) -> Vec<Agent> {
     out
 }
 
-/// The WORKSPACES level's cards: every workspace, in the tab order the
-/// panels' bar gives them. Never reordered by what is running in them —
-/// the cursor here IS the open workspace ([`workspace_cursor`]), so a
-/// card that moved under it would take the cursor with it.
-pub fn workspace_cards(app: &App) -> Vec<WorkspaceCard> {
-    let now = crate::app::now_ms();
-    app.tree
-        .workspaces
-        .iter()
-        .map(|w| {
-            let projects = cards_in(app, &w.id);
-            WorkspaceCard {
-                id: w.id.clone(),
-                name: w.name.clone(),
-                sessions: projects.iter().map(|p| p.sessions.len()).sum(),
-                needs_you: projects.iter().map(|p| p.needs_you).sum(),
-                status: crate::app::rollup(projects.iter().filter_map(|p| p.status)),
-                unseen: projects.iter().any(|p| p.unseen),
-                recency: crate::app::workspace_recency(&app.tree, &w.id, now),
-                open: w.id == app.tree.active_workspace,
-                projects,
-            }
-        })
-        .collect()
-}
+// ---- the header's PROJECT TABS ----
 
-/// Where the cursor is on the PROJECTS level: the selected project's
-/// card. The cursor IS `App::sel_project` — the PROJECTS PANEL's own — so
-/// the card under it, the grid it opens and every verb that reads the
-/// selection all agree, exactly as the SESSIONS level's cursor is
-/// `App::selected_session`. None while the selection rests on nothing.
-pub fn project_cursor(app: &App, cards: &[ProjectCard]) -> Option<usize> {
-    let selected = app.selected_project()?;
-    cards.iter().position(|c| c.id == selected.id)
-}
-
-/// And on the WORKSPACES level: the open workspace's own tab index, since
-/// the cards are in tab order and moving the cursor is opening one.
-pub fn workspace_cursor(app: &App) -> Option<usize> {
-    app.tree.active_workspace_index()
-}
-
-/// The project on card `index`, for the mouse.
-pub fn project_at(app: &App, index: usize) -> Option<ProjectId> {
-    project_cards(app).get(index).map(|c| c.id.clone())
-}
-
-/// The workspace on card `index`, for the mouse — tab order, so straight
-/// off the tree.
-pub fn workspace_at(app: &App, index: usize) -> Option<WorkspaceId> {
-    app.tree.workspaces.get(index).map(|w| w.id.clone())
-}
-
-/// How many of `cards` have something waiting on a human — the count the
-/// PROJECTS level's header puts in red, as [`needs_you`] is the SESSIONS
-/// level's.
-pub fn project_cards_needing_you(cards: &[ProjectCard]) -> usize {
-    cards.iter().filter(|c| c.needs_you > 0).count()
-}
-
-/// The same for the WORKSPACES level.
-pub fn workspace_cards_needing_you(cards: &[WorkspaceCard]) -> usize {
-    cards.iter().filter(|c| c.needs_you > 0).count()
-}
-
-// ---- the header's STATUS TALLY ----
-
-/// What the LAUNCHER VIEW's header counts in dots: the cards in front of
-/// you, one apiece, under the loudest state each is in — so the counts can
-/// never add up to more than the grid holds, and every card the eye can
-/// find is in exactly one of them.
+/// What a PROJECT TAB counts in dots beside its name: that project's
+/// sessions, each under its own status — waiting on a human, finished
+/// unread, mid-turn. A session at rest counts nowhere, so a quiet project
+/// is a bare name.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tally {
     /// Waiting on a human: the red dot.
@@ -650,76 +746,61 @@ pub struct Tally {
     pub done: usize,
     /// Mid-turn: the yellow dot.
     pub running: usize,
-    /// Nothing live on it, and the pull request on its branch has landed:
-    /// the purple dot.
-    pub merged: usize,
 }
 
-/// Which dot a card counts under, or None for one at rest: the ladder every
-/// rollup in nebula reads — needs-you over running over finished-unread —
-/// with the merge under all of it, since a landed branch is a thing to file
-/// away rather than a thing happening. A live session on a merged checkout
-/// therefore counts as live, exactly as
-/// [`crate::app::App::worktree_wears_merge`] lets one outrank the merge in
-/// the WORKTREES panel.
-fn counted(tally: &mut Tally, status: Option<AgentStatus>, unseen: bool, merged: bool) {
-    match status {
-        Some(AgentStatus::NeedsFeedback) => tally.needs_you += 1,
-        Some(AgentStatus::Running) => tally.running += 1,
-        Some(AgentStatus::Finished) if unseen => tally.done += 1,
-        _ if merged => tally.merged += 1,
-        _ => {}
-    }
-}
-
-/// The SESSIONS level's tally, over the cards the grid holds: each card's
-/// own status, and the standing of the pull request on its checkout.
-pub fn session_tally(rows: &[LauncherRow]) -> Tally {
+/// `project`'s tally, over the sessions its grid lists — the unarchived
+/// ones, less any in a ROOT WORKTREE it hides — so a tab never counts a
+/// session its own grid would not show.
+pub fn project_tally(app: &App, project: &ProjectId) -> Tally {
     let mut tally = Tally::default();
-    for row in rows {
-        let merged = row
-            .pr
-            .as_ref()
-            .is_some_and(|pr| pr.standing == Standing::Merged);
-        counted(&mut tally, Some(row.agent.status), row.agent.unseen, merged);
+    for a in project_sessions(app, project) {
+        match a.status {
+            AgentStatus::NeedsFeedback => tally.needs_you += 1,
+            AgentStatus::Running => tally.running += 1,
+            AgentStatus::Finished if a.unseen => tally.done += 1,
+            _ => {}
+        }
     }
     tally
 }
 
-/// The PROJECTS level's, over each card's rolled-up status — and over the
-/// project's checkouts for the merge, which belongs to a branch rather than
-/// to any session on it.
-pub fn project_tally(app: &App, cards: &[ProjectCard]) -> Tally {
-    let mut tally = Tally::default();
-    for card in cards {
-        counted(
-            &mut tally,
-            card.status,
-            card.unseen,
-            project_merged(app, &card.id),
-        );
-    }
-    tally
+/// One tab in the header's PROJECT TABS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectTab {
+    pub id: ProjectId,
+    pub name: String,
+    pub tally: Tally,
+    /// The project the grid is on — the selected one.
+    pub active: bool,
+    /// The header's own cursor is on it: the PROJECT TABS have the keys
+    /// ([`App::launcher_tab_cursor`]) and the grid is showing this one.
+    pub focused: bool,
 }
 
-/// The WORKSPACES level's, the same way one tier further out.
-pub fn workspace_tally(app: &App, cards: &[WorkspaceCard]) -> Tally {
-    let mut tally = Tally::default();
-    for card in cards {
-        let merged = card.projects.iter().any(|p| project_merged(app, &p.id));
-        counted(&mut tally, card.status, card.unseen, merged);
-    }
-    tally
-}
-
-/// Whether any of `project`'s checkouts has landed — the purple a WORKTREES
-/// row wears (`App::worktree_wears_merge`, which lets a live session on the
-/// branch outrank the merge), rolled up to the card over it.
-fn project_merged(app: &App, project: &ProjectId) -> bool {
-    app.tree
-        .worktrees
+/// The PROJECT TABS across the LAUNCHER VIEW's header: every project
+/// opened since it was last closed ([`App::launcher_tabs`]), the most
+/// recently opened at the far left. Opening a project that has no tab yet
+/// puts one there ([`App::settle_project_tabs`]); switching between tabs
+/// already open moves none of them, so a tab stays where the pointer last
+/// found it.
+///
+/// A project gone from the tree drops out here, before the settle next
+/// prunes it.
+pub fn project_tabs(app: &App) -> Vec<ProjectTab> {
+    let active = app.selected_project().map(|p| p.id.clone());
+    app.launcher_tabs
         .iter()
-        .any(|w| &w.project_id == project && app.worktree_wears_merge(&w.id))
+        .filter_map(|id| {
+            let p = app.tree.projects.iter().find(|p| &p.id == id)?;
+            Some(ProjectTab {
+                id: id.clone(),
+                name: p.name.clone(),
+                tally: project_tally(app, id),
+                active: active.as_ref() == Some(id),
+                focused: app.launcher_tab_cursor.as_ref() == Some(id),
+            })
+        })
+        .collect()
 }
 
 /// The checkout a launch into `project`'s existing work lands in — the
@@ -779,6 +860,35 @@ pub fn target_for(app: &App, project: &ProjectId, new_worktree: bool) -> QuickTa
     }
 }
 
+/// `project`'s ROOT WORKTREE — the checkout its ROOT BRANCH lives in,
+/// which is where a launch from an UNAIMED box lands ([`root_target_for`]).
+/// None for a project that hides its root, whose root git is still
+/// cutting, or that has no root checkout of its own.
+pub fn root_checkout(app: &App, project: &ProjectId) -> Option<WorktreeId> {
+    let p = app.tree.projects.iter().find(|p| &p.id == project)?;
+    if app.root_hidden(p) {
+        return None;
+    }
+    app.tree
+        .worktrees
+        .iter()
+        .find(|w| &w.project_id == project && w.is_main && !app.is_placeholder_worktree(&w.id))
+        .map(|w| w.id.clone())
+}
+
+/// Where a launch from an UNAIMED box lands
+/// (`event_loop::launcher::open_box`): `project`'s ROOT BRANCH — the root checkout, not the worktree the
+/// cursor was last parked in and not a fresh branch. Nothing is selected,
+/// so there is no card to read a checkout off and the box takes the one
+/// place every project has. A project with no usable root falls back to
+/// the aimed rule ([`target_for`]).
+pub fn root_target_for(app: &App, project: &ProjectId) -> QuickTarget {
+    match root_checkout(app, project) {
+        Some(worktree) => QuickTarget::Worktree(worktree),
+        None => target_for(app, project, false),
+    }
+}
+
 /// The PROJECT a launch target is in.
 pub fn project_of(app: &App, target: &QuickTarget) -> Option<ProjectId> {
     match target {
@@ -793,12 +903,11 @@ pub fn project_of(app: &App, target: &QuickTarget) -> Option<ProjectId> {
 }
 
 /// Is a launch into `project` a BACKGROUND LAUNCH — one that lands
-/// outside what the screen is showing? The SESSIONS level is one
-/// project's, so a box re-aimed with `^P` starts its session in a list
+/// outside what the screen is showing? The grid is one project's, so a box re-aimed with `^P` starts its session in a list
 /// nobody is looking at, and that is the point: a prompt fired into
 /// another project while you keep working in this one. Such a launch
-/// moves nothing here — not the cursor, not the open workspace, not the
-/// pane — where a launch into the project under the cursor still lands
+/// moves nothing here — not the cursor, not the tabs, not the pane —
+/// where a launch into the project under the cursor still lands
 /// on its new session.
 pub fn is_background(app: &App, project: &ProjectId) -> bool {
     app.launcher_active() && app.selected_project().is_some_and(|p| &p.id != project)
@@ -813,15 +922,30 @@ pub fn project_name(app: &App, project: &ProjectId) -> Option<String> {
         .map(|p| p.name.clone())
 }
 
+/// One of the four details on the view's box: where the session runs —
+/// the project and the checkout in it — what runs there, on which model.
+/// Each is drawn with the chord that changes it beside it, the checkout
+/// with a `▾` (`ui::launcher_view::detail_line`), and each is a button — a
+/// click on one opens the very picker its chord does, through the one
+/// `event_loop::launcher::open_box_field` both ways in call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxField {
+    /// `^P` — the PROJECT the launch is aimed at.
+    Project,
+    /// `▾` — the checkout in it the launch runs in: the WORKTREE PICKER,
+    /// which only a click opens.
+    Worktree,
+    /// `Tab` — the harness that runs there.
+    Agent,
+    /// `^O` — that harness's MODEL, and its effort.
+    Model,
+}
+
 /// One project the PROJECT PICKER offers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PickerProject {
     pub id: ProjectId,
     pub name: String,
-    pub workspace: WorkspaceId,
-    /// The workspace's name when it is not the open one — drawn dim after
-    /// the project's, since picking it switches this instance there.
-    pub elsewhere: Option<String>,
     /// The repo path, `~/…` under the home directory, drawn dim to tell
     /// two same-named projects apart.
     pub path: String,
@@ -840,16 +964,13 @@ fn home_relative(path: &std::path::Path) -> String {
 
 /// `^P` in the launcher's box: every project on this machine, filtered as
 /// you type (fzf-style, `fuzzy::rank`) and picked with Enter, which puts
-/// the box back on that project with the typed text kept. The open
-/// workspace's projects come first, in the Projects panel's order (the
-/// most recently worked in on top); the rest follow under their
-/// workspace's name.
+/// the box back on that project with the typed text kept. The projects
+/// come in the Projects panel's order, the most recently worked in on top.
 ///
 /// A pick only aims the box. The grid behind it goes on showing the
-/// project being worked in, and a project from another workspace does not
-/// open that workspace — the launch that follows is a BACKGROUND LAUNCH
-/// ([`is_background`]), which starts the session over there and leaves
-/// the screen here.
+/// project being worked in — the launch that follows is a BACKGROUND
+/// LAUNCH ([`is_background`]), which starts the session over there and
+/// leaves the screen here.
 #[derive(Debug, Clone)]
 pub struct ProjectPicker {
     /// The box to put back — with its text — on a pick or on Esc.
@@ -871,35 +992,16 @@ impl ProjectPicker {
     /// project the box is aimed at.
     pub fn new(app: &App, back: QuickReturn) -> Self {
         let current = project_of(app, &back.launch.target);
-        let open = &app.tree.active_workspace;
-        let mut projects: Vec<PickerProject> = app
+        let projects: Vec<PickerProject> = app
             .project_rows()
             .into_iter()
             .filter_map(|i| app.tree.projects.get(i))
             .map(|p| PickerProject {
                 id: p.id.clone(),
                 name: p.name.clone(),
-                workspace: p.workspace_id.clone(),
-                elsewhere: None,
                 path: home_relative(&p.repo_path),
             })
             .collect();
-        // Then every other workspace's, in tab order.
-        for workspace in app.tree.workspaces.iter().filter(|w| &w.id != open) {
-            projects.extend(
-                app.tree
-                    .projects
-                    .iter()
-                    .filter(|p| p.workspace_id == workspace.id)
-                    .map(|p| PickerProject {
-                        id: p.id.clone(),
-                        name: p.name.clone(),
-                        workspace: p.workspace_id.clone(),
-                        elsewhere: Some(workspace.name.clone()),
-                        path: home_relative(&p.repo_path),
-                    }),
-            );
-        }
         let mut picker = Self {
             back,
             query: TextInput::new(),
@@ -955,11 +1057,10 @@ impl ProjectPicker {
 mod tests {
     use super::*;
     use crate::pull_request::PullRequest;
-    use nebula_core::{AgentKind, AgentStatus, Project, Workspace, Worktree};
+    use nebula_core::{AgentKind, AgentStatus, Project, Worktree};
 
-    fn project(id: &str, name: &str, workspace: &str) -> Project {
+    fn project(id: &str, name: &str) -> Project {
         Project {
-            workspace_id: WorkspaceId(workspace.into()),
             id: ProjectId(id.into()),
             name: name.into(),
             repo_path: format!("/tmp/{name}").into(),
@@ -1000,26 +1101,15 @@ mod tests {
         }
     }
 
-    /// Two projects in the default workspace, one in `side`: `api` with
-    /// its root and a `feat` checkout, `web` with its root, `ops` over in
-    /// the other workspace. Sessions a1 (api root), a2 (api feat), a3
-    /// (web root), a4 (ops root), created in that order.
+    /// Three projects: `api` with its root and a `feat` checkout, `web`
+    /// and `ops` with their roots. Sessions a1 (api root), a2 (api feat),
+    /// a3 (web root), a4 (ops root), created in that order.
     fn app() -> App {
         let mut app = App::new();
-        app.tree.workspaces = vec![
-            Workspace {
-                id: WorkspaceId::default(),
-                name: "default".into(),
-            },
-            Workspace {
-                id: WorkspaceId("side".into()),
-                name: "side".into(),
-            },
-        ];
         app.tree.projects = vec![
-            project("p1", "api", "default"),
-            project("p2", "web", "default"),
-            project("p3", "ops", "side"),
+            project("p1", "api"),
+            project("p2", "web"),
+            project("p3", "ops"),
         ];
         app.tree.worktrees = vec![
             worktree("w1", "p1", "main", true),
@@ -1041,10 +1131,9 @@ mod tests {
     }
 
     /// The list is the SELECTED PROJECT's sessions, each carrying the
-    /// project and worktree its row names under it. The project beside it
-    /// is not in the list — walking out to it is what Esc and the
-    /// PROJECTS level are for — nor is the other workspace's session, nor
-    /// an archived one. (The order is
+    /// project and worktree its row names under it. The projects beside it
+    /// are not in the list — their tabs are how to get to them — nor is an
+    /// archived one. (The order is
     /// `rows_are_ordered_the_way_the_sessions_panel_orders_them`'s
     /// subject; here every session is working, so they tie and fall back
     /// to newest created.)
@@ -1075,8 +1164,8 @@ mod tests {
             ("api", "main", true)
         );
 
-        // Walked into `web`, and the list is its one session instead —
-        // the same cursor, a level's worth of scope away.
+        // Switched to `web`, and the list is its one session instead —
+        // the same cursor, one tab over.
         app.sel_project = web_row(&app);
         assert_eq!(names(&super::rows(&app)), ["tidy-css"]);
 
@@ -1323,7 +1412,7 @@ mod tests {
     #[test]
     fn the_pane_takes_the_bottom_of_a_body_with_room_for_it() {
         let body = Rect::new(0, 0, 80, 40);
-        let (view, pane) = split(body, Level::Sessions, None);
+        let (view, pane) = split(body, None);
         let pane = pane.expect("40 rows has room for a pane");
         assert_eq!(view.height + pane.height, body.height, "the whole body");
         assert_eq!(pane.y, view.y + view.height, "the pane is under the grid");
@@ -1334,7 +1423,40 @@ mod tests {
         // Too short for a header, a row of cards and a pane worth the name:
         // all grid, and a session is only seen full-screen.
         let short = Rect::new(0, 0, 80, HEAD_H + CARD_H + PANE_MIN_H - 1);
-        assert_eq!(split(short, Level::Sessions, None), (short, None));
+        assert_eq!(split(short, None), (short, None));
+    }
+
+    /// The window counts what it left off, and which way it went: cards
+    /// past the bottom edge when the cursor is at the top, cards behind
+    /// the cursor once it has walked down. A grid with room for the lot
+    /// hides nothing — that is the case the header stays quiet for.
+    #[test]
+    fn the_window_counts_the_cards_it_could_not_draw() {
+        // Two columns, two rows of cards on screen: four at a time.
+        let body = Rect::new(0, 0, 100, HEAD_H + CARD_H * 2 + GAP_Y);
+        let g = grid(body);
+        assert_eq!((g.cols, g.rows_fit), (2, 2));
+
+        assert_eq!(g.hidden(Some(0), 4), Hidden::default(), "the lot fits");
+        assert_eq!(g.hidden(None, 4), Hidden::default(), "and with no cursor");
+        assert_eq!(
+            g.hidden(Some(0), 9),
+            Hidden { above: 0, below: 5 },
+            "from the top, the rest are under the fold"
+        );
+        // The cursor on the last card: the window has scrolled to it, so
+        // what is missing is behind it rather than ahead. Nine cards over
+        // two columns is five rows; the last two of them are on screen.
+        assert_eq!(g.hidden(Some(8), 9), Hidden { above: 6, below: 0 });
+        // And in the middle, both ways at once.
+        assert_eq!(g.hidden(Some(5), 12), Hidden { above: 2, below: 6 });
+        assert_eq!(g.hidden(Some(5), 12).total(), 8);
+
+        // A body with room for one row of cards hides everything under it
+        // — the PANE dragged up to its stop.
+        let squeezed = grid(Rect::new(0, 0, 100, HEAD_H + CARD_H));
+        assert_eq!(squeezed.rows_fit, 1);
+        assert_eq!(squeezed.hidden(Some(0), 9), Hidden { above: 0, below: 7 });
     }
 
     #[test]
@@ -1396,24 +1518,11 @@ mod tests {
         );
     }
 
-    /// The levels walk one tier at a time and stop at either end: Esc off
-    /// the sessions reaches the workspaces in two presses and no further,
-    /// and Enter comes back the same way.
-    #[test]
-    fn the_levels_walk_one_tier_at_a_time() {
-        assert_eq!(Level::Sessions.up(), Some(Level::Projects));
-        assert_eq!(Level::Projects.up(), Some(Level::Workspaces));
-        assert_eq!(Level::Workspaces.up(), None, "the top of the tree");
-
-        assert_eq!(Level::default(), Level::Sessions, "the view's home");
-        assert_eq!(Level::Projects.crumb(), "projects");
-        assert_eq!(Level::Projects.singular(), "project");
-    }
-
-    /// The PROJECTS level puts what is waiting on a human first, then what
-    /// is running, then the rest in the PROJECTS PANEL's own order — and
-    /// each card's sessions are sorted the same way, so the name the card
-    /// leads with is the one to look at.
+    /// The PROJECT DROPDOWN's list puts what is waiting on a human first,
+    /// then what is running, then the rest in the PROJECTS PANEL's own
+    /// order — every project on the machine — and each project's sessions
+    /// are sorted the same way, so the one it leads with is the one to
+    /// look at.
     #[test]
     fn project_cards_put_what_wants_a_human_first() {
         let mut app = app();
@@ -1424,23 +1533,20 @@ mod tests {
         let cards = project_cards(&app);
         assert_eq!(
             cards.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-            ["api", "web"],
-            "the open workspace's projects, and not the other one's"
+            ["api", "web", "ops"],
+            "every project"
         );
         assert_eq!(cards[0].sessions.len(), 2, "api's two");
-        assert_eq!(cards[0].needs_you, 0);
 
         // web's session blocks on a human and its card comes first, with
-        // the dot and the count to match.
+        // the status to match.
         app.tree.agents[2].status = AgentStatus::NeedsFeedback;
         let cards = project_cards(&app);
         assert_eq!(
             cards.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-            ["web", "api"]
+            ["web", "api", "ops"]
         );
-        assert_eq!(cards[0].needs_you, 1);
         assert_eq!(cards[0].status, Some(AgentStatus::NeedsFeedback));
-        assert_eq!(project_cards_needing_you(&cards), 1);
 
         // Inside a card the same order holds: api's blocked session leads
         // its running one, whatever their stamps say.
@@ -1457,7 +1563,7 @@ mod tests {
         );
 
         // A project whose only checkout is a hidden root has no sessions
-        // to name, as the SESSIONS level has none to list.
+        // to count, as its grid has none to list.
         app.project_fallback.hide_root_worktree = true;
         let cards = project_cards(&app);
         let web = cards.iter().find(|c| c.name == "web").expect("web");
@@ -1465,146 +1571,84 @@ mod tests {
         assert_eq!(web.status, None, "and no dot to wear");
     }
 
-    /// The WORKSPACES level stays in tab order however loud a workspace
-    /// gets — the cursor there IS the open workspace, so a card that moved
-    /// would take the cursor with it — and each card carries what is under
-    /// it, its projects in the PROJECTS level's own order.
+    /// A PROJECT TAB's tally counts every session its grid lists, each
+    /// under its own status — asking, mid-turn, finished unread — and a
+    /// session at rest, or one archived out of the grid, nowhere.
     #[test]
-    fn workspace_cards_keep_tab_order_and_carry_their_projects() {
+    fn a_project_tally_counts_each_session_under_its_status() {
         let mut app = app();
-        app.tree.agents[3].status = AgentStatus::NeedsFeedback; // ops, in `side`
-        let cards = workspace_cards(&app);
+        let api = ProjectId("p1".into());
+        // Both api sessions are mid-turn (the fixture's default).
         assert_eq!(
-            cards.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-            ["default", "side"],
-            "tab order, not attention order"
-        );
-        assert!(cards[0].open, "the cursor's card");
-        assert_eq!(
-            cards[0]
-                .projects
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>(),
-            ["api", "web"]
-        );
-        assert_eq!(cards[0].sessions, 3, "api's two and web's one");
-        assert_eq!(cards[1].needs_you, 1);
-        assert_eq!(cards[1].status, Some(AgentStatus::NeedsFeedback));
-        assert_eq!(workspace_cards_needing_you(&cards), 1);
-        assert_eq!(workspace_at(&app, 1).map(|w| w.0), Some("side".into()));
-    }
-
-    /// The header's TALLY counts every card the grid holds exactly once,
-    /// under the loudest state it is in: needs-you over running over an
-    /// unread finish, and the merge only for a card with nothing live on
-    /// it at all.
-    #[test]
-    fn a_tally_counts_each_card_once_under_its_loudest_state() {
-        let mut app = app();
-        // The SESSIONS level is `api`'s: its root session and its `feat`
-        // one, which is the checkout with the merged pull request.
-        app.pull_requests.insert(
-            WorktreeId("w2".into()),
-            Some(PullRequest {
-                number: 42,
-                url: "https://github.com/o/api/pull/42".into(),
-                title: "Add search".into(),
-                state: crate::pull_request::STATE_MERGED.into(),
-                is_draft: false,
-                health: Default::default(),
-                activity: Vec::new(),
-            }),
-        );
-        // Both api sessions are mid-turn (the fixture's default), so the
-        // merge is outranked on its own checkout.
-        assert_eq!(
-            session_tally(&rows(&app)),
+            project_tally(&app, &api),
             Tally {
                 running: 2,
                 ..Tally::default()
             }
         );
 
-        // The merged checkout's session finishes and is read: nothing is
-        // live on it any more, so the card counts as landed rather than as
-        // one more result filed away.
-        app.tree.agents[1].status = AgentStatus::Finished;
-        assert_eq!(
-            session_tally(&rows(&app)),
-            Tally {
-                running: 1,
-                merged: 1,
-                ..Tally::default()
-            }
-        );
-
-        // Unread, it is a finish first — a result nobody has looked at
-        // outranks a branch that has landed.
-        app.tree.agents[1].unseen = true;
-        assert_eq!(
-            session_tally(&rows(&app)),
-            Tally {
-                running: 1,
-                done: 1,
-                ..Tally::default()
-            }
-        );
-
-        // And a question beats everything.
-        app.tree.agents[1].unseen = false;
         app.tree.agents[1].status = AgentStatus::NeedsFeedback;
+        app.tree.agents[0].status = AgentStatus::Finished;
+        app.tree.agents[0].unseen = true;
         assert_eq!(
-            session_tally(&rows(&app)),
-            Tally {
-                running: 1,
-                needs_you: 1,
-                ..Tally::default()
-            }
-        );
-    }
-
-    /// The levels above the sessions tally their own cards: one dot per
-    /// project, one per workspace, off the rollup each card already wears.
-    #[test]
-    fn the_levels_above_tally_their_cards() {
-        let mut app = app();
-        app.tree.agents[0].status = AgentStatus::NeedsFeedback; // api root
-        app.tree.agents[2].status = AgentStatus::Finished; // web root
-        app.tree.agents[2].unseen = true;
-
-        let cards = project_cards(&app);
-        assert_eq!(
-            project_tally(&app, &cards),
+            project_tally(&app, &api),
             Tally {
                 needs_you: 1,
                 done: 1,
-                ..Tally::default()
-            },
-            "api asks, web has an unread finish"
+                running: 0,
+            }
         );
 
-        // The workspace over them wears the loudest of what it holds, and
-        // `side`'s own project is still mid-turn.
-        let cards = workspace_cards(&app);
+        // Read, the finish is at rest; archived, the question is off the
+        // grid — and so off the tab.
+        app.tree.agents[0].unseen = false;
+        app.tree.agents[1].archived = true;
+        assert_eq!(project_tally(&app, &api), Tally::default());
+
+        // Another project's sessions are its own tab's business.
         assert_eq!(
-            workspace_tally(&app, &cards),
+            project_tally(&app, &ProjectId("p2".into())),
             Tally {
-                needs_you: 1,
                 running: 1,
                 ..Tally::default()
             }
         );
     }
 
-    /// Only the SESSIONS level has a pane: a project or a workspace card
-    /// is not something the pane can read, and the cards take the body.
+    /// The tabs are the projects opened on the grid, the newest opened at
+    /// the far left. Coming back to one already open moves nothing, and a
+    /// project gone from the tree takes its tab with it.
     #[test]
-    fn the_levels_above_the_sessions_have_no_pane() {
-        let body = Rect::new(0, 0, 80, 40);
-        assert!(split(body, Level::Sessions, None).1.is_some());
-        assert_eq!(split(body, Level::Projects, None), (body, None));
-        assert_eq!(split(body, Level::Workspaces, None), (body, None));
+    fn a_project_gets_a_tab_when_it_is_opened() {
+        let mut app = app();
+        let ids =
+            |app: &App| -> Vec<String> { project_tabs(app).into_iter().map(|t| t.name).collect() };
+        app.settle_project_tabs();
+        assert_eq!(ids(&app), ["api"], "the project the view opened on");
+
+        app.sel_project = web_row(&app);
+        app.settle_project_tabs();
+        assert_eq!(ids(&app), ["web", "api"], "the newest opened leads");
+
+        // Back to `api`: it is already open, so nothing moves — only which
+        // tab is lit.
+        app.sel_project = app
+            .project_rows()
+            .iter()
+            .position(|i| app.tree.projects[*i].id.0 == "p1")
+            .expect("api has a row");
+        app.settle_project_tabs();
+        let tabs = project_tabs(&app);
+        assert_eq!(ids(&app), ["web", "api"]);
+        assert_eq!(
+            tabs.iter().map(|t| t.active).collect::<Vec<_>>(),
+            [false, true]
+        );
+
+        // Removed from the tree, `web` is removed from the header.
+        app.tree.projects.retain(|p| p.id.0 != "p2");
+        app.settle_project_tabs();
+        assert_eq!(ids(&app), ["api"]);
     }
 
     /// The PANE stands at the height its edge was dragged to, held to its
@@ -1631,7 +1675,7 @@ mod tests {
             "the header and a row of cards are kept"
         );
 
-        let (view, pane) = split(body, Level::Sessions, Some(20));
+        let (view, pane) = split(body, Some(20));
         let pane = pane.expect("40 rows has room for a pane");
         assert_eq!(pane.height, 20, "the dragged height, laid out");
         assert_eq!(view.height + pane.height, body.height, "the whole body");
@@ -1641,12 +1685,91 @@ mod tests {
         // A body with no room for a pane has no height to drag it to.
         let short = Rect::new(0, 0, 80, HEAD_H + CARD_H + PANE_MIN_H - 1);
         assert_eq!(pane_height(short, Some(20)), None);
-        assert_eq!(split(short, Level::Sessions, Some(20)), (short, None));
+        assert_eq!(split(short, Some(20)), (short, None));
     }
 
-    /// The picker lists the open workspace's projects, then the rest under
-    /// their workspace's name; typing narrows by name, best match first,
-    /// and the cursor starts on the project the box is aimed at.
+    /// The **Session pane** words: the three sides round-trip, and a word
+    /// off the list is the bottom the pane had before there was a choice.
+    #[test]
+    fn pane_sides_read_back_and_default_to_the_bottom() {
+        for side in [PaneSide::Bottom, PaneSide::Right, PaneSide::Left] {
+            assert_eq!(PaneSide::parse(side.as_str()), side);
+        }
+        assert_eq!(PaneSide::parse(" right "), PaneSide::Right);
+        assert_eq!(PaneSide::parse("top"), PaneSide::Bottom);
+        assert_eq!(PaneSide::parse(""), PaneSide::Bottom);
+        assert_eq!(PaneSide::default(), PaneSide::Bottom);
+    }
+
+    /// A pane beside the cards splits the body's columns rather than its
+    /// rows: half of them by default, all of the height, the grid on the
+    /// other side — and its edge, grip column and grab zone face the
+    /// cards, whichever side it is on.
+    #[test]
+    fn a_side_pane_splits_the_columns() {
+        let body = Rect::new(0, 3, 160, 40);
+
+        let (view, pane) = split_at(body, PaneSide::Right, None);
+        let pane = pane.expect("160 columns has room beside the cards");
+        assert_eq!((pane.y, pane.height), (body.y, body.height), "full height");
+        assert_eq!(pane.width, 80, "half the body by default");
+        assert_eq!((view.x, view.width), (0, 80), "the grid on the left");
+        assert_eq!(pane.x, view.x + view.width, "the pane right of it");
+        assert_eq!(pane_boundary(PaneSide::Right, pane), 80);
+        assert_eq!(pane_edge(PaneSide::Right, pane).x, 80);
+        assert_eq!(
+            pane_grab_zone(PaneSide::Right, pane),
+            Rect::new(79, 3, 2, 40),
+            "the grid's last column and the pane's first"
+        );
+        let content = pane_content(PaneSide::Right, pane);
+        assert_eq!((content.x, content.width), (81, 79), "clear of the grip");
+
+        let (view, pane) = split_at(body, PaneSide::Left, Some(50));
+        let pane = pane.expect("room on the left too");
+        assert_eq!((pane.x, pane.width), (0, 50), "as dragged");
+        assert_eq!((view.x, view.width), (50, 110), "the grid right of it");
+        assert_eq!(pane_boundary(PaneSide::Left, pane), 50);
+        assert_eq!(pane_edge(PaneSide::Left, pane).x, 49);
+        assert_eq!(
+            pane_grab_zone(PaneSide::Left, pane),
+            Rect::new(49, 3, 2, 40),
+            "the pane's last column and the grid's first"
+        );
+        let content = pane_content(PaneSide::Left, pane);
+        assert_eq!((content.x, content.width), (0, 49), "clear of the grip");
+
+        // The bottom is `split` itself, and its edge the pane's first row.
+        let (_, pane) = split_at(body, PaneSide::Bottom, None);
+        let pane = pane.expect("40 rows has room under the cards");
+        assert_eq!(Some(pane), split(body, None).1);
+        assert_eq!(pane_boundary(PaneSide::Bottom, pane), i32::from(pane.y));
+        assert_eq!(pane_content(PaneSide::Bottom, pane), pane);
+    }
+
+    /// A side pane's width rests against its own minimum at one end and
+    /// against one column of cards at the other; a body too narrow for
+    /// both side by side lays the pane out along the bottom instead.
+    #[test]
+    fn a_side_pane_is_clamped_and_falls_back_to_the_bottom() {
+        let body = Rect::new(0, 0, 160, 40);
+        assert_eq!(pane_width(body, Some(1)), Some(PANE_MIN_W), "its floor");
+        assert_eq!(
+            pane_width(body, Some(999)),
+            Some(160 - CARD_MIN_W - PAD_X * 2),
+            "one column of cards kept"
+        );
+        assert_eq!(fitted_side(body, PaneSide::Left), PaneSide::Left);
+
+        let narrow = Rect::new(0, 0, CARD_MIN_W + PAD_X * 2 + PANE_MIN_W - 1, 40);
+        assert_eq!(pane_width(narrow, None), None);
+        assert_eq!(fitted_side(narrow, PaneSide::Right), PaneSide::Bottom);
+        assert_eq!(fitted_side(narrow, PaneSide::Bottom), PaneSide::Bottom);
+    }
+
+    /// The picker lists every project, each with its path; typing narrows
+    /// by name, best match first, and the cursor starts on the project the
+    /// box is aimed at.
     #[test]
     fn the_project_picker_lists_every_project_and_filters_by_name() {
         let app = app();
@@ -1659,16 +1782,16 @@ mod tests {
             from_box: true,
         };
         let mut picker = ProjectPicker::new(&app, back);
-        let listed: Vec<(&str, Option<&str>)> = picker
+        let listed: Vec<(&str, &str)> = picker
             .matches
             .iter()
             .map(|(i, _)| {
                 let p = &picker.projects[*i];
-                (p.name.as_str(), p.elsewhere.as_deref())
+                (p.name.as_str(), p.path.as_str())
             })
             .collect();
         assert_eq!(listed.len(), 3);
-        assert_eq!(listed[2], ("ops", Some("side")));
+        assert_eq!(listed[2], ("ops", "/tmp/ops"));
         assert_eq!(
             picker.selected_project().map(|p| p.name.as_str()),
             Some("web"),

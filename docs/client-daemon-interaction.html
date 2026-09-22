@@ -194,8 +194,6 @@ sequenceDiagram
   S->>R: snapshot()
   S-->>C: ServerEvent::Snapshot (full tree + ui_state)
   S-->>C: stream ServerEvents via broadcast (deltas forever)
-
-  Note over C: Client pins workspace scope at first Subscribe
         </pre>
       </div>
     </section>
@@ -244,7 +242,6 @@ flowchart TB
       </div>
       <ul>
         <li><strong>Subscribe</strong> → one <code>Snapshot</code>, then a broadcast fan-out of entity/status deltas to every connected TUI.</li>
-        <li><strong>OpenWorkspace</strong> scopes <em>this connection only</em> — two TUIs can view different workspaces.</li>
         <li>One-shot CLIs send a single request (e.g. <code>AutoRenameAgent</code>) and exit; no Subscribe.</li>
       </ul>
     </section>
@@ -329,12 +326,10 @@ sequenceDiagram
       <div class="diagram">
         <pre class="mermaid">
 flowchart TB
-  WS["WORKSPACE"]
   PR["PROJECT (git repo)"]
   WT["WORKTREE (checkout)"]
   SESS["SESSION"]
 
-  WS --> PR
   PR --> WT
   WT --> SESS
 
@@ -342,7 +337,7 @@ flowchart TB
   SESS --> TERM["TERMINAL SESSION<br/>(plain shell tab)"]
 
   DAEMON["DAEMON owns tree + SQLite STORE"]
-  DAEMON --- WS
+  DAEMON --- PR
 
   TUI["TUI draws panels<br/>client-side: gh pr view, git diff, fuzzy find"]
   TUI -.->|"Subscribe + deltas"| DAEMON

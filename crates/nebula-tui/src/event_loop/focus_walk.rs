@@ -1,10 +1,9 @@
 //! The panel walk: focus moving across the columns — Tab / ⇧Tab and
 //! ^⇧L / ^⇧H one panel at a time, `h`/`l` (←/→) as their vim twins —
 //! and the double tap that jumps a walk edge: `l`,`l` at Sessions into the
-//! pane, `h`,`h` or `k`,`k` up into the Workspaces bar, `j`,`j` back down
-//! out of it. `event_loop.rs` dispatches the keys; this module decides
-//! where focus lands. The state it drives is `App::focus`, `App::edge_tap`,
-//! `App::bar_return` and the pane's input lock.
+//! pane. `event_loop.rs` dispatches the keys; this module decides where
+//! focus lands. The state it drives is `App::focus`, `App::edge_tap` and
+//! the pane's input lock.
 
 use super::fire_pending_attach;
 use crate::app::{App, Focus, HitTarget};
@@ -58,7 +57,7 @@ pub(super) fn double_tapped(
 /// The forward panel walk — Tab / ^⇧L, and l/→ (double-tapped at the
 /// end) — one visible column right (a hidden Projects or Worktrees panel
 /// is skipped), stopping dead at the terminal pane so leaning on the key
-/// can't spill past it and back round to the Workspaces bar. Landing on
+/// can't spill past it and back round to the first column. Landing on
 /// the pane takes the input lock: walking that far means the user is
 /// going to type at the agent, and the preview under the Sessions cursor
 /// is already the session they picked.
@@ -70,127 +69,53 @@ pub(super) fn walk_focus_forward(app: &mut App, out: &mut Vec<ClientRequest>) {
 }
 
 /// The backward panel walk — ⇧Tab / ^⇧H, and h/← (double-tapped at the
-/// end) — one visible column left, stopping dead at the first stop: the
-/// Workspaces bar while it's shown, otherwise the first visible sidebar.
-/// Never wraps into the pane: ^⇧H is also the unlock hatch out of a locked
+/// end) — one visible column left, stopping dead at the first visible
+/// sidebar. Never wraps into the pane: ^⇧H is also the unlock hatch out of a locked
 /// pane, so a wrap made the key cycle first column → pane → Sessions → …
 /// forever, with nothing to stop against. Forward is the way into the
 /// pane, and Ctrl+→ crosses into it without taking the input lock.
 pub(super) fn walk_focus_back(app: &mut App) {
-    match app.previous_visible_focus(app.focus) {
-        Focus::Workspaces => enter_workspaces_bar(app),
-        prev => app.focus = prev,
-    }
-}
-
-/// Step up into the Workspaces bar — the walk back, h,h / k,k, or a click
-/// on a tab — remembering the panel the cursor came from so j,j in the bar
-/// can drop back onto it. The terminal pane is not a panel under the bar:
-/// coming from there, the way back lands on Sessions, the column whose
-/// cursor the pane previews. Already in the bar, the memory stands.
-pub(super) fn enter_workspaces_bar(app: &mut App) {
-    app.bar_return = match app.focus {
-        Focus::Workspaces => app.bar_return,
-        Focus::Terminal => Focus::Sessions,
-        panel => panel,
-    };
-    app.focus = Focus::Workspaces;
+    app.focus = app.previous_visible_focus(app.focus);
 }
 
 /// Where the click that dismissed a modal lands: on the focus of whatever
 /// the pointer was over, and nothing else. The user aimed that click at a
 /// panel, not at the modal's margin, so the panel takes focus as a click
 /// on it would — but the click itself was spent closing the modal: it
-/// moves no cursor, previews no session, switches no workspace and never
+/// moves no cursor, previews no session, switches no project and never
 /// opens a prompt, or dismissing a modal would be the one click in nebula
 /// that acts on a row the user could not see it land on. The pane is the
 /// exception that the walk already makes: entering it is a commitment to
 /// type at the agent, so it takes the input lock the way the click and Tab
-/// both do. A splitter — the seam between two panels, or the LAUNCHER
-/// VIEW's pane edge — and the footer's nameplate is a button: neither is
-/// somewhere focus lives.
+/// both do. The LAUNCHER VIEW's pane edge and its header's tabs are
+/// buttons: none of them is somewhere focus lives.
 pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut Vec<ClientRequest>) {
     match app.hit_at(column, row) {
-        Some(HitTarget::Workspace(_)) => enter_workspaces_bar(app),
-        Some(HitTarget::Project(_)) => app.focus = app.first_sidebar_focus(),
-        Some(HitTarget::Worktree(_) | HitTarget::OpenPrsHeader | HitTarget::IssuesHeader) => {
-            app.focus = Focus::Worktrees
-        }
-        Some(
-            HitTarget::Session(_)
-            | HitTarget::ArchivedHeader
-            | HitTarget::LauncherRow(_)
-            | HitTarget::LauncherProjectCard(_)
-            | HitTarget::LauncherWorkspaceCard(_)
-            | HitTarget::SessionFollowUp(_)
-            | HitTarget::FollowUpBox,
-        ) => app.focus = Focus::Sessions,
+        Some(HitTarget::LauncherRow(_)) => app.focus = Focus::Sessions,
         Some(HitTarget::PanelBg(focus)) => app.focus = focus,
-        // The click was spent closing the modal, so a chevron or rail
-        // only takes focus when its panel is open; toggling is the
-        // direct-click path's job.
-        Some(HitTarget::CollapsePanel(focus)) => {
-            if app.collapse_target_open(focus) {
-                app.focus = focus;
-            }
-        }
         Some(HitTarget::TerminalPane | HitTarget::CloudSessionLink) => {
             enter_terminal_pane(app, out)
         }
         // The crumb is a button out of a full-screen session, not
-        // somewhere focus lives: its own handler is what moves focus.
+        // somewhere focus lives: its own handler is what moves focus. So
+        // are the PANE's own TAB STRIP tabs — a click on one says what
+        // the pane reads, and typing into it is the separate commitment
+        // the pane itself takes.
         Some(
-            HitTarget::Splitter(_)
-            | HitTarget::LauncherPaneSplitter
-            | HitTarget::FooterWorkspace
+            HitTarget::LauncherPaneSplitter
             | HitTarget::LauncherCrumb
-            | HitTarget::LauncherRoot
-            | HitTarget::LauncherWorkspace
-            | HitTarget::LauncherProject,
+            | HitTarget::LauncherTab(_)
+            | HitTarget::LauncherTabClose(_)
+            | HitTarget::LauncherTabAdd
+            | HitTarget::LauncherPaneSession
+            | HitTarget::LauncherPaneTerminal(_)
+            | HitTarget::LauncherPaneCloseTerminal(_)
+            | HitTarget::LauncherPaneClose
+            | HitTarget::LauncherPullRequests
+            | HitTarget::LauncherIssues
+            | HitTarget::LauncherWelcomePrompt
+            | HitTarget::FooterUsage,
         )
         | None => {}
-    }
-}
-
-/// Where j,j out of the Workspaces bar lands: the panel focus came up from
-/// (Projects until it has ever come up) — unless that panel has been hidden
-/// since (⇧P / ⇧B), in which case the first visible sidebar stands in, the
-/// way Enter in the bar does. A hidden panel can't own focus.
-pub(super) fn bar_return_target(app: &App) -> Focus {
-    if app.focus_visible(app.bar_return) {
-        app.bar_return
-    } else {
-        app.first_sidebar_focus()
-    }
-}
-
-/// j,j in the Workspaces bar: back down onto `bar_return_target`. The
-/// cursor there is untouched — the row it was on is the row it lands on.
-pub(super) fn leave_workspaces_bar(app: &mut App) {
-    app.focus = bar_return_target(app);
-}
-
-/// Whether the focused panel's cursor sits on its first row — the top
-/// edge, where k/↑ has nowhere left to go and a double tap steps up into
-/// the Workspaces bar instead. An empty panel counts: its cursor is at
-/// row 0 with nothing above or below.
-pub(super) fn at_top_row(app: &App) -> bool {
-    match app.focus {
-        Focus::Projects => app.sel_project == 0,
-        Focus::Worktrees => app.sel_worktree == 0,
-        Focus::Sessions => app.sel_session == 0,
-        Focus::Workspaces | Focus::Terminal => false,
-    }
-}
-
-/// The panel's name as the footer flash says it: "j again: back to
-/// sessions".
-pub(super) fn panel_name(focus: Focus) -> &'static str {
-    match focus {
-        Focus::Workspaces => "workspaces",
-        Focus::Projects => "projects",
-        Focus::Worktrees => "worktrees",
-        Focus::Sessions => "sessions",
-        Focus::Terminal => "terminal",
     }
 }

@@ -665,8 +665,8 @@ fn day(stamp: &str) -> &str {
 // ---- opening, fetching, landing ----
 
 /// The hotkey: the ISSUES MODAL for the selected PROJECT. Every panel has
-/// one selected, so this works from any row; only an empty workspace has
-/// nothing to list.
+/// one selected, so this works from any row; only a machine with no
+/// project has nothing to list.
 pub(crate) fn open_issues(app: &mut App) {
     let Some(project) = app.selected_project().cloned() else {
         app.flash = Some("issues: select a project first".into());
@@ -790,8 +790,8 @@ pub(crate) fn sweep_others(app: &mut App) {
     request_list(app, project, dir);
 }
 
-/// The project the sweep should spend this tick on, if any: the first of
-/// the workspace's projects, in row order, that isn't selected, isn't in
+/// The project the sweep should spend this tick on, if any: the first
+/// project, in row order, that isn't selected, isn't in
 /// flight, and was never asked, or whose list is older than
 /// [`SWEEP_REFRESH`] — or whose own beat has run out, when that backoff is
 /// the longer wait (a repo with nothing open, or no `gh`, keeps its
@@ -2330,7 +2330,6 @@ mod tests {
         app.tree.projects.push(nebula_core::Project {
             id: project.clone(),
             name: id.into(),
-            workspace_id: Default::default(),
             repo_path: dir.into(),
             sort_order: 0,
         });
@@ -2444,7 +2443,7 @@ mod tests {
         app.issues_failed.clear();
         refresh_selected(&mut app);
         assert!(app.issues_failed.is_empty());
-        // An empty workspace arms nothing.
+        // No project at all arms nothing.
         let mut empty = App::new();
         schedule_prefetch(&mut empty);
         assert!(empty.pending_issues_prefetch.is_none());

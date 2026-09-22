@@ -125,8 +125,8 @@ impl PullRequestsView {
 // ---- opening, fetching, following ----
 
 /// The hotkey: the PULL REQUESTS MODAL for the selected PROJECT. Every
-/// panel has one selected, so this works from any row; only an empty
-/// workspace has nothing to list. The cursor starts on the pull request
+/// panel has one selected, so this works from any row; only a machine
+/// with no project has nothing to list. The cursor starts on the pull request
 /// the Worktrees cursor rests on, when it rests on one — the row the user
 /// was already reading.
 pub(crate) fn open(app: &mut App) {
@@ -744,7 +744,6 @@ mod tests {
         app.tree.projects.push(nebula_core::Project {
             id: project.clone(),
             name: "demo".into(),
-            workspace_id: Default::default(),
             repo_path: DIR.into(),
             sort_order: 0,
         });

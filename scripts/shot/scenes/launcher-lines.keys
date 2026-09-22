@@ -1,0 +1,35 @@
+# launcher-changes with CARD LINE COUNTS on: three launches from the box, then the grid, each card
+# following its checkout's file count with the lines behind it in green and red.
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+p
+Sort the changelog entries by date, newest first
+Enter
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+h
+h
+F12
+F12
+F12
+F12

@@ -122,7 +122,6 @@ mod tests {
         daemon
             .store
             .insert_project(&Project {
-                workspace_id: Default::default(),
                 id: ProjectId("p".into()),
                 name: "p".into(),
                 repo_path: "/nebula-test/p".into(),

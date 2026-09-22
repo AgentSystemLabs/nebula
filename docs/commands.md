@@ -18,7 +18,6 @@ nebula rename <title>       title the session this runs inside          (agents 
 nebula worktree [name]      move this session into a worktree           (agents run this)
 nebula spawn <task>         start another agent session beside it       (agents run this)
 nebula open <file>…         show files in this nebula's file tabs       (agents run this)
-nebula workspace <cmd>      manage workspaces — named groups of projects
 nebula config <cmd>         back up, restore or locate this machine's settings
 nebula browser              serve this TUI in a web browser via ttyd
 nebula ssh <host>           open nebula on a remote host over ssh
@@ -29,12 +28,9 @@ nebula upgrade              install the latest published nebula
 ## The TUI
 
 ```sh
-nebula                    # launch the TUI (auto-starts the daemon)
-nebula --workspace <name> # launch it on a named workspace; each instance keeps its own, so
-                          # two windows can sit on two workspaces at once. Only this bare TUI
-                          # launch reads the flag — `nebula --workspace foo add ~/repo` parses
-                          # fine, but the flag is ignored there and the repo lands in the
-                          # daemon's current default workspace instead
+nebula                    # launch the TUI (auto-starts the daemon). With no project yet, a
+                          # launch from inside a git repo offers it on the splash — Enter
+                          # opens it; anywhere else, `o` browses for one
 ```
 
 ## Projects and the daemon
@@ -67,16 +63,6 @@ nebula open <file>…       # show the files in this nebula's FILE TABS — a mo
                           # file, the focused one previewed, Enter editing it (agents run this only
                           # when you ask to see a file; text files only — an image or any other
                           # binary is refused, and the agent names the path instead)
-```
-
-## Workspaces
-
-```sh
-nebula workspace add <name>     # create a workspace (a named project group)
-nebula workspace open <name>    # open it in the next instance you launch
-nebula workspace list           # list workspaces; * marks the one new instances open into
-nebula workspace rename <a> <b> # rename a workspace
-nebula workspace delete <name>  # delete an empty workspace
 ```
 
 ## Settings

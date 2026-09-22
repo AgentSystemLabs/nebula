@@ -6,8 +6,7 @@ use crate::session_title::TitleState;
 use anyhow::{Context, Result};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, PromptEntry,
-    TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, DEFAULT_WORKSPACE_ID,
-    RECENT_PROMPTS_KEPT,
+    TerminalId, TerminalTab, Worktree, WorktreeId, RECENT_PROMPTS_KEPT,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -268,6 +267,66 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN custom_harness TEXT;
     ",
+    // 28: workspaces are gone (13 created them, 14 let one repo sit in
+    // several) — every project is in one list again. A repo that sat in
+    // two workspaces was two rows: the older row survives and takes the
+    // other's checkouts, and a checkout both rows knew (their root, at the
+    // least) keeps the survivor's row, with the duplicate's sessions,
+    // terminals and links moved onto it before the duplicate goes. The
+    // projects table is rebuilt without its workspace column and with
+    // repo_path UNIQUE again, as it was before 14, and the order is
+    // renumbered workspace by workspace — oldest workspace first — so the
+    // one list reads the way the groups did. Runs with foreign keys off
+    // (see migrate()) so the DROP doesn't cascade into the children.
+    "
+    CREATE TEMP TABLE project_merge AS
+      SELECT p.id AS dup,
+        (SELECT s.id FROM projects s WHERE s.repo_path = p.repo_path
+          ORDER BY s.created_at, s.id LIMIT 1) AS keep
+      FROM projects p;
+    DELETE FROM project_merge WHERE dup = keep;
+    CREATE TEMP TABLE worktree_home AS
+      SELECT w.id AS id, w.path AS path, w.created_at AS created_at,
+        COALESCE(m.keep, w.project_id) AS project,
+        (m.dup IS NOT NULL) AS moved
+      FROM worktrees w LEFT JOIN project_merge m ON m.dup = w.project_id;
+    CREATE TEMP TABLE worktree_merge AS
+      SELECT h.id AS dup,
+        (SELECT c.id FROM worktree_home c WHERE c.project = h.project AND c.path = h.path
+          ORDER BY c.moved, c.created_at, c.id LIMIT 1) AS keep
+      FROM worktree_home h WHERE h.moved;
+    DELETE FROM worktree_merge WHERE dup = keep;
+    UPDATE agents SET worktree_id = (SELECT keep FROM worktree_merge WHERE dup = agents.worktree_id)
+      WHERE worktree_id IN (SELECT dup FROM worktree_merge);
+    UPDATE terminals SET worktree_id = (SELECT keep FROM worktree_merge WHERE dup = terminals.worktree_id)
+      WHERE worktree_id IN (SELECT dup FROM worktree_merge);
+    UPDATE links SET worktree_id = (SELECT keep FROM worktree_merge WHERE dup = links.worktree_id)
+      WHERE worktree_id IN (SELECT dup FROM worktree_merge);
+    DELETE FROM worktrees WHERE id IN (SELECT dup FROM worktree_merge);
+    UPDATE worktrees SET is_main = 0
+      WHERE is_main = 1 AND project_id IN (SELECT dup FROM project_merge);
+    UPDATE worktrees SET project_id = (SELECT keep FROM project_merge WHERE dup = worktrees.project_id)
+      WHERE project_id IN (SELECT dup FROM project_merge);
+    CREATE TABLE projects_new (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      repo_path   TEXT NOT NULL UNIQUE,
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL
+    );
+    INSERT INTO projects_new (id, name, repo_path, sort_order, created_at)
+      SELECT p.id, p.name, p.repo_path,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(w.created_at, 0), p.sort_order, p.created_at, p.id) - 1,
+        p.created_at
+      FROM projects p LEFT JOIN workspaces w ON w.id = COALESCE(p.workspace_id, 'default')
+      WHERE p.id NOT IN (SELECT dup FROM project_merge);
+    DROP TABLE projects;
+    ALTER TABLE projects_new RENAME TO projects;
+    DROP TABLE workspaces;
+    DROP TABLE temp.project_merge;
+    DROP TABLE temp.worktree_home;
+    DROP TABLE temp.worktree_merge;
+    ",
 ];
 
 pub struct Store {
@@ -330,24 +389,6 @@ impl Store {
         Ok(())
     }
 
-    // ---- workspaces ----
-
-    pub fn insert_workspace(&self, w: &Workspace) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO workspaces (id, name, active, created_at) VALUES (?1, ?2, 0, ?3)",
-            params![w.id.as_str(), w.name, now_ms()],
-        )?;
-        Ok(())
-    }
-
-    pub fn rename_workspace(&self, id: &WorkspaceId, name: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE workspaces SET name = ?2 WHERE id = ?1",
-            params![id.as_str(), name],
-        )?;
-        Ok(())
-    }
-
     /// `DELETE FROM <table> WHERE id = ?1` — every entity delete is exactly
     /// this one statement, the schema's cascades taking the children with
     /// the row.
@@ -359,88 +400,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
-        self.delete_by_id("workspaces", id.as_str())
-    }
-
-    /// Every workspace, oldest first (the 'default' one leads — it is
-    /// created at time 0 by the migration).
-    pub fn load_workspaces(&self) -> Result<Vec<Workspace>> {
-        let conn = self.conn.lock().unwrap();
-        let workspaces = conn
-            .prepare(&format!(
-                "SELECT {WORKSPACE_COLUMNS} FROM workspaces ORDER BY created_at, id"
-            ))?
-            .query_map([], row_to_workspace)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(workspaces)
-    }
-
-    pub fn get_workspace(&self, id: &WorkspaceId) -> Result<Option<Workspace>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE id = ?1"
-        ))?;
-        let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(row_to_workspace).transpose()?)
-    }
-
-    pub fn workspace_by_name(&self, name: &str) -> Result<Option<WorkspaceId>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id FROM workspaces WHERE name = ?1")?;
-        let mut rows = stmt.query(params![name])?;
-        Ok(rows
-            .next()?
-            .map(|r| r.get::<_, String>(0))
-            .transpose()?
-            .map(WorkspaceId))
-    }
-
-    /// The open workspace. Falls back to 'default' if no row is flagged
-    /// (never expected — the migration flags it and switches keep exactly
-    /// one flag set).
-    pub fn active_workspace_id(&self) -> Result<WorkspaceId> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id FROM workspaces WHERE active = 1 LIMIT 1")?;
-        let mut rows = stmt.query([])?;
-        Ok(rows
-            .next()?
-            .map(|r| r.get::<_, String>(0))
-            .transpose()?
-            .map(WorkspaceId)
-            .unwrap_or_default())
-    }
-
-    pub fn set_active_workspace(&self, id: &WorkspaceId) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE workspaces SET active = (id = ?1)",
-            params![id.as_str()],
-        )?;
-        Ok(())
-    }
-
-    pub fn count_workspace_projects(&self, id: &WorkspaceId) -> Result<i64> {
-        Ok(self.conn.lock().unwrap().query_row(
-            "SELECT COUNT(*) FROM projects WHERE COALESCE(workspace_id, ?2) = ?1",
-            params![id.as_str(), DEFAULT_WORKSPACE_ID],
-            |r| r.get(0),
-        )?)
-    }
-
-    pub fn count_workspaces(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM workspaces", [], |r| r.get(0))?)
-    }
-
     // ---- projects ----
 
     pub fn insert_project(&self, p: &Project) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO projects (id, name, workspace_id, repo_path, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![p.id.as_str(), p.name, p.workspace_id.as_str(), p.repo_path.to_string_lossy(), p.sort_order, now_ms()],
+            "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![p.id.as_str(), p.name, p.repo_path.to_string_lossy(), p.sort_order, now_ms()],
         )?;
         Ok(())
     }
@@ -466,23 +431,12 @@ impl Store {
         self.delete_by_id("projects", id.as_str())
     }
 
-    /// The project row for `path` within one workspace. Repo paths may
-    /// repeat across workspaces (a workspace is just a grouping), so path
-    /// lookups are always workspace-scoped.
-    pub fn project_in_workspace(
-        &self,
-        path: &Path,
-        workspace: &WorkspaceId,
-    ) -> Result<Option<ProjectId>> {
+    /// The project row registered for the repo at `path`, if any — one
+    /// repo is one project (`repo_path` is UNIQUE).
+    pub fn project_by_path(&self, path: &Path) -> Result<Option<ProjectId>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id FROM projects WHERE repo_path = ?1 AND COALESCE(workspace_id, ?3) = ?2",
-        )?;
-        let mut rows = stmt.query(params![
-            path.to_string_lossy(),
-            workspace.as_str(),
-            DEFAULT_WORKSPACE_ID
-        ])?;
+        let mut stmt = conn.prepare("SELECT id FROM projects WHERE repo_path = ?1")?;
+        let mut rows = stmt.query(params![path.to_string_lossy()])?;
         Ok(rows
             .next()?
             .map(|r| r.get::<_, String>(0))
@@ -1073,11 +1027,7 @@ impl Store {
 // on which path fetched it. The column order is the mapper's contract.
 
 // Column orders the `row_to_*` mappers below read.
-const WORKSPACE_COLUMNS: &str = "id, name";
-/// `workspace_id` is NULL on rows that predate workspaces; `row_to_project`
-/// fills in the default rather than a `COALESCE(.., ?1)` in the column list,
-/// which would hide a positional bind every query had to remember.
-const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order, workspace_id";
+const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order";
 const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_order";
 const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
@@ -1085,23 +1035,12 @@ const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
 const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order, run_command";
 const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
 
-fn row_to_workspace(r: &rusqlite::Row) -> rusqlite::Result<Workspace> {
-    Ok(Workspace {
-        id: WorkspaceId(r.get(0)?),
-        name: r.get(1)?,
-    })
-}
-
 fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
     Ok(Project {
         id: ProjectId(r.get(0)?),
         name: r.get(1)?,
         repo_path: PathBuf::from(r.get::<_, String>(2)?),
         sort_order: r.get(3)?,
-        workspace_id: WorkspaceId(
-            r.get::<_, Option<String>>(4)?
-                .unwrap_or_else(|| DEFAULT_WORKSPACE_ID.to_string()),
-        ),
     })
 }
 
@@ -1200,7 +1139,6 @@ mod tests {
     fn roundtrip_tree() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId::generate(),
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
@@ -1389,7 +1327,6 @@ mod tests {
     fn link_crud_roundtrip_and_cascade() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId::generate(),
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
@@ -1535,10 +1472,12 @@ mod tests {
         }
     }
 
-    /// Real upgrade path: a v12 database (pre-workspaces) gains the
-    /// 'default' workspace, marked open, with every existing project in it.
+    /// Real upgrade path: a v12 database (pre-workspaces) walks the whole
+    /// chain — 13 grouping its projects into 'default', 28 taking the
+    /// groups away again — and its project loads untouched, with no
+    /// workspace table left behind.
     #[test]
-    fn migration_13_moves_existing_projects_into_default_workspace() {
+    fn migration_13_to_28_carries_a_pre_workspace_project_through() {
         let path =
             std::env::temp_dir().join(format!("nebula-mig13-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -1559,16 +1498,10 @@ mod tests {
         }
 
         let store = Store::open(&path).unwrap();
-        let workspaces = store.load_workspaces().unwrap();
-        assert_eq!(workspaces.len(), 1);
-        assert_eq!(workspaces[0].id.as_str(), DEFAULT_WORKSPACE_ID);
-        assert_eq!(workspaces[0].name, "default");
-        assert_eq!(
-            store.active_workspace_id().unwrap().as_str(),
-            DEFAULT_WORKSPACE_ID
-        );
         let (projects, _, _, _) = store.load_tree().unwrap();
-        assert_eq!(projects[0].workspace_id.as_str(), DEFAULT_WORKSPACE_ID);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "p");
+        assert_eq!(table_names(&store), table_names_without_workspaces());
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
@@ -1608,7 +1541,6 @@ mod tests {
             ["one", "two"]
         );
         assert_eq!(projects[0].sort_order, 0);
-        assert_eq!(projects[1].workspace_id.as_str(), DEFAULT_WORKSPACE_ID);
         let columns: Vec<String> = store
             .conn
             .lock()
@@ -1629,11 +1561,11 @@ mod tests {
         }
     }
 
-    /// Real upgrade path: a v13 database (global UNIQUE on repo_path) is
-    /// rebuilt so the same repo can live in several workspaces. The rebuild
-    /// drops the old projects table — child rows must survive it.
+    /// Real upgrade path: a v13 database goes through both projects-table
+    /// rebuilds (14 scoping repo uniqueness to a workspace, 28 making it
+    /// global again). Each drops the old table — child rows must survive.
     #[test]
-    fn migration_14_scopes_repo_uniqueness_to_workspace() {
+    fn migration_14_and_28_rebuilds_keep_the_children() {
         let path =
             std::env::temp_dir().join(format!("nebula-mig14-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -1661,37 +1593,152 @@ mod tests {
         assert_eq!(worktrees.len(), 1, "worktrees must survive the rebuild");
         assert_eq!(agents.len(), 1, "agents must survive the rebuild");
 
-        // The same repo is now welcome in a second workspace…
-        store
-            .insert_workspace(&Workspace {
-                id: WorkspaceId("w2".into()),
-                name: "second".into(),
-            })
-            .unwrap();
-        let dup = |id: &str, workspace: &str| Project {
-            id: ProjectId(id.into()),
+        // One repo is one project again: a second row for it is refused.
+        let dup = Project {
+            id: ProjectId("p2".into()),
             name: "p".into(),
-            workspace_id: WorkspaceId(workspace.into()),
             repo_path: PathBuf::from("/tmp/p"),
             sort_order: 1,
         };
-        store.insert_project(&dup("p2", "w2")).unwrap();
-        // …but still refused twice in the same one.
-        assert!(store.insert_project(&dup("p3", "default")).is_err());
+        assert!(store.insert_project(&dup).is_err());
 
-        // Path lookups resolve per workspace.
+        // Path lookups need no scope.
         assert_eq!(
-            store
-                .project_in_workspace(Path::new("/tmp/p"), &WorkspaceId("w2".into()))
-                .unwrap(),
-            Some(ProjectId("p2".into()))
+            store.project_by_path(Path::new("/tmp/p")).unwrap(),
+            Some(ProjectId("p1".into()))
         );
+        assert_eq!(store.project_by_path(Path::new("/tmp/q")).unwrap(), None);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
+    /// Every table in the schema, sorted — what a migration test compares
+    /// to prove nothing was left behind.
+    fn table_names(store: &Store) -> Vec<String> {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn table_names_without_workspaces() -> Vec<String> {
+        [
+            "agents",
+            "links",
+            "pr_seen",
+            "projects",
+            "terminals",
+            "ui_state",
+            "worktrees",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    /// Real upgrade path, shaped like a real install: a v27 database with
+    /// two workspaces, one repo registered in both (its root checkout a row
+    /// under each), a checkout only the newer row knew, and the default
+    /// workspace deleted. Migration 28 folds the two rows into the older
+    /// one — every session, terminal and link under the newer row's root
+    /// moves onto the survivor's root, the extra checkout moves across
+    /// whole — renumbers the one list oldest workspace first, and leaves
+    /// no workspace behind.
+    #[test]
+    fn migration_28_folds_a_repo_registered_in_two_workspaces_into_one_project() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig28-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(27).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO workspaces (id, name, active, created_at) VALUES ('ws-work', 'work', 1, 10);
+                 INSERT INTO workspaces (id, name, active, created_at) VALUES ('ws-video', 'video', 0, 20);
+                 INSERT INTO projects (id, name, repo_path, sort_order, created_at, workspace_id) VALUES
+                   ('site-a', 'site', '/r/site', 1, 100, 'ws-work'),
+                   ('api', 'api', '/r/api', 0, 50, 'ws-work'),
+                   ('site-b', 'site', '/r/site', 0, 200, 'ws-video'),
+                   ('film', 'film', '/r/film', 1, 60, 'ws-video');
+                 DELETE FROM workspaces WHERE id = 'default';
+                 INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES
+                   ('a-root', 'site-a', '/r/site', 'main', 1, 0, 100),
+                   ('b-root', 'site-b', '/r/site', 'main', 1, 0, 200),
+                   ('b-feat', 'site-b', '/r/site-wt/feat', 'feat', 0, 1, 210),
+                   ('api-root', 'api', '/r/api', 'main', 1, 0, 50),
+                   ('film-root', 'film', '/r/film', 'main', 1, 0, 60);
+                 INSERT INTO agents (id, worktree_id, name, created_at) VALUES
+                   ('ag-a', 'a-root', 'on a', 0),
+                   ('ag-b', 'b-root', 'on b', 0),
+                   ('ag-feat', 'b-feat', 'on feat', 0);
+                 INSERT INTO terminals (id, worktree_id, name, created_at) VALUES ('t-b', 'b-root', 'shell', 0);
+                 INSERT INTO links (id, worktree_id, url, created_at) VALUES ('l-b', 'b-root', 'https://x.test/1', 0);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let (projects, worktrees, agents, terminals) = store.load_tree().unwrap();
+        // One `site`, the older row; the list reads workspace by workspace
+        // (work's api then site, then video's film), renumbered from 0.
         assert_eq!(
-            store
-                .project_in_workspace(Path::new("/tmp/p"), &WorkspaceId("empty".into()))
-                .unwrap(),
-            None
+            projects
+                .iter()
+                .map(|p| (p.id.as_str(), p.sort_order))
+                .collect::<Vec<_>>(),
+            [("api", 0), ("site-a", 1), ("film", 2)]
         );
+        // The newer row's root is gone; its extra checkout moved across and
+        // is not a second root.
+        let site: Vec<_> = worktrees
+            .iter()
+            .filter(|w| w.project_id.as_str() == "site-a")
+            .map(|w| (w.id.as_str(), w.is_main))
+            .collect();
+        assert_eq!(site, [("a-root", true), ("b-feat", false)]);
+        assert!(!worktrees.iter().any(|w| w.id.as_str() == "b-root"));
+        // Nothing that lived under it was lost.
+        let home = |id: &str| {
+            agents
+                .iter()
+                .find(|a| a.id.as_str() == id)
+                .map(|a| a.worktree_id.as_str().to_string())
+        };
+        assert_eq!(home("ag-a").as_deref(), Some("a-root"));
+        assert_eq!(home("ag-b").as_deref(), Some("a-root"));
+        assert_eq!(home("ag-feat").as_deref(), Some("b-feat"));
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].worktree_id.as_str(), "a-root");
+        let links = store.load_links().unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].worktree_id.as_str(), "a-root");
+        // No workspace table, no scratch tables, and one repo = one row.
+        assert_eq!(table_names(&store), table_names_without_workspaces());
+        assert_eq!(
+            store.project_by_path(Path::new("/r/site")).unwrap(),
+            Some(ProjectId("site-a".into()))
+        );
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
@@ -1699,84 +1746,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_crud_and_active_flag() {
-        let store = Store::open_in_memory().unwrap();
-        // The migration seeds the open 'default' workspace.
-        let workspaces = store.load_workspaces().unwrap();
-        assert_eq!(workspaces.len(), 1);
-        assert_eq!(workspaces[0].name, "default");
-        assert_eq!(
-            store.active_workspace_id().unwrap().as_str(),
-            DEFAULT_WORKSPACE_ID
-        );
-
-        let client = Workspace {
-            id: WorkspaceId("ws-client".into()),
-            name: "client".into(),
-        };
-        store.insert_workspace(&client).unwrap();
-        assert_eq!(store.count_workspaces().unwrap(), 2);
-        assert_eq!(
-            store.workspace_by_name("client").unwrap(),
-            Some(client.id.clone())
-        );
-        // UNIQUE name: a duplicate insert errors.
-        assert!(store
-            .insert_workspace(&Workspace {
-                id: WorkspaceId("ws-dup".into()),
-                name: "client".into(),
-            })
-            .is_err());
-
-        // Exactly one open workspace at a time.
-        store.set_active_workspace(&client.id).unwrap();
-        assert_eq!(store.active_workspace_id().unwrap(), client.id);
-        store
-            .set_active_workspace(&WorkspaceId(DEFAULT_WORKSPACE_ID.into()))
-            .unwrap();
-        assert_eq!(
-            store.active_workspace_id().unwrap().as_str(),
-            DEFAULT_WORKSPACE_ID
-        );
-
-        store.rename_workspace(&client.id, "acme").unwrap();
-        assert_eq!(
-            store.get_workspace(&client.id).unwrap().unwrap().name,
-            "acme"
-        );
-        assert_eq!(store.workspace_by_name("client").unwrap(), None);
-
-        // Projects count per workspace; inserts land where they say.
-        let project = Project {
-            workspace_id: client.id.clone(),
-            id: ProjectId::generate(),
-            name: "demo".into(),
-            repo_path: "/tmp/demo".into(),
-            sort_order: 0,
-        };
-        store.insert_project(&project).unwrap();
-        assert_eq!(store.count_workspace_projects(&client.id).unwrap(), 1);
-        assert_eq!(
-            store
-                .count_workspace_projects(&WorkspaceId(DEFAULT_WORKSPACE_ID.into()))
-                .unwrap(),
-            0
-        );
-        let (projects, _, _, _) = store.load_tree().unwrap();
-        assert_eq!(projects[0].workspace_id, client.id);
-
-        // The FK keeps a populated workspace undeletable; empty it first.
-        assert!(store.delete_workspace(&client.id).is_err());
-        store.delete_project(&project.id).unwrap();
-        store.delete_workspace(&client.id).unwrap();
-        assert_eq!(store.count_workspaces().unwrap(), 1);
-    }
-
-    #[test]
     fn auto_title_pending_lifecycle() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId::generate(),
             name: "p".into(),
             repo_path: "/tmp/p".into(),
@@ -1861,7 +1833,6 @@ mod tests {
     fn claude_title_follows_claude_without_undoing_a_nebula_rename() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId::generate(),
             name: "p".into(),
             repo_path: "/tmp/p".into(),
@@ -1950,7 +1921,6 @@ mod tests {
     fn cascade_delete_project_removes_children() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId::generate(),
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
@@ -1988,7 +1958,6 @@ mod tests {
     fn sweep_disconnected_only_hits_live_statuses() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId::generate(),
             name: "p".into(),
             repo_path: "/tmp/p".into(),
@@ -2059,7 +2028,6 @@ mod tests {
     fn unseen_follows_the_status_and_clears_on_seen() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId::generate(),
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
@@ -2157,7 +2125,6 @@ mod tests {
     fn push_prompt_keeps_the_newest_bounded_history() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId("p1".into()),
             name: "p".into(),
             repo_path: "/tmp/p".into(),

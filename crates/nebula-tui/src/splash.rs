@@ -7,9 +7,12 @@
 //!
 //! The event loop ticks a repaint every [`FRAME`] while [`App::splash_active`]
 //! holds; the scene itself is a pure function of elapsed time, so a missed
-//! frame skips ahead instead of stuttering.
+//! frame skips ahead instead of stuttering. The sky on its own
+//! ([`draw_sky`]) is also what the empty GRID's welcome is drawn over,
+//! ticked while [`App::welcome_active`] holds.
 
 use crate::app::{App, Focus, HitTarget};
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -82,6 +85,55 @@ fn density(dx: f32, dy: f32, rot: f32) -> f32 {
     (arm * wisp * falloff * 1.5 + core).min(1.0)
 }
 
+/// Seconds into the scene that started at `epoch` — or, with animations
+/// off, a moment well past the fade-in: the event loop doesn't tick a
+/// still scene, so it holds one finished frame instead of whatever
+/// instant a stray redraw lands on.
+pub fn scene_time(app: &App, epoch: std::time::Instant) -> f32 {
+    if app.animations {
+        epoch.elapsed().as_secs_f32()
+    } else {
+        60.0
+    }
+}
+
+/// How far the scene has faded in from black `t` seconds in: 0 -> 1 over
+/// [`FADE_IN`], eased at both ends.
+fn fade_at(t: f32) -> f32 {
+    let raw = (t / FADE_IN).clamp(0.0, 1.0);
+    raw * raw * (3.0 - 2.0 * raw)
+}
+
+/// The wordmark's color at `u` (0 -> 1) across it: the gradient, with the
+/// slow shine sweeping through once the scene has faded in.
+fn mark_color(u: f32, t: f32, fade: f32) -> Color {
+    let shine = (u * 5.0 - t * 1.4).sin() > 0.93;
+    if shine && fade >= 1.0 {
+        return Color::Indexed(231); // near-white glint
+    }
+    let gi = (u * (MARK.len() as f32 - 1.0)).round() as usize;
+    Color::Indexed(MARK[gi])
+}
+
+/// `word` in the wordmark's gradient and shine, one cell per letter: the
+/// name where there is no room for the block letters, or no call for
+/// them.
+pub fn wordmark_word(word: &str, t: f32) -> Vec<Span<'static>> {
+    let fade = fade_at(t);
+    let n = word.chars().count().max(1) as f32;
+    word.chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            Span::styled(
+                ch.to_string(),
+                Style::default()
+                    .fg(mark_color(i as f32 / n, t, fade))
+                    .add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect()
+}
+
 /// One wordmark row as per-cell spans: gradient across the word, a slow
 /// shine sweeping through, and the blocks materializing from static
 /// (`░` -> `▒` -> `█`) while the scene fades in.
@@ -104,17 +156,10 @@ fn wordmark_line(row: usize, t: f32, fade: f32) -> Line<'static> {
         for ch in letter[row].chars() {
             if ch == '#' {
                 let u = col as f32 / width as f32;
-                let shine = (u * 5.0 - t * 1.4).sin() > 0.93;
-                let color = if shine && fade >= 1.0 {
-                    231 // near-white glint
-                } else {
-                    let gi = (u * (MARK.len() as f32 - 1.0)).round() as usize;
-                    MARK[gi]
-                };
                 spans.push(Span::styled(
                     block,
                     Style::default()
-                        .fg(Color::Indexed(color))
+                        .fg(mark_color(u, t, fade))
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
@@ -131,16 +176,8 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width < 8 || area.height < 4 {
         return;
     }
-    // Animations off: the event loop doesn't tick us, so hold one finished
-    // frame (well past the fade-in) instead of whatever instant a stray
-    // redraw lands on.
-    let t = if app.animations {
-        app.splash_epoch.elapsed().as_secs_f32()
-    } else {
-        60.0
-    };
-    let raw = (t / FADE_IN).clamp(0.0, 1.0);
-    let fade = raw * raw * (3.0 - 2.0 * raw);
+    let t = scene_time(app, app.splash_epoch);
+    let fade = fade_at(t);
 
     // ---- text block: wordmark, tagline, key hints, bottom-anchored ----
     let big = area.width >= 50 && area.height >= 18;
@@ -176,8 +213,17 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         ]
     };
     let mut hint = Vec::new();
-    if !app.tree.has_visible_projects() {
-        hint.extend(key("n / o", "create your first project"));
+    if !app.tree.has_projects() {
+        // Started inside a repo, that repo is one key away; anywhere else
+        // `o` browses for one. Nothing here asks for anything but a folder.
+        match app.launch_repo_name() {
+            Some(name) => {
+                hint.extend(key("Enter", &format!("open {name}")));
+                hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
+                hint.extend(key("o", "another folder"));
+            }
+            None => hint.extend(key("n / o", "create your first project")),
+        }
         hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
         hint.extend(key("?", "help"));
     } else {
@@ -195,8 +241,22 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         height: block_h,
     };
 
+    draw_sky(f.buffer_mut(), area, text, t, th.accent);
+    f.render_widget(Paragraph::new(lines).centered(), text);
+    // A click anywhere lands focus back on the (invisible) projects panel,
+    // where `n` creates the first project.
+    app.hits.push((area, HitTarget::PanelBg(Focus::Projects)));
+}
+
+/// The galaxy and its starfield across `area`, `t` seconds into the
+/// scene: the disc centered in the sky above `text` and stretched to fill
+/// it, dust and stars both kept off a band around `text` so the words sit
+/// on clear black. The first-run splash and the empty GRID's welcome
+/// (`ui::launcher_view`) are both drawn over it.
+pub fn draw_sky(buf: &mut Buffer, area: Rect, text: Rect, t: f32, accent: Color) {
+    let fade = fade_at(t);
     // ---- galaxy centered in the sky above the text ----
-    let above = (text.y - area.y).max(4);
+    let above = text.y.saturating_sub(area.y).max(4);
     let cx = f32::from(area.x) + f32::from(area.width) / 2.0;
     let cy = f32::from(area.y) + f32::from(above) / 2.0;
     // Independent x/y scales stretch the disc to fill the sky; a terminal
@@ -213,7 +273,6 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
     .intersection(area);
 
     let rot = t * 0.25;
-    let buf = f.buffer_mut();
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if x >= carve.left() && x < carve.right() && y >= carve.top() && y < carve.bottom() {
@@ -242,7 +301,7 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
                 continue;
             }
             if (h >> 4).is_multiple_of(111) {
-                buf[(x, y)].set_char('+').set_fg(th.accent);
+                buf[(x, y)].set_char('+').set_fg(accent);
             } else if tw > 0.8 {
                 buf[(x, y)].set_char('·').set_fg(Color::Indexed(189));
             } else {
@@ -250,9 +309,4 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
     }
-
-    f.render_widget(Paragraph::new(lines).centered(), text);
-    // A click anywhere lands focus back on the (invisible) projects panel,
-    // where `n` creates the first project.
-    app.hits.push((area, HitTarget::PanelBg(Focus::Projects)));
 }

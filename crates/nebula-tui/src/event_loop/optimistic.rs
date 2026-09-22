@@ -19,9 +19,7 @@
 
 use super::{handle_server_event, send_with};
 use crate::app::{App, PendingIntent, Undo};
-use nebula_core::{
-    AgentId, ClientRequest, Entity, EntityId, ProjectId, ServerEvent, TerminalId, WorkspaceId,
-};
+use nebula_core::{AgentId, ClientRequest, Entity, EntityId, ProjectId, ServerEvent, TerminalId};
 
 /// Show `entity` as the DAEMON will have it, and send `make`'s request with
 /// `before` — the row as it is now — to put back if it is refused.
@@ -140,34 +138,6 @@ pub(super) fn rename_project(
     }
 }
 
-/// A name another workspace holds is refused by the DAEMON, and comes back.
-pub(super) fn rename_workspace(
-    app: &mut App,
-    id: WorkspaceId,
-    name: String,
-    out: &mut Vec<ClientRequest>,
-) {
-    let make = |req_id| ClientRequest::RenameWorkspace {
-        req_id,
-        id: id.clone(),
-        name: name.clone(),
-    };
-    match app.tree.workspaces.iter().find(|w| w.id == id) {
-        Some(before) if !name.trim().is_empty() => {
-            let mut after = before.clone();
-            after.name = name.trim().to_string();
-            upsert(
-                app,
-                Entity::Workspace(before.clone()),
-                Entity::Workspace(after),
-                out,
-                make,
-            );
-        }
-        _ => send_with(app, out, PendingIntent::None, make),
-    }
-}
-
 /// Archive (`archived`) or unarchive an agent. An archived agent's process
 /// is killed by the DAEMON, so its row goes down as not alive.
 pub(super) fn set_archived(
@@ -236,7 +206,6 @@ pub(super) fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<Client
 
 fn id_of(entity: &Entity) -> EntityId {
     match entity {
-        Entity::Workspace(w) => EntityId::Workspace(w.id.clone()),
         Entity::Project(p) => EntityId::Project(p.id.clone()),
         Entity::Worktree(w) => EntityId::Worktree(w.id.clone()),
         Entity::Agent(a) => EntityId::Agent(a.id.clone()),

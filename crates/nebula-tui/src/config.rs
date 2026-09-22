@@ -33,6 +33,14 @@ pub const DEFAULT_RECENT_PROMPTS_COUNT: usize = 3;
 /// models, hand-edited configs can name any command the list doesn't.
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 
+/// The **Session pane** choices (Settings → Appearance), in the order the
+/// row cycles them: the [`crate::launcher::PaneSide`] sides by name.
+pub const PANE_SIDES: &[&str] = &[
+    crate::launcher::PaneSide::Bottom.as_str(),
+    crate::launcher::PaneSide::Right.as_str(),
+    crate::launcher::PaneSide::Left.as_str(),
+];
+
 /// The **Preset text** choices (Settings → Sessions), in the order the row
 /// cycles them: the [`PresetText`] sides by label.
 pub const PRESET_TEXTS: &[&str] = &[
@@ -336,6 +344,12 @@ pub const AGENTS_HEAD: &[SettingSpec] = &[
         group: "Quick prompt",
     },
     SettingSpec {
+        kind: SettingKind::QuickPromptNewWorktree,
+        label: "New worktree",
+        hint: "Each new quick prompt starts on a fresh worktree (off = the selected checkout; ^N flips one box)",
+        group: "Quick prompt",
+    },
+    SettingSpec {
         kind: SettingKind::HideUninstalledHarnesses,
         label: "Hide missing CLIs",
         hint: "List only harnesses found on PATH in the New session picker (daemon still checks at launch)",
@@ -370,13 +384,15 @@ pub enum SettingKind {
     Theme,
     Animations,
     FocusTint,
-    ShowWorkspaces,
+    SessionPane,
     HideProjects,
     HideWorktrees,
     HideSessions,
     HideDraftPrs,
+    CardLineChanges,
     QuickPromptKind,
     QuickPromptFocus,
+    QuickPromptNewWorktree,
     HideRootWorktree,
     RunCommand,
     OpenCommand,
@@ -385,7 +401,6 @@ pub enum SettingKind {
     ShowKeyCombos,
     RememberHarness,
     PrIssueCounts,
-    LauncherView,
     HideUninstalledHarnesses,
 }
 
@@ -550,9 +565,9 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 group: "",
             },
             SettingSpec {
-                kind: SettingKind::ShowWorkspaces,
-                label: "Workspaces bar",
-                hint: "Show the Workspaces tab bar across the top (Shift+W toggles)",
+                kind: SettingKind::SessionPane,
+                label: "Session pane",
+                hint: "Where the session under the cursor is read: under the cards, or beside them on the right or left",
                 group: "",
             },
             SettingSpec {
@@ -577,6 +592,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::HideDraftPrs,
                 label: "Draft pull requests",
                 hint: "Show or hide drafts in the OPEN PRS group and / search; checkouts always stay",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::CardLineChanges,
+                label: "Card line counts",
+                hint: "Follow each card's changed-file count with its lines, +3 files +120 -45 in green and red",
                 group: "",
             },
         ]),
@@ -650,12 +671,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::PrIssueCounts,
                 label: "PR & issue counts",
                 hint: "Count each project's open pull requests and issues after its name, 3 prs · 2 issues",
-                group: "",
-            },
-            SettingSpec {
-                kind: SettingKind::LauncherView,
-                label: "Launcher view",
-                hint: "Open on a task box; list every session with its project, worktree and PR beside the live pane",
                 group: "",
             },
         ]),
@@ -980,11 +995,19 @@ pub struct Config {
     /// transparency or image configured in the terminal shows through
     /// the whole frame instead of stopping at the focused panel.
     pub focus_tint: bool,
-    /// Whether the Workspaces bar is drawn across the top. This is the
-    /// bar's only home: `Shift+W` writes it here as it toggles, so a hidden
-    /// bar stays hidden across restarts, and a crash or a
-    /// closed browser tab can't lose the choice the way the daemon's
-    /// save-on-quit UI blob would.
+    /// Where the LAUNCHER VIEW's PANE — the session under the cursor, live
+    /// — sits against the GRID of cards: `bottom` (under them, the
+    /// default), `right` or `left` (down that side of them). Read through
+    /// [`Config::pane_side`], so a word off the list is the bottom; a
+    /// window too narrow for the pane beside the cards lays it out along
+    /// the bottom until there is room (`launcher::fitted_side`).
+    pub session_pane: String,
+    /// The key of the **Workspaces bar** SETTING (Settings → Appearance,
+    /// through 0.33): whether the bar of WORKSPACE tabs was drawn across
+    /// the top. Workspaces are gone — every project is in the one list the
+    /// PROJECT TABS open from — so this build never reads it and no tab
+    /// edits it. Still loaded and written back as stored, so an older
+    /// build sharing the file keeps the bar its user chose.
     pub show_workspaces: bool,
     /// Collapse the Projects panel to a rail and give its width to the
     /// terminal pane. False by default so configs written before this key
@@ -1008,6 +1031,13 @@ pub struct Config {
     /// the SESSIONS PANEL — those describe work you have, not work you are
     /// browsing. Off by default: a config predating the key hides nothing.
     pub hide_draft_prs: bool,
+    /// CARD LINE COUNTS: each LAUNCHER VIEW card follows its checkout's
+    /// changed-file count with the lines behind it — `+3 files +120 -45`,
+    /// the added in the DIFF VIEWER's green and the removed in its red —
+    /// read by a `git diff --numstat` beside every `git status` the count
+    /// already runs, which only happens while this is on. Off by default:
+    /// the file count alone is what a card has always said.
+    pub card_line_changes: bool,
     /// What every project without a `projects` entry gets for **Hide root
     /// worktree** — the key the setting lived under while it was one
     /// switch for every project (Settings → Experimental, through 0.27).
@@ -1063,14 +1093,6 @@ pub struct Config {
     /// budget — and the one Experimental switch that is; off, the rows
     /// are what they were and no project but the selected one is asked.
     pub pr_issue_counts: bool,
-    /// Experimental: the LAUNCHER VIEW — nebula opens on the QUICK PROMPT,
-    /// focused, with the launch the AGENTS TAB defaults describe (`^P`
-    /// retargets the project with type-ahead, `^O` the model), and the
-    /// three panels give way to a grid of cards, one per session in the
-    /// open workspace — its project, worktree and pull request under its
-    /// name — with the session under the cursor live in the pane along the
-    /// bottom (`launcher.rs`). Off by default: it replaces the whole layout.
-    pub launcher_view: bool,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
     /// value is passed through verbatim, so hand-edited configs can name
@@ -1142,6 +1164,11 @@ pub struct Config {
     /// (the NEW SESSION PICKER, an AGENT PRESET, a PR SESSION, a Cloud task)
     /// still enters the pane.
     pub quick_prompt_focus: bool,
+    /// Whether each new QUICK PROMPT starts aimed at a fresh worktree
+    /// rather than an existing checkout. `^N` flips the one box that is
+    /// up; the next box starts from this again. Off by default: most
+    /// launches are more work on a checkout that already exists.
+    pub quick_prompt_new_worktree: bool,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
     /// deliberately unbound. Only rows that differ from the defaults are
@@ -1271,11 +1298,13 @@ impl Default for Config {
             theme: "default".into(),
             animations: true,
             focus_tint: true,
+            session_pane: crate::launcher::PaneSide::Bottom.as_str().into(),
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
             hide_sessions: false,
             hide_draft_prs: false,
+            card_line_changes: false,
             hide_root_worktree: false,
             projects: BTreeMap::new(),
             recent_prompts: false,
@@ -1283,7 +1312,6 @@ impl Default for Config {
             show_key_combos: false,
             remember_harness: false,
             pr_issue_counts: true,
-            launcher_view: false,
             claude_model: DEFAULT_CHOICE.into(),
             claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
@@ -1305,6 +1333,7 @@ impl Default for Config {
             harnesses: BTreeMap::new(),
             quick_prompt_kind: AgentKind::Claude.as_str().into(),
             quick_prompt_focus: false,
+            quick_prompt_new_worktree: false,
             keybindings: BTreeMap::new(),
             skipped: BTreeSet::new(),
         }
@@ -1414,6 +1443,12 @@ impl Config {
     /// `theme` resolved to the palette the UI draws with.
     pub fn theme(&self) -> crate::theme::Theme {
         crate::theme::Theme::by_name(&self.theme)
+    }
+
+    /// `session_pane` resolved to the side the LAUNCHER VIEW lays its pane
+    /// out on.
+    pub fn pane_side(&self) -> crate::launcher::PaneSide {
+        crate::launcher::PaneSide::parse(&self.session_pane)
     }
 
     /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
@@ -2087,11 +2122,12 @@ impl Config {
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
-            SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
+            SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
             SettingKind::HideSessions => shown_hidden(self.hide_sessions).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
+            SettingKind::CardLineChanges => on_off(self.card_line_changes).into(),
             SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand => {
                 self.project_fallback().value_label(kind)
             }
@@ -2099,7 +2135,6 @@ impl Config {
             SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
             SettingKind::RememberHarness => on_off(self.remember_harness).into(),
             SettingKind::PrIssueCounts => on_off(self.pr_issue_counts).into(),
-            SettingKind::LauncherView => on_off(self.launcher_view).into(),
             SettingKind::RecentPromptsCount => self
                 .recent_prompts_count
                 .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
@@ -2107,6 +2142,7 @@ impl Config {
             SettingKind::HideUninstalledHarnesses => on_off(self.hide_uninstalled_harnesses).into(),
             SettingKind::QuickPromptKind => self.quick_prompt_kind.clone(),
             SettingKind::QuickPromptFocus => on_off(self.quick_prompt_focus).into(),
+            SettingKind::QuickPromptNewWorktree => on_off(self.quick_prompt_new_worktree).into(),
         }
     }
 
@@ -2187,8 +2223,11 @@ impl Config {
             SettingKind::FocusTint => {
                 self.focus_tint = !self.focus_tint;
             }
-            SettingKind::ShowWorkspaces => {
-                self.show_workspaces = !self.show_workspaces;
+            SettingKind::SessionPane => {
+                // Cycled from the resolved side, so a hand edit off the
+                // list steps on from the bottom it reads as.
+                self.session_pane =
+                    cycle_choice(self.pane_side().as_str(), PANE_SIDES, step).into();
             }
             SettingKind::HideProjects => {
                 self.hide_projects = !self.hide_projects;
@@ -2201,6 +2240,9 @@ impl Config {
             }
             SettingKind::HideDraftPrs => {
                 self.hide_draft_prs = !self.hide_draft_prs;
+            }
+            SettingKind::CardLineChanges => {
+                self.card_line_changes = !self.card_line_changes;
             }
             // One project's, not the file's: see `cycle_project`.
             SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand => {}
@@ -2223,9 +2265,6 @@ impl Config {
             SettingKind::PrIssueCounts => {
                 self.pr_issue_counts = !self.pr_issue_counts;
             }
-            SettingKind::LauncherView => {
-                self.launcher_view = !self.launcher_view;
-            }
             SettingKind::HideUninstalledHarnesses => {
                 self.hide_uninstalled_harnesses = !self.hide_uninstalled_harnesses;
             }
@@ -2235,6 +2274,9 @@ impl Config {
             }
             SettingKind::QuickPromptFocus => {
                 self.quick_prompt_focus = !self.quick_prompt_focus;
+            }
+            SettingKind::QuickPromptNewWorktree => {
+                self.quick_prompt_new_worktree = !self.quick_prompt_new_worktree;
             }
         }
     }
@@ -3104,21 +3146,28 @@ mod tests {
         assert!(cfg.animations);
     }
 
+    /// Workspaces are gone, so **Workspaces bar** has no row to be edited
+    /// on — but the key an earlier release wrote still loads, and is
+    /// written back unchanged for the older builds that read it.
     #[test]
-    fn show_workspaces_default_on_toggle_and_persist() {
-        let mut cfg = Config::default();
-        assert!(cfg.show_workspaces);
-        let (tab, row) = locate(SettingKind::ShowWorkspaces).unwrap();
-        cfg.cycle(tab, row, 0);
-        assert!(!cfg.show_workspaces);
+    fn show_workspaces_has_no_row_and_is_written_back_for_older_builds() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|row| row.label != "Workspaces bar")
+            }
+            TabBody::Hotkeys | TabBody::Agents => true,
+        }));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"show_workspaces": false}"#).unwrap();
+        let mut cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(!cfg.show_workspaces);
+
+        cfg.focus_tint = false;
         cfg.save_to(&path).unwrap();
-        assert!(!load_from(&path).show_workspaces);
-        // A config predating the key leaves the column shown.
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(cfg.show_workspaces);
+        assert_eq!(read_json_file(&path)["show_workspaces"], false);
     }
 
     #[test]
@@ -3181,6 +3230,35 @@ mod tests {
         assert!(!legacy.hide_draft_prs);
     }
 
+    /// CARD LINE COUNTS: an Appearance row, off by default so a config that
+    /// predates the key keeps its cards as they were, persisted under
+    /// `card_line_changes`.
+    #[test]
+    fn card_line_counts_default_off_toggle_on_the_appearance_tab_and_persist() {
+        let mut cfg = Config::default();
+        assert!(
+            !cfg.card_line_changes,
+            "cards count files alone until asked"
+        );
+        assert_eq!(cfg.value_label(SettingKind::CardLineChanges), "off");
+
+        let (tab, row) = locate(SettingKind::CardLineChanges).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.card_line_changes);
+        assert_eq!(cfg.value_label(SettingKind::CardLineChanges), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""card_line_changes": true"#), "{raw}");
+        assert!(load_from(&path).card_line_changes);
+
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.card_line_changes);
+    }
+
     /// The FOCUS TINT: on out of the box, toggled from its Appearance row,
     /// persisted under `focus_tint`. A config.json written while the key
     /// was ignored (2026-08-29 to v0.26) is honoured again: `false` in
@@ -3210,6 +3288,44 @@ mod tests {
             older.focus_tint,
             "a config predating the key keeps the tint"
         );
+    }
+
+    /// The **Session pane**: along the bottom out of the box, cycled from
+    /// its Appearance row through right and left and back, persisted
+    /// under `session_pane`. A config predating the key, or holding a
+    /// word off the list, reads as the bottom.
+    #[test]
+    fn session_pane_defaults_to_the_bottom_cycles_and_persists() {
+        use crate::launcher::PaneSide;
+        let mut cfg = Config::default();
+        assert_eq!(cfg.pane_side(), PaneSide::Bottom);
+        let (tab, row) = locate(SettingKind::SessionPane).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        assert_eq!(cfg.value_label(SettingKind::SessionPane), "bottom");
+        cfg.cycle(tab, row, 0);
+        assert_eq!(cfg.pane_side(), PaneSide::Right);
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.pane_side(), PaneSide::Left);
+        assert_eq!(cfg.value_label(SettingKind::SessionPane), "left");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.pane_side(), PaneSide::Bottom, "and round again");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.pane_side(), PaneSide::Left, "either arrow walks it");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).pane_side(), PaneSide::Left);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.get("session_pane"), Some(&serde_json::json!("left")));
+
+        let older: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(older.pane_side(), PaneSide::Bottom, "predating the key");
+        let mut odd: Config = serde_json::from_str(r#"{"session_pane": "top"}"#).unwrap();
+        assert_eq!(odd.pane_side(), PaneSide::Bottom, "a word off the list");
+        odd.cycle(tab, row, 0);
+        assert_eq!(odd.pane_side(), PaneSide::Right, "steps on from the bottom");
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,
@@ -3617,39 +3733,6 @@ mod tests {
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.remember_harness);
-    }
-
-    /// LAUNCHER VIEW: an Experimental switch, off by default — it replaces
-    /// the whole layout — the tab's last row, a plain toggle persisted
-    /// under `launcher_view`, and off in a config written before it.
-    #[test]
-    fn launcher_view_is_off_by_default_on_the_experimental_tab_and_persists() {
-        let mut cfg = Config::default();
-        assert!(!cfg.launcher_view);
-        assert_eq!(cfg.value_label(SettingKind::LauncherView), "off");
-
-        let (tab, row) = locate(SettingKind::LauncherView).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
-        assert_eq!(
-            row + 1,
-            tab_settings(tab).len(),
-            "the newest switch sits last"
-        );
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.launcher_view);
-        assert_eq!(cfg.value_label(SettingKind::LauncherView), "on");
-        cfg.cycle(tab, row, 1);
-        assert!(!cfg.launcher_view, "either arrow toggles it back");
-        cfg.cycle(tab, row, -1);
-        assert!(cfg.launcher_view);
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).launcher_view);
-
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(!cfg.launcher_view);
     }
 
     /// PRESET TEXT: a Sessions row after the sounds, `prefix` by default,
@@ -4511,6 +4594,7 @@ mod tests {
                         vec![
                             "Agent".to_string(),
                             "Focus".to_string(),
+                            "New worktree".to_string(),
                             "Hide missing CLIs".to_string()
                         ]
                     ),

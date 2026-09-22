@@ -1,0 +1,53 @@
+# The PROJECT TABS across the grid's header: three launches into the demo — one keeps running with a
+# pull request, one finishes, one stops on a question — then two more projects opened from the
+# projects level, each landing a tab at the far left, and `]`,`]` walking right to the demo's tab,
+# lit, its STATUS DOTS right of its name.
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+p
+Sort the changelog entries by date, newest first
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+Escape
+Escape
+l
+Enter
+Escape
+l
+l
+Enter
+]
+]
+F12
+F12

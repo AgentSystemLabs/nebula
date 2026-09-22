@@ -26,8 +26,8 @@ use clap::{Parser, Subcommand};
     max_term_width = 100,
     about = "Terminal multiplexer for Claude Code agents",
     long_about = "Terminal multiplexer for Claude Code agents.\n\n\
-        Nebula keeps a tree — workspaces hold projects, projects hold worktrees, \
-        worktrees hold sessions — and a background daemon owns every PTY in it. \
+        Nebula keeps a tree — projects hold worktrees, worktrees hold sessions — \
+        and a background daemon owns every PTY in it. \
         Agents keep running after the TUI quits, and their scrollback is replayed \
         when you come back.\n\n\
         A bare `nebula` opens the TUI. The commands below drive the same tree from \
@@ -43,20 +43,12 @@ pub(crate) struct Cli {
     /// A directory whose name collides with a subcommand needs the long form
     /// (`nebula add browser`) or a `./` prefix.
     pub(crate) dir: Option<String>,
-    /// Open this instance on the named workspace.
-    ///
-    /// Overrides the last workspace opened, for this instance only. Each
-    /// nebula window scopes itself, so two can sit on two different
-    /// workspaces at once.
-    #[arg(long, value_name = "NAME")]
-    pub(crate) workspace: Option<String>,
 }
 
 const ROOT_EXAMPLES: &str = "\
 Examples:
   nebula                            open the TUI (auto-starts the daemon)
   nebula add ~/code/my-app          register a project
-  nebula --workspace client-work    open the TUI on a named workspace
   nebula browser --port 8080        serve this TUI in a browser tab
 
 Run `nebula <command> --help` for a command's flags and examples.";
@@ -82,8 +74,8 @@ fn parse_agent_kind(s: &str) -> Result<nebula_core::AgentKind, String> {
 pub(crate) enum Command {
     /// Register a git checkout as a project.
     ///
-    /// Adds a directory to the project list of the open workspace, named after
-    /// the repository's root directory. Bare `nebula <dir>` is the same
+    /// Adds a directory to the project list, named after the repository's
+    /// root directory. Bare `nebula <dir>` is the same
     /// command, so `nebula .` and `nebula add .` do the same thing.
     #[command(after_help = ADD_EXAMPLES)]
     Add {
@@ -178,18 +170,6 @@ pub(crate) enum Command {
         /// The files to show, relative to the current directory or absolute.
         #[arg(required = true, num_args = 1.., value_name = "FILE")]
         files: Vec<String>,
-    },
-    /// Manage workspaces — named groups of projects.
-    ///
-    /// Each nebula instance has exactly one workspace open and scopes its
-    /// project list — and the `/` search — to it, so two windows can sit on
-    /// two workspaces at once. Every install starts with one named `default`;
-    /// it is an ordinary workspace with no special protection — only the last
-    /// workspace left standing cannot be deleted.
-    #[command(after_help = WORKSPACE_EXAMPLES)]
-    Workspace {
-        #[command(subcommand)]
-        command: WorkspaceCommand,
     },
     /// Back up, restore or locate this machine's settings.
     ///
@@ -367,13 +347,6 @@ Examples:
   nebula open README.md                one tab
   nebula open src/main.rs docs/keys.md a tab each, in this order";
 
-const WORKSPACE_EXAMPLES: &str = "\
-Examples:
-  nebula workspace add client-work   create one
-  nebula workspace list              list them; * marks the next default
-  nebula workspace open client-work  the next instance opens into it
-  nebula --workspace client-work     aim one instance without switching";
-
 const BROWSER_EXAMPLES: &str = "\
 Examples:
   nebula browser                   serve on 127.0.0.1:7681, open a tab
@@ -452,47 +425,4 @@ pub(crate) enum ConfigCommand {
     /// override it.
     #[command(after_help = "Example:\n  nebula config harnesses")]
     Harnesses,
-}
-
-#[derive(Subcommand)]
-pub(crate) enum WorkspaceCommand {
-    /// Create a workspace (does not open it).
-    ///
-    /// The new workspace starts empty and nothing switches to it;
-    /// `nebula workspace open` sets what the next instance boots into.
-    #[command(after_help = "Example:\n  nebula workspace add client-work")]
-    Add {
-        /// Name for the new workspace.
-        name: String,
-    },
-    /// Open a workspace in the next nebula instance launched.
-    ///
-    /// Running instances keep the workspace they booted on — aim a single one
-    /// with `nebula --workspace <name>` instead.
-    #[command(after_help = "Example:\n  nebula workspace open client-work")]
-    Open {
-        /// Workspace the next instance should open into.
-        name: String,
-    },
-    /// List workspaces; `*` marks the one new instances open into.
-    #[command(after_help = "Example:\n  nebula workspace list")]
-    List,
-    /// Delete an empty workspace.
-    ///
-    /// A workspace that still holds projects is refused, and so is the last
-    /// one left — no name is protected, `default` included. Deleting the one
-    /// new instances open into moves that mark to a surviving workspace.
-    #[command(after_help = "Example:\n  nebula workspace delete client-work")]
-    Delete {
-        /// Workspace to delete; it must hold no projects.
-        name: String,
-    },
-    /// Rename a workspace.
-    #[command(after_help = "Example:\n  nebula workspace rename old-name new-name")]
-    Rename {
-        /// Workspace to rename.
-        name: String,
-        /// Its new name.
-        new_name: String,
-    },
 }

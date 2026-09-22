@@ -57,8 +57,8 @@ pub(crate) fn click_is_outside(overlay: &Overlay, pos: Position) -> bool {
 
 /// Dismiss the open overlay after a click landed outside it — "exactly as
 /// Esc would", which for half of them means running Esc itself: a CONFIRM
-/// DIALOG cancels and lands back in the SETTINGS OVERLAY or WORKSPACE
-/// SWITCHER it came from, a PROMPT DIALOG restores the warm slot's spec, the
+/// DIALOG cancels and lands back in the SETTINGS OVERLAY or AGENT PRESETS
+/// list it came from, a PROMPT DIALOG restores the warm slot's spec, the
 /// AGENT PRESETS list in QUICK PROMPT picker mode hands the box back with
 /// its text, and the PRESET EDITOR backs out to its list.
 pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {

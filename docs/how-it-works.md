@@ -7,8 +7,8 @@
   or `/tmp/nebula-<uid>/`, mode 0700). Quit the TUI, relaunch later, and your sessions are still alive
   with scrollback replayed. When the daemon swaps the process under a session you are looking at — a
   restart, or the `nebula worktree` relocation at the end of a turn — the pane is rebound to the new
-  one on its own. Moving the cursor onto a live session — a row in the Sessions panel, or a worktree,
-  project or workspace switch that brings one back — attaches it on the keypress; only a session the
+  one on its own. Moving the cursor onto a live session — a card in the grid, or a worktree or
+  project switch that brings one back — attaches it on the keypress; only a session the
   idle reaper took waits a moment, so that walking past its row doesn't boot a CLI. The screens of the
   last six sessions shown are kept, so returning to one paints on the same frame and fetches only the
   bytes it missed instead of replaying the whole ring. Between them they may hold about 12 MB of grid;
@@ -213,7 +213,7 @@
   since its hooks can't inject context. Titling is one-shot and never clobbers a name you typed or set
   with `r` — a late agent attempt is politely declined. `nebula rename --force` overrides.
 - **A Claude session's own name and its row stay tied.** `/rename <name>` inside Claude Code retitles
-  the row within a moment — the same name then shows in the SESSIONS PANEL, Claude's prompt box, its
+  the row within a moment — the same name then shows on the session's card, Claude's prompt box, its
   `/resume` picker and `/rc` list, and survives a restart. Claude fires no hook for `/rename`; it
   rewrites the window title (`✳ <name>`) and writes `custom-title.json` beside the transcript, so the
   DAEMON reads that file when the PTY's title changes (and on every hook), and adopts a title Claude
@@ -233,16 +233,18 @@
   Claude stays in that family.
 - **Rows can list what they were last asked.** With **Recent prompts** on (Settings → Experimental),
   the `prompt` field of the `UserPromptSubmit` payload — which every harness sends — is condensed to
-  one line in the hook receiver, kept on the AGENT row (the newest ten, in SQLite) and drawn under its
-  pill in the SESSIONS PANEL with an ago label, newest last. Pure capture: nothing is injected into the
+  one line in the hook receiver, kept on the AGENT row (the newest ten, in SQLite) and drawn on the
+  session's card with an ago label, newest last. Pure capture: nothing is injected into the
   model's context and no extra turn runs. See [Sessions](sessions.md#recent-prompts).
-- **Project rows count what is waiting on the repo.** With **PR & issue counts** on (Settings →
-  Experimental; on out of the box), each PROJECTS PANEL row says `3m ago - 3 prs · 2 issues` after
-  its name, the pull requests in the accent the OPEN PRS rows wear and the issues in green — the open
+- **The header counts what is waiting on the repo.** With **PR & issue counts** on (Settings →
+  Experimental; on out of the box), the GRID's header says `4 sessions  3 prs · 2 issues` for the
+  selected project, the pull requests in the accent the PULL REQUESTS MODAL's rows wear and the
+  issues in green — the open
   pull requests the OPEN PRS sweep already keeps warm for every project (drafts left out while
   `hide_draft_prs` is on), and the open issues, which a sweep of their own asks for one project per
   tick on a five-minute beat only while the switch is on. Zero says nothing, and a narrow column
-  drops the badge before the name. See [Configuration](configuration.md#every-setting).
+  drops the badge before the name. Each count is a button: a click opens the PULL REQUESTS or
+  ISSUES MODAL for that project, as `v` and `i` do. See [Configuration](configuration.md#every-setting).
 - **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree" and
   it runs `nebula worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
   `<repo>/.claude/worktrees/` on a `worktree-*` branch). nebula creates the checkout in its usual
@@ -276,8 +278,7 @@
   checks the caller is a known session and passes the agent's checkout along as the editor's working
   directory. Same appended prompt, plus a `Bash(nebula open:*)` permission.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
-  projects, worktrees, agents (with kind + CLI session ids), links, workspaces, and your
-  last selection.
+  projects, worktrees, agents (with kind + CLI session ids), links, and your last selection.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI in the selected worktree
   before you ask for one, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
@@ -327,13 +328,13 @@ checkouts on a sweep that takes one of them per tick — so every worktree row l
 has merged without the cursor ever visiting it (the ROOT WORKTREE is left out; nobody deletes it over a
 merge). Nothing is stacked while a call is in flight, and each is abandoned after 20 s. With **PR &
 issue counts** on (Settings → Experimental, on out of the box), the other projects' open issues are
-swept the same way, one project per tick on the five-minute beat, so the counts on the PROJECTS
-PANEL rows are minutes old at worst. The selected
+swept the same way, one project per tick on the five-minute beat, so the counts in the grid's
+header are minutes old at worst. The selected
 worktree and the open list settle onto a steady 15 s beat; the swept checkouts onto 5 min, since a
 merge reaches them sooner anyway — the moment a pull request drops out of the open list, the checkout on
 its branch is asked again on the next tick, and turns purple seconds after the merge. An empty answer
 backs off by doubling — out to 3 min for a branch that never grows a PR, 10 min for a project with none
-open — so a workspace of thirty repos does not cost thirty API calls a beat. Focusing a sidebar panel or
+open — so a machine with thirty repos does not cost thirty API calls a beat. Focusing a sidebar panel or
 the terminal window pulls the next lookup forward, floored at a few seconds; `Shift+R` is the one
 gesture that asks straight away, every checkout of the project included.
 

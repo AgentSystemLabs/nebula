@@ -2,8 +2,8 @@
 #
 # Ways to run code you just wrote:
 #   make dev      isolated instance — own daemon, own data; your real sessions untouched
-#                 (first run copies your real projects, worktrees, workspaces and
-#                 settings in, so it looks like yours — `make dev-reset` re-copies)
+#                 (first run copies your real projects, worktrees and settings in,
+#                 so it looks like yours — `make dev-reset` re-copies)
 #   make browser  the same isolated instance, served into a browser tab via ttyd
 #
 # Each checkout gets its own instance, keyed to its path, so the main clone and
@@ -99,7 +99,7 @@ dev-prep:
 # reads the WAL, so the copy is consistent even with the real daemon running.
 # The real dir is where `directories::ProjectDirs::from("dev","nebula","nebula")`
 # puts it (nebula-core/src/paths.rs); keep the two in step.
-dev-seed: ## Copy real projects/workspaces/settings into the dev instance (only if it has no DB yet)
+dev-seed: ## Copy real projects/settings into the dev instance (only if it has no DB yet)
 	@[ ! -e $(DEV_DATA)/nebula.db ] || exit 0; \
 	case "$$(uname -s)" in \
 		Darwin) real="$$HOME/Library/Application Support/dev.nebula.nebula";; \
@@ -115,7 +115,7 @@ dev-seed: ## Copy real projects/workspaces/settings into the dev instance (only 
 	for f in config.json config.local.json reviewed.json; do \
 		if [ -f "$$real/$$f" ]; then cp "$$real/$$f" $(DEV_DATA)/; fi; \
 	done; \
-	echo "seeded dev instance from $$real (projects, worktrees, workspaces, settings — no sessions)"
+	echo "seeded dev instance from $$real (projects, worktrees, settings — no sessions)"
 
 dev-reset: dev-stop ## Wipe this checkout's dev data; the next `make dev` re-seeds it
 	rm -rf $(DEV_DATA)

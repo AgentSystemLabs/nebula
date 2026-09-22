@@ -5,7 +5,7 @@ use crate::pull_request::{OpenPr, PrDetail, PullRequest};
 use crate::text_input::TextInput;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Project, ProjectId, SessionRef,
-    TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
+    TerminalId, TerminalTab, Worktree, WorktreeId,
 };
 use ratatui::layout::{Position, Rect};
 use std::collections::{BTreeMap, HashMap};
@@ -39,6 +39,21 @@ pub const TERM_CACHE_MAX: usize = 6;
 /// the history is replayed if the user scrolls up into it.
 pub const TERM_CACHE_CELLS: usize = 400_000;
 
+/// The git repository nebula was started in: the directory it was launched
+/// from, or the nearest one above it holding a `.git` — what the first
+/// run's SPLASH offers to open with Enter, and what the open-project prompt
+/// starts on. None when started outside a repository, or at the home
+/// directory itself: a dotfiles repo at `~` is not the project anyone
+/// launching from there means.
+pub fn launch_repo() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let home = nebula_core::env::home_dir();
+    cwd.ancestors()
+        .take_while(|dir| Some(*dir) != home.as_deref())
+        .find(|dir| dir.join(".git").exists())
+        .map(std::path::Path::to_path_buf)
+}
+
 /// Wall-clock epoch ms, comparable to the daemon's `status_changed_at`.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -49,10 +64,6 @@ pub fn now_ms() -> i64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    /// The optional top bar (`Shift+W` shows/hides it). Its cursor
-    /// IS the open workspace — moving it switches, the way moving in the
-    /// Projects column re-scopes the worktrees.
-    Workspaces,
     Projects,
     Worktrees,
     Sessions,
@@ -62,46 +73,12 @@ pub enum Focus {
 /// What a screen cell maps to; rebuilt on every draw for hit-testing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HitTarget {
-    /// Row index into `tree.workspaces`; a click opens that workspace.
-    Workspace(usize),
-    /// The `◇ workspace` nameplate on the footer; a click opens the
-    /// workspace switcher.
-    FooterWorkspace,
-    /// Row index into `App::project_rows()`.
-    Project(usize),
-    Worktree(usize),
-    Session(usize),
-    /// The FOLLOW-UP CHEVRON at the right end of a session card's name row
-    /// (index into `App::visible_session_rows()`); a click expands or folds
-    /// that card's FOLLOW-UP COMPOSER, same as the space key. Registered
-    /// ahead of the row it sits on, so it wins.
-    SessionFollowUp(usize),
-    /// The open FOLLOW-UP COMPOSER's box. Registered ahead of its row so a
-    /// click inside the box lands on the box — typing into it must not read
-    /// as a second click on the card, which would attach and lock the pane.
-    FollowUpBox,
-    /// The ARCHIVED group header (either form); a click toggles the group
-    /// open/closed, same as the A key.
-    ArchivedHeader,
-    /// The Worktrees panel's OPEN PRS group header (either form); a click
-    /// folds the group down to its count or opens it back up.
-    OpenPrsHeader,
-    /// The Worktrees panel's ISSUES group header (either form); a click
-    /// folds or opens it, as the OPEN PRS header's does.
-    IssuesHeader,
-    /// Panel background (registered after rows, so rows win).
+    /// The GRID's background (registered after the cards, so they win).
     PanelBg(Focus),
     TerminalPane,
     /// The session URL on the CLOUD SESSION PANEL; a click opens it in the
     /// browser. Registered ahead of the pane it sits on, so it wins.
     CloudSessionLink,
-    /// Draggable right boundary of a visible sidebar panel. The index is
-    /// logical (0 Projects, 1 Worktrees, 2 Sessions), so hidden panels keep
-    /// their remembered widths without owning a boundary.
-    Splitter(usize),
-    /// The small collapse button in a sidebar panel's header row (right
-    /// end). A click hides that panel, the same as its `Shift+` hotkey.
-    CollapsePanel(Focus),
     /// A card in the LAUNCHER VIEW's GRID, by its place in
     /// `launcher::rows`.
     LauncherRow(usize),
@@ -109,46 +86,61 @@ pub enum HitTarget {
     /// (LAUNCHER VIEW): a click leaves the session for the grid, as `^q`
     /// does.
     LauncherCrumb,
-    /// The `nebula` crumb at the head of the LAUNCHER VIEW's breadcrumb:
-    /// a click opens what it names — the whole machine, which is the
-    /// WORKSPACES level.
-    LauncherRoot,
-    /// The workspace crumb in the LAUNCHER VIEW's header: a click opens
-    /// that workspace — the PROJECTS level, scoped to it.
-    LauncherWorkspace,
-    /// The project crumb in the LAUNCHER VIEW's header: a click opens that
-    /// project — the SESSIONS level, which is where the crumb is only ever
-    /// drawn, so it lands where it already is.
-    LauncherProject,
-    /// A card on the LAUNCHER VIEW's PROJECTS level, by its place in
-    /// `launcher::project_cards`.
-    LauncherProjectCard(usize),
-    /// A card on its WORKSPACES level, by its place in
-    /// `launcher::workspace_cards` — which is tab order, so also its index
-    /// in `tree.workspaces`.
-    LauncherWorkspaceCard(usize),
+    /// A PROJECT TAB in the LAUNCHER VIEW's header, by the project it
+    /// names: a click opens that project's sessions, as `[` and `]`
+    /// walking onto it do, and a right-click opens it with the project's
+    /// own menu over it — new worktree, run, rename, remove.
+    LauncherTab(ProjectId),
+    /// The `×` on that tab. Its own target rather than a corner of the
+    /// tab's, so a click on the cross can never read as a click on the
+    /// tab it closes.
+    LauncherTabClose(ProjectId),
+    /// The `+` before the first tab: a click drops the PROJECT DROPDOWN
+    /// under it — every project, the one in front of you ticked, narrowed
+    /// by type-ahead, with a row for opening a folder that is not one yet
+    /// — and the pick opens a tab.
+    LauncherTabAdd,
     /// Draggable top edge of the LAUNCHER VIEW's PANE: the blank row the
     /// pane opens with, plus the grid row above it. Registered ahead of
     /// the cards so a card ending on that row never swallows the grab.
     LauncherPaneSplitter,
+    /// The `SESSION` tab at the head of the LAUNCHER VIEW's PANE: a click
+    /// takes the pane off whichever TERMINAL it was reading and back onto
+    /// the card under the cursor.
+    LauncherPaneSession,
+    /// A TERMINAL tab in that same header, by its place in
+    /// `App::pane_terminals` — the current checkout's terminals, in tree
+    /// order. A click reads that terminal in the pane.
+    LauncherPaneTerminal(usize),
+    /// The `×` on that tab. Its own target rather than a corner of the
+    /// tab's, so a click on the cross can never read as a click on the
+    /// tab it closes.
+    LauncherPaneCloseTerminal(usize),
+    /// The CLOSE BUTTON at the right end of that header: a click folds
+    /// the pane away, the same `event_loop::launcher::toggle_pane` `^~`
+    /// runs.
+    LauncherPaneClose,
+    /// The PR COUNT on the right of the LAUNCHER VIEW's header (`2 prs`):
+    /// a click opens the open pull requests of the project in front of
+    /// you — the modal `v` opens.
+    LauncherPullRequests,
+    /// The ISSUE COUNT beside it (`1 issue`): a click opens that
+    /// project's open issues — the modal `i` opens.
+    LauncherIssues,
+    /// The key cap in the empty GRID's welcome (`press p to prompt`): a
+    /// click opens the QUICK PROMPT, through the very
+    /// `event_loop::launcher::open_box` the key runs.
+    LauncherWelcomePrompt,
+    /// The footer's right-edge readout (`2 agents · 1 term · 412 MB`): a
+    /// click opens the memory modal — the one `⇧M` opens.
+    FooterUsage,
 }
 
 /// Default widths of the Projects / Worktrees / Sessions panels. Sessions
 /// is the widest because its rows carry the most: name, "23m ago", harness.
 pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
-/// Height of the Workspaces bar that spans the top of the body: a blank
-/// spacer, the label-plus-tabs row, a second blank spacer, and the rule
-/// that closes it off from the panels below. The label lands on the same
-/// row-1 / x-3 grid the panel headers use, and the tabs get a row of air on
-/// either side so the bar reads as its own tier rather than as a header
-/// crowded against the rule.
-pub const WORKSPACES_BAR_H: u16 = 4;
 /// A panel can't be dragged narrower than this.
 pub const MIN_PANEL_W: u16 = 10;
-/// Height of the hidden workspaces bar: one rail row carrying an expand
-/// chevron at the same right-end column the bar's collapse chevron sits
-/// in. Clickable across the whole row.
-pub const COLLAPSED_BAR_H: u16 = 1;
 /// Width of a collapsed sidebar panel's rail: the column rule itself,
 /// with the expand chevron drawn over it on the header row. Clickable
 /// along its whole height. The panel's remembered width is untouched
@@ -167,6 +159,14 @@ pub const MIN_DIFF_FILES_W: u16 = 16;
 pub const SETTINGS_MEMORY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// The diff pane always keeps at least this much width.
 pub const MIN_DIFF_PANE_W: u16 = 24;
+
+/// What a PANE losing the keyboard says ([`App::release_terminal`]). The
+/// input lock is what decides where a keystroke lands, so a drop the user
+/// did not ask for silently changes what every key they type next MEANS —
+/// `x` closes the project's tab, `⇧M` opens the memory modal — and the
+/// one thing it must not be is quiet.
+pub const TERMINAL_RELEASED: &str =
+    "the keys are the grid's again — Enter steps back into the session";
 
 // ---- list-view arithmetic shared by every overlay with a cursor ----
 
@@ -287,15 +287,10 @@ pub enum MenuAction {
     /// Retitle a project's row. Display only — the folder keeps its name and
     /// stays visible under the new one.
     RenameProject(ProjectId),
-    /// Workspace-switcher row: open this workspace. The switcher's other
-    /// verbs are keys, not rows — n: new, r: rename, d: delete (footer
-    /// hints).
-    OpenWorkspace(WorkspaceId),
-    /// The Workspaces column's menu rows: the switcher's n / r / d verbs,
-    /// for a mouse that never learned the keys.
-    NewWorkspace,
-    RenameWorkspace(WorkspaceId),
-    RemoveWorkspace(WorkspaceId),
+    /// PROJECT DROPDOWN row (the `+` in front of the LAUNCHER VIEW's
+    /// PROJECT TABS): open this project — its sessions, and a tab for it
+    /// first, next to the `+`, if it had none.
+    OpenProject(ProjectId),
     ToggleArchived,
     /// Fold / unfold the PROJECT OPEN PRS GROUP (Worktrees panel menu).
     ToggleOpenPrs,
@@ -304,6 +299,15 @@ pub enum MenuAction {
     /// Flip the `hide_draft_prs` SETTING from the Worktrees panel menu:
     /// drafts out of the group and `/`, or back in.
     ToggleDraftPrs,
+    /// A row of the WORKTREE PICKER a click on the NEW SESSION box's branch
+    /// opens: aim this one launch at `target` — one of the project's
+    /// checkouts, or a fresh worktree — and hand the box back with its
+    /// text. It picks where the session runs, never what branch a checkout
+    /// is on: that is the BRANCH SWITCHER's (`SwitchBranch`).
+    PickLaunchWorktree {
+        target: crate::quick_prompt::QuickTarget,
+        back: Box<crate::quick_prompt::QuickReturn>,
+    },
 }
 
 /// Which submenu → (right arrow) opens from a menu row.
@@ -454,20 +458,20 @@ impl ContextMenu {
         !self.filter_query().is_empty()
     }
 
-    /// Is this the `w` workspace switcher? Its rows are all OpenWorkspace,
-    /// which gates the switcher-only keys (n/r/d) and its footer hint.
-    pub fn is_workspace_picker(&self) -> bool {
+    /// Is this the LAUNCHER VIEW's PROJECT DROPDOWN? Its rows are
+    /// OpenProject, and it gates its footer hint.
+    pub fn is_project_picker(&self) -> bool {
         self.items
             .iter()
-            .any(|i| matches!(i.action, MenuAction::OpenWorkspace(_)))
+            .any(|i| matches!(i.action, MenuAction::OpenProject(_)))
     }
 
-    /// The workspace under the switcher's cursor, if this is the switcher.
-    pub fn hovered_workspace(&self) -> Option<WorkspaceId> {
-        match &self.items.get(self.hover)?.action {
-            MenuAction::OpenWorkspace(id) => Some(id.clone()),
-            _ => None,
-        }
+    /// Is this the WORKTREE PICKER a click on the NEW SESSION box's branch
+    /// opens? It is drawn hanging from that branch.
+    pub fn is_launch_worktree_picker(&self) -> bool {
+        self.items
+            .iter()
+            .any(|i| matches!(i.action, MenuAction::PickLaunchWorktree { .. }))
     }
 
     /// Cloud mode is a root new-session-picker modifier, not another agent
@@ -543,14 +547,6 @@ pub enum PendingAction {
         terminals: Vec<TerminalId>,
     },
     RemoveProject(ProjectId),
-    /// `d` on a workspace — the column, its menu, or the `w` switcher.
-    /// `reopen_picker` is the switcher's hover row when the confirm came
-    /// from there: both answers put the switcher back, hover intact, so
-    /// the EntityRemoved delta drops the row in place as before.
-    RemoveWorkspace {
-        id: WorkspaceId,
-        reopen_picker: Option<usize>,
-    },
     DeleteLink(LinkId),
     /// `d` in the AGENT PRESETS list: drop the preset at `index` from the
     /// store. Both answers reopen the list for `worktree` — as the QUICK
@@ -624,6 +620,16 @@ pub enum PromptKind {
     CloudMessage {
         id: AgentId,
     },
+    /// The next turn for a session already running, typed into a small
+    /// modal and sent straight down that session's PTY — the LAUNCHER
+    /// VIEW's follow-up, where the SESSIONS PANEL expands the card itself
+    /// ([`App::follow_up`]). A grid of fixed-height cards has nowhere to
+    /// grow a box, and a modal is what lets one card after another be
+    /// prompted without ever stepping into a session. Multi-row: a turn
+    /// is usually one line, but never only one line.
+    FollowUp {
+        id: AgentId,
+    },
     /// A comment to post on the pull request under the cursor — a
     /// PROJECT OPEN PRS GROUP row or the Sessions panel's PR ROW — with
     /// `gh pr comment` (`y`, or **Comment…** from the row's menu).
@@ -664,11 +670,6 @@ pub enum PromptKind {
         kind: crate::config::SettingKind,
         project: Option<std::path::PathBuf>,
     },
-    /// Name for a workspace created from the switcher; opened on Ack.
-    NewWorkspace,
-    RenameWorkspace {
-        id: WorkspaceId,
-    },
     /// Rewrite a pinned link's URL.
     EditLink {
         id: LinkId,
@@ -685,6 +686,18 @@ pub enum PromptKind {
 }
 
 impl PromptKind {
+    /// Does this box's text become a turn for an agent on this machine —
+    /// one that can open a file path written into it? A cloud session
+    /// can't, and the rest aren't prompts at all.
+    pub fn reaches_local_agent(&self) -> bool {
+        matches!(
+            self,
+            PromptKind::QuickPrompt(_)
+                | PromptKind::AgentPresetTask { .. }
+                | PromptKind::FollowUp { .. }
+        )
+    }
+
     /// The checkout this box is addressed to — the one its Enter launches
     /// into — to rewrite when a stand-in becomes the real row. None for a
     /// box that names no checkout, and for a QUICK PROMPT about to cut
@@ -725,6 +738,17 @@ pub struct PromptDialog {
     /// same as `^N`. Empty on every other box, and an empty rect contains
     /// no point — so no other box has to know about it.
     pub toggle_area: Rect,
+    /// The box's four details — `project ^P`, `worktree main ▾`, `agent
+    /// Tab`, `model ^O` — and the columns each was drawn in, written
+    /// during draw: a click on one opens the picker its chord opens, the
+    /// branch the WORKTREE PICKER. Empty on every other box, and on a box
+    /// too narrow to draw a field at all.
+    pub detail_areas: Vec<(crate::launcher::BoxField, Rect)>,
+    /// The branch alone in that row's `worktree main ▾`, written during
+    /// draw: the WORKTREE PICKER hangs from it. Empty wherever the branch
+    /// is not drawn or names nothing to pick — a PR SESSION's checkout is
+    /// the DAEMON's.
+    pub branch_area: Rect,
 }
 
 impl PromptDialog {
@@ -745,6 +769,8 @@ impl PromptDialog {
             area: Rect::default(),
             editor_area: Rect::default(),
             toggle_area: Rect::default(),
+            detail_areas: Vec::new(),
+            branch_area: Rect::default(),
         };
         // The task and comment boxes hold line breaks; the rest are one
         // line. The field itself then knows which keys break a line and
@@ -768,6 +794,7 @@ impl PromptDialog {
             self.kind,
             PromptKind::ClaudeCloudTask { .. }
                 | PromptKind::CloudMessage { .. }
+                | PromptKind::FollowUp { .. }
                 | PromptKind::PrComment { .. }
                 | PromptKind::AgentPresetTask { .. }
                 | PromptKind::QuickPrompt { .. }
@@ -1937,6 +1964,9 @@ pub enum PendingIntent {
         text: String,
         /// The stand-in rows on screen meanwhile.
         placeholder: PlaceholderRows,
+        /// The session's Ack takes the pane — `⌘Enter`, or the
+        /// `quick_prompt_focus` SETTING, as the box's Enter found them.
+        focus: bool,
     },
     /// A PR SESSION whose head branch had no checkout yet: the DAEMON
     /// fetches the branch, cuts the worktree and spawns the CLI in it
@@ -1962,9 +1992,6 @@ pub enum PendingIntent {
         /// checkout.
         pr_url: String,
     },
-    /// Open the workspace this Ack just created (switcher's "New workspace…"
-    /// flow: creating from there means you want to be in it).
-    OpenCreatedWorkspace,
     /// Worktree removed optimistically; restore these rows on Error.
     DeleteWorktree(WorktreeRollback),
     /// A row renamed, archived, unarchived or deleted on the keypress
@@ -1997,8 +2024,7 @@ impl PendingIntent {
             | PendingIntent::AttachCreatedWithCloudRetry { .. }
             | PendingIntent::AttachCreatedPrSession { .. }
             | PendingIntent::LaunchInCreatedWorktree { .. }
-            | PendingIntent::SelectCreatedProject
-            | PendingIntent::OpenCreatedWorkspace => true,
+            | PendingIntent::SelectCreatedProject => true,
             PendingIntent::SelectCreatedWorktree { launch, .. } => launch.is_some(),
             _ => false,
         }
@@ -2259,25 +2285,6 @@ pub fn project_rollup(tree: &Tree, project_id: &ProjectId) -> Option<AgentStatus
     )
 }
 
-/// One status for a whole workspace: every live agent under every project
-/// in it, folded the same way a project folds its worktrees. This is what
-/// lets the Workspaces column say "something is running over there"
-/// without opening it — background workspaces keep receiving status
-/// deltas, so the reading is live.
-pub fn workspace_rollup(tree: &Tree, workspace_id: &WorkspaceId) -> Option<AgentStatus> {
-    rollup(workspace_agents(tree, workspace_id).map(|a| a.status))
-}
-
-/// The `n done` count for a workspace tab: sessions under it that finished
-/// a turn nobody has read yet. Same thing [`worktree_unseen`] and
-/// [`project_unseen`] count, one tier up — a count means the same at every
-/// tier, and it counts down to nothing as the cursor visits each session.
-pub fn workspace_unseen(tree: &Tree, workspace_id: &WorkspaceId) -> usize {
-    workspace_agents(tree, workspace_id)
-        .filter(|a| a.unseen)
-        .count()
-}
-
 /// How many sessions under a worktree finished a turn nobody has looked at
 /// yet (`Agent::unseen`) — the row's count badge, the number of terminals
 /// to go read. Archived rows are out of sight, so they don't count.
@@ -2324,33 +2331,6 @@ pub fn project_fresh_done(tree: &Tree, project_id: &ProjectId, now: i64) -> bool
         .iter()
         .filter(|w| &w.project_id == project_id)
         .any(|w| worktree_fresh_done(tree, &w.id, now))
-}
-
-/// And over every project of a workspace, for its tab.
-pub fn workspace_fresh_done(tree: &Tree, workspace_id: &WorkspaceId, now: i64) -> bool {
-    workspace_agents(tree, workspace_id).any(|a| fresh_done(a, now))
-}
-
-/// Every unarchived agent under every project in a workspace.
-fn workspace_agents<'a>(
-    tree: &'a Tree,
-    workspace_id: &WorkspaceId,
-) -> impl Iterator<Item = &'a Agent> + 'a {
-    let project_ids: Vec<&ProjectId> = tree
-        .projects
-        .iter()
-        .filter(|p| &p.workspace_id == workspace_id)
-        .map(|p| &p.id)
-        .collect();
-    let wt_ids: Vec<WorktreeId> = tree
-        .worktrees
-        .iter()
-        .filter(|w| project_ids.contains(&&w.project_id))
-        .map(|w| w.id.clone())
-        .collect();
-    tree.agents
-        .iter()
-        .filter(move |a| !a.archived && wt_ids.contains(&a.worktree_id))
 }
 
 /// A session that is mid-turn or blocked on the user. These count as
@@ -2424,6 +2404,51 @@ impl Recency {
             stamped: r.stamped.max(a.status_changed_at),
         })
     }
+
+    /// Fold one more session in, for the one-pass rollups below.
+    fn absorb(&mut self, a: &Agent, now: i64) {
+        self.interacted = self.interacted.max(last_interaction_ms(a, now));
+        self.stamped = self.stamped.max(a.status_changed_at);
+    }
+}
+
+/// EVERY checkout's [`Recency`], rolled up in ONE pass over the sessions.
+///
+/// The row sorts want all of them at once. Asking [`worktree_recency`]
+/// per row walks the whole session list again for each — and `sort_by_key`
+/// repeats the key on every COMPARISON, not once per row, so a project
+/// with a couple of hundred sessions under one checkout pays tens of
+/// thousands of id comparisons per sort. The sorts run several times per
+/// frame and twice per turn of the event loop, which is enough to starve
+/// the keyboard. One pass here, one hash lookup per comparison there.
+pub fn worktree_recencies(tree: &Tree, now: i64) -> HashMap<&WorktreeId, Recency> {
+    let mut by_worktree: HashMap<&WorktreeId, Recency> = HashMap::new();
+    for a in &tree.agents {
+        by_worktree
+            .entry(&a.worktree_id)
+            .or_default()
+            .absorb(a, now);
+    }
+    by_worktree
+}
+
+/// The same for every project, on the same one-pass footing — and with
+/// the checkout→project map hashed too, where [`project_recency`] walks a
+/// `Vec` of the project's checkouts once per session.
+pub fn project_recencies(tree: &Tree, now: i64) -> HashMap<&ProjectId, Recency> {
+    let owner: HashMap<&WorktreeId, &ProjectId> = tree
+        .worktrees
+        .iter()
+        .map(|w| (&w.id, &w.project_id))
+        .collect();
+    let mut by_project: HashMap<&ProjectId, Recency> = HashMap::new();
+    for a in &tree.agents {
+        let Some(project) = owner.get(&a.worktree_id) else {
+            continue;
+        };
+        by_project.entry(project).or_default().absorb(a, now);
+    }
+    by_project
 }
 
 /// When a worktree last saw a turn: the newest stamp of any session in it.
@@ -2448,19 +2473,6 @@ pub fn project_recency(tree: &Tree, project_id: &ProjectId, now: i64) -> Recency
             .filter(|a| wt_ids.contains(&&a.worktree_id)),
         now,
     )
-}
-
-/// The same over every project of a workspace — what lets the `/` PALETTE
-/// put the workspace you were just in back within reach.
-pub fn workspace_recency(tree: &Tree, workspace_id: &WorkspaceId, now: i64) -> Recency {
-    tree.projects
-        .iter()
-        .filter(|p| &p.workspace_id == workspace_id)
-        .map(|p| project_recency(tree, &p.id, now))
-        .fold(Recency::default(), |r, p| Recency {
-            interacted: r.interacted.max(p.interacted),
-            stamped: r.stamped.max(p.stamped),
-        })
 }
 
 /// How loudly one status asks for a human: needs-feedback > running >
@@ -2489,19 +2501,10 @@ pub fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus
     best
 }
 
-/// Client-side mirror of the entity tree. `projects` holds EVERY workspace's
-/// projects; the panels scope to `active_workspace` (see
-/// [`App::project_rows`]), so a workspace switch is a pure re-filter — no
-/// refetch, and background workspaces keep receiving status updates. The
-/// `/` palette deliberately doesn't scope: it searches the whole tree (see
-/// [`crate::palette::Palette`]), which is the same data either way.
+/// Client-side mirror of the entity tree: every project on this machine,
+/// with the checkouts, sessions, terminals and links under them.
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
-    pub workspaces: Vec<Workspace>,
-    /// The workspace THIS instance is showing. Client-local: the daemon
-    /// hands over the last-opened one at boot, and after that every nebula
-    /// window scopes itself — switching here moves no one else.
-    pub active_workspace: WorkspaceId,
     pub projects: Vec<Project>,
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
@@ -2510,49 +2513,24 @@ pub struct Tree {
 }
 
 impl Tree {
-    /// Is this project in the open workspace (i.e. visible)?
-    pub fn in_active_workspace(&self, p: &Project) -> bool {
-        p.workspace_id == self.active_workspace
+    /// Any project at all? None is a first run: the splash, with the way
+    /// to open one, is all there is to draw.
+    pub fn has_projects(&self) -> bool {
+        !self.projects.is_empty()
     }
 
-    /// Row of the open workspace in `workspaces` — the Workspaces column's
-    /// cursor. None only before the first snapshot lands.
-    pub fn active_workspace_index(&self) -> Option<usize> {
-        self.workspaces
-            .iter()
-            .position(|w| w.id == self.active_workspace)
-    }
-
-    /// Display name of the open workspace, for the footer and switcher.
-    pub fn active_workspace_name(&self) -> &str {
-        self.workspaces
-            .iter()
-            .find(|w| w.id == self.active_workspace)
-            .map(|w| w.name.as_str())
-            .unwrap_or("default")
-    }
-
-    /// Is the open workspace the built-in `default` one? The first-run
-    /// splash is scoped to it: an empty workspace the user created (or
-    /// stepped onto in the Workspaces column) is an ordinary empty tree,
-    /// not a first run.
-    pub fn in_default_workspace(&self) -> bool {
-        self.active_workspace.as_str() == nebula_core::DEFAULT_WORKSPACE_ID
-    }
-
-    /// Any project visible in the open workspace? (The splash and the
-    /// empty-panel hints key off this, not the raw project list — other
-    /// workspaces' projects don't count.)
-    pub fn has_visible_projects(&self) -> bool {
-        self.projects.iter().any(|p| self.in_active_workspace(p))
-    }
-
-    /// Visible-project count for the PROJECTS panel header.
-    pub fn visible_project_count(&self) -> usize {
-        self.projects
-            .iter()
-            .filter(|p| self.in_active_workspace(p))
-            .count()
+    /// The project registered for the repo at `path`, or for any checkout
+    /// of it — the folder the user named when a project already stands
+    /// for it. An exact path match, so it is run on canonical paths
+    /// ([`crate::event_loop`]'s add prompt canonicalizes first).
+    pub fn project_at_path(&self, path: &std::path::Path) -> Option<&Project> {
+        self.projects.iter().find(|p| {
+            p.repo_path == path
+                || self
+                    .worktrees
+                    .iter()
+                    .any(|w| w.project_id == p.id && w.path == path)
+        })
     }
 }
 
@@ -2762,9 +2740,6 @@ pub struct UiState {
     /// older blobs, which keep it open.
     #[serde(default)]
     pub issues_collapsed: bool,
-    /// Panel widths (projects, worktrees, sessions); absent in older blobs.
-    #[serde(default)]
-    pub panel_widths: Option<[u16; 3]>,
     /// Diff modal file-list width; absent in older blobs.
     #[serde(default)]
     pub diff_files_width: Option<u16>,
@@ -2777,6 +2752,18 @@ pub struct UiState {
     /// both of which open the pane on its default share.
     #[serde(default)]
     pub launcher_pane_h: Option<u16>,
+    /// Width the pane was dragged to beside the cards; absent in older
+    /// blobs, which open a side pane on its default half.
+    #[serde(default)]
+    pub launcher_pane_w: Option<u16>,
+    /// The LAUNCHER VIEW's pane was folded away (`^~`); absent in older
+    /// blobs, which open with it showing.
+    #[serde(default)]
+    pub launcher_pane_hidden: bool,
+    /// The LAUNCHER VIEW's PROJECT TABS, by project id, far left first;
+    /// absent in older blobs, which open with the one project restored.
+    #[serde(default)]
+    pub launcher_tabs: Vec<String>,
 }
 
 /// A mouse selection over the terminal pane (drag or double-click word),
@@ -2824,17 +2811,6 @@ impl TermSelection {
             (self.head, self.anchor)
         }
     }
-}
-
-/// An in-progress drag of a panel splitter.
-#[derive(Debug, Clone, Copy)]
-pub struct SplitterDrag {
-    /// Which boundary (see `HitTarget::Splitter`).
-    pub idx: usize,
-    /// `boundary_x - grab column` at mouse-down, so the boundary tracks the
-    /// cursor without jumping a cell depending on which border cell was
-    /// grabbed.
-    pub grab_offset: i32,
 }
 
 /// Mouse pointer shape the outer terminal should show, requested via the
@@ -2977,8 +2953,8 @@ pub struct FollowUp {
 pub struct App {
     pub tree: Tree,
     pub focus: Focus,
-    /// Selected row in the Projects panel — indexes `project_rows()`, the
-    /// open workspace's projects in display order.
+    /// Selected row in the Projects panel — indexes `project_rows()`,
+    /// every project in display order.
     pub sel_project: usize,
     pub sel_worktree: usize,
     pub sel_session: usize,
@@ -3053,15 +3029,11 @@ pub struct App {
     /// can't ask leaves it as it was.
     pub update_available: Option<String>,
     /// The last `h`/`l` (or ←/→) that landed on the end of the panel row,
-    /// or `k`/`j` (↑/↓) on a panel's first row / in the Workspaces bar, and
-    /// stayed put, with when it arrived: a second press of the same action
-    /// inside `DOUBLE_TAP` jumps the boundary the way ⇧Tab / Tab would.
-    /// Any other key in between clears it.
+    /// or `k`/`j` (↑/↓) on a panel's first row, and stayed put, with when
+    /// it arrived: a second press of the same action inside `DOUBLE_TAP`
+    /// jumps the boundary the way ⇧Tab / Tab would. Any other key in
+    /// between clears it.
     pub edge_tap: Option<(crate::keymap::Action, std::time::Instant)>,
-    /// The panel focus came up from when it last stepped into the
-    /// Workspaces bar — by k,k, h,h, ⇧Tab or a click — so j,j in the bar
-    /// drops back onto it. Projects until the bar has been entered.
-    pub bar_return: Focus,
     pub overlay: Option<Overlay>,
     /// The expanded session card's FOLLOW-UP COMPOSER, or None with every
     /// card folded. Not an `Overlay`: it draws inside the SESSIONS PANEL
@@ -3077,22 +3049,6 @@ pub struct App {
     pub issues_collapsed: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
-    /// Workspaces bar shown across the top of the body, with the panels
-    /// below it; see `workspaces_bar_h`. Mirrors the `show_workspaces`
-    /// setting, which both `Shift+W` and the Appearance tab write — this
-    /// field is the live copy, the config file is where it persists.
-    pub show_workspaces: bool,
-    /// Projects panel collapsed to a rail; mirrors CONFIG.JSON's
-    /// `hide_projects` (the key predates rails and keeps its name so
-    /// existing configs carry over: `true` used to hide the panel
-    /// outright, now it collapses it).
-    pub hide_projects: bool,
-    /// Worktrees panel collapsed to a rail; mirrors CONFIG.JSON's
-    /// `hide_worktrees` (same rename history as `hide_projects`).
-    pub hide_worktrees: bool,
-    /// Sessions panel collapsed to a rail; mirrors CONFIG.JSON's
-    /// `hide_sessions`.
-    pub hide_sessions: bool,
     /// Draft pull requests left out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE; mirrors CONFIG.JSON's `hide_draft_prs` (Settings →
     /// Appearance, or the Worktrees panel menu). Read on every look at
@@ -3119,33 +3075,53 @@ pub struct App {
     /// `project_open_counts`, and what lets `issues::sweep_others` ask
     /// about the projects the cursor is not on.
     pub pr_issue_counts: bool,
-    /// The LAUNCHER VIEW is on (`launcher.rs`): one session list beside
-    /// the pane instead of the three panels, and the QUICK PROMPT up at
-    /// launch. Mirrors CONFIG.JSON's `launcher_view` (Settings →
-    /// Experimental). Read through [`App::launcher_active`], which also
-    /// wants a project to launch into.
-    pub launcher: bool,
-    /// The LAUNCHER VIEW's box is owed at boot: set when the loop starts
-    /// with the view on, taken by the first snapshot that has a project
-    /// to aim it at (`event_loop::launcher::boot`).
-    pub launcher_boot: bool,
-    /// Which LEVEL of the workspace tree the LAUNCHER VIEW's GRID is
-    /// showing — `workspaces / projects / sessions`, walked into with
-    /// Enter and back out with Esc (`launcher::Level`). The view opens on
-    /// SESSIONS, scoped to the selected project, and a launch always lands
-    /// back there.
-    pub launcher_level: crate::launcher::Level,
-    /// Whether the LAUNCHER VIEW's box cuts a fresh worktree for its
-    /// session (`^N` flips it). Remembered for the rest of the run, so the
-    /// next box starts the way the last one was sent; on at launch — a
-    /// session of its own per task.
-    pub launcher_new_worktree: bool,
+    /// Nothing in the LAUNCHER VIEW's GRID is selected: the aim has been
+    /// let go of — by a click on the air between the cards, or by the
+    /// first Esc (`event_loop::launcher::clear_aim`). No card is drawn
+    /// wearing the cursor while it is set, and the box `p` opens has no
+    /// card to read a checkout off, so it is aimed at the project's ROOT
+    /// BRANCH (`event_loop::launcher::open_box`) — the way out of a box
+    /// locked onto whichever worktree the cursor was last parked in.
+    /// Anything that puts the cursor back on a card takes the aim back
+    /// (`event_loop::launcher::take_aim`).
+    pub launcher_unaimed: bool,
     /// Height the LAUNCHER VIEW's PANE was dragged to, in rows; None until
     /// its top edge is dragged, which leaves the pane on its default share
     /// of the body. Re-clamped to the body on every draw
     /// (`launcher::pane_height`), so a height kept from a taller window
     /// never squeezes the cards out.
     pub launcher_pane_h: Option<u16>,
+    /// Width the PANE was dragged to while it stands beside the cards, in
+    /// columns: [`App::launcher_pane_h`]'s twin for a pane on the right or
+    /// the left, kept apart from it so switching sides never reads a
+    /// height as a width. Re-clamped the same way (`launcher::pane_width`).
+    pub launcher_pane_w: Option<u16>,
+    /// Where the PANE sits against the GRID — along the bottom, or down
+    /// the right or the left side — as Settings → Appearance → **Session
+    /// pane** has it (`event_loop::apply_config`). What a frame lays out
+    /// is [`App::launcher_pane_side`], which falls back to the bottom on a
+    /// window too narrow to stand the pane beside the cards.
+    pub launcher_pane_at: crate::launcher::PaneSide,
+    /// The LAUNCHER VIEW's PANE is folded away (`^~`): the GRID takes the
+    /// whole body and no session is read under it. Hiding it also lets
+    /// the card under the cursor go (`event_loop::launcher::toggle_pane`
+    /// runs the same `clear_aim` the first Esc does), so the cards stand
+    /// on their own — nothing selected, nothing being read. It is
+    /// remembered across restarts with the pane's height.
+    pub launcher_pane_hidden: bool,
+    /// Which TERMINAL the LAUNCHER VIEW's PANE is reading instead of the
+    /// card under the cursor — the tab its header's strip is on, None for
+    /// SESSION (`event_loop::launcher::show_pane_tab`).
+    ///
+    /// Scoped to the checkout, because the strip is: it lists that
+    /// worktree's terminals and nobody else's, so a cursor walked into
+    /// another checkout is reading a different strip and the pin no
+    /// longer names anything on it. [`App::pinned_terminal`] is the pin
+    /// read through that rule; [`App::settle_pane_tab`] drops one the
+    /// cursor has walked out from under. Not remembered across restarts:
+    /// a terminal's PTY doesn't outlive the daemon's hold on it, and
+    /// nebula opens on the session.
+    pub launcher_terminal: Option<TerminalId>,
     /// In-progress drag of that edge: `boundary row - grab row` at
     /// mouse-down, so the edge tracks the pointer instead of jumping by
     /// one depending on which of the two grab rows was caught (the
@@ -3155,6 +3131,35 @@ pub struct App {
     /// Only ever set in terminals that report plain mouse motion;
     /// elsewhere the grip rests until a drag takes hold.
     pub hover_launcher_pane: bool,
+    /// The header button under the pointer, from the last mouse report:
+    /// a PROJECT TAB, its `×`, the `+` in front of them, a full-screen
+    /// session's `‹ sessions`, or the footer's memory readout (the one
+    /// button off the header). The header marks that one for as long as
+    /// it is there, so a word reads as the button it is before anyone
+    /// clicks to find out. Carries `hover_launcher_pane`'s caveat — only
+    /// terminals that report plain motion ever set it, and elsewhere the
+    /// header rests plain.
+    pub hover_crumb: Option<HitTarget>,
+    /// The LAUNCHER VIEW's PROJECT TABS: every project opened on the
+    /// SESSIONS level since its tab was last closed, the most recently
+    /// opened first — the far left of the header. Kept up by
+    /// [`App::settle_project_tabs`], closed one at a time by
+    /// `event_loop::launcher::close_tab`, and remembered across restarts.
+    pub launcher_tabs: Vec<ProjectId>,
+    /// The PROJECT TABS have the keyboard, and this is the tab their
+    /// cursor is on: `k`,`k` (↑,↑) on the GRID's top row walks up into the
+    /// header (`event_loop::launcher::focus_tabs`), `h` / `l` move this
+    /// cursor along the tabs and switch the grid to each project as they
+    /// pass, on the card it was last left on, and Enter — or `j`,`j` back
+    /// down — hands the keys back to that card
+    /// (`event_loop::launcher::choose_tab`). None with the keys on the
+    /// cards, which is every other moment: Esc, a click anywhere, and any
+    /// other key hand them back. Never remembered across a restart.
+    pub launcher_tab_cursor: Option<ProjectId>,
+    /// The git repository this instance was started in
+    /// ([`launch_repo`]), read once at launch: the folder the first run's
+    /// SPLASH opens on Enter and the open-project prompt starts on.
+    pub launch_repo: Option<PathBuf>,
     /// The whole body the LAUNCHER VIEW splits, from the last draw.
     /// `body_area` there is the grid's half alone, so the pane drag takes
     /// its bounds from here.
@@ -3173,10 +3178,6 @@ pub struct App {
     /// user put them — a manual move outranks a selection-follow. Filled
     /// by `event_loop::handle_terminal_event`, emptied by the Ack or Error.
     pub left_behind: std::collections::HashSet<u64>,
-    /// `nebula --workspace <name>`: the workspace this instance was asked
-    /// to open into, held until the first snapshot arrives with the names
-    /// to resolve it against. Taken there — it applies once, at boot.
-    pub startup_workspace: Option<String>,
     /// Session created by us, awaiting its upsert to fix the selection.
     pub select_when_seen: Option<SessionRef>,
     /// The session this client just launched, held first in the sessions
@@ -3205,11 +3206,6 @@ pub struct App {
     /// Last selected session per worktree — switching back to a worktree
     /// re-shows the session the user left it on.
     pub last_session_for_worktree: HashMap<WorktreeId, SessionRef>,
-    /// Last selected project per workspace — switching back to a workspace
-    /// returns to the project the user left it on, which is what makes the
-    /// worktree and session memory above reachable across a workspace
-    /// switch (they key off the project the cursor lands on).
-    pub last_project_for_workspace: HashMap<WorkspaceId, ProjectId>,
     /// Debounced session prewarm: the worktree whose dead sessions the
     /// daemon should pre-spawn once the selection has rested on it past the
     /// deadline — armed on every worktree context switch, so walking the
@@ -3229,9 +3225,8 @@ pub struct App {
     pub quick_draft: Option<crate::quick_prompt::QuickDraft>,
     /// Debounced attach: the session the pane is showing but the daemon has
     /// not been told about yet. Stepping a selection is not a decision to
-    /// boot a CLI — and in the Workspaces column every step is a full
-    /// workspace switch, so without this, walking past four workspaces
-    /// cold-spawns four agents and abandons three of them.
+    /// boot a CLI — walking the grid past four cards must not cold-spawn
+    /// four agents and abandon three of them.
     pub pending_attach: Option<(SessionRef, std::time::Instant)>,
     /// What this connection is attached to daemon-side. Lags `term.sref`
     /// while an attach waits out its debounce, so the Detach that precedes
@@ -3260,25 +3255,12 @@ pub struct App {
     /// Last left-click on a session row (time + session), for double-click
     /// attach detection (a single click only selects the row).
     pub last_session_click: Option<(std::time::Instant, RowKey)>,
-    /// Last left-click on a LAUNCHER VIEW PROJECT card (time + project),
-    /// for the double-click that walks into it. Keyed on the project and
-    /// not the card's slot: the cards reorder as statuses change under
-    /// them, and a card that slid under the pointer is not the card that
-    /// was clicked.
-    pub last_project_click: Option<(std::time::Instant, nebula_core::ProjectId)>,
-    /// The same for a WORKSPACE card.
-    pub last_workspace_click: Option<(std::time::Instant, nebula_core::WorkspaceId)>,
     /// URLs detected on the visible screen during the last draw; hit-tested
     /// on ⌥click and underlined by the renderer.
     pub term_links: Vec<crate::links::TermLink>,
     /// File paths detected on the visible screen during the last draw;
     /// ⌥click opens them in the editor modal.
     pub term_file_links: Vec<crate::links::FileLink>,
-    /// Widths of the Projects / Worktrees / Sessions panels; the terminal
-    /// pane takes the remainder.
-    pub panel_widths: [u16; 3],
-    /// Width of the Workspaces column when it's shown. Kept out of
-    /// `panel_widths` so old persisted layouts still deserialize.
     /// File-list width of the diff modal, remembered across opens.
     pub diff_files_width: u16,
     /// The diff modal lists its files as a directory tree (`Ctrl+t` inside
@@ -3303,12 +3285,6 @@ pub struct App {
     /// because a keymap lookup happens on every single key press. The
     /// event loop refreshes it at startup and whenever a binding changes.
     pub keymap: crate::keymap::Keymap,
-    /// In-progress splitter drag, if any.
-    pub splitter_drag: Option<SplitterDrag>,
-    /// Main-screen splitter under the mouse (a drag counts), highlighting
-    /// that boundary's grip. Only ever set in terminals that report plain
-    /// mouse motion; elsewhere the grip just stays in its resting shade.
-    pub hover_splitter: Option<usize>,
     /// Pointer shape the outer terminal should currently show (OSC 22).
     pub pointer_shape: PointerShape,
     /// Base64 payload waiting to go out as an OSC 52 clipboard request, set
@@ -3362,6 +3338,23 @@ pub struct App {
     /// The checkout whose count is being read right now, so a repaint can't
     /// stack `git status` processes; the answer clears it.
     pub git_changes_inflight: Option<WorktreeId>,
+    /// The last changed-file count read in each checkout, and when: what
+    /// the LAUNCHER VIEW's cards print beside their branch. Fed by the
+    /// selected checkout's own reads (`git_changes`) and by a sweep that
+    /// spends each poll tick on one other checkout the grid lists, the
+    /// least recently read first. The count is None when git couldn't say.
+    pub worktree_changes: HashMap<WorktreeId, (Option<usize>, std::time::Instant)>,
+    /// The checkout the sweep is reading right now; its answer clears it.
+    pub worktree_changes_inflight: Option<WorktreeId>,
+    /// The lines added and removed in each checkout, read beside its
+    /// changed-file count while CARD LINE COUNTS is on: what its cards
+    /// print after `+3 files`. Only a checkout with changed lines has an
+    /// entry.
+    pub worktree_lines: HashMap<WorktreeId, crate::git_diff::LineChanges>,
+    /// Mirrors CONFIG.JSON's `card_line_changes` (Settings → Appearance):
+    /// the reads behind `worktree_lines` run, and the cards print them,
+    /// only while it is on.
+    pub card_line_changes: bool,
     /// What `gh pr view` last said about each worktree's branch: `Some(pr)`
     /// when one exists, `None` when the lookup came back empty (no PR, no
     /// `gh`, no remote). A missing key means "not looked up yet" — briefly,
@@ -3399,7 +3392,7 @@ pub struct App {
     /// What `gh pr list` last said about each project's open pull requests
     /// — the group at the bottom of the Worktrees panel. A missing key
     /// means "never asked"; only the selected project is ever asked, so a
-    /// workspace of thirty projects still costs one call per refresh.
+    /// machine with thirty projects still costs one call per refresh.
     pub open_prs: HashMap<ProjectId, OpenPrs>,
     /// Projects with a list lookup in flight, so a repaint can't stack a
     /// second `gh` on the first.
@@ -3460,6 +3453,11 @@ pub struct App {
     /// GIT POLL, plus once on quit.
     pub pr_cache: Option<crate::pr_cache::PrCache>,
     pub pr_cache_dirty: bool,
+    /// Where a file dropped onto a prompt box bound for an agent is copied
+    /// before macOS deletes it (`dropped_files`): the main loop installs
+    /// the DATA DIR's `attachments/` at startup; the unit tests leave it
+    /// `None`, so a paste there is never staged into the real user's dir.
+    pub attachments_dir: Option<std::path::PathBuf>,
     /// Bodies in `pr_detail` that came from the cache rather than from
     /// `gh`. The pane shows them at once; resting the cursor on their row
     /// fetches a fresh copy over the top, as it would fetch a missing one,
@@ -3535,6 +3533,12 @@ pub struct App {
     /// Splash summoned on demand (N) with a populated tree; any key
     /// dismisses it.
     pub splash_preview: bool,
+    /// The last frame drew the empty GRID's welcome, nebula and all
+    /// (`ui::launcher_view`). Cleared at the top of every `ui::draw` and
+    /// set again by the welcome itself, so between frames it says what is
+    /// on screen — which is what keeps the sky ticking
+    /// ([`App::welcome_active`]).
+    pub welcome_on_screen: bool,
     /// The `animations` setting: master switch for the status-text sweep
     /// and the splash's motion (off = fewer repaints). Mirrors the config,
     /// refreshed at startup and when the settings overlay applies a change.
@@ -3557,7 +3561,9 @@ impl App {
     pub fn new() -> Self {
         Self {
             tree: Tree::default(),
-            focus: Focus::Projects,
+            // The GRID is where FOCUS lives; the PANE under it is the only
+            // other place it can go.
+            focus: Focus::Sessions,
             sel_project: 0,
             sel_worktree: 0,
             sel_session: 0,
@@ -3581,35 +3587,34 @@ impl App {
             flash: None,
             update_available: None,
             edge_tap: None,
-            bar_return: Focus::Projects,
             overlay: None,
             show_archived: false,
             open_prs_collapsed: false,
             issues_collapsed: false,
             collapsed: false,
-            show_workspaces: true,
-            hide_projects: false,
-            hide_worktrees: false,
-            hide_sessions: false,
             hide_draft_prs: false,
             projects_config: BTreeMap::new(),
             project_fallback: Default::default(),
             recent_prompts: 0,
             show_key_combos: false,
             pr_issue_counts: true,
-            launcher: false,
-            launcher_boot: false,
-            launcher_level: crate::launcher::Level::default(),
-            launcher_new_worktree: true,
+            launcher_unaimed: false,
             launcher_pane_h: None,
+            launcher_pane_w: None,
+            launcher_pane_at: crate::launcher::PaneSide::Bottom,
+            launcher_pane_hidden: false,
+            launcher_terminal: None,
             launcher_pane_drag: None,
             hover_launcher_pane: false,
+            hover_crumb: None,
+            launcher_tabs: Vec::new(),
+            launcher_tab_cursor: None,
+            launch_repo: None,
             launcher_body: Rect::default(),
             key_combo: None,
             next_req_id: 1,
             pending: HashMap::new(),
             left_behind: std::collections::HashSet::new(),
-            startup_workspace: None,
             select_when_seen: None,
             just_launched: None,
             select_project_when_seen: None,
@@ -3617,7 +3622,6 @@ impl App {
             run_flash_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
-            last_project_for_workspace: HashMap::new(),
             pending_prewarm: None,
             parked_pr_prompt: None,
             quick_draft: None,
@@ -3629,11 +3633,8 @@ impl App {
             term_mouse_grab: None,
             last_term_click: None,
             last_session_click: None,
-            last_project_click: None,
-            last_workspace_click: None,
             term_links: Vec::new(),
             term_file_links: Vec::new(),
-            panel_widths: DEFAULT_PANEL_WIDTHS,
             diff_files_width: DEFAULT_DIFF_FILES_W,
             diff_tree: false,
             settings_tab: 0,
@@ -3641,8 +3642,6 @@ impl App {
             settings_on_tabs: true,
             settings_closed_at: None,
             keymap: crate::keymap::Keymap::default(),
-            splitter_drag: None,
-            hover_splitter: None,
             pointer_shape: PointerShape::default(),
             pending_clipboard: None,
             pending_ding: false,
@@ -3657,6 +3656,10 @@ impl App {
             vim_generation: 0,
             git_changes: None,
             git_changes_inflight: None,
+            worktree_changes: HashMap::new(),
+            worktree_changes_inflight: None,
+            worktree_lines: HashMap::new(),
+            card_line_changes: false,
             pull_requests: HashMap::new(),
             merge_landed: HashMap::new(),
             pr_seen: HashMap::new(),
@@ -3679,6 +3682,7 @@ impl App {
             pr_comment_tx: None,
             pr_cache: None,
             pr_cache_dirty: false,
+            attachments_dir: None,
             pr_detail_stale: std::collections::HashSet::new(),
             issues: HashMap::new(),
             issues_inflight: std::collections::HashSet::new(),
@@ -3700,6 +3704,7 @@ impl App {
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),
             splash_preview: false,
+            welcome_on_screen: false,
             animations: true,
             focus_tint: true,
         }
@@ -3753,17 +3758,118 @@ impl App {
         }
     }
 
-    /// The LAUNCHER VIEW is what the body draws: the setting is on and
-    /// this machine knows a project somewhere. With none at all — a first
-    /// run — the splash's "add a project" comes first, as it does for the
-    /// panels.
-    ///
-    /// Any project, not just one in the open workspace: the view has a
-    /// WORKSPACES level to walk back out to, so an empty workspace is a
-    /// level to step out of rather than a dead end that drops the user
-    /// into the panels mid-navigation.
+    /// The folder name of [`App::launch_repo`] while it is not a project
+    /// yet — what the SPLASH's "Enter: open …" names. None once it is one,
+    /// or when nebula was started outside a repository.
+    pub fn launch_repo_name(&self) -> Option<String> {
+        let repo = self.launch_repo.as_ref()?;
+        if self.tree.project_at_path(repo).is_some() {
+            return None;
+        }
+        repo.file_name().map(|n| n.to_string_lossy().into_owned())
+    }
+
+    /// The LAUNCHER VIEW is what the body draws — which is nebula's only
+    /// view — once this machine knows a project. With none at all (a
+    /// first run) the splash's "open a project" comes first.
     pub fn launcher_active(&self) -> bool {
-        self.launcher && !self.tree.projects.is_empty()
+        self.tree.has_projects()
+    }
+
+    /// The checkout the LAUNCHER PANE's TAB STRIP is scoped to: the one
+    /// the card under the GRID's cursor runs in, so the terminals on the
+    /// strip and the session the pane reads beside them always belong to
+    /// the same checkout — which is the whole claim the strip makes by
+    /// naming the branch between them.
+    ///
+    /// Not [`App::selected_worktree`], which is the PANELS' cursor: a
+    /// walk of the grid drags it along (`event_loop::launcher::select`),
+    /// but before the first walk it is still parked on whatever the
+    /// panels were left on, and the strip would name one checkout while
+    /// listing another's terminals. It is the fallback all the same, for
+    /// a grid with no card under the cursor at all.
+    pub fn pane_worktree(&self) -> Option<WorktreeId> {
+        let rows = crate::launcher::rows(self);
+        crate::launcher::cursor(self, &rows)
+            .and_then(|at| rows.get(at))
+            .map(|row| row.agent.worktree_id.clone())
+            .or_else(|| self.selected_worktree().map(|w| w.id.clone()))
+    }
+
+    /// The TERMINALS the strip lists: that checkout's, in tree order.
+    /// [`App::visible_terminals`] is the same list read off the panels'
+    /// cursor, for the panels' own rows.
+    pub fn pane_terminals(&self) -> Vec<TerminalTab> {
+        let Some(wt) = self.pane_worktree() else {
+            return Vec::new();
+        };
+        self.tree
+            .terminals
+            .iter()
+            .filter(|t| t.worktree_id == wt)
+            .cloned()
+            .collect()
+    }
+
+    /// The TERMINAL the LAUNCHER VIEW's PANE is reading, when that pin is
+    /// still good: the view is on and the terminal is one of the
+    /// checkout's ([`App::pane_terminals`] — what the header's TAB STRIP
+    /// lists). None means the pane reads the card under the cursor, which
+    /// is what every other tenant of the pane assumes.
+    ///
+    /// Read rather than trusted, so a pin that has gone stale — the
+    /// cursor walked into another checkout, the terminal was closed —
+    /// simply stops answering instead of leaving the pane on a session
+    /// nobody selected.
+    pub fn pinned_terminal(&self) -> Option<TerminalId> {
+        if !self.launcher_active() {
+            return None;
+        }
+        let id = self.launcher_terminal.as_ref()?;
+        self.pane_terminals()
+            .iter()
+            .any(|t| &t.id == id)
+            .then(|| id.clone())
+    }
+
+    /// Drop a pin that no longer names a tab on the strip. Run by the
+    /// view's draw, as [`App::settle_launcher_focus`] is: the pin goes
+    /// stale by things that happen elsewhere — the cursor walking into
+    /// another checkout, a terminal closing — rather than by anything the
+    /// pane itself does, so there is no one place to clear it from.
+    pub fn settle_pane_tab(&mut self) {
+        if self.launcher_terminal.is_some() && self.pinned_terminal().is_none() {
+            self.launcher_terminal = None;
+        }
+    }
+
+    /// Keep the PROJECT TABS true to the tree: a tab whose project is gone
+    /// goes, and the project the grid is on gets one at the far left if it
+    /// has none — however it got there, whether a tab, the `+` dropdown, a
+    /// `/` jump, a folder just opened or the restore at boot. A project
+    /// already open keeps its place. Run by the view's draw, as
+    /// [`App::settle_pane_tab`] is, and by the tab keys before they read
+    /// the list.
+    pub fn settle_project_tabs(&mut self) {
+        let projects = &self.tree.projects;
+        self.launcher_tabs
+            .retain(|id| projects.iter().any(|p| &p.id == id));
+        // The header's cursor needs a tab to be on and the keys to be on
+        // the grid: a tab closed or a project dropped under it, or the
+        // pane taking the keys, hands them back to the cards.
+        if self.launcher_tab_cursor.as_ref().is_some_and(|id| {
+            !self.launcher_tabs.contains(id) || self.focus == Focus::Terminal || self.collapsed
+        }) {
+            self.launcher_tab_cursor = None;
+            self.dirty = true;
+        }
+        let Some(id) = self.selected_project().map(|p| p.id.clone()) else {
+            return;
+        };
+        if !self.launcher_tabs.contains(&id) {
+            self.launcher_tabs.insert(0, id);
+            self.dirty = true;
+        }
     }
 
     /// The GRID is what the body is showing: the LAUNCHER VIEW is on and
@@ -3773,6 +3879,32 @@ impl App {
         self.launcher_active() && !self.collapsed
     }
 
+    /// Take the keyboard back from the session in the PANE, and say so
+    /// when it was really being typed into.
+    ///
+    /// Every UNASKED drop goes through here: a redraw that finds the pane
+    /// gone ([`App::settle_launcher_focus`]), a row archived, deleted or
+    /// reaped out from under the pane showing it, a stand-in replaced by
+    /// the session it stood for. None of those is a key the user pressed,
+    /// and each one leaves the next thing they type meaning something
+    /// else — so each one flashes [`TERMINAL_RELEASED`].
+    ///
+    /// The guard lives here rather than at the call sites: they run from
+    /// draws and from daemon events and cannot know whether the lock was
+    /// held, and a flash on every frame would be noise. Only a lock that
+    /// was actually HELD says anything.
+    ///
+    /// The deliberate ways out of a pane — `^q`, `^z`, Esc up a level —
+    /// name what they did themselves and do not come through here.
+    pub fn release_terminal(&mut self) {
+        if !self.term_locked {
+            return;
+        }
+        self.term_locked = false;
+        self.flash = Some(TERMINAL_RELEASED.into());
+        self.dirty = true;
+    }
+
     /// FOCUS as the LAUNCHER VIEW's GRID has it: the cards, or the PANE
     /// under them while something is in it — a click into the pane types
     /// into that session where it stands, and the hatch (`^q`) comes back
@@ -3780,35 +3912,34 @@ impl App {
     /// a panel this view doesn't draw — lands on the cards. Run by the
     /// view's draw, as `settle_focus` is by the panels'.
     pub fn settle_launcher_focus(&mut self) {
-        // Only the SESSIONS level draws a pane (`launcher::split`): above
-        // it there is nothing under the grid for focus to rest in, so it
-        // comes back to the cards rather than sitting on a pane that is
-        // no longer on screen.
+        // Only the SESSIONS level draws a pane (`launcher::split`), only
+        // while it is unfolded (`^~`) and only with a card wearing the
+        // cursor for it to read: with nothing under the grid there is
+        // nowhere for focus to rest, so it comes back to the cards
+        // rather than sitting on a pane that is no longer on screen.
         if self.focus == Focus::Terminal
             && self.term.is_some()
-            && self.launcher_level == crate::launcher::Level::Sessions
+            && !self.launcher_pane_hidden
+            && self.launcher_aimed()
         {
             return;
         }
-        if self.focus != Focus::Sessions {
-            self.focus = Focus::Sessions;
-            self.term_locked = false;
-        }
+        self.focus = Focus::Sessions;
+        // The lock goes with the pane however FOCUS got off it: a click
+        // on the air between the cards sets FOCUS itself
+        // (`event_loop`'s `PanelBg` arm) before letting the card go, and
+        // the input lock left behind would have gone on eating keys with
+        // no pane on screen to type into. `release_terminal` is a no-op
+        // on a lock that was never held, so only a real one says so.
+        self.release_terminal();
     }
 
-    /// The splash is what the body is showing: nothing in the tree yet
-    /// (first run) or summoned with N, and the panels aren't collapsed
-    /// away. True whether it's animating or drawn as a still frame, so the
+    /// The splash is what the body is showing: no project on this machine
+    /// yet (first run) or summoned with N, and no session full-screen over
+    /// it. True whether it's animating or drawn as a still frame, so the
     /// footer can key its hints off it.
-    ///
-    /// "First run" means the **default** workspace is empty. Any other
-    /// empty workspace keeps the panels (with their "no projects yet"
-    /// hints) — otherwise stepping the Workspaces column onto a fresh
-    /// workspace would hide the very column being stepped through.
     pub fn splash_showing(&self) -> bool {
-        !self.collapsed
-            && ((self.tree.in_default_workspace() && !self.tree.has_visible_projects())
-                || self.splash_preview)
+        !self.collapsed && (!self.tree.has_projects() || self.splash_preview)
     }
 
     /// The animated splash is on screen and should be ticking: nothing in
@@ -3817,6 +3948,13 @@ impl App {
     /// splash still draws — as a still frame).
     pub fn splash_active(&self) -> bool {
         self.animations && self.splash_showing() && self.vim.is_none()
+    }
+
+    /// The empty GRID's welcome is on screen and its nebula should be
+    /// ticking — the same cadence and the same switch as the splash's.
+    /// Off, the welcome still draws, as a still frame.
+    pub fn welcome_active(&self) -> bool {
+        self.animations && self.welcome_on_screen && self.vim.is_none()
     }
 
     /// Some sidebar row is showing a running (yellow) or needs-feedback
@@ -3829,6 +3967,10 @@ impl App {
     /// checkout only shows while its project is selected, so only those
     /// keep the clock running. The one-shots run out on the clock, so an
     /// idle app with a week-old merged checkout on screen repaints nothing.
+    /// The exception is a PROJECT TAB: its name sweeps blue for as long as
+    /// its project has a finish left unread and nothing live, so the clock
+    /// runs while one does (the cheap scan for any unread finish first,
+    /// since this is asked on every turn of the event loop).
     pub fn status_anim_active(&self) -> bool {
         let now = now_ms();
         self.animations
@@ -3842,7 +3984,23 @@ impl App {
             }) || self
                 .visible_worktrees()
                 .iter()
-                .any(|w| self.worktree_wears_merge(&w.id) && self.merge_is_fresh(&w.id)))
+                .any(|w| self.worktree_wears_merge(&w.id) && self.merge_is_fresh(&w.id))
+                || self.tab_sweeps_done())
+    }
+
+    /// Some PROJECT TAB sweeps blue: its project has an unread finish on
+    /// the grid ([`crate::launcher::project_tally`]'s `done`).
+    fn tab_sweeps_done(&self) -> bool {
+        self.launcher_active()
+            && self
+                .tree
+                .agents
+                .iter()
+                .any(|a| !a.archived && a.unseen && a.status == AgentStatus::Finished)
+            && self
+                .launcher_tabs
+                .iter()
+                .any(|id| crate::launcher::project_tally(self, id).done > 0)
     }
 
     /// This client just saw `worktree`'s pull request turn merged: start
@@ -3883,10 +4041,6 @@ impl App {
         project_fresh_done(&self.tree, project_id, now_ms())
     }
 
-    pub fn workspace_fresh_done(&self, workspace_id: &WorkspaceId) -> bool {
-        workspace_fresh_done(&self.tree, workspace_id, now_ms())
-    }
-
     /// Frame counter for the status-sweep text animation — a pure function
     /// of elapsed time (same model as the splash), so a missed tick just
     /// skips ahead instead of stuttering.
@@ -3894,178 +4048,87 @@ impl App {
         (self.splash_epoch.elapsed().as_millis() / SWEEP_FRAME.as_millis()) as usize
     }
 
-    /// Rows the Workspaces bar takes off the top of the body: the full
-    /// bar when shown, a one-row rail with an expand chevron when hidden
-    /// (like the side panels' rails, so the bar never vanishes without a
-    /// way back). Every screen-y computation for the panels below it
-    /// starts here.
-    pub fn workspaces_bar_h(&self) -> u16 {
-        if self.show_workspaces {
-            WORKSPACES_BAR_H
+    /// Is the GRID aimed at a card — is there something for the PANE
+    /// along the bottom to read? The selection itself is never let go of
+    /// (see [`App::launcher_unaimed`]); this is whether the view is
+    /// pointed at it, which `event_loop::launcher::take_aim` sets and
+    /// `clear_aim` drops, and which `ui::launcher_view`'s `wearing`
+    /// draws the cursor's card by.
+    pub fn launcher_aimed(&self) -> bool {
+        !self.launcher_unaimed
+    }
+
+    /// `body` in two the way the LAUNCHER VIEW draws it: the grid's half
+    /// and the PANE — along the bottom, or beside the cards on the side
+    /// [`App::launcher_pane_side`] names — or the whole body and no pane
+    /// at all. `launcher::split_at` is the geometry — whether there is
+    /// room for a pane, and how the two share the rows or the columns;
+    /// this is the one place the fold (`^~`) and the aim are read, so the
+    /// draw, the drag grip and the keys all agree about whether a pane is
+    /// on screen.
+    ///
+    /// No card wearing the cursor, no pane: the pane is the selected
+    /// session, so with nothing selected there is nothing for it to be
+    /// and the grid takes the whole body back. Clicking a card selects
+    /// it and the pane opens under the cards; letting the card go —
+    /// Esc, a click on the air between them — collapses it again.
+    pub fn launcher_split(&self, body: Rect) -> (Rect, Option<Rect>) {
+        if self.launcher_pane_hidden || !self.launcher_aimed() {
+            return (body, None);
+        }
+        let side = crate::launcher::fitted_side(body, self.launcher_pane_at);
+        let want = if side.beside() {
+            self.launcher_pane_w
         } else {
-            COLLAPSED_BAR_H
-        }
+            self.launcher_pane_h
+        };
+        crate::launcher::split_at(body, side, want)
     }
 
-    /// Sidebar indices occupying body columns, left to right. Collapsed
-    /// panels stay in the row as rails, so every panel is always present;
-    /// the terminal pane takes whatever width is left.
-    pub fn visible_panel_indices(&self) -> Vec<usize> {
-        (0..3).filter(|idx| self.panel_visible(*idx)).collect()
+    /// The side the PANE is laid out on this frame: the one Settings asks
+    /// for, or the bottom on a body too narrow to stand it beside the cards
+    /// (`launcher::fitted_side`). The drag, the grip and the pointer's
+    /// arrows all read this one, so none of them can disagree with the
+    /// draw about which way the pane's edge runs.
+    pub fn launcher_pane_side(&self) -> crate::launcher::PaneSide {
+        crate::launcher::fitted_side(self.launcher_body, self.launcher_pane_at)
     }
 
-    pub fn panel_visible(&self, idx: usize) -> bool {
-        matches!(idx, 0 | 1 | 2)
+    /// Where the edge between the cards and the PANE sits on this frame,
+    /// by `launcher::pane_boundary`'s measure — a row under the cards, a
+    /// column beside them. None with no pane on screen.
+    pub fn launcher_pane_boundary(&self) -> Option<i32> {
+        let pane = self.launcher_split(self.launcher_body).1?;
+        Some(crate::launcher::pane_boundary(
+            self.launcher_pane_side(),
+            pane,
+        ))
     }
 
-    /// Expanded sidebar indices: collapsed panels (rails) hold no rows,
-    /// own no splitter, and take no part in width normalization.
-    pub fn expanded_panel_indices(&self) -> Vec<usize> {
-        (0..3).filter(|idx| self.panel_expanded(*idx)).collect()
-    }
-
-    pub fn panel_expanded(&self, idx: usize) -> bool {
-        match idx {
-            0 => !self.hide_projects,
-            1 => !self.hide_worktrees,
-            2 => !self.sessions_collapsed(),
-            _ => false,
-        }
-    }
-
-    /// Whether the SESSIONS PANEL stands folded to its rail: hidden with
-    /// `Shift+S` (`hide_sessions`), or — the Worktrees cursor on a PROJECT
-    /// OPEN PRS or PROJECT ISSUES row — with nothing to list. Neither row
-    /// has a checkout and so neither has sessions, and the pane beside it
-    /// is reading the pull request or the issue, so the column gives the
-    /// pane its width for as long as the cursor rests there and comes
-    /// back the moment it steps onto a checkout. `hide_sessions` is
-    /// untouched either way: a panel the user collapsed stays a rail on
-    /// the checkout too, and the fold a pull request row causes is never
-    /// written to CONFIG.JSON.
-    pub fn sessions_collapsed(&self) -> bool {
-        self.hide_sessions
-            || self.selected_worktree_pr().is_some()
-            || self.selected_worktree_issue().is_some()
-    }
-
-    /// Width a panel draws at: its remembered width expanded, the fixed
-    /// rail width collapsed.
-    pub fn panel_draw_width(&self, idx: usize) -> u16 {
-        if self.panel_expanded(idx) {
-            self.panel_widths[idx]
-        } else {
-            COLLAPSED_RAIL_W
-        }
-    }
-
-    /// True when at least one sidebar panel is expanded past its rail.
-    pub fn any_panel_expanded(&self) -> bool {
-        (0..3).any(|idx| self.panel_expanded(idx))
-    }
-
-    /// Whether a collapse target currently shows its content: an expanded
-    /// panel, or the shown workspaces bar. A rail click expands, a header
-    /// chevron click collapses.
-    pub fn collapse_target_open(&self, focus: Focus) -> bool {
-        match focus {
-            Focus::Workspaces => self.show_workspaces,
-            Focus::Projects => !self.hide_projects,
-            Focus::Worktrees => !self.hide_worktrees,
-            Focus::Sessions => !self.sessions_collapsed(),
-            Focus::Terminal => false,
-        }
-    }
-
-    /// Every expanded sidebar owns the draggable boundary on its right.
-    /// Rails are fixed width and own none.
-    pub fn splitter_indices(&self) -> Vec<usize> {
-        self.expanded_panel_indices()
-    }
-
-    /// Screen x of splitter `idx` — the column where the panel to its right
-    /// starts, i.e. the right edge of panel `idx`.
-    pub fn splitter_x(&self, idx: usize) -> u16 {
-        self.visible_panel_indices()
-            .into_iter()
-            .filter(|visible| *visible <= idx)
-            .map(|visible| self.panel_draw_width(visible))
-            .sum()
-    }
-
-    /// Whether the panel right of splitter `idx` is a rail — the one
-    /// column its grab zone would otherwise claim along with the rule.
-    pub fn splitter_abuts_rail(&self, idx: usize) -> bool {
-        self.visible_panel_indices()
-            .into_iter()
-            .find(|visible| *visible > idx)
-            .is_some_and(|next| !self.panel_expanded(next))
-    }
-
-    /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
-    /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
-    /// Rails are fixed width: dragging at one does nothing, and neighbors
-    /// measure past them at rail width.
-    pub fn set_splitter(&mut self, idx: usize, boundary_x: i32, body_w: u16) {
-        let want = boundary_x.max(0) as u16;
-        if !self.panel_expanded(idx) {
-            return;
-        }
-        let visible = self.visible_panel_indices();
-        let left: u16 = visible
-            .iter()
-            .copied()
-            .filter(|visible| *visible < idx)
-            .map(|visible| self.panel_draw_width(visible))
-            .sum();
-        let fixed_right: u16 = visible
-            .iter()
-            .copied()
-            .filter(|visible| *visible > idx)
-            .map(|visible| self.panel_draw_width(visible))
-            .sum();
-        let max = body_w.saturating_sub(left + fixed_right + MIN_TERM_W);
-        if max < MIN_PANEL_W {
-            return; // terminal too small to honor the minimums
-        }
-        self.panel_widths[idx] = want.saturating_sub(left).clamp(MIN_PANEL_W, max);
-    }
-
-    /// Move the LAUNCHER VIEW's pane boundary to `boundary_y` — the screen
-    /// row the pane starts on — and remember the height that leaves it.
-    /// `launcher::pane_height` does the clamping, so a drag off either end
-    /// rests against the pane's own minimum or against the header plus one
-    /// row of cards the grid keeps. A body with no room for a pane at all
+    /// Move the LAUNCHER VIEW's pane boundary to `boundary` — the screen
+    /// row the pane starts on under the cards, or beside them the column
+    /// `launcher::pane_boundary` names — and remember the height, or the
+    /// width, that leaves it. `launcher::pane_height` and `pane_width` do
+    /// the clamping, so a drag off either end rests against the pane's own
+    /// minimum or against what the grid keeps: the header plus one row of
+    /// cards, or one column of them. A body with no room for a pane at all
     /// remembers nothing: there is no edge on screen to have grabbed.
-    pub fn set_launcher_pane(&mut self, boundary_y: i32) {
+    pub fn set_launcher_pane(&mut self, boundary: i32) {
+        use crate::launcher::PaneSide;
         let body = self.launcher_body;
-        let bottom = i32::from(body.y) + i32::from(body.height);
-        let want = (bottom - boundary_y).clamp(0, i32::from(u16::MAX)) as u16;
-        if let Some(h) = crate::launcher::pane_height(body, Some(want)) {
+        let side = self.launcher_pane_side();
+        let want = match side {
+            PaneSide::Bottom => i32::from(body.y) + i32::from(body.height) - boundary,
+            PaneSide::Right => i32::from(body.x) + i32::from(body.width) - boundary,
+            PaneSide::Left => boundary - i32::from(body.x),
+        };
+        let want = want.clamp(0, i32::from(u16::MAX)) as u16;
+        if side.beside() {
+            if let Some(w) = crate::launcher::pane_width(body, Some(want)) {
+                self.launcher_pane_w = Some(w);
+            }
+        } else if let Some(h) = crate::launcher::pane_height(body, Some(want)) {
             self.launcher_pane_h = Some(h);
-        }
-    }
-
-    /// Re-fit panel widths to the current body width, shrinking the rightmost
-    /// panel first, each floored at `MIN_PANEL_W`. Keeps the terminal pane at
-    /// `MIN_TERM_W` whenever the screen allows it at all. The Workspaces bar
-    /// spans the full width above them, so it costs the panels nothing here.
-    pub fn normalize_panel_widths(&mut self, body_w: u16) {
-        let rails: u16 = (0..3)
-            .filter(|i| !self.panel_expanded(*i))
-            .map(|_| COLLAPSED_RAIL_W)
-            .sum();
-        let budget = body_w.saturating_sub(MIN_TERM_W + rails);
-        let expanded = self.expanded_panel_indices();
-        for i in expanded.iter().rev().copied() {
-            let others: u16 = expanded
-                .iter()
-                .copied()
-                .filter(|j| *j != i)
-                .map(|j| self.panel_widths[j])
-                .sum();
-            let max = budget.saturating_sub(others);
-            self.panel_widths[i] = self.panel_widths[i].clamp(MIN_PANEL_W, max.max(MIN_PANEL_W));
         }
     }
 
@@ -4083,9 +4146,7 @@ impl App {
     /// its modes mid-drag is a change under a gesture in progress), and a
     /// motion report with no button named is still the drag.
     pub fn mouse_held(&self) -> bool {
-        self.splitter_drag.is_some()
-            || self.term_mouse_grab.is_some()
-            || self.term_selection.is_some_and(|s| s.dragging)
+        self.term_mouse_grab.is_some() || self.term_selection.is_some_and(|s| s.dragging)
     }
 
     /// Is this worktree row a stand-in (a QUICK PROMPT's, or the NEW
@@ -4147,9 +4208,8 @@ impl App {
         )
     }
 
-    /// Projects panel rows in display order, each an index into the FULL
-    /// `tree.projects` list. Scoped to the open workspace — other
-    /// workspaces' projects get no row.
+    /// Projects panel rows in display order, each an index into
+    /// `tree.projects` — every project gets one.
     ///
     /// Most recently interacted with first — the newest stamp under any of
     /// the project's worktrees, so the project you just worked in heads the
@@ -4163,14 +4223,19 @@ impl App {
             .projects
             .iter()
             .enumerate()
-            .filter(|(_, p)| self.tree.in_active_workspace(p))
             .map(|(i, _)| i)
             .collect();
+        // One pass for every project rather than one per comparison the
+        // sort makes (`project_recencies`).
+        let recencies = project_recencies(&self.tree, now);
         rows.sort_by_key(|i| {
             // The raw stamp breaks the tie every project with a session
             // mid-turn shares, so the project just launched into leads —
             // the sessions list's own rule (`recency_key`).
-            let r = project_recency(&self.tree, &self.tree.projects[*i].id, now);
+            let r = recencies
+                .get(&self.tree.projects[*i].id)
+                .copied()
+                .unwrap_or_default();
             (
                 std::cmp::Reverse(r.interacted),
                 std::cmp::Reverse(r.stamped),
@@ -4224,6 +4289,22 @@ impl App {
             Some((id, count)) if *id == wt.id => *count,
             _ => None,
         }
+    }
+
+    /// A checkout's last-read changed-file count, for its cards: None until
+    /// one has been read there, or when git couldn't say.
+    pub fn worktree_changes(&self, id: &WorktreeId) -> Option<usize> {
+        self.worktree_changes.get(id).and_then(|(count, _)| *count)
+    }
+
+    /// A checkout's last-read line counts, for its cards: None while CARD
+    /// LINE COUNTS is off, until one has been read there, or when nothing
+    /// changed by the line.
+    pub fn worktree_lines(&self, id: &WorktreeId) -> Option<crate::git_diff::LineChanges> {
+        if !self.card_line_changes {
+            return None;
+        }
+        self.worktree_lines.get(id).copied()
     }
 
     /// Does the cache describe a different worktree than the selection?
@@ -4312,20 +4393,24 @@ impl App {
 
     /// The full row list the panel shows — `sel_session` indexes this.
     pub fn visible_session_rows(&self) -> Vec<SessionRow> {
-        let agents = self.visible_sessions();
-        let (active, _) = self.session_group_counts();
+        // All four groups below hang off the SAME checkout, and each one
+        // asking `selected_worktree` for it re-sorts every checkout of the
+        // project — four sorts to build one list of rows. Asked once here
+        // and handed down.
+        let Some(wt) = self.selected_worktree() else {
+            return vec![];
+        };
+        let wt = &wt.id;
+        let agents = self.sessions_in(wt);
+        let (active, _) = self.group_counts_in(wt);
         let active = active.min(agents.len());
         let mut rows: Vec<SessionRow> = agents[..active]
             .iter()
             .cloned()
             .map(SessionRow::Agent)
             .collect();
-        rows.extend(
-            self.visible_terminals()
-                .into_iter()
-                .map(SessionRow::Terminal),
-        );
-        rows.extend(self.visible_links().into_iter().map(SessionRow::Link));
+        rows.extend(self.terminals_in(wt).into_iter().map(SessionRow::Terminal));
+        rows.extend(self.links_in(wt).into_iter().map(SessionRow::Link));
         rows.extend(agents[active..].iter().cloned().map(SessionRow::Agent));
         rows
     }
@@ -4340,13 +4425,18 @@ impl App {
         let Some(wt) = self.selected_worktree() else {
             return vec![];
         };
+        self.links_in(&wt.id)
+    }
+
+    /// The same for a checkout already in hand ([`App::sessions_in`]).
+    fn links_in(&self, wt: &WorktreeId) -> Vec<LinkRow> {
         let saved: Vec<&Link> = self
             .tree
             .links
             .iter()
-            .filter(|l| l.worktree_id == wt.id)
+            .filter(|l| &l.worktree_id == wt)
             .collect();
-        let pr = self.pull_requests.get(&wt.id).cloned().flatten();
+        let pr = self.pull_requests.get(wt).cloned().flatten();
         let matched = pr
             .as_ref()
             .and_then(|p| saved.iter().position(|l| l.url == p.url));
@@ -4433,10 +4523,15 @@ impl App {
         let Some(wt) = self.selected_worktree() else {
             return vec![];
         };
+        self.terminals_in(&wt.id)
+    }
+
+    /// The same for a checkout already in hand ([`App::sessions_in`]).
+    fn terminals_in(&self, wt: &WorktreeId) -> Vec<TerminalTab> {
         self.tree
             .terminals
             .iter()
-            .filter(|t| t.worktree_id == wt.id)
+            .filter(|t| &t.worktree_id == wt)
             .cloned()
             .collect()
     }
@@ -4482,10 +4577,13 @@ impl App {
             .iter()
             .filter(|w| w.project_id == project.id && !(hide_root && w.is_main))
             .collect();
+        // Rolled up once for every checkout rather than re-walked per
+        // comparison the sort makes (`worktree_recencies`).
+        let recencies = worktree_recencies(&self.tree, now);
         rows.sort_by_key(|w| {
             // The raw stamp breaks the tie every checkout with a session
             // mid-turn shares — see `recency_key`.
-            let r = worktree_recency(&self.tree, &w.id, now);
+            let r = recencies.get(&w.id).copied().unwrap_or_default();
             (
                 std::cmp::Reverse(w.is_main),
                 std::cmp::Reverse(r.interacted),
@@ -4775,6 +4873,13 @@ impl App {
         let Some(wt) = self.selected_worktree() else {
             return vec![];
         };
+        self.sessions_in(&wt.id)
+    }
+
+    /// The same for a checkout the caller has already found, so the rows
+    /// builder does not pay for `selected_worktree` to find it again
+    /// ([`App::visible_session_rows`]).
+    fn sessions_in(&self, wt: &WorktreeId) -> Vec<Agent> {
         let now = now_ms();
         // Stable throughout, so ties — never-run rows especially, which all
         // stamp 0 — keep tree order instead of shuffling between frames.
@@ -4782,7 +4887,7 @@ impl App {
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && !a.archived)
+            .filter(|a| &a.worktree_id == wt && !a.archived)
             .cloned()
             .collect();
         rows.sort_by_key(|a| recency_key(a, now));
@@ -4797,7 +4902,7 @@ impl App {
                 .tree
                 .agents
                 .iter()
-                .filter(|a| a.worktree_id == wt.id && a.archived)
+                .filter(|a| &a.worktree_id == wt && a.archived)
                 .cloned()
                 .collect();
             // Most recently archived first; pre-`archived_at` rows (stamp 0)
@@ -4813,17 +4918,22 @@ impl App {
         let Some(wt) = self.selected_worktree() else {
             return (0, 0);
         };
+        self.group_counts_in(&wt.id)
+    }
+
+    /// The same for a checkout already in hand ([`App::sessions_in`]).
+    fn group_counts_in(&self, wt: &WorktreeId) -> (usize, usize) {
         let live = self
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && !a.archived)
+            .filter(|a| &a.worktree_id == wt && !a.archived)
             .count();
         let archived = self
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && a.archived)
+            .filter(|a| &a.worktree_id == wt && a.archived)
             .count();
         (live, archived)
     }
@@ -5002,14 +5112,6 @@ impl App {
         project_recency(&self.tree, project_id, now_ms())
     }
 
-    pub fn workspace_rollup(&self, workspace_id: &WorkspaceId) -> Option<AgentStatus> {
-        workspace_rollup(&self.tree, workspace_id)
-    }
-
-    pub fn workspace_unseen(&self, workspace_id: &WorkspaceId) -> usize {
-        workspace_unseen(&self.tree, workspace_id)
-    }
-
     /// Sessions under a worktree that went green with nobody looking.
     pub fn worktree_unseen(&self, worktree_id: &WorktreeId) -> usize {
         worktree_unseen(&self.tree, worktree_id)
@@ -5019,54 +5121,21 @@ impl App {
         project_unseen(&self.tree, project_id)
     }
 
-    /// First visible sidebar under the Workspaces bar. With every panel
-    /// hidden there is no sidebar to land on, so the terminal takes it.
+    /// Where a walk out of the pane lands: the GRID, which is the only
+    /// thing beside it.
     pub fn first_sidebar_focus(&self) -> Focus {
-        if !self.hide_projects {
-            Focus::Projects
-        } else if !self.hide_worktrees {
-            Focus::Worktrees
-        } else if !self.sessions_collapsed() {
-            Focus::Sessions
-        } else {
-            Focus::Terminal
-        }
+        Focus::Sessions
     }
 
+    /// The two places FOCUS can rest: the LAUNCHER VIEW's GRID of cards
+    /// and the PANE under them. The three columns the other variants name
+    /// are no longer drawn.
     pub fn focus_visible(&self, focus: Focus) -> bool {
-        match focus {
-            Focus::Workspaces => self.show_workspaces,
-            Focus::Projects => !self.hide_projects,
-            Focus::Worktrees => !self.hide_worktrees,
-            Focus::Sessions => !self.sessions_collapsed(),
-            Focus::Terminal => true,
-        }
-    }
-
-    /// Step focus off a SESSIONS PANEL that has folded under it. The
-    /// hotkey and the chevron move a cursor off the panel as they fold
-    /// it (`set_hide_sessions`); the fold a pull request row causes has
-    /// no keypress of its own — the checkout under a Sessions cursor is
-    /// deleted, or its row hidden, and the Worktrees cursor lands on the
-    /// pull request beside it — so the frame that finds focus on the rail
-    /// settles it: back onto the nearest column to the left, the way
-    /// `⇧Tab` walks, or on to the pane when no column is open. Nothing
-    /// to do while the panel is open, or focus is elsewhere.
-    pub fn settle_focus(&mut self) {
-        if self.focus != Focus::Sessions || self.focus_visible(Focus::Sessions) {
-            return;
-        }
-        let back = self.previous_visible_focus(Focus::Sessions);
-        self.focus = if back == Focus::Sessions {
-            self.next_visible_focus(Focus::Sessions)
-        } else {
-            back
-        };
+        matches!(focus, Focus::Sessions | Focus::Terminal)
     }
 
     fn focus_rank(focus: Focus) -> u8 {
         match focus {
-            Focus::Workspaces => 0,
             Focus::Projects => 1,
             Focus::Worktrees => 2,
             Focus::Sessions => 3,
@@ -5077,7 +5146,6 @@ impl App {
     pub fn next_visible_focus(&self, focus: Focus) -> Focus {
         let rank = Self::focus_rank(focus);
         [
-            Focus::Workspaces,
             Focus::Projects,
             Focus::Worktrees,
             Focus::Sessions,
@@ -5095,21 +5163,26 @@ impl App {
             Focus::Sessions,
             Focus::Worktrees,
             Focus::Projects,
-            Focus::Workspaces,
         ]
         .into_iter()
         .find(|candidate| Self::focus_rank(*candidate) < rank && self.focus_visible(*candidate))
         .unwrap_or(focus)
     }
 
-    /// First stop in the Tab walk (and where a cross-workspace jump lands):
-    /// the Workspaces bar when shown, otherwise the first visible sidebar.
+    /// First stop in the Tab walk, and where a jump into another project
+    /// lands: the GRID.
     pub fn first_focus(&self) -> Focus {
-        if self.show_workspaces {
-            Focus::Workspaces
-        } else {
-            self.first_sidebar_focus()
-        }
+        Focus::Sessions
+    }
+
+    /// Where `target` was drawn on the last frame — the rect the hit was
+    /// registered with. A dropdown hangs off the word it belongs to, so
+    /// it needs the word's own cell and not the pointer's.
+    pub fn hit_rect(&self, target: &HitTarget) -> Option<Rect> {
+        self.hits
+            .iter()
+            .find(|(_, t)| t == target)
+            .map(|(rect, _)| *rect)
     }
 
     pub fn hit_at(&self, x: u16, y: u16) -> Option<HitTarget> {
@@ -5222,7 +5295,6 @@ mod tests {
         let project_id = ProjectId("p1".into());
         let worktree_id = WorktreeId("w1".into());
         app.tree.projects.push(Project {
-            workspace_id: Default::default(),
             id: project_id.clone(),
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
@@ -5508,5 +5580,92 @@ mod tests {
         v.filter = "zzz".into();
         v.apply_filter();
         assert_eq!(v.toggle_reviewed(), None);
+    }
+
+    // ---- the recency rollups ----
+
+    /// The one-pass rollups must answer exactly what the per-row functions
+    /// answer, for every checkout and every project — including the ones
+    /// with no sessions under them at all, which the maps have no entry for
+    /// and the sorts read as a default stamp.
+    ///
+    /// They exist only to stop the row sorts re-walking every session per
+    /// COMPARISON (`worktree_recencies`); the moment they disagree with
+    /// `worktree_recency` the launcher silently reorders itself.
+    #[test]
+    fn the_one_pass_rollups_agree_with_the_per_row_stamps() {
+        use nebula_core::AgentKind;
+
+        let now = 10_000;
+        let mut tree = Tree::default();
+        for p in 0..3 {
+            tree.projects.push(Project {
+                id: ProjectId(format!("p{p}")),
+                name: format!("p{p}"),
+                repo_path: format!("/tmp/p{p}").into(),
+                sort_order: p,
+            });
+            for w in 0..3 {
+                tree.worktrees.push(Worktree {
+                    id: WorktreeId(format!("p{p}w{w}")),
+                    project_id: ProjectId(format!("p{p}")),
+                    path: format!("/tmp/p{p}w{w}").into(),
+                    branch: if w == 0 {
+                        "main".into()
+                    } else {
+                        format!("b{w}")
+                    },
+                    is_main: w == 0,
+                    sort_order: w,
+                });
+            }
+        }
+        // Sessions on some checkouts and not others, live turns among them
+        // (which count as interacting NOW, the tie the raw stamp breaks).
+        for (i, wt) in ["p0w0", "p0w0", "p0w1", "p1w2", "p2w0"].iter().enumerate() {
+            tree.agents.push(Agent {
+                id: AgentId(format!("a{i}")),
+                worktree_id: WorktreeId((*wt).into()),
+                name: format!("a{i}"),
+                status: if i % 2 == 0 {
+                    AgentStatus::Finished
+                } else {
+                    AgentStatus::Running
+                },
+                archived: i == 4,
+                archived_at: 0,
+                unseen: false,
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: 100 * (i as i64 + 1),
+                alive: true,
+                recent_prompts: Vec::new(),
+            });
+        }
+
+        let by_worktree = worktree_recencies(&tree, now);
+        for w in &tree.worktrees {
+            assert_eq!(
+                by_worktree.get(&w.id).copied().unwrap_or_default(),
+                worktree_recency(&tree, &w.id, now),
+                "checkout {:?}",
+                w.id
+            );
+        }
+
+        let by_project = project_recencies(&tree, now);
+        for p in &tree.projects {
+            assert_eq!(
+                by_project.get(&p.id).copied().unwrap_or_default(),
+                project_recency(&tree, &p.id, now),
+                "project {:?}",
+                p.id
+            );
+        }
     }
 }

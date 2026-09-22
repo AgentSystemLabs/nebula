@@ -17,15 +17,15 @@ IPC is length-prefixed MessagePack: the client sends `ClientRequest`s (CRUD, att
 
 Everything is nested:
 
-**Workspace** (a named project group) → **Project** (a git repo) → **Worktree** (main checkout or `git worktree add`) → **Session** (an agent *or* a plain terminal tab).
+**Project** (a git repo) → **Worktree** (main checkout or `git worktree add`) → **Session** (an agent *or* a plain terminal tab).
 
-Exactly one workspace is *open* at a time — daemon-global state, switched with `nebula workspace open <name>` or the TUI's `w` picker and broadcast to every client. The TUI scopes its Projects panel and `/` search to the open workspace; other workspaces' sessions keep running (and keep receiving status updates) in the background. Every install starts with the built-in `default` workspace, and `nebula add` files new projects under whichever workspace is open.
+Every project is in one list — there is no grouping above it. One repo is one project: adding a path that resolves to a repo already registered (its root or any checkout of it) is refused. The TUI shows one project's sessions at a time and moves between projects with its PROJECT TABS; every other project's sessions keep running (and keep receiving status updates) in the background. Databases through 0.33 grouped projects into named workspaces; migration 28 folds the groups away, merging a repo that sat in two of them into its older row.
 
 Worktrees are real git worktrees, created under `<repo>/../<repo-name>-worktrees/<branch>`. The daemon also polls git metadata so worktrees created outside Nebula still show up.
 
 An agent is a PTY running `claude`, `codex`, `cursor-agent`, `pi`, or `muse` in that worktree. Restart uses `--resume <session-id>` when one is stored (muse always boots fresh: no resume flag mapped yet).
 
-Persistence is SQLite at `~/.local/share/nebula/nebula.db`: workspaces (one flagged open), projects, worktrees, agents (kind + CLI session id, plus a PR URL when the AGENT was created from one), links, last UI selection.
+Persistence is SQLite at `~/.local/share/nebula/nebula.db`: projects, worktrees, agents (kind + CLI session id, plus a PR URL when the AGENT was created from one), links, last UI selection.
 
 Worktrees can still carry a persisted **link list** from earlier versions: URLs pinned to a checkout and normalized to http(s) on the way in. The TUI no longer exposes manual link creation, but keeps existing rows visible and editable so no stored data disappears. The Sessions panel presents those rows under OPEN PRS with the row nothing stores: the pull request on that branch, looked up client-side with `gh pr view` on the git-poll tick and cached per worktree. The detected row opens in the browser but can't be edited or deleted — it comes back from git on the next lookup. A saved link that matches the detected PR is shown once, as the pull-request row.
 

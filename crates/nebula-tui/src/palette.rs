@@ -1,40 +1,38 @@
-//! The `/` PALETTE: one fuzzy search over every WORKSPACE, PROJECT,
-//! WORKTREE, SESSION and open pull request nebula knows about, in *every*
-//! workspace — the "jump to anything" tool. Its rows are built here from
+//! The `/` PALETTE: one fuzzy search over every PROJECT, WORKTREE,
+//! SESSION and open pull request nebula knows about — the "jump to
+//! anything" tool. Its rows are built here from
 //! the tree; `event_loop.rs` handles the keys and the jump, `ui.rs` draws
 //! the rows.
 //!
-//! The list is NESTED: each project is a header row with its rows indented
-//! under it, so the palette reads project → session title instead of a
-//! column of `workspace/project/branch/session` paths. Before a query it is
-//! the RECENT OVERVIEW — only projects and their sessions, project by
-//! project; typing searches everything, still grouped under the projects.
+//! The list is FLAT: one row per thing, each drawing the project it lives
+//! in dim before its own name — `demo/fix-login` — instead of a header row
+//! with its rows indented under it, and instead of a column of full
+//! `project/branch/session` paths. Before a query it is the RECENT
+//! SESSIONS list: only the sessions, the ones that want you first; typing
+//! reaches the projects, worktrees and pull requests too, on lines of
+//! their own in that same order.
 
 use crate::app::{
     clamp_selection, last_interaction_ms, now_ms, project_recency, project_rollup, project_unseen,
-    window_start, workspace_recency, workspace_rollup, workspace_unseen, worktree_recency,
-    worktree_rollup, worktree_unseen, OpenPrs, Tree,
+    window_start, worktree_recency, worktree_rollup, worktree_unseen, OpenPrs, Tree,
 };
 use crate::pull_request::{Standing, Trouble};
 use crate::text_input::TextInput;
-use nebula_core::{Agent, AgentId, AgentStatus, Project, ProjectId, WorkspaceId, WorktreeId};
+use nebula_core::{Agent, AgentId, AgentStatus, Project, ProjectId, WorktreeId};
 use ratatui::layout::Rect;
 use std::collections::HashMap;
 
 /// What a `/` palette row jumps to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteTarget {
-    /// A whole workspace: picking it switches this instance to it, the
-    /// same as the `w` switcher's Enter.
-    Workspace(WorkspaceId),
     Project(ProjectId),
     Worktree(WorktreeId),
     Session(AgentId),
     /// An open pull request on `project`'s repo, addressed by URL — the
     /// only identity it has, since nothing about a PR is stored. Picking it
     /// lands the Worktrees cursor on its row in that project's OPEN PRS
-    /// group, so the pane reads it; the project is what says which
-    /// workspace to switch to and which group to unfold on the way.
+    /// group, so the pane reads it; the project is what says which group
+    /// to unfold on the way.
     PullRequest {
         project: ProjectId,
         url: String,
@@ -45,48 +43,42 @@ pub enum PaletteTarget {
 /// the PALETTE's attention order, best first. A SESSION waiting on you
 /// (NEEDS FEEDBACK) comes first, then one mid-turn (RUNNING), then one that
 /// finished a turn nobody has read (UNSEEN); every other row — read and
-/// never-run sessions, and every workspace, project, worktree and pull
-/// request — sorts under those in RECENCY ORDER, so the checkout you were
-/// just in is the first thing after what needs you. ARCHIVED rows sink
-/// below even the never-run ones, as in the SESSIONS PANEL.
+/// never-run sessions, and every project, worktree and pull request — sorts under those in RECENCY ORDER, so the checkout you were
+/// just in is the first thing after what needs you. ARCHIVED sessions have
+/// no tier because they have no row — see [`build_palette_items`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PaletteTier {
     NeedsFeedback,
     Running,
     Unseen,
     Rest,
-    Archived,
 }
 
 /// One searchable row of the `/` palette. `text` is the string the fuzzy
-/// filter runs over: every row carries its full path from the workspace
-/// down — `workspace` for workspaces, `workspace/project` for projects,
-/// `workspace/project/branch` for worktrees, `workspace/project/branch/name`
-/// for sessions — so a query can narrow by any ancestor, a workspace name
-/// included. Only the part from `label_at` on is drawn; the project the
-/// rest names is the header the row sits under.
+/// filter runs over: every row carries its full path from the project
+/// down — `project` for projects, `project/branch` for worktrees,
+/// `project/branch/name` for sessions — so a query can narrow by any
+/// ancestor. Two slices of it are drawn: the `crumb` (the project) and
+/// everything from `label_at` on (the row's own name). What lies between
+/// — a session's branch — is searched but not drawn.
 #[derive(Debug, Clone)]
 pub struct PaletteItem {
     pub target: PaletteTarget,
     pub text: String,
     /// Char index into `text` where the row's own name starts — past the
-    /// path a query can still narrow by. The row draws only this part, and
-    /// match positions before it light nothing.
+    /// path a query can still narrow by. The row draws this part and the
+    /// `crumb`; match positions outside both light nothing.
     pub label_at: usize,
-    /// Index into the palette's `items` of the project row this one nests
-    /// under — every worktree, session and pull request row has one — or
-    /// `None` for a project or workspace row, which sits at the top level.
-    pub parent: Option<usize>,
+    /// Char range in `text` of the CRUMB drawn dim before the row's own
+    /// name — the project it lives in, which every worktree, session and
+    /// pull request row carries, so a flat row still says where it is
+    /// (`demo/fix-login`). `None` on a project row, which is its own name
+    /// already.
+    pub crumb: Option<(usize, usize)>,
     /// The raw stamp the row's dim "23m ago" reads, the one its panel row
     /// shows: `status_changed_at` for a session, the newest one under it
     /// for a worktree. 0 = never run, no label.
     pub stamped: i64,
-    /// A project row outside the open workspace carries that workspace's
-    /// name, drawn dim at the row's right edge, so two workspaces' projects of
-    /// the same name are told apart and a pick that switches workspace
-    /// says so first. `None` for every other row.
-    pub workspace: Option<String>,
-    pub archived: bool,
     /// The status this row's panel row would show: a rollup for projects
     /// and worktrees, its own status for a session. Drives the glyph color
     /// and the text sweep, so a running session reads as running in the
@@ -101,8 +93,8 @@ pub struct PaletteItem {
     pub tier: PaletteTier,
     /// The row's RECENCY ORDER stamp: [`last_interaction_ms`] for a session
     /// (a working one counts as now), the newest stamp under it for a
-    /// workspace, project or worktree, `archived_at` for an archived row,
-    /// nothing for a pull request. 0 sorts last within its tier.
+    /// project or worktree, nothing for a pull request. 0 sorts
+    /// last within its tier.
     pub interacted: i64,
     /// Where a pull request row's PR stands — `Draft`, or `Open` for one
     /// that is ready for review; every row here is open, so those are the
@@ -126,27 +118,19 @@ pub struct PaletteItem {
 pub struct PaletteMatch {
     pub item: usize,
     pub positions: Vec<usize>,
-    /// Drawn indented under the project header above it.
-    pub nested: bool,
-    /// A project header the query did not match itself, listed only to
-    /// place the rows under it that did. Still a row the cursor can pick;
-    /// it just does not count toward the title's `(hits/total)`.
-    pub context: bool,
 }
 
-/// Fuzzy-search palette over every workspace, project, worktree, and
-/// session (`/`), across all workspaces — not just the open one.
+/// Fuzzy-search palette over every project, worktree, and session (`/`).
 #[derive(Debug, Clone)]
 pub struct Palette {
     pub items: Vec<PaletteItem>,
     /// Type-to-filter query over `items` texts; always live.
     pub query: TextInput,
-    /// Visible rows, NESTED: `items` narrowed by `query` (to projects and
-    /// sessions while it is empty), best matches first — ties, and the
-    /// whole list before a query, in the attention order of
-    /// [`PaletteTier`] then most recent interaction — then folded under
-    /// their projects: each project where its best row ranks, its rows
-    /// after it in that same order. See [`nest`].
+    /// Visible rows, FLAT: `items` narrowed by `query` (to the sessions
+    /// while it is empty), best matches first — ties, and the whole list
+    /// before a query, in the attention order of [`PaletteTier`] then most
+    /// recent interaction. One row per thing, nothing folded under
+    /// anything.
     pub matches: Vec<PaletteMatch>,
     /// Index into `matches` (not `items`).
     pub selected: usize,
@@ -164,13 +148,12 @@ pub struct Palette {
 impl Palette {
     pub fn new(
         tree: &Tree,
-        show_archived: bool,
         enter_attaches: bool,
         open_prs: &HashMap<ProjectId, OpenPrs>,
         hide_draft_prs: bool,
     ) -> Self {
         let mut palette = Self {
-            items: build_palette_items(tree, show_archived, open_prs, hide_draft_prs),
+            items: build_palette_items(tree, open_prs, hide_draft_prs),
             query: TextInput::new(),
             matches: Vec::new(),
             selected: 0,
@@ -190,12 +173,11 @@ impl Palette {
     pub fn rebuild(
         &mut self,
         tree: &Tree,
-        show_archived: bool,
         open_prs: &HashMap<ProjectId, OpenPrs>,
         hide_draft_prs: bool,
     ) {
         let keep = self.selected_target().cloned();
-        self.items = build_palette_items(tree, show_archived, open_prs, hide_draft_prs);
+        self.items = build_palette_items(tree, open_prs, hide_draft_prs);
         self.apply_filter();
         if let Some(target) = keep {
             if let Some(row) = self
@@ -230,109 +212,45 @@ impl Palette {
     }
 
     /// Recompute `matches` from `query` and put the selection on the best
-    /// row. Best matches first; the attention order breaks ties and is the
-    /// whole order when the query is empty, so `/` `Enter` lands on the
-    /// session that needs you before anything else — nested under its
-    /// project, which is why the cursor goes to that row and not to the
-    /// header drawn above it.
+    /// row — the top one, since the list is flat and nothing is drawn only
+    /// to hold something else. Best matches first; the attention order
+    /// breaks ties and is the whole order when the query is empty, so `/`
+    /// `Enter` lands on the session that needs you before anything else.
     pub fn apply_filter(&mut self) {
         let rank = attention_rank(&self.items);
         let overview = self.query.trim().is_empty();
-        let ranked: Vec<(usize, Vec<usize>)> = crate::fuzzy::rank_by(
+        self.matches = crate::fuzzy::rank_by(
             &self.query,
             self.items.iter().map(|i| i.text.as_str()),
             |i, _| rank[i],
         )
         .into_iter()
         .filter(|(i, _)| !overview || self.items[*i].in_overview())
+        .map(|(item, positions)| PaletteMatch { item, positions })
         .collect();
-        // Before a query the cursor starts on a session: a project ties its
-        // newest session's stamp and wins the tie on build order, but its
-        // header is drawn right above that session anyway, and `/` `Enter`
-        // is for going back to what you ran. A query keeps its best match,
-        // project or not.
-        let best = ranked
-            .iter()
-            .find(|(i, _)| !overview || matches!(self.items[*i].target, PaletteTarget::Session(_)))
-            .or(ranked.first())
-            .map(|(i, _)| *i);
-        self.matches = nest(&self.items, ranked);
-        self.selected = best
-            .and_then(|b| self.matches.iter().position(|m| m.item == b))
-            .unwrap_or(0);
+        self.selected = 0;
     }
 
-    /// Rows the query actually matched — the title's count, which leaves
-    /// out the context headers placed only to hold them.
+    /// Rows the query matched — the title's count, which is every visible
+    /// row now that the list is flat.
     pub fn hits(&self) -> usize {
-        self.matches.iter().filter(|m| !m.context).count()
+        self.matches.len()
     }
 }
 
 impl PaletteItem {
-    /// Whether the row belongs in the RECENT OVERVIEW `/` opens on before
-    /// anything is typed: the projects and the sessions under them. The
-    /// workspaces, worktrees and pull requests wait for a query.
+    /// Whether the row belongs in the RECENT SESSIONS list `/` opens on
+    /// before anything is typed: the sessions, and only those. The
+    /// projects, worktrees and pull requests wait for a query.
     fn in_overview(&self) -> bool {
-        matches!(
-            self.target,
-            PaletteTarget::Project(_) | PaletteTarget::Session(_)
-        )
+        matches!(self.target, PaletteTarget::Session(_))
     }
-}
-
-/// Fold a best-first ranking into the NESTED list: each project header
-/// where its best-ranked row (or itself) first appears, then that
-/// project's rows in rank order, indented; a workspace row stands alone at
-/// the top level. A project the query did not match comes along as a
-/// `context` header so its rows never float free of it.
-fn nest(items: &[PaletteItem], ranked: Vec<(usize, Vec<usize>)>) -> Vec<PaletteMatch> {
-    struct Group {
-        head: usize,
-        /// The header's own match, `None` while it is only context.
-        head_positions: Option<Vec<usize>>,
-        rows: Vec<(usize, Vec<usize>)>,
-    }
-    let mut groups: Vec<Group> = Vec::new();
-    let mut slot: HashMap<usize, usize> = HashMap::new();
-    for (i, positions) in ranked {
-        let head = items[i].parent.unwrap_or(i);
-        let g = *slot.entry(head).or_insert_with(|| {
-            groups.push(Group {
-                head,
-                head_positions: None,
-                rows: Vec::new(),
-            });
-            groups.len() - 1
-        });
-        if head == i {
-            groups[g].head_positions = Some(positions);
-        } else {
-            groups[g].rows.push((i, positions));
-        }
-    }
-    let mut matches = Vec::new();
-    for g in groups {
-        matches.push(PaletteMatch {
-            item: g.head,
-            context: g.head_positions.is_none(),
-            positions: g.head_positions.unwrap_or_default(),
-            nested: false,
-        });
-        matches.extend(g.rows.into_iter().map(|(item, positions)| PaletteMatch {
-            item,
-            positions,
-            nested: true,
-            context: false,
-        }));
-    }
-    matches
 }
 
 /// Each item's position in the attention order: tier first, then most
-/// recently interacted, then build order — which keeps a workspace over its
-/// projects over their worktrees over their sessions when they share a
-/// stamp, and never-run rows in tree order with the open workspace first.
+/// recently interacted, then build order — which keeps a project over its
+/// worktrees over their sessions when they share a stamp, and never-run
+/// rows in tree order.
 fn attention_rank(items: &[PaletteItem]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&i| (items[i].tier, std::cmp::Reverse(items[i].interacted), i));
@@ -343,14 +261,14 @@ fn attention_rank(items: &[PaletteItem]) -> Vec<usize> {
     rank
 }
 
-/// The SESSION rows of the `/` palette in its attention order — what `]`
-/// and `[` step through with no modal open: the same [`attention_rank`]
+/// The SESSION rows of the `/` palette in its attention order — what `.`
+/// and `,` step through with no modal open: the same [`attention_rank`]
 /// the palette applies before a query is typed, kept to the rows that are
-/// sessions. Every workspace contributes, not only the open one, and
-/// archived sessions are left out whatever the SESSIONS PANEL's toggle
-/// says: a released PTY has nothing left to ask of anyone.
+/// sessions. Every project contributes, not only the one on screen, and
+/// archived sessions are left out, here as in the palette itself: a
+/// released PTY has nothing left to ask of anyone.
 pub fn attention_sessions(tree: &Tree) -> Vec<AgentId> {
-    let items = build_palette_items(tree, false, &HashMap::new(), false);
+    let items = build_palette_items(tree, &HashMap::new(), false);
     let rank = attention_rank(&items);
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&i| rank[i]);
@@ -364,12 +282,9 @@ pub fn attention_sessions(tree: &Tree) -> Vec<AgentId> {
 }
 
 /// The tier a session row sorts into — its own status, read against the
-/// UNSEEN flag the DONE BADGE counts; an archived row sinks whatever its
-/// last status was.
+/// UNSEEN flag the DONE BADGE counts. Archived sessions never reach here:
+/// they are not rows at all.
 fn session_tier(a: &Agent) -> PaletteTier {
-    if a.archived {
-        return PaletteTier::Archived;
-    }
     match a.status {
         AgentStatus::NeedsFeedback => PaletteTier::NeedsFeedback,
         AgentStatus::Running => PaletteTier::Running,
@@ -378,202 +293,129 @@ fn session_tier(a: &Agent) -> PaletteTier {
     }
 }
 
-/// Every jumpable entity, across every workspace: the workspaces
-/// themselves, then each one's projects in tree order, then their
+/// Every jumpable entity: each project in tree order, then their
 /// worktrees, then their sessions, then the open pull requests nebula has
-/// fetched. Archived sessions appear only when the archived toggle is on
-/// (the Sessions panel rule); draft pull requests only while
-/// `hide_draft_prs` is off (the PROJECT OPEN PRS GROUP's rule — the two
-/// surfaces show the same rows). Worktrees and sessions are never held
-/// back by either.
+/// fetched. ARCHIVED SESSIONS ARE NEVER ROWS, whatever the SESSIONS
+/// PANEL's `A` toggle shows: a released PTY has nothing left to jump to,
+/// and the find-anything tool is for what is still live. Draft pull
+/// requests are left out only while `hide_draft_prs` is on (the PROJECT
+/// OPEN PRS GROUP's rule — the two surfaces show the same rows);
+/// worktrees are never held back.
 ///
 /// This is the build order — what `matches` falls back to among rows with
-/// the same tier and stamp; the open workspace comes first so never-run
-/// rows favor what's on screen. The order the user sees is
-/// [`attention_rank`]'s. Every row's text is prefixed with its workspace,
-/// which is both what keeps the paths unambiguous once two workspaces can
-/// hold the same project name and what lets a query cross over (`/` then
-/// the other workspace's name).
+/// the same tier and stamp. The order the user sees is
+/// [`attention_rank`]'s.
 fn build_palette_items(
     tree: &Tree,
-    show_archived: bool,
     open_prs: &HashMap<ProjectId, OpenPrs>,
     hide_draft_prs: bool,
 ) -> Vec<PaletteItem> {
     let now = now_ms();
     let mut items = Vec::new();
-    for id in palette_workspace_order(tree) {
-        // A project can outlive knowledge of its workspace — its upsert can
-        // land before the workspace's, and a workspace can go while a stale
-        // project row is still in the tree. Such a project still belongs in
-        // `/` (vanishing from the find-anything tool is the worst failure
-        // it has); it just has no name to path it under, and no row of its
-        // own to jump to.
-        let workspace = tree.workspaces.iter().find(|w| w.id == id);
-        if let Some(ws) = workspace {
+    // Where each project's own name sits inside its rows' paths: the
+    // crumb every row under it draws dim before its own name.
+    let crumb = |p: &Project| Some((0, p.name.chars().count()));
+    let projects: Vec<&Project> = tree.projects.iter().collect();
+    // The kinds stay grouped project → worktree → session, so a bare
+    // query still ranks the shallowest match first.
+    for p in &projects {
+        items.push(PaletteItem {
+            target: PaletteTarget::Project(p.id.clone()),
+            text: p.name.clone(),
+            label_at: 0,
+            crumb: None,
+            stamped: project_recency(tree, &p.id, now).stamped,
+            status: project_rollup(tree, &p.id),
+            unseen: project_unseen(tree, &p.id) > 0,
+            tier: PaletteTier::Rest,
+            interacted: project_recency(tree, &p.id, now).interacted,
+            standing: None,
+            trouble: None,
+        });
+    }
+    for p in &projects {
+        let under = format!("{}/", p.name);
+        for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
             items.push(PaletteItem {
-                target: PaletteTarget::Workspace(ws.id.clone()),
-                text: ws.name.clone(),
-                label_at: 0,
-                parent: None,
-                stamped: workspace_recency(tree, &ws.id, now).stamped,
-                workspace: None,
-                archived: false,
-                status: workspace_rollup(tree, &ws.id),
-                unseen: workspace_unseen(tree, &ws.id) > 0,
+                target: PaletteTarget::Worktree(w.id.clone()),
+                text: format!("{under}{}", w.branch),
+                label_at: under.chars().count(),
+                crumb: crumb(p),
+                stamped: worktree_recency(tree, &w.id, now).stamped,
+                status: worktree_rollup(tree, &w.id),
+                unseen: worktree_unseen(tree, &w.id) > 0,
                 tier: PaletteTier::Rest,
-                interacted: workspace_recency(tree, &ws.id, now).interacted,
+                interacted: worktree_recency(tree, &w.id, now).interacted,
                 standing: None,
                 trouble: None,
             });
         }
-        let at = match workspace {
-            Some(ws) => format!("{}/", ws.name),
-            None => String::new(),
-        };
-        // Named on each of its project headers when it isn't the one open.
-        let away = workspace
-            .filter(|ws| ws.id != tree.active_workspace)
-            .map(|ws| ws.name.clone());
-        let projects: Vec<&Project> = tree
-            .projects
-            .iter()
-            .filter(|p| p.workspace_id == id)
-            .collect();
-        // Project `k`'s row is `first + k`: the header its rows nest under.
-        let first = items.len();
-        // Within a workspace the kinds stay grouped project → worktree →
-        // session, so a bare query still ranks the shallowest match first.
-        for p in &projects {
-            items.push(PaletteItem {
-                target: PaletteTarget::Project(p.id.clone()),
-                text: format!("{at}{}", p.name),
-                label_at: at.chars().count(),
-                parent: None,
-                stamped: project_recency(tree, &p.id, now).stamped,
-                workspace: away.clone(),
-                archived: false,
-                status: project_rollup(tree, &p.id),
-                unseen: project_unseen(tree, &p.id) > 0,
-                tier: PaletteTier::Rest,
-                interacted: project_recency(tree, &p.id, now).interacted,
-                standing: None,
-                trouble: None,
-            });
-        }
-        for (k, p) in projects.iter().enumerate() {
-            let under = format!("{at}{}/", p.name);
-            for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+    }
+    for p in &projects {
+        for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+            // The branch stays in the searched path but not the drawn
+            // label: the row reads project → session title.
+            let under = format!("{}/{}/", p.name, w.branch);
+            for a in tree.agents.iter().filter(|a| a.worktree_id == w.id) {
+                // An ARCHIVED session is not a jump target: its PTY is
+                // released, so there is nothing to attach to or answer.
+                if a.archived {
+                    continue;
+                }
                 items.push(PaletteItem {
-                    target: PaletteTarget::Worktree(w.id.clone()),
-                    text: format!("{under}{}", w.branch),
+                    target: PaletteTarget::Session(a.id.clone()),
+                    text: format!("{under}{}", a.name),
                     label_at: under.chars().count(),
-                    parent: Some(first + k),
-                    stamped: worktree_recency(tree, &w.id, now).stamped,
-                    workspace: None,
-                    archived: false,
-                    status: worktree_rollup(tree, &w.id),
-                    unseen: worktree_unseen(tree, &w.id) > 0,
-                    tier: PaletteTier::Rest,
-                    interacted: worktree_recency(tree, &w.id, now).interacted,
+                    crumb: crumb(p),
+                    stamped: a.status_changed_at,
+                    status: Some(a.status),
+                    unseen: a.unseen,
+                    tier: session_tier(a),
+                    interacted: last_interaction_ms(a, now),
                     standing: None,
                     trouble: None,
                 });
             }
         }
-        for (k, p) in projects.iter().enumerate() {
-            for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
-                // The branch stays in the searched path but not the drawn
-                // label: the row reads project → session title.
-                let under = format!("{at}{}/{}/", p.name, w.branch);
-                for a in tree.agents.iter().filter(|a| a.worktree_id == w.id) {
-                    if a.archived && !show_archived {
-                        continue;
-                    }
-                    items.push(PaletteItem {
-                        target: PaletteTarget::Session(a.id.clone()),
-                        text: format!("{under}{}", a.name),
-                        label_at: under.chars().count(),
-                        parent: Some(first + k),
-                        stamped: a.status_changed_at,
-                        workspace: None,
-                        archived: a.archived,
-                        status: Some(a.status),
-                        unseen: a.unseen && !a.archived,
-                        tier: session_tier(a),
-                        // Archived rows order among themselves by when they
-                        // were archived, the Sessions panel's rule.
-                        interacted: if a.archived {
-                            a.archived_at
-                        } else {
-                            last_interaction_ms(a, now)
-                        },
-                        standing: None,
-                        trouble: None,
-                    });
-                }
-            }
-        }
-        // Pull requests go last so a query that also matches a session
-        // still lands on the session first — the panels are what `/` is
-        // mostly for. Only projects whose list has actually been fetched
-        // contribute; the rest simply have nothing to offer yet.
-        for (k, p) in projects.iter().enumerate() {
-            let Some(open) = open_prs.get(&p.id) else {
+    }
+    // Pull requests go last so a query that also matches a session still
+    // lands on the session first — the panels are what `/` is mostly for.
+    // Only projects whose list has actually been fetched contribute; the
+    // rest simply have nothing to offer yet.
+    for p in &projects {
+        let Some(open) = open_prs.get(&p.id) else {
+            continue;
+        };
+        let under = format!("{}/", p.name);
+        for pr in &open.list {
+            if hide_draft_prs && pr.is_draft {
                 continue;
-            };
-            let under = format!("{at}{}/", p.name);
-            for pr in &open.list {
-                if hide_draft_prs && pr.is_draft {
-                    continue;
-                }
-                items.push(PaletteItem {
-                    target: PaletteTarget::PullRequest {
-                        project: p.id.clone(),
-                        url: pr.url.clone(),
-                    },
-                    text: format!("{under}{}", pr.label()),
-                    label_at: under.chars().count(),
-                    parent: Some(first + k),
-                    stamped: 0,
-                    workspace: None,
-                    archived: false,
-                    status: None,
-                    unseen: false,
-                    tier: PaletteTier::Rest,
-                    interacted: 0,
-                    standing: Some(pr.standing()),
-                    trouble: pr.trouble(),
-                });
             }
+            items.push(PaletteItem {
+                target: PaletteTarget::PullRequest {
+                    project: p.id.clone(),
+                    url: pr.url.clone(),
+                },
+                text: format!("{under}{}", pr.label()),
+                label_at: under.chars().count(),
+                crumb: crumb(p),
+                stamped: 0,
+                status: None,
+                unseen: false,
+                tier: PaletteTier::Rest,
+                interacted: 0,
+                standing: Some(pr.standing()),
+                trouble: pr.trouble(),
+            });
         }
     }
     items
 }
 
-/// The workspaces `/` walks, in build order: the open one first (so among
-/// never-run rows what's on screen wins), then the rest in tree order,
-/// then any workspace only a project still refers to — see the orphan note
-/// in [`build_palette_items`].
-fn palette_workspace_order(tree: &Tree) -> Vec<WorkspaceId> {
-    let mut order = vec![tree.active_workspace.clone()];
-    let ids = tree
-        .workspaces
-        .iter()
-        .map(|w| w.id.clone())
-        .chain(tree.projects.iter().map(|p| p.workspace_id.clone()));
-    for id in ids {
-        if !order.contains(&id) {
-            order.push(id);
-        }
-    }
-    order
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nebula_core::{AgentKind, Workspace, Worktree};
+    use nebula_core::{AgentKind, Worktree};
 
     fn agent(id: &str, wt: &str, status: AgentStatus, unseen: bool, stamp: i64) -> Agent {
         Agent {
@@ -597,9 +439,8 @@ mod tests {
         }
     }
 
-    fn project(ws: &str, id: &str, name: &str) -> Project {
+    fn project(id: &str, name: &str) -> Project {
         Project {
-            workspace_id: WorkspaceId(ws.into()),
             id: ProjectId(id.into()),
             name: name.into(),
             repo_path: format!("/tmp/{name}").into(),
@@ -618,26 +459,12 @@ mod tests {
         }
     }
 
-    /// Two workspaces: `default/demo` with `main` (a session waiting on
-    /// you, one mid-turn, one never run) and `feat` (one unread finish,
-    /// one read finish, newer), and `other/quiet`, which has never run.
+    /// Two projects: `demo` with `main` (a session waiting on you, one
+    /// mid-turn, one never run) and `feat` (one unread finish, one read
+    /// finish, newer), and `quiet`, which has never run.
     fn tree() -> Tree {
         Tree {
-            workspaces: vec![
-                Workspace {
-                    id: WorkspaceId("default".into()),
-                    name: "default".into(),
-                },
-                Workspace {
-                    id: WorkspaceId("other".into()),
-                    name: "other".into(),
-                },
-            ],
-            active_workspace: WorkspaceId("default".into()),
-            projects: vec![
-                project("default", "p1", "demo"),
-                project("other", "p2", "quiet"),
-            ],
+            projects: vec![project("p1", "demo"), project("p2", "quiet")],
             worktrees: vec![
                 worktree("w1", "p1", "main"),
                 worktree("w2", "p1", "feat"),
@@ -655,11 +482,11 @@ mod tests {
         }
     }
 
-    /// The palette as drawn: a project header by its label (with the other
-    /// workspace it lives in, `◇ other`), the rows under it stepped in two
-    /// columns, and the row the cursor starts on marked `▶`.
-    fn rows(tree: &Tree, show_archived: bool, query: &str) -> Vec<String> {
-        let mut palette = Palette::new(tree, show_archived, false, &HashMap::new(), false);
+    /// The palette as drawn: every row on a line of its own, its project
+    /// crumb then its own name (`demo/ask`), and the row the cursor starts
+    /// on marked `▶`.
+    fn rows(tree: &Tree, query: &str) -> Vec<String> {
+        let mut palette = Palette::new(tree, false, &HashMap::new(), false);
         palette.query = TextInput::from(query);
         palette.apply_filter();
         palette
@@ -668,37 +495,34 @@ mod tests {
             .enumerate()
             .map(|(row, m)| {
                 let item = &palette.items[m.item];
+                let crumb = item.crumb.map_or(String::new(), |(at, end)| {
+                    let name: String = item.text.chars().take(end).skip(at).collect();
+                    format!("{name}/")
+                });
                 let label: String = item.text.chars().skip(item.label_at).collect();
-                let away = item
-                    .workspace
-                    .as_ref()
-                    .map_or(String::new(), |ws| format!(" ◇ {ws}"));
                 let mark = if row == palette.selected { "▶" } else { "" };
-                let indent = if m.nested { "  " } else { "" };
-                format!("{mark}{indent}{label}{away}")
+                format!("{mark}{crumb}{label}")
             })
             .collect()
     }
 
-    /// Before a query `/` is the RECENT OVERVIEW: each project with its
-    /// sessions under it — no workspace, worktree or branch in the way —
-    /// the project that needs you first, and inside it the attention
-    /// order: NEEDS FEEDBACK, RUNNING, UNSEEN, then by last interaction,
-    /// never-run at the bottom. The cursor starts on the session that
-    /// needs you, not on the header drawn above it.
+    /// Before a query `/` is the RECENT SESSIONS list: one flat line per
+    /// session, each naming the project it lives in — no worktree or
+    /// branch in the way, and no header rows — in the
+    /// attention order NEEDS FEEDBACK, RUNNING, UNSEEN, then by last
+    /// interaction, never-run at the bottom. The cursor starts on the
+    /// session that needs you. `quiet`, a project with no sessions, is not
+    /// a row until something is typed.
     #[test]
-    fn empty_query_nests_sessions_under_projects_in_attention_order() {
+    fn empty_query_lists_the_sessions_flat_in_attention_order() {
         assert_eq!(
-            rows(&tree(), false, ""),
+            rows(&tree(), ""),
             [
-                "demo",
-                "▶  ask",
-                "  run",
-                "  unread",
-                "  read",
-                "  fresh",
-                // The other workspace's project, named as such.
-                "quiet ◇ other",
+                "▶demo/ask",
+                "demo/run",
+                "demo/unread",
+                "demo/read",
+                "demo/fresh",
             ]
         );
     }
@@ -713,62 +537,55 @@ mod tests {
             .retain(|a| a.name == "read" || a.name == "fresh");
         tree.agents
             .push(agent("older", "w1", AgentStatus::Finished, false, 20));
-        assert_eq!(
-            rows(&tree, false, ""),
-            ["demo", "▶  read", "  older", "  fresh", "quiet ◇ other"]
-        );
+        assert_eq!(rows(&tree, ""), ["▶demo/read", "demo/older", "demo/fresh"]);
     }
 
-    /// The overview leaves out the workspace, worktree and pull request
-    /// rows; a query reaches them, still grouped: a workspace row stands
-    /// alone at the top level, a worktree nests under its project.
+    /// The overview leaves out the project, worktree and pull request rows;
+    /// a query reaches them, each on a line of its own — a project by its
+    /// bare name, a worktree with its project in front.
     #[test]
     fn a_query_reaches_the_rows_the_overview_leaves_out() {
         let tree = tree();
-        let palette = Palette::new(&tree, false, false, &HashMap::new(), false);
+        let palette = Palette::new(&tree, false, &HashMap::new(), false);
         assert!(
-            palette.matches.iter().all(|m| matches!(
-                palette.items[m.item].target,
-                PaletteTarget::Project(_) | PaletteTarget::Session(_)
-            )),
-            "only projects and sessions before a query"
+            palette
+                .matches
+                .iter()
+                .all(|m| matches!(palette.items[m.item].target, PaletteTarget::Session(_))),
+            "only sessions before a query"
         );
-        assert_eq!(
-            rows(&tree, false, "other"),
-            ["▶other", "quiet ◇ other", "  main"]
-        );
+        assert_eq!(rows(&tree, "quiet"), ["▶quiet", "quiet/main"]);
     }
 
     #[test]
     fn a_query_ranks_score_first_and_attention_on_ties() {
         let tree = tree();
-        // Every `demo` row scores the same boundary run: attention decides,
-        // and the header — which matched too — leads its rows.
-        let demo = rows(&tree, false, "demo");
-        assert_eq!(demo[..3], ["demo", "▶  ask", "  run"]);
+        // Every `demo` row scores the same boundary run, so attention alone
+        // decides — the session waiting on you leads, the project row it
+        // used to sit under is just another line further down.
+        let demo = rows(&tree, "demo");
+        assert_eq!(demo[..3], ["▶demo/ask", "demo/run", "demo/unread"]);
         // A better match still beats a better tier: `read` starts a segment
-        // in `feat/read`, sits mid-word in `feat/unread`. Their project
-        // matched nothing, but still heads them.
-        assert_eq!(rows(&tree, false, "read"), ["demo", "▶  read", "  unread"]);
+        // in `feat/read`, sits mid-word in `feat/unread`.
+        assert_eq!(rows(&tree, "read"), ["▶demo/read", "demo/unread"]);
     }
 
-    /// A header the query only brought along to hold its rows is context:
-    /// pickable, but not a hit — `(2/12)` counts the two sessions.
+    /// Nothing is listed only to hold something else any more, so every
+    /// visible row is a hit: `(2/12)` counts exactly the rows drawn.
     #[test]
-    fn context_headers_do_not_count_as_hits() {
+    fn every_visible_row_counts_as_a_hit() {
         let tree = tree();
-        let mut palette = Palette::new(&tree, false, false, &HashMap::new(), false);
+        let mut palette = Palette::new(&tree, false, &HashMap::new(), false);
         palette.query = TextInput::from("read");
         palette.apply_filter();
-        assert_eq!(palette.matches.len(), 3);
-        assert!(palette.matches[0].context);
-        assert!(palette.matches[0].positions.is_empty());
+        assert_eq!(palette.matches.len(), 2);
+        assert!(palette.matches.iter().all(|m| !m.positions.is_empty()));
         assert_eq!(palette.hits(), 2);
     }
 
-    /// The `]` / `[` ring is the palette's session rows in the palette's
+    /// The `.` / `,` ring is the palette's session rows in the palette's
     /// order — attention tiers, then recency, never-run last — with the
-    /// workspaces, projects, worktrees and archived sessions left out.
+    /// projects, worktrees and archived sessions left out.
     #[test]
     fn attention_sessions_is_the_palette_order_kept_to_live_sessions() {
         let mut tree = tree();
@@ -811,7 +628,7 @@ mod tests {
             },
         );
         let texts = |hide: bool| -> Vec<String> {
-            Palette::new(&tree, false, false, &open_prs, hide)
+            Palette::new(&tree, false, &open_prs, hide)
                 .items
                 .iter()
                 .map(|i| i.text.clone())
@@ -820,23 +637,23 @@ mod tests {
 
         let shown = texts(false);
         assert!(
-            shown.iter().any(|t| t == "default/demo/#7 Attach links"),
+            shown.iter().any(|t| t == "demo/#7 Attach links"),
             "{shown:?}"
         );
         assert!(
-            shown.iter().any(|t| t == "default/demo/#9 Still cooking"),
+            shown.iter().any(|t| t == "demo/#9 Still cooking"),
             "{shown:?}"
         );
 
         let hidden = texts(true);
         assert!(
-            hidden.iter().any(|t| t == "default/demo/#7 Attach links"),
+            hidden.iter().any(|t| t == "demo/#7 Attach links"),
             "{hidden:?}"
         );
         assert!(!hidden.iter().any(|t| t.contains("#9")), "{hidden:?}");
         assert_eq!(hidden.len(), shown.len() - 1, "only the draft row went");
         assert!(
-            hidden.iter().any(|t| t == "default/demo/main/ask"),
+            hidden.iter().any(|t| t == "demo/main/ask"),
             "sessions are untouched: {hidden:?}"
         );
     }
@@ -885,7 +702,7 @@ mod tests {
                 step: std::time::Duration::from_secs(1),
             },
         );
-        let palette = Palette::new(&tree, false, false, &open_prs, false);
+        let palette = Palette::new(&tree, false, &open_prs, false);
         let troubles: Vec<(&str, Option<Trouble>)> = palette
             .items
             .iter()
@@ -895,9 +712,9 @@ mod tests {
         assert_eq!(
             troubles,
             [
-                ("default/demo/#7 pr 7", None),
-                ("default/demo/#8 pr 8", Some(Trouble::Conflicts)),
-                ("default/demo/#9 pr 9", Some(Trouble::FailingChecks)),
+                ("demo/#7 pr 7", None),
+                ("demo/#8 pr 8", Some(Trouble::Conflicts)),
+                ("demo/#9 pr 9", Some(Trouble::FailingChecks)),
             ]
         );
         assert!(
@@ -942,7 +759,7 @@ mod tests {
                 step: std::time::Duration::from_secs(1),
             },
         );
-        let palette = Palette::new(&tree, false, false, &open_prs, false);
+        let palette = Palette::new(&tree, false, &open_prs, false);
         let standings: Vec<(&str, Option<Standing>)> = palette
             .items
             .iter()
@@ -952,8 +769,8 @@ mod tests {
         assert_eq!(
             standings,
             [
-                ("default/demo/#7 Attach links", Some(Standing::Open)),
-                ("default/demo/#9 Number the lines", Some(Standing::Draft)),
+                ("demo/#7 Attach links", Some(Standing::Open)),
+                ("demo/#9 Number the lines", Some(Standing::Draft)),
             ]
         );
         assert!(
@@ -966,19 +783,26 @@ mod tests {
         );
     }
 
+    /// An ARCHIVED session is never a `/` row — not in the RECENT
+    /// OVERVIEW, and not for a query that spells its name out. The
+    /// SESSIONS PANEL's `A` toggle has no say here: it is the panel's
+    /// fold, not the palette's filter.
     #[test]
-    fn archived_rows_sink_below_the_never_run_ones() {
+    fn archived_sessions_are_never_rows() {
         let mut tree = tree();
         let mut gone = agent("gone", "w1", AgentStatus::NeedsFeedback, false, 9_000);
         gone.archived = true;
         gone.archived_at = 9_000;
         tree.agents.push(gone);
-        let listed = rows(&tree, true, "");
-        assert_eq!(
-            listed[listed.len() - 2..],
-            ["  gone", "quiet ◇ other"],
-            "last under its project: {listed:?}"
+        let listed = rows(&tree, "");
+        assert!(
+            !listed.iter().any(|t| t.contains("gone")),
+            "archived row in the overview: {listed:?}"
         );
-        assert!(!rows(&tree, false, "").iter().any(|t| t.ends_with("gone")));
+        let hunted = rows(&tree, "gone");
+        assert!(
+            !hunted.iter().any(|t| t.contains("gone")),
+            "archived row found by name: {hunted:?}"
+        );
     }
 }

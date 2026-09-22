@@ -205,18 +205,8 @@ pub(super) fn follow_up(app: &mut App) {
             return;
         }
     }
-    if !app.takes_follow_up(&row) {
-        app.flash = Some(match &row {
-            SessionRow::Agent(a) if a.archived => {
-                "archived sessions take no follow-up — u brings it back".into()
-            }
-            SessionRow::Agent(a) if a.cloud_session_id.is_some() => {
-                "cloud sessions take a queued message — m, then Send to cloud session".into()
-            }
-            SessionRow::Agent(_) => "the session is still starting".into(),
-            SessionRow::Terminal(_) => "terminals take typing in the pane — Enter attaches".into(),
-            SessionRow::Link(_) => "a pull request takes a comment — y".into(),
-        });
+    if let Some(why) = no_follow_up(app, &row) {
+        app.flash = Some(why);
         return;
     }
     let SessionRow::Agent(a) = row else {
@@ -228,6 +218,27 @@ pub(super) fn follow_up(app: &mut App) {
     });
     app.focus = Focus::Sessions;
     app.dirty = true;
+}
+
+/// Why `row` takes no follow-up, or None when it does. Both composers
+/// ask — the SESSIONS PANEL's box in the card ([`follow_up`]) and the
+/// LAUNCHER VIEW's modal (`event_loop::launcher::follow_up`) — so what a
+/// row refuses, and the word it refuses with, is written once.
+pub(super) fn no_follow_up(app: &App, row: &SessionRow) -> Option<String> {
+    if app.takes_follow_up(row) {
+        return None;
+    }
+    Some(match row {
+        SessionRow::Agent(a) if a.archived => {
+            "archived sessions take no follow-up — u brings it back".into()
+        }
+        SessionRow::Agent(a) if a.cloud_session_id.is_some() => {
+            "cloud sessions take a queued message — m, then Send to cloud session".into()
+        }
+        SessionRow::Agent(_) => "the session is still starting".into(),
+        SessionRow::Terminal(_) => "terminals take typing in the pane — Enter attaches".into(),
+        SessionRow::Link(_) => "a pull request takes a comment — y".into(),
+    })
 }
 
 /// Bring an archived agent back — `u` on its row, **Unarchive** in its

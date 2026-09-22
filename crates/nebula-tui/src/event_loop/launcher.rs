@@ -7,58 +7,75 @@
 //! or Enter and a double-click, end in the same state.
 
 use super::{
-    build_submenu, double_tapped, enter_terminal_pane, is_double_click, jump_to_target,
-    jump_to_target_inner, open_prompt, restore_project_cursors, restore_workspace_project,
-    select_project_row_by_id, switch_workspace_quietly, Landing,
+    build_submenu, enter_terminal_pane, is_double_click, jump_to_target, jump_to_target_inner,
+    open_prompt, restore_project_cursors, select_project_row_by_id, Landing,
 };
-use crate::app::{App, Focus, MenuAction, MenuItem, Overlay, PromptKind};
-use crate::keymap::Action;
-use crate::launcher::{self as view, Level, ProjectPicker};
+use crate::app::{
+    App, ContextMenu, Focus, HitTarget, MenuAction, MenuFilter, MenuItem, Overlay, PromptKind,
+};
+use crate::keymap::{Action, KeyChord};
+use crate::launcher::{self as view, BoxField, ProjectPicker};
 use crate::palette::PaletteTarget;
 use crate::quick_prompt::{QuickLaunch, QuickReturn, QuickTarget};
 use crate::text_input::TextInput;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nebula_core::{AgentId, ClientRequest, ProjectId, WorkspaceId};
+use nebula_core::{AgentId, ClientRequest, ProjectId, SessionRef, TerminalId};
 
 /// Rows of cards `Ctrl+d` / `Ctrl+u` jump.
 const HALF_PAGE: i64 = 2;
 
-/// What the grid says when there is nothing to step through yet.
+/// What `⇧A` says each way: which of the two lists the grid is now of.
+const ARCHIVED_VIEW: &str = "archived sessions — u unarchives one, ⇧A back to the live ones";
+const LIVE_VIEW: &str = "live sessions — ⇧A reads the archived ones";
+
+/// What the grid says when there is nothing to step through yet — of
+/// whichever of the two lists it is showing ([`toggle_archived`]).
 const NO_SESSIONS: &str = "no sessions yet — p starts one";
+const NO_ARCHIVED_SESSIONS: &str = "nothing archived here — ⇧A back to the live sessions";
 
-/// What the panel toggles say here: there are no panels to show or hide.
-const NO_PANELS: &str = "the launcher view has no panels — Settings › Experimental switches it off";
-
-/// What the PROJECTS level says with nothing to step through.
-const NO_PROJECTS: &str = "no projects in this workspace — Esc steps out to the workspaces";
-
-/// What Esc says at the top of the tree: there is no level above the
-/// workspaces to walk out to.
-const AT_TOP: &str = "workspaces are the top of the tree — Enter opens the one under the cursor";
-
-/// What the footer's workspace nameplate says here. Workspaces are not a
-/// dialog in this view but the top LEVEL of it — workspaces / projects /
-/// sessions, the hierarchy `Esc` walks up — so the switcher stays shut
-/// (`event_loop::open_workspace_picker`) and `w` walks there instead.
-pub(super) const WORKSPACES_LEVEL: &str =
-    "workspaces are a level of this view, not a dialog — w walks up to it";
-
-/// The first snapshot has landed: with the view on and a project to aim
-/// at, the box goes up — nebula opens on it, focused, the way the view
-/// promises. Once per run; a snapshot with no project yet (a first run)
-/// leaves it owed until one arrives, and another modal already up (a
-/// `nebula open` from a session) keeps it rather than covering that.
-pub(super) fn boot(app: &mut App) {
-    if !app.launcher_boot || !app.launcher_active() || app.overlay.is_some() {
-        return;
-    }
-    app.launcher_boot = false;
-    open_box(app);
+/// Is the card under this id one of the ARCHIVED VIEW's? Its session was
+/// reaped when it was archived, so nothing on it can be stepped into.
+fn is_archived(app: &App, id: &AgentId) -> bool {
+    app.tree.agents.iter().any(|a| &a.id == id && a.archived)
 }
 
+/// The one of those two this grid means.
+fn nothing_here(app: &App) -> &'static str {
+    if app.show_archived {
+        NO_ARCHIVED_SESSIONS
+    } else {
+        NO_SESSIONS
+    }
+}
+
+/// What the PROJECT DROPDOWN says with no project to list — never on
+/// screen in practice: the view is only up once there is one.
+const NO_PROJECTS: &str = "no projects yet — o opens a folder";
+
+/// What folding the PANE away says, and what bringing it back says. The
+/// first names what went with it: the card under the cursor is let go of
+/// too, so the same `p` that takes the root branch after an Esc takes it
+/// after this.
+const PANE_HIDDEN: &str = "pane hidden, nothing selected — ^` brings it back";
+const PANE_SHOWN: &str = "pane back under the cards";
+
+/// What the fold key did as the first of its two presses from inside the
+/// PANE ([`fold_key`]), for the KEY COMBO DISPLAY.
+const BACK_TO_CARD: &str = "Back to the card";
+
+/// What letting the card under the cursor go says: nothing in the GRID is
+/// selected any more, so the box `p` opens has no checkout to read off a
+/// card and lands on the project's ROOT BRANCH instead.
+pub(super) const UNAIMED: &str = "nothing selected — p starts on the project's root branch";
+
 /// The box: the QUICK PROMPT, aimed at the project under the list's cursor
-/// (the selected project) and at a fresh worktree or that project's
-/// checkout as `^N` last left it. `p`, `n`, and the boot.
+/// (the selected project). The `quick_prompt_new_worktree` SETTING alone
+/// picks a fresh worktree or an existing checkout; `^N` flips only the box
+/// that is up. `p`, `n`, and the boot.
+///
+/// On an existing checkout with the aim let go of ([`clear_aim`]) there is
+/// no card to read one off, so the box lands on the project's ROOT BRANCH
+/// (`view::root_target_for`).
 pub(super) fn open_box(app: &mut App) {
     let project = app.selected_project().map(|p| p.id.clone()).or_else(|| {
         app.project_rows()
@@ -70,59 +87,290 @@ pub(super) fn open_box(app: &mut App) {
         app.flash = Some("add a project first".into());
         return;
     };
-    let target = view::target_for(app, &project, app.launcher_new_worktree);
+    let target = if crate::config::Config::load().quick_prompt_new_worktree {
+        view::target_for(app, &project, true)
+    } else if app.launcher_unaimed {
+        view::root_target_for(app, &project)
+    } else {
+        view::target_for(app, &project, false)
+    };
     crate::quick_prompt::open_for(app, target);
 }
 
-/// A panel key while the GRID is up — true when the view took it. Which
-/// grid it is depends on the LEVEL ([`view::Level`]): the keys that walk
-/// cards, open one and walk the levels are the same three sets of arms,
-/// reading a different list each time.
+/// Put the cursor back on a card: anything that lands on one — a key that
+/// walks the grid, a click on a card, a project opened — takes the aim
+/// back, so the box reads a checkout again and the PANE along the bottom
+/// opens on that card ([`App::launcher_split`]). Only the aim: the keys
+/// stay on the cards, and crossing into the pane is a second click or
+/// Enter ([`enter_pane`]).
+pub(super) fn take_aim(app: &mut App) {
+    if app.launcher_unaimed {
+        app.launcher_unaimed = false;
+        app.dirty = true;
+    }
+}
+
+/// Let the card under the cursor go: no card is drawn wearing the cursor,
+/// the box has no checkout to read off one, and the PANE along the bottom
+/// collapses — it is the selected session, so with nothing selected there
+/// is nothing for it to be and the grid takes the whole body back
+/// ([`App::launcher_split`]). What the cursor was on is only let go of and
+/// not forgotten: [`take_aim`] brings both the card and the pane back, and
+/// `j` steps from where the eye last saw it.
+///
+/// INPUT PARITY: the one function behind the first Esc ([`escape`]) and
+/// the fold of the PANE ([`toggle_pane`]), so both end in the same state
+/// and say the same word. A click on the air between the cards is NOT one
+/// of them: a miss with the pointer folds nothing away — see the
+/// `PanelBg` arm in `event_loop`.
+pub(super) fn clear_aim(app: &mut App) {
+    app.launcher_unaimed = true;
+    app.flash = Some(UNAIMED.into());
+    app.dirty = true;
+}
+
+/// `⇧A`: swap the grid between a project's LIVE sessions and its
+/// ARCHIVED ones. The cards are the same cards — an archived one wears
+/// the same name, checkout and last prompt — so what changes is which
+/// list the grid is of, and `u` on a card there unarchives it where it
+/// stands. The cursor lands on the first card of whichever list arrives,
+/// so the pane reads something at once instead of sitting blank under a
+/// full grid; an empty list lets the aim go, the way a folded pane does.
+///
+/// INPUT PARITY: the one function behind the `⇧A` key and the card
+/// menu's **Show/hide archived**, so both end in the same state.
+pub(crate) fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.show_archived = !app.show_archived;
+    match view::rows(app).first().map(|row| row.agent.id.clone()) {
+        Some(first) => select(app, first, out),
+        None => clear_aim(app),
+    }
+    app.flash = Some(
+        if app.show_archived {
+            ARCHIVED_VIEW
+        } else {
+            LIVE_VIEW
+        }
+        .into(),
+    );
+    app.dirty = true;
+}
+
+/// `^``, and every other chord the pane fold answers to: the way out of
+/// the PANE, and then the way it folds. With the keys in the pane —
+/// typing into it, or standing in it unlocked — the first press only
+/// hands them back to the card it reads, the cursor still on it; pressed
+/// again from the cards it folds the pane away ([`toggle_pane`]), and
+/// once more brings it back. Returns what it did, for the KEY COMBO
+/// DISPLAY.
+///
+/// INPUT PARITY: the one function behind the chord, whether a LOCKED
+/// PANE let it through (`event_loop::handle_key`) or the grid got it
+/// ([`handle_action`]).
+pub(super) fn fold_key(app: &mut App) -> &'static str {
+    if app.focus == Focus::Terminal && !app.launcher_pane_hidden {
+        super::leave_terminal_lock(app);
+        app.dirty = true;
+        return BACK_TO_CARD;
+    }
+    toggle_pane(app);
+    if app.launcher_pane_hidden {
+        "Hide the pane"
+    } else {
+        "Show the pane"
+    }
+}
+
+/// `^``: fold the PANE under the cards away and give the grid the whole
+/// body, or bring it back. Folding it lets the card under the cursor go
+/// with it — nothing selected, nothing being read — and bringing the pane
+/// back takes the aim again, since the pane reads the card it is aimed at.
+pub(super) fn toggle_pane(app: &mut App) {
+    app.launcher_pane_hidden = !app.launcher_pane_hidden;
+    if app.launcher_pane_hidden {
+        clear_aim(app);
+        // FOCUS cannot stay in a pane that is no longer drawn: the keys
+        // come back to the cards, the way `^q` hands them back.
+        app.focus = Focus::Sessions;
+        app.term_locked = false;
+        app.flash = Some(PANE_HIDDEN.into());
+    } else {
+        take_aim(app);
+        app.flash = Some(PANE_SHOWN.into());
+    }
+    app.dirty = true;
+}
+
+// ---- the PANE's TAB STRIP ----
+
+/// What `` ` `` says with nothing to walk to: the checkout has no
+/// terminals, so SESSION is the only tab on the strip — which says as
+/// much itself, naming the key that opens one.
+const NO_TERMINALS: &str = "no terminals in this checkout — t opens one";
+
+/// What it says over a full-screen session, which has no strip to walk.
+pub(super) const NO_PANE_HERE: &str = "the pane's terminals are under the grid — ^q back to it";
+
+/// Read `tab` in the PANE along the bottom: None is the SESSION tab —
+/// the card under the cursor — and Some names one of the checkout's
+/// TERMINALS (`ui::launcher_view::pane_frame` draws the strip).
+///
+/// INPUT PARITY: the one function behind every way the strip is walked —
+/// a click on a tab (`event_loop`'s `LauncherPaneSession` and
+/// `LauncherPaneTerminal` arms) and the `` ` `` key ([`cycle_pane_tab`])
+/// — so the pointer and the key end in the same state.
+///
+/// The attach is immediate: a tab was named outright, so there is
+/// nothing to wait to see whether it was meant.
+pub(super) fn show_pane_tab(app: &mut App, tab: Option<TerminalId>, out: &mut Vec<ClientRequest>) {
+    // A folded pane has nothing to read ([`toggle_pane`]): bring it back,
+    // or the tab would be swapped behind a pane that is not drawn. A
+    // pane collapsed for want of a card under the cursor ([`clear_aim`])
+    // comes back the same way.
+    if app.launcher_pane_hidden {
+        toggle_pane(app);
+    }
+    take_aim(app);
+    app.launcher_terminal = tab.clone();
+    app.dirty = true;
+    match tab {
+        Some(id) => super::attach_now(app, SessionRef::Terminal(id), out),
+        // Back onto the card under the cursor, found the same way every
+        // other walk of the grid finds it — the pin is already off, so
+        // the preview reads the session rather than the terminal.
+        None => super::preview_selected_now(app, out),
+    }
+}
+
+/// `` ` ``: walk the strip — SESSION, then each TERMINAL of the checkout
+/// in the order the header lists them, then back to SESSION. The key
+/// walks exactly the tabs the pointer can click, so it never lands on
+/// something that is not on screen.
+pub(super) fn cycle_pane_tab(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let terminals = app.visible_terminals();
+    if terminals.is_empty() {
+        app.flash = Some(NO_TERMINALS.into());
+        return;
+    }
+    let at = app
+        .pinned_terminal()
+        .and_then(|id| terminals.iter().position(|t| t.id == id));
+    let next = match at {
+        None => Some(terminals[0].id.clone()),
+        // Past the last tab is back to SESSION, so the walk is a loop
+        // rather than a dead end.
+        Some(i) => terminals.get(i + 1).map(|t| t.id.clone()),
+    };
+    show_pane_tab(app, next, out);
+}
+
+/// A click on the TERMINAL tab at `index` — its place in
+/// `App::visible_terminals`, which is the order the strip draws. A stale
+/// index (the terminal closed between the draw and the click) is left
+/// alone rather than reading whatever slid into the slot.
+pub(super) fn click_pane_tab(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) {
+    let Some(id) = app.visible_terminals().get(index).map(|t| t.id.clone()) else {
+        return;
+    };
+    show_pane_tab(app, Some(id), out);
+}
+
+/// Close the TERMINAL at `index` on the strip — the `×` on its tab, and
+/// `d` with the pane on it ([`close_pinned_terminal`]). Both put up the
+/// CONFIRM the SESSIONS PANEL's own `d` puts up on a terminal row, so
+/// one wording covers every way a shell is killed.
+pub(super) fn close_pane_tab(app: &mut App, index: usize) {
+    let Some(t) = app.pane_terminals().into_iter().nth(index) else {
+        return;
+    };
+    app.overlay = Some(Overlay::Confirm(super::confirm_close_terminal(
+        &t.name,
+        t.id.clone(),
+    )));
+}
+
+/// `d` while the pane is on a TERMINAL: close that terminal rather than
+/// delete the card under the cursor. The strip is what the keys aimed at
+/// what the pane holds mean while it is on one — as Enter and `z` are
+/// ([`enter_pane`], [`open_session`]) — and the card is still there to
+/// delete once the strip is back on SESSION.
+pub(super) fn close_pinned_terminal(app: &mut App) {
+    let Some(id) = app.pinned_terminal() else {
+        return;
+    };
+    let at = app.pane_terminals().iter().position(|t| t.id == id);
+    if let Some(at) = at {
+        close_pane_tab(app, at);
+    }
+}
+
+/// Which tab the strip lands on when `closing` goes: the tab after it,
+/// else the one before it, else SESSION (the inner None). The outer None
+/// means the strip was not on that terminal at all and must be left
+/// alone — which is every close made from the panels, where there is no
+/// strip.
+///
+/// Read BEFORE the row is dropped, since it is the row's neighbours that
+/// answer it.
+pub(super) fn tab_after(app: &App, closing: &TerminalId) -> Option<Option<TerminalId>> {
+    if app.pinned_terminal().as_ref() != Some(closing) {
+        return None;
+    }
+    let terminals = app.pane_terminals();
+    let at = terminals.iter().position(|t| &t.id == closing)?;
+    Some(
+        terminals
+            .get(at + 1)
+            .or_else(|| at.checked_sub(1).and_then(|before| terminals.get(before)))
+            .map(|t| t.id.clone()),
+    )
+}
+
+/// Esc in the GRID: let the card under the cursor go ([`clear_aim`]) —
+/// the selection the box reads, so the next `p` starts its session on the
+/// project's root branch instead of in whichever checkout the cursor was
+/// parked in. With nothing selected already there is nothing left to let
+/// go of, and Esc does nothing: the grid is the top of the view.
+///
+/// With the PROJECT TABS holding the keys ([`focus_tabs`]) Esc is only
+/// the way back down: the cards get the keys again, on the project the
+/// header's cursor walked to and the card it shows.
+pub(super) fn escape(app: &mut App) {
+    if app.launcher_tab_cursor.is_some() {
+        leave_tabs(app);
+    } else if !app.launcher_unaimed {
+        clear_aim(app);
+    }
+}
+
+/// A panel key while the GRID is up — true when the view took it: `h` and
+/// `l` walk a row of cards, `j` and `k` the column under the cursor, the
+/// ways into a session step down into the PANE along the bottom (`z`
+/// full-screens it instead), `p` / `n` open the box, the PROJECT TABS
+/// walk with `[` / `]` / a digit and close with `x`; every other key falls
+/// through to its panel meaning, which reads the same selection the
+/// grid's cursor is.
 ///
 /// Nothing here fires while a session is full-screen: the keys are the
 /// PTY's then, and `^q` (`leave_terminal_lock`) is the way back to the
 /// grid.
+///
+/// `armed` and `chord` are the DOUBLE TAP's (`focus_walk::double_tapped`):
+/// `k`,`k` on the top row of cards walks up into the PROJECT TABS, and
+/// `j`,`j` there walks back down ([`tabs_action`]).
 pub(super) fn handle_action(
     app: &mut App,
     action: Action,
     armed: Option<(Action, std::time::Instant)>,
-    chord: &crate::keymap::KeyChord,
+    chord: &KeyChord,
     out: &mut Vec<ClientRequest>,
 ) -> bool {
-    match app.launcher_level {
-        Level::Sessions => sessions_action(app, action, armed, chord, out),
-        Level::Projects => projects_action(app, action, armed, chord, out),
-        Level::Workspaces => workspaces_action(app, action, armed, chord, out),
+    if app.launcher_tab_cursor.is_some() && tabs_action(app, action, armed, chord, out) {
+        return true;
     }
-}
-
-/// The SESSIONS level's keys: `h` and `l` walk a row of cards, `j` and
-/// `k` the column under the cursor, the ways into a session step down
-/// into the PANE along the bottom (`z` full-screens it instead), `p` /
-/// `n` open the box, the panel toggles say there are no panels, `w`
-/// walks up to the workspaces and a digit opens the Nth one; every other
-/// key falls through to its panel meaning, which reads the same
-/// selection the grid's cursor is.
-///
-/// `k` on the grid's top row is the one key that is not a step: there is
-/// nowhere above it to go, so a second press inside `DOUBLE_TAP` walks
-/// out to the PROJECTS level, exactly as `k`,`k` on a panel's first row
-/// steps up into the WORKSPACES BAR.
-fn sessions_action(
-    app: &mut App,
-    action: Action,
-    armed: Option<(Action, std::time::Instant)>,
-    chord: &crate::keymap::KeyChord,
-    out: &mut Vec<ClientRequest>,
-) -> bool {
     match action {
         Action::MoveDown => step_grid(app, 0, 1, out),
-        Action::MoveUp if at_top(app) => {
-            if double_tapped(app, action, armed, chord, "projects") {
-                go_up(app, out);
-            }
-        }
-        Action::MoveUp => step_grid(app, 0, -1, out),
+        Action::MoveUp => step_up(app, armed, chord, out),
         Action::FocusRight => step_grid(app, 1, 0, out),
         Action::FocusLeft => step_grid(app, -1, 0, out),
         Action::HalfPageDown => step_grid(app, 0, HALF_PAGE, out),
@@ -136,146 +384,124 @@ fn sessions_action(
         Action::Zoom => open_session(app, out),
         // There is nothing to the left of the grid to walk back to.
         Action::FocusPrev => {}
+        // The pane's TAB STRIP: what the pane READS, where `^~` is
+        // whether it is drawn at all.
+        Action::PaneTabs => cycle_pane_tab(app, out),
+        // And `d` on a strip that is on a terminal closes that terminal,
+        // not the card under the cursor.
+        Action::Delete if app.pinned_terminal().is_some() => close_pinned_terminal(app),
         Action::New | Action::QuickPrompt => open_box(app),
-        Action::ToggleProjects
-        | Action::ToggleWorktrees
-        | Action::ToggleSessions
-        | Action::ToggleSidebars => app.flash = Some(NO_PANELS.into()),
-        _ => return level_walk(app, action, out),
-    }
-    true
-}
-
-/// The keys every level shares: `w` to the top of the tree, a digit to
-/// the Nth workspace, ⇧W with nothing to fold. False for a key none of
-/// them claims, which then keeps its panel meaning.
-fn level_walk(app: &mut App, action: Action, out: &mut Vec<ClientRequest>) -> bool {
-    match action {
-        // Workspaces are a level here, not a dialog over the grid: `w`
-        // walks to the top of the tree rather than opening the panels'
-        // switcher (which `event_loop::open_workspace_picker` keeps shut).
-        Action::Workspaces => go_to(app, Level::Workspaces),
-        // A digit opens that workspace and lands on its projects — the
-        // tab it names, without the bar the view never draws.
-        Action::SelectWorkspace(n) => open_workspace_slot(app, n, out),
-        // ⇧W folds a bar that is never drawn.
-        Action::ToggleWorkspaces => app.flash = Some(WORKSPACES_LEVEL.into()),
+        // `⇧A` swaps the grid for the project's archived sessions, and
+        // back. It is the grid's own key here rather than the panels'
+        // group fold: there is no ARCHIVED group to open, only the other
+        // list of cards.
+        Action::ToggleArchived => toggle_archived(app, out),
+        // Space on a card: its FOLLOW-UP MODAL, a box over the grid —
+        // the card itself has no room to grow one, and the pane stays
+        // exactly as it is.
+        Action::FollowUp => follow_up(app),
+        // `m` with no card selected — the aim let go of, or a project with
+        // no sessions yet — is the PROJECT's menu: there is no session
+        // under the cursor for it to be the menu of.
+        Action::ContextMenu if app.launcher_unaimed || view::rows(app).is_empty() => {
+            project_menu(app, super::KEYBOARD_MENU_ANCHOR)
+        }
+        // The fold is a preference the view keeps, and its key is the way
+        // out of the pane first ([`fold_key`]). `⇧Z` / `^B` is the same
+        // fold under its old "give it the full width" name, since the pane
+        // is the only thing left to fold.
+        Action::ToggleLauncherPane => {
+            fold_key(app);
+        }
+        Action::ToggleSidebars => toggle_pane(app),
+        // The PROJECT TABS across the header.
+        Action::NextProjectTab => step_tab(app, 1, out),
+        Action::PrevProjectTab => step_tab(app, -1, out),
+        Action::CloseProjectTab => close_active_tab(app, out),
+        Action::SelectProjectTab(n) => open_tab_slot(app, n, out),
+        // `⌘P`: the list the header's `+` drops, the click's own
+        // [`open_project_menu`].
+        Action::ProjectDropdown => open_project_menu(app),
         _ => return false,
     }
     true
 }
 
-/// The PROJECTS level's keys: the same walk over project cards, Enter
-/// into the project under the cursor, `p` / `n` a box aimed at it, and
-/// `k`,`k` off the top row out to the WORKSPACES level.
+/// Space on a card, and **Follow-up prompt** in its menu: the FOLLOW-UP
+/// MODAL for the session under the cursor — a small box floating over the
+/// grid, where the SESSIONS PANEL expands the card itself. Enter there
+/// sends what was typed down that session's PTY as its next turn
+/// (`event_loop::send_turn`) and the box closes onto the grid.
 ///
-/// A key that acts on a session is swallowed here rather than falling
-/// through: the cursor this level moves is the project's, and `a` must
-/// not archive a session the user cannot see. [`reaches_here`] is the
-/// list of keys that still mean what they always meant.
-fn projects_action(
-    app: &mut App,
-    action: Action,
-    armed: Option<(Action, std::time::Instant)>,
-    chord: &crate::keymap::KeyChord,
-    out: &mut Vec<ClientRequest>,
-) -> bool {
-    match action {
-        Action::MoveDown => step_projects(app, 0, 1),
-        Action::MoveUp
-            if at_top_card(view::project_cursor(app, &view::project_cards(app)), app) =>
-        {
-            if double_tapped(app, action, armed, chord, "workspaces") {
-                go_up(app, out);
-            }
-        }
-        Action::MoveUp => step_projects(app, 0, -1),
-        Action::FocusRight => step_projects(app, 1, 0),
-        Action::FocusLeft => step_projects(app, -1, 0),
-        Action::HalfPageDown => step_projects(app, 0, HALF_PAGE),
-        Action::HalfPageUp => step_projects(app, 0, -HALF_PAGE),
-        Action::Activate | Action::FocusNext | Action::FocusTerminal | Action::Zoom => {
-            enter_project(app, out)
-        }
-        Action::FocusPrev => {}
-        Action::New | Action::QuickPrompt => open_box(app),
-        Action::ToggleProjects
-        | Action::ToggleWorktrees
-        | Action::ToggleSessions
-        | Action::ToggleSidebars => app.flash = Some(NO_PANELS.into()),
-        _ if level_walk(app, action, out) => {}
-        _ if reaches_here(action) => return false,
-        _ => app.flash = Some(swallowed(Level::Projects)),
+/// Nothing about the PANE moves: it is not unfolded, not swapped onto the
+/// card and not focused. Prompting a card is not opening it — the point of
+/// the box is to hand a session its next turn and move to the next card,
+/// without ever stepping into one.
+///
+/// What a row refuses, and the word it refuses with, comes from the same
+/// [`super::activate::no_follow_up`] the panel's box asks.
+pub(super) fn follow_up(app: &mut App) {
+    let Some(row) = app.selected_session_row() else {
+        app.flash = Some(nothing_here(app).into());
+        return;
+    };
+    if let Some(why) = super::activate::no_follow_up(app, &row) {
+        app.flash = Some(why);
+        return;
     }
-    true
+    let crate::app::SessionRow::Agent(agent) = row else {
+        return;
+    };
+    super::open_follow_up(app, agent.id, String::new());
 }
 
-/// The WORKSPACES level's keys: the walk over workspace cards — where
-/// moving the cursor IS opening that workspace, as it is in the panels'
-/// bar — and Enter down into its projects. `k` on the top row has nowhere
-/// to go: this is the top of the tree.
-fn workspaces_action(
-    app: &mut App,
-    action: Action,
-    _armed: Option<(Action, std::time::Instant)>,
-    _chord: &crate::keymap::KeyChord,
-    out: &mut Vec<ClientRequest>,
-) -> bool {
-    match action {
-        Action::MoveDown => step_workspaces(app, 0, 1, out),
-        Action::MoveUp => step_workspaces(app, 0, -1, out),
-        Action::FocusRight => step_workspaces(app, 1, 0, out),
-        Action::FocusLeft => step_workspaces(app, -1, 0, out),
-        Action::HalfPageDown => step_workspaces(app, 0, HALF_PAGE, out),
-        Action::HalfPageUp => step_workspaces(app, 0, -HALF_PAGE, out),
-        Action::Activate | Action::FocusNext | Action::FocusTerminal | Action::Zoom => {
-            enter_workspace(app)
+/// The PROJECT's own menu — `m` with no card selected, and a right-click
+/// on its PROJECT TAB ([`tab_menu`]): what the PROJECTS and WORKTREES
+/// panels' rows carried between them — a checkout cut in it, the project
+/// renamed or dropped, and the RUN COMMAND of the checkout the grid would
+/// launch into started or stopped. These have no key of their own on the
+/// grid, whose letters belong to the session under the cursor, so the
+/// project's menu is where they live. `at` is where it hangs.
+fn project_menu(app: &mut App, at: (u16, u16)) {
+    let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
+        return;
+    };
+    let mut items = vec![MenuItem::new(
+        "New worktree",
+        MenuAction::NewWorktree(project.clone()),
+    )];
+    if let Some(w) = crate::launcher::checkout_for(app, &project) {
+        let running = app.worktree_running(&w);
+        items.push(MenuItem::new(
+            if running { "Stop run" } else { "Run" },
+            MenuAction::ToggleRun(w.clone()),
+        ));
+        items.push(MenuItem::new("Open", MenuAction::OpenWorktree(w.clone())));
+        if !app.tree.worktrees.iter().any(|x| x.id == w && x.is_main) {
+            items.push(MenuItem::destructive(
+                "Delete worktree",
+                MenuAction::DeleteWorktree(w),
+            ));
         }
-        Action::FocusPrev => {}
-        Action::ToggleProjects
-        | Action::ToggleWorktrees
-        | Action::ToggleSessions
-        | Action::ToggleSidebars => app.flash = Some(NO_PANELS.into()),
-        _ if level_walk(app, action, out) => {}
-        _ if reaches_here(action) => return false,
-        _ => app.flash = Some(swallowed(Level::Workspaces)),
     }
-    true
+    items.push(MenuItem::new(
+        "Rename",
+        MenuAction::RenameProject(project.clone()),
+    ));
+    items.push(MenuItem::destructive(
+        "Remove from list",
+        MenuAction::RemoveProject(project),
+    ));
+    super::open_menu(app, items, at);
 }
 
-/// Keys that keep their meaning above the SESSIONS level: they act on the
-/// app, or on the project under the cursor — which these levels do have —
-/// rather than on a session they are not drawing.
-fn reaches_here(action: Action) -> bool {
-    matches!(
-        action,
-        Action::Palette
-            | Action::Settings
-            | Action::Help
-            | Action::Quit
-            | Action::Metrics
-            | Action::Hosts
-            | Action::Splash
-            | Action::AddProject
-            | Action::FindFile
-            | Action::Grep
-            | Action::TreeBrowser
-            | Action::Issues
-            | Action::PullRequests
-            | Action::GitDiff
-            | Action::OpenRepo
-            | Action::OpenGhosttyTab
-            | Action::RefreshPullRequests
-            | Action::SwitchBranch
-    )
-}
-
-/// What a session key says on a level that is not drawing sessions.
-fn swallowed(level: Level) -> String {
-    format!(
-        "that works on a session — Enter opens the {} under the cursor first",
-        level.singular()
-    )
+/// A right-click on a PROJECT TAB: that project opened, as a left click
+/// opens it ([`open_tab`]), with its menu hung under the tab — so the
+/// menu is always of the project on screen, and what it does is seen.
+pub(super) fn tab_menu(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
+    open_tab(app, id, out);
+    let at = crumb_anchor(app, &HitTarget::LauncherTab(id.clone()));
+    project_menu(app, at);
 }
 
 /// Cards per row as the last frame drew them — the geometry the keys and
@@ -291,7 +517,7 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
     let rows = view::rows(app);
     let at = view::cursor(app, &rows);
     let Some(next) = view::grid_stepped(at, dx, dy, cols(app), rows.len()) else {
-        app.flash = Some(NO_SESSIONS.into());
+        app.flash = Some(nothing_here(app).into());
         return;
     };
     if Some(next) == at {
@@ -300,88 +526,390 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
     select(app, rows[next].agent.id.clone(), out);
 }
 
-/// The SESSIONS cursor is on the grid's top row — where `k` has nowhere
-/// left to go and a second press walks out a level. An empty grid counts:
-/// there is nothing under the cursor to move down from.
-fn at_top(app: &App) -> bool {
+/// `k` (↑): a row up the grid — and on the top row, where there is no
+/// row above, the edge of a DOUBLE TAP: the first press stays put and
+/// says what a second one does, the second walks up into the PROJECT
+/// TABS ([`focus_tabs`]). A grid with no cards on it is all top row.
+/// Only `k` itself: `^u`'s half page stops against the top like any
+/// other edge, so leaning on it never lands in the header.
+fn step_up(
+    app: &mut App,
+    armed: Option<(Action, std::time::Instant)>,
+    chord: &KeyChord,
+    out: &mut Vec<ClientRequest>,
+) {
     let rows = view::rows(app);
-    at_top_card(view::cursor(app, &rows), app)
-}
-
-/// The same for a cursor already in hand: card `at` sits on the grid's
-/// first row. No cursor at all counts as the top.
-fn at_top_card(at: Option<usize>, app: &App) -> bool {
-    at.is_none_or(|at| at < cols(app))
-}
-
-// ---- walking the LEVELS ----
-
-/// Esc, and the double tap off the grid's top row: one level back out of
-/// the tree — a project's sessions to the projects beside it, those to
-/// the workspaces. Already at the top, the footer says so rather than
-/// leaving Esc looking broken.
-///
-/// Nothing is detached on the way out. The pane is not drawn above the
-/// SESSIONS level (`launcher::split`), but the session it holds is the
-/// one the level came from and the one Enter comes back to, so it keeps
-/// running and the walk back in is instant.
-pub(super) fn go_up(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let _ = out;
-    let Some(up) = app.launcher_level.up() else {
-        app.flash = Some(AT_TOP.into());
-        return;
+    let top = match view::cursor(app, &rows) {
+        Some(at) => at < cols(app),
+        None => rows.is_empty(),
     };
-    go_to(app, up);
+    if !top {
+        step_grid(app, 0, -1, out);
+    } else if super::double_tapped(app, Action::MoveUp, armed, chord, "project tabs") {
+        focus_tabs(app);
+    }
 }
 
-/// Put the view on `level` — the one move, so a key, a click and Esc all
-/// land in the same state. FOCUS comes back to the cards: above the
-/// SESSIONS level there is no pane under them for it to sit in.
-fn go_to(app: &mut App, level: Level) {
-    if app.launcher_level == level {
+// ---- the PROJECT TABS ----
+
+/// Where a dropdown hangs off the header — the PROJECT DROPDOWN under the
+/// `+`, a project's menu under its tab: the row under it, at its own left
+/// edge, so the list reads as belonging to it rather than to wherever the
+/// pointer happened to land. A word the header had no room to draw falls
+/// back to the keyboard's anchor.
+fn crumb_anchor(app: &App, crumb: &HitTarget) -> (u16, u16) {
+    app.hit_rect(crumb)
+        .map(|rect| (rect.x, rect.y + 1))
+        .unwrap_or(super::KEYBOARD_MENU_ANCHOR)
+}
+
+/// What the tab keys say over a full-screen session, where the header
+/// they walk is not on screen.
+pub(super) const NO_TABS_HERE: &str = "project tabs are on the grid's header — ^q back to it";
+/// What the tab keys say with nothing to move between.
+const NO_TABS: &str = "no projects open — + in the header opens one";
+const ONE_TAB: &str = "one project open — + in the header opens another";
+/// The PROJECT DROPDOWN's last row: a folder that is not a project yet.
+const OPEN_FOLDER: &str = "+ open a folder…";
+/// What closing the only tab says: it is the project on screen, and there
+/// is no tab beside it to hand the grid to.
+const LAST_TAB: &str = "the only project open stays open — + opens another first";
+
+/// A click on a PROJECT TAB, `[` / `]` onto it, and the tab that slides
+/// into a closed one's place: that project's sessions, through the one
+/// [`open_project`] the `+` dropdown takes — so the grid lands where it
+/// would have landed however the project was opened.
+/// INPUT IS NOT ACTION: the key and the click both end here.
+///
+/// The tab the grid is already on is left alone: opening it again would
+/// throw the cursor off the card it was walked to.
+pub(super) fn open_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
+    if app.selected_project().is_some_and(|p| &p.id == id) {
         return;
     }
-    app.launcher_level = level;
-    app.focus = Focus::Sessions;
-    app.term_locked = false;
+    open_project(app, id, out);
+}
+
+/// A digit (or ⌘N): the Nth PROJECT TAB from the left, as a click on it
+/// opens it ([`open_tab`]) — the browser's own shortcut for its tabs.
+fn open_tab_slot(app: &mut App, slot: u8, out: &mut Vec<ClientRequest>) {
+    app.settle_project_tabs();
+    let Some(id) = open_tabs(app)
+        .get(usize::from(slot).saturating_sub(1))
+        .cloned()
+    else {
+        app.flash = Some(format!("no project tab {slot} — + in the header opens one"));
+        return;
+    };
+    open_tab(app, &id, out);
+}
+
+/// The tabs the header draws, by project ([`view::project_tabs`]), which
+/// are the ones the keys walk and the ones a closed tab's neighbor is
+/// found among.
+fn open_tabs(app: &App) -> Vec<ProjectId> {
+    view::project_tabs(app).into_iter().map(|t| t.id).collect()
+}
+
+/// `]` and `[`: the tab `delta` along from the one the grid is on,
+/// stopping at either end rather than wrapping round — from no tab at
+/// all, the first or the last.
+pub(super) fn step_tab(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
+    app.settle_project_tabs();
+    let tabs = open_tabs(app);
+    let Some(last) = tabs.len().checked_sub(1) else {
+        app.flash = Some(NO_TABS.into());
+        return;
+    };
+    let at = app
+        .selected_project()
+        .and_then(|p| tabs.iter().position(|t| t == &p.id));
+    let next = match at {
+        Some(at) => (at as i64 + delta).clamp(0, last as i64) as usize,
+        None if delta < 0 => last,
+        None => 0,
+    };
+    // The end of the row — `[` on the first tab, `]` on the last — goes
+    // nowhere.
+    if Some(next) == at {
+        if last == 0 {
+            app.flash = Some(ONE_TAB.into());
+        }
+        return;
+    }
+    open_tab(app, &tabs[next], out);
+}
+
+/// `k`,`k` on the top row of cards: the keys go up to the PROJECT TABS,
+/// their cursor on the tab of the project on screen. `h` / `l` walk the
+/// cursor along the tabs and the grid comes with it, each project shown
+/// on the card it was last left on ([`walk_tab_cursor`]); Enter, `j`,`j`
+/// back down, or Esc hands the keys back to that card ([`choose_tab`]).
+/// The card under the grid's cursor stays under it, drawn unfocused, and
+/// the pane keeps reading it.
+pub(super) fn focus_tabs(app: &mut App) {
+    app.settle_project_tabs();
+    let tabs = open_tabs(app);
+    let Some(first) = tabs.first().cloned() else {
+        app.flash = Some(NO_TABS.into());
+        return;
+    };
+    let on = app
+        .selected_project()
+        .map(|p| p.id.clone())
+        .filter(|id| tabs.contains(id))
+        .unwrap_or(first);
+    app.launcher_tab_cursor = Some(on);
     app.dirty = true;
 }
 
-/// A click on one of the header breadcrumb's crumbs: the crumb names a
-/// tier of the tree and the click OPENS that tier — `nebula` the list of
-/// workspaces, a workspace its projects, a project its sessions — so the
-/// word clicked and the grid landed on say the same thing, the way a
-/// path segment does. It walks through the same [`go_to`] that Esc,
-/// `k`,`k` and `w` take, so the pointer and the keys land in the same
-/// state, and a crumb naming the level already on screen simply stays
-/// put. Never a dialog: the view puts none over its grid.
-pub(super) fn click_crumb(app: &mut App, level: Level) {
-    go_to(app, level);
+/// The keys back to the cards, on whichever project the header's cursor
+/// walked the grid to: Esc, a click, and any key the header has no use
+/// for, which then goes on to mean what it means on the grid.
+pub(super) fn leave_tabs(app: &mut App) {
+    if app.launcher_tab_cursor.take().is_some() {
+        app.dirty = true;
+    }
 }
 
-/// `h` / `j` / `k` / `l` over the PROJECT cards. The cursor it moves is
-/// `App::sel_project` — the PROJECTS PANEL's own — so the card under it
-/// is what the level below will open on and what every verb that reads
-/// the selection sees.
-fn step_projects(app: &mut App, dx: i64, dy: i64) {
-    let cards = view::project_cards(app);
-    let at = view::project_cursor(app, &cards);
-    let Some(next) = view::grid_stepped(at, dx, dy, cols(app), cards.len()) else {
-        app.flash = Some(NO_PROJECTS.into());
+/// A key while the PROJECT TABS have the keyboard: `h` / `l` (and `[` /
+/// `]`) walk the header's cursor and the grid with it, Enter goes back
+/// down to the cards of the tab under it, `j`,`j` does too — the double
+/// tap back down the way `k`,`k` came up — and `x` closes it. `k` has nowhere higher to go. Any other key hands the keys
+/// back to the cards and is false, so the grid's own meaning of it runs:
+/// `p` opens the box, `/` the palette, a digit a tab outright.
+fn tabs_action(
+    app: &mut App,
+    action: Action,
+    armed: Option<(Action, std::time::Instant)>,
+    chord: &KeyChord,
+    out: &mut Vec<ClientRequest>,
+) -> bool {
+    let Some(on) = app.launcher_tab_cursor.clone() else {
+        return false;
+    };
+    match action {
+        Action::FocusLeft | Action::PrevProjectTab => walk_tab_cursor(app, -1, out),
+        Action::FocusRight | Action::NextProjectTab => walk_tab_cursor(app, 1, out),
+        Action::Activate => choose_tab(app, &on, out),
+        Action::MoveDown => {
+            let name = app
+                .tree
+                .projects
+                .iter()
+                .find(|p| p.id == on)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            if super::double_tapped(app, action, armed, chord, &format!("into {name}")) {
+                choose_tab(app, &on, out);
+            }
+        }
+        Action::MoveUp => {}
+        Action::CloseProjectTab => close_cursor_tab(app, &on, out),
+        _ => {
+            leave_tabs(app);
+            return false;
+        }
+    }
+    true
+}
+
+/// `h` / `l` with the PROJECT TABS holding the keys: the header's cursor
+/// `delta` tabs along, stopping at either end as `[` / `]` do on the
+/// grid — and the grid under it switches to that project at once, on the
+/// card it was last left on, with the pane reading that session
+/// ([`open_tab`], the tab click's own move). No Enter is needed to see a
+/// project: the header walks the projects the way `h` / `l` walk the
+/// cards, and the keys stay up here until they go back down.
+fn walk_tab_cursor(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
+    app.settle_project_tabs();
+    let tabs = open_tabs(app);
+    let Some(at) = app
+        .launcher_tab_cursor
+        .as_ref()
+        .and_then(|on| tabs.iter().position(|t| t == on))
+    else {
         return;
     };
-    if Some(next) == at {
+    if tabs.len() == 1 {
+        app.flash = Some(ONE_TAB.into());
         return;
     }
-    let id = cards[next].id.clone();
-    select_project(app, &id);
+    let next = (at as i64 + delta).clamp(0, tabs.len() as i64 - 1) as usize;
+    if next == at {
+        return;
+    }
+    app.launcher_tab_cursor = Some(tabs[next].clone());
+    app.dirty = true;
+    open_tab(app, &tabs[next], out);
 }
 
-/// Put the cursor on project `id`. Nothing is attached: the level draws
-/// no pane, so bringing up the project's last session here would boot a
-/// PTY nobody is looking at — only Enter, which opens the level that does
-/// draw one, brings a session up.
+/// Enter on the header's cursor, `j`,`j` down from it, and a click on a
+/// tab while the header has the keys ([`click_tab`]): the keys go back to
+/// the cards of project `id`. The walk has already put the grid on the
+/// project under the cursor, so that is only handing the keys down to the
+/// card it shows; a click on another tab opens that one first, on its
+/// last-focused card ([`open_tab`]).
+pub(super) fn choose_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
+    leave_tabs(app);
+    open_tab(app, id, out);
+}
+
+/// A left click on a PROJECT TAB. With the keys on the cards it is the
+/// tab key's twin ([`open_tab`]); with the header holding them it is
+/// Enter on that tab ([`choose_tab`]) — so the pointer never means
+/// something else than the key would in the same state.
+pub(super) fn click_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
+    if app.launcher_tab_cursor.is_some() {
+        choose_tab(app, id, out);
+    } else {
+        open_tab(app, id, out);
+    }
+}
+
+/// `x` with the PROJECT TABS holding the keys: close the tab the header's
+/// cursor is on, through the same [`close_tab`] the `×` takes, and put
+/// the cursor on the tab that slid into its place. The last tab is
+/// refused there, and the cursor stays on it.
+fn close_cursor_tab(app: &mut App, on: &ProjectId, out: &mut Vec<ClientRequest>) {
+    let at = open_tabs(app).iter().position(|t| t == on);
+    close_tab(app, on, out);
+    let tabs = open_tabs(app);
+    if tabs.contains(on) {
+        return;
+    }
+    let next = at
+        .and_then(|at| tabs.get(at.min(tabs.len().saturating_sub(1))))
+        .cloned();
+    app.launcher_tab_cursor = next;
+    app.dirty = true;
+}
+
+/// `x`: close the tab the grid is on — the selected project's.
+fn close_active_tab(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.settle_project_tabs();
+    let active = app
+        .selected_project()
+        .map(|p| p.id.clone())
+        .filter(|id| open_tabs(app).contains(id));
+    match active {
+        Some(id) => close_tab(app, &id, out),
+        None => app.flash = Some(NO_TABS.into()),
+    }
+}
+
+/// Drop project `id`'s tab from the header — the `×` on it, or `x` on the
+/// one the grid is on. Nothing about the project changes: its sessions
+/// run on, and the `+` dropdown opens it again, back at the far left.
+///
+/// Closing the tab the grid is on moves the grid to the tab that slides
+/// into its place — the one to its right, else the one to its left — as
+/// closing a TERMINAL tab moves the pane ([`tab_after`]). Closing any
+/// other tab moves nothing. The only tab left is refused: it is the
+/// project on screen, and there is no tab to hand the grid to — the `+`
+/// opens another first.
+pub(super) fn close_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
+    let mut tabs = open_tabs(app);
+    let Some(at) = tabs.iter().position(|t| t == id) else {
+        return;
+    };
+    if tabs.len() == 1 {
+        app.flash = Some(LAST_TAB.into());
+        return;
+    }
+    let showing = app.selected_project().is_some_and(|p| &p.id == id);
+    app.launcher_tabs.retain(|t| t != id);
+    tabs.remove(at);
+    app.dirty = true;
+    if !showing {
+        return;
+    }
+    let next = tabs
+        .get(at)
+        .or_else(|| at.checked_sub(1).and_then(|before| tabs.get(before)))
+        .cloned();
+    if let Some(next) = next {
+        open_tab(app, &next, out);
+    }
+}
+
+/// The PROJECT DROPDOWN: a click on the `+` after the PROJECT TABS drops
+/// every project on this machine under it ([`view::project_cards`]) —
+/// the ones wanting a human first, then the most recently worked in —
+/// the one in front of you ticked, each with how many sessions it holds.
+/// Enter on a row opens that project's sessions ([`open_project`]) and,
+/// if it had none, a tab for it at the far left. The last row opens a
+/// folder that is not a project yet — the same prompt `o` opens — so the
+/// `+` is the one place to reach for any project, known or not.
+///
+/// `⌘P` ([`Action::ProjectDropdown`]) drops the same list from the
+/// keyboard — from the cards, or from inside the PANE under them
+/// (`event_loop::drops_project_dropdown`) — and puts it away again; the
+/// key `+` does it from the cards in terminals that never send ⌘.
+/// INPUT IS NOT ACTION: the click and the keys all land here.
+///
+/// It takes TYPE-AHEAD, the same one the MODEL and EFFORT submenus have
+/// ([`crate::app::MenuFilter`]): letters narrow the rows to what they
+/// fuzzy-match, best first, so a tree of thirty projects is three letters
+/// and Enter away from any of them rather than a scroll. ↑/↓ move,
+/// Backspace widens, Esc clears the text before it closes — and a letter
+/// no project matches is refused, so the list never empties.
+///
+/// The tick rides at the END of a row, which is where
+/// [`crate::app::ContextMenu::set_filter`] looks for it: clearing the
+/// query hands the cursor back to the project you are already in rather
+/// than to the top of the list.
+pub(super) fn open_project_menu(app: &mut App) {
+    let open = app.selected_project().map(|p| p.id.clone());
+    let cards = view::project_cards(app);
+    if cards.is_empty() {
+        app.flash = Some(NO_PROJECTS.into());
+        return;
+    }
+    let mut items: Vec<MenuItem> = cards
+        .iter()
+        .map(|card| {
+            MenuItem::new(
+                format!(
+                    "{}  ({}){}",
+                    card.name,
+                    card.sessions.len(),
+                    if Some(&card.id) == open.as_ref() {
+                        " ✓"
+                    } else {
+                        ""
+                    }
+                ),
+                MenuAction::OpenProject(card.id.clone()),
+            )
+        })
+        .collect();
+    items.push(MenuItem::new(OPEN_FOLDER, MenuAction::AddProject));
+    let hover = open
+        .as_ref()
+        .and_then(|id| cards.iter().position(|card| &card.id == id))
+        .unwrap_or(0);
+    let at = crumb_anchor(app, &HitTarget::LauncherTabAdd);
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("Project".into()),
+        filter: Some(MenuFilter {
+            query: String::new(),
+            all: items.clone(),
+        }),
+        items,
+        at: Some(at),
+        hover,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+    }));
+    app.dirty = true;
+}
+
+/// Put the cursor on project `id` — the grid's scope, and the lit tab.
+/// Nothing is attached here: [`open_project`] puts the cursor on a card
+/// next, and that is what brings its session up in the pane.
 fn select_project(app: &mut App, id: &ProjectId) {
+    take_aim(app);
     if !select_project_row_by_id(app, id) {
         app.flash = Some("project no longer exists".into());
         return;
@@ -390,75 +918,59 @@ fn select_project(app: &mut App, id: &ProjectId) {
     app.dirty = true;
 }
 
-/// Enter on a project card: into the project — the SESSIONS level, scoped
-/// to it, with the cursor on the session the card led with (the one
-/// wanting a human, else the one that moved last) and the pane on that
-/// session. A project with nothing in it yet opens the BOX on it: the
-/// level below would otherwise be an empty grid with no way to fill it.
-fn enter_project(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let cards = view::project_cards(app);
-    let at = view::project_cursor(app, &cards).or((!cards.is_empty()).then_some(0));
-    let Some(at) = at else {
-        app.flash = Some(NO_PROJECTS.into());
+/// Into project `id` — the one move, so a tab, a digit and a pick from the
+/// PROJECT DROPDOWN end in the same state. INPUT IS NOT ACTION: the key,
+/// the click and the dropdown row all land here.
+///
+/// The cursor lands on the card the project was last left on
+/// ([`last_focused`]), so switching away and back puts you where you
+/// were, the pane reading the same session; on a first visit, or with
+/// that session gone or archived since, on the project's FIRST card.
+///
+/// A project with nothing in it yet lands on the empty grid, which names
+/// the key that starts a session — no BOX. Opening one here would put a
+/// modal over a screen the user only asked to look at: switching to a
+/// project is not asking to start a session in it.
+pub(super) fn open_project(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
+    let Some(card) = view::project_cards(app).into_iter().find(|c| &c.id == id) else {
+        app.flash = Some("project no longer exists".into());
         return;
     };
-    let (id, first) = (
-        cards[at].id.clone(),
-        cards[at].sessions.first().map(|a| a.id.clone()),
-    );
-    select_project(app, &id);
-    go_to(app, Level::Sessions);
-    match first {
+    let land = last_focused(app, &card).or_else(|| card.sessions.first().map(|a| a.id.clone()));
+    select_project(app, id);
+    match land {
         Some(id) => select(app, id, out),
-        None => open_box(app),
+        None => fold_empty_grid(app),
     }
 }
 
-/// `h` / `j` / `k` / `l` over the WORKSPACE cards. Moving the cursor here
-/// IS opening that workspace — the cards are in tab order and the cursor
-/// is `Tree::active_workspace`, exactly as it is in the panels' bar — but
-/// quietly: nothing is restored and nothing attaches while the user is
-/// still walking the row.
-fn step_workspaces(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientRequest>) {
-    let cards = view::workspace_cards(app);
-    let at = view::workspace_cursor(app);
-    let Some(next) = view::grid_stepped(at, dx, dy, cols(app), cards.len()) else {
-        return;
+/// Nothing to aim at: with no card the PANE along the bottom has no
+/// session to be, so it folds and the grid takes the body — the hero, and
+/// the word for how to fill it.
+///
+/// INPUT PARITY: the one landing for a grid with no cards, whether a
+/// project with none was opened ([`open_project`]) or the last card was
+/// archived or deleted out of it ([`keep_cursor`]).
+fn fold_empty_grid(app: &mut App) {
+    let word = nothing_here(app);
+    clear_aim(app);
+    app.flash = Some(word.into());
+}
+
+/// The card project `card` was last left on: the session under the cursor
+/// when the grid last moved off the project (`remember_context` keeps its
+/// checkout and that checkout's session), while it is still one of the
+/// project's cards. Read before [`select_project`], whose own bookkeeping
+/// rewrites it.
+fn last_focused(app: &App, card: &view::ProjectCard) -> Option<AgentId> {
+    let wid = app.last_worktree_for_project.get(&card.id)?;
+    let SessionRef::Agent(id) = app.last_session_for_worktree.get(wid)? else {
+        return None;
     };
-    if Some(next) == at {
-        return;
-    }
-    let id = cards[next].id.clone();
-    select_workspace(app, id, out);
-}
-
-/// Put the cursor on workspace `id` — which is to open it, quietly.
-fn select_workspace(app: &mut App, id: WorkspaceId, out: &mut Vec<ClientRequest>) {
-    if switch_workspace_quietly(app, id, out) {
-        app.dirty = true;
-    }
-}
-
-/// Enter on a workspace card: down into its projects. The cursor is
-/// already the open workspace, so there is nothing to switch — what Enter
-/// adds is the project this workspace was last left on, which the quiet
-/// switch deliberately did not restore while the row was still being
-/// walked.
-fn enter_workspace(app: &mut App) {
-    restore_workspace_project(app);
-    restore_project_cursors(app);
-    go_to(app, Level::Projects);
-}
-
-/// A digit (or ⌘N): open the Nth workspace and land on its projects — the
-/// tab it names, without the bar this view never draws.
-fn open_workspace_slot(app: &mut App, slot: u8, out: &mut Vec<ClientRequest>) {
-    let Some(id) = view::workspace_at(app, usize::from(slot).saturating_sub(1)) else {
-        app.flash = Some(format!("no workspace {slot}"));
-        return;
-    };
-    select_workspace(app, id, out);
-    enter_workspace(app);
+    card.sessions
+        .iter()
+        .any(|a| &a.id == id)
+        .then(|| id.clone())
 }
 
 /// Put the cursor on session `id`, through the jump the `/` PALETTE takes
@@ -469,19 +981,29 @@ fn open_workspace_slot(app: &mut App, slot: u8, out: &mut Vec<ClientRequest>) {
 /// PANE under the grid reads, so walking the cards swaps the pane exactly
 /// as ↑/↓ down the SESSIONS PANEL previews a row — the same debounced
 /// attach, and the same mark-as-seen, since that session is now on screen.
+/// FOCUS stays on the grid: the pane is opened, never entered.
 fn select(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
+    // A pointer moved onto another card is the one way the cursor leaves
+    // an open FOLLOW-UP STRIP while it holds the keyboard: the strip is
+    // aimed at the card it was opened on, so it folds rather than sending
+    // the next turn to a session the cursor has left.
+    if app.follow_up.as_ref().is_some_and(|f| f.agent != id) {
+        app.follow_up = None;
+    }
+    take_aim(app);
     jump_to_target_inner(app, PaletteTarget::Session(id), Landing::FocusOnly, out);
     app.focus = Focus::Sessions;
 }
 
-/// A click on the card at `index`: the cursor lands there, and a second
-/// click on the same card is Enter — down into the PANE along the bottom,
+/// A click on the card at `index`: the cursor lands there, which opens the
+/// PANE along the bottom on that session ([`point_at`]) without taking the
+/// keys off the cards — the session is there to read, not yet to type
+/// into. A second click on the same card is Enter — down into the pane,
 /// where that session is already running.
 pub(super) fn click_row(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) {
-    let Some(id) = view::agent_at(app, index) else {
+    let Some(id) = point_at(app, index, out) else {
         return;
     };
-    select(app, id.clone(), out);
     if is_double_click(
         &mut app.last_session_click,
         crate::app::RowKey::Session(nebula_core::SessionRef::Agent(id)),
@@ -491,63 +1013,25 @@ pub(super) fn click_row(app: &mut App, index: usize, out: &mut Vec<ClientRequest
 }
 
 /// A right-click's first half, `select_clicked_row`'s arm: the cursor on
-/// the card at `index`, as a left click would put it. False off the grid.
+/// the card at `index` and the pane open on it, as a left click leaves
+/// them. False off the grid.
 pub(super) fn select_row(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) -> bool {
-    let Some(id) = view::agent_at(app, index) else {
-        return false;
-    };
-    select(app, id, out);
-    true
+    point_at(app, index, out).is_some()
 }
 
-/// A click on the PROJECT card at `index`: the cursor lands there, and a
-/// second click on the same card is Enter — into the project. Input is
-/// not action: both ends call the same [`select_project`] and
-/// [`enter_project`] the keys do.
-pub(super) fn click_project_card(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) {
-    let Some(id) = view::project_at(app, index) else {
-        return;
-    };
-    select_project(app, &id);
-    if is_double_click(&mut app.last_project_click, id) {
-        enter_project(app, out);
+/// The pointer landing on the card at `index`, either button: the cursor
+/// goes there and the PANE along the bottom opens on it — ALWAYS, folded
+/// away (`^~`) or not. A card clicked is a card to read, so the fold only
+/// lasts while the grid is walked with the keys; a click unfolds it the
+/// way Enter and naming a TAB do ([`enter_pane`], [`show_pane_tab`]).
+/// None off the grid.
+fn point_at(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) -> Option<AgentId> {
+    let id = view::agent_at(app, index)?;
+    if app.launcher_pane_hidden {
+        toggle_pane(app);
     }
-}
-
-/// The same click's first half, for a right-click's menu. False off the
-/// grid.
-pub(super) fn select_project_card(app: &mut App, index: usize) -> bool {
-    let Some(id) = view::project_at(app, index) else {
-        return false;
-    };
-    select_project(app, &id);
-    true
-}
-
-/// A click on the WORKSPACE card at `index`: the cursor lands there —
-/// which opens that workspace — and a second click is Enter, down into
-/// its projects.
-pub(super) fn click_workspace_card(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) {
-    let Some(id) = view::workspace_at(app, index) else {
-        return;
-    };
-    select_workspace(app, id.clone(), out);
-    if is_double_click(&mut app.last_workspace_click, id) {
-        enter_workspace(app);
-    }
-}
-
-/// The same click's first half. False off the grid.
-pub(super) fn select_workspace_card(
-    app: &mut App,
-    index: usize,
-    out: &mut Vec<ClientRequest>,
-) -> bool {
-    let Some(id) = view::workspace_at(app, index) else {
-        return false;
-    };
-    select_workspace(app, id, out);
-    true
+    select(app, id.clone(), out);
+    Some(id)
 }
 
 /// The card under the cursor ahead of an input event, for [`keep_cursor`]:
@@ -562,16 +1046,13 @@ pub(super) struct CursorCard {
     /// list has moved. None at the ends of the list.
     before: Option<AgentId>,
     after: Option<AgentId>,
-    /// The SESSIONS level's project. A switch to another one takes every
-    /// card off the list at once, which [`keep_cursor`] has to tell from
-    /// this one card leaving it.
+    /// The grid's project. A switch to another one takes every card off
+    /// the list at once, which [`keep_cursor`] has to tell from this one
+    /// card leaving it.
     project: Option<ProjectId>,
 }
 
 pub(super) fn cursor_entry(app: &App) -> Option<CursorCard> {
-    if app.launcher_level != Level::Sessions {
-        return None;
-    }
     let rows = view::rows(app);
     let at = view::cursor(app, &rows)?;
     let id_at = |i: usize| rows.get(i).map(|row| row.agent.id.clone());
@@ -596,12 +1077,14 @@ pub(super) fn cursor_entry(app: &App) -> Option<CursorCard> {
 /// whole project's, ordered by recency — so the neighbor they hand the
 /// cursor to is some card elsewhere in the grid, and taking it threw the
 /// cursor across the screen.
+///
+/// The LAST card leaving has no neighbor to take: the pane folds away with
+/// it ([`fold_empty_grid`]), as it does on a project opened with none.
 pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<ClientRequest>) {
-    // Not this list any more: the level was walked out of, or the grid
-    // has another project's cards up. Every card left it, this one with
-    // them, and whatever put the cursor on one of the new ones meant to.
-    if app.launcher_level != Level::Sessions
-        || app.selected_project().map(|p| p.id.clone()) != before.project
+    // Not this list any more: the grid has another project's cards up.
+    // Every card left it, this one with them, and whatever put the cursor
+    // on one of the new ones meant to.
+    if app.selected_project().map(|p| p.id.clone()) != before.project
         // A create is still being followed onto its own row (`n`, the
         // box): that landing is the one the user asked for.
         || app.select_when_seen.is_some()
@@ -609,7 +1092,11 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
         return;
     }
     let rows = view::rows(app);
-    if rows.is_empty() || rows.iter().any(|row| row.agent.id == before.id) {
+    if rows.is_empty() {
+        fold_empty_grid(app);
+        return;
+    }
+    if rows.iter().any(|row| row.agent.id == before.id) {
         return;
     }
     // Named neighbours, not arithmetic: the card that WAS before this one
@@ -642,13 +1129,28 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
 /// Enter (or Tab, or `^→`, or a double-click): the session under the
 /// cursor in the PANE along the bottom, with the input lock on — focus
 /// crosses into the pane where it stands, the grid still up over it, and
-/// `^q` (`leave_terminal_lock`) hands the keys back to the cards, exactly
-/// as it does after a click into the pane. `z` ([`open_session`]) is the
+/// `^`` ([`fold_key`]) hands the keys back to the cards, exactly as it
+/// does after a click into the pane. `z` ([`open_session`]) is the
 /// way to the whole screen.
 ///
 /// The jump attaches the card outright, so a card the pane's debounce had
 /// not reached yet is the one the keys reach.
 pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
+    // A pane folded away (`^~`) is brought back rather than stepped over,
+    // the way naming a TAB brings it back ([`show_pane_tab`]): opening a
+    // session here means the pane under the cards, so asking for one
+    // unfolds it instead of taking the whole screen out from under the
+    // grid — `z` ([`open_session`]) is the only way to that. With the
+    // pane already drawn this changes nothing and focus lands in it
+    // below, so a second ask, with the keys already there, is a no-op.
+    if app.launcher_pane_hidden {
+        toggle_pane(app);
+    }
+    // Nor is a pane collapsed for want of a card under the cursor
+    // ([`clear_aim`] — Esc, a click on the air) stepped over: the aim
+    // comes back first, so the pane opens on the card Enter is about to
+    // cross into instead of the keys landing on nothing.
+    take_aim(app);
     // A body too short for a pane worth the name draws none ([`has_pane`]):
     // there is nothing under the cards to cross into, so the session takes
     // the whole screen rather than the keys going somewhere off-screen.
@@ -656,10 +1158,26 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
         open_session(app, out);
         return;
     }
+    // The pane may be reading a TERMINAL rather than the card under the
+    // cursor (its TAB STRIP): Enter steps into what is on screen, not
+    // into something the strip would have to be walked off first.
+    if let Some(id) = app.pinned_terminal() {
+        super::attach_now(app, SessionRef::Terminal(id), out);
+        enter_terminal_pane(app, out);
+        return;
+    }
     let Some(id) = cursor_or_first(app) else {
-        app.flash = Some(NO_SESSIONS.into());
+        app.flash = Some(nothing_here(app).into());
         return;
     };
+    // An ARCHIVED card has no session to read: the daemon reaped it when
+    // it was archived. Say what to press rather than handing the keys to
+    // an empty pane.
+    if is_archived(app, &id) {
+        app.flash = Some(super::AGENT_ARCHIVED.into());
+        return;
+    }
+    take_aim(app);
     jump_to_target(app, PaletteTarget::Session(id), Landing::Attach, out);
     // A Cloud row's Enter is its browser page, not a PTY: the jump has
     // already opened it and there is nothing to type into.
@@ -674,10 +1192,22 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// comes back to the grid. The jump attaches the card outright, so a card
 /// the pane's debounce had not reached yet is the one that comes up.
 pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
+    // As with Enter ([`enter_pane`]): `z` full-screens whatever the pane
+    // is reading, which is the pinned TERMINAL when the strip is on one.
+    if let Some(id) = app.pinned_terminal() {
+        super::attach_now(app, SessionRef::Terminal(id), out);
+        super::zoom_pane(app, out);
+        return;
+    }
     let Some(id) = cursor_or_first(app) else {
-        app.flash = Some(NO_SESSIONS.into());
+        app.flash = Some(nothing_here(app).into());
         return;
     };
+    if is_archived(app, &id) {
+        app.flash = Some(super::AGENT_ARCHIVED.into());
+        return;
+    }
+    take_aim(app);
     jump_to_target(app, PaletteTarget::Session(id), Landing::Attach, out);
     // A Cloud row's Enter is its browser page, not a PTY: the jump has
     // already opened it and there is nothing to full-screen.
@@ -686,14 +1216,12 @@ pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
 }
 
-/// Is the PANE along the bottom on screen? False on a body too short to
-/// hold the header, a row of cards and a pane worth the name, where a
-/// session is only ever seen full-screen — and before the first draw,
-/// which no key beats.
+/// Is the PANE along the bottom on screen? False with the pane folded
+/// away (`^~`), on a body too short to hold the header, a row of cards
+/// and a pane worth the name, where a session is only ever seen
+/// full-screen — and before the first draw, which no key beats.
 fn has_pane(app: &App) -> bool {
-    view::split(app.launcher_body, app.launcher_level, app.launcher_pane_h)
-        .1
-        .is_some()
+    app.launcher_split(app.launcher_body).1.is_some()
 }
 
 /// The card under the cursor, or the first one when it is on none — the
@@ -717,7 +1245,7 @@ pub(super) fn handle_box_key(
     launch: &QuickLaunch,
     input: &TextInput,
 ) -> bool {
-    if !app.launcher || !key.modifiers.contains(KeyModifiers::CONTROL) {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
         return false;
     }
     let back = QuickReturn {
@@ -726,16 +1254,51 @@ pub(super) fn handle_box_key(
         from_box: true,
     };
     match key.code {
-        KeyCode::Char('p' | 'P') => open_project_picker(app, back),
-        KeyCode::Char('o' | 'O') => open_model_picker(app, back),
+        KeyCode::Char('p' | 'P') => open_box_field(app, BoxField::Project, back),
+        KeyCode::Char('o' | 'O') => open_box_field(app, BoxField::Model, back),
         KeyCode::Char('n' | 'N') => toggle_new_worktree(app, launch.clone(), input.clone()),
         _ => return false,
     }
     true
 }
 
+/// The picker behind one of the box's details, whichever way it was
+/// asked for — the chord beside it or a click on it. Input is not action:
+/// there is one of these per field and both ways in end here.
+///
+/// `Tab`'s own arm (`event_loop`'s prompt keys) is the harness picker for
+/// every QUICK PROMPT, LAUNCHER VIEW or not, and it opens the same
+/// [`crate::quick_prompt::open_launch_picker`] this does.
+pub(super) fn open_box_field(app: &mut App, field: BoxField, back: QuickReturn) {
+    match field {
+        BoxField::Project => open_project_picker(app, back),
+        BoxField::Worktree => open_worktree_picker(app, back),
+        BoxField::Agent => crate::quick_prompt::open_launch_picker(app, back),
+        BoxField::Model => open_model_picker(app, back),
+    }
+}
+
+/// A click on one of the box's details: the launch and the text read off
+/// the box that is up, then the same [`open_box_field`] the chord takes.
+pub(super) fn click_box_field(app: &mut App, field: BoxField) {
+    let Some(crate::app::Overlay::Prompt(prompt)) = &app.overlay else {
+        return;
+    };
+    let crate::app::PromptKind::QuickPrompt(launch) = &prompt.kind else {
+        return;
+    };
+    let back = QuickReturn {
+        launch: launch.clone(),
+        text: prompt.input.as_str().to_string(),
+        from_box: true,
+    };
+    open_box_field(app, field, back);
+}
+
 /// `^P`: the PROJECT PICKER over the box. A box already bound to one
 /// project's work — an issue's, a pull request's — keeps its project.
+/// Only ever reached from a box that is up, so its `back` always hands
+/// one back ([`handle_picker_key`]).
 fn open_project_picker(app: &mut App, back: QuickReturn) {
     if let Some(issue) = &back.launch.issue {
         app.flash = Some(format!(
@@ -807,9 +1370,10 @@ pub(super) fn click_new_worktree(app: &mut App) {
 
 /// `^N` in the view's box: flip this launch between a fresh worktree and
 /// the project's own checkout — the project the box is aimed at, which is
-/// not always the one under the list's cursor (`^P` moves it). The choice
-/// sticks for the next box. A PR SESSION's checkout is the DAEMON's to
-/// pick, so it has nothing to flip.
+/// not always the one under the list's cursor (`^P` moves it). Only this
+/// box: the next one starts from the `quick_prompt_new_worktree` SETTING.
+/// A PR SESSION's checkout is the DAEMON's to pick, so it has nothing to
+/// flip.
 fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
     if launch.pr.is_some() {
         app.flash =
@@ -822,17 +1386,7 @@ fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
     };
     let fresh = !launch.is_new_worktree();
     let target = if fresh {
-        match &launch.issue {
-            Some(issue) => QuickTarget::NewWorktree {
-                branch: crate::branch_name::issue_name(
-                    issue.number,
-                    &issue.title,
-                    &app.project_branches(&project),
-                ),
-                project,
-            },
-            None => view::target_for(app, &project, true),
-        }
+        fresh_worktree(app, project, &launch)
     } else {
         match view::checkout_for(app, &project) {
             Some(worktree) => QuickTarget::Worktree(worktree),
@@ -842,8 +1396,133 @@ fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
             }
         }
     };
-    app.launcher_new_worktree = fresh;
     reopen_with(app, QuickLaunch { target, ..launch }, input);
+}
+
+/// A fresh worktree for `launch` in `project`, on a branch nobody has
+/// yet: named after the issue for an ISSUE SESSION, the random name `n`
+/// would offer otherwise.
+fn fresh_worktree(app: &App, project: ProjectId, launch: &QuickLaunch) -> QuickTarget {
+    let taken = app.project_branches(&project);
+    let branch = match &launch.issue {
+        Some(issue) => crate::branch_name::issue_name(issue.number, &issue.title, &taken),
+        None => crate::branch_name::random_name(&taken),
+    };
+    QuickTarget::NewWorktree { project, branch }
+}
+
+/// The WORKTREE PICKER for the box `back` owes — a click on the branch in
+/// the box's details row (`worktree main ▾`), dropped down from that
+/// branch over the box, which stays on screen under it as it does under
+/// `Tab` and `^O` (`ui::draw_overlay`). It is the manual pick of where
+/// this one launch runs, and never a branch switch: every checkout keeps
+/// the branch it is on. First a fresh worktree — the branch it would be cut on
+/// named, the one already minted when the box is aimed at one — then the
+/// project's checkouts, the ROOT WORKTREE first and the rest most recently
+/// worked in first, as the WORKTREES PANEL lists them. Never a stand-in git
+/// is still cutting, nor a root the project hides. The row the box is
+/// aimed at wears the ✓ and starts highlighted; letters narrow the list.
+///
+/// Every row carries the box back, so Esc and a click outside hand it
+/// back as it was (`menu_quick_return`), and a pick hands it back aimed
+/// at the row ([`pick_launch_worktree`]). A PR SESSION has nothing to
+/// pick: the DAEMON runs it in the pull request's own checkout.
+fn open_worktree_picker(app: &mut App, back: QuickReturn) {
+    use std::cmp::Reverse;
+    if back.launch.pr.is_some() {
+        app.flash =
+            Some("quick prompt: a PR session runs in the pull request's own checkout".into());
+        return;
+    }
+    let Some(project) = view::project_of(app, &back.launch.target) else {
+        app.flash = Some("project no longer exists".into());
+        return;
+    };
+    let hide_root = app
+        .tree
+        .projects
+        .iter()
+        .find(|p| p.id == project)
+        .is_some_and(|p| app.root_hidden(p));
+    let mut checkouts: Vec<_> = app
+        .tree
+        .worktrees
+        .iter()
+        .filter(|w| {
+            w.project_id == project
+                && !(hide_root && w.is_main)
+                && !app.is_placeholder_worktree(&w.id)
+        })
+        .collect();
+    let now = crate::app::now_ms();
+    checkouts.sort_by_key(|w| {
+        let r = crate::app::worktree_recency(&app.tree, &w.id, now);
+        (
+            Reverse(w.is_main),
+            Reverse(r.interacted),
+            Reverse(r.stamped),
+        )
+    });
+
+    let tick = |on: bool| if on { " ✓" } else { "" };
+    let row = |label: String, target: QuickTarget| {
+        MenuItem::new(
+            label,
+            MenuAction::PickLaunchWorktree {
+                target,
+                back: Box::new(back.clone()),
+            },
+        )
+    };
+    let fresh = match &back.launch.target {
+        QuickTarget::NewWorktree { .. } => back.launch.target.clone(),
+        QuickTarget::Worktree(_) => fresh_worktree(app, project.clone(), &back.launch),
+    };
+    let QuickTarget::NewWorktree { branch, .. } = &fresh else {
+        unreachable!("fresh_worktree mints a new worktree")
+    };
+    let mut items = vec![row(
+        format!(
+            "+ new worktree  {branch}{}",
+            tick(back.launch.is_new_worktree())
+        ),
+        fresh.clone(),
+    )];
+    for w in checkouts {
+        let aimed = back.launch.target == QuickTarget::Worktree(w.id.clone());
+        let root = if w.is_main { "  (root)" } else { "" };
+        items.push(row(
+            format!("{}{root}{}", w.branch, tick(aimed)),
+            QuickTarget::Worktree(w.id.clone()),
+        ));
+    }
+    let hover = items
+        .iter()
+        .position(|i| i.label.ends_with(" ✓"))
+        .unwrap_or(0);
+    app.overlay = Some(Overlay::Menu(crate::app::ContextMenu {
+        title: Some("Worktree".into()),
+        items: items.clone(),
+        at: None,
+        hover,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+        filter: Some(crate::app::MenuFilter {
+            query: String::new(),
+            all: items,
+        }),
+    }));
+}
+
+/// A row of the WORKTREE PICKER: the box back, aimed at `target`, with the
+/// text it had. Like `^N`, only this box: the next one starts from the
+/// `quick_prompt_new_worktree` SETTING.
+pub(super) fn pick_launch_worktree(app: &mut App, target: QuickTarget, back: QuickReturn) {
+    let launch = QuickLaunch {
+        target,
+        ..back.launch
+    };
+    crate::quick_prompt::reopen(app, launch, &back.text);
 }
 
 /// Put the box back up on `launch` with `input` — text and caret — as it
@@ -873,7 +1552,13 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             let back = picker.back.clone();
             app.overlay = None;
-            crate::quick_prompt::reopen(app, back.launch, &back.text);
+            // A picker with no box under it — `p` with nothing selected —
+            // closes on Esc rather than putting up a box nobody asked
+            // for, exactly as the preset picker reached off a pull
+            // request does (`QuickReturn::from_box`).
+            if back.from_box {
+                crate::quick_prompt::reopen(app, back.launch, &back.text);
+            }
         }
         KeyCode::Enter => pick(app),
         KeyCode::Down => picker.select(1),
@@ -906,8 +1591,7 @@ pub(super) fn click_picker_row(app: &mut App, index: usize) {
 /// Enter in the PROJECT PICKER: the box comes back aimed at the project
 /// under the cursor, text kept, a fresh worktree or its checkout as the
 /// box had it. Aiming the box is not navigation: the grid behind it stays
-/// on the project you are working in, and the workspace stays open, even
-/// when the pick lives in another one. The launch that follows is a
+/// on the project you are working in. The launch that follows is a
 /// BACKGROUND LAUNCH (`view::is_background`) — it starts the session over
 /// there and leaves the screen here.
 fn pick(app: &mut App) {
@@ -924,23 +1608,34 @@ fn pick(app: &mut App) {
         target,
         ..back.launch
     };
-    crate::quick_prompt::reopen(app, launch, &back.text);
+    if back.from_box {
+        crate::quick_prompt::reopen(app, launch, &back.text);
+        return;
+    }
+    // No box was under the picker: this pick OPENS one, so it goes
+    // through the door every other way into the box takes — which is
+    // what hands back the DRAFT the last abandoned box left
+    // (`quick_prompt::open_box`).
+    crate::quick_prompt::open_box(app, launch);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{buffer_text, hse, seed_tree, with_default_config};
+    use super::super::tests::{
+        buffer_text, hse, seed_issues, seed_open_prs, seed_tree, with_config_json,
+        with_default_config,
+    };
     use super::super::{handle_terminal_event, sweep_target};
-    use crate::app::{App, Focus, HitTarget, Overlay, PromptKind};
-    use crate::keymap::Action;
+    use crate::app::{App, Focus, HitTarget, Overlay, PendingAction, PromptKind};
+    use crate::launcher::BoxField;
     use crate::quick_prompt::{QuickLaunch, QuickTarget};
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use nebula_core::{
         Agent, AgentId, AgentKind, AgentStatus, ClientRequest, Entity, Project, ProjectId,
-        ServerEvent, SessionRef, WorkspaceId, Worktree, WorktreeId,
+        ServerEvent, SessionRef, TerminalId, TerminalTab, Worktree, WorktreeId,
     };
     use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
     use ratatui::Terminal;
 
     /// `seed_tree`'s `demo` project (its root `main`, session `agent-1`),
@@ -948,16 +1643,14 @@ mod tests {
     /// newer session and so the grid's first card — and a second project,
     /// `web`, whose root runs `tidy-css`.
     ///
-    /// The SESSIONS level is one project's, so the grid holds demo's two
-    /// cards and `web` is a card beside it one level up — which is what
-    /// makes both the walk and the walk out testable off one tree. The
-    /// view is on; nothing is owed at boot.
+    /// The grid is one project's, so it holds demo's two cards and `web`
+    /// is a tab away — which is what makes both the walk and the switch
+    /// testable off one tree. The view is on; nothing is owed at boot.
     fn two_sessions() -> App {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_feat(&mut app, "/tmp/demo-feat".into());
         seed_web(&mut app);
-        app.launcher = true;
         app
     }
 
@@ -1047,7 +1740,6 @@ mod tests {
             app,
             ServerEvent::EntityUpserted {
                 entity: Entity::Project(Project {
-                    workspace_id: Default::default(),
                     id: ProjectId("p2".into()),
                     name: "web".into(),
                     repo_path: "/tmp/web".into(),
@@ -1187,72 +1879,119 @@ mod tests {
         });
     }
 
-    /// INPUT PARITY: the view has no workspaces, so nothing here reaches
-    /// the WORKSPACE SWITCHER — `w`, `⇧W` and the digit tabs each say so,
-    /// and so does a click on the footer's `◇ name` nameplate, which opens
-    /// the switcher in every other view. Turning the view off gives the
-    /// key its switcher back.
+    /// INPUT PARITY for a pane BESIDE the cards (Settings → Appearance →
+    /// **Session pane**): the draw lays it down the right or the left side,
+    /// registers the grab zone on the edge facing the cards, and a drag
+    /// through the loop's own entry point moves that edge sideways — the
+    /// next frame laying the pane out at the width it was left at, and the
+    /// height it had under the cards left alone.
     #[test]
-    fn the_workspace_keys_walk_the_level_instead_of_a_dialog() {
+    fn a_side_panes_edge_drags_sideways() {
+        use crate::launcher::PaneSide;
+        with_default_config(|| {
+            for side in [PaneSide::Right, PaneSide::Left] {
+                let mut app = two_sessions();
+                app.launcher_pane_at = side;
+                let edge = |app: &App| {
+                    app.hits
+                        .iter()
+                        .find(|(_, hit)| *hit == HitTarget::LauncherPaneSplitter)
+                        .map(|(rect, _)| *rect)
+                };
+                let col = |terminal: &Terminal<TestBackend>, x: u16| {
+                    buffer_text(terminal)
+                        .lines()
+                        .filter_map(|line| line.chars().nth(x as usize))
+                        .collect::<String>()
+                };
+
+                let terminal = draw(&mut app);
+                let body = app.launcher_body;
+                let (_, pane) = app.launcher_split(body);
+                let pane = pane.expect("130 columns fits a pane beside the cards");
+                assert_eq!(app.launcher_pane_side(), side);
+                assert_eq!((pane.y, pane.height), (body.y, body.height), "{side:?}");
+                let zone = edge(&app).expect("the pane's edge was registered");
+                let grip_x = crate::launcher::pane_edge(side, pane).x;
+                assert!(zone.x <= grip_x && grip_x < zone.x + zone.width);
+                assert_eq!(zone.height, pane.height, "the whole edge is grabbable");
+                assert!(col(&terminal, grip_x).contains('┃'), "the grip marks it");
+
+                // Four columns toward the cards: the pane takes them.
+                let toward = if side == PaneSide::Right { -4 } else { 4 };
+                let to = (i32::from(grip_x) + toward) as u16;
+                let row = pane.y + pane.height / 2;
+                mouse(
+                    &mut app,
+                    MouseEventKind::Down(MouseButton::Left),
+                    grip_x,
+                    row,
+                );
+                mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), to, row);
+                mouse(&mut app, MouseEventKind::Up(MouseButton::Left), to, row);
+                assert_eq!(app.launcher_pane_w, Some(pane.width + 4), "{side:?}");
+                assert_eq!(app.launcher_pane_h, None, "the bottom's height untouched");
+
+                let terminal = draw(&mut app);
+                let (_, moved) = app.launcher_split(app.launcher_body);
+                let moved = moved.expect("still a pane");
+                assert_eq!(moved.width, pane.width + 4);
+                assert_eq!(crate::launcher::pane_edge(side, moved).x, to);
+                assert!(col(&terminal, to).contains('┃'), "the grip moved with it");
+            }
+        });
+    }
+
+    /// Too narrow for the pane beside the cards: it goes along the bottom
+    /// rather than away, and its edge is dragged up and down there.
+    #[test]
+    fn a_side_pane_on_a_narrow_window_lies_along_the_bottom() {
+        use crate::launcher::PaneSide;
         with_default_config(|| {
             let mut app = two_sessions();
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Workspace(nebula_core::Workspace {
-                        id: Default::default(),
-                        name: "default".into(),
-                    }),
-                },
-            );
-            draw(&mut app);
-            // `w` walks to the top of the tree rather than dropping the
-            // panels' switcher over the grid.
-            key(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "w opened {:?}", app.overlay);
-            assert_eq!(app.launcher_level, crate::launcher::Level::Workspaces);
+            app.launcher_pane_at = PaneSide::Right;
+            draw_at(&mut app, 70, 34);
+            assert_eq!(app.launcher_pane_side(), PaneSide::Bottom);
+            let body = app.launcher_body;
+            let pane = app.launcher_split(body).1.expect("a pane under the cards");
+            assert_eq!((pane.x, pane.width), (body.x, body.width), "full width");
+            assert_eq!(pane.y + pane.height, body.y + body.height, "at the bottom");
+        });
+    }
 
-            // A digit opens that workspace and lands on its projects —
-            // the tab it names, without the bar this view never draws.
-            key(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "1 opened {:?}", app.overlay);
-            assert_eq!(app.launcher_level, crate::launcher::Level::Projects);
+    /// A digit opens the PROJECT TAB it counts to from the left — the
+    /// click on that tab, through the same [`open_tab`] — and one past the
+    /// last tab says so rather than doing nothing. `w` means nothing on
+    /// the grid: there is no level above it to walk to.
+    #[test]
+    fn the_digits_open_the_project_tabs() {
+        with_default_config(|| {
+            let mut by_key = two_tabs();
+            key(&mut by_key, KeyCode::Char('1'), KeyModifiers::NONE);
+            let mut by_click = two_tabs();
+            let (x, y) = crumb_cell(&by_click, HitTarget::LauncherTab(ProjectId("p2".into())));
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(tab_state(&by_key), tab_state(&by_click));
+            assert_eq!(tab_state(&by_key).0.as_deref(), Some("web"));
 
-            // ⇧W still has a bar to fold that is never drawn.
-            app.flash = None;
-            key(&mut app, KeyCode::Char('W'), KeyModifiers::SHIFT);
-            assert!(app.overlay.is_none());
-            assert_eq!(app.flash.as_deref(), Some(super::WORKSPACES_LEVEL));
-            app.launcher_level = crate::launcher::Level::Sessions;
+            key(&mut by_key, KeyCode::Char('2'), KeyModifiers::NONE);
+            assert_eq!(tab_state(&by_key).0.as_deref(), Some("demo"));
 
-            // The footer's nameplate belongs to the panels too, so it
-            // lands on the same refusal the keys do. (The header's own
-            // workspace crumb does not — it is the view's way in, and
-            // `the_header_crumbs_open_their_switchers` is where it opens.)
-            let (rect, _) = *app
-                .hits
-                .iter()
-                .find(|(_, hit)| *hit == HitTarget::FooterWorkspace)
-                .expect("the footer nameplate was drawn");
-            app.flash = None;
-            mouse(
-                &mut app,
-                MouseEventKind::Down(MouseButton::Left),
-                rect.x,
-                rect.y,
-            );
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
-            assert_eq!(app.flash.as_deref(), Some(super::WORKSPACES_LEVEL));
-
-            // Off, `w` is the switcher again.
-            app.launcher = false;
-            draw(&mut app);
-            key(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
+            key(&mut by_key, KeyCode::Char('9'), KeyModifiers::NONE);
+            assert_eq!(tab_state(&by_key).0.as_deref(), Some("demo"));
             assert!(
-                matches!(&app.overlay, Some(Overlay::Menu(menu)) if menu.is_workspace_picker()),
-                "the panels still switch workspaces: {:?}",
-                app.overlay
+                by_key
+                    .flash
+                    .as_deref()
+                    .is_some_and(|f| f.contains("no project tab 9")),
+                "{:?}",
+                by_key.flash
             );
+
+            let before = tab_state(&by_key);
+            key(&mut by_key, KeyCode::Char('w'), KeyModifiers::NONE);
+            assert!(by_key.overlay.is_none(), "w opened {:?}", by_key.overlay);
+            assert_eq!(tab_state(&by_key), before);
         });
     }
 
@@ -1338,6 +2077,851 @@ mod tests {
         });
     }
 
+    /// The columns `field` was drawn in on the box that is up.
+    fn detail(app: &App, field: BoxField) -> ratatui::layout::Rect {
+        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            panic!("expected the box, got {:?}", app.overlay);
+        };
+        prompt
+            .detail_areas
+            .iter()
+            .find(|(drawn, _)| *drawn == field)
+            .map(|(_, area)| *area)
+            .unwrap_or_else(|| panic!("{field:?} was not drawn: {:?}", prompt.detail_areas))
+    }
+
+    /// INPUT PARITY: the box's three details — `project ^P`, `agent Tab`,
+    /// `model ^O` — are buttons as much as the toggle under them. A click
+    /// on one opens exactly what its chord opens, down to the rows in it,
+    /// and Esc hands the box back with what was typed either way. The air
+    /// between two fields is not a button: a click there leaves the box up,
+    /// as any other miss in it does.
+    #[test]
+    fn clicking_a_box_detail_opens_the_picker_its_chord_does() {
+        with_default_config(|| {
+            // What is up, in enough detail that two pickers of the same
+            // shape cannot pass for one another. A field that refuses
+            // (no model list, a project the box is bound to) leaves the
+            // box up with a flash, and that is a shape too — the click
+            // has to be refused exactly as the chord is.
+            fn shape(app: &App) -> String {
+                match &app.overlay {
+                    Some(Overlay::ProjectPicker(picker)) => format!(
+                        "projects[{}]: {}",
+                        picker.selected,
+                        picker
+                            .projects
+                            .iter()
+                            .map(|p| p.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    Some(Overlay::Menu(menu)) => format!(
+                        "menu {:?}: {}",
+                        menu.title,
+                        menu.items
+                            .iter()
+                            .map(|i| i.label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    Some(Overlay::Prompt(_)) => format!("box: {:?}", app.flash),
+                    other => panic!("expected a picker or the box, got {other:?}"),
+                }
+            }
+
+            const TYPED: &str = "ship it";
+            let opened = |app: &mut App| {
+                key(app, KeyCode::Char('p'), KeyModifiers::NONE);
+                type_text(app, TYPED);
+                assert_eq!(launch(app).1, TYPED);
+            };
+
+            for (field, code, mods) in [
+                (BoxField::Project, KeyCode::Char('p'), KeyModifiers::CONTROL),
+                (BoxField::Agent, KeyCode::Tab, KeyModifiers::NONE),
+                (BoxField::Model, KeyCode::Char('o'), KeyModifiers::CONTROL),
+            ] {
+                let mut by_key = two_sessions();
+                opened(&mut by_key);
+                key(&mut by_key, code, mods);
+                let want = shape(&by_key);
+
+                let mut by_click = two_sessions();
+                opened(&mut by_click);
+                draw_at(&mut by_click, 140, 40);
+                let area = detail(&by_click, field);
+                assert!(area.width > 0, "{field:?} was drawn with no columns");
+                mouse(
+                    &mut by_click,
+                    MouseEventKind::Down(MouseButton::Left),
+                    area.x + 1,
+                    area.y,
+                );
+                assert_eq!(
+                    shape(&by_click),
+                    want,
+                    "{field:?}: the click opened something other than the chord does"
+                );
+
+                // And the trip back: the box returns with what was typed,
+                // whichever way it was left.
+                key(&mut by_click, KeyCode::Esc, KeyModifiers::NONE);
+                assert_eq!(
+                    launch(&by_click).1,
+                    TYPED,
+                    "{field:?}: the click lost the text on the way there"
+                );
+            }
+
+            // The gap between two fields is not either of them.
+            let mut app = two_sessions();
+            opened(&mut app);
+            draw_at(&mut app, 140, 40);
+            let project = detail(&app, BoxField::Project);
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                project.x + project.width,
+                project.y,
+            );
+            assert_eq!(
+                launch(&app).1,
+                TYPED,
+                "a click in the air between two fields left the box up"
+            );
+        });
+    }
+
+    /// A shell TERMINAL in checkout `worktree`. Terminals are the
+    /// checkout's, not the session's, which is the whole reason the PANE's
+    /// TAB STRIP names the branch beside them.
+    fn seed_terminal(app: &mut App, id: &str, worktree: &str, name: &str) {
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Terminal(TerminalTab {
+                    id: TerminalId(id.into()),
+                    worktree_id: WorktreeId(worktree.into()),
+                    name: name.into(),
+                    sort_order: 0,
+                    alive: true,
+                    run_command: None,
+                }),
+            },
+        );
+    }
+
+    /// What the PANE is reading, as its tab strip would have to agree.
+    fn reading(app: &App) -> Option<SessionRef> {
+        app.term.as_ref().map(|t| t.sref.clone())
+    }
+
+    /// Where the draw put the tab for `hit`.
+    fn tab_at(app: &App, hit: HitTarget) -> ratatui::layout::Rect {
+        app.hits
+            .iter()
+            .find(|(_, h)| *h == hit)
+            .map(|(r, _)| *r)
+            .unwrap_or_else(|| panic!("no tab was registered for {hit:?}"))
+    }
+
+    /// The PANE's header row, as the last draw left it.
+    fn head_row(app: &App, terminal: &Terminal<TestBackend>) -> String {
+        let body = app.launcher_body;
+        let pane_h =
+            crate::launcher::pane_height(body, app.launcher_pane_h).expect("a pane worth drawing");
+        let y = body.y + body.height - pane_h + 1;
+        buffer_text(terminal)
+            .lines()
+            .nth(y as usize)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The PANE's header is a TAB STRIP: the `SESSION` tab, the checkout
+    /// the tabs after it belong to, a divider, then one tab per TERMINAL
+    /// open in that checkout — in that order, because the branch is what
+    /// scopes everything drawn after it. Each tab is a click target the
+    /// draw registered where the word actually is.
+    #[test]
+    fn the_pane_header_lists_the_checkouts_terminals_after_the_session_tab() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_terminal(&mut app, "t1", "w2", "shell-1");
+            seed_terminal(&mut app, "t2", "w2", "shell-2");
+            draw(&mut app);
+            // Onto the `feat` card, so `feat` is the strip's checkout and
+            // its two terminals are the tabs.
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            let terminal = draw(&mut app);
+            let head = head_row(&app, &terminal);
+
+            // Columns, not bytes: the strip is full of `·`, `│` and `❯`,
+            // and a click lands on a cell.
+            let at = |needle: &str| {
+                let byte = head
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{head:?} is missing {needle:?}"));
+                head[..byte].chars().count()
+            };
+            assert!(
+                at("SESSION") < at("feat"),
+                "the checkout comes after the tab it scopes: {head:?}"
+            );
+            assert!(
+                at("feat") < at('│'.to_string().as_str()),
+                "the divider closes the session side off: {head:?}"
+            );
+            assert!(
+                at("│") < at("shell-1") && at("shell-1") < at("shell-2"),
+                "the terminals follow the divider, in tree order: {head:?}"
+            );
+
+            // And every tab is a button, on the row it was drawn on.
+            let session = tab_at(&app, HitTarget::LauncherPaneSession);
+            let second = tab_at(&app, HitTarget::LauncherPaneTerminal(1));
+            assert_eq!(session.y, second.y, "one row, all of it");
+            assert_eq!(
+                usize::from(session.x - app.launcher_body.x),
+                at("SESSION"),
+                "the SESSION button is where the word is"
+            );
+            assert_eq!(
+                usize::from(second.x - app.launcher_body.x),
+                at("shell-2") - 2,
+                "a terminal's button takes its glyph as well as its name"
+            );
+        });
+    }
+
+    /// INPUT PARITY: `` ` `` and a click on a tab walk the same strip
+    /// through the one [`show_pane_tab`], and what the pane READS follows
+    /// — SESSION, each terminal in turn, then round to SESSION again.
+    #[test]
+    fn the_key_and_a_click_walk_the_same_tab_strip() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_terminal(&mut app, "t1", "w2", "shell-1");
+            seed_terminal(&mut app, "t2", "w2", "shell-2");
+            draw(&mut app);
+            // Onto the `feat` card, whose checkout holds both terminals.
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            draw(&mut app);
+            let term = |id: &str| Some(SessionRef::Terminal(TerminalId(id.into())));
+
+            key(&mut app, KeyCode::Char('`'), KeyModifiers::NONE);
+            assert_eq!(reading(&app), term("t1"), "the first tab past SESSION");
+            key(&mut app, KeyCode::Char('`'), KeyModifiers::NONE);
+            assert_eq!(reading(&app), term("t2"));
+            key(&mut app, KeyCode::Char('`'), KeyModifiers::NONE);
+            assert!(
+                matches!(reading(&app), Some(SessionRef::Agent(_))),
+                "past the last tab is back to the card: {:?}",
+                reading(&app)
+            );
+
+            // The pointer lands in exactly the states the key does.
+            draw(&mut app);
+            let tab = tab_at(&app, HitTarget::LauncherPaneTerminal(1));
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                tab.x,
+                tab.y,
+            );
+            assert_eq!(reading(&app), term("t2"), "a click reads that terminal");
+
+            draw(&mut app);
+            let tab = tab_at(&app, HitTarget::LauncherPaneSession);
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                tab.x,
+                tab.y,
+            );
+            assert!(
+                matches!(reading(&app), Some(SessionRef::Agent(_))),
+                "and SESSION hands the pane back to the card: {:?}",
+                reading(&app)
+            );
+        });
+    }
+
+    /// The strip is one checkout's, so the terminal on it stays up while
+    /// the cursor walks the cards of that checkout — and is let go of the
+    /// moment the cursor lands in another one, where the strip lists
+    /// different terminals and the pin names nothing on it.
+    #[test]
+    fn a_terminal_stays_up_inside_its_checkout_and_is_dropped_leaving_it() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_running(&mut app, "a4", "w2", "more-feat");
+            seed_terminal(&mut app, "t1", "w2", "shell-1");
+            draw(&mut app);
+            let card = |app: &App, name: &str| {
+                crate::launcher::rows(app)
+                    .iter()
+                    .position(|r| r.agent.name == name)
+                    .unwrap_or_else(|| panic!("no card for {name}"))
+            };
+
+            let mut out = Vec::new();
+            let feat = card(&app, "polish-nav");
+            super::select_row(&mut app, feat, &mut out);
+            key(&mut app, KeyCode::Char('`'), KeyModifiers::NONE);
+            assert_eq!(
+                reading(&app),
+                Some(SessionRef::Terminal(TerminalId("t1".into())))
+            );
+
+            // Another card in the same checkout: the terminal is still up.
+            let sibling = card(&app, "more-feat");
+            super::select_row(&mut app, sibling, &mut out);
+            draw(&mut app);
+            assert_eq!(
+                reading(&app),
+                Some(SessionRef::Terminal(TerminalId("t1".into()))),
+                "walking inside the checkout must not swap the terminal out"
+            );
+
+            // A card in the root checkout: different terminals, so the pin
+            // goes and the pane reads the card again.
+            let root = card(&app, "agent-1");
+            super::select_row(&mut app, root, &mut out);
+            draw(&mut app);
+            assert_eq!(app.launcher_terminal, None, "the pin was let go of");
+            assert!(
+                matches!(reading(&app), Some(SessionRef::Agent(_))),
+                "the pane is the card's again: {:?}",
+                reading(&app)
+            );
+        });
+    }
+
+    /// The `×` on a tab is how a terminal is done with: a click on it puts
+    /// up the same confirm the SESSIONS PANEL's `d` does, `y` kills the
+    /// shell, and the strip lands on the tab beside it rather than on a
+    /// pane left blank by the detach.
+    #[test]
+    fn the_cross_on_a_tab_closes_that_terminal_and_the_strip_moves_on() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_terminal(&mut app, "t1", "w2", "shell-1");
+            seed_terminal(&mut app, "t2", "w2", "shell-2");
+            draw(&mut app);
+            // Onto the `feat` card, then onto its first terminal.
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('`'), KeyModifiers::NONE);
+            let term = |id: &str| Some(SessionRef::Terminal(TerminalId(id.into())));
+            assert_eq!(reading(&app), term("t1"));
+
+            draw(&mut app);
+            let cross = tab_at(&app, HitTarget::LauncherPaneCloseTerminal(0));
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                cross.x,
+                cross.y,
+            );
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    if matches!(c.action, PendingAction::CloseTerminal(_))),
+                "the cross asks first: {:?}",
+                app.overlay
+            );
+
+            let out = key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert!(
+                out.iter()
+                    .any(|r| matches!(r, ClientRequest::CloseTerminal { id, .. }
+                    if id == &TerminalId("t1".into()))),
+                "the daemon is told to close it: {out:?}"
+            );
+            assert_eq!(
+                reading(&app),
+                term("t2"),
+                "and the strip lands on the tab beside it"
+            );
+
+            // Closing the last one hands the pane back to the card.
+            draw(&mut app);
+            let cross = tab_at(&app, HitTarget::LauncherPaneCloseTerminal(0));
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                cross.x,
+                cross.y,
+            );
+            key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert_eq!(app.launcher_terminal, None, "no tab is pinned any more");
+            assert!(
+                matches!(reading(&app), Some(SessionRef::Agent(_))),
+                "the pane is the card's again: {:?}",
+                reading(&app)
+            );
+        });
+    }
+
+    /// INPUT PARITY: the right end of the PANE's header is its CLOSE
+    /// BUTTON, not the `INPUT` tag the panels' pane wears while locked —
+    /// and one click on it folds the pane away exactly as `^`` pressed
+    /// twice from inside does (out to the card, then the fold), keys and
+    /// all.
+    #[test]
+    fn the_close_button_on_the_pane_folds_it_like_the_key() {
+        with_default_config(|| {
+            let locked = || {
+                let mut app = two_sessions();
+                draw(&mut app);
+                key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+                key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                if app.term.is_none() {
+                    app.term = Some(crate::app::AttachedTerm::new(
+                        SessionRef::Agent(AgentId("a2".into())),
+                        40,
+                        10,
+                    ));
+                }
+                assert!(app.term_locked, "Enter put the keys in the pane");
+                app
+            };
+
+            let mut by_click = locked();
+            let terminal = draw(&mut by_click);
+            let head = head_row(&by_click, &terminal);
+            assert!(!head.contains("INPUT"), "no lock tag on the strip: {head}");
+            assert!(
+                head.trim_end().ends_with('×'),
+                "the close button ends the row: {head}"
+            );
+            let close = tab_at(&by_click, HitTarget::LauncherPaneClose);
+            mouse(
+                &mut by_click,
+                MouseEventKind::Down(MouseButton::Left),
+                close.x + 1,
+                close.y,
+            );
+
+            let mut by_key = locked();
+            draw(&mut by_key);
+            key(&mut by_key, KeyCode::Char('`'), KeyModifiers::CONTROL);
+            key(&mut by_key, KeyCode::Char('`'), KeyModifiers::CONTROL);
+
+            for app in [&by_click, &by_key] {
+                assert!(app.launcher_pane_hidden, "the pane folded away");
+                assert_eq!(app.focus, Focus::Sessions, "the keys are the cards'");
+                assert!(!app.term_locked);
+            }
+            assert_eq!(by_click.launcher_unaimed, by_key.launcher_unaimed);
+            assert_eq!(by_click.flash, by_key.flash);
+        });
+    }
+
+    /// `d` follows the strip: on a TERMINAL it closes that terminal, and
+    /// back on SESSION it is the card's delete again — the card is never
+    /// deleted by a key aimed at the pane.
+    #[test]
+    fn d_closes_the_terminal_the_strip_is_on_and_the_card_otherwise() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_terminal(&mut app, "t1", "w2", "shell-1");
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+
+            // On SESSION, `d` is still the card's.
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    if matches!(c.action, PendingAction::DeleteAgent(_))),
+                "the card's delete: {:?}",
+                app.overlay
+            );
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            // On the terminal it is the terminal's.
+            key(&mut app, KeyCode::Char('`'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    if matches!(c.action, PendingAction::CloseTerminal(_))),
+                "the terminal's close: {:?}",
+                app.overlay
+            );
+        });
+    }
+
+    /// Space on a card opens the FOLLOW-UP MODAL over the grid, aimed at
+    /// the card under the cursor — and touches nothing else: the PANE goes
+    /// on reading what it was reading, at the size it was, with the keys
+    /// still on the cards.
+    #[test]
+    fn space_opens_the_follow_up_modal_over_the_grid() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let (rows, reading, focus) = (app.term_area, pane(&app), app.focus);
+            let id = app.selected_session().map(|a| a.id.clone()).unwrap();
+            let name = app.selected_session().map(|a| a.name.clone()).unwrap();
+
+            key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Prompt(p))
+                    if p.kind == PromptKind::FollowUp { id: id.clone() }),
+                "the box is aimed at the card under the cursor: {:?}",
+                app.overlay
+            );
+
+            let text = buffer_text(&draw(&mut app));
+            assert!(
+                text.contains(&format!("Follow-up · {name}")),
+                "the modal names the session it will prompt:\n{text}"
+            );
+            assert_eq!(app.term_area, rows, "the pane kept its rows");
+            assert_eq!(pane(&app), reading, "and went on reading the same thing");
+            assert_eq!(app.focus, focus, "the keys never left the cards");
+        });
+    }
+
+    /// Enter sends what was typed down that session's PTY as its next turn
+    /// — the text, then the carriage return, two Inputs so the child reads
+    /// the prompt before the Enter — and the box closes onto the grid.
+    #[test]
+    fn the_modal_sends_the_turn_and_closes() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let id = app.selected_session().map(|a| a.id.clone()).unwrap();
+            let name = app.selected_session().map(|a| a.name.clone()).unwrap();
+
+            key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            type_text(&mut app, "rebase onto main");
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert_eq!(
+                inputs_to(&out, &id),
+                vec![b"rebase onto main".to_vec(), b"\r".to_vec()],
+                "the prompt, then the Enter that submits it: {out:?}"
+            );
+            assert!(app.overlay.is_none(), "the box closed: {:?}", app.overlay);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some(format!("sent to {name}").as_str())
+            );
+        });
+    }
+
+    /// The point of the modal: hand one card after another its next turn
+    /// without ever stepping into a session. The pane is never attached to,
+    /// never unfolded and never focused — with it folded away entirely the
+    /// turns still go out.
+    #[test]
+    fn cards_can_be_prompted_one_after_another_without_opening_the_pane() {
+        with_default_config(|| {
+            let mut app = three_sessions();
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('~'), KeyModifiers::NONE);
+            assert!(app.launcher_pane_hidden, "the pane is folded away");
+
+            let mut sent = Vec::new();
+            for turn in ["first", "second"] {
+                // Along the row to the next card (which takes the aim
+                // back, the fold having let it go), then prompt it.
+                key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+                let id = app.selected_session().map(|a| a.id.clone()).unwrap();
+                key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+                type_text(&mut app, turn);
+                let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                assert_eq!(
+                    inputs_to(&out, &id),
+                    vec![turn.as_bytes().to_vec(), b"\r".to_vec()],
+                    "{turn} went to the card it was typed on"
+                );
+                assert!(
+                    !out.iter()
+                        .any(|r| matches!(r, ClientRequest::Attach { .. })),
+                    "{turn} attached a pane nobody asked for: {out:?}"
+                );
+                sent.push(id);
+            }
+            assert_ne!(sent[0], sent[1], "two different cards were prompted");
+            assert!(app.launcher_pane_hidden, "and the pane stayed folded away");
+            assert_eq!(app.focus, Focus::Sessions, "the keys never left the cards");
+        });
+    }
+
+    /// A pane already open is left exactly where it is — including on a
+    /// TERMINAL tab, which prompting the card does not swap away from.
+    #[test]
+    fn an_open_pane_is_left_on_the_tab_it_was_reading() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_terminal(&mut app, "t1", "w2", "shell-1");
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('`'), KeyModifiers::NONE);
+            let reading = pane(&app);
+            assert!(app.pinned_terminal().is_some(), "the pane is on a terminal");
+
+            key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            type_text(&mut app, "status?");
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert!(app.pinned_terminal().is_some(), "still on the terminal tab");
+            assert_eq!(pane(&app), reading, "and still reading it");
+        });
+    }
+
+    /// Esc closes the box without sending, and leaves the grid where it
+    /// was.
+    #[test]
+    fn esc_closes_the_modal_without_sending() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            type_text(&mut app, "never mind");
+
+            let out = key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "the box closed");
+            assert!(
+                !out.iter().any(|r| matches!(r, ClientRequest::Input { .. })),
+                "nothing was sent: {out:?}"
+            );
+            assert_eq!(
+                app.selected_project().map(|p| p.name.as_str()),
+                Some("demo"),
+                "and the grid stayed where it was"
+            );
+        });
+    }
+
+    /// INPUT PARITY: **Follow-up prompt** in the card's `m` menu opens the
+    /// same modal Space does.
+    #[test]
+    fn the_menu_row_opens_the_same_modal_space_does() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let id = app.selected_session().map(|a| a.id.clone()).unwrap();
+
+            key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+            let at = match &app.overlay {
+                Some(Overlay::Menu(menu)) => menu
+                    .items
+                    .iter()
+                    .position(|i| i.label == "Follow-up prompt")
+                    .expect("the row is on the card's menu"),
+                other => panic!("expected the menu, got {other:?}"),
+            };
+            for _ in 0..at {
+                key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Prompt(p))
+                    if p.kind == PromptKind::FollowUp { id: id.clone() }),
+                "the menu row opened the box too: {:?}",
+                app.overlay
+            );
+        });
+    }
+
+    /// A row that takes no follow-up says why rather than opening a box
+    /// over it — the SESSIONS PANEL's own message, from the one
+    /// `activate::no_follow_up` both composers ask.
+    #[test]
+    fn a_cloud_card_says_what_it_takes_instead() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let id = app.selected_session().map(|a| a.id.clone()).unwrap();
+            if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == id) {
+                a.cloud_session_id = Some("cs-1".into());
+            }
+            key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "no box over a cloud session");
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("cloud sessions take a queued message — m, then Send to cloud session"),
+            );
+        });
+    }
+
+    /// The Inputs `out` carries for session `id`, in order.
+    fn inputs_to(out: &[ClientRequest], id: &AgentId) -> Vec<Vec<u8>> {
+        out.iter()
+            .filter_map(|r| match r {
+                ClientRequest::Input { session, data }
+                    if session == &SessionRef::Agent(id.clone()) =>
+                {
+                    Some(data.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The branch in the box's header, as drawn.
+    fn branch_button(app: &App) -> ratatui::layout::Rect {
+        match &app.overlay {
+            Some(Overlay::Prompt(p)) => p.branch_area,
+            other => panic!("expected the box, got {other:?}"),
+        }
+    }
+
+    /// The WORKTREE PICKER's rows and the one under its cursor.
+    fn picker_rows(app: &App) -> (Vec<String>, usize) {
+        match &app.overlay {
+            Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Worktree") => {
+                (m.items.iter().map(|i| i.label.clone()).collect(), m.hover)
+            }
+            other => panic!("expected the worktree picker, got {other:?}"),
+        }
+    }
+
+    /// Click the branch, then draw, so the picker's rows are clickable.
+    fn open_worktree_picker(app: &mut App) {
+        draw_at(app, 140, 40);
+        let button = branch_button(app);
+        assert!(button.width > 0, "the branch was drawn as a button");
+        mouse(
+            app,
+            MouseEventKind::Down(MouseButton::Left),
+            button.x + 1,
+            button.y,
+        );
+        draw_at(app, 140, 40);
+    }
+
+    /// Click the picker's row that starts with `label`, as drawn.
+    fn click_picker_row(app: &mut App, label: &str) {
+        let (area, index) = match &app.overlay {
+            Some(Overlay::Menu(m)) => (
+                m.area,
+                m.items
+                    .iter()
+                    .position(|i| i.label.starts_with(label))
+                    .unwrap_or_else(|| panic!("no {label:?} row")),
+            ),
+            other => panic!("expected the worktree picker, got {other:?}"),
+        };
+        mouse(
+            app,
+            MouseEventKind::Down(MouseButton::Left),
+            area.x + 2,
+            area.y + 1 + index as u16,
+        );
+    }
+
+    /// A click on the branch in the box's header opens the WORKTREE PICKER
+    /// over the box, hung right under the branch: a fresh worktree first,
+    /// then every checkout of the box's project — the root first, nothing
+    /// from another project — with the one the box is aimed at ticked and
+    /// under the cursor. A pick aims the launch there and hands the box
+    /// back with the task and the harness kept; the crumb follows it. It
+    /// picks where the session runs: no checkout changes branch.
+    #[test]
+    fn clicking_the_branch_picks_the_worktree_the_launch_runs_in() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            type_text(&mut app, "fix the nav");
+            let (start, _) = launch(&app);
+            assert_eq!(
+                start.target,
+                QuickTarget::Worktree(WorktreeId("w1".into())),
+                "the box opens on the root"
+            );
+
+            open_worktree_picker(&mut app);
+            let (rows, hover) = picker_rows(&app);
+            assert!(rows[0].starts_with("+ new worktree  "), "{rows:?}");
+            assert!(!rows[0].ends_with(" ✓"), "{rows:?}");
+            assert_eq!(rows[1..], ["main  (root) ✓", "feat"], "{rows:?}");
+            assert_eq!(hover, 1, "the cursor starts on the ✓");
+
+            // Over the box, which stays on screen behind it.
+            let text = buffer_text(&draw_at(&mut app, 140, 40));
+            assert!(text.contains("New session"), "the box's title: {text}");
+            assert!(text.contains("fix the nav"), "the task: {text}");
+            assert!(text.contains("+ new worktree"), "the picker: {text}");
+
+            click_picker_row(&mut app, "feat");
+            let (after, text) = launch(&app);
+            assert_eq!(after.target, QuickTarget::Worktree(WorktreeId("w2".into())));
+            assert_eq!(text, "fix the nav", "the task survives the trip");
+            assert_eq!(
+                (after.kind, &after.model, &after.effort),
+                (start.kind, &start.model, &start.effort),
+                "the harness is not the picker's to change"
+            );
+            let text = buffer_text(&draw_at(&mut app, 140, 40));
+            assert!(
+                text.contains("worktree feat ▾"),
+                "the details row follows: {text}"
+            );
+            assert!(
+                app.tree
+                    .worktrees
+                    .iter()
+                    .any(|w| w.id.0 == "w2" && w.branch == "feat"),
+                "the checkout keeps its branch"
+            );
+
+            // Opened again it ticks the checkout; Esc hands the box back
+            // as it was.
+            open_worktree_picker(&mut app);
+            let (rows, hover) = picker_rows(&app);
+            assert_eq!(rows[hover], "feat ✓");
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let (kept, text) = launch(&app);
+            assert_eq!(kept.target, after.target);
+            assert_eq!(text, "fix the nav");
+
+            // And the fresh row cuts a worktree again.
+            open_worktree_picker(&mut app);
+            click_picker_row(&mut app, "+ new worktree");
+            let (fresh, text) = launch(&app);
+            assert!(
+                matches!(&fresh.target, QuickTarget::NewWorktree { project, .. } if project.0 == "p1"),
+                "{:?}",
+                fresh.target
+            );
+            assert_eq!(text, "fix the nav");
+        });
+    }
+
+    /// The picker hangs from the branch it was opened on — its top edge on
+    /// the row under the crumb, its rows' text in the branch's column —
+    /// and keeps hanging from it when the terminal is resized under it:
+    /// the anchor is where the box draws its branch this frame, not where
+    /// the click happened to land.
+    #[test]
+    fn the_worktree_picker_hangs_under_the_branch() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            let mut buttons = Vec::new();
+            for (w, h) in [(140, 40), (110, 30)] {
+                draw_at(&mut app, w, h);
+                buttons.push(((w, h), branch_button(&app)));
+            }
+            // Opened at 140x40 (the helper's size), then drawn at each.
+            open_worktree_picker(&mut app);
+            for ((w, h), button) in buttons {
+                draw_at(&mut app, w, h);
+                let area = match &app.overlay {
+                    Some(Overlay::Menu(m)) => m.area,
+                    other => panic!("expected the worktree picker, got {other:?}"),
+                };
+                assert_eq!(area.y, button.y + 1, "{w}x{h}: {area:?} under {button:?}");
+                assert_eq!(area.x + 2, button.x, "{w}x{h}: {area:?} on {button:?}");
+            }
+        });
+    }
+
     fn selected(app: &App) -> Option<String> {
         app.selected_session().map(|a| a.id.0)
     }
@@ -1382,35 +2966,29 @@ mod tests {
         (rect.x + 3, rect.y + 1)
     }
 
-    /// With the view on, nebula opens on the box — up at the first
-    /// snapshot that has a project, aimed at that project and at a fresh
-    /// worktree, the harness the settings name — and only once: Esc
-    /// leaves it for the list, and later snapshots do not bring it back.
+    /// nebula opens on the GRID and on nothing else: no snapshot puts a
+    /// modal up, not the first one and not the one that brings a first
+    /// run's first project. The box is a key away — `p` opens it, aimed at
+    /// the selected project and its existing checkout (the new-worktree
+    /// SETTING is off by default), with the harness the settings name.
     #[test]
-    fn the_box_is_up_at_boot_aimed_at_a_fresh_worktree() {
+    fn no_modal_opens_at_boot() {
         with_default_config(|| {
             let mut app = App::new();
-            app.launcher = true;
-            app.launcher_boot = true;
             seed_tree(&mut app);
+            assert!(app.overlay.is_none(), "the first snapshot opens nothing");
+            seed_web(&mut app);
+            assert!(app.overlay.is_none(), "nor any later one");
+
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             let (launch, text) = launch(&app);
             assert!(text.is_empty());
-            assert!(matches!(
-                &launch.target,
-                QuickTarget::NewWorktree { project, .. } if project.0 == "p1"
-            ));
+            assert!(matches!(launch.target, QuickTarget::Worktree(_)));
+            assert_eq!(
+                crate::launcher::project_of(&app, &launch.target).map(|p| p.0),
+                Some("p1".to_string())
+            );
             assert_eq!(launch.kind, AgentKind::Claude, "the settings' harness");
-            assert!(!app.launcher_boot, "owed once");
-
-            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.overlay.is_none());
-            seed_web(&mut app);
-            assert!(app.overlay.is_none(), "not owed again");
-
-            // Off, nothing is owed and nothing opens.
-            let mut app = App::new();
-            seed_tree(&mut app);
-            assert!(app.overlay.is_none());
         });
     }
 
@@ -1521,8 +3099,9 @@ mod tests {
                 text.contains("SESSION · polish-nav"),
                 "the pane names the cursor's card: {text}"
             );
-            assert!(
-                text.contains("nebula / default / demo / sessions"),
+            assert_eq!(
+                tabs_drawn(&app),
+                ["demo"],
                 "the grid is still up over it: {text}"
             );
             let below = app
@@ -1609,8 +3188,9 @@ mod tests {
             assert!(app.term_locked);
             assert!(!app.collapsed, "the pane under the grid, not full-screen");
             let text = buffer_text(&draw(&mut app));
-            assert!(
-                text.contains("nebula / default / demo / sessions"),
+            assert_eq!(
+                tabs_drawn(&app),
+                ["demo"],
                 "the grid is still up over the pane: {text}"
             );
 
@@ -1648,8 +3228,8 @@ mod tests {
                 "the breadcrumb names the session: {text}"
             );
             assert!(
-                !text.contains("/ sessions  "),
-                "the grid's breadcrumb is gone: {text}"
+                tabs_drawn(&app).is_empty(),
+                "the grid's header is gone: {text}"
             );
 
             let out = key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
@@ -1666,12 +3246,30 @@ mod tests {
             assert!(!app.collapsed, "back out of full-screen");
             assert_eq!(selected(&app).as_deref(), Some("a2"));
             let text = buffer_text(&draw(&mut app));
-            assert!(
-                text.contains("nebula / default / demo / sessions"),
+            assert_eq!(
+                tabs_drawn(&app),
+                ["demo"],
                 "the grid, not the panels: {text}"
             );
             assert!(text.contains("2 sessions"), "{text}");
         });
+    }
+
+    /// The PROJECT TABS the last draw laid down, by project name, left to
+    /// right — none at all while the grid's header is not on screen.
+    fn tabs_drawn(app: &App) -> Vec<String> {
+        app.hits
+            .iter()
+            .filter_map(|(_, h)| match h {
+                HitTarget::LauncherTab(id) => app
+                    .tree
+                    .projects
+                    .iter()
+                    .find(|p| &p.id == id)
+                    .map(|p| p.name.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A cell inside the crumb `hit` names, as the header drew it.
@@ -1684,68 +3282,1101 @@ mod tests {
         (rect.x, rect.y)
     }
 
-    /// INPUT PARITY: the header's breadcrumb is the way back up the tree
-    /// with the pointer — a click on a crumb lands in exactly the state
-    /// the keys land in, since both go through `go_to`. A crumb opens
-    /// what its word names: the workspace crumb its projects (`Esc`), the
-    /// `nebula` crumb the workspaces (`Esc`,`Esc`, or `w`), and neither
-    /// puts a dialog over the grid.
+    /// The header is the PROJECT TABS: the `+`, then a tab for the project
+    /// the view opened on — no `nebula`, no trail. A lone tab
+    /// has no `×`: it is the project on screen.
     #[test]
-    fn the_header_crumbs_walk_back_up_the_tree() {
+    fn the_header_is_the_project_tabs_and_nothing_else() {
         with_default_config(|| {
-            use crate::launcher::Level;
             let mut app = two_sessions();
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Workspace(nebula_core::Workspace {
-                        id: Default::default(),
-                        name: "default".into(),
-                    }),
-                },
+            let terminal = draw(&mut app);
+            let head = head_line(&terminal);
+            assert!(!head.contains("nebula"), "{head}");
+            assert!(!head.contains("demo / sessions"), "{head}");
+
+            let demo = ProjectId("p1".into());
+            let head: Vec<HitTarget> = app
+                .hits
+                .iter()
+                .filter(|(r, h)| {
+                    r.y == 1
+                        && matches!(
+                            h,
+                            HitTarget::LauncherTab(_)
+                                | HitTarget::LauncherTabClose(_)
+                                | HitTarget::LauncherTabAdd
+                        )
+                })
+                .map(|(_, h)| h.clone())
+                .collect();
+            assert_eq!(
+                head,
+                vec![HitTarget::LauncherTabAdd, HitTarget::LauncherTab(demo)],
+                "{head:?}"
             );
-            let text = buffer_text(&draw(&mut app));
-            assert!(
-                text.contains("nebula / default / demo / sessions"),
-                "{text}"
+        });
+    }
+
+    /// What the header row underlines: the word under the pointer, and
+    /// nothing else.
+    fn underlined_head(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, 1)))
+            .filter(|c| c.modifier.contains(Modifier::UNDERLINED))
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// The header row, as it was drawn.
+    fn head_line(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, 1)))
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// The `+` after the tabs is a SWITCH: a click on it drops every
+    /// project under it — the one in front of you ticked and under the
+    /// cursor, a row for opening a folder last — and the list hangs off
+    /// the `+` rather than in the middle of the screen. Picking a row
+    /// re-aims the grid and gives the project a tab at the far left.
+    #[test]
+    fn the_plus_drops_the_projects_under_it() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+
+            // The `+`: every project, `demo` ticked and hovered, the list
+            // under the button.
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("the + drops a list: {:?}", app.overlay);
+            };
+            assert!(menu.is_project_picker());
+            assert_eq!(menu.at, Some((x, y + 1)), "it hangs off the +");
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec!["demo  (2) ✓", "web  (1)", super::OPEN_FOLDER],
+                "{labels:?}"
+            );
+            assert_eq!(menu.hover, 0, "the cursor starts on the open project");
+            assert_eq!(
+                app.selected_project().map(|p| p.name.as_str()),
+                Some("demo"),
+                "the grid stays put until a row is picked"
             );
 
-            // The project crumb names the project whose sessions are
-            // already on screen, so the click is a no-op rather than a
-            // step out to the list the project sits in.
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherProject);
-            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            assert_eq!(app.launcher_level, Level::Sessions);
+            // Enter on `web`: the grid, aimed at the other project. The
+            // rows take type-ahead, so the arrows move here, not j/k.
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "the list closes: {:?}", app.overlay);
+            assert_eq!(
+                app.selected_project().map(|p| p.name.clone()),
+                Some("web".into())
+            );
+            draw(&mut app);
+            assert_eq!(
+                tabs_drawn(&app),
+                ["web", "demo"],
+                "the project just opened leads the tabs"
+            );
+        });
+    }
 
-            // The workspace crumb opens that workspace: its projects.
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherWorkspace);
-            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            assert_eq!(app.launcher_level, Level::Projects);
-            assert!(app.overlay.is_none(), "no dialog: {:?}", app.overlay);
-            let text = buffer_text(&draw(&mut app));
-            assert!(text.contains("nebula / default / projects"), "{text}");
+    /// TYPE-AHEAD in the PROJECT DROPDOWN: letters narrow the rows to what
+    /// they fuzzy-match rather than jumping the cursor, so a project is
+    /// found by name instead of by scrolling. Backspace widens, Esc clears
+    /// the query before it closes the list, and a letter nothing matches
+    /// is refused so the list never empties.
+    #[test]
+    fn typing_in_the_project_dropdown_narrows_it_to_the_name() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_empty_project(&mut app);
+            draw(&mut app);
 
-            // And `nebula` is the machine: every workspace it knows.
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherRoot);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            assert_eq!(app.launcher_level, Level::Workspaces);
-            assert!(app.overlay.is_none(), "no dialog: {:?}", app.overlay);
-            let text = buffer_text(&draw(&mut app));
-            assert!(text.contains("nebula / workspaces"), "{text}");
+            let labels = |app: &App| -> Vec<String> {
+                let Some(Overlay::Menu(menu)) = &app.overlay else {
+                    panic!("the dropdown closed: {:?}", app.overlay);
+                };
+                menu.items.iter().map(|i| i.label.clone()).collect()
+            };
+            assert_eq!(
+                labels(&app),
+                vec!["demo  (2) ✓", "web  (1)", "docs  (0)", super::OPEN_FOLDER],
+                "every project, before a letter is typed"
+            );
 
-            // Two levels in one click on `nebula`, and it matches the two
-            // Escs that walk the same path.
+            // Inside the dropdown a letter is a letter: `w` narrows to
+            // `web`.
+            key(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
+            assert_eq!(labels(&app), vec!["web  (1)"]);
+
+            // Backspace widens back to the whole list.
+            key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            assert_eq!(labels(&app).len(), 4);
+
+            // `do` finds `docs` past `demo`, and Enter opens it.
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+            assert_eq!(labels(&app)[0], "docs  (0)");
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert_eq!(
+                app.selected_project().map(|p| p.name.clone()),
+                Some("docs".into())
+            );
+
+            // A letter nothing matches leaves the list as it was, and says
+            // so; Esc then clears the query before it closes the list. The
+            // `+` moved right to make room for `docs`'s new tab.
+            draw(&mut app);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            let narrowed = labels(&app);
+            key(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+            assert_eq!(labels(&app), narrowed, "the list never empties");
+            assert!(app.flash.is_some(), "and the refusal says so");
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(labels(&app).len(), 4, "Esc clears the query first");
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "and then closes: {:?}", app.overlay);
+        });
+    }
+
+    /// `⌘P` is the click on the header's `+` from the keyboard — INPUT
+    /// PARITY: both are [`super::open_project_menu`], so it is the same
+    /// list hung off the same `+`. It works from the cards and from inside
+    /// the PANE under them, where the chord is taken rather than typed
+    /// into the agent and Esc hands the keys straight back. The chord
+    /// again puts the list away instead of typing a `p` into its
+    /// type-ahead, and a full-screen session, with no header on screen,
+    /// keeps the chord for itself.
+    #[test]
+    fn cmd_p_drops_the_project_dropdown_from_the_cards_and_the_pane() {
+        with_default_config(|| {
+            let cmd_p = |app: &mut App| key(app, KeyCode::Char('p'), KeyModifiers::SUPER);
+            let dropdown = |app: &App| -> (Vec<String>, Option<(u16, u16)>, usize) {
+                let Some(Overlay::Menu(menu)) = &app.overlay else {
+                    panic!("no PROJECT DROPDOWN: {:?}", app.overlay);
+                };
+                assert!(menu.is_project_picker());
+                let labels = menu.items.iter().map(|i| i.label.clone()).collect();
+                (labels, menu.at, menu.hover)
+            };
+
             let mut by_click = two_sessions();
             draw(&mut by_click);
-            let (x, y) = crumb_cell(&by_click, HitTarget::LauncherRoot);
+            let (x, y) = crumb_cell(&by_click, HitTarget::LauncherTabAdd);
             mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
             let mut by_key = two_sessions();
             draw(&mut by_key);
-            key(&mut by_key, KeyCode::Esc, KeyModifiers::NONE);
-            key(&mut by_key, KeyCode::Esc, KeyModifiers::NONE);
-            assert_eq!(by_click.launcher_level, by_key.launcher_level);
-            assert_eq!(by_click.focus, by_key.focus);
-            assert_eq!(by_click.term_locked, by_key.term_locked);
+            cmd_p(&mut by_key);
+            assert_eq!(dropdown(&by_key), dropdown(&by_click));
+            let mut by_plus = two_sessions();
+            draw(&mut by_plus);
+            key(&mut by_plus, KeyCode::Char('+'), KeyModifiers::NONE);
+            assert_eq!(
+                dropdown(&by_plus),
+                dropdown(&by_click),
+                "+ where ⌘ never arrives"
+            );
+
+            cmd_p(&mut by_key);
+            assert!(by_key.overlay.is_none(), "{:?}", by_key.overlay);
+
+            // Inside the pane under the cards.
+            let mut app = two_sessions();
+            draw(&mut app);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.term_locked && !app.collapsed);
+            draw(&mut app);
+            let out = cmd_p(&mut app);
+            assert!(
+                !out.iter().any(|r| matches!(r, ClientRequest::Input { .. })),
+                "the agent was sent the chord: {out:?}"
+            );
+            assert_eq!(dropdown(&app).1, dropdown(&by_click).1, "off the same +");
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert_eq!(app.focus, Focus::Terminal, "the keys are the pane's again");
+            assert!(app.term_locked);
+
+            // A project picked from over the pane lands on its cards.
+            cmd_p(&mut app);
+            key(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert_eq!(
+                app.selected_project().map(|p| p.name.clone()),
+                Some("web".into())
+            );
+            assert_eq!(app.focus, Focus::Sessions);
+
+            // Full-screen: no header, so no list.
+            key(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+            assert!(app.collapsed && app.term_locked);
+            cmd_p(&mut app);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        });
+    }
+
+    /// Switching projects is asking to LOOK at one, never to start
+    /// something in it: a pick from the PROJECT DROPDOWN that lands on a
+    /// project with nothing in it yet leaves the box shut, and the grid
+    /// says what starts one instead. The same for its tab and a digit —
+    /// all take the one [`open_project`].
+    #[test]
+    fn switching_to_an_empty_project_opens_no_box() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_empty_project(&mut app);
+            draw(&mut app);
+
+            // Down the `+`'s list to `docs`, the one with no sessions.
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("the + drops a list: {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec!["demo  (2) ✓", "web  (1)", "docs  (0)", super::OPEN_FOLDER],
+                "{labels:?}"
+            );
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert!(
+                app.overlay.is_none(),
+                "switching projects put a modal up: {:?}",
+                app.overlay
+            );
+            assert_eq!(
+                app.selected_project().map(|p| p.name.clone()),
+                Some("docs".into())
+            );
+            assert!(app.launcher_unaimed, "no card to aim at, so the pane folds");
+            assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+            let text = buffer_text(&draw(&mut app));
+            assert_eq!(tabs_drawn(&app), ["docs", "demo"], "{text}");
+            assert!(
+                text.contains("press  p  to prompt"),
+                "the grid says what starts one: {text}"
+            );
+        });
+    }
+
+    /// [`two_sessions`] plus `docs` from [`seed_empty_project`], opened:
+    /// a project with no sessions in front of you, so an empty grid.
+    fn on_an_empty_project() -> App {
+        let mut app = two_sessions();
+        seed_empty_project(&mut app);
+        super::open_project(&mut app, &ProjectId("p3".into()), &mut Vec::new());
+        app
+    }
+
+    /// The empty grid is a welcome and nothing else: the name, and the key
+    /// that starts a session as a key cap. The nebula it is drawn over
+    /// ticks while it is on screen, and stops under the box that key puts
+    /// up. INPUT PARITY: a click on the key cap is the key — the same
+    /// `open_box`, so the same box, aimed at the same checkout.
+    #[test]
+    fn the_empty_grid_welcomes_you_and_its_key_cap_is_the_key() {
+        with_default_config(|| {
+            let mut by_click = on_an_empty_project();
+            let terminal = draw(&mut by_click);
+            let text = buffer_text(&terminal);
+            assert!(text.contains("Welcome to nebula"), "{text}");
+            assert!(text.contains("press  p  to prompt"), "{text}");
+            assert!(!text.contains("type a task"), "only the welcome: {text}");
+            let (x, y) = crumb_cell(&by_click, HitTarget::LauncherWelcomePrompt);
+            let cap = &terminal.backend().buffer()[(x + 7, y)];
+            assert_eq!(cap.symbol(), "p", "{text}");
+            assert_eq!(cap.bg, by_click.theme.accent, "the key is a key cap");
+            assert!(by_click.welcome_active(), "the nebula ticks while it is up");
+
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+            let mut by_key = on_an_empty_project();
+            draw(&mut by_key);
+            key(&mut by_key, KeyCode::Char('p'), KeyModifiers::NONE);
+            let launch = |app: &App| match &app.overlay {
+                Some(Overlay::Prompt(p)) => match &p.kind {
+                    PromptKind::QuickPrompt(launch) => launch.clone(),
+                    other => panic!("not the box: {other:?}"),
+                },
+                other => panic!("no box: {other:?}"),
+            };
+            assert_eq!(launch(&by_click), launch(&by_key));
+
+            draw(&mut by_click);
+            assert!(!by_click.welcome_active(), "nothing ticks under the box");
+        });
+    }
+
+    /// The welcome sits under the splash's nebula: dust in the sky over
+    /// it, clear black right around the words — and on a grid too small
+    /// for a sky, the words alone.
+    #[test]
+    fn the_welcome_sits_under_a_nebula() {
+        const DUST: &[&str] = &[".", ":", "·", "+", "*", "o", "@"];
+        with_default_config(|| {
+            let glyphs = |terminal: &Terminal<TestBackend>, rows: std::ops::Range<u16>| {
+                let buf = terminal.backend().buffer();
+                rows.flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+                    .filter(|&(x, y)| DUST.contains(&buf[(x, y)].symbol()))
+                    .count()
+            };
+            let row = |terminal: &Terminal<TestBackend>, y: u16| {
+                let buf = terminal.backend().buffer();
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            };
+
+            let mut app = on_an_empty_project();
+            // Animations off hold one finished frame, well past the fade.
+            app.animations = false;
+            let terminal = draw(&mut app);
+            let grid = crate::launcher::grid(app.body_area).area;
+            let (_, key_y) = crumb_cell(&app, HitTarget::LauncherWelcomePrompt);
+            let sky = glyphs(&terminal, grid.y..key_y - 3);
+            assert!(sky > 40, "{sky} specks of dust: {}", buffer_text(&terminal));
+            assert!(row(&terminal, key_y - 2).contains("   Welcome to nebula   "));
+            assert!(row(&terminal, key_y).contains("   press  p  to prompt   "));
+            assert!(!app.welcome_active(), "animations off: a still frame");
+
+            let mut small = on_an_empty_project();
+            small.animations = false;
+            let terminal = draw_at(&mut small, 40, 12);
+            let grid = crate::launcher::grid(small.body_area).area;
+            let (_, key_y) = crumb_cell(&small, HitTarget::LauncherWelcomePrompt);
+            assert!(row(&terminal, key_y - 2).contains("Welcome to nebula"));
+            let specks =
+                glyphs(&terminal, grid.y..key_y - 2) + glyphs(&terminal, key_y + 1..grid.bottom());
+            assert_eq!(specks, 0, "{}", buffer_text(&terminal));
+        });
+    }
+
+    /// `/`, the query, Enter: the fuzzy jump, the way it is typed.
+    fn jump(app: &mut App, query: &str) {
+        key(app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in query.chars() {
+            key(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        key(app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.overlay.is_none(), "the jump landed: {:?}", app.overlay);
+    }
+
+    /// A `/` jump into another project ADDS its tab: the header keeps
+    /// every project already open, so the jump reads as one more tab at
+    /// the far left — never as the first tab changing its name. A click on
+    /// the tab left behind goes back and moves no tab, and `[` steps
+    /// back across them.
+    #[test]
+    fn a_jump_into_another_project_adds_a_tab() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            assert_eq!(tabs_drawn(&app), ["demo"]);
+
+            jump(&mut app, "tidy-css");
+            assert_eq!(
+                app.selected_project().map(|p| p.name.clone()),
+                Some("web".into())
+            );
+            draw(&mut app);
+            assert_eq!(tabs_drawn(&app), ["web", "demo"]);
+
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTab(ProjectId("p1".into())));
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(
+                app.selected_project().map(|p| p.name.clone()),
+                Some("demo".into())
+            );
+            draw(&mut app);
+            assert_eq!(tabs_drawn(&app), ["web", "demo"], "no tab moved");
+
+            key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+            assert_eq!(
+                app.selected_project().map(|p| p.name.clone()),
+                Some("web".into())
+            );
+        });
+    }
+
+    /// The PROJECT DROPDOWN's last row opens a folder that is not a
+    /// project yet: the open-project prompt `o` opens, over the grid.
+    #[test]
+    fn the_dropdowns_last_row_opens_a_folder() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            for _ in 0..2 {
+                key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the row opens the prompt: {:?}", app.overlay);
+            };
+            assert!(matches!(prompt.kind, PromptKind::AddProject));
+            assert_eq!(prompt.title, "Open project");
+        });
+    }
+
+    /// A right-click on a PROJECT TAB opens that project — the left
+    /// click's [`open_tab`] — with the project's own menu hung under the
+    /// tab: its checkouts, its run command, its name and its place in the
+    /// list, the verbs the PROJECTS PANEL's rows used to carry.
+    #[test]
+    fn a_right_click_on_a_tab_opens_its_projects_menu() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTab(ProjectId("p2".into())));
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y);
+            assert_eq!(
+                app.selected_project().map(|p| p.name.as_str()),
+                Some("web"),
+                "the tab opened"
+            );
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("the tab's menu: {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            for want in ["New worktree", "Rename", "Remove from list"] {
+                assert!(labels.contains(&want), "{want} in {labels:?}");
+            }
+            assert_eq!(menu.at.map(|(_, row)| row), Some(y + 1), "under the tab");
+        });
+    }
+
+    /// `m` with no card selected is the PROJECT's menu — there is no
+    /// session under the cursor for it to be the menu of — and with a
+    /// card selected it is still that card's.
+    #[test]
+    fn m_with_nothing_selected_is_the_projects_menu() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("the card's menu: {:?}", app.overlay);
+            };
+            assert!(
+                !menu.items.iter().any(|i| i.label == "Remove from list"),
+                "a card's menu is the card's"
+            );
+            app.overlay = None;
+
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.launcher_unaimed);
+            key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("the project's menu: {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert!(labels.contains(&"Rename"), "{labels:?}");
+            assert!(labels.contains(&"Remove from list"), "{labels:?}");
+        });
+    }
+
+    /// [`two_sessions`] with both projects open — `web` opened last, so
+    /// its tab leads — and the grid on `demo`, the tab on the right.
+    fn two_tabs() -> App {
+        let mut app = two_sessions();
+        draw(&mut app);
+        app.launcher_tabs = vec![ProjectId("p2".into()), ProjectId("p1".into())];
+        draw(&mut app);
+        app
+    }
+
+    /// Everything a tab switch or a close moves, for INPUT PARITY: the
+    /// project, the card and the tabs themselves.
+    fn tab_state(app: &App) -> (Option<String>, Option<String>, Vec<String>) {
+        (
+            app.selected_project().map(|p| p.name.clone()),
+            selected(app),
+            app.launcher_tabs.iter().map(|t| t.0.clone()).collect(),
+        )
+    }
+
+    /// Click on a PROJECT TAB and the key that walks onto it end in the
+    /// same state — one [`open_tab`] — and `[` / `]` stop at either end.
+    /// A switch moves no tab: the order is when each was opened.
+    #[test]
+    fn a_click_on_a_tab_is_the_key_that_walks_to_it() {
+        with_default_config(|| {
+            let mut by_key = two_tabs();
+            key(&mut by_key, KeyCode::Char('['), KeyModifiers::NONE);
+
+            let mut by_click = two_tabs();
+            let (x, y) = crumb_cell(&by_click, HitTarget::LauncherTab(ProjectId("p2".into())));
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+
+            assert_eq!(tab_state(&by_key), tab_state(&by_click));
+            assert_eq!(pane(&by_key), pane(&by_click));
+            assert_eq!(
+                tab_state(&by_key).0.as_deref(),
+                Some("web"),
+                "`[` from the right-hand tab is the one on its left"
+            );
+            assert_eq!(selected(&by_key).as_deref(), Some("a3"), "web's session");
+            assert_eq!(tab_state(&by_key).2, ["p2", "p1"], "no tab moved");
+
+            // Neither end wraps round: `]` on the last tab and `[` on the
+            // first stay where they are, quietly.
+            let mut app = two_tabs();
+            let before = tab_state(&app);
+            key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+            assert_eq!(tab_state(&app), before, "`]` on the last tab");
+            assert_eq!(app.flash, None);
+            key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+            assert_eq!(tab_state(&app).0.as_deref(), Some("web"));
+            let first = tab_state(&app);
+            key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+            assert_eq!(tab_state(&app), first, "`[` on the first tab");
+            assert_eq!(app.flash, None);
+            key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+            assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
+
+            // A click on the lit tab changes nothing — not even the card
+            // the cursor was walked to.
+            key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            let before = tab_state(&app);
+            draw(&mut app);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTab(ProjectId("p1".into())));
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(tab_state(&app), before);
+        });
+    }
+
+    /// Back onto a tab, by `[` / `]`, a digit or a click, the grid lands on
+    /// the card the project was left on — its session back in the pane —
+    /// not on its first card. A session archived since falls back to the
+    /// first.
+    #[test]
+    fn a_tab_comes_back_on_the_card_it_was_left_on() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            keys(
+                &mut app,
+                &[KeyCode::Char('h'), KeyCode::Char('h'), KeyCode::Char('l')],
+            );
+            assert_eq!(selected(&app).as_deref(), Some("a1"), "demo's second card");
+
+            keys(&mut app, &[KeyCode::Char('['), KeyCode::Char(']')]);
+            assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
+            assert_eq!(selected(&app).as_deref(), Some("a1"), "by `[` / `]`");
+            assert_eq!(pane(&app), Some(SessionRef::Agent(AgentId("a1".into()))));
+
+            keys(&mut app, &[KeyCode::Char('1'), KeyCode::Char('2')]);
+            assert_eq!(selected(&app).as_deref(), Some("a1"), "by the digits");
+
+            keys(&mut app, &[KeyCode::Char('[')]);
+            draw(&mut app);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTab(ProjectId("p1".into())));
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(selected(&app).as_deref(), Some("a1"), "by a click");
+
+            // Gone from the cards since: the first card instead.
+            keys(&mut app, &[KeyCode::Char('[')]);
+            for a in app.tree.agents.iter_mut().filter(|a| a.id.0 == "a1") {
+                a.archived = true;
+            }
+            keys(&mut app, &[KeyCode::Char(']')]);
+            assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
+            assert_eq!(selected(&app).as_deref(), Some("a2"), "the first card");
+        });
+    }
+
+    /// `x` and the `×` on the lit tab close it the same way: the tab goes
+    /// and the grid lands on the one that slides into its place. The last
+    /// tab is the project on screen, with nothing to hand the grid to, so
+    /// it stays — and says why.
+    #[test]
+    fn closing_the_lit_tab_lands_on_the_one_beside_it() {
+        with_default_config(|| {
+            let mut by_key = two_tabs();
+            key(&mut by_key, KeyCode::Char('x'), KeyModifiers::NONE);
+
+            let mut by_click = two_tabs();
+            let (x, y) = crumb_cell(
+                &by_click,
+                HitTarget::LauncherTabClose(ProjectId("p1".into())),
+            );
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+
+            assert_eq!(tab_state(&by_key), tab_state(&by_click));
+            assert_eq!(
+                tab_state(&by_key),
+                (Some("web".into()), Some("a3".into()), vec!["p2".into()])
+            );
+            // The project itself is untouched: its sessions run on.
+            assert!(by_key.tree.projects.iter().any(|p| p.name == "demo"));
+
+            let before = tab_state(&by_key);
+            key(&mut by_key, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert_eq!(tab_state(&by_key), before, "the last tab stays");
+            assert_eq!(by_key.flash.as_deref(), Some(super::LAST_TAB));
+            draw(&mut by_key);
+            assert_eq!(tabs_drawn(&by_key), ["web"]);
+        });
+    }
+
+    /// Closing a tab the grid is not on moves nothing: not the project,
+    /// not the card, not the pane.
+    #[test]
+    fn closing_another_tab_moves_nothing() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            let before = tab_state(&app);
+            let pane_before = pane(&app);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTabClose(ProjectId("p2".into())));
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            let after = tab_state(&app);
+            assert_eq!((&after.0, &after.1), (&before.0, &before.1));
+            assert_eq!(after.2, ["p1"]);
+            assert_eq!(pane(&app), pane_before);
+            draw(&mut app);
+            assert_eq!(tabs_drawn(&app), ["demo"]);
+        });
+    }
+
+    /// Press `code` with no modifiers, once per entry.
+    fn keys(app: &mut App, codes: &[KeyCode]) {
+        for code in codes {
+            key(app, *code, KeyModifiers::NONE);
+        }
+    }
+
+    /// The header row's cells that wear the header's cursor — the accent
+    /// as a block — as text.
+    fn tab_cursor_drawn(app: &App, terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, 1)))
+            .filter(|c| c.bg == app.theme.accent)
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    /// Up into the PROJECT TABS: `k` on the top row of cards stays put and
+    /// says what a second press does, and `k`,`k` hands the keys to the
+    /// header with its cursor on the lit tab. `h` / `l` walk that cursor
+    /// — stopping at either end, as `[` / `]` do — and the grid switches
+    /// with it, no Enter needed: each project comes up on the card it was
+    /// left on, its session in the pane. Enter hands the keys back to the
+    /// cards of the project on screen.
+    #[test]
+    fn k_k_on_the_top_row_walks_up_into_the_project_tabs() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            keys(&mut app, &[KeyCode::Char('h'), KeyCode::Char('h')]);
+            assert_eq!(selected(&app).as_deref(), Some("a2"), "the first card");
+            let before = tab_state(&app);
+
+            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(app.launcher_tab_cursor, None, "one press stays put");
+            assert!(
+                app.flash
+                    .as_deref()
+                    .is_some_and(|f| f.ends_with("again: project tabs")),
+                "{:?}",
+                app.flash
+            );
+            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(
+                app.launcher_tab_cursor,
+                Some(ProjectId("p1".into())),
+                "on the lit tab"
+            );
+            assert_eq!(tab_state(&app), before, "nothing opened");
+
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p2".into())));
+            let on_web = (Some("web".into()), Some("a3".into()), before.2.clone());
+            assert_eq!(tab_state(&app), on_web, "the grid comes with the cursor");
+            assert_eq!(
+                pane(&app),
+                Some(SessionRef::Agent(AgentId("a3".into()))),
+                "and the pane reads web's session"
+            );
+            key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            assert_eq!(
+                app.launcher_tab_cursor,
+                Some(ProjectId("p2".into())),
+                "← on the first tab stays on it"
+            );
+            keys(&mut app, &[KeyCode::Right, KeyCode::Right]);
+            assert_eq!(
+                app.launcher_tab_cursor,
+                Some(ProjectId("p1".into())),
+                "→ past the last tab stays on it"
+            );
+            assert_eq!(tab_state(&app), before, "demo, on the card it was left on");
+            key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+            assert_eq!(
+                app.launcher_tab_cursor,
+                Some(ProjectId("p2".into())),
+                "`[` walks the cursor too"
+            );
+            assert_eq!(tab_state(&app), on_web);
+
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.launcher_tab_cursor, None,
+                "the keys are the cards' again"
+            );
+            assert_eq!(
+                tab_state(&app),
+                (
+                    Some("web".into()),
+                    Some("a3".into()),
+                    vec!["p2".into(), "p1".into()]
+                )
+            );
+            assert_eq!(app.focus, Focus::Sessions);
+        });
+    }
+
+    /// Only the top row walks up: from a card with a row over it `k` is
+    /// the step onto that row, and the double tap starts there. `↑` is the
+    /// same key.
+    #[test]
+    fn k_below_the_top_row_is_a_step_up_the_grid() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            draw_narrow(&mut app);
+            keys(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
+            assert_eq!(app.launcher_tab_cursor, None);
+            keys(&mut app, &[KeyCode::Char('j')]);
+            assert_eq!(selected(&app).as_deref(), Some("a1"), "the second row");
+
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert_eq!(selected(&app).as_deref(), Some("a2"), "a row up");
+            assert_eq!(app.launcher_tab_cursor, None, "and not armed by the step");
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert_eq!(app.launcher_tab_cursor, None, "the top row's first press");
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+        });
+    }
+
+    /// `j`,`j` is the way back down: the first press stays in the header
+    /// and says where a second one goes, the second hands the keys back to
+    /// the card the grid is showing — the one walked to before going up,
+    /// not the top of the grid.
+    #[test]
+    fn j_j_from_the_tabs_goes_back_down_to_the_card_left() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            keys(
+                &mut app,
+                &[KeyCode::Char('h'), KeyCode::Char('h'), KeyCode::Char('l')],
+            );
+            assert_eq!(selected(&app).as_deref(), Some("a1"), "the second card");
+            keys(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
+
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+            assert!(
+                app.flash
+                    .as_deref()
+                    .is_some_and(|f| f.ends_with("again: into demo")),
+                "{:?}",
+                app.flash
+            );
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
+            assert_eq!(selected(&app).as_deref(), Some("a1"), "the card it was on");
+
+            // And down into the tab the cursor was walked onto.
+            keys(
+                &mut app,
+                &[
+                    KeyCode::Char('k'),
+                    KeyCode::Char('k'),
+                    KeyCode::Char('h'),
+                    KeyCode::Down,
+                    KeyCode::Down,
+                ],
+            );
+            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(tab_state(&app).0.as_deref(), Some("web"));
+            assert_eq!(selected(&app).as_deref(), Some("a3"));
+
+            // And back up and over to demo, which comes up on the card it
+            // was left on rather than its first.
+            keys(
+                &mut app,
+                &[KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('l')],
+            );
+            assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
+            assert_eq!(selected(&app).as_deref(), Some("a1"));
+        });
+    }
+
+    /// Esc goes back down on the project the header's cursor walked the
+    /// grid to, its card still selected. So does any key the header has
+    /// no use for, which then means what it means on the grid — `p` the
+    /// box.
+    #[test]
+    fn esc_or_another_key_hands_the_keys_back_to_the_cards() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            keys(
+                &mut app,
+                &[KeyCode::Char('h'), KeyCode::Char('h'), KeyCode::Char('l')],
+            );
+            keys(
+                &mut app,
+                &[KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('h')],
+            );
+            assert!(app.launcher_tab_cursor.is_some());
+            let walked = tab_state(&app);
+            assert_eq!(walked.0.as_deref(), Some("web"));
+
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(tab_state(&app), walked, "still on the project walked to");
+            assert!(!app.launcher_unaimed, "and the card is still selected");
+
+            keys(
+                &mut app,
+                &[KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('p')],
+            );
+            assert_eq!(app.launcher_tab_cursor, None);
+            launch(&app);
+        });
+    }
+
+    /// INPUT PARITY: with the header holding the keys, a click on a tab is
+    /// the walk onto it and Enter — one [`choose_tab`], onto the card the
+    /// project was left on — and a click on a card hands the keys back to
+    /// the cards.
+    #[test]
+    fn a_click_on_a_tab_from_the_header_is_enter_on_it() {
+        with_default_config(|| {
+            let up = [
+                KeyCode::Char('h'),
+                KeyCode::Char('h'),
+                KeyCode::Char('l'),
+                KeyCode::Char('k'),
+                KeyCode::Char('k'),
+            ];
+            let mut by_key = two_tabs();
+            keys(&mut by_key, &up);
+            key(&mut by_key, KeyCode::Enter, KeyModifiers::NONE);
+
+            let mut by_click = two_tabs();
+            keys(&mut by_click, &up);
+            draw(&mut by_click);
+            let (x, y) = crumb_cell(&by_click, HitTarget::LauncherTab(ProjectId("p1".into())));
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+
+            assert_eq!(tab_state(&by_key), tab_state(&by_click));
+            assert_eq!(pane(&by_key), pane(&by_click));
+            assert_eq!(by_key.launcher_tab_cursor, by_click.launcher_tab_cursor);
+            assert_eq!(selected(&by_key).as_deref(), Some("a1"), "the card left");
+
+            // Onto the other tab: `h` and Enter, or a click on it.
+            let mut by_key = two_tabs();
+            keys(&mut by_key, &up);
+            keys(&mut by_key, &[KeyCode::Char('h'), KeyCode::Enter]);
+
+            let mut by_click = two_tabs();
+            keys(&mut by_click, &up);
+            draw(&mut by_click);
+            let (x, y) = crumb_cell(&by_click, HitTarget::LauncherTab(ProjectId("p2".into())));
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+
+            assert_eq!(tab_state(&by_key), tab_state(&by_click));
+            assert_eq!(pane(&by_key), pane(&by_click));
+            assert_eq!(by_key.launcher_tab_cursor, by_click.launcher_tab_cursor);
+            assert_eq!(tab_state(&by_key).0.as_deref(), Some("web"));
+
+            let mut app = two_tabs();
+            keys(&mut app, &up);
+            draw(&mut app);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherRow(1));
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                x + 2,
+                y + 1,
+            );
+            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(selected(&app).as_deref(), Some("a1"));
+        });
+    }
+
+    /// `x` with the header holding the keys closes the tab under its
+    /// cursor — the project the walk put on screen — and the grid and the
+    /// cursor both take the tab that slid into its place, the grid on the
+    /// card it was left on.
+    #[test]
+    fn x_in_the_header_closes_the_tab_under_its_cursor() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            keys(&mut app, &[KeyCode::Char('h'), KeyCode::Char('h')]);
+            let before = tab_state(&app);
+            keys(
+                &mut app,
+                &[
+                    KeyCode::Char('k'),
+                    KeyCode::Char('k'),
+                    KeyCode::Char('h'),
+                    KeyCode::Char('x'),
+                ],
+            );
+            assert_eq!(
+                app.launcher_tabs,
+                [ProjectId("p1".into())],
+                "web's tab went"
+            );
+            assert_eq!(
+                (tab_state(&app).0, tab_state(&app).1),
+                (before.0, before.1),
+                "the grid back on demo, on its card"
+            );
+            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+        });
+    }
+
+    /// The header's cursor is drawn: the tab it is on wears the accent as
+    /// a block, apart from the lit tab, and the footer names the header's
+    /// keys. Esc takes both away.
+    #[test]
+    fn the_header_cursor_is_drawn_on_its_tab() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            keys(&mut app, &[KeyCode::Char('h'), KeyCode::Char('h')]);
+            let terminal = draw(&mut app);
+            assert_eq!(tab_cursor_drawn(&app, &terminal), "");
+
+            keys(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
+            let terminal = draw(&mut app);
+            assert_eq!(tab_cursor_drawn(&app, &terminal), "demo");
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            let terminal = draw(&mut app);
+            assert_eq!(tab_cursor_drawn(&app, &terminal), "web");
+            assert!(
+                buffer_text(&terminal).contains("switch project"),
+                "{}",
+                buffer_text(&terminal)
+            );
+
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let terminal = draw(&mut app);
+            assert_eq!(tab_cursor_drawn(&app, &terminal), "");
+            assert!(!buffer_text(&terminal).contains("switch project"));
+        });
+    }
+
+    /// The tabs are remembered across a restart, in the order they were
+    /// left — less any project the tree no longer has.
+    #[test]
+    fn the_tabs_come_back_after_a_restart() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            app.launcher_tabs.insert(1, ProjectId("gone".into()));
+            let json = super::super::ui_state_json(&app);
+
+            let mut next = two_sessions();
+            super::super::restore_ui_state(&mut next, &json);
+            assert_eq!(
+                next.launcher_tabs,
+                [ProjectId("p2".into()), ProjectId("p1".into())]
+            );
+            draw(&mut next);
+            assert_eq!(tabs_drawn(&next), ["web", "demo"]);
+        });
+    }
+
+    /// A third project, `docs`, with a checkout and no sessions in it.
+    fn seed_empty_project(app: &mut App) {
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    id: ProjectId("p3".into()),
+                    name: "docs".into(),
+                    repo_path: "/tmp/docs".into(),
+                    sort_order: 2,
+                }),
+            },
+        );
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w3root".into()),
+                    project_id: ProjectId("p3".into()),
+                    path: "/tmp/docs".into(),
+                    branch: "main".into(),
+                    is_main: true,
+                    sort_order: 0,
+                }),
+            },
+        );
+    }
+
+    /// A tab is a word, and a word says nothing about being clickable —
+    /// so the one under the pointer is underlined for as long as it rests
+    /// there, and only that one: a tab's name, or the `+`.
+    #[test]
+    fn the_pointer_underlines_the_tab_it_rests_on() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            let terminal = draw(&mut app);
+            assert_eq!(
+                underlined_head(&terminal),
+                "",
+                "nothing is under the pointer yet"
+            );
+
+            // The tab, with the pointer on it: its name alone underlines.
+            let demo = HitTarget::LauncherTab(ProjectId("p1".into()));
+            let (demo_x, demo_y) = crumb_cell(&app, demo.clone());
+            mouse(&mut app, MouseEventKind::Moved, demo_x, demo_y);
+            assert_eq!(app.hover_crumb, Some(demo));
+            assert_eq!(underlined_head(&draw(&mut app)), "demo");
+
+            // The `+` is a button too.
+            let (add_x, add_y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
+            mouse(&mut app, MouseEventKind::Moved, add_x + 1, add_y);
+            assert_eq!(app.hover_crumb, Some(HitTarget::LauncherTabAdd));
+            assert_eq!(underlined_head(&draw(&mut app)), "+");
+
+            // And the pointer off the row takes the underline with it.
+            mouse(&mut app, MouseEventKind::Moved, demo_x, demo_y + 6);
+            assert_eq!(app.hover_crumb, None);
+            assert_eq!(underlined_head(&draw(&mut app)), "");
+
+            // The hatch out of a full-screen session is the same kind of
+            // button, and wears the same underline.
+            let mut full = two_sessions();
+            draw(&mut full);
+            key(&mut full, KeyCode::Char('z'), KeyModifiers::NONE);
+            draw(&mut full);
+            let (x, y) = crumb_cell(&full, HitTarget::LauncherCrumb);
+            mouse(&mut full, MouseEventKind::Moved, x, y);
+            assert_eq!(underlined_head(&draw(&mut full)), "‹ sessions");
         });
     }
 
@@ -1805,7 +4436,7 @@ mod tests {
             let mut app = two_sessions();
             draw_at(&mut app, 130, 20);
             assert!(
-                crate::launcher::split(app.launcher_body, app.launcher_level, app.launcher_pane_h)
+                crate::launcher::split(app.launcher_body, app.launcher_pane_h)
                     .1
                     .is_none(),
                 "too short for a pane"
@@ -2006,6 +4637,36 @@ mod tests {
         });
     }
 
+    /// The ONLY card leaving — archived with `a`, or deleted with `d` and
+    /// its confirm — leaves nothing for the PANE to read, so it folds away
+    /// and the empty grid takes the body, the way a project opened with no
+    /// sessions lands. INPUT PARITY: both verbs end in the same state.
+    #[test]
+    fn the_last_card_leaving_folds_the_pane_away() {
+        with_default_config(|| {
+            for keys in [&['a'][..], &['d', 'y'][..]] {
+                let mut app = two_sessions();
+                super::open_project(&mut app, &ProjectId("p2".into()), &mut Vec::new());
+                draw(&mut app);
+                assert_eq!(cards(&app), ["a3"], "web's one card");
+                assert!(super::has_pane(&app), "{keys:?}: the pane reads it");
+
+                for c in keys {
+                    key(&mut app, KeyCode::Char(*c), KeyModifiers::NONE);
+                }
+                assert!(cards(&app).is_empty(), "{keys:?}: the card left");
+                assert!(app.launcher_unaimed, "{keys:?}: nothing left to aim at");
+                assert!(!super::has_pane(&app), "{keys:?}: and the pane folded");
+                assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+                let text = buffer_text(&draw(&mut app));
+                assert!(
+                    text.contains("press  p  to prompt"),
+                    "{keys:?}: the empty grid says what starts one: {text}"
+                );
+            }
+        });
+    }
+
     /// `confirm_on_archive` on: the archive runs on the dialog's Enter,
     /// a second input event, and that is the one the landing is kept
     /// across. The bare key's landing and this one are the same card.
@@ -2056,6 +4717,118 @@ mod tests {
                 "the pane under the grid either way"
             );
             assert!(!by_click.collapsed, "not full-screen: that is `z`");
+        });
+    }
+
+    /// INPUT PARITY: with the pane folded away (`^~`), a click on a card
+    /// brings the pane back under the grid, and the second click — like
+    /// Enter, the key behind it — puts the keys in it. Neither
+    /// full-screens the session: that is `z` alone. A third click, with
+    /// the keys already in the pane, leaves it exactly where it is.
+    #[test]
+    fn a_click_on_a_card_unfolds_the_pane_rather_than_full_screening() {
+        with_default_config(|| {
+            let mut by_key = two_sessions();
+            draw(&mut by_key);
+            key(&mut by_key, KeyCode::Char('~'), KeyModifiers::NONE);
+            assert!(by_key.launcher_pane_hidden, "^~ folded the pane away");
+            key(&mut by_key, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut by_key, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!by_key.launcher_pane_hidden, "Enter brought the pane back");
+            assert!(
+                !by_key.collapsed,
+                "the pane under the grid, not full-screen"
+            );
+            assert_eq!(by_key.focus, Focus::Terminal, "and the keys are in it");
+
+            let mut by_click = two_sessions();
+            draw(&mut by_click);
+            key(&mut by_click, KeyCode::Char('~'), KeyModifiers::NONE);
+            assert!(by_click.launcher_pane_hidden);
+            let (x, y) = row_cell(&by_click, 0);
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert!(
+                !by_click.launcher_pane_hidden,
+                "one click on a card always brings the folded pane back"
+            );
+            assert!(!by_click.launcher_unaimed, "on the card clicked");
+            assert_eq!(
+                by_click.focus,
+                Focus::Sessions,
+                "and the keys stay on the cards until the second click"
+            );
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+
+            assert!(
+                !by_click.launcher_pane_hidden,
+                "the second click brought the pane back"
+            );
+            assert_eq!(
+                by_click.collapsed, by_key.collapsed,
+                "the pane under the grid either way"
+            );
+            assert!(!by_click.collapsed, "not full-screen: that is `z`");
+            assert_eq!(by_click.focus, by_key.focus, "and the keys are in it");
+            assert_eq!(pane(&by_click), pane(&by_key));
+            let text = buffer_text(&draw(&mut by_click));
+            assert_eq!(
+                tabs_drawn(&by_click),
+                ["demo"],
+                "the grid is still up over the pane: {text}"
+            );
+
+            // Again, with the keys already there: nothing moves.
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert!(!by_click.launcher_pane_hidden, "the pane stayed");
+            assert!(!by_click.collapsed, "and never took the whole screen");
+            assert_eq!(by_click.focus, Focus::Terminal);
+        });
+    }
+
+    /// INPUT PARITY: a right-click lands on a card exactly as a left click
+    /// does — the pane folded away (`^~`) comes back open on that card,
+    /// with the menu over it — while the keys walk the grid under the fold
+    /// and leave it folded.
+    #[test]
+    fn a_right_click_on_a_card_unfolds_the_pane_as_a_left_click_does() {
+        with_default_config(|| {
+            let mut by_left = two_sessions();
+            let mut by_right = two_sessions();
+            for app in [&mut by_left, &mut by_right] {
+                draw(app);
+                key(app, KeyCode::Char('~'), KeyModifiers::NONE);
+                key(app, KeyCode::Char('h'), KeyModifiers::NONE);
+                assert!(
+                    app.launcher_pane_hidden,
+                    "a key walking the cards leaves the fold be"
+                );
+                draw(app);
+            }
+            let (x, y) = row_cell(&by_left, 0);
+            mouse(&mut by_left, MouseEventKind::Down(MouseButton::Left), x, y);
+            mouse(
+                &mut by_right,
+                MouseEventKind::Down(MouseButton::Right),
+                x,
+                y,
+            );
+
+            for app in [&by_left, &by_right] {
+                assert!(!app.launcher_pane_hidden, "the click brought the pane back");
+                assert!(!app.launcher_unaimed, "on the card clicked");
+                assert_eq!(app.focus, Focus::Sessions, "the keys stay on the cards");
+            }
+            assert_eq!(
+                by_right.selected_session().map(|a| a.id.clone()),
+                by_left.selected_session().map(|a| a.id.clone()),
+                "both buttons land on the same card"
+            );
+            assert!(
+                matches!(by_right.overlay, Some(Overlay::Menu(_))),
+                "and the right one opens its menu: {:?}",
+                by_right.overlay
+            );
         });
     }
 
@@ -2160,7 +4933,7 @@ mod tests {
     /// the box back on the pick with what was typed kept.
     #[test]
     fn ctrl_p_picks_the_project_by_typing_and_keeps_the_task() {
-        with_default_config(|| {
+        with_config_json(r#"{"quick_prompt_new_worktree": true}"#, || {
             let mut app = two_sessions();
             draw(&mut app);
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
@@ -2197,7 +4970,7 @@ mod tests {
     /// the project the prompt went to, since nothing else moved.
     #[test]
     fn a_launch_into_another_project_leaves_the_screen_where_it_is() {
-        with_default_config(|| {
+        with_config_json(r#"{"quick_prompt_new_worktree": true}"#, || {
             let mut app = two_sessions();
             draw(&mut app);
             assert_eq!(
@@ -2259,7 +5032,7 @@ mod tests {
         });
     }
 
-    /// The same with `^N` off, where there is no checkout to cut and the
+    /// The same with the new-worktree SETTING off, where there is no checkout to cut and the
     /// create goes straight out: it is born LEFT BEHIND, so the Ack that
     /// comes back seconds later cannot pull the screen over to it either.
     #[test]
@@ -2274,8 +5047,7 @@ mod tests {
             key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
             type_text(&mut app, "we");
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            // Into web's own checkout rather than a fresh worktree.
-            key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            // Into web's own checkout: the new-worktree SETTING is off.
             let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
             let req_id = match out.as_slice() {
@@ -2339,27 +5111,21 @@ mod tests {
         });
     }
 
-    /// Picking a project that lives in another workspace aims the box
-    /// there without opening that workspace: the grid behind the box goes
-    /// on showing the work in front of the user.
+    /// Picking another project in the box aims the box there without
+    /// switching to it: the grid behind the box goes on showing the work
+    /// in front of the user, and no tab moves.
     #[test]
-    fn picking_a_project_in_another_workspace_leaves_the_workspace_open() {
+    fn picking_another_project_in_the_box_leaves_the_grid_where_it_is() {
         with_default_config(|| {
             let mut app = two_sessions();
-            let elsewhere: WorkspaceId = "ws2".to_string().into();
-            app.tree.workspaces.push(nebula_core::Workspace {
-                id: elsewhere.clone(),
-                name: "side".into(),
-            });
             app.tree.projects.push(Project {
-                workspace_id: elsewhere.clone(),
                 id: ProjectId("p3".into()),
                 name: "away".into(),
                 repo_path: "/tmp/away".into(),
                 sort_order: 2,
             });
-            let open = app.tree.active_workspace.clone();
             draw(&mut app);
+            let tabs = app.launcher_tabs.clone();
 
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
@@ -2372,12 +5138,8 @@ mod tests {
                 Some(ProjectId("p3".into())),
                 "the box is aimed at it"
             );
-            assert_eq!(app.tree.active_workspace, open, "the workspace stayed open");
-            assert!(
-                !out.iter()
-                    .any(|r| matches!(r, ClientRequest::OpenWorkspace { .. })),
-                "and nothing asked the DAEMON to switch: {out:?}"
-            );
+            let _ = out;
+            assert_eq!(app.launcher_tabs, tabs, "no tab was added");
             assert_eq!(
                 app.selected_project().map(|p| p.name.as_str()),
                 Some("demo")
@@ -2418,17 +5180,17 @@ mod tests {
         });
     }
 
-    /// `^N` flips the box between a fresh worktree and the project's own
-    /// checkout — the project the box is aimed at — and the next box
-    /// starts the way this one was left.
+    /// `^N` flips the box between the project's own checkout — the
+    /// project the box is aimed at — and a fresh worktree, and the next
+    /// box starts from the SETTING again (off by default).
     #[test]
-    fn ctrl_n_flips_to_the_projects_checkout_and_is_remembered() {
-        with_default_config(|| {
+    fn ctrl_n_flips_one_box_and_the_next_starts_from_the_setting() {
+        with_config_json(r#"{"quick_prompt_new_worktree": true}"#, || {
             let mut app = two_sessions();
             draw(&mut app);
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             let (launch, _) = launch(&app);
-            assert!(launch.is_new_worktree());
+            assert!(launch.is_new_worktree(), "the setting is on");
             key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
             let (launch, _) = self::launch(&app);
             let QuickTarget::Worktree(worktree) = &launch.target else {
@@ -2437,36 +5199,240 @@ mod tests {
             let project = crate::launcher::project_of(&app, &launch.target);
             assert_eq!(project, app.selected_project().map(|p| p.id.clone()));
             assert!(app.tree.worktrees.iter().any(|w| &w.id == worktree));
-            assert!(!app.launcher_new_worktree);
 
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             let (launch, _) = self::launch(&app);
-            assert!(!launch.is_new_worktree(), "the next box remembers");
+            assert!(launch.is_new_worktree(), "the next box follows the setting");
         });
     }
 
-    /// The panel toggles have no panels to fold here, and say so.
+    /// `⇧A` swaps the grid for the project's ARCHIVED sessions and back:
+    /// the live cards go, the archived ones arrive, the header counts
+    /// them under their own word, and `u` on one unarchives it where it
+    /// stands. An archived card has no session to step into, so Enter
+    /// says to unarchive it first.
     #[test]
-    fn the_panel_toggles_say_there_are_no_panels() {
-        let mut app = two_sessions();
-        let mut out = Vec::new();
-        assert!(super::handle_action(
-            &mut app,
-            Action::ToggleProjects,
-            None,
-            &crate::keymap::KeyChord::from_event(&crossterm::event::KeyEvent::new(
-                KeyCode::Char('P'),
-                KeyModifiers::SHIFT
-            )),
-            &mut out
-        ));
-        assert_eq!(app.flash.as_deref(), Some(super::NO_PANELS));
+    fn shift_a_swaps_the_grid_for_the_archived_sessions_and_back() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            // `polish-nav` archived, `agent-1` still live.
+            for agent in &mut app.tree.agents {
+                if agent.id == AgentId("a2".into()) {
+                    agent.archived = true;
+                }
+            }
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("agent-1"), "{text}");
+            assert!(!text.contains("polish-nav"), "the live grid: {text}");
+
+            key(&mut app, KeyCode::Char('A'), KeyModifiers::SHIFT);
+            assert!(app.show_archived, "the archived view is on");
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("polish-nav"), "the archived card: {text}");
+            assert!(!text.contains("agent-1"), "and only that one: {text}");
+            assert!(
+                text.contains("1 archived session"),
+                "the header counts them under their own word: {text}"
+            );
+            assert_eq!(
+                app.selected_session().map(|a| a.id),
+                Some(AgentId("a2".into())),
+                "the cursor lands on the first card of the list that arrived"
+            );
+
+            // Enter has no session to step into there.
+            app.flash = None;
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some(crate::event_loop::AGENT_ARCHIVED)
+            );
+
+            // `u` unarchives the card under the cursor where it stands.
+            let out = key(&mut app, KeyCode::Char('u'), KeyModifiers::NONE);
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::UnarchiveAgent { id, .. } if *id == AgentId("a2".into())
+                )),
+                "{out:?}"
+            );
+
+            // And `⇧A` again is the live grid.
+            key(&mut app, KeyCode::Char('A'), KeyModifiers::SHIFT);
+            assert!(!app.show_archived);
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("agent-1"), "{text}");
+        });
+    }
+
+    /// An empty ARCHIVED VIEW says so and names the way back, rather than
+    /// showing the first-run hero, which would be advice about the other
+    /// list.
+    #[test]
+    fn an_empty_archived_view_names_the_way_back() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            key(&mut app, KeyCode::Char('A'), KeyModifiers::SHIFT);
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("0 archived sessions"), "{text}");
+            assert!(text.contains("nothing archived"), "{text}");
+            assert!(
+                !text.contains("type a task"),
+                "not the first-run hero: {text}"
+            );
+        });
+    }
+
+    /// A PANE that loses the KEYBOARD says so. The input lock decides
+    /// where a keystroke lands, so a drop nobody asked for — here a
+    /// redraw that finds the pane folded out from under a locked cursor —
+    /// leaves the very next key meaning something else entirely: `x`
+    /// closes the project's tab, `⇧M` opens the memory modal.
+    /// Handing the keys over in silence is the bug the flash closes.
+    #[test]
+    fn a_pane_losing_the_keyboard_says_so() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            app.term = Some(crate::app::AttachedTerm::new(
+                SessionRef::Agent(AgentId("a2".into())),
+                40,
+                10,
+            ));
+            app.focus = Focus::Terminal;
+            app.term_locked = true;
+
+            // Nothing was pressed at the pane: it simply is not drawn any
+            // more, and the draw settles focus back onto the cards.
+            app.launcher_pane_hidden = true;
+            app.flash = None;
+            draw(&mut app);
+
+            assert!(!app.term_locked, "the keys are the grid's now");
+            assert_eq!(
+                app.flash.as_deref(),
+                Some(crate::app::TERMINAL_RELEASED),
+                "and the handover said so"
+            );
+            assert!(
+                buffer_text(&draw(&mut app)).contains("the keys are the grid's again"),
+                "and it is on screen, not just in the field"
+            );
+
+            // Said once, on the handover — not repainted every frame.
+            app.flash = None;
+            draw(&mut app);
+            assert_eq!(app.flash, None, "once, not every frame");
+        });
+    }
+
+    /// A pane that was only being PREVIEWED says nothing when focus
+    /// settles off it: the keys were the grid's all along, so nothing
+    /// changed hands and there is nothing to report.
+    #[test]
+    fn a_previewed_pane_losing_focus_says_nothing() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            app.term = Some(crate::app::AttachedTerm::new(
+                SessionRef::Agent(AgentId("a2".into())),
+                40,
+                10,
+            ));
+            app.focus = Focus::Terminal;
+            app.term_locked = false;
+
+            app.launcher_pane_hidden = true;
+            app.flash = None;
+            draw(&mut app);
+
+            assert_eq!(app.focus, Focus::Sessions, "focus still settles");
+            assert_eq!(app.flash, None, "nothing was being typed at");
+        });
+    }
+
+    /// PR & ISSUE COUNTS: the header counts the selected project's open
+    /// pull requests and issues beside the session count, so what is
+    /// waiting on the repo reads off the header instead of `v` and `i`.
+    #[test]
+    fn the_header_counts_the_projects_open_prs_and_issues() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Fix the nav")]);
+            seed_issues(&mut app, &[(15, "Crash on boot")]);
+
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("2 sessions"), "{text}");
+            assert!(text.contains("2 prs"), "{text}");
+            assert!(text.contains("1 issue"), "the singular: {text}");
+        });
+    }
+
+    /// INPUT PARITY: the header's PR & ISSUE COUNTS are buttons. A click
+    /// on `2 prs` opens the PULL REQUESTS MODAL and one on `1 issue` the
+    /// ISSUES MODAL, each for the project in front of you — the modals `v`
+    /// and `i` open, through the same function. Each target sits on its
+    /// own word and not on the `·` between them, and the one under the
+    /// pointer is underlined, as the header's tabs are.
+    #[test]
+    fn clicking_a_header_count_opens_that_list() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Fix the nav")]);
+            seed_issues(&mut app, &[(15, "Crash on boot")]);
+            let project = app.selected_project().expect("a project").id.clone();
+            let terminal = draw(&mut app);
+            let line: Vec<char> = head_line(&terminal).chars().collect();
+            let word = |app: &App, hit: HitTarget| -> String {
+                let rect = app.hit_rect(&hit).expect("the count was drawn");
+                assert_eq!(rect.y, 1, "on the header row");
+                line[rect.x as usize..(rect.x + rect.width) as usize]
+                    .iter()
+                    .collect()
+            };
+            assert_eq!(word(&app, HitTarget::LauncherPullRequests), "2 prs");
+            assert_eq!(word(&app, HitTarget::LauncherIssues), "1 issue");
+
+            // The pointer resting on a count underlines that word alone.
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherIssues);
+            mouse(&mut app, MouseEventKind::Moved, x, y);
+            assert_eq!(underlined_head(&draw(&mut app)), "1 issue");
+
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherPullRequests);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            let Some(Overlay::PullRequests(view)) = &app.overlay else {
+                panic!("`2 prs` opens the pull requests: {:?}", app.overlay);
+            };
+            assert_eq!(view.project, project);
+            let clicked = app.overlay.take();
+            key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+            assert_eq!(
+                format!("{:?}", app.overlay),
+                format!("{clicked:?}"),
+                "the click is `v`"
+            );
+
+            app.overlay = None;
+            draw(&mut app);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherIssues);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            let Some(Overlay::Issues(view)) = &app.overlay else {
+                panic!("`1 issue` opens the issues: {:?}", app.overlay);
+            };
+            assert_eq!(view.project, project);
+            let clicked = app.overlay.take();
+            key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert_eq!(
+                format!("{:?}", app.overlay),
+                format!("{clicked:?}"),
+                "the click is `i`"
+            );
+        });
     }
 
     /// The grid names each session's place, the harness it runs on and
     /// its pull request, with the count and the needs-you tally in the
-    /// header — and no panels anywhere. Off, the panels are back.
+    /// header.
     #[test]
     fn the_grid_names_each_sessions_place_and_pull_request() {
         with_default_config(|| {
@@ -2488,10 +5454,7 @@ mod tests {
             let text = buffer_text(&draw(&mut app));
             assert!(!text.contains("PROJECTS"), "{text}");
             assert!(!text.contains("WORKTREES"), "{text}");
-            assert!(
-                text.contains("nebula / default / demo / sessions"),
-                "the header names the workspace and the project: {text}"
-            );
+            assert_eq!(tabs_drawn(&app), ["demo"], "the header's tabs: {text}");
             assert!(text.contains("2 sessions"), "{text}");
             assert!(text.contains("polish-nav"), "{text}");
             // Each card names the checkout its session runs in, in the
@@ -2509,17 +5472,13 @@ mod tests {
             );
             assert!(text.contains("#42 Polish the nav"), "{text}");
             assert!(text.contains("⌂ main · claude"), "{text}");
-
-            app.launcher = false;
-            let text = buffer_text(&draw(&mut app));
-            assert!(text.contains("PROJECTS"), "{text}");
         });
     }
 
-    /// The header's STATUS TALLY, on the header row: one dot per state
-    /// with a card in it, carrying that state's count and no word — so
-    /// what is waiting on a human is the red dot, and reading it means
-    /// reading the color the cell is painted in.
+    /// The PROJECT TABS' STATUS DOTS, on the header row: one dot per
+    /// state a tab's sessions are in, carrying that state's count and no
+    /// word — so what is waiting on a human is the red dot, and reading it
+    /// means reading the color the cell is painted in.
     fn head_tally(terminal: &Terminal<TestBackend>) -> Vec<(String, Color)> {
         let buf = terminal.backend().buffer();
         let mut dots = Vec::new();
@@ -2530,11 +5489,11 @@ mod tests {
             if dot.symbol() != "●" {
                 continue;
             }
-            // `  ● 12`: the count starts two cells along and runs as far
-            // as the digits do, so the `2 sessions` off on the right edge
-            // is never read as part of it.
+            // `●12`: the count starts on the next cell and runs as far as
+            // the digits do, so the `2 sessions` off on the right edge is
+            // never read as part of it.
             let mut count = String::new();
-            let mut i = x + 2;
+            let mut i = x + 1;
             while let Some(cell) = buf.cell((i, 1)) {
                 if !cell.symbol().chars().all(|c| c.is_ascii_digit()) {
                     break;
@@ -2547,7 +5506,7 @@ mod tests {
         dots
     }
 
-    /// The header counts what is waiting on a human in the STATUS TALLY's
+    /// The header counts what is waiting on a human in the project tab's
     /// red dot — the count, and not a word beside it. Nothing else on the
     /// row says it: the dot is the whole announcement.
     #[test]
@@ -2585,11 +5544,99 @@ mod tests {
         });
     }
 
-    /// However narrow the terminal, the breadcrumb and the count keep
-    /// off each other: the crumbs are squeezed, then dropped from the
-    /// right — the project first, then the workspace — rather than drawn
-    /// over the count (the two are separate right/left-aligned
-    /// paragraphs on one row, so an overlong crumb would overprint it).
+    /// The fg of each cell a PROJECT TAB's name is painted in, on the
+    /// header row — found by what it spells, since tabs move as others
+    /// open.
+    fn tab_name_colors(terminal: &Terminal<TestBackend>, name: &str) -> Vec<Color> {
+        let buf = terminal.backend().buffer();
+        let cells: Vec<_> = (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, 1)))
+            .collect();
+        let want: Vec<String> = name.chars().map(String::from).collect();
+        let at = cells
+            .windows(want.len())
+            .position(|w| w.iter().zip(&want).all(|(c, s)| c.symbol() == s))
+            .unwrap_or_else(|| panic!("no {name:?} tab on the header row"));
+        cells[at..at + want.len()].iter().map(|c| c.fg).collect()
+    }
+
+    /// A PROJECT TAB's name sweeps on the loudest thing its sessions are
+    /// doing, lit tab or not: yellow while one runs, red while one waits
+    /// on you whatever else runs, and blue once none is live but a finish
+    /// is left unread — for as long as it stays unread, so the sweep clock
+    /// keeps running for it — then still once it is read. The animations
+    /// setting stops all three.
+    #[test]
+    fn a_project_tabs_name_sweeps_the_loudest_status_under_it() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            app.launcher_tabs.push(ProjectId("p2".into()));
+            draw(&mut app);
+            let th = app.theme;
+            let sweeps = |term: &Terminal<TestBackend>, name: &str, ramp: [Color; 3]| {
+                tab_name_colors(term, name).iter().all(|c| ramp.contains(c))
+            };
+            let set = |app: &mut App, id: &str, status: AgentStatus, unseen: bool| {
+                let a = app.tree.agents.iter_mut().find(|a| a.id.0 == id).unwrap();
+                a.status = status;
+                a.unseen = unseen;
+            };
+
+            let term = draw(&mut app);
+            assert!(sweeps(&term, "demo", th.warn_sweep), "polish-nav runs");
+            assert!(sweeps(&term, "web", th.warn_sweep), "the tab not lit too");
+
+            set(&mut app, "a1", AgentStatus::NeedsFeedback, false);
+            assert!(
+                sweeps(&draw(&mut app), "demo", th.err_sweep),
+                "red outranks the one still running"
+            );
+
+            set(&mut app, "a1", AgentStatus::Finished, true);
+            assert!(
+                sweeps(&draw(&mut app), "demo", th.warn_sweep),
+                "a finish is not the project done while another runs"
+            );
+
+            set(&mut app, "a2", AgentStatus::Finished, true);
+            set(&mut app, "a3", AgentStatus::Finished, false);
+            let term = draw(&mut app);
+            assert!(sweeps(&term, "demo", th.done_sweep), "all done: blue");
+            assert_eq!(
+                tab_name_colors(&term, "web"),
+                vec![th.muted; 3],
+                "web is quiet"
+            );
+            assert!(
+                app.status_anim_active(),
+                "long-finished, but unread: the blue keeps the clock running"
+            );
+
+            set(&mut app, "a1", AgentStatus::Finished, false);
+            set(&mut app, "a2", AgentStatus::Finished, false);
+            let term = draw(&mut app);
+            assert_eq!(
+                tab_name_colors(&term, "demo"),
+                vec![th.accent; 4],
+                "read: still"
+            );
+            assert!(!app.status_anim_active(), "and nothing left to tick for");
+
+            set(&mut app, "a2", AgentStatus::Running, false);
+            app.animations = false;
+            assert_eq!(
+                tab_name_colors(&draw(&mut app), "demo"),
+                vec![th.accent; 4],
+                "animations off"
+            );
+        });
+    }
+
+    /// However narrow the terminal, the tabs and the count keep off each
+    /// other: a tab is cut, then counted rather than drawn — never drawn
+    /// over the count (the two are separate right/left-aligned paragraphs
+    /// on one row, so an overlong tab would overprint it) — and the `+`
+    /// is never pushed off.
     #[test]
     fn the_header_never_overprints_its_count() {
         with_default_config(|| {
@@ -2600,25 +5647,18 @@ mod tests {
                 let text = buffer_text(&draw_at(&mut app, width, 34));
                 let head = text.lines().nth(1).unwrap_or_default().to_string();
                 assert!(head.contains("2 sessions"), "{width}: {head:?}");
-                // The crumbs end before the count begins: the gap between
+                // The tabs end before the count begins: the gap between
                 // the two is real air, not a letter eaten by one of them.
-                let crumbs = head.split("2 sessions").next().unwrap_or_default();
+                let tabs = head.split("2 sessions").next().unwrap_or_default();
                 assert!(
-                    crumbs.ends_with("  "),
-                    "{width}: crumbs run into the count: {head:?}"
+                    tabs.ends_with("  "),
+                    "{width}: tabs run into the count: {head:?}"
                 );
-                assert!(
-                    crumbs.trim_start().starts_with("nebula"),
-                    "{width}: {head:?}"
-                );
+                assert!(tabs.contains('+'), "{width}: {head:?}");
             }
-            // Wide enough for everything, narrow enough that the project
-            // gives way first and the workspace survives alone.
-            let wide = buffer_text(&draw_at(&mut app, 130, 34));
-            assert!(
-                wide.contains("nebula / default / demo / sessions"),
-                "{wide}"
-            );
+            // Wide enough for the tab whole.
+            draw_at(&mut app, 130, 34);
+            assert_eq!(tabs_drawn(&app), ["demo"]);
         });
     }
 
@@ -2688,11 +5728,11 @@ mod tests {
         });
     }
 
-    /// The box, in the view: each of the three chord-changed details on
-    /// its first row beside the chord that changes it, and the prompt
-    /// header under them naming where the launch lands and the toggle
-    /// that cuts a fresh checkout. None of those chords is repeated on
-    /// the border — that repetition was the box's wall of text.
+    /// The box, in the view: each of its details on its first row beside
+    /// the chord that changes it — the checkout the launch lands in among
+    /// them, beside its `▾` — and the prompt header under them with the
+    /// toggle that cuts a fresh checkout. None of those chords is repeated
+    /// on the border — that repetition was the box's wall of text.
     #[test]
     fn the_box_names_its_details_and_its_keys() {
         with_default_config(|| {
@@ -2704,7 +5744,11 @@ mod tests {
             assert!(text.contains("agent claude Tab"), "{text}");
             assert!(text.contains("model default ^O"), "{text}");
             assert!(text.contains("new worktree ^N"), "{text}");
-            assert!(text.contains("(demo / "), "where the launch lands: {text}");
+            assert!(
+                text.contains("worktree main ▾"),
+                "where the launch lands: {text}"
+            );
+            assert!(!text.contains("(demo / "), "not twice over: {text}");
             assert!(!text.contains("^P project"), "not twice over: {text}");
             assert!(!text.contains("^O model"), "not twice over: {text}");
 
@@ -2715,200 +5759,23 @@ mod tests {
         });
     }
 
-    /// A cell inside the PROJECT card at `index`, as the level drew it.
-    fn project_cell(app: &App, index: usize) -> (u16, u16) {
-        let (rect, _) = app
-            .hits
-            .iter()
-            .find(|(_, hit)| *hit == HitTarget::LauncherProjectCard(index))
-            .unwrap_or_else(|| panic!("project card {index} was not drawn"));
-        (rect.x + 3, rect.y + 1)
-    }
-
-    /// `k` on the grid's top row has nowhere left to go, so a second press
-    /// walks out to the PROJECTS level — the same double tap `k`,`k` on a
-    /// panel's first row is, and the first press says so in the footer
-    /// rather than moving anything.
+    /// Out to the PROJECTS level the way the keys walk it: Esc lets the
+    /// `k` on the grid's top row has nowhere left to go, and however many
+    /// times it is pressed it goes nowhere: the grid is the top of the
+    /// view, with no level above it to walk out to.
     #[test]
-    fn k_k_off_the_top_row_walks_out_to_the_projects() {
+    fn k_on_the_top_row_stays_put() {
         with_default_config(|| {
             let mut app = two_sessions();
             draw(&mut app);
-            // The cursor starts on the older card, on the same top row as
-            // the newer one: both are on row 0 here.
+            let before = (selected(&app), app.selected_project().map(|p| p.id.clone()));
+            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
             assert_eq!(
-                app.launcher_level,
-                crate::launcher::Level::Sessions,
-                "one press only arms"
+                (selected(&app), app.selected_project().map(|p| p.id.clone())),
+                before
             );
-            assert_eq!(
-                app.flash.as_deref(),
-                Some("k again: projects"),
-                "and says what the second one does"
-            );
-
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-            assert_eq!(app.launcher_level, crate::launcher::Level::Projects);
-
-            // Slowly, it is two single presses: the arm is only good for
-            // `DOUBLE_TAP`, and anything in between breaks it too.
-            let mut app = two_sessions();
-            draw(&mut app);
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-            key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-            assert_eq!(
-                app.launcher_level,
-                crate::launcher::Level::Sessions,
-                "a key in between breaks the tap"
-            );
-        });
-    }
-
-    /// Esc walks one level out of the tree each press — a project's
-    /// sessions, the projects beside it, the workspaces — and stops at the
-    /// top rather than looking broken. Enter walks back in along the same
-    /// path.
-    #[test]
-    fn esc_walks_up_the_tree_and_enter_walks_back_in() {
-        with_default_config(|| {
-            use crate::launcher::Level;
-            let mut app = two_sessions();
-            draw(&mut app);
-            assert_eq!(app.launcher_level, Level::Sessions);
-
-            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert_eq!(app.launcher_level, Level::Projects);
-            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert_eq!(app.launcher_level, Level::Workspaces);
-
-            app.flash = None;
-            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert_eq!(app.launcher_level, Level::Workspaces, "the top of the tree");
-            assert!(app.flash.is_some(), "and it says so");
-
-            draw(&mut app);
-            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(app.launcher_level, Level::Projects);
-            draw(&mut app);
-            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(app.launcher_level, Level::Sessions);
-        });
-    }
-
-    /// The PROJECTS level draws a card per project, naming the sessions
-    /// under it, and the header counts them. Walking the cards moves the
-    /// project cursor; Enter goes into the project, and the SESSIONS level
-    /// below is that project's alone.
-    #[test]
-    fn entering_a_project_scopes_the_grid_to_it() {
-        with_default_config(|| {
-            let mut app = two_sessions();
-            draw(&mut app);
-            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            let text = buffer_text(&draw(&mut app));
-            assert!(
-                text.contains("nebula / default / projects"),
-                "the crumb stops at the level: {text}"
-            );
-            assert!(text.contains("2 projects"), "{text}");
-            // Each card names its project and the sessions under it.
-            assert!(text.contains("demo"), "{text}");
-            assert!(text.contains("polish-nav"), "{text}");
-            assert!(text.contains("web"), "{text}");
-            assert!(text.contains("tidy-css"), "{text}");
-
-            // The cursor starts on the selected project and `l` walks to
-            // the one beside it.
-            assert_eq!(
-                app.selected_project().map(|p| p.name.as_str()),
-                Some("demo")
-            );
-            key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
-            assert_eq!(app.selected_project().map(|p| p.name.as_str()), Some("web"));
-
-            // Enter goes in, and the grid below is web's one session.
-            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(app.launcher_level, crate::launcher::Level::Sessions);
-            assert_eq!(selected(&app).as_deref(), Some("a3"), "web's own session");
-            let text = buffer_text(&draw(&mut app));
-            assert!(text.contains("nebula / default / web / sessions"), "{text}");
-            assert!(text.contains("1 session"), "{text}");
-            assert!(text.contains("tidy-css"), "{text}");
-            assert!(
-                !text.contains("polish-nav"),
-                "demo's sessions are a level away: {text}"
-            );
-        });
-    }
-
-    /// A click on a project card is the keys that walk to it, and a second
-    /// click is its Enter — one function per intent, whichever end it
-    /// comes from.
-    #[test]
-    fn a_click_on_a_project_card_is_the_keys_that_walk_to_it() {
-        with_default_config(|| {
-            let mut by_key = two_sessions();
-            draw(&mut by_key);
-            key(&mut by_key, KeyCode::Esc, KeyModifiers::NONE);
-            draw(&mut by_key);
-            key(&mut by_key, KeyCode::Char('l'), KeyModifiers::NONE);
-
-            let mut by_click = two_sessions();
-            draw(&mut by_click);
-            key(&mut by_click, KeyCode::Esc, KeyModifiers::NONE);
-            draw(&mut by_click);
-            let (x, y) = project_cell(&by_click, 1);
-            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
-
-            assert_eq!(by_click.sel_project, by_key.sel_project);
-            assert_eq!(by_click.launcher_level, by_key.launcher_level);
-            assert_eq!(by_click.focus, by_key.focus);
-
-            key(&mut by_key, KeyCode::Enter, KeyModifiers::NONE);
-            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
-            assert_eq!(
-                by_click.launcher_level, by_key.launcher_level,
-                "the second click is Enter"
-            );
-            assert_eq!(selected(&by_click), selected(&by_key));
-        });
-    }
-
-    /// The WORKSPACES level draws a card per workspace naming its
-    /// projects, and Enter on one opens it and lands on its projects.
-    #[test]
-    fn the_workspaces_level_names_each_workspaces_projects() {
-        with_default_config(|| {
-            let mut app = two_sessions();
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Workspace(nebula_core::Workspace {
-                        id: Default::default(),
-                        name: "default".into(),
-                    }),
-                },
-            );
-            draw(&mut app);
-            key(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
-            let text = buffer_text(&draw(&mut app));
-            assert!(
-                text.contains("nebula / workspaces"),
-                "the crumb is the whole path at the top: {text}"
-            );
-            assert!(text.contains("1 workspace"), "{text}");
-            assert!(text.contains("default"), "{text}");
-            assert!(
-                text.contains("demo") && text.contains("web"),
-                "the card names the projects under it: {text}"
-            );
-            // Above the sessions there is no pane to read.
-            assert!(
-                !text.contains("SESSION · polish-nav"),
-                "no pane above the sessions: {text}"
-            );
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
         });
     }
 
@@ -2923,7 +5790,6 @@ mod tests {
         seed_tree(&mut app);
         seed_feat(&mut app, feat.path().to_path_buf());
         seed_web(&mut app);
-        app.launcher = true;
         app.sel_project = project_row(&app, "p1");
         let (id, _) = sweep_target(&mut app).expect("demo's other checkout is listed");
         assert_eq!(id, WorktreeId("w2".into()));
@@ -2932,6 +5798,437 @@ mod tests {
         // went with the level and has nothing to spend the tick on.
         app.sel_project = project_row(&app, "p2");
         assert_eq!(sweep_target(&mut app), None, "the sweep followed the level");
+    }
+
+    /// The first Esc lets the card under the cursor go; a click on the
+    /// air between the cards does NOT. A miss with the pointer — the
+    /// gutter between two cards, the blank rows under a short last row —
+    /// is not a request to close the session being read, so it takes
+    /// FOCUS and changes nothing else. Letting the card go stays a key.
+    #[test]
+    fn the_first_esc_lets_the_card_go_and_a_click_on_the_air_does_not() {
+        with_default_config(|| {
+            let mut by_click = two_sessions();
+            draw(&mut by_click);
+            let (x, y) = air(&by_click);
+            by_click.flash = None;
+            let was = by_click.sel_session;
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert!(
+                !by_click.launcher_unaimed,
+                "the click on the air let the card go"
+            );
+            assert_eq!(by_click.flash, None, "and it said something about it");
+            assert_eq!(by_click.sel_session, was, "it moved the cursor");
+            assert_eq!(by_click.focus, Focus::Sessions, "the keys are the grid's");
+
+            let mut by_key = two_sessions();
+            draw(&mut by_key);
+            by_key.flash = None;
+            key(&mut by_key, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(by_key.launcher_unaimed, "Esc left the grid aimed");
+            assert_eq!(by_key.flash.as_deref(), Some(super::UNAIMED));
+        });
+    }
+
+    /// The card really stops being drawn as the cursor's — the border
+    /// goes back to the frame's own edge color — and the grid does not
+    /// scroll or forget where the cursor is: clicking a card takes the
+    /// aim straight back.
+    #[test]
+    fn the_unselected_card_stops_wearing_the_cursor() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            let terminal = draw(&mut app);
+            let at = crate::launcher::cursor(&app, &crate::launcher::rows(&app))
+                .expect("the grid opens with a card under the cursor");
+            let (cell, _) = *app
+                .hits
+                .iter()
+                .find(|(_, hit)| *hit == HitTarget::LauncherRow(at))
+                .expect("the cursor's card was drawn");
+            let accent = app.theme.accent;
+            let edge = app.theme.edge;
+            assert_eq!(
+                corner(&terminal, cell),
+                accent,
+                "the cursor's card starts out wearing the accent border"
+            );
+
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let terminal = draw(&mut app);
+            assert_eq!(
+                corner(&terminal, cell),
+                edge,
+                "no card wears the cursor once the aim is let go of"
+            );
+            assert!(
+                crate::launcher::cursor(&app, &crate::launcher::rows(&app)).is_some(),
+                "the grid still knows where the cursor was — it is let go of, not forgotten"
+            );
+
+            // A click on a card is the aim back, and the border with it.
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                cell.x + 2,
+                cell.y + 1,
+            );
+            assert!(!app.launcher_unaimed, "the click re-aimed the grid");
+            let terminal = draw(&mut app);
+            assert_eq!(corner(&terminal, cell), accent);
+        });
+    }
+
+    /// The PANE along the bottom IS the selected session, so it comes
+    /// and goes with the card under the cursor: letting the card go — the
+    /// first Esc — collapses the pane and gives the grid the whole body,
+    /// and a click back on a card opens it again. A click OPENS the pane
+    /// and no more: the keys stay on the cards, and only the second click
+    /// crosses into it.
+    ///
+    /// A click on the AIR between the cards is none of that: the pane it
+    /// was reading stays exactly where it is. Missing a card with the
+    /// pointer — the gutter, the blank rows under a short last row — is
+    /// the easiest click in the view to make by accident, and it used to
+    /// shut the session under the grid every time.
+    #[test]
+    fn a_click_opens_the_pane_and_esc_collapses_it() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let has_pane = |app: &App| {
+                app.hits
+                    .iter()
+                    .any(|(_, hit)| *hit == HitTarget::LauncherPaneSplitter)
+            };
+            let cards_h = |app: &App| {
+                app.hits
+                    .iter()
+                    .find(|(_, hit)| *hit == HitTarget::PanelBg(Focus::Sessions))
+                    .map(|(area, _)| area.height)
+                    .expect("the grid registered its background")
+            };
+            let pane_h = crate::launcher::pane_height(app.launcher_body, app.launcher_pane_h)
+                .expect("34 rows fits a pane");
+            let grid_with_pane = cards_h(&app);
+            assert!(has_pane(&app) && !app.launcher_unaimed);
+
+            // A click that misses every card leaves all of it alone:
+            // same pane, same rows, same card under the cursor.
+            let (ax, ay) = air(&app);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), ax, ay);
+            draw(&mut app);
+            assert!(
+                has_pane(&app) && !app.launcher_unaimed,
+                "a click on the air shut the pane"
+            );
+            assert_eq!(cards_h(&app), grid_with_pane);
+
+            // The card let go of: the pane goes with it and the cards
+            // take the rows it was drawn over.
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            draw(&mut app);
+            assert!(app.launcher_unaimed);
+            assert!(!has_pane(&app), "nothing selected, no pane");
+            assert_eq!(cards_h(&app), grid_with_pane + pane_h);
+
+            // A click on a card opens it again — and only opens it.
+            let (x, y) = row_cell(&app, 0);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert!(!app.launcher_unaimed, "the click aimed the grid again");
+            assert_eq!(
+                app.focus,
+                Focus::Sessions,
+                "one click opens the pane, it does not enter it"
+            );
+            assert!(!app.term_locked, "and nothing is being typed into");
+            draw(&mut app);
+            assert!(has_pane(&app), "the pane came back under the cards");
+            assert_eq!(cards_h(&app), grid_with_pane);
+
+            // The second click on the same card is Enter, into the pane.
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(app.focus, Focus::Terminal, "the second click is Enter");
+            assert!(
+                !app.collapsed,
+                "the pane under the grid: full-screen is `z`"
+            );
+
+            // And with the keys in the pane, letting the card go takes
+            // them back out with it rather than leaving FOCUS on a pane
+            // that is no longer drawn (`App::settle_launcher_focus`).
+            // Straight through [`clear_aim`]: from inside a LOCKED PANE
+            // Esc belongs to the child, so there is no key here to press.
+            draw(&mut app);
+            super::clear_aim(&mut app);
+            draw(&mut app);
+            assert!(
+                !has_pane(&app),
+                "the pane collapsed out from under the keys"
+            );
+            assert_eq!(app.focus, Focus::Sessions, "which handed them back");
+            assert!(!app.term_locked);
+        });
+    }
+
+    /// `^~` folds the PANE away and takes the selection with it: no pane
+    /// is drawn under the cards, no card wears the cursor, and the edge
+    /// the pane gave the pointer to drag is gone with it. The same key
+    /// brings all three back. Ctrl and a bare backtick is the second
+    /// chord on the same key, for the terminals that send it unshifted.
+    #[test]
+    fn folding_the_pane_away_lets_the_card_go_too() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            // The pane's own edge, which `ui::draw` registers only while
+            // there is a pane to drag, and the rows the cards are laid
+            // out over: the fold hands one to the other.
+            let has_pane = |app: &App| {
+                app.hits
+                    .iter()
+                    .any(|(_, hit)| *hit == HitTarget::LauncherPaneSplitter)
+            };
+            let cards_h = |app: &App| {
+                app.hits
+                    .iter()
+                    .find(|(_, hit)| *hit == HitTarget::PanelBg(Focus::Sessions))
+                    .map(|(area, _)| area.height)
+                    .expect("the grid registered its background")
+            };
+            let pane_h = crate::launcher::pane_height(app.launcher_body, app.launcher_pane_h)
+                .expect("34 rows fits a pane");
+            let (was_pane, grid_was) = (has_pane(&app), cards_h(&app));
+            assert!(was_pane && !app.launcher_unaimed);
+
+            key(&mut app, KeyCode::Char('~'), KeyModifiers::CONTROL);
+            assert!(app.launcher_pane_hidden, "^~ folded the pane away");
+            assert!(
+                app.launcher_unaimed,
+                "folding the pane away let the card under the cursor go"
+            );
+            draw(&mut app);
+            assert!(
+                !has_pane(&app),
+                "a folded pane leaves no edge under the pointer to drag"
+            );
+            assert_eq!(
+                cards_h(&app),
+                grid_was + pane_h,
+                "the cards took the rows the pane was drawn over"
+            );
+
+            // The same key back: the pane returns, reading the card it is
+            // aimed at again.
+            key(&mut app, KeyCode::Char('~'), KeyModifiers::CONTROL);
+            assert!(!app.launcher_pane_hidden);
+            assert!(
+                !app.launcher_unaimed,
+                "the pane came back without the card it reads"
+            );
+            draw(&mut app);
+            assert!(has_pane(&app));
+            assert_eq!(cards_h(&app), grid_was, "the pane took its rows back");
+
+            // The two chords beside it: the bare `~` every terminal
+            // delivers, and `^`` where ctrl reports the key unshifted.
+            for chord in [
+                (KeyCode::Char('~'), KeyModifiers::NONE),
+                (KeyCode::Char('`'), KeyModifiers::CONTROL),
+            ] {
+                let folded = app.launcher_pane_hidden;
+                key(&mut app, chord.0, chord.1);
+                assert_ne!(
+                    app.launcher_pane_hidden, folded,
+                    "{chord:?} did not fold the pane"
+                );
+                draw(&mut app);
+            }
+        });
+    }
+
+    /// `^`` is the way out of the PANE, in two presses: typing into the
+    /// session under the cards, the chord is not forwarded to it but
+    /// hands the keys back to the card the pane reads — pane still up,
+    /// card still under the cursor — and the same chord from the cards
+    /// then folds the pane away. The bare `~` bound beside it is still
+    /// the agent's to type.
+    #[test]
+    fn ctrl_backtick_steps_out_to_the_card_then_folds_the_pane() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.focus, Focus::Terminal);
+            assert!(app.term_locked && !app.collapsed);
+
+            let typed = |out: &[ClientRequest]| {
+                out.iter().any(|r| matches!(r, ClientRequest::Input { .. }))
+            };
+            let out = key(&mut app, KeyCode::Char('~'), KeyModifiers::NONE);
+            assert!(typed(&out), "a bare ~ is typed into the session: {out:?}");
+            assert!(!app.launcher_pane_hidden && app.term_locked);
+
+            let card = crate::launcher::cursor(&app, &crate::launcher::rows(&app));
+            let out = key(&mut app, KeyCode::Char('`'), KeyModifiers::CONTROL);
+            assert!(!typed(&out), "^` never reaches the session: {out:?}");
+            assert_eq!(app.focus, Focus::Sessions, "the keys are the grid's");
+            assert!(!app.term_locked);
+            assert!(!app.launcher_pane_hidden, "the first ^` left the pane up");
+            assert!(!app.launcher_unaimed, "and the card it reads selected");
+            assert_eq!(
+                crate::launcher::cursor(&app, &crate::launcher::rows(&app)),
+                card,
+                "the cursor stayed on it"
+            );
+            draw(&mut app);
+            assert_eq!(app.focus, Focus::Sessions);
+
+            // Again, from the cards: the pane folds away.
+            key(&mut app, KeyCode::Char('`'), KeyModifiers::CONTROL);
+            assert!(app.launcher_pane_hidden, "the second ^` folded the pane");
+            assert_eq!(app.focus, Focus::Sessions);
+            draw(&mut app);
+
+            // And once more brings it back.
+            key(&mut app, KeyCode::Char('`'), KeyModifiers::CONTROL);
+            assert!(!app.launcher_pane_hidden);
+        });
+    }
+
+    /// Esc lets the card go and goes no further: the grid is the top of
+    /// the view, so Esc pressed again changes nothing — not the project,
+    /// not the tabs — and says nothing. A card walked onto takes the aim
+    /// back.
+    #[test]
+    fn esc_lets_the_card_go_and_goes_no_further() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.launcher_unaimed);
+            let project = app.selected_project().map(|p| p.id.clone());
+
+            app.flash = None;
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.launcher_unaimed);
+            assert_eq!(app.selected_project().map(|p| p.id.clone()), project);
+            assert_eq!(app.flash, None, "nothing moved, nothing said");
+
+            // The cursor sits on the older card, the right-hand one of
+            // the row, so `h` has a card to walk onto.
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert!(!app.launcher_unaimed, "a step re-aimed the grid");
+        });
+    }
+
+    /// With nothing selected, `p` asks nothing: no PROJECT PICKER goes
+    /// up, the box does — aimed at the project's ROOT BRANCH, the one
+    /// place every project has, rather than at the checkout the cursor
+    /// was parked in. `^P` in the
+    /// box is still the way to another project.
+    #[test]
+    fn p_with_nothing_selected_opens_the_box_on_the_root_branch() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+
+            // Aimed at a card, the box reuses a checkout — the new-worktree
+            // SETTING is off by default.
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert!(
+                !launch(&app).0.is_new_worktree(),
+                "an aimed p cut a worktree with the setting off"
+            );
+            app.overlay = None;
+
+            // Let the aim go with the first Esc.
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.launcher_unaimed);
+
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert!(
+                !matches!(&app.overlay, Some(Overlay::ProjectPicker(_))),
+                "the picker went up instead of the box"
+            );
+            let (launch, _) = launch(&app);
+            assert_eq!(
+                launch.target,
+                QuickTarget::Worktree(WorktreeId("w1".into())),
+                "the box did not land on demo's root branch"
+            );
+
+            // And it is the box itself, drawn with its own chrome.
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("new worktree ^N"), "{text}");
+        });
+    }
+
+    /// The unaimed box is a box like any other: `^P` over it re-aims it
+    /// at another project, and the pick hands the box back rather than
+    /// opening a second one.
+    #[test]
+    fn the_unaimed_box_can_still_be_re_aimed_with_the_picker() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+            let Some(Overlay::ProjectPicker(picker)) = &app.overlay else {
+                panic!("expected the project picker, got {:?}", app.overlay);
+            };
+            assert!(picker.back.from_box, "the box under it was forgotten");
+            let to = picker
+                .matches
+                .iter()
+                .position(|(i, _)| picker.projects[*i].name == "web")
+                .expect("web is on the list");
+            for _ in 0..to {
+                key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let (launch, _) = launch(&app);
+            assert_eq!(
+                crate::launcher::project_of(&app, &launch.target),
+                Some(ProjectId("p2".into())),
+                "the pick is what re-aimed the box"
+            );
+        });
+    }
+
+    /// A cell of the grid's background — the air between the cards, which
+    /// falls through to the `PanelBg` the grid registers under them.
+    fn air(app: &App) -> (u16, u16) {
+        let (area, _) = *app
+            .hits
+            .iter()
+            .find(|(_, hit)| *hit == HitTarget::PanelBg(Focus::Sessions))
+            .expect("the grid registered its background");
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if app.hit_at(x, y) == Some(HitTarget::PanelBg(Focus::Sessions)) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("the cards covered the whole grid");
+    }
+
+    /// The color of a card's top-left corner — its border, which is the
+    /// accent while it wears the cursor and the frame's own edge when it
+    /// does not.
+    fn corner(terminal: &Terminal<TestBackend>, cell: ratatui::layout::Rect) -> Color {
+        terminal
+            .backend()
+            .buffer()
+            .cell((cell.x, cell.y))
+            .expect("the card is on screen")
+            .fg
     }
 
     /// A project's place in the PROJECTS PANEL's row order.

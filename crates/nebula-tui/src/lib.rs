@@ -9,6 +9,7 @@ pub mod completion;
 pub mod config;
 pub mod cursor_catalogue;
 pub mod diff_tree;
+pub mod dropped_files;
 pub mod event_loop;
 pub mod file_tabs;
 pub mod fuzzy;
@@ -68,11 +69,8 @@ pub fn run_config(op: ConfigOp) -> Result<()> {
 /// binary crate stays a thin arg-parser. `Some(entry)` means the user picked
 /// a recent ssh host — the terminal is restored and the caller should exec
 /// `nebula ssh` at it.
-///
-/// `workspace` is `--workspace <name>`: which workspace this instance opens
-/// into, independent of any other instance already running.
-pub fn run_tui(workspace: Option<String>) -> Result<Option<hosts::HostEntry>> {
-    runtime()?.block_on(event_loop::run_app(workspace))
+pub fn run_tui() -> Result<Option<hosts::HostEntry>> {
+    runtime()?.block_on(event_loop::run_app())
 }
 
 /// Phase-2 throwaway raw-mode client (`nebula _raw-attach`).
@@ -117,12 +115,7 @@ pub fn run_add_project(path: String) -> Result<()> {
     runtime()?.block_on(ipc::add_project(&path))
 }
 
-pub use ipc::{RenameMode, WorkspaceOp};
-
-/// `nebula workspace <add|open|list|delete|rename>` (see `ipc::run_workspace_op`).
-pub fn run_workspace(op: WorkspaceOp) -> Result<()> {
-    runtime()?.block_on(ipc::run_workspace_op(op))
-}
+pub use ipc::RenameMode;
 
 /// `nebula kill`.
 pub fn run_kill() -> Result<()> {
