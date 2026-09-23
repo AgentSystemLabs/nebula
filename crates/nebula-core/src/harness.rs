@@ -528,6 +528,28 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
             },
             ..base
         },
+        "grok" => HarnessDescriptor {
+            label: "Grok Build".into(),
+            program: "grok".into(),
+            model: ModelSpec {
+                flag: Some("--model".into()),
+                ..ModelSpec::default()
+            },
+            effort: EffortSpec {
+                flag: Some("--reasoning-effort".into()),
+                offered: true,
+                ..EffortSpec::default()
+            },
+            resume: ResumeSpec {
+                flag: Some("--resume".into()),
+                ..ResumeSpec::default()
+            },
+            system: SystemSpec {
+                append_flag: Some("--rules".into()),
+                ..SystemSpec::default()
+            },
+            ..base
+        },
         // OpenCode's model is a `provider/model` id (`opencode models`
         // lists what this machine has credentials for; a hand-edited id
         // passes verbatim). No effort flag: reasoning is a per-model
@@ -984,7 +1006,7 @@ mod tests {
     #[test]
     fn builtins_cover_every_builtin_kind() {
         let all = builtins();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
                 continue;
@@ -1088,13 +1110,13 @@ mod tests {
         let ids: Vec<&str> = all.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["claude", "codex", "cursor", "pi", "muse", "opencode", "zed", "agy"]
+            vec!["claude", "codex", "cursor", "pi", "muse", "grok", "opencode", "zed", "agy"]
         );
         assert!(!all[0].enabled, "the claude override applied");
-        assert_eq!(all[6].program, "agy", "legacy entry converts");
-        assert_eq!(all[7].program, "agy", "map-only entry resolves");
+        assert_eq!(all[7].program, "agy", "legacy entry converts");
+        assert_eq!(all[8].program, "agy", "map-only entry resolves");
         assert!(
-            !all[7].effort.offered,
+            !all[8].effort.offered,
             "a bare program stays Model-only like a legacy custom"
         );
     }
@@ -1157,7 +1179,7 @@ mod tests {
         broken.program = "  ".into();
         let all = registry(&BTreeMap::new(), &[broken]);
         assert!(resolve(&all, AgentKind::Custom, Some("broken")).is_err());
-        assert_eq!(usable(&all).len(), 6, "the broken entry is hidden");
+        assert_eq!(usable(&all).len(), 7, "the broken entry is hidden");
     }
 
     #[test]
@@ -1166,6 +1188,7 @@ mod tests {
         assert!(custom("Agy").problem().is_some());
         assert!(custom("claude").problem().is_some());
         assert!(custom("muse").problem().is_some());
+        assert!(custom("grok").problem().is_some());
         assert!(custom("opencode").problem().is_some());
         let claude_hooks = CustomHarness {
             hooks: Some("claude".into()),

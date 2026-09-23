@@ -237,6 +237,7 @@ pub(crate) fn kind_label(kind: AgentKind) -> &'static str {
         AgentKind::Cursor => "Cursor",
         AgentKind::Pi => "Pi",
         AgentKind::Muse => "Muse",
+        AgentKind::Grok => "Grok Build",
         AgentKind::OpenCode => "OpenCode",
         // Custom rows label through `harness_label` (the entry's own
         // label); this is only the fallback when its entry is gone.
@@ -592,7 +593,10 @@ mod tests {
                 let Some(Overlay::Menu(menu)) = &app.overlay else {
                     panic!("{:?}", app.overlay);
                 };
-                assert_eq!(labels(menu), ["Claude", "Codex", "Pi", "Muse", "OpenCode"]);
+                assert_eq!(
+                    labels(menu),
+                    ["Claude", "Codex", "Pi", "Muse", "Grok Build", "OpenCode"]
+                );
                 assert_eq!(
                     menu.hover, 0,
                     "a remembered harness switched off steps to the first enabled"
@@ -606,7 +610,7 @@ mod tests {
     #[test]
     fn no_harness_flashes_the_picker_and_empties_the_menu_rows() {
         pinned(
-            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false, "muse_enabled": false, "opencode_enabled": false}"#,
+            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false, "muse_enabled": false, "opencode_enabled": false, "harnesses":{"grok":{"enabled":false}}}"#,
             || {
                 let worktree = WorktreeId("w1".into());
                 let mut app = App::new();

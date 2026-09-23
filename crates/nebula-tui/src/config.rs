@@ -1915,7 +1915,7 @@ impl Config {
             "pi" => self.pi_enabled = enabled,
             "muse" => self.muse_enabled = enabled,
             "opencode" => self.opencode_enabled = enabled,
-            _ => {}
+            _ => self.harness_override_mut(id).enabled = Some(enabled),
         }
     }
 
@@ -1927,7 +1927,7 @@ impl Config {
             "pi" => self.pi_model = model,
             "muse" => self.muse_model = model,
             "opencode" => self.opencode_model = model,
-            _ => {}
+            _ => self.harness_override_mut(id).model_default = Some(model),
         }
     }
 
@@ -1938,7 +1938,7 @@ impl Config {
             "cursor" => self.cursor_effort = effort,
             "pi" => self.pi_effort = effort,
             "muse" => self.muse_effort = effort,
-            _ => {}
+            _ => self.harness_override_mut(id).effort_default = Some(effort),
         }
     }
 
@@ -2532,6 +2532,18 @@ mod tests {
         (
             "0.33.0",
             include_str!("../../nebula-core/fixtures/config-0.33.0.json"),
+        ),
+        (
+            "0.34.0",
+            include_str!("../../nebula-core/fixtures/config-0.34.0.json"),
+        ),
+        (
+            "0.35.0",
+            include_str!("../../nebula-core/fixtures/config-0.35.0.json"),
+        ),
+        (
+            "0.36.0",
+            include_str!("../../nebula-core/fixtures/config-0.36.0.json"),
         ),
     ];
 
@@ -3993,6 +4005,7 @@ mod tests {
                 AgentKind::Cursor,
                 AgentKind::Pi,
                 AgentKind::Muse,
+                AgentKind::Grok,
                 AgentKind::OpenCode
             ],
             "the disabled kind drops out, order kept"
@@ -4021,10 +4034,39 @@ mod tests {
 
         // Every kind off is representable (a hand edit), and reads as empty.
         let cfg: Config = serde_json::from_str(
-            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false,"muse_enabled":false,"opencode_enabled":false}"#,
+            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false,"muse_enabled":false,"opencode_enabled":false,"harnesses":{"grok":{"enabled":false}}}"#,
         )
         .unwrap();
         assert!(cfg.enabled_kinds().is_empty());
+    }
+
+    #[test]
+    fn grok_is_builtin_and_settings_persist_without_legacy_keys() {
+        let mut cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.offered_harnesses().contains(&(AgentKind::Grok, None)));
+        assert_eq!(AgentKind::parse("grok"), Some(AgentKind::Grok));
+        assert_eq!(AgentKind::Grok.cli_program(), "grok");
+        cfg.set_harness_enabled("grok", false);
+        cfg.set_harness_model("grok", "model-id".into());
+        cfg.set_harness_effort("grok", "high".into());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert!(!loaded.kind_enabled(AgentKind::Grok));
+        assert_eq!(
+            loaded.default_model(AgentKind::Grok).as_deref(),
+            Some("model-id")
+        );
+        assert_eq!(
+            loaded.default_effort(AgentKind::Grok).as_deref(),
+            Some("high")
+        );
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved["harnesses"]["grok"]["enabled"], false);
+        assert_eq!(saved["harnesses"]["grok"]["model_default"], "model-id");
+        assert_eq!(saved["harnesses"]["grok"]["effort_default"], "high");
     }
 
     #[test]
@@ -4076,6 +4118,7 @@ mod tests {
                 (AgentKind::Cursor, None),
                 (AgentKind::Pi, None),
                 (AgentKind::Muse, None),
+                (AgentKind::Grok, None),
                 (AgentKind::OpenCode, None),
             ]
         );
@@ -4091,8 +4134,8 @@ mod tests {
         )
         .unwrap();
         let offered = cfg.offered_harnesses();
-        assert_eq!(offered.len(), 7);
-        assert_eq!(offered[6], (AgentKind::Custom, Some("agy".into())));
+        assert_eq!(offered.len(), 8);
+        assert_eq!(offered[7], (AgentKind::Custom, Some("agy".into())));
         let rows = cfg.agent_rows();
         assert!(rows.contains(&("off".to_string(), HarnessField::Enabled)));
         assert!(rows.contains(&("broken".to_string(), HarnessField::Enabled)));
@@ -4590,6 +4633,14 @@ mod tests {
                         ]
                     ),
                     (
+                        "Grok Build".to_string(),
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
+                    ),
+                    (
                         "OpenCode".to_string(),
                         vec!["Enabled".to_string(), "Model".to_string()]
                     ),
@@ -4646,6 +4697,7 @@ mod tests {
                         "Cursor",
                         "Pi",
                         "Muse",
+                        "Grok Build",
                         "OpenCode",
                         "agy"
                     ]

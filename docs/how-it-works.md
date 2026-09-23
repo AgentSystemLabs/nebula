@@ -272,7 +272,7 @@
   directory it was started in.
 - **Ask the agent for another session and it starts one.** Tell a Claude session "start a new nebula
   session that fixes the login redirect" and it runs `nebula spawn "<task>"`: the daemon starts a second
-  agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse|opencode`
+  agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse|grok|opencode`
   names another — opening on that task as its first prompt, so it is working before you look. The new
   row appears in the sessions list on its own (default name, so it titles itself), and the session you
   asked from is untouched: no restart, no focus change. Claude learns this from the same appended system

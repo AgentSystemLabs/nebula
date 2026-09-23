@@ -4,7 +4,7 @@
 
 The `nebula` CLI. Every command carries its own help — `nebula <command> --help` is the full page,
 flags and examples included, and `-h` is the one-screen reminder. `nebula --version` (short `-V`)
-prints the version of the binary you're running (`nebula 0.33.0`) — the same version the TUI's
+prints the version of the binary you're running (`nebula 0.36.0`) — the same version the TUI's
 FOOTER carries at its left edge (with `⇡ vX.Y.Z` beside it once a newer release is published), and
 what to check after `nebula upgrade`. This page is the same surface in one place. Commands marked *(agents run this)* are the ones a coding agent invokes on
 your behalf — see [How it works](how-it-works.md).
@@ -55,7 +55,7 @@ nebula worktree [name] [--base <ref>]  # move the current session into a worktre
                           # worktree; no name invents one; --base picks a new branch's start point,
                           # a branch name meaning origin's fetched copy — main is origin/main;
                           # without it the worktree_base_branch setting, else origin's default)
-nebula spawn <task> [--kind <claude|codex|cursor|pi|muse|opencode>]  # start a new agent session beside the current
+nebula spawn <task> [--kind <claude|codex|cursor|pi|muse|grok|opencode>]  # start a new agent session beside the current
                           # (custom harnesses launch from the TUI picker and presets, not --kind)
                           # one, in the same worktree, opening on <task> (agents run this when you
                           # ask for a new nebula session; --kind defaults to this session's harness)
