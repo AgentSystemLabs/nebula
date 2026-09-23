@@ -2787,10 +2787,6 @@ impl AttachedTerm {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-
 /// Opaque UI state persisted in the daemon's DB for session restore.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct UiState {
@@ -2827,10 +2823,12 @@ pub struct UiState {
     /// blobs, which open with it showing.
     #[serde(default)]
     pub launcher_pane_hidden: bool,
-    /// The GRID was inside a worktree ([`App::launcher_inside`]). A state
-    /// saved before there were bands opens inside, as every grid did.
-    #[serde(default = "default_true")]
-    pub launcher_inside: bool,
+    /// The band left open as the ACCORDION
+    /// ([`App::launcher_expanded`]), by its worktree id; absent, or None,
+    /// in blobs saved before there was one, which open with every band
+    /// collapsed.
+    #[serde(default)]
+    pub launcher_expanded: Option<String>,
     /// The LAUNCHER VIEW's PROJECT TABS, by project id, far left first;
     /// absent in older blobs, which open with the one project restored.
     #[serde(default)]
@@ -3283,31 +3281,27 @@ pub struct App {
     /// on their own — nothing selected, nothing being read. It is
     /// remembered across restarts with the pane's height.
     pub launcher_pane_hidden: bool,
-    /// The GRID is INSIDE a worktree: Enter on a BAND opened it, and the
-    /// grid is that checkout's cards alone — the sessions wrapped into
-    /// rows, the terminals under them — with the keys walking the cards.
-    /// False at the top level, where the grid is every checkout's band
-    /// and the keys walk the bands (`event_loop::launcher::enter_band`,
-    /// `leave_band`). Which worktree is inside is the SELECTED WORKTREE:
-    /// a jump that lands on a session in another checkout — `/`, the
-    /// attention walk, a click on a card, a terminal just opened — is
-    /// inside that one, so the flag stays true and the checkout follows.
-    /// Remembered across restarts, so a project opens where it was left;
-    /// a first run opens inside, on the first checkout's cards, which is
-    /// the grid a one-checkout project has always had.
-    pub launcher_inside: bool,
-    /// How far the GRID inside a worktree is scrolled: rows of its layout
-    /// (`launcher::InsideLayout`) above the window's top edge, the way a
-    /// terminal's screen scrolls through its history. The wheel moves it
-    /// a few rows a notch (`event_loop::launcher::wheel_grid`) and the
-    /// cursor stays where it is — a trackpad never swaps the pane out
-    /// from under the card being read; a cursor move pulls it just far
-    /// enough to bring the cursor's card whole on screen
-    /// (`launcher::InsideLayout::reveal`), so `j` lands on a card that
-    /// is there to see; and every draw holds it within the layout, so
-    /// one kept from a taller list never leaves the window empty.
-    /// Settled by `ui::launcher_view` each frame from the four fields
-    /// after it.
+    /// The one BAND open as an ACCORDION, its cards wrapped into rows
+    /// under its rule instead of the one-row STRIP a collapsed band
+    /// shows (`Tab`, `event_loop::launcher::toggle_band_expand`). At
+    /// most one at a time: opening another closes this one first. None
+    /// at the top, where every band is the collapsed row. Remembered
+    /// across restarts, so a project reopens with the checkout it was
+    /// left looking into still open.
+    pub launcher_expanded: Option<WorktreeId>,
+    /// How far the whole GRID is scrolled: rows of its panel layout
+    /// (`launcher::panel_layout`) above the window's top edge, the way a
+    /// terminal's screen scrolls through its history. Collapsed bands
+    /// never push the panel past one screen on their own, but the one
+    /// OPEN band can, so the whole list — not just that band — scrolls
+    /// as one. The wheel moves it a few rows a notch
+    /// (`event_loop::launcher::wheel_grid`) and the cursor stays where
+    /// it is — a trackpad never swaps the pane out from under the card
+    /// being read; a cursor move pulls it just far enough to bring the
+    /// cursor's card whole on screen; and every draw holds it within the
+    /// layout, so one kept from a taller list never leaves the window
+    /// empty. Settled by `ui::launcher_view` each frame from the three
+    /// fields after it.
     pub launcher_scroll: u16,
     /// The wheel put the scroll where it is: the draw leaves it there,
     /// whatever the cursor's card does, until a key or a landing asks
@@ -3319,8 +3313,9 @@ pub struct App {
     /// The card the scroll last kept on screen: a frame that finds the
     /// cursor on another one scrolls to that, wheel or no wheel.
     pub launcher_scroll_on: Option<SessionRef>,
-    /// The worktree the scroll is through: another's cards open at their
-    /// own top rather than wherever the last one's were left.
+    /// Which band's cards the scroll last settled a reveal against:
+    /// opening a different one as the ACCORDION starts its reveal fresh
+    /// rather than wherever the last one's scroll was left.
     pub launcher_scroll_in: Option<WorktreeId>,
     /// A key asked for the cursor's card whether or not the cursor moved
     /// (`j` against the grid's edge after a wheel away, a landing on the
@@ -3812,7 +3807,7 @@ impl App {
             launcher_pane_w: None,
             launcher_pane_at: crate::launcher::PaneSide::default(),
             launcher_pane_hidden: false,
-            launcher_inside: true,
+            launcher_expanded: None,
             launcher_scroll: 0,
             launcher_scroll_held: false,
             launcher_scroll_on: None,
@@ -4251,15 +4246,23 @@ impl App {
         !self.launcher_unaimed
     }
 
-    /// The band the GRID is inside of ([`App::launcher_inside`]): the
-    /// SELECTED WORKTREE's, while the flag is set and the checkout still
-    /// has a band — one whose last card left the grid has nothing to be
-    /// inside of, and the grid is the bands again.
-    pub fn launcher_inside_band(&self, bands: &[crate::launcher::Band]) -> Option<usize> {
-        if !self.launcher_inside {
-            return None;
-        }
-        crate::launcher::band_cursor(self, bands)
+    /// The band OPEN as the ACCORDION ([`App::launcher_expanded`]), while
+    /// the checkout it names still has a band on this grid. None with
+    /// every band collapsed, and none while the open checkout is another
+    /// project's, or has nothing running in it any more.
+    pub fn open_band(&self, bands: &[crate::launcher::Band]) -> Option<usize> {
+        let open = self.launcher_expanded.as_ref()?;
+        bands.iter().position(|b| &b.worktree == open)
+    }
+
+    /// The band the cursor is on, when it is also the one OPEN as the
+    /// ACCORDION — so its cards walk as rows rather than as the collapsed
+    /// STRIP's single row. None with the cursor on a collapsed band: the
+    /// open one's cards stay open on screen, but the keys are walking
+    /// somewhere else.
+    pub fn cursor_in_open_band(&self, bands: &[crate::launcher::Band]) -> Option<usize> {
+        let index = crate::launcher::band_cursor(self, bands)?;
+        (self.open_band(bands) == Some(index)).then_some(index)
     }
 
     /// `body` in two the way the LAUNCHER VIEW draws it: the grid's half

@@ -257,6 +257,20 @@ pub(crate) fn open_box(app: &mut App, launch: QuickLaunch) {
     }
 }
 
+/// Open the box a picker reached with NO box up owes — `n`'s NEW SESSION
+/// PICKER (`QuickReturn::from_box` false): the pick is the spec, and the
+/// DRAFT the last abandoned box left hands back its text alone. The
+/// harness was chosen a moment ago, on purpose, so no parked spec
+/// overrides it the way [`open_box`]'s same-aim rule would; the slot is
+/// emptied all the same, the text being in this box now.
+pub(crate) fn open_picked_box(app: &mut App, launch: QuickLaunch) {
+    let restored = app.quick_draft.take().map(|draft| draft.input);
+    crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
+    if let (Some(input), Some(Overlay::Prompt(prompt))) = (restored, &mut app.overlay) {
+        prompt.input = input;
+    }
+}
+
 impl QuickLaunch {
     /// The launch the `quick_prompt_kind` SETTING describes: that harness
     /// plus its own MODEL / EFFORT defaults from the AGENTS TAB, no preset.

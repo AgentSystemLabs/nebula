@@ -695,8 +695,9 @@ fn tui_git_diff_modal() {
     tui.wait_for_text("Files (2)");
 
     // ---- the modal blocks other interaction ----
-    // n would open the box on the grid; inside the modal it feeds the
-    // filter instead (verified after close — stale-frame convention).
+    // n would open the NEW SESSION PICKER on the grid; inside the modal it
+    // feeds the filter instead (verified after close — stale-frame
+    // convention).
     tui.send(b"n");
     tui.wait_for_text("no matches");
     tui.send(ESC); // clears the filter…

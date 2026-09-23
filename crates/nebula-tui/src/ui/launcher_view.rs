@@ -66,20 +66,11 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     // opened, before the header lays the tabs out.
     app.settle_project_tabs();
     let bands = crate::launcher::bands(app);
-    // INSIDE a worktree (Enter on its band): that checkout's cards alone,
-    // its rule up in the header. A checkout whose last card just left
-    // the grid has no band to be inside of, so the grid is the bands
-    // again until Enter opens another.
-    if let Some(band) = app.launcher_inside_band(&bands) {
-        draw_inside(f, app, body, &bands, band);
-        return;
-    }
     let g = crate::launcher::bands_layout(body);
     let cursor = wearing(app, crate::launcher::band_cursor(app, &bands));
-    let hidden = g.hidden(cursor, bands.len());
     let count = HeadCount::of(&bands);
-    draw_head(f, app, body, count, hidden);
     if bands.is_empty() {
+        draw_head(f, app, body, count, Hidden::default());
         // Nothing archived is not nothing at all: the hero's "type a
         // task" would be advice about the wrong list, so the ARCHIVED
         // VIEW gets the plain empty line and the way back out of it.
@@ -90,7 +81,53 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
         }
         return;
     }
-    draw_bands(f, app, g, &bands, cursor);
+    // The ACCORDION: at most one band's cards wrapped into rows in place
+    // (`App::launcher_expanded`) — pushing the bands after it down, so
+    // the whole panel, not just that band, may run taller than the
+    // screen and scrolls as one list.
+    let panel = crate::launcher::panel_layout(body, &bands, app.launcher_expanded.as_ref());
+    let scroll = settle_panel_scroll(app, &panel, &bands, cursor);
+    draw_head(f, app, body, count, panel.hidden(scroll));
+    draw_bands(f, app, &g, &panel, &bands, cursor, scroll);
+}
+
+/// The scroll this frame draws the GRID at, settled from what the last
+/// frame left and what has happened since — the rule
+/// [`App::launcher_scroll`] spells out. Opening or closing a band as the
+/// ACCORDION starts from the top again rather than wherever the last
+/// layout's scroll was left; a scroll the wheel set is kept unless a key
+/// asked for the cursor's card ([`App::launcher_reveal`]) or the cursor
+/// is on another card than the one it was set under; any other scroll
+/// keeps in step with the cursor — its band whole on screen, or on the
+/// open band its card with the row over it
+/// ([`crate::launcher::PanelLayout::reveal`]). Whatever it lands on is
+/// held within the panel, so a window that grew or a list that shrank
+/// never scrolls past the last row.
+fn settle_panel_scroll(
+    app: &mut App,
+    panel: &crate::launcher::PanelLayout,
+    bands: &[crate::launcher::Band],
+    cursor: Option<usize>,
+) -> u16 {
+    if app.launcher_scroll_in != app.launcher_expanded {
+        app.launcher_scroll = 0;
+        app.launcher_scroll_held = false;
+        app.launcher_scroll_in = app.launcher_expanded.clone();
+    }
+    let mut scroll = panel.clamp(app.launcher_scroll);
+    if let Some(index) = cursor {
+        let band = &bands[index];
+        let at = crate::launcher::card_cursor(app, band);
+        let on = at.and_then(|i| band.cards.get(i)).map(|c| c.sref());
+        if app.launcher_reveal || !app.launcher_scroll_held || app.launcher_scroll_on != on {
+            scroll = panel.reveal(scroll, index, at);
+            app.launcher_scroll_held = false;
+            app.launcher_scroll_on = on;
+        }
+    }
+    app.launcher_reveal = false;
+    app.launcher_scroll = scroll;
+    scroll
 }
 
 /// What the header counts: the cards on the grid, by kind.
@@ -108,12 +145,6 @@ impl HeadCount {
         }
     }
 }
-
-/// What the header says at the right of the PROJECT TABS while the grid
-/// is inside a worktree: the way back out to the bands.
-const BACK_TO_BANDS: &str = "Esc back to the worktrees";
-/// The same on a rule too narrow for the sentence.
-const BACK_TO_BANDS_SHORT: &str = "Esc back";
 
 /// What the ARCHIVED VIEW says with nothing in it.
 const NO_ARCHIVED: &str = "nothing archived in this project — ⇧A back to the live sessions";
@@ -567,21 +598,22 @@ fn pad_x(r: Rect) -> Rect {
     }
 }
 
-/// The GRID: one card per session, most recent first, left to right and top to
-/// bottom, scrolled by whole rows so the cursor's card is always drawn.
+/// The GRID: one band per checkout, top to bottom — a collapsed one its
+/// rule and one row of cards, the ACCORDION's open one its rule and
+/// every card wrapped into rows under it — the whole panel scrolled by
+/// rows so the cursor's card is always drawn, a band that straddles the
+/// window's edge drawn cut ([`draw_cut`]) rather than left out.
 fn draw_bands(
     f: &mut Frame,
     app: &mut App,
-    g: crate::launcher::BandsLayout,
+    g: &crate::launcher::BandsLayout,
+    panel: &crate::launcher::PanelLayout,
     bands: &[crate::launcher::Band],
     cursor: Option<usize>,
+    scroll: u16,
 ) {
     let th = app.theme;
-    // Scrolling is by band: the window starts on whichever band keeps
-    // the cursor's on screen. Nothing selected (`App::launcher_unaimed`):
-    // no band wears the cursor, and the window stays where it was —
-    // letting the aim go is not a scroll.
-    let (start, shown) = g.window(cursor, bands.len());
+    let window = panel.window();
     // One CONFIG.JSON read for the whole frame, and only if some card on
     // it runs a CUSTOM harness whose label lives in there — a screenful
     // of cards must not reload the file once per card.
@@ -594,52 +626,211 @@ fn draw_bands(
     // The band the selection is on, aimed at or let go of: its row
     // follows its remembered card either way, so Esc scrolls nothing.
     let aimed = crate::launcher::band_cursor(app, bands);
-    for (slot, (index, band)) in bands.iter().enumerate().skip(start).enumerate().take(shown) {
+    for (index, band) in bands.iter().enumerate() {
+        let pb = &panel.bands[index];
+        let on = cursor == Some(index);
         let at = (aimed == Some(index))
             .then(|| crate::launcher::card_cursor(app, band))
             .flatten();
-        let strip = g.strip(slot, index, band, at);
-        let on = cursor == Some(index);
-        let hits = draw_band_rule(
-            f.buffer_mut(),
-            app,
-            g.rule_rect(slot),
-            band,
-            BandRule::Band {
+        // Collapsed: the STRIP's one row of cards under the rule, its
+        // `y` wherever the panel put the band.
+        let strip = pb.content.is_none().then(|| {
+            g.strip_at(
+                Rect {
+                    y: pb.rule_y,
+                    height: crate::launcher::BAND_H,
+                    ..g.area
+                },
                 index,
-                on,
-                lit: on && keys,
-                more: strip.hidden(),
-            },
-        );
-        app.hits.extend(hits);
-        // The cards under the rule: on the band the cursor is on, the
-        // one it remembers — what the pane reads, and what `h`/`l` walk
-        // along the row — wears the cursor's accent outline, the tint
-        // staying with the lit rule; the rest are a preview of what is
-        // inside. A click on any lands the cursor on it
-        // (`HitTarget::LauncherCard`).
-        for slot in &strip.cards {
-            let card = &band.cards[slot.at.card];
-            draw_any_card(
+                band,
+                at,
+            )
+        });
+        let rule = Rect {
+            y: pb.rule_y,
+            height: crate::launcher::BAND_RULE_H,
+            ..g.area
+        };
+        // A one-row rule is on screen whole or not at all
+        // ([`crate::launcher::place`]), so it needs no [`draw_cut`].
+        if let Some(placed) = crate::launcher::place(window, scroll, rule) {
+            let hits = draw_band_rule(
                 f.buffer_mut(),
                 app,
-                slot.rect,
-                card,
-                on && at == Some(slot.at.card),
-                false,
-                th,
-                &mut cfg,
+                placed.rect,
+                band,
+                BandRule {
+                    index,
+                    on,
+                    lit: on && keys,
+                    more: strip.as_ref().map_or(0, crate::launcher::Strip::hidden),
+                    expanded: strip.is_none(),
+                },
             );
-            note_tail_card(app, card);
-            app.hits.push((slot.rect, HitTarget::LauncherCard(slot.at)));
+            app.hits.extend(hits);
         }
-        draw_strip_arrows(f, app, &strip, index, on && keys, th);
+        // The cards under the rule: on the band the cursor is on, the
+        // one it remembers — what the pane reads, and what the keys walk
+        // — wears the cursor's accent outline, the tint staying with the
+        // lit rule; the rest are a preview. A click on any lands the
+        // cursor on it (`HitTarget::LauncherCard`), and a card drawn cut
+        // is clicked on the rows of it there are: the landing scrolls
+        // the rest of it into view (`settle_panel_scroll`).
+        match &strip {
+            None => {
+                // Open: every card, wrapped into rows, the terminals
+                // under a section rule of their own. The sessions' rule
+                // is the band's, drawn above.
+                for (y, label) in pb.rules() {
+                    if label == crate::launcher::SESSIONS_RULE {
+                        continue;
+                    }
+                    let rule = Rect {
+                        y,
+                        height: crate::launcher::BAND_RULE_H,
+                        ..g.area
+                    };
+                    let Some(placed) = crate::launcher::place(window, scroll, rule) else {
+                        continue;
+                    };
+                    let fill = "─".repeat(
+                        usize::from(placed.rect.width).saturating_sub(label.chars().count() + 4),
+                    );
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled("── ", Style::default().fg(th.edge)),
+                            Span::styled(label.to_string(), Style::default().fg(th.dim)),
+                            Span::styled(format!(" {fill}"), Style::default().fg(th.edge)),
+                        ])),
+                        placed.rect,
+                    );
+                }
+                for (i, card) in band.cards.iter().enumerate() {
+                    let Some(placed) = pb
+                        .cell(i)
+                        .and_then(|cell| crate::launcher::place(window, scroll, cell))
+                    else {
+                        continue;
+                    };
+                    let selected = on && at == Some(i);
+                    draw_cut(f, placed, |buf, r| {
+                        draw_any_card(buf, &*app, r, card, selected, false, th, &mut cfg)
+                    });
+                    note_tail_card(app, card);
+                    app.hits.push((
+                        placed.rect,
+                        HitTarget::LauncherCard(crate::launcher::CardRef {
+                            band: index,
+                            card: i,
+                        }),
+                    ));
+                }
+            }
+            Some(strip) => {
+                let row = Rect {
+                    y: pb.rule_y + crate::launcher::BAND_RULE_H,
+                    height: crate::launcher::CARD_H,
+                    ..g.area
+                };
+                let Some(row_placed) = crate::launcher::place(window, scroll, row) else {
+                    continue;
+                };
+                for slot in &strip.cards {
+                    let placed = crate::launcher::Placed {
+                        rect: Rect {
+                            x: slot.rect.x,
+                            width: slot.rect.width,
+                            ..row_placed.rect
+                        },
+                        cut_top: row_placed.cut_top,
+                        cut_bottom: row_placed.cut_bottom,
+                    };
+                    let card = &band.cards[slot.at.card];
+                    draw_cut(f, placed, |buf, r| {
+                        draw_any_card(
+                            buf,
+                            &*app,
+                            r,
+                            card,
+                            on && at == Some(slot.at.card),
+                            false,
+                            th,
+                            &mut cfg,
+                        )
+                    });
+                    note_tail_card(app, card);
+                    app.hits
+                        .push((placed.rect, HitTarget::LauncherCard(slot.at)));
+                }
+                // The arrows only on a row drawn whole: they stand beside
+                // the cards' full height.
+                if row_placed.whole() {
+                    draw_strip_arrows(f, app, strip, index, on && keys, th);
+                }
+            }
+        }
     }
-    draw_more_below(f, &g, shown, bands.len().saturating_sub(start + shown), th);
+    draw_panel_edge_marks(f, panel, scroll, th);
     // Last, so the bands themselves win `hit_at`'s first-match scan and
     // only the air between them falls through to the grid.
     app.hits.push((g.area, HitTarget::PanelBg(Focus::Sessions)));
+}
+
+/// The EDGE MARKERS on a grid taller than its window: `↑ 2 more above`
+/// on the header's row of air over the cards, `↓ 3 more below` on the
+/// row kept under them ([`crate::launcher::PanelLayout::window`]) —
+/// each where the eye looks for the rest, so the grid says it scrolls,
+/// and which way, without a word painted over a card. With every band
+/// collapsed what is past the edge is whole checkouts, and the marker
+/// says so (`↓ 3 more worktrees below`), so a screenful that happens to
+/// end on a band does not read as the whole project; with one open its
+/// cards are in the count too, and the marker just counts. The header's
+/// `↑↓ 5 hidden` says the same once more. A grid that fits has neither
+/// row marked, and a panel scrolled to an end leaves that end's row as
+/// plain air.
+fn draw_panel_edge_marks(
+    f: &mut Frame,
+    panel: &crate::launcher::PanelLayout,
+    scroll: u16,
+    th: Theme,
+) {
+    if !panel.overflows() {
+        return;
+    }
+    let hidden = panel.hidden(scroll);
+    let what = |n: usize| {
+        if panel.open().is_some() {
+            String::new()
+        } else {
+            format!(" worktree{}", plural(n))
+        }
+    };
+    let mark = |f: &mut Frame, r: Rect, words: String| {
+        f.render_widget(
+            Paragraph::new(Span::styled(words, Style::default().fg(th.muted)))
+                .alignment(ratatui::layout::Alignment::Center),
+            r,
+        );
+    };
+    if hidden.above > 0 {
+        let r = Rect {
+            y: panel.area.y.saturating_sub(1),
+            height: 1,
+            ..panel.area
+        };
+        let n = hidden.above;
+        mark(f, r, format!("↑ {n} more{} above", what(n)));
+    }
+    if hidden.below > 0 {
+        let window = panel.window();
+        let r = Rect {
+            y: window.y + window.height,
+            height: crate::launcher::BELOW_MARK_H,
+            ..panel.area
+        };
+        let n = hidden.below;
+        mark(f, r, format!("↓ {n} more{} below", what(n)));
+    }
 }
 
 /// The `❮` and `❯` beside a band's row.
@@ -714,166 +905,6 @@ fn draw_strip_arrows(
     }
 }
 
-/// The GRID inside one worktree: its sessions wrapped into rows under the
-/// checkout's own rule — the band's, kept over its cards for as long as
-/// the grid is in it, with the way back out at its right — its terminals,
-/// when it has any, under a `terminals` rule, the card under the cursor
-/// in its accent outline and the PANE reading it.
-fn draw_inside(
-    f: &mut Frame,
-    app: &mut App,
-    body: Rect,
-    bands: &[crate::launcher::Band],
-    index: usize,
-) {
-    let th = app.theme;
-    let band = &bands[index];
-    let layout = crate::launcher::inside_layout(body, band);
-    let cursor = crate::launcher::card_cursor(app, band);
-    let on = wearing(app, cursor);
-    let scroll = settle_scroll(app, &layout, band, cursor);
-    let hidden = layout.hidden(scroll);
-    draw_head(
-        f,
-        app,
-        body,
-        HeadCount::of(std::slice::from_ref(band)),
-        hidden,
-    );
-    draw_edge_marks(f, body, &layout, hidden, th);
-    // The keys are in the pane, or up on the PROJECT TABS: the card under
-    // the cursor keeps its accent outline — it still says which session
-    // the pane reads — but the tint goes with the keys.
-    let focused = app.focus != Focus::Terminal && app.launcher_tab_cursor.is_none();
-    for (r, label) in layout.rules(scroll) {
-        // The sessions' rule is the checkout's own: the branch, its
-        // changes and its pull request over its cards, and the way back
-        // out at the right — the band's rule, kept for as long as the
-        // grid is in it. The terminals' is a quiet section rule under
-        // them.
-        if label == crate::launcher::SESSIONS_RULE {
-            let hits = draw_band_rule(f.buffer_mut(), app, r, band, BandRule::Inside);
-            app.hits.extend(hits);
-            continue;
-        }
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("── ", Style::default().fg(th.edge)),
-                Span::styled(label.to_string(), Style::default().fg(th.dim)),
-                Span::styled(
-                    " ".to_string()
-                        + &"─"
-                            .repeat(usize::from(r.width).saturating_sub(label.chars().count() + 4)),
-                    Style::default().fg(th.edge),
-                ),
-            ])),
-            r,
-        );
-    }
-    let mut cfg = None;
-    for (i, card) in band.cards.iter().enumerate() {
-        let Some(placed) = layout.cell(i, scroll) else {
-            continue;
-        };
-        let selected = on == Some(i);
-        draw_cut(f, placed, |buf, r| {
-            draw_any_card(buf, &*app, r, card, selected, focused, th, &mut cfg)
-        });
-        note_tail_card(app, card);
-        // A card drawn cut is clicked on the rows of it there are: the
-        // click lands the cursor on it, and the landing scrolls the rest
-        // of it into view (`settle_scroll`).
-        app.hits.push((
-            placed.rect,
-            HitTarget::LauncherCard(crate::launcher::CardRef {
-                band: index,
-                card: i,
-            }),
-        ));
-    }
-    app.hits
-        .push((layout.area, HitTarget::PanelBg(Focus::Sessions)));
-}
-
-/// The scroll this frame draws the worktree's cards at, settled from
-/// what the last frame left and what has happened since — the rule
-/// [`App::launcher_scroll`] spells out. Another worktree's cards start
-/// at their own top; a scroll the wheel set is kept unless a key asked
-/// for the cursor's card ([`App::launcher_reveal`]) or the cursor is on
-/// another card than the one it was set under; any other scroll keeps
-/// in step with the cursor's card, whole on screen with the row over it
-/// ([`crate::launcher::InsideLayout::reveal`]). Whatever it lands on is
-/// held within the layout, so a window that grew or a list that shrank
-/// never scrolls past the last row.
-fn settle_scroll(
-    app: &mut App,
-    layout: &crate::launcher::InsideLayout,
-    band: &crate::launcher::Band,
-    cursor: Option<usize>,
-) -> u16 {
-    if app.launcher_scroll_in.as_ref() != Some(&band.worktree) {
-        app.launcher_scroll = 0;
-        app.launcher_scroll_held = false;
-        app.launcher_scroll_in = Some(band.worktree.clone());
-    }
-    let mut scroll = layout.clamp(app.launcher_scroll);
-    if let Some(at) = cursor {
-        let on = Some(band.cards[at].sref());
-        if app.launcher_reveal || !app.launcher_scroll_held || app.launcher_scroll_on != on {
-            scroll = layout.reveal(scroll, at);
-            app.launcher_scroll_held = false;
-            app.launcher_scroll_on = on;
-        }
-    }
-    app.launcher_reveal = false;
-    app.launcher_scroll = scroll;
-    scroll
-}
-
-/// The EDGE MARKERS on a grid taller than its window: `↑ 2 more above`
-/// on the header's row of air over the cards, `↓ 3 more below` on the
-/// row kept under them ([`crate::launcher::InsideLayout::window`]) —
-/// each where the eye looks for the rest, so the grid says it scrolls,
-/// and which way, without a word painted over a card. The header's
-/// `↑↓ 5 hidden` says the same once more in the count. A grid that fits
-/// has neither row marked, and a layout scrolled to an end leaves that
-/// end's row as plain air.
-fn draw_edge_marks(
-    f: &mut Frame,
-    body: Rect,
-    layout: &crate::launcher::InsideLayout,
-    hidden: Hidden,
-    th: Theme,
-) {
-    if !layout.overflows() {
-        return;
-    }
-    let mark = |f: &mut Frame, r: Rect, words: String| {
-        f.render_widget(
-            Paragraph::new(Span::styled(words, Style::default().fg(th.muted)))
-                .alignment(ratatui::layout::Alignment::Center),
-            r,
-        );
-    };
-    if hidden.above > 0 {
-        let r = Rect {
-            y: body.y + crate::launcher::HEAD_H - 1,
-            height: 1,
-            ..layout.area
-        };
-        mark(f, r, format!("↑ {} more above", hidden.above));
-    }
-    if hidden.below > 0 {
-        let window = layout.window();
-        let r = Rect {
-            y: window.y + window.height,
-            height: crate::launcher::BELOW_MARK_H,
-            ..layout.area
-        };
-        mark(f, r, format!("↓ {} more below", hidden.below));
-    }
-}
-
 /// Draw something the window's edges may cut — a card half scrolled off
 /// the top — as the terminal draws a line half scrolled off: the rows of
 /// it inside the window, and only those. `draw` paints the whole thing
@@ -941,23 +972,25 @@ fn note_tail_card(app: &mut App, card: &crate::launcher::Card) {
 /// stay, the words go.
 const ENTER_HINT_ROOM: usize = 12;
 
-/// Where a band's rule is being drawn: on the grid over its cards, or up
-/// in the header while the grid is inside the worktree.
+/// Where a band's rule is being drawn: always on the grid over its
+/// cards — the ACCORDION opens a band in place rather than replacing
+/// the grid with it, so there is only ever the one kind now.
 #[derive(Debug, Clone, Copy)]
-enum BandRule {
-    Band {
-        /// The band's place in `launcher::bands` — what its hit names.
-        index: usize,
-        /// The cursor is on the band: its branch goes bold.
-        on: bool,
-        /// The keys are on the band too — not up on the PROJECT TABS nor
-        /// down in the pane: the rule takes the accent, the cursor mark
-        /// and the Enter hint.
-        lit: bool,
-        /// Cards its row had no room for.
-        more: usize,
-    },
-    Inside,
+struct BandRule {
+    /// The band's place in `launcher::bands` — what its hit names.
+    index: usize,
+    /// The cursor is on the band: its branch goes bold.
+    on: bool,
+    /// The keys are on the band too — not up on the PROJECT TABS nor
+    /// down in the pane: the rule takes the accent, the cursor mark
+    /// and the Tab hint.
+    lit: bool,
+    /// Cards its row had no room for — always 0 once the band is open.
+    more: usize,
+    /// The band is open as the ACCORDION: its cards are wrapped into
+    /// rows under this rule rather than the collapsed STRIP's one row,
+    /// and the hint at the right end says Tab closes it.
+    expanded: bool,
 }
 
 /// A BAND's rule: the checkout — `⌂ main` or `↳ feat` in the SCOPE
@@ -968,10 +1001,10 @@ enum BandRule {
 /// branch is bold — this is what says which checkout the pane reads,
 /// since no card under it wears the cursor — and for as long as the keys
 /// are on it the rule wears the accent, opens on the CURSOR MARK `❯`
-/// instead of `──`, and says at its right end what Enter does there
-/// (`Enter: see all 8`, or `Enter: open` when the row showed every
-/// card); gray, unmarked and silent like the rest once the keys are up
-/// on the PROJECT TABS or down in the pane.
+/// instead of `──`, and says at its right end what Tab does there
+/// (`Tab: see all 8`, `Tab: expand`, or `Tab: collapse` on the one band
+/// that is open); gray, unmarked and silent like the rest once the keys
+/// are up on the PROJECT TABS or down in the pane.
 /// Returns the rule's hits: the pull request ahead of the rule itself,
 /// so a click on `#42` opens it and one anywhere else lands on the band.
 fn draw_band_rule(
@@ -983,70 +1016,61 @@ fn draw_band_rule(
 ) -> Vec<(Rect, HitTarget)> {
     let th = app.theme;
     let width = usize::from(r.width);
-    let (on, lit, edge) = match rule {
-        BandRule::Band { on, lit, .. } => (on, lit, if lit { th.accent } else { th.edge }),
-        BandRule::Inside => (true, false, th.edge),
-    };
+    let BandRule {
+        on,
+        lit,
+        more,
+        expanded,
+        ..
+    } = rule;
+    let edge = if lit { th.accent } else { th.edge };
     let dash = |n: usize| Span::styled("─".repeat(n), Style::default().fg(edge));
 
     // The right end first, since the left gives way to it.
-    let right = match rule {
-        BandRule::Band { more, .. } => {
-            let mut words = format!("{} session{}", band.sessions(), plural(band.sessions()));
-            if band.terminals() > 0 {
-                words.push_str(&format!(
-                    " · {} terminal{}",
-                    band.terminals(),
-                    plural(band.terminals())
-                ));
-            }
-            let mut spans = vec![Span::styled(words, Style::default().fg(th.dim))];
-            if more > 0 {
-                spans.push(Span::styled(
-                    format!("  ▸ {more} more"),
-                    Style::default().fg(th.muted),
-                ));
-            }
-            // The VERB, on the band the keys are on: a titled rule reads
-            // as a divider, and nothing about a divider says a key acts
-            // on it, so the rule under the cursor spells what Enter does
-            // at its right end — the spot the inside view's `Esc back to
-            // the worktrees` takes, so the way in and the way out are
-            // said in the same place. It names what the row could not
-            // show (`Enter: see all 8`) when cards hang past the edge,
-            // plain `Enter: open` when they all fit. A rule too narrow to
-            // keep the branch legible beside the words drops them: the
-            // `❯` at the left still says which band is selected.
-            if lit {
-                let key = super::key_hint(app, crate::keymap::Action::Activate);
-                let does = if more > 0 {
-                    format!(": see all {}", band.cards.len())
-                } else {
-                    ": open".to_string()
-                };
-                let taken: usize = spans.iter().map(|s| s.width()).sum();
-                let with_hint = 3 + taken + 2 + key.chars().count() + does.chars().count() + 4;
-                if width >= with_hint + ENTER_HINT_ROOM {
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled(key, Style::default().fg(th.accent)));
-                    spans.push(Span::styled(does, Style::default().fg(th.dim)));
-                }
-            }
-            spans
+    let right = {
+        let mut words = format!("{} session{}", band.sessions(), plural(band.sessions()));
+        if band.terminals() > 0 {
+            words.push_str(&format!(
+                " · {} terminal{}",
+                band.terminals(),
+                plural(band.terminals())
+            ));
         }
-        // The way back out gives way before the checkout does: the whole
-        // sentence on a wide rule, the key alone beside a pane, nothing
-        // on a rule with no room to spare.
-        BandRule::Inside => {
-            let hint = if width >= 72 {
-                BACK_TO_BANDS
-            } else if width >= 40 {
-                BACK_TO_BANDS_SHORT
+        let mut spans = vec![Span::styled(words, Style::default().fg(th.dim))];
+        if more > 0 {
+            spans.push(Span::styled(
+                format!("  ▸ {more} more"),
+                Style::default().fg(th.muted),
+            ));
+        }
+        // The VERB, on the band the keys are on: a titled rule reads as
+        // a divider, and nothing about a divider says a key acts on it,
+        // so the rule under the cursor spells what Tab does at its right
+        // end. It names what the row could not show (`Tab: see all 8`)
+        // when cards hang past the edge, plain `Tab: expand` when they
+        // all fit collapsed, and `Tab: collapse` on the one band already
+        // open. A rule too narrow to keep the branch legible beside the
+        // words drops them: the `❯` at the left still says which band is
+        // selected. Tab is the panels' "next panel" key, which the grid
+        // takes for itself (`event_loop::launcher::handle_action`).
+        if lit {
+            let key = super::key_hint(app, crate::keymap::Action::FocusNext);
+            let does = if expanded {
+                ": collapse".to_string()
+            } else if more > 0 {
+                format!(": see all {}", band.cards.len())
             } else {
-                ""
+                ": expand".to_string()
             };
-            vec![Span::styled(hint.to_string(), Style::default().fg(th.dim))]
+            let taken: usize = spans.iter().map(|s| s.width()).sum();
+            let with_hint = 3 + taken + 2 + key.chars().count() + does.chars().count() + 4;
+            if width >= with_hint + ENTER_HINT_ROOM {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(key, Style::default().fg(th.accent)));
+                spans.push(Span::styled(does, Style::default().fg(th.dim)));
+            }
         }
+        spans
     };
     let right_w: usize = right.iter().map(|s| s.width()).sum();
 
@@ -1164,9 +1188,7 @@ fn draw_band_rule(
     spans.push(Span::raw(" "));
     spans.push(dash(2));
     Paragraph::new(Line::from(spans)).render(r, buf);
-    if let BandRule::Band { index, .. } = rule {
-        hits.push((r, HitTarget::LauncherBand(index)));
-    }
+    hits.push((r, HitTarget::LauncherBand(rule.index)));
     hits
 }
 
@@ -1486,45 +1508,6 @@ fn draw_card(
 /// which is what says the box `p` opens will ask where its session lands.
 fn wearing(app: &App, cursor: Option<usize>) -> Option<usize> {
     (!app.launcher_unaimed).then_some(cursor).flatten()
-}
-
-/// The MORE-BELOW CUE: the air under the last whole band — rows too few
-/// for another — says how many bands the window left past its bottom
-/// edge, so a screenful that happens to end on a band does not read as
-/// the whole project, and the arrow says the way to them is down.
-/// Centered in that air, in the header's HIDDEN MARKER color. Nothing
-/// once every band from the window down is on screen, and nothing when
-/// the bands fill the grid to its last row: the header's marker still
-/// counts them then.
-fn draw_more_below(
-    f: &mut Frame,
-    g: &crate::launcher::BandsLayout,
-    shown: usize,
-    below: usize,
-    th: Theme,
-) {
-    if below == 0 || shown == 0 {
-        return;
-    }
-    let last = g.band_rect(shown - 1);
-    let top = last.y + last.height;
-    let bottom = g.area.y + g.area.height;
-    if top >= bottom {
-        return;
-    }
-    let r = Rect {
-        y: top + (bottom - top) / 2,
-        height: 1,
-        ..g.area
-    };
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            format!("↓ {below} more worktree{} below", plural(below)),
-            Style::default().fg(th.muted),
-        ))
-        .alignment(ratatui::layout::Alignment::Center),
-        r,
-    );
 }
 
 /// What the ARCHIVED VIEW shows with no cards at all — one line where the
@@ -2808,17 +2791,18 @@ mod tests {
             .expect("a row for the session");
     }
 
-    /// The whole view, drawn inside a worktree: a body too short for every
-    /// card says so on the worktree's rule, and says it about exactly the
-    /// cards the grid left off. This is what a PANE dragged up over the
-    /// grid looks like — the cards that lost their room are counted rather
-    /// than simply gone — and the grid's own edge says it again where the
-    /// eye looks for the rest.
+    /// The whole view, drawn with its one band open on the ACCORDION: a
+    /// body too short for every card says so on the worktree's rule, and
+    /// says it about exactly the cards the grid left off. This is what a
+    /// PANE dragged up over the grid looks like — the cards that lost
+    /// their room are counted rather than simply gone — and the grid's
+    /// own edge says it again where the eye looks for the rest.
     #[test]
     fn a_body_too_short_for_its_cards_counts_them_in_the_header() {
         use crate::launcher::{BAND_RULE_H, BELOW_MARK_H, CARD_H, GAP_Y, HEAD_H};
         let mut app = a_crowded_tree(9);
         select(&mut app, "api");
+        app.launcher_expanded = Some(nebula_core::WorktreeId("w0".into()));
         // The cursor on the grid's first card, the way a project opens:
         // everything missing is under the fold.
         let first = crate::launcher::rows(&app)[0].agent.id.0.clone();
@@ -2868,6 +2852,7 @@ mod tests {
         use nebula_core::{TerminalId, TerminalTab, WorktreeId};
         let mut app = a_crowded_tree(9);
         select(&mut app, "api");
+        app.launcher_expanded = Some(WorktreeId("w0".into()));
         for i in 1..=3 {
             app.tree.terminals.push(TerminalTab {
                 id: TerminalId(format!("t{i}")),
@@ -2950,6 +2935,9 @@ mod tests {
                 end_seq: 9,
             },
         );
+        // The band open: the terminal's card is under the session's
+        // rather than off the end of its one-column strip.
+        app.launcher_expanded = Some(WorktreeId("w0".into()));
         let body = Rect::new(0, 0, 100, 30);
         let lines = drawn_lines(&mut app, body);
         let row = lines
@@ -3100,7 +3088,7 @@ mod tests {
                 ..one.clone()
             })
             .collect();
-        app.launcher_inside = false;
+        app.launcher_expanded = None;
         app
     }
 
@@ -3109,12 +3097,13 @@ mod tests {
         app.sel_worktree = app
             .worktree_row_of(&nebula_core::WorktreeId(id.into()))
             .expect("a row for the checkout");
-        app.launcher_inside = false;
+        app.launcher_expanded = None;
     }
 
     /// The air under the last whole band says how many more are down
-    /// there — in that air, under the bands, not over them — and says
-    /// nothing once the walk down has brought the last one on screen.
+    /// there — in that air, under the bands, not over them — and once
+    /// the walk down has brought the last one on screen the cue is the
+    /// header's row of air pointing back up at the ones scrolled off.
     #[test]
     fn the_air_under_the_cards_says_how_many_more_are_below() {
         use crate::launcher::{BAND_H, GAP_Y, HEAD_H};
@@ -3129,6 +3118,8 @@ mod tests {
             .filter(|&y| lines[y].contains("more worktree"))
             .collect();
         assert_eq!(cue.len(), 1, "{lines:#?}");
+        // Seven bands are past the two whole ones — the third's rule fits
+        // in the air, its cards cut, and a band drawn cut still counts.
         assert!(
             lines[cue[0]].contains("↓ 7 more worktrees below"),
             "{:?}",
@@ -3136,11 +3127,19 @@ mod tests {
         );
         assert!(cue[0] >= bands_end as usize, "under the bands: {lines:#?}");
 
-        // Walked to the last band, nothing is left below to point at.
+        // Walked to the last band, nothing is left below to point at: the
+        // seven scrolled off the top are counted on the row of air under
+        // the tabs instead.
         aim_at_band(&mut app, "wt8");
         let lines = drawn_lines(&mut app, body);
         assert!(
-            lines.iter().all(|line| !line.contains("more worktree")),
+            lines
+                .iter()
+                .all(|line| !line.contains("more worktrees below")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[usize::from(HEAD_H) - 1].contains("↑ 7 more worktrees above"),
             "{lines:#?}"
         );
     }
@@ -3646,11 +3645,12 @@ mod tests {
             app,
             band,
             width,
-            BandRule::Band {
+            BandRule {
                 index: 0,
                 on: false,
                 lit: false,
                 more: 0,
+                expanded: false,
             },
         )
     }
@@ -3737,7 +3737,7 @@ mod tests {
     /// The band the keys are on says so, and what Enter does: its rule
     /// opens on the CURSOR MARK `❯` in the accent where every other
     /// band's opens on `──`, and past its counts it spells the key —
-    /// `Enter: see all 8` when cards hang past the row's edge, `Enter:
+    /// `z: see all 8` when cards hang past the row's edge, `z:
     /// open` when the row showed them all. A titled rule looks like a
     /// divider, and nothing about a divider says a key acts on it. With
     /// the cursor on the band but the keys elsewhere (up on the PROJECT
@@ -3747,15 +3747,16 @@ mod tests {
     fn the_band_the_keys_are_on_marks_itself_and_says_what_enter_does() {
         let app = App::new();
         let th = app.theme;
-        let key = crate::ui::key_hint(&app, crate::keymap::Action::Activate);
+        let key = crate::ui::key_hint(&app, crate::keymap::Action::FocusNext);
         let mut band = a_band(true, "main");
         let card = band.cards[0].clone();
         band.cards.extend(std::iter::repeat_n(card, 7));
-        let lit = |more| BandRule::Band {
+        let lit = |more| BandRule {
             index: 0,
             on: true,
             lit: true,
             more,
+            expanded: false,
         };
 
         let buf = rule_row_as(&app, &band, 96, lit(6));
@@ -3772,11 +3773,11 @@ mod tests {
         assert!(accent.contains(&key), "{accent:?}");
         assert_eq!(painted(&buf, 0, th.root), "⌂ main");
 
-        // Every card on the row: nothing to see more of, so plain `open`.
+        // Every card on the row: nothing to see more of, so plain `expand`.
         let buf = rule_row_as(&app, &band, 96, lit(0));
         let text = row_string(&buf, 0);
         assert!(
-            text.contains(&format!("8 sessions  {key}: open ──")),
+            text.contains(&format!("8 sessions  {key}: expand ──")),
             "{text:?}"
         );
 
@@ -3786,11 +3787,12 @@ mod tests {
             &app,
             &band,
             96,
-            BandRule::Band {
+            BandRule {
                 index: 0,
                 on: true,
                 lit: false,
                 more: 6,
+                expanded: false,
             },
         );
         let text = row_string(&buf, 0);
@@ -3807,15 +3809,16 @@ mod tests {
     #[test]
     fn a_narrow_rule_keeps_the_cursor_mark_and_drops_the_enter_hint() {
         let app = App::new();
-        let key = crate::ui::key_hint(&app, crate::keymap::Action::Activate);
+        let key = crate::ui::key_hint(&app, crate::keymap::Action::FocusNext);
         let mut band = a_band(false, "feat-x");
         let card = band.cards[0].clone();
         band.cards.extend(std::iter::repeat_n(card, 2));
-        let rule = BandRule::Band {
+        let rule = BandRule {
             index: 0,
             on: true,
             lit: true,
             more: 2,
+            expanded: false,
         };
 
         let buf = rule_row_as(&app, &band, 40, rule);

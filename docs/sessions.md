@@ -47,7 +47,7 @@ is on (Settings → Experimental, `remember_harness` in CONFIG.JSON). Then every
 through this picker, the PR SESSION picker or the QUICK PROMPT's `Tab` picker writes its harness into
 the Agents tab's **Quick prompt › Agent** row, and a model or effort you drilled into through the
 submenus into that harness's own **Model** / **Effort** rows: the next `n` opens on that harness with
-its ✓ on that model, `Enter` launches it, and `p` launches it too. The rows are the ordinary settings,
+its ✓ on that model, the box `Enter` opens is set to it, and `p` launches it too. The rows are the ordinary settings,
 so the Agents tab always shows what the next launch will be, and you can still change them there. An
 AGENT PRESET launch leaves them alone — its harness is the preset's, not a change of mind.
 
@@ -215,7 +215,7 @@ nebula opens on a GRID of session cards — no modal over it, ever, on any launc
 is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing you type is the task.
 
 - **The box** starts on the selected project and in the checkout under the cursor — the worktree
-  whose band is selected, or the one the grid is inside; the root branch with nothing selected, a
+  whose band the cursor is on, open or collapsed; the root branch with nothing selected, a
   fresh worktree with **New worktree** on under **Quick prompt** — launching
   the harness, model and effort the Agents tab defaults name — the row at the top of the box spells
   them out, `project demo ^P · worktree main ^T · harness claude Tab · model opus high ^O`, the branch
@@ -298,8 +298,10 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   purple once merged), a link while the pointer rests on it — and, at its right end, how many
   sessions and terminals are under it and how many cards the row had no room for (`▸ 2 more`).
   The band the keys are on opens on `❯` where the rest open on `──`, and past its counts says
-  what Enter does there — `Enter: see all 8` with cards past the edge, `Enter: open` when the row
-  showed them all — since a titled rule reads as a divider until something says a key acts on it.
+  what Tab does there — `Tab: see all 8` with cards past the edge, `Tab: expand` when the row
+  showed them all, `Tab: collapse` on the one band open as an accordion, every card of it wrapped
+  into rows under the rule — since a titled rule reads as a divider until something says a key
+  acts on it.
   The cards under it are the checkout's sessions, then its terminals as cards two columns wide,
   gap included, so their output has room — a one-column grid gives them the one (`❯ shell-1`
   with what runs in it, then the last lines its shell printed, asked of the daemon
@@ -325,19 +327,21 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   above` on the row of air under the PROJECT TABS once the top has scrolled off, `↓ 3 more below`
   on a row kept under the cards while there is more past the bottom — the row stays as air once the
   grid is scrolled to its end, and neither appears on a grid that fits.
-- **Walking it** has two levels. At the band level `j` and `k` walk the bands — the rule of the
-  band under the cursor takes the accent and its branch goes bold, no card wears the cursor, and
-  the pane reads the band's remembered card (the session it was last left on, else its first);
-  the accent goes with the keys, so with them up on the PROJECT TABS or down in the pane the rule
-  is gray like the others and only the bold branch still says which checkout the pane reads —
-  and `Enter` opens the worktree: the grid is then that checkout's cards alone, the sessions
-  wrapped into rows under the checkout's own rule — with `Esc back to the worktrees` at its
-  right — and the terminals under a `terminals` rule. Inside,
+- **Walking it.** `j` and `k` walk the bands — the rule of the band under the cursor takes the
+  accent and its branch goes bold, its remembered card (the session it was last left on, else its
+  first) wears the cursor's outline and the pane reads it; the accent goes with the keys, so with
+  them up on the PROJECT TABS or down in the pane the rule is gray like the others and only the
+  bold branch still says which checkout the pane reads. `h` and `l` walk the cards along the band's
+  row, which scrolls under the cursor. `Tab` opens the band in place, like an accordion: every one
+  of its cards wrapped into rows under its own rule — the sessions first, the terminals under a
+  `terminals` rule — pushing the bands under it down, one band open at a time. On the open band
   `h`/`j`/`k`/`l` (or the arrows) walk the cards — `h` and `l` along a row, `j` and `k` down the
-  rows, on from the last row of sessions into the terminals — and `Esc` backs out to the bands with
-  the cursor on the band just left. A band with more cards than its row can hold counts the rest on
-  its rule rather than wrapping, so a step down is always a step onto the next checkout; inside,
-  there is room to wrap. Which level you are at is remembered across restarts, and a jump that
+  rows, on from the last row of sessions into the terminals, and off the band's last row onto the
+  next band — and `Tab` or `Esc` folds it back up with the cursor where it was. A collapsed band
+  with more cards than its row can hold counts the rest on its rule rather than wrapping, so a step
+  down is always a step onto the next checkout; open, there is room to wrap, and the whole grid
+  scrolls by rows to keep the cursor's card on screen. `Enter` opens the card under the cursor in
+  the pane, open band or collapsed. Which band is open is remembered across restarts, and a jump that
   names a session — `/`, the attention walk, a terminal just opened — lands inside its checkout.
   The wheel never walks the cursor, so a trackpad cannot swap the pane out from under the card you
   are reading: at the band level a notch over the grid is ignored, and the window scrolls only as

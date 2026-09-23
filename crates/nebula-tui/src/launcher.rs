@@ -780,25 +780,23 @@ pub struct Slot {
     pub rect: Rect,
 }
 
-/// The grid at the top level: one BAND per checkout, each its rule over
-/// one row of cards, scrolled by whole bands so the cursor's band is
-/// always drawn. A band's cards run along its one row; the ones past its
-/// edges are counted on the rule rather than wrapped, so a step down is
-/// always a step onto the next checkout, and the row scrolls under `h` /
-/// `l` to keep the cursor's card on it ([`BandsLayout::strip`]).
+/// A collapsed BAND's row: its rule over one row of cards. The cards run
+/// along the row; the ones past its edges are counted on the rule rather
+/// than wrapped, so a step down is always a step onto the next checkout,
+/// and the row scrolls under `h` / `l` to keep the cursor's card on it
+/// ([`BandsLayout::strip_at`]). Where each band's row sits on the grid,
+/// and how the grid scrolls, is [`PanelLayout`]'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BandsLayout {
     /// Where the bands go: the body under the header, inset by [`PAD_X`].
     pub area: Rect,
     /// Width of one session card — what [`grid`] would give a card in
-    /// this area, so a band's cards are the size the cards inside a
-    /// worktree are.
+    /// this area, so a band's cards are the size the open band's cards
+    /// are.
     pub card_w: u16,
     /// Cards per row, as [`grid`] gives it: what a terminal's card spans
     /// two of ([`terminal_w`]).
     pub cols: usize,
-    /// Bands the area has room for, at least 1.
-    pub bands_fit: usize,
 }
 
 /// The bands `body` lays out.
@@ -808,52 +806,10 @@ pub fn bands_layout(body: Rect) -> BandsLayout {
         area: g.area,
         card_w: g.card_w,
         cols: g.cols,
-        bands_fit: usize::from((g.area.height + GAP_Y) / (BAND_H + GAP_Y)).max(1),
     }
 }
 
 impl BandsLayout {
-    /// The rule and cards of the band in `slot`, counting from the first
-    /// band drawn.
-    pub fn band_rect(&self, slot: usize) -> Rect {
-        Rect {
-            y: self.area.y + slot as u16 * (BAND_H + GAP_Y),
-            height: BAND_H,
-            ..self.area
-        }
-    }
-
-    /// The band's rule: its top row.
-    pub fn rule_rect(&self, slot: usize) -> Rect {
-        Rect {
-            height: BAND_RULE_H,
-            ..self.band_rect(slot)
-        }
-    }
-
-    /// The bands drawn with the cursor on `cursor`: where the window
-    /// starts, and how many whole bands follow it on screen.
-    pub fn window(&self, cursor: Option<usize>, total: usize) -> (usize, usize) {
-        let start = crate::app::window_start(cursor.unwrap_or(0), self.bands_fit);
-        let bottom = self.area.y + self.area.height;
-        let fits = (0..self.bands_fit)
-            .take_while(|&slot| {
-                let r = self.band_rect(slot);
-                r.y + r.height <= bottom
-            })
-            .count();
-        (start, total.saturating_sub(start).min(fits))
-    }
-
-    /// How many bands the window leaves off screen, either way.
-    pub fn hidden(&self, cursor: Option<usize>, total: usize) -> Hidden {
-        let (start, shown) = self.window(cursor, total);
-        Hidden {
-            above: start.min(total),
-            below: total.saturating_sub(start + shown),
-        }
-    }
-
     /// How wide `card` is on this grid: a session's card one column, a
     /// terminal's two ([`terminal_w`]).
     pub fn card_width(&self, card: &Card) -> u16 {
@@ -891,19 +847,19 @@ impl BandsLayout {
         start
     }
 
-    /// The cards of `band` along the row of the band in `slot` with the
-    /// cursor on `cursor`: from the first the follow-window keeps
+    /// The cards of `band` along `row` — its rule on the row's first
+    /// line, wherever [`panel_layout`] put the band — with the cursor on
+    /// `cursor`: from the first the follow-window keeps
     /// ([`BandsLayout::strip_start`]), left to right, as many as fit — a
     /// card is drawn whole or not at all — and how many the row left off
     /// at either end.
-    pub fn strip(
+    pub fn strip_at(
         &self,
-        slot: usize,
+        row: Rect,
         band_index: usize,
         band: &Band,
         cursor: Option<usize>,
     ) -> Strip {
-        let row = self.band_rect(slot);
         let y = row.y + BAND_RULE_H;
         let right = row.x + row.width;
         let start = self.strip_start(band, cursor);
@@ -960,38 +916,214 @@ impl Strip {
     }
 }
 
-// ---- inside one WORKTREE ----
+// ---- the PANEL: every band, at most one of them open ----
 
-/// The grid inside a worktree (Enter on its band): the sessions wrapped
-/// into rows under a `sessions` rule, the terminals — each two columns
-/// wide ([`terminal_w`]) — wrapped into rows of their own under a
+/// One band's place on the GRID: the row its rule stands on, counted
+/// from the top of the whole panel rather than the screen, and — on the
+/// one band open as the ACCORDION — its cards' own layout, the same one
+/// the keys walk it with (`event_loop::launcher::step_grid`), so the
+/// rows the grid draws are exactly the rows `j`/`k` step through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelBand {
+    pub rule_y: u16,
+    /// The band's cards wrapped into rows under its rule, on the open
+    /// band; None collapsed, where the STRIP draws its one row.
+    pub content: Option<ExpandedLayout>,
+    /// Rows the band takes, rule included: [`BAND_H`] collapsed, or its
+    /// content's height open.
+    pub height: u16,
+}
+
+impl PanelBand {
+    /// `card`'s cell on the open band, in panel rows. None collapsed,
+    /// where the cards are the STRIP's ([`BandsLayout::strip_at`]).
+    pub fn cell(&self, card: usize) -> Option<Rect> {
+        let local = self.content.as_ref()?.cell(card)?;
+        Some(Rect {
+            y: self.rule_y + local.y,
+            ..local
+        })
+    }
+
+    /// The open band's section rules in panel rows: the sessions' on the
+    /// band's own rule, the terminals' where the terminals begin. None
+    /// collapsed.
+    pub fn rules(&self) -> impl Iterator<Item = (u16, &'static str)> + '_ {
+        self.content
+            .iter()
+            .flat_map(|c| c.rules().iter().map(|&(y, label)| (self.rule_y + y, label)))
+    }
+}
+
+/// The whole GRID laid out: every band's rule top to bottom, a collapsed
+/// band's one row of cards under it, and the one band open as the
+/// ACCORDION (`App::launcher_expanded`) every card of it wrapped into
+/// rows — which pushes every band after it down, so the panel can run
+/// taller than the screen. It scrolls as one list, by rows, the way a
+/// terminal's screen scrolls through its history: a card or a band the
+/// window's edge cuts is drawn cut ([`ui::launcher_view::draw_cut`]),
+/// never left out, so the window is always full to its edges and no
+/// card-sized hole opens where one a row too far up would have been.
+/// Where it is scrolled to is the app's
+/// ([`crate::app::App::launcher_scroll`]): the wheel moves it, a cursor
+/// move pulls it just far enough to bring the cursor's card whole on
+/// screen ([`PanelLayout::reveal`]), and the draw holds it within the
+/// panel ([`PanelLayout::clamp`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelLayout {
+    /// Where the bands go: the body under the header, inset by [`PAD_X`].
+    pub area: Rect,
+    pub bands: Vec<PanelBand>,
+    /// Rows the whole panel takes.
+    height: u16,
+}
+
+/// `bands` laid out in `body`, with `expanded`'s cards open under its
+/// rule when it names one of them.
+pub fn panel_layout(body: Rect, bands: &[Band], expanded: Option<&WorktreeId>) -> PanelLayout {
+    let mut y = 0u16;
+    let mut out = Vec::with_capacity(bands.len());
+    for band in bands {
+        let content = (expanded == Some(&band.worktree)).then(|| expanded_layout(body, band));
+        let height = content.as_ref().map_or(BAND_H, ExpandedLayout::height);
+        out.push(PanelBand {
+            rule_y: y,
+            content,
+            height,
+        });
+        y += height + GAP_Y;
+    }
+    PanelLayout {
+        area: grid(body).area,
+        bands: out,
+        height: y.saturating_sub(GAP_Y),
+    }
+}
+
+impl PanelLayout {
+    /// Rows the whole panel takes, scrolled or not.
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+
+    /// The band open as the ACCORDION, if one of these is.
+    pub fn open(&self) -> Option<usize> {
+        self.bands.iter().position(|b| b.content.is_some())
+    }
+
+    /// The panel is taller than its area: it scrolls, and a marker row
+    /// stands under the window ([`BELOW_MARK_H`]).
+    pub fn overflows(&self) -> bool {
+        self.height > self.area.height
+    }
+
+    /// The rows of the area the panel scrolls through: all of it when it
+    /// fits, else all but its last row, kept for the `↓ N more below`
+    /// marker ([`BELOW_MARK_H`]) — so the marker never paints over a
+    /// card's row, and a panel scrolled to its end leaves that row as
+    /// air, as the header's row of air stands over the top.
+    pub fn window(&self) -> Rect {
+        if self.overflows() {
+            Rect {
+                height: self.area.height.saturating_sub(BELOW_MARK_H),
+                ..self.area
+            }
+        } else {
+            self.area
+        }
+    }
+
+    /// The furthest the panel scrolls: the last row on the window's last
+    /// row. Zero when it fits.
+    pub fn max_scroll(&self) -> u16 {
+        self.height.saturating_sub(self.window().height)
+    }
+
+    /// `scroll` held within the panel: one kept from a taller panel, or
+    /// a taller window, comes back to the last one this has.
+    pub fn clamp(&self, scroll: u16) -> u16 {
+        scroll.min(self.max_scroll())
+    }
+
+    /// `scroll` moved just far enough that the cursor is whole on screen:
+    /// on the open band, `card` with the row over it — the band's rule on
+    /// a first row, the air between rows elsewhere — so a walk onto the
+    /// first row brings the rule back too; on a collapsed band, or the
+    /// open one with no card under the cursor, the whole band, rule and
+    /// row. Something already whole moves nothing: a wheel that left the
+    /// cursor's card on screen is left alone. Something taller than the
+    /// window shows its top. Held within the panel.
+    pub fn reveal(&self, scroll: u16, band: usize, card: Option<usize>) -> u16 {
+        let pb = &self.bands[band];
+        let (top, bottom) = match card.and_then(|c| pb.cell(c)) {
+            Some(cell) => (cell.y.saturating_sub(BAND_RULE_H), cell.y + cell.height),
+            None => (pb.rule_y, pb.rule_y + pb.height),
+        };
+        let rows = self.window().height;
+        let mut scroll = scroll;
+        if bottom > scroll + rows {
+            scroll = bottom - rows;
+        }
+        if scroll > top {
+            scroll = top;
+        }
+        self.clamp(scroll)
+    }
+
+    /// What the window's edges cut, either way — what the header's `↑↓ N
+    /// hidden` and the edge markers count: a collapsed band not whole on
+    /// screen is one, the open band's cards one each, and a thing drawn
+    /// cut counts, since the rest of it is what the marker says there is
+    /// more of. `above` has rows over the window's top edge, `below` rows
+    /// past its bottom.
+    pub fn hidden(&self, scroll: u16) -> Hidden {
+        let bottom = scroll + self.window().height;
+        let mut hidden = Hidden::default();
+        let mut count = |top: u16, end: u16| {
+            if top < scroll {
+                hidden.above += 1;
+            } else if end > bottom {
+                hidden.below += 1;
+            }
+        };
+        for band in &self.bands {
+            match &band.content {
+                None => count(band.rule_y, band.rule_y + band.height),
+                Some(content) => {
+                    for cell in content.cells() {
+                        let y = band.rule_y + cell.y;
+                        count(y, y + cell.height);
+                    }
+                }
+            }
+        }
+        hidden
+    }
+}
+
+// ---- the open band's cards ----
+
+/// The band open as the ACCORDION, as its cards lay out under its rule:
+/// the sessions wrapped into rows — the band's own rule over the first,
+/// where a collapsed band has its one row — then the terminals, each two
+/// columns wide ([`terminal_w`]), wrapped into rows of their own under a
 /// `terminals` rule that stands only once there is one, and `j`/`k`
 /// walking the rows of both as one column — off the last row of sessions
-/// is onto the first of terminals.
-///
-/// Taller than the body, it scrolls the way a terminal's screen does: by
-/// rows, through a window ([`InsideLayout::window`]), a card that
-/// straddles the window's edge drawn cut rather than left out — so the
-/// window is always full to its edges, and no card-sized hole opens
-/// where one that is a row too far up would have been. Where it is
-/// scrolled to is the app's ([`crate::app::App::launcher_scroll`]): the
-/// wheel moves it, a cursor move pulls it just far enough to bring the
-/// cursor's card whole on screen ([`InsideLayout::reveal`]), and the
-/// draw holds it within the layout ([`InsideLayout::clamp`]).
+/// is onto the first of terminals. Rows are counted from the band's rule
+/// (row 0), not the screen: where the band sits on the grid, and how far
+/// the grid is scrolled, is [`PanelLayout`]'s.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InsideLayout {
-    pub area: Rect,
-    pub card_w: u16,
-    /// Every card's cell, by its index in the band, with `y` counted
-    /// from the top of the layout rather than the screen.
+pub struct ExpandedLayout {
+    /// Every card's cell, by its index in the band.
     cells: Vec<Rect>,
-    /// The rules over each section: their row (counted the same way) and
-    /// what they say. Only a section with cards has one.
+    /// The rules over each section: their row and what they say. The
+    /// sessions' is the band's own rule, on row 0; the terminals' stands
+    /// only with a terminal under it.
     rules: Vec<(u16, &'static str)>,
     /// The cards on each visual row, top to bottom and left to right:
     /// what the cursor keys walk.
     pub rows: Vec<Vec<usize>>,
-    /// Rows the whole layout takes.
+    /// Rows the whole layout takes, the band's rule included.
     height: u16,
 }
 
@@ -999,8 +1131,8 @@ pub struct InsideLayout {
 pub const SESSIONS_RULE: &str = "sessions";
 pub const TERMINALS_RULE: &str = "terminals";
 
-/// `band`'s cards laid out in `body`.
-pub fn inside_layout(body: Rect, band: &Band) -> InsideLayout {
+/// `band`'s cards laid out on the columns `body` gives the grid.
+pub fn expanded_layout(body: Rect, band: &Band) -> ExpandedLayout {
     let g = grid(body);
     let mut cells = vec![Rect::default(); band.cards.len()];
     let mut rules = Vec::new();
@@ -1026,10 +1158,9 @@ pub fn inside_layout(body: Rect, band: &Band) -> InsideLayout {
             .map(|(i, _)| i)
             .collect();
         if slots.is_empty() {
-            // The sessions' rule is the checkout's own (`draw_inside`
-            // draws the band's rule on it), and heads the grid even with
-            // no session under it. The terminals' says nothing without a
-            // terminal to say it of.
+            // The sessions' rule is the band's own, and heads the cards
+            // even with no session under it. The terminals' says nothing
+            // without a terminal to say it of.
             if !terminal {
                 rules.push((y, label));
                 y += BAND_RULE_H;
@@ -1053,9 +1184,7 @@ pub fn inside_layout(body: Rect, band: &Band) -> InsideLayout {
             y += CARD_H + GAP_Y;
         }
     }
-    InsideLayout {
-        area: g.area,
-        card_w: g.card_w,
+    ExpandedLayout {
         cells,
         rules,
         rows,
@@ -1088,7 +1217,26 @@ impl Placed {
 /// that the `↑` marker rides ([`HEAD_H`]).
 pub const BELOW_MARK_H: u16 = 1;
 
-impl InsideLayout {
+/// Where `rect` — a card or a rule in panel rows, `y` counted from the
+/// top of the panel rather than the screen — lands with the panel
+/// scrolled by `scroll` rows through `window` ([`PanelLayout::window`]):
+/// the rows of it inside the window, and what the window's edges cut
+/// off. None when none of it is on screen.
+pub fn place(window: Rect, scroll: u16, rect: Rect) -> Option<Placed> {
+    let (top, bottom) = (scroll, scroll + window.height);
+    let (y0, y1) = (rect.y.max(top), (rect.y + rect.height).min(bottom));
+    (y1 > y0).then(|| Placed {
+        rect: Rect {
+            y: window.y + (y0 - top),
+            height: y1 - y0,
+            ..rect
+        },
+        cut_top: y0 - rect.y,
+        cut_bottom: rect.y + rect.height - y1,
+    })
+}
+
+impl ExpandedLayout {
     /// The row and column of `card` in the walk.
     pub fn row_of(&self, card: usize) -> Option<(usize, usize)> {
         self.rows
@@ -1097,126 +1245,25 @@ impl InsideLayout {
             .find_map(|(r, row)| row.iter().position(|&i| i == card).map(|c| (r, c)))
     }
 
-    /// Rows the whole layout takes, scrolled or not.
+    /// Rows the whole layout takes, the band's rule included.
     pub fn height(&self) -> u16 {
         self.height
     }
 
-    /// The layout is taller than the area: it scrolls, and a marker row
-    /// stands under the window.
-    pub fn overflows(&self) -> bool {
-        self.height > self.area.height
+    /// `card`'s cell, `y` counted from the band's rule.
+    pub fn cell(&self, card: usize) -> Option<Rect> {
+        self.cells.get(card).copied()
     }
 
-    /// The rows of the area the cards scroll through: all of it when the
-    /// layout fits, else all but its last row, kept for the `↓ N more
-    /// below` marker ([`BELOW_MARK_H`]) — so the marker never paints over
-    /// a card's row, and a layout scrolled to its end leaves that row as
-    /// air, as the header's row of air stands over the top.
-    pub fn window(&self) -> Rect {
-        if self.overflows() {
-            Rect {
-                height: self.area.height.saturating_sub(BELOW_MARK_H),
-                ..self.area
-            }
-        } else {
-            self.area
-        }
+    /// Every card's cell, in the band's own card order.
+    pub fn cells(&self) -> &[Rect] {
+        &self.cells
     }
 
-    /// The furthest the layout scrolls: the last row on the window's last
-    /// row. Zero when it fits.
-    pub fn max_scroll(&self) -> u16 {
-        self.height.saturating_sub(self.window().height)
-    }
-
-    /// `scroll` held within the layout: a scroll kept from a taller
-    /// layout, or a taller window, comes back to the last one this has.
-    pub fn clamp(&self, scroll: u16) -> u16 {
-        scroll.min(self.max_scroll())
-    }
-
-    /// `scroll` moved just far enough that `card` is whole on screen,
-    /// with the row over it — its section's rule on a first row, the air
-    /// between rows elsewhere — so a walk onto the first row brings the
-    /// checkout's rule back too. A card already whole moves nothing: a
-    /// wheel that left the cursor's card on screen is left alone. A card
-    /// taller than the window shows its top. Held within the layout.
-    pub fn reveal(&self, scroll: u16, card: usize) -> u16 {
-        let Some(cell) = self.cells.get(card) else {
-            return self.clamp(scroll);
-        };
-        let rows = self.window().height;
-        let top = cell.y.saturating_sub(BAND_RULE_H);
-        let bottom = cell.y + cell.height;
-        let mut scroll = scroll;
-        if bottom > scroll + rows {
-            scroll = bottom - rows;
-        }
-        if scroll > top {
-            scroll = top;
-        }
-        self.clamp(scroll)
-    }
-
-    /// Where `card` lands with the layout scrolled by `scroll`: the rows
-    /// of it inside the window, and what the window's edges cut off. None
-    /// when none of it is on screen.
-    pub fn cell(&self, card: usize, scroll: u16) -> Option<Placed> {
-        self.place(*self.cells.get(card)?, scroll)
-    }
-
-    /// [`InsideLayout::cell`] for any rect of the layout, `y` counted
-    /// from its top.
-    fn place(&self, rect: Rect, scroll: u16) -> Option<Placed> {
-        let window = self.window();
-        let (top, bottom) = (scroll, scroll + window.height);
-        let (y0, y1) = (rect.y.max(top), (rect.y + rect.height).min(bottom));
-        (y1 > y0).then(|| Placed {
-            rect: Rect {
-                y: window.y + (y0 - top),
-                height: y1 - y0,
-                ..rect
-            },
-            cut_top: y0 - rect.y,
-            cut_bottom: rect.y + rect.height - y1,
-        })
-    }
-
-    /// The rules on screen with the layout scrolled by `scroll`: each
-    /// one's row and its word. A rule is one row, so it is on screen
-    /// whole or not at all.
-    pub fn rules(&self, scroll: u16) -> Vec<(Rect, &'static str)> {
-        self.rules
-            .iter()
-            .filter_map(|&(y, label)| {
-                let rule = Rect {
-                    y,
-                    height: BAND_RULE_H,
-                    ..self.area
-                };
-                Some((self.place(rule, scroll)?.rect, label))
-            })
-            .collect()
-    }
-
-    /// The cards not whole on screen with the layout scrolled by
-    /// `scroll`, by which edge cuts them: one with rows above the
-    /// window's top is `above`, one with rows past its bottom `below` —
-    /// a card drawn cut counts, since the rest of it is what the marker
-    /// says there is more of.
-    pub fn hidden(&self, scroll: u16) -> Hidden {
-        let window = self.window();
-        let bottom = scroll + window.height;
-        let mut hidden = Hidden::default();
-        for cell in &self.cells {
-            if cell.y < scroll {
-                hidden.above += 1;
-            } else if cell.y + cell.height > bottom {
-                hidden.below += 1;
-            }
-        }
-        hidden
+    /// The section rules: each one's row, counted from the band's rule,
+    /// and its word.
+    pub fn rules(&self) -> &[(u16, &'static str)] {
+        &self.rules
     }
 
     /// The card `dx` along its row and `dy` rows down from `at`, clamped
@@ -2145,10 +2192,10 @@ mod tests {
             feat,
             "the checkout under the cursor"
         );
-        // On the band as inside the worktree.
-        app.launcher_inside = false;
+        // Collapsed or open, the band the cursor is on reads the same.
+        app.launcher_expanded = None;
         assert_eq!(target_for(&app, &api, false), feat, "on the band");
-        app.launcher_inside = true;
+        app.launcher_expanded = Some(WorktreeId("w2".into()));
         // Another project's box reads its own root, not this cursor.
         assert_eq!(
             target_for(&app, &ProjectId("p2".into()), false),
@@ -2454,10 +2501,10 @@ mod tests {
     }
 
     /// A terminal's card spans two of the grid's columns, gap included —
-    /// on a band's strip and inside the worktree alike — so the lines its
+    /// on a band's strip and on the open band alike — so the lines its
     /// shell printed have room to read; a one-column grid gives it the
-    /// one. Inside, the terminals wrap by rows of their own width, and
-    /// the walk still runs down through them.
+    /// one. Open, the terminals wrap by rows of their own width, and the
+    /// walk still runs down through them.
     #[test]
     fn terminal_cards_span_two_columns() {
         let mut app = app();
@@ -2473,7 +2520,7 @@ mod tests {
         assert_eq!(g.cols, 4, "150 columns hold four cards");
         let wide = terminal_w(g.cols, g.card_w);
         assert_eq!(wide, g.card_w * 2 + GAP_X);
-        let strip = g.strip(0, 0, &all[0], None);
+        let strip = g.strip_at(g.area, 0, &all[0], None);
         let (more, cards) = (strip.hidden(), strip.cards);
         assert_eq!(cards.len(), 2, "the session and one terminal fit");
         assert_eq!(more, 2, "the rest are counted on the rule");
@@ -2481,10 +2528,10 @@ mod tests {
         assert_eq!(cards[1].rect.width, wide, "two columns wide");
         assert_eq!(cards[1].rect.x, cards[0].rect.x + g.card_w + GAP_X);
 
-        let layout = inside_layout(body, &all[0]);
-        let cell = |i: usize| layout.cell(i, 0).expect("the card's cell").rect;
+        let layout = expanded_layout(body, &all[0]);
+        let cell = |i: usize| layout.cell(i).expect("the card's cell");
         let (session, first, second, third) = (cell(0), cell(1), cell(2), cell(3));
-        assert_eq!(first.width, wide, "inside the worktree too");
+        assert_eq!(first.width, wide, "on the open band too");
         assert_eq!(first.x, session.x, "under the terminals rule, first column");
         assert_eq!(
             (second.x, second.y),
@@ -2527,7 +2574,7 @@ mod tests {
         let g = bands_layout(Rect::new(0, 0, 80, 60));
         assert_eq!(g.cols, 2);
         let at = |cursor: Option<usize>| {
-            let s = g.strip(0, 0, &all[0], cursor);
+            let s = g.strip_at(g.area, 0, &all[0], cursor);
             (
                 s.cards.iter().map(|c| c.at.card).collect::<Vec<_>>(),
                 s.before,
@@ -2550,9 +2597,93 @@ mod tests {
         );
         // Wherever the window starts, the first card drawn sits in the
         // row's first column, and the rule counts both sides as hidden.
-        let s = g.strip(0, 0, &all[0], Some(4));
+        let s = g.strip_at(g.area, 0, &all[0], Some(4));
         assert_eq!(s.cards[0].rect.x, g.area.x);
         assert_eq!(s.hidden(), 4);
+    }
+
+    /// The ACCORDION in the panel: a collapsed band is its rule and one
+    /// row of cards, one after another down the grid; the open band takes
+    /// the rows its cards wrap into, its first row right under its rule
+    /// where a collapsed band's row is, and every band after it moves
+    /// down by the difference. Past the window's edge a collapsed band
+    /// counts as one thing, the open band's cards one each.
+    #[test]
+    fn the_open_band_pushes_the_bands_under_it_down() {
+        let mut app = app();
+        app.tree
+            .agents
+            .extend((0..5).map(|i| agent(&format!("s{i}"), "w1", &format!("session-{i}"))));
+        let all = super::bands(&app);
+        assert_eq!(all.len(), 2, "the root band and feat's");
+        assert_eq!(all[0].cards.len(), 6);
+        // 80 columns: two cards to a row.
+        let body = Rect::new(0, 0, 80, 60);
+        let collapsed = panel_layout(body, &all, None);
+        assert_eq!(collapsed.open(), None);
+        assert_eq!(collapsed.bands[0].height, BAND_H);
+        assert_eq!(
+            collapsed.bands[1].rule_y,
+            BAND_H + GAP_Y,
+            "one band's row, then the next"
+        );
+        assert_eq!(collapsed.height(), BAND_H * 2 + GAP_Y);
+        assert!(
+            collapsed.bands[0].cell(0).is_none(),
+            "a collapsed band's cards are the strip's"
+        );
+
+        let open = panel_layout(body, &all, Some(&all[0].worktree));
+        assert_eq!(open.open(), Some(0));
+        let first = &open.bands[0];
+        let layout = first.content.as_ref().expect("the root band is open");
+        assert_eq!(
+            layout.rows,
+            vec![vec![0, 1], vec![2, 3], vec![4, 5]],
+            "six sessions over two columns"
+        );
+        assert_eq!(first.height, BAND_RULE_H + CARD_H * 3 + GAP_Y * 2);
+        assert_eq!(
+            first.cell(0).unwrap().y,
+            BAND_RULE_H,
+            "the first row right under the rule"
+        );
+        assert_eq!(first.cell(2).unwrap().y, BAND_RULE_H + CARD_H + GAP_Y);
+        assert_eq!(
+            open.bands[1].rule_y,
+            first.height + GAP_Y,
+            "feat's band moved down"
+        );
+        assert_eq!(open.bands[1].height, BAND_H, "and stays collapsed");
+
+        // A window two rows of cards tall: the open band's third row and
+        // feat's band are past its edge — two cards and one band.
+        let short = Rect::new(
+            0,
+            0,
+            80,
+            HEAD_H + BAND_RULE_H + CARD_H * 2 + GAP_Y + BELOW_MARK_H,
+        );
+        let open = panel_layout(short, &all, Some(&all[0].worktree));
+        assert!(open.overflows());
+        assert_eq!(open.hidden(0), Hidden { above: 0, below: 3 });
+        // Scrolled to the end: the first two rows are off the top.
+        let end = open.max_scroll();
+        assert_eq!(open.hidden(end), Hidden { above: 4, below: 0 });
+        // Revealing feat's band brings the whole band on, rule and row.
+        let scroll = open.reveal(0, 1, None);
+        assert_eq!(scroll, end, "feat's row is the panel's last");
+        assert!(place(
+            open.window(),
+            scroll,
+            open.bands[1].cell(0).unwrap_or(Rect {
+                y: open.bands[1].rule_y,
+                height: BAND_H,
+                ..open.area
+            })
+        )
+        .unwrap()
+        .whole());
     }
 
     /// The screenshot's grid: nine sessions in two columns and three
@@ -2578,64 +2709,72 @@ mod tests {
     fn a_card_the_top_edge_cuts_is_placed_cut_not_dropped() {
         let (app, body) = crowded();
         let all = super::bands(&app);
-        let band = all.iter().find(|b| b.worktree.0 == "w1").unwrap();
-        assert_eq!(band.cards.len(), 12);
-        let layout = inside_layout(body, band);
+        let at = all.iter().position(|b| b.worktree.0 == "w1").unwrap();
+        assert_eq!(all[at].cards.len(), 12);
+        let panel = panel_layout(body, &all, Some(&all[at].worktree));
+        let pb = &panel.bands[at];
+        let layout = pb.content.as_ref().expect("the band is open");
         assert_eq!(
             layout.rows.len(),
             8,
             "five rows of sessions, three of terminals"
         );
-        assert!(layout.overflows());
         assert_eq!(
-            layout.window().height,
-            layout.area.height - BELOW_MARK_H,
+            pb.height,
+            layout.height(),
+            "the band is as tall as its cards"
+        );
+        assert!(panel.overflows());
+        let window = panel.window();
+        assert_eq!(
+            window.height,
+            panel.area.height - BELOW_MARK_H,
             "the marker's row is kept back"
         );
-        assert_eq!(
-            layout.max_scroll(),
-            layout.height() - layout.window().height
-        );
+        assert_eq!(panel.max_scroll(), panel.height() - window.height);
 
         // The first terminal is card 9: bringing it whole on screen
         // scrolls two rows, and the first row of sessions loses one row
         // to the top edge — and is still placed, one row short.
-        let scroll = layout.reveal(0, 9);
+        let scroll = panel.reveal(0, at, Some(9));
         assert_eq!(scroll, 2);
-        let first = layout
-            .cell(0, scroll)
-            .expect("the first card is still placed");
+        let first =
+            place(window, scroll, pb.cell(0).unwrap()).expect("the first card is still placed");
         assert_eq!((first.cut_top, first.cut_bottom), (1, 0));
         assert!(!first.whole());
         assert_eq!(
-            first.rect.y,
-            layout.window().y,
+            first.rect.y, window.y,
             "its first row on screen is the window's first"
         );
         assert_eq!(first.rect.height, CARD_H - 1);
-        let term = layout.cell(9, scroll).expect("the cursor's card");
+        let term = place(window, scroll, pb.cell(9).unwrap()).expect("the cursor's card");
         assert!(term.whole(), "the cursor's card is whole");
         assert_eq!(
             term.rect.y + term.rect.height,
-            layout.window().y + layout.window().height,
+            window.y + window.height,
             "on the window's last row"
         );
         // Both cards on the cut row count as above; the two terminals
         // past the window count as below.
-        assert_eq!(layout.hidden(scroll), Hidden { above: 2, below: 2 });
-        // The sessions' rule is off the top; the terminals' is on.
-        assert_eq!(
-            layout
-                .rules(scroll)
-                .iter()
-                .map(|(_, l)| *l)
-                .collect::<Vec<_>>(),
-            [TERMINALS_RULE]
-        );
+        assert_eq!(panel.hidden(scroll), Hidden { above: 2, below: 2 });
+        // The band's own rule is off the top; the terminals' is on.
+        let on_screen: Vec<&str> = pb
+            .rules()
+            .filter(|&(y, _)| {
+                let rule = Rect {
+                    y,
+                    height: BAND_RULE_H,
+                    ..panel.area
+                };
+                place(window, scroll, rule).is_some()
+            })
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(on_screen, [TERMINALS_RULE]);
     }
 
     /// The scroll follows the cursor only as far as it must: a walk to
-    /// the last card scrolls to the layout's end, a walk back up onto the
+    /// the last card scrolls to the panel's end, a walk back up onto the
     /// first row scrolls all the way back — the rule over it comes too —
     /// and a card already whole on screen moves nothing, so a wheel that
     /// left the cursor's card in view is left alone. A scroll past the
@@ -2644,54 +2783,63 @@ mod tests {
     fn reveal_scrolls_just_far_enough_either_way() {
         let (app, body) = crowded();
         let all = super::bands(&app);
-        let band = all.iter().find(|b| b.worktree.0 == "w1").unwrap();
-        let layout = inside_layout(body, band);
-        let end = layout.reveal(2, 11);
-        assert_eq!(end, layout.max_scroll(), "the last terminal is at the end");
-        assert!(layout.cell(11, end).unwrap().whole());
+        let at = all.iter().position(|b| b.worktree.0 == "w1").unwrap();
+        let panel = panel_layout(body, &all, Some(&all[at].worktree));
+        let pb = &panel.bands[at];
+        let end = panel.reveal(2, at, Some(11));
+        assert_eq!(end, panel.max_scroll(), "the last terminal is at the end");
+        assert!(place(panel.window(), end, pb.cell(11).unwrap())
+            .unwrap()
+            .whole());
         assert_eq!(
-            layout.reveal(end, 0),
-            0,
+            panel.reveal(end, at, Some(0)),
+            pb.rule_y,
             "the first row brings the rule back"
         );
         assert_eq!(
-            layout.reveal(end, 2),
-            layout.cell(2, 0).unwrap().rect.y - layout.area.y - GAP_Y,
+            panel.reveal(end, at, Some(2)),
+            pb.cell(2).unwrap().y - GAP_Y,
             "the second row brings the air over it"
         );
-        assert_eq!(layout.reveal(5, 4), 5, "a card already whole moves nothing");
-        assert_eq!(layout.clamp(500), layout.max_scroll());
-        assert_eq!(layout.reveal(500, 11), layout.max_scroll());
+        assert_eq!(
+            panel.reveal(5, at, Some(4)),
+            5,
+            "a card already whole moves nothing"
+        );
+        assert_eq!(panel.clamp(500), panel.max_scroll());
+        assert_eq!(panel.reveal(500, at, Some(11)), panel.max_scroll());
     }
 
-    /// A layout that fits has nothing to scroll: no marker row kept back,
+    /// A panel that fits has nothing to scroll: no marker row kept back,
     /// no scroll at all whatever is asked for, nothing hidden.
     #[test]
-    fn a_layout_that_fits_never_scrolls() {
+    fn a_panel_that_fits_never_scrolls() {
         let app = app();
         let all = super::bands(&app);
-        let layout = inside_layout(Rect::new(0, 0, 80, 60), &all[0]);
-        assert!(!layout.overflows());
-        assert_eq!(layout.window(), layout.area);
-        assert_eq!(layout.max_scroll(), 0);
-        assert_eq!(layout.reveal(7, 0), 0);
-        assert_eq!(layout.clamp(7), 0);
-        assert_eq!(layout.hidden(0), Hidden::default());
-        assert!(layout.cell(0, 0).unwrap().whole());
+        let panel = panel_layout(Rect::new(0, 0, 80, 60), &all, Some(&all[0].worktree));
+        assert!(!panel.overflows());
+        assert_eq!(panel.window(), panel.area);
+        assert_eq!(panel.max_scroll(), 0);
+        assert_eq!(panel.reveal(7, 0, Some(0)), 0);
+        assert_eq!(panel.clamp(7), 0);
+        assert_eq!(panel.hidden(0), Hidden::default());
+        assert!(place(panel.window(), 0, panel.bands[0].cell(0).unwrap())
+            .unwrap()
+            .whole());
     }
 
-    /// A checkout with no terminal has no `terminals` section inside it:
-    /// the sessions' rule heads the grid alone, the layout ends with the
-    /// last session and the walk on it. The rule comes with the first
+    /// A checkout with no terminal has no `terminals` section on its open
+    /// band: the band's rule heads the cards alone, the layout ends with
+    /// the last session and the walk on it. The rule comes with the first
     /// terminal.
     #[test]
     fn no_terminals_no_terminals_section() {
         let body = Rect::new(0, 0, 80, 60);
         let mut app = app();
         let all = super::bands(&app);
-        let layout = inside_layout(body, &all[0]);
+        let layout = expanded_layout(body, &all[0]);
         assert_eq!(
-            layout.rules(0).iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            layout.rules().iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             [SESSIONS_RULE],
             "no rule over nothing"
         );
@@ -2709,9 +2857,9 @@ mod tests {
 
         app.tree.terminals = vec![terminal("t1", "w1", "shell-1")];
         let all = super::bands(&app);
-        let layout = inside_layout(body, &all[0]);
+        let layout = expanded_layout(body, &all[0]);
         assert_eq!(
-            layout.rules(0).iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            layout.rules().iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             [SESSIONS_RULE, TERMINALS_RULE]
         );
         assert_eq!(layout.rows, vec![vec![0], vec![1]]);

@@ -2158,7 +2158,7 @@ fn ui_state_json(app: &App) -> String {
         launcher_pane_h: app.launcher_pane_h,
         launcher_pane_w: app.launcher_pane_w,
         launcher_pane_hidden: app.launcher_pane_hidden,
-        launcher_inside: app.launcher_inside,
+        launcher_expanded: app.launcher_expanded.as_ref().map(|w| w.to_string()),
         launcher_tabs: app.launcher_tabs.iter().map(|id| id.to_string()).collect(),
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
@@ -2193,7 +2193,7 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
     // height does. Nothing is unselected on the way back in: the restore
     // lands on the cards either way.
     app.launcher_pane_hidden = state.launcher_pane_hidden;
-    app.launcher_inside = state.launcher_inside;
+    app.launcher_expanded = state.launcher_expanded.map(nebula_core::WorktreeId::from);
     // The PROJECT TABS come back in the order they were left, less any
     // project the tree no longer has; the draw's settle gives the
     // restored project its tab if it had none.
@@ -5395,15 +5395,17 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             }
             // Esc in a submenu backs out one level; at the top it closes —
             // unless the picker was opened from the QUICK PROMPT, which is
-            // owed its box back with the text still in it.
+            // owed its box back with the text still in it. Only a box that
+            // was up comes back: `n`'s NEW SESSION PICKER is reached with
+            // none and closes as any menu does (`QuickReturn::from_box`).
             KeyCode::Esc => match menu.parent.take() {
                 Some(parent) => *menu = *parent,
                 None => match menu_quick_return(menu) {
-                    Some(back) => {
+                    Some(back) if back.from_box => {
                         app.overlay = None;
                         crate::quick_prompt::reopen(app, back.launch, &back.text);
                     }
-                    None => app.overlay = None,
+                    _ => app.overlay = None,
                 },
             },
             KeyCode::Char('j') | KeyCode::Down => {
@@ -6865,7 +6867,13 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 // comes back a CLAUDE CLOUD one, where it can be one.
                 .with_cloud(cloud)
                 .with_under(back.launch.under.clone());
-                crate::quick_prompt::reopen(app, launch, &back.text);
+                if back.from_box {
+                    crate::quick_prompt::reopen(app, launch, &back.text);
+                } else {
+                    // No box was up (`n`'s NEW SESSION PICKER): the pick
+                    // OPENS one, on the spec just chosen.
+                    crate::quick_prompt::open_picked_box(app, launch);
+                }
                 return;
             }
             // Resolve the picker's choice against the configured defaults:
@@ -7275,7 +7283,7 @@ fn jump_to_target_inner(
             app.focus = Focus::Sessions;
             // A checkout picked by name is its BAND on the grid, with the
             // pane on the card it was last left on.
-            launcher::land_on_band(app);
+            launcher::land_on_grid(app);
         }
         PaletteTarget::Session(id) => {
             let worktree = app
@@ -7313,9 +7321,8 @@ fn jump_to_target_inner(
                 return;
             };
             app.sel_session = index;
-            // A session picked by name is its card, inside its worktree:
-            // the grid opens that checkout's band around it.
-            launcher::land_inside(app);
+            // A session picked by name is its card on the grid, aimed at.
+            launcher::land_on_grid(app);
             match landing {
                 Landing::Attach => attach_selected(app, out),
                 Landing::FocusOnly => {
@@ -11019,6 +11026,9 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_second_agent(&mut app, AgentStatus::Finished);
+        // The band open, so both cards are on screen whichever the
+        // cursor's row keeps on its strip.
+        app.launcher_expanded = Some(nebula_core::WorktreeId("w1".into()));
         let a2 = AgentId("a2".into());
         // The agent-2 row's dot color, and the row's text.
         let dot = |app: &mut App| {
@@ -29417,14 +29427,14 @@ diff --git a/src/c.rs b/src/c.rs
                 }
                 let mut out = Vec::new();
                 // Onto the reaped session: shown, the attach still waiting.
-                // `k` up the grid onto it: the newest card leads the
-                // list, so the reaped one sits above the cursor's.
+                // `h` along the band onto it: the newest card leads the
+                // row, so the reaped one sits left of the cursor's.
                 let reaped = AgentId("a2".into());
                 for _ in 0..crate::launcher::rows(&app).len() {
                     if app.selected_session().map(|a| a.id) == Some(reaped.clone()) {
                         break;
                     }
-                    press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+                    press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
                 }
                 assert_eq!(
                     app.selected_session().map(|a| a.id),

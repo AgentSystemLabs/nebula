@@ -1,7 +1,8 @@
 //! The one AGENT KIND picker behind every launch surface — the NEW SESSION
-//! PICKER (`n` in the SESSIONS PANEL), the PR SESSION picker (`n` on a
-//! PROJECT OPEN PRS GROUP row) and the QUICK PROMPT's `Tab` — plus the
-//! per-harness rows a CONTEXT MENU on a PR row offers. Each is one
+//! PICKER (`n` on the grid, which opens the QUICK PROMPT on the pick; from
+//! a menu's "New agent" row it launches outright), the PR SESSION picker
+//! (`n` on a PROJECT OPEN PRS GROUP row) and the QUICK PROMPT's `Tab` —
+//! plus the per-harness rows a CONTEXT MENU on a PR row offers. Each is one
 //! `ContextMenu` with a row per harness still enabled on the AGENTS TAB (a
 //! disabled one is absent, not greyed), every row a
 //! `MenuAction::NewAgentOfKind` carrying the surface's launch context, so
@@ -68,6 +69,19 @@ impl KindPicker {
     pub fn quick_prompt(worktree: WorktreeId, back: QuickReturn) -> Self {
         Self {
             title: "Quick prompt agent".into(),
+            ..Self::new_session_box(worktree, back)
+        }
+    }
+
+    /// `n` on the grid: the NEW SESSION PICKER with no box up yet — the
+    /// harness is asked first, and Enter on a row OPENS the QUICK PROMPT
+    /// set to it (`back.from_box` is false: Esc closes the picker and
+    /// opens nothing). The cursor starts on the harness the box would
+    /// have opened on — the Settings → Agents one, which REMEMBER
+    /// HARNESS writes the last launch into — so `Enter` at once is `p`.
+    pub fn new_session_box(worktree: WorktreeId, back: QuickReturn) -> Self {
+        Self {
+            title: "New session".into(),
             worktree,
             pr: None,
             hover: Some(HarnessRow {
@@ -455,7 +469,10 @@ mod tests {
                 text: "typed so far".into(),
                 from_box: true,
             };
-            open_kind_picker(&mut app, KindPicker::quick_prompt(worktree.clone(), back));
+            open_kind_picker(
+                &mut app,
+                KindPicker::quick_prompt(worktree.clone(), back.clone()),
+            );
             let Some(Overlay::Menu(menu)) = &app.overlay else {
                 panic!("{:?}", app.overlay);
             };
@@ -466,6 +483,31 @@ mod tests {
                 &item.action,
                 MenuAction::NewAgentOfKind { pr: None, quick: Some(back), .. }
                     if back.text == "typed so far"
+            )));
+
+            // `n` on the grid: the same rows under the NEW SESSION title,
+            // owing a box that is not up yet.
+            open_kind_picker(
+                &mut app,
+                KindPicker::new_session_box(
+                    worktree.clone(),
+                    QuickReturn {
+                        text: String::new(),
+                        from_box: false,
+                        ..back
+                    },
+                ),
+            );
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("New session"));
+            assert_eq!(labels(menu), offered);
+            assert_eq!(menu.hover, 1, "starts on the harness the box would open on");
+            assert!(menu.items.iter().all(|item| matches!(
+                &item.action,
+                MenuAction::NewAgentOfKind { pr: None, quick: Some(back), .. }
+                    if !back.from_box && back.text.is_empty()
             )));
 
             let rows = pr_session_menu_rows(worktree, &open_pr());
