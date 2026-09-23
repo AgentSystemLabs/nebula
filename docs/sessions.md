@@ -163,7 +163,7 @@ Nothing about the PANE moves when you use it. It is not unfolded, not swapped on
 attached to and not focused, and the turn goes down the session's PTY where it stands: prompting a
 card is not opening it. So the loop is click a card, `Space`, type a line, `Enter`, move to the next
 card — over a folded pane (`^~`) if you walk the cards with the keys, since a click on a card always
-brings the pane back — never once stepping into a session or waiting for one to attach. A pane already open is left on whatever tab it was reading, terminal included.
+brings the pane back — never once stepping into a session or waiting for one to attach. A pane already open is left on whatever card it was reading, a terminal's chip included.
 
 Only a live local agent has a card to expand. An archived session's turn is over, a Claude Cloud row's
 agent runs in a sandbox with a message queue of its own (**Send to cloud session** in its menu), a shell
@@ -214,9 +214,11 @@ feature simply has nothing to show until its next prompt.
 nebula opens on a GRID of session cards — no modal over it, ever, on any launch. Starting a session
 is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing you type is the task.
 
-- **The box** starts on the selected project and on a fresh worktree cut for the session, launching
+- **The box** starts on the selected project and in the checkout under the cursor — the worktree
+  whose band is selected, or the one the grid is inside; the root branch with nothing selected, a
+  fresh worktree with **New worktree** on under **Quick prompt** — launching
   the harness, model and effort the Agents tab defaults name — the row at the top of the box spells
-  them out, `project demo ^P · worktree main ▾ · harness claude Tab · model opus high ^O`, the branch
+  them out, `project demo ^P · worktree main ^T · harness claude Tab · model opus high ^O`, the branch
   in green while Enter will cut it as a fresh worktree.
   `^P` puts the PROJECT PICKER over it — literally over it: the list floats inside the box, which
   stays on screen under it with its title, its details row and the task already typed into it, so
@@ -226,18 +228,17 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   you are working in, so a prompt fired at another project is a **background launch**: the session
   starts over there and nothing on screen moves — no tab is added, none is lit. The details row
   lights the project when the box is aimed away, and the footer names it once Enter lands.
-  `^O` opens the harness's model list straight away (`→` on a model reaches its efforts) and `Tab`
-  the harness picker — both over the box, as the project picker is, so the task stays in front of
-  you while you pick what will run it. `Tab` again on the picker's Claude row is the new-session
+  `^T` drops the WORKTREE PICKER down from the branch the box names — a fresh worktree, then every
+  checkout the project has, the one the box is aimed at ticked — and picks where this one launch
+  runs, never switching a checkout's branch. `^O` opens the harness's model list straight away
+  (`→` on a model reaches its efforts) and `Tab` the harness picker — all three over the box, as
+  the project picker is, so the task stays in front of you while you pick what will run it. `Tab` again on the picker's Claude row is the new-session
   picker's Claude Cloud toggle: the box comes back as a cloud one (`harness claude · cloud`) and
   Enter sends your text as the cloud task — not offered in a box for an issue or a pull request. `⇧Tab` takes a preset, and `^N` flips between a fresh
   worktree and the project's own checkout — the choice sticks for the next box. None of the four
-  needs the chord: the details row is a row of buttons, and a click on `project …`, `agent …` or
-  `model …` — or on the `[ ] new worktree` toggle across from the question — opens exactly what
-  the chord printed beside it opens, box and task still in front of you. The `worktree … ▾` is
-  the one with no chord: a click on it drops the worktree picker down from it — a fresh worktree,
-  then every checkout the project has — and picks where this one launch runs, never switching a
-  checkout's branch. Enter
+  needs the chord: the details row is a row of buttons, and a click on `project …`, `worktree …`,
+  `agent …` or `model …` — or on the `[ ] new worktree` toggle across from the question — opens
+  exactly what the chord printed beside it opens, box and task still in front of you. Enter
   launches; Esc leaves the box for the grid, keeping what you typed — `p` opens on it again.
 - **The grid** takes the top of the body: every unarchived session of
   the **selected project**, most recently touched first, as a wall
@@ -258,8 +259,9 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   opened (a tab, the `+`, a `/` jump), so the nebula has the whole body; whatever the pane was
   reading, a session or a terminal, runs on in the project you left and is never shown here.
   `` ^` `` brings the pane up empty — one press, since there was nothing on screen to fold — with
-  `t opens a terminal here` on its strip, a button as well as the key; the terminal comes up on
-  its own tab with the keys in it. From the keyboard the header can also be
+  nothing on its header to click — `t` opens a terminal on the project's root; the terminal comes
+  up as a card inside its checkout's band with the keys in it, and `t` (or a card menu's **New
+  terminal**) is the only way to open one: the grid has no `+` for it. From the keyboard the header can also be
   walked: `k`,`k` (`↑`,`↑`) on the top row of cards hands the keys up to the tabs, with a cursor of
   their own on the lit tab; `h`/`l` (`←`/`→`) move it and the grid switches with it, each project
   shown on its last-focused card as the cursor passes, and `Enter` — or `j`,`j` (`↓`,`↓`) back
@@ -284,19 +286,32 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   Backspace widens, Esc clears the query before it closes the list — so opening a project is its
   name and Enter. Tabs that do not fit the row are
   counted at the edge they went past (`‹2`, `3›`), and the lit one is always drawn. A tab's name,
-  its `×` and the `+` all mark themselves while the pointer rests on them. Each
-  card is the session's name with its status dot and how long ago, then where it runs and with what
-  (`↳ feat · claude opus`, `⌂` for a root checkout — the project is the grid's own scope, named
-  once in the header rather than on every card), with that checkout's uncommitted changes right
-  behind the branch in the warning color (`↳ feat +3 files`, just `+3` on a narrow card, nothing
-  when it is clean; with `card_line_changes` on, the lines behind it follow in green and red,
-  `+3 files +120 -45`) — every card in a checkout carries its count, not only the one under the
-  cursor, since a slow sweep reads each checkout the grid lists — then its pull request —
+  its `×` and the `+` all mark themselves while the pointer rests on them. The cards are grouped
+  into **BANDS**, one per checkout that has something running in it — the root first, then the
+  rest most recently worked in first; a checkout with nothing running has no band. Each band is a
+  titled rule over one row of cards: the rule names the checkout in its scope color (`↳ feat`,
+  `⌂ main` for the root — the project is the grid's own scope, named once in the header), with
+  that checkout's uncommitted changes right behind the branch in the warning color (`↳ feat +3
+  files`, just `+3` on a narrow rule, nothing when it is clean; with `card_line_changes` on, the
+  lines behind it follow in green and red, `+3 files +120 -45`), then its pull request —
   `↗ #42 Polish the nav  ready` in the colors the PR rows wear (red for conflicts or failing checks,
-  purple once merged) — then the last thing it was asked to do, on a `›`, over three rows so a
-sentence reads as one (what still does not fit ends in an ellipsis). The pull requests come
-  from the same `gh` lookups the PULL REQUESTS MODAL makes, swept over every checkout the grid
-  lists. The header counts the project's open pull requests and issues beside the session count
+  purple once merged), a link while the pointer rests on it — and, at its right end, how many
+  sessions and terminals are under it and how many cards the row had no room for (`▸ 2 more`).
+  The band the keys are on opens on `❯` where the rest open on `──`, and past its counts says
+  what Enter does there — `Enter: see all 8` with cards past the edge, `Enter: open` when the row
+  showed them all — since a titled rule reads as a divider until something says a key acts on it.
+  The cards under it are the checkout's sessions, then its terminals as cards two columns wide,
+  gap included, so their output has room — a one-column grid gives them the one (`❯ shell-1`
+  with what runs in it, then the last lines its shell printed, asked of the daemon
+  once a second while the card is on screen, so a glance down the grid says what each shell is up
+  to; `▶` on a RUN TERMINAL, `exited` at the name's right once its shell is gone — the lines it
+  went out on stay, so the card says what it was doing when it went). A session
+  card is the session's name with its status dot and how long ago, what it runs on (`claude opus high`:
+  the harness, its model and the reasoning effort it was launched with — a session on the CLI's own
+  default effort stops at the model),
+  then the last thing it was asked to do, on a `›`, over four rows so a sentence reads as one
+  (what still does not fit ends in an ellipsis). The pull requests come from the same `gh` lookups
+  the PULL REQUESTS MODAL makes, swept over every checkout the grid lists. The header counts the project's open pull requests and issues beside the session count
   (`4 sessions  3 prs · 2 issues`), so what is waiting on the repo is read without opening `v` or
   `i` to find it — and a click on either count opens that list, as the key does;
   `pr_issue_counts` in CONFIG.JSON switches the counts off. When the room left
@@ -306,19 +321,45 @@ sentence reads as one (what still does not fit ends in an ellipsis). The pull re
   card that is not on screen reads as something taking its room rather than as a session gone, and
   the arrow says whether the way back to it is `j` down through the grid or the pane's edge dragged
   back down. It holds the right edge on a narrow terminal: the pr and issue counts give way first.
-- **Walking it** is `h`/`j`/`k`/`l` (or the arrows): `h` and `l` move along a row and stop at its
-  ends, `j` and `k` move down the column. The wheel moves nothing: a notch over the cards is
-  ignored, so a trackpad cannot swap the pane out from under the card you are reading. The window
-  scrolls only as far as it must to keep the cursor's card on screen.
+  Inside a worktree the grid's own edges say it again where the eye looks for the rest: `↑ 2 more
+  above` on the row of air under the PROJECT TABS once the top has scrolled off, `↓ 3 more below`
+  on a row kept under the cards while there is more past the bottom — the row stays as air once the
+  grid is scrolled to its end, and neither appears on a grid that fits.
+- **Walking it** has two levels. At the band level `j` and `k` walk the bands — the rule of the
+  band under the cursor takes the accent and its branch goes bold, no card wears the cursor, and
+  the pane reads the band's remembered card (the session it was last left on, else its first);
+  the accent goes with the keys, so with them up on the PROJECT TABS or down in the pane the rule
+  is gray like the others and only the bold branch still says which checkout the pane reads —
+  and `Enter` opens the worktree: the grid is then that checkout's cards alone, the sessions
+  wrapped into rows under the checkout's own rule — with `Esc back to the worktrees` at its
+  right — and the terminals under a `terminals` rule. Inside,
+  `h`/`j`/`k`/`l` (or the arrows) walk the cards — `h` and `l` along a row, `j` and `k` down the
+  rows, on from the last row of sessions into the terminals — and `Esc` backs out to the bands with
+  the cursor on the band just left. A band with more cards than its row can hold counts the rest on
+  its rule rather than wrapping, so a step down is always a step onto the next checkout; inside,
+  there is room to wrap. Which level you are at is remembered across restarts, and a jump that
+  names a session — `/`, the attention walk, a terminal just opened — lands inside its checkout.
+  The wheel never walks the cursor, so a trackpad cannot swap the pane out from under the card you
+  are reading: at the band level a notch over the grid is ignored, and the window scrolls only as
+  far as it must to keep the cursor's band on screen. Inside a worktree the grid scrolls the way a
+  terminal's screen does — the wheel moves the cards three rows a notch under a cursor that stays
+  put, held at the grid's ends, and a card the window's edge cuts is drawn to the edge rather than
+  left out, so the window is full to its edges and no card-sized hole opens over the cards. The
+  next key that walks the cursor, or `j`/`k` against the grid's edge, scrolls just far enough to
+  bring the cursor's card whole back on screen — with the checkout's rule when it is on the first
+  row — and a click on a cut card does the same.
 - **The pane** runs down the right side of the cards, full height and half the width — or along
-  the bottom, under them, with the `⬓` button just before the `×` on its tab strip (`◨` there moves
+  the bottom, under them, with the `⬓` button just before the `×` on its header (`◨` there moves
   it back) or Settings → Appearance → **Session pane** (`session_pane`, which the button writes; a
   window too narrow for it beside a column of cards lays it along the bottom until there is
-  room) — and reads whichever card the cursor is on:
-  `SESSION · polish-nav` on its header and that session live under it, swapping as you walk the grid,
-  so stepping across a wall of cards reads each one's progress in turn. It is the selected session, so
+  room) — and reads whichever card the cursor is on — at the band level, the band's remembered
+  card: `● polish-nav  ↳ feat` on its header, the card's name and its checkout, with a `+` after
+  them that opens a terminal there, and that session live under it, swapping as you walk the
+  grid, so stepping across the bands reads each checkout's progress in turn. A terminal's chip
+  puts its shell there the same way. It is the selected session, so
   it comes and goes with the selection: clicking a card opens the pane on it — reading only, the keys
-  stay on the cards — and letting the card go (the first Esc, or `^~`) collapses
+  stay on the cards, and the grid keeps its level, so a card clicked from the bands stays a
+  preview under its rule — and letting the card go (`Esc` at the band level, or `^~`) collapses
   the pane and gives the grid the whole body back. A click on the air between the cards does not: a
   miss with the pointer leaves the pane exactly where it is. It takes a second click, or Enter, to type into it. It is the same pane the
   a full-screen session has — the same attach, the same scrollback and wheel, and the card it shows is marked read
@@ -331,20 +372,21 @@ sentence reads as one (what still does not fit ends in an ellipsis). The pull re
   leave it at is remembered across restarts, and re-fitted to the window each frame. Beside the
   cards it is the edge facing them that drags, sideways, under a short `┃` grip, trading columns
   down to one column of cards — and that width is remembered apart from the height, so switching
-  sides never turns one into the other. On a terminal
+  sides never turns one into the other. A double-click on either edge snaps it to the middle of the
+  body, the cards and the pane sharing it evenly. On a terminal
   too short for the header, a row of cards and a pane worth the name, there is no pane and a session
   is only ever seen full-screen.
 - **A follow-up** is `Space` on a card: a small modal opens over the grid and `Enter` sends what you
   type as that session's next turn, straight down its PTY. The pane is left exactly as it is — this is
   the way to hand a wall of sessions their next instructions one after another without opening any of
   them. See [the FOLLOW-UP COMPOSER](#the-follow-up-composer).
-- **Stepping into one** is Enter (or `Tab`, `^→`, or a double-click): the keys cross into the pane
-  beside the cards, where that session is already running, with its input locked and the grid still
-  up over it — the same place a click into the pane lands. `` ^` `` hands the keys back to the cards,
-  and a second `` ^` `` folds the pane away.
-- **Opening one full-screen** is `z`: that session takes the whole screen — the grid and its pane
-  both give way — with its input locked. Its
-  header is a
+- **Stepping into one** is Enter inside a worktree (or `Tab`, `^→`, or a double-click — from the
+  bands, a double-click on a card is Enter twice, into the worktree and then in): the keys cross
+  into the pane beside the cards, where that session is already running, with its input locked and
+  the grid still up over it — the same place a click into the pane lands. `` ^` `` hands the keys
+  back to the cards, and a second `` ^` `` folds the pane away.
+- **On a terminal too short to draw the pane**, stepping into a session gives it the whole screen
+  instead — the grid gives way — with its input locked. Its header is a
   breadcrumb — `‹ sessions / ● Fix the login redirect loop`, with the harness, model and checkout
   right-aligned — and `^q`, or a click on `‹ sessions`, comes back to the grid with the cursor on
   the card you came from. `p` (or `n`) opens the box again, on the project under the cursor.
@@ -354,33 +396,35 @@ sentence reads as one (what still does not fit ends in an ellipsis). The pull re
   sessions yet): **New worktree**; **Run** / **Stop run** and **Open** for the checkout the grid
   would launch into, and **Delete worktree** when that is a linked one; **Rename**, a label only —
   the folder on disk keeps its name, and an empty name goes back to it; and **Remove from list**,
-  behind a confirm, which leaves the clone on disk alone. There is nothing above the grid to walk
-  out to: `Esc` lets the card go and a second one does nothing, and `k` on the top row stays put.
+  behind a confirm, which leaves the clone on disk alone. There is nothing above the bands to walk
+  out to: `Esc` inside a worktree backs out to them, `Esc` there lets the band go, a third does
+  nothing, and `k` on the first band stays put.
 
 Every other key acts on the session under the cursor — `a` archives, `d` deletes, `g` opens its
 diff, `m` its menu, `/` jumps, `s` opens Settings. `a` asks first, always: a CONFIRM DIALOG names
 the session, `Enter` or `y` archives it and `Esc` or `n` keeps it, so a letter aimed at an agent
 that lands on the grid archives nothing — and saying yes is cheap, since `u` brings it back. The
-cursor lands on the card before the one archived. A held `a` opens one dialog and archives nothing
-by itself; a held `u` in the ARCHIVED VIEW unarchives one card, and the next needs the key let go
-and pressed again (on a terminal with the kitty keyboard protocol, which is what tells a held key's
-repeats from a fresh press; without it a long hold still walks the row).
+cursor lands on the card after the one archived in its band — the one that slides up into its
+place — or, when the band's last card went, on the one before it; a band's only card leaving takes
+the band with it, and the grid is the bands again, on the one that slid up into its slot. `d` lands
+the same way. A held `a` opens one dialog and
+archives nothing by itself; a held `u` in the ARCHIVED VIEW unarchives one card, and the next needs
+the key let go and pressed again (on a terminal with the kitty keyboard protocol, which is what
+tells a held key's repeats from a fresh press; without it a long hold still walks the row).
 
 **`⇧A` is the ARCHIVED VIEW**: the same grid, of the project's archived sessions instead of its live
 ones, with the header counting them under their own word (`3 archived sessions`). `u` unarchives the
 card under the cursor where it stands and `d` deletes it; `⇧A` again comes back to the live
-sessions. The two lists never mix — there is no group to fold, only the other grid — and `Enter` or
-`z` on an archived card says to unarchive it first, its session having been reaped when it was
+sessions. The two lists never mix — there is no group to fold, only the other grid — and `Enter`
+on an archived card says to unarchive it first, its session having been reaped when it was
 archived.
 
 **An archived card is drawn as the live card put away**, so which of the two grids is on screen
 reads before the header is: its frame squares off (`┌`, where a live card is rounded `╭`), its
 STATUS DOT gives way to a square `▪` — the session is filed, and the status it was filed in stopped
-being a job the moment it was — and the color comes off the whole card. The name goes muted and
-drops its bold, the checkout keeps its `⌂` / `↳` glyph but not the SCOPE COLOR (that color warns
-about what a session is editing *now*, and an archived one edits nothing), and the pull request goes
-dim with the rest rather than carrying its merged purple or a red conflict across a wall of
-filed-away work. The badge on the right counts from when the session was archived (`2h ago`), not
+being a job the moment it was — and the color comes off the whole card: the name goes muted and
+drops its bold, and the harness row goes with it. The ARCHIVED VIEW's bands are the checkouts the
+filed sessions were in, with no terminals under them — a terminal is never archived. The badge on the right counts from when the session was archived (`2h ago`), not
 from its last turn — a session archived before nebula kept that stamp simply has no badge. Under the
 cursor the whole card lifts a step, so the one you are about to unarchive stays legible on the
 focus tint, and with color off entirely the two shapes still tell the grids apart. No card says
@@ -492,7 +536,8 @@ pull requests left out — down the left of a modal, and reads the one under the
 number and title, who opened it and when, its labels, the description rendered as markdown (a newline
 is a line break, as GitHub shows a comment), and,
 once the cursor has rested on the row for a moment, its comments (`gh issue view`, one call per issue
-you actually stop on, remembered for the session). `o` opens the issue in the browser and `r` asks
+you actually stop on, remembered for the session). `Ctrl+o` — or a click on the `↗ open in browser`
+button pinned right on the reading pane's frame — opens the issue in the browser and `Ctrl+r` asks
 GitHub again; a machine with no `gh`, or one that is not logged in, gets a line saying so in the pane
 rather than an empty modal. The list is asked for before you press `i`: once the cursor has rested
 on a project for a moment its open issues are fetched in the background, and re-fetched every couple
@@ -501,14 +546,26 @@ answer), so the modal opens on rows instead of an empty pane. A list that landed
 seconds is what you see; an older one paints while the fresh list lands underneath — and the cursor
 stays on the issue it was on, by URL, when a refresh retires a row above it.
 
-`c` leaves a comment on the issue under the cursor without leaving the modal for long: a multi-row
+The list filters as you type, from the moment the modal is up — the FILE FINDER's and the DIFF
+VIEWER's way, no key to press first: letters narrow the rows to the fuzzy matches of `#15 title`,
+best first, the cursor on the best with its comments asked for as any move asks for them, the matched
+letters lit in each row and the title's count reading `2/14`. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
+matches, and `Enter`, `Shift+Tab`, `Ctrl+e`, `Ctrl+c` and `Ctrl+o` act on the issue you found. `Esc`
+clears the filter, the cursor staying on that row, and a second `Esc` closes the modal, as in every
+fuzzy overlay; a filter nothing matches says `no issues match` and leaves the cursor where it was for
+the next letter or `Backspace` to decide. A refresh that retires the row under the cursor lands it on
+the filter's next match, never on a row the filter hides. Because the letters are the filter's, the
+verbs are chords — the diff viewer's rule — and `Ctrl+u` kills the typed filter before it scrolls the
+pane.
+
+`Ctrl+c` leaves a comment on the issue under the cursor without leaving the modal for long: a multi-row
 box (the task prompts' shape, `Shift+Enter` for a newline) whose `Enter` posts the text as you —
 `gh issue comment`, so it appears under your GitHub login — and puts the modal back on the row at
 once, the pane saying the comment is on its way until GitHub answers; then the conversation is read
 again with it in. `Esc`, or an empty box, puts the modal back without posting, and a post `gh`
 refused (not logged in, no network) brings the box back with your text so nothing is lost.
 
-`E` edits the issue itself without leaving the modal at all: the reading pane becomes a form on
+`Ctrl+e` edits the issue itself without leaving the modal at all: the reading pane becomes a form on
 the row's title and description — `Tab`, `↑`/`↓` or a click move between the two fields, and the
 description takes `Shift+Enter` (or `Option+Enter`, or `Ctrl+J`) for a line break and `↑`/`↓` to walk
 its lines, as every multi-row box does — the preset editor's prefix and postfix included.
@@ -520,10 +577,10 @@ without a call, a blank title is refused on the spot, and a save GitHub refuses 
 push access to the repo — keeps the form up with `gh`'s own reason on its frame and your text
 intact, so nothing typed is lost. Labels, assignees and milestones stay GitHub's to edit.
 
-Two keys put an agent on the issue. `Enter` (or `p`) opens the QUICK PROMPT for it — the same box
+Two keys put an agent on the issue. `Enter` opens the QUICK PROMPT for it — the same box
 `p` opens anywhere, titled `Quick prompt · issue #15 (claude · opus)`, launching the `Agent` row's
 harness from Settings → Agents on the PROJECT's ROOT WORKTREE, whatever card the cursor is on — or
-on a fresh worktree named after the issue, with `New worktree` on under **Quick prompt**. `e` opens the AGENT PRESETS list as a picker instead, and
+on a fresh worktree named after the issue, with `New worktree` on under **Quick prompt**. `Shift+Tab` opens the AGENT PRESETS list as a picker instead — the box's own key for it — and
 `Enter` on a preset hands the same box back with that preset's harness, model, effort and
 prefix/postfix applied. Inside the box `Tab` and `Shift+Tab` still switch the harness or the preset
 and `Ctrl+N` still flips to a fresh worktree — named `issue-15-fix-login-redirect` here, the number
@@ -560,19 +617,23 @@ already keeps warm (and remembers across launches), so the modal opens on them a
 than thirty seconds is asked for again underneath, and the cursor follows its pull request by URL
 when the answer reorders the rows or retires one. The reading pane shares the pane's fetch: a pull
 request read in one is read in the other, and resting on a row for a moment fetches its body (`gh pr
-view`) the same way. `r` asks for the list and the row's body again now.
+view`) the same way. `Ctrl+r` asks for the list and the row's body again now.
 
-The keys are the ISSUES MODAL's, and the group row's. `Enter` (or `p`) opens the QUICK PROMPT for a
+The keys are the ISSUES MODAL's, and the QUICK PROMPT box's: the list filters as you type, narrowing
+the rows to the fuzzy matches of `#42 title`, `Esc` clears the filter before a second `Esc` closes,
+and the verbs are chords. `Enter` opens the QUICK PROMPT for a
 PR SESSION on the pull request — the box `p` opens on its group row, titled `Quick prompt · PR #42 …`
-— `e` launches one of your AGENT PRESETS on it, and `n` picks a harness and starts the session bare,
+— `Shift+Tab` launches one of your AGENT PRESETS on it, and `Tab` picks a harness and starts the session bare,
 `→` drilling into the MODEL / EFFORT submenus. Every one of them is the group row's launch: a
 `CreatePrAgent` that runs in the project's checkout of the pull request's head branch, reused when
 one is there and cut by the DAEMON otherwise, its stand-in rows up under the pull request from the
 moment you launch, and the PR's URL and work rule in the harness's context. The QUICK PROMPT stands
 on the modal as the ISSUES MODAL's does: the list stays under the box, `Esc` or a click outside puts
 you back on the pull request you opened it on, and the launch closes the modal onto the new
-session's card, the grid's cursor on it. `c` (or `y`) opens the
+session's card, the grid's cursor on it. `Ctrl+c` opens the
 COMMENT BOX on the pull request and comes back to the modal on the row — after `Enter` posts, after
-`Esc`, and after a post `gh` refused, with your text back in the box — `g` opens the pull request's
-whole diff, `o` opens it in the browser, and `Esc`, `q` or `v` closes the modal. The hotkey is
+`Esc`, and after a post `gh` refused, with your text back in the box — `Ctrl+g` opens the pull request's
+whole diff, `Ctrl+o` — or a click on the `↗ open in browser` button pinned right on the reading pane's
+frame — opens it in the browser and marks it read on the way out, and `Esc` closes the
+modal (twice, with a filter typed). The hotkey is
 rebindable (`pull_requests`).

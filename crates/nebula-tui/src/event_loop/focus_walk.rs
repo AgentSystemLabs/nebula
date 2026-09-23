@@ -91,9 +91,13 @@ pub(super) fn walk_focus_back(app: &mut App) {
 /// buttons: none of them is somewhere focus lives.
 pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut Vec<ClientRequest>) {
     match app.hit_at(column, row) {
-        Some(HitTarget::LauncherRow(_) | HitTarget::LauncherCardPr(_)) => {
-            app.focus = Focus::Sessions
-        }
+        Some(
+            HitTarget::LauncherCard(_)
+            | HitTarget::LauncherBand(_)
+            | HitTarget::LauncherBandPr(_)
+            | HitTarget::LauncherStripLeft(_)
+            | HitTarget::LauncherStripRight(_),
+        ) => app.focus = Focus::Sessions,
         Some(HitTarget::PanelBg(focus)) => app.focus = focus,
         Some(HitTarget::TerminalPane | HitTarget::CloudSessionLink) => {
             enter_terminal_pane(app, out)
@@ -109,16 +113,13 @@ pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut V
             | HitTarget::LauncherTab(_)
             | HitTarget::LauncherTabClose(_)
             | HitTarget::LauncherTabAdd
-            | HitTarget::LauncherPaneSession
-            | HitTarget::LauncherPaneTerminal(_)
-            | HitTarget::LauncherPaneCloseTerminal(_)
-            | HitTarget::LauncherPaneNewTerminal
             | HitTarget::LauncherPaneClose
             | HitTarget::LauncherPaneSide
             | HitTarget::LauncherPullRequests
             | HitTarget::LauncherIssues
             | HitTarget::LauncherWelcomePrompt
-            | HitTarget::FooterUsage,
+            | HitTarget::FooterUsage
+            | HitTarget::ModalBrowser,
         )
         | None => {}
     }

@@ -1,4 +1,5 @@
-# `e` on an issue picks one of the saved AGENT PRESETS for it.
+# Shift+Tab (tmux spells it `BTab`) on an issue picks one of the saved AGENT PRESETS for it;
+# ↓ rather than `j`, since letters type into the list's live filter.
 i
-j
-e
+Down
+BTab

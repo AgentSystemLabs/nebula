@@ -24,7 +24,7 @@ use crate::app::App;
 use crate::pull_request::{Standing, Trouble};
 use crate::quick_prompt::{QuickReturn, QuickTarget};
 use crate::text_input::TextInput;
-use nebula_core::{Agent, AgentId, AgentStatus, ProjectId, WorktreeId};
+use nebula_core::{Agent, AgentId, AgentStatus, ProjectId, SessionRef, TerminalTab, WorktreeId};
 use ratatui::layout::Rect;
 
 /// One session in the launcher's list.
@@ -79,10 +79,7 @@ impl RowPr {
 /// nothing to submit arrives `fresh`, and a `fresh` row loses to every
 /// session mid-turn — so the session this client just launched leads the
 /// list outright until its own first turn starts, which is when its stamp
-/// takes over ([`crate::app::App::just_launched`]). A
-/// session in a ROOT WORKTREE its project hides (**Hide root worktree**)
-/// is left out, as the panels leave it out: the cursor cannot be put on
-/// it.
+/// takes over ([`crate::app::App::just_launched`]).
 ///
 /// The list is the SELECTED PROJECT's alone — the one whose PROJECT TAB is
 /// lit in the header. Every jump moves `sel_project` with it, so the
@@ -160,9 +157,6 @@ fn row_of(
     if scope.is_some_and(|id| id != &project.id) {
         return None;
     }
-    if worktree.is_main && app.root_hidden(project) {
-        return None;
-    }
     Some(LauncherRow {
         agent: agent.clone(),
         project: project.name.clone(),
@@ -198,10 +192,169 @@ fn row_pr(app: &App, worktree: &WorktreeId, project: &ProjectId, branch: &str) -
     })
 }
 
-/// The row the cursor is on: the selected session, when it is one of the
-/// list's. None while the selection rests on a terminal, a pull request,
-/// an archived session or nothing.
-pub fn cursor(app: &App, rows: &[LauncherRow]) -> Option<usize> {
+// ---- the BANDS ----
+
+/// One card on the grid: a session, or a shell TERMINAL — the two things
+/// that run in a checkout, drawn side by side in its BAND — a session
+/// the grid's column wide, a terminal two ([`terminal_w`]), so the lines
+/// its shell printed have room. A session card carries its whole row and a
+/// terminal's only its tab: the difference in what they hold is what it
+/// is, and the cards live for one frame, so boxing every session to even
+/// the two out would buy nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum Card {
+    Session(LauncherRow),
+    Terminal(TerminalTab),
+}
+
+impl Card {
+    /// The attachable session behind the card — what the PANE reads when
+    /// the cursor is on it.
+    pub fn sref(&self) -> SessionRef {
+        match self {
+            Card::Session(row) => SessionRef::Agent(row.agent.id.clone()),
+            Card::Terminal(t) => SessionRef::Terminal(t.id.clone()),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Card::Session(row) => &row.agent.name,
+            Card::Terminal(t) => &t.name,
+        }
+    }
+
+    /// The session, on a session card.
+    pub fn agent(&self) -> Option<&Agent> {
+        match self {
+            Card::Session(row) => Some(&row.agent),
+            Card::Terminal(_) => None,
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Card::Terminal(_))
+    }
+}
+
+/// One worktree's BAND: the checkout — its branch, its uncommitted
+/// changes, its pull request, all on the rule over the cards — and every
+/// session and terminal running in it, sessions first.
+#[derive(Debug, Clone)]
+pub struct Band {
+    pub worktree: WorktreeId,
+    /// The PROJECT's display name.
+    pub project: String,
+    pub branch: String,
+    /// The checkout is the project's ROOT WORKTREE (`⌂`).
+    pub is_main: bool,
+    pub pr: Option<RowPr>,
+    /// The sessions in `rows` order, then the terminals in tree order.
+    pub cards: Vec<Card>,
+}
+
+impl Band {
+    pub fn sessions(&self) -> usize {
+        self.cards.iter().filter(|c| !c.is_terminal()).count()
+    }
+
+    pub fn terminals(&self) -> usize {
+        self.cards.iter().filter(|c| c.is_terminal()).count()
+    }
+
+    /// Where `sref`'s card sits in the band.
+    pub fn position(&self, sref: &SessionRef) -> Option<usize> {
+        self.cards.iter().position(|c| &c.sref() == sref)
+    }
+}
+
+/// The grid's BANDS: one per checkout of the SELECTED PROJECT that has
+/// something running in it — a session on the list `rows` builds, or a
+/// terminal — the root first, then the rest most recently worked in
+/// first (`App::visible_worktrees`). A checkout with nothing running has
+/// no band: the grid is what is running, not what is checked out. The
+/// ARCHIVED VIEW's bands hold the archived sessions alone; a terminal is
+/// never archived, so none is listed there.
+pub fn bands(app: &App) -> Vec<Band> {
+    let Some(project) = app.selected_project() else {
+        return Vec::new();
+    };
+    let rows = rows(app);
+    let mut out = Vec::new();
+    for w in app.visible_worktrees() {
+        let mut cards: Vec<Card> = rows
+            .iter()
+            .filter(|r| r.agent.worktree_id == w.id)
+            .cloned()
+            .map(Card::Session)
+            .collect();
+        if !app.show_archived {
+            cards.extend(
+                app.tree
+                    .terminals
+                    .iter()
+                    .filter(|t| t.worktree_id == w.id)
+                    .cloned()
+                    .map(Card::Terminal),
+            );
+        }
+        if cards.is_empty() {
+            continue;
+        }
+        out.push(Band {
+            worktree: w.id.clone(),
+            project: project.name.clone(),
+            branch: w.branch.clone(),
+            is_main: w.is_main,
+            pr: row_pr(app, &w.id, &project.id, &w.branch),
+            cards,
+        });
+    }
+    out
+}
+
+/// A card's place on the grid: which band, and which card along it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CardRef {
+    pub band: usize,
+    pub card: usize,
+}
+
+/// The card at `at`, when the grid has one there.
+pub fn card_at(bands: &[Band], at: CardRef) -> Option<&Card> {
+    bands.get(at.band)?.cards.get(at.card)
+}
+
+/// The band the cursor is on: the SELECTED WORKTREE's, when it has one.
+/// None while the selection rests on a pull request, an issue, or a
+/// checkout with nothing running.
+pub fn band_cursor(app: &App, bands: &[Band]) -> Option<usize> {
+    let w = app.selected_worktree()?;
+    bands.iter().position(|b| b.worktree == w.id)
+}
+
+/// The card the cursor is on inside `band`: the selected row's session
+/// or terminal, when it is one of the band's. None on a link row, an
+/// archived session on the live grid, or nothing.
+pub fn card_cursor(app: &App, band: &Band) -> Option<usize> {
+    let sref = app.selected_session_row()?.sref()?;
+    band.position(&sref)
+}
+
+/// The cursor as a card: the band it is on and, inside it, the card. At
+/// the band level the card is the one the pane reads — the band's
+/// remembered card — which is what a click or Enter lands on.
+pub fn cursor(app: &App, bands: &[Band]) -> Option<CardRef> {
+    let band = band_cursor(app, bands)?;
+    let card = card_cursor(app, &bands[band])?;
+    Some(CardRef { band, card })
+}
+
+/// The row the cursor is on in a flat list of session rows — the selected
+/// session, when it is one of the list's. What the full-screen crumb and
+/// the counts read; the grid itself reads [`cursor`].
+pub fn row_cursor(app: &App, rows: &[LauncherRow]) -> Option<usize> {
     let selected = app.selected_session()?;
     rows.iter().position(|row| row.agent.id == selected.id)
 }
@@ -217,20 +370,41 @@ pub const CARD_MIN_W: u16 = 34;
 pub const MAX_COLS: usize = 4;
 /// How many rows of a card the last prompt gets: enough that a sentence
 /// reads as a sentence instead of being clipped at the card's edge.
-pub const PROMPT_LINES: usize = 3;
-/// The rows above the prompt: the name, where it runs, its pull request.
-pub const CARD_HEAD_H: u16 = 3;
-/// A card's text rows — name, place, pull request, then the last prompt
-/// wrapped over [`PROMPT_LINES`] — inside its border.
+pub const PROMPT_LINES: usize = 4;
+/// The rows above the prompt: the name, and what it runs on. Where it
+/// runs — the checkout, its changes, its pull request — is the BAND's
+/// rule over the card, said once for every card in it.
+pub const CARD_HEAD_H: u16 = 2;
+/// A card's text rows — name, harness, then the last prompt wrapped over
+/// [`PROMPT_LINES`] — inside its border.
 pub const CARD_TEXT_H: u16 = CARD_HEAD_H + PROMPT_LINES as u16;
 pub const CARD_H: u16 = CARD_TEXT_H + 2;
+/// How many of the grid's columns a TERMINAL's card spans: two, gap
+/// included, so the last lines its shell printed have room to read as
+/// lines — a session card's width shows a prompt, a shell's output wants
+/// twice that. A one-column grid gives it the one.
+pub const TERM_SPAN: usize = 2;
+
+/// How wide a TERMINAL's card is on a grid of `cols` columns `card_w`
+/// wide: [`TERM_SPAN`] columns and the gaps between them.
+pub fn terminal_w(cols: usize, card_w: u16) -> u16 {
+    let span = TERM_SPAN.min(cols.max(1)) as u16;
+    card_w * span + GAP_X * (span - 1)
+}
+/// The row over a BAND's cards: the checkout's rule.
+pub const BAND_RULE_H: u16 = 1;
+/// A BAND on the grid: its rule and one row of cards under it.
+pub const BAND_H: u16 = BAND_RULE_H + CARD_H;
 /// Gaps between cards: a column of air either side, a blank row under.
 pub const GAP_X: u16 = 2;
 pub const GAP_Y: u16 = 1;
 /// The margin the grid keeps off the body's edges.
 pub const PAD_X: u16 = 2;
-/// Rows above the grid: the breadcrumb header and a blank under it.
-pub const HEAD_H: u16 = 3;
+/// Rows above the grid: a blank, the PROJECT TABS, the rule under them,
+/// and a row of air under that — so the first band's rule, or the
+/// checkout's rule inside a worktree, never sits hard against the
+/// header's.
+pub const HEAD_H: u16 = 4;
 /// Shortest the PANE under the grid is worth drawing: its own three header
 /// rows and enough of the PTY under them that a reply reads as a reply.
 pub const PANE_MIN_H: u16 = 12;
@@ -597,6 +771,488 @@ pub fn grid_stepped(at: Option<usize>, dx: i64, dy: i64, cols: usize, len: usize
     Some((((row + dy).clamp(0, rows) * cols) + col).min(last) as usize)
 }
 
+// ---- the BANDS' layout ----
+
+/// Where one card is drawn: its place on the grid and its cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slot {
+    pub at: CardRef,
+    pub rect: Rect,
+}
+
+/// The grid at the top level: one BAND per checkout, each its rule over
+/// one row of cards, scrolled by whole bands so the cursor's band is
+/// always drawn. A band's cards run along its one row; the ones past its
+/// edges are counted on the rule rather than wrapped, so a step down is
+/// always a step onto the next checkout, and the row scrolls under `h` /
+/// `l` to keep the cursor's card on it ([`BandsLayout::strip`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandsLayout {
+    /// Where the bands go: the body under the header, inset by [`PAD_X`].
+    pub area: Rect,
+    /// Width of one session card — what [`grid`] would give a card in
+    /// this area, so a band's cards are the size the cards inside a
+    /// worktree are.
+    pub card_w: u16,
+    /// Cards per row, as [`grid`] gives it: what a terminal's card spans
+    /// two of ([`terminal_w`]).
+    pub cols: usize,
+    /// Bands the area has room for, at least 1.
+    pub bands_fit: usize,
+}
+
+/// The bands `body` lays out.
+pub fn bands_layout(body: Rect) -> BandsLayout {
+    let g = grid(body);
+    BandsLayout {
+        area: g.area,
+        card_w: g.card_w,
+        cols: g.cols,
+        bands_fit: usize::from((g.area.height + GAP_Y) / (BAND_H + GAP_Y)).max(1),
+    }
+}
+
+impl BandsLayout {
+    /// The rule and cards of the band in `slot`, counting from the first
+    /// band drawn.
+    pub fn band_rect(&self, slot: usize) -> Rect {
+        Rect {
+            y: self.area.y + slot as u16 * (BAND_H + GAP_Y),
+            height: BAND_H,
+            ..self.area
+        }
+    }
+
+    /// The band's rule: its top row.
+    pub fn rule_rect(&self, slot: usize) -> Rect {
+        Rect {
+            height: BAND_RULE_H,
+            ..self.band_rect(slot)
+        }
+    }
+
+    /// The bands drawn with the cursor on `cursor`: where the window
+    /// starts, and how many whole bands follow it on screen.
+    pub fn window(&self, cursor: Option<usize>, total: usize) -> (usize, usize) {
+        let start = crate::app::window_start(cursor.unwrap_or(0), self.bands_fit);
+        let bottom = self.area.y + self.area.height;
+        let fits = (0..self.bands_fit)
+            .take_while(|&slot| {
+                let r = self.band_rect(slot);
+                r.y + r.height <= bottom
+            })
+            .count();
+        (start, total.saturating_sub(start).min(fits))
+    }
+
+    /// How many bands the window leaves off screen, either way.
+    pub fn hidden(&self, cursor: Option<usize>, total: usize) -> Hidden {
+        let (start, shown) = self.window(cursor, total);
+        Hidden {
+            above: start.min(total),
+            below: total.saturating_sub(start + shown),
+        }
+    }
+
+    /// How wide `card` is on this grid: a session's card one column, a
+    /// terminal's two ([`terminal_w`]).
+    pub fn card_width(&self, card: &Card) -> u16 {
+        if card.is_terminal() {
+            terminal_w(self.cols, self.card_w)
+        } else {
+            self.card_w
+        }
+    }
+
+    /// The first card `band`'s row draws with the cursor on `cursor`: the
+    /// stateless follow-window every list scrolls by
+    /// (`app::window_start`) — the row slides only as far as it must to
+    /// keep the cursor's card on it, as its last — counted in cards'
+    /// widths rather than rows, since a terminal's card is two columns
+    /// wide. With no cursor on the band the row starts at its first card.
+    pub fn strip_start(&self, band: &Band, cursor: Option<usize>) -> usize {
+        let Some(last) = band.cards.len().checked_sub(1) else {
+            return 0;
+        };
+        let Some(cursor) = cursor else {
+            return 0;
+        };
+        let cursor = cursor.min(last);
+        let mut start = cursor;
+        let mut used = self.card_width(&band.cards[cursor]);
+        while start > 0 {
+            let width = self.card_width(&band.cards[start - 1]);
+            if used + GAP_X + width > self.area.width {
+                break;
+            }
+            used += GAP_X + width;
+            start -= 1;
+        }
+        start
+    }
+
+    /// The cards of `band` along the row of the band in `slot` with the
+    /// cursor on `cursor`: from the first the follow-window keeps
+    /// ([`BandsLayout::strip_start`]), left to right, as many as fit — a
+    /// card is drawn whole or not at all — and how many the row left off
+    /// at either end.
+    pub fn strip(
+        &self,
+        slot: usize,
+        band_index: usize,
+        band: &Band,
+        cursor: Option<usize>,
+    ) -> Strip {
+        let row = self.band_rect(slot);
+        let y = row.y + BAND_RULE_H;
+        let right = row.x + row.width;
+        let start = self.strip_start(band, cursor);
+        let mut x = row.x;
+        let mut cards = Vec::new();
+        for (i, card) in band.cards.iter().enumerate().skip(start) {
+            let width = self.card_width(card);
+            if x + width > right {
+                break;
+            }
+            cards.push(Slot {
+                at: CardRef {
+                    band: band_index,
+                    card: i,
+                },
+                rect: Rect {
+                    x,
+                    y,
+                    width,
+                    height: CARD_H,
+                },
+            });
+            x += width + GAP_X;
+        }
+        let after = band.cards.len() - start - cards.len();
+        Strip {
+            cards,
+            before: start,
+            after,
+        }
+    }
+}
+
+/// One band's row of cards as the grid draws it: the cards that fit, and
+/// how many the row left off at either end — scrolled past its left edge
+/// to keep the cursor's card on the row, or past its right edge for want
+/// of room. Each count is what the `❮` / `❯` beside the row stands for
+/// (`ui::launcher_view::draw_strip_arrows`), and `h` / `l` walk the
+/// cursor onto them one card at a time (`event_loop::launcher::walk_band`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Strip {
+    pub cards: Vec<Slot>,
+    /// Cards before the first drawn.
+    pub before: usize,
+    /// Cards after the last drawn.
+    pub after: usize,
+}
+
+impl Strip {
+    /// Cards the row left off, either side: what the rule counts as
+    /// `▸ n more`.
+    pub fn hidden(&self) -> usize {
+        self.before + self.after
+    }
+}
+
+// ---- inside one WORKTREE ----
+
+/// The grid inside a worktree (Enter on its band): the sessions wrapped
+/// into rows under a `sessions` rule, the terminals — each two columns
+/// wide ([`terminal_w`]) — wrapped into rows of their own under a
+/// `terminals` rule that stands only once there is one, and `j`/`k`
+/// walking the rows of both as one column — off the last row of sessions
+/// is onto the first of terminals.
+///
+/// Taller than the body, it scrolls the way a terminal's screen does: by
+/// rows, through a window ([`InsideLayout::window`]), a card that
+/// straddles the window's edge drawn cut rather than left out — so the
+/// window is always full to its edges, and no card-sized hole opens
+/// where one that is a row too far up would have been. Where it is
+/// scrolled to is the app's ([`crate::app::App::launcher_scroll`]): the
+/// wheel moves it, a cursor move pulls it just far enough to bring the
+/// cursor's card whole on screen ([`InsideLayout::reveal`]), and the
+/// draw holds it within the layout ([`InsideLayout::clamp`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsideLayout {
+    pub area: Rect,
+    pub card_w: u16,
+    /// Every card's cell, by its index in the band, with `y` counted
+    /// from the top of the layout rather than the screen.
+    cells: Vec<Rect>,
+    /// The rules over each section: their row (counted the same way) and
+    /// what they say. Only a section with cards has one.
+    rules: Vec<(u16, &'static str)>,
+    /// The cards on each visual row, top to bottom and left to right:
+    /// what the cursor keys walk.
+    pub rows: Vec<Vec<usize>>,
+    /// Rows the whole layout takes.
+    height: u16,
+}
+
+/// What the two sections are called on their rules.
+pub const SESSIONS_RULE: &str = "sessions";
+pub const TERMINALS_RULE: &str = "terminals";
+
+/// `band`'s cards laid out in `body`.
+pub fn inside_layout(body: Rect, band: &Band) -> InsideLayout {
+    let g = grid(body);
+    let mut cells = vec![Rect::default(); band.cards.len()];
+    let mut rules = Vec::new();
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut y = 0u16;
+    // One section at a time: the sessions on the grid's columns, then the
+    // terminals on their wider ones (`terminal_w`) — fewer to a row, and
+    // no row at all, rule included, when the checkout has none.
+    for (terminal, label, cols, w) in [
+        (false, SESSIONS_RULE, g.cols, g.card_w),
+        (
+            true,
+            TERMINALS_RULE,
+            (g.cols / TERM_SPAN).max(1),
+            terminal_w(g.cols, g.card_w),
+        ),
+    ] {
+        let slots: Vec<usize> = band
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_terminal() == terminal)
+            .map(|(i, _)| i)
+            .collect();
+        if slots.is_empty() {
+            // The sessions' rule is the checkout's own (`draw_inside`
+            // draws the band's rule on it), and heads the grid even with
+            // no session under it. The terminals' says nothing without a
+            // terminal to say it of.
+            if !terminal {
+                rules.push((y, label));
+                y += BAND_RULE_H;
+            }
+            continue;
+        }
+        rules.push((y, label));
+        y += BAND_RULE_H;
+        for chunk in slots.chunks(cols.max(1)) {
+            let mut row = Vec::new();
+            for (col, i) in chunk.iter().enumerate() {
+                cells[*i] = Rect {
+                    x: g.area.x + col as u16 * (w + GAP_X),
+                    y,
+                    width: w,
+                    height: CARD_H,
+                };
+                row.push(*i);
+            }
+            rows.push(row);
+            y += CARD_H + GAP_Y;
+        }
+    }
+    InsideLayout {
+        area: g.area,
+        card_w: g.card_w,
+        cells,
+        rules,
+        rows,
+        height: y.saturating_sub(GAP_Y),
+    }
+}
+
+/// A card, or a rule, as the scrolled window lands it on screen: the
+/// part of it inside the window, and how many of its rows the window's
+/// edges cut off — none for one drawn whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed {
+    /// The rows of it on screen, in screen coordinates.
+    pub rect: Rect,
+    /// Rows of it above the window's top edge.
+    pub cut_top: u16,
+    /// Rows of it past the window's bottom edge.
+    pub cut_bottom: u16,
+}
+
+impl Placed {
+    /// Every row of it is on screen.
+    pub fn whole(&self) -> bool {
+        self.cut_top == 0 && self.cut_bottom == 0
+    }
+}
+
+/// The row kept under the window when the cards outrun it: where the
+/// `↓ N more below` marker stands, the twin of the header's row of air
+/// that the `↑` marker rides ([`HEAD_H`]).
+pub const BELOW_MARK_H: u16 = 1;
+
+impl InsideLayout {
+    /// The row and column of `card` in the walk.
+    pub fn row_of(&self, card: usize) -> Option<(usize, usize)> {
+        self.rows
+            .iter()
+            .enumerate()
+            .find_map(|(r, row)| row.iter().position(|&i| i == card).map(|c| (r, c)))
+    }
+
+    /// Rows the whole layout takes, scrolled or not.
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+
+    /// The layout is taller than the area: it scrolls, and a marker row
+    /// stands under the window.
+    pub fn overflows(&self) -> bool {
+        self.height > self.area.height
+    }
+
+    /// The rows of the area the cards scroll through: all of it when the
+    /// layout fits, else all but its last row, kept for the `↓ N more
+    /// below` marker ([`BELOW_MARK_H`]) — so the marker never paints over
+    /// a card's row, and a layout scrolled to its end leaves that row as
+    /// air, as the header's row of air stands over the top.
+    pub fn window(&self) -> Rect {
+        if self.overflows() {
+            Rect {
+                height: self.area.height.saturating_sub(BELOW_MARK_H),
+                ..self.area
+            }
+        } else {
+            self.area
+        }
+    }
+
+    /// The furthest the layout scrolls: the last row on the window's last
+    /// row. Zero when it fits.
+    pub fn max_scroll(&self) -> u16 {
+        self.height.saturating_sub(self.window().height)
+    }
+
+    /// `scroll` held within the layout: a scroll kept from a taller
+    /// layout, or a taller window, comes back to the last one this has.
+    pub fn clamp(&self, scroll: u16) -> u16 {
+        scroll.min(self.max_scroll())
+    }
+
+    /// `scroll` moved just far enough that `card` is whole on screen,
+    /// with the row over it — its section's rule on a first row, the air
+    /// between rows elsewhere — so a walk onto the first row brings the
+    /// checkout's rule back too. A card already whole moves nothing: a
+    /// wheel that left the cursor's card on screen is left alone. A card
+    /// taller than the window shows its top. Held within the layout.
+    pub fn reveal(&self, scroll: u16, card: usize) -> u16 {
+        let Some(cell) = self.cells.get(card) else {
+            return self.clamp(scroll);
+        };
+        let rows = self.window().height;
+        let top = cell.y.saturating_sub(BAND_RULE_H);
+        let bottom = cell.y + cell.height;
+        let mut scroll = scroll;
+        if bottom > scroll + rows {
+            scroll = bottom - rows;
+        }
+        if scroll > top {
+            scroll = top;
+        }
+        self.clamp(scroll)
+    }
+
+    /// Where `card` lands with the layout scrolled by `scroll`: the rows
+    /// of it inside the window, and what the window's edges cut off. None
+    /// when none of it is on screen.
+    pub fn cell(&self, card: usize, scroll: u16) -> Option<Placed> {
+        self.place(*self.cells.get(card)?, scroll)
+    }
+
+    /// [`InsideLayout::cell`] for any rect of the layout, `y` counted
+    /// from its top.
+    fn place(&self, rect: Rect, scroll: u16) -> Option<Placed> {
+        let window = self.window();
+        let (top, bottom) = (scroll, scroll + window.height);
+        let (y0, y1) = (rect.y.max(top), (rect.y + rect.height).min(bottom));
+        (y1 > y0).then(|| Placed {
+            rect: Rect {
+                y: window.y + (y0 - top),
+                height: y1 - y0,
+                ..rect
+            },
+            cut_top: y0 - rect.y,
+            cut_bottom: rect.y + rect.height - y1,
+        })
+    }
+
+    /// The rules on screen with the layout scrolled by `scroll`: each
+    /// one's row and its word. A rule is one row, so it is on screen
+    /// whole or not at all.
+    pub fn rules(&self, scroll: u16) -> Vec<(Rect, &'static str)> {
+        self.rules
+            .iter()
+            .filter_map(|&(y, label)| {
+                let rule = Rect {
+                    y,
+                    height: BAND_RULE_H,
+                    ..self.area
+                };
+                Some((self.place(rule, scroll)?.rect, label))
+            })
+            .collect()
+    }
+
+    /// The cards not whole on screen with the layout scrolled by
+    /// `scroll`, by which edge cuts them: one with rows above the
+    /// window's top is `above`, one with rows past its bottom `below` —
+    /// a card drawn cut counts, since the rest of it is what the marker
+    /// says there is more of.
+    pub fn hidden(&self, scroll: u16) -> Hidden {
+        let window = self.window();
+        let bottom = scroll + window.height;
+        let mut hidden = Hidden::default();
+        for cell in &self.cells {
+            if cell.y < scroll {
+                hidden.above += 1;
+            } else if cell.y + cell.height > bottom {
+                hidden.below += 1;
+            }
+        }
+        hidden
+    }
+
+    /// The card `dx` along its row and `dy` rows down from `at`, clamped
+    /// as [`grid_stepped`] clamps: a step along a row stops at its ends,
+    /// a step down the rows keeps the column and lands on a short row's
+    /// last card. From no cursor a forward step takes the first card and
+    /// a backward one the last. None only with no cards.
+    pub fn stepped(&self, at: Option<usize>, dx: i64, dy: i64) -> Option<usize> {
+        let last_row = self.rows.len().checked_sub(1)?;
+        let Some(at) = at else {
+            return if dx + dy >= 0 {
+                self.rows.first()?.first().copied()
+            } else {
+                self.rows.last()?.last().copied()
+            };
+        };
+        let (row, col) = self.row_of(at)?;
+        if dx != 0 {
+            let cells = &self.rows[row];
+            let col = (col as i64 + dx).clamp(0, cells.len() as i64 - 1) as usize;
+            return Some(cells[col]);
+        }
+        let row = (row as i64 + dy).clamp(0, last_row as i64) as usize;
+        let cells = &self.rows[row];
+        Some(cells[col.min(cells.len() - 1)])
+    }
+
+    /// Is `card` on the top row — where `k` walks up into the header?
+    pub fn on_top_row(&self, card: Option<usize>) -> bool {
+        match card {
+            Some(i) => self.row_of(i).is_some_and(|(r, _)| r == 0),
+            None => self.rows.is_empty(),
+        }
+    }
+}
+
 /// How many of `rows` are waiting on a human — the count the grid's
 /// header puts in red, the same status the red dot marks.
 pub fn needs_you(rows: &[LauncherRow]) -> usize {
@@ -683,16 +1339,8 @@ pub fn project_cards(app: &App) -> Vec<ProjectCard> {
 /// A project's sessions as its tab and its dropdown row count them: the
 /// unarchived ones in its checkouts, the ones wanting a human first, then
 /// the ones most recently interacted with — the grid's own
-/// `recency_key`, so the first is the session the grid opens on. A
-/// session in a hidden ROOT WORKTREE is left out, as the grid leaves it
-/// out.
+/// `recency_key`, so the first is the session the grid opens on.
 fn project_sessions(app: &App, project: &ProjectId) -> Vec<Agent> {
-    let hide_root = app
-        .tree
-        .projects
-        .iter()
-        .find(|p| &p.id == project)
-        .is_some_and(|p| app.root_hidden(p));
     // The project's checkouts once, not once per session: the tabs count
     // every open project's sessions on every frame, and a scan per agent
     // turned that into the tree squared.
@@ -700,7 +1348,7 @@ fn project_sessions(app: &App, project: &ProjectId) -> Vec<Agent> {
         .tree
         .worktrees
         .iter()
-        .filter(|w| &w.project_id == project && !(hide_root && w.is_main))
+        .filter(|w| &w.project_id == project)
         .map(|w| &w.id)
         .collect();
     let mut out: Vec<Agent> = app
@@ -798,16 +1446,14 @@ pub fn project_tabs(app: &App) -> Vec<ProjectTab> {
 /// project, else the one it was last left on), else its ROOT WORKTREE,
 /// else any checkout it has. Not where the box launches: that is the
 /// root or a fresh worktree ([`target_for`]).
-/// Never a stand-in git is still cutting, nor a root the project hides.
-/// None for a project with no usable checkout.
+/// Never a stand-in git is still cutting. None for a project with no
+/// usable checkout.
 pub fn checkout_for(app: &App, project: &ProjectId) -> Option<WorktreeId> {
-    let p = app.tree.projects.iter().find(|p| &p.id == project)?;
-    let hide_root = app.root_hidden(p);
     let usable = |id: &WorktreeId| {
         app.tree
             .worktrees
             .iter()
-            .any(|w| &w.id == id && &w.project_id == project && !(hide_root && w.is_main))
+            .any(|w| &w.id == id && &w.project_id == project)
             && !app.is_placeholder_worktree(id)
     };
     let selected = app
@@ -834,17 +1480,16 @@ pub fn checkout_for(app: &App, project: &ProjectId) -> Option<WorktreeId> {
 
 /// Where a launch from the box lands for `project`: a fresh worktree off
 /// the project's default base (`new_worktree` — the
-/// `quick_prompt_new_worktree` SETTING, or `^N` in the box), or the
-/// project's ROOT BRANCH ([`root_checkout`]). Never the checkout of the
-/// card under the cursor: more work in a session's own worktree is a
-/// FOLLOW-UP (Space on its card), not a new session. A project with no
-/// usable root — hidden, or still being cut — gets a fresh worktree
+/// `quick_prompt_new_worktree` SETTING, or `^N` in the box), or an
+/// existing checkout ([`launch_checkout`]): the worktree under the grid's
+/// cursor, else the project's ROOT BRANCH. A project with no usable
+/// checkout — still being cut, or none at all — gets a fresh worktree
 /// either way.
 pub fn target_for(app: &App, project: &ProjectId, new_worktree: bool) -> QuickTarget {
-    let root = (!new_worktree)
-        .then(|| root_checkout(app, project))
+    let existing = (!new_worktree)
+        .then(|| launch_checkout(app, project))
         .flatten();
-    match root {
+    match existing {
         Some(worktree) => QuickTarget::Worktree(worktree),
         None => QuickTarget::NewWorktree {
             project: project.clone(),
@@ -853,16 +1498,47 @@ pub fn target_for(app: &App, project: &ProjectId, new_worktree: bool) -> QuickTa
     }
 }
 
-/// `project`'s ROOT WORKTREE — the checkout its ROOT BRANCH lives in,
-/// which is where a launch from the box lands unless it cuts a fresh
-/// worktree ([`target_for`]). None for a project that hides its root,
-/// whose root git is still cutting, or that has no root checkout of its
-/// own.
-pub fn root_checkout(app: &App, project: &ProjectId) -> Option<WorktreeId> {
-    let p = app.tree.projects.iter().find(|p| &p.id == project)?;
-    if app.root_hidden(p) {
+/// The existing checkout a launch from the box lands in for `project`:
+/// the one under the grid's cursor when it is the project's own
+/// ([`cursor_checkout`]) — a prompt sent with a worktree's band under
+/// the cursor, or from inside the worktree, runs in that worktree, as
+/// `t`'s terminal does — else the project's ROOT BRANCH
+/// ([`root_checkout`]): the aim let go (Esc off the band), the cursor on
+/// a pull request or an issue, or a box re-aimed at another project with
+/// `^P`. A checkout still being cut is stepped over to the root. None
+/// for a project with no usable checkout at all.
+pub fn launch_checkout(app: &App, project: &ProjectId) -> Option<WorktreeId> {
+    cursor_checkout(app)
+        .filter(|id| {
+            app.tree
+                .worktrees
+                .iter()
+                .any(|w| &w.id == id && &w.project_id == project)
+                && !app.is_placeholder_worktree(id)
+        })
+        .or_else(|| root_checkout(app, project))
+}
+
+/// The checkout the GRID's cursor is on: the band it rests on, or the
+/// worktree the grid is inside — the SELECTED WORKTREE, while the aim is
+/// on it ([`App::launcher_aimed`]) and it has a band to be on. A
+/// selection resting on a checkout with nothing running has no row on
+/// screen, so there is nothing under the cursor to read; nor with the
+/// aim let go.
+pub fn cursor_checkout(app: &App) -> Option<WorktreeId> {
+    if !app.launcher_aimed() {
         return None;
     }
+    let bands = bands(app);
+    let band = band_cursor(app, &bands)?;
+    Some(bands[band].worktree.clone())
+}
+
+/// `project`'s ROOT WORKTREE — the checkout its ROOT BRANCH lives in,
+/// which is where a launch from the box lands with nothing under the
+/// grid's cursor ([`launch_checkout`]). None for a project whose root git
+/// is still cutting, or that has no root checkout of its own.
+pub fn root_checkout(app: &App, project: &ProjectId) -> Option<WorktreeId> {
     app.tree
         .worktrees
         .iter()
@@ -905,16 +1581,15 @@ pub fn project_name(app: &App, project: &ProjectId) -> Option<String> {
 
 /// One of the four details on the view's box: where the session runs —
 /// the project and the checkout in it — what runs there, on which model.
-/// Each is drawn with the chord that changes it beside it, the checkout
-/// with a `▾` (`ui::launcher_view::detail_line`), and each is a button — a
-/// click on one opens the very picker its chord does, through the one
+/// Each is drawn with the chord that changes it beside it
+/// (`ui::launcher_view::detail_line`), and each is a button — a click on
+/// one opens the very picker its chord does, through the one
 /// `event_loop::launcher::open_box_field` both ways in call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoxField {
     /// `^P` — the PROJECT the launch is aimed at.
     Project,
-    /// `▾` — the checkout in it the launch runs in: the WORKTREE PICKER,
-    /// which only a click opens.
+    /// `^T` — the checkout in it the launch runs in: the WORKTREE PICKER.
     Worktree,
     /// `Tab` — the harness that runs there.
     Agent,
@@ -1268,15 +1943,6 @@ mod tests {
         );
     }
 
-    /// A project that hides its ROOT WORKTREE hides its sessions from the
-    /// list too — the cursor could not land on them.
-    #[test]
-    fn a_hidden_root_keeps_its_sessions_off_the_list() {
-        let mut app = app();
-        app.project_fallback.hide_root_worktree = true;
-        assert_eq!(names(&rows(&app)), ["add-search"]);
-    }
-
     /// A row's pull request is what `gh pr view` said about its branch,
     /// else the project's OPEN PRS row on the same head branch; with
     /// neither, it has none.
@@ -1448,23 +2114,26 @@ mod tests {
         assert_eq!(g.page(), 1);
     }
 
-    /// With `^N` off the box lands on the project's ROOT BRANCH, whatever
-    /// card the cursor is on and whatever checkout the project was last
-    /// left on; a hidden root is never it, and a project with no usable
-    /// root gets a fresh worktree after all.
+    /// With `^N` off the box lands in the checkout under the grid's
+    /// cursor — the band it is on, or the worktree it is inside — and,
+    /// with the aim let go, on the project's ROOT BRANCH, whatever
+    /// checkout the project was last left on; another project's box
+    /// (`^P`) lands on that project's root, not this grid's cursor. With
+    /// `^N` on it cuts a fresh worktree.
     #[test]
-    fn a_launch_into_existing_work_lands_on_the_root_branch() {
+    fn a_launch_lands_in_the_cursors_checkout_or_on_the_root_branch() {
         let mut app = app();
         let api = ProjectId("p1".into());
         let root = QuickTarget::Worktree(WorktreeId("w1".into()));
+        let feat = QuickTarget::Worktree(WorktreeId("w2".into()));
         app.last_worktree_for_project
             .insert(api.clone(), WorktreeId("w2".into()));
         assert_eq!(
             target_for(&app, &api, false),
             root,
-            "not the remembered one"
+            "the cursor opens on the root's band, not the remembered one"
         );
-        // The cursor on api's other checkout: still the root.
+        // The cursor on api's other checkout: the box goes there.
         app.sel_worktree = app
             .worktree_rows()
             .iter()
@@ -1473,22 +2142,27 @@ mod tests {
         assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w2"));
         assert_eq!(
             target_for(&app, &api, false),
-            root,
-            "not the checkout under the cursor"
+            feat,
+            "the checkout under the cursor"
         );
+        // On the band as inside the worktree.
+        app.launcher_inside = false;
+        assert_eq!(target_for(&app, &api, false), feat, "on the band");
+        app.launcher_inside = true;
+        // Another project's box reads its own root, not this cursor.
+        assert_eq!(
+            target_for(&app, &ProjectId("p2".into()), false),
+            QuickTarget::Worktree(WorktreeId("w3".into())),
+            "web's root"
+        );
+        // The aim let go: nothing under the cursor, so the root.
+        app.launcher_unaimed = true;
+        assert_eq!(target_for(&app, &api, false), root, "unaimed");
+        app.launcher_unaimed = false;
         assert!(matches!(
             target_for(&app, &api, true),
             QuickTarget::NewWorktree { ref project, .. } if *project == api
         ));
-
-        app.project_fallback.hide_root_worktree = true;
-        assert!(
-            matches!(
-                target_for(&app, &api, false),
-                QuickTarget::NewWorktree { .. }
-            ),
-            "a hidden root is never the target"
-        );
     }
 
     /// The PROJECT DROPDOWN's list puts what is waiting on a human first,
@@ -1534,14 +2208,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["fix-login", "add-search"]
         );
-
-        // A project whose only checkout is a hidden root has no sessions
-        // to count, as its grid has none to list.
-        app.project_fallback.hide_root_worktree = true;
-        let cards = project_cards(&app);
-        let web = cards.iter().find(|c| c.name == "web").expect("web");
-        assert!(web.sessions.is_empty());
-        assert_eq!(web.status, None, "and no dot to wear");
     }
 
     /// A PROJECT TAB's tally counts every session its grid lists, each
@@ -1774,5 +2440,280 @@ mod tests {
         );
         picker.select(5);
         assert_eq!(picker.selected, picker.matches.len() - 1);
+    }
+
+    fn terminal(id: &str, worktree: &str, name: &str) -> nebula_core::TerminalTab {
+        nebula_core::TerminalTab {
+            id: nebula_core::TerminalId(id.into()),
+            worktree_id: WorktreeId(worktree.into()),
+            name: name.into(),
+            sort_order: 0,
+            alive: true,
+            run_command: None,
+        }
+    }
+
+    /// A terminal's card spans two of the grid's columns, gap included —
+    /// on a band's strip and inside the worktree alike — so the lines its
+    /// shell printed have room to read; a one-column grid gives it the
+    /// one. Inside, the terminals wrap by rows of their own width, and
+    /// the walk still runs down through them.
+    #[test]
+    fn terminal_cards_span_two_columns() {
+        let mut app = app();
+        app.tree.terminals = vec![
+            terminal("t1", "w1", "shell-1"),
+            terminal("t2", "w1", "shell-2"),
+            terminal("t3", "w1", "shell-3"),
+        ];
+        let all = super::bands(&app);
+        // Four columns: the session, then the first terminal beside it.
+        let body = Rect::new(0, 0, 150, 60);
+        let g = bands_layout(body);
+        assert_eq!(g.cols, 4, "150 columns hold four cards");
+        let wide = terminal_w(g.cols, g.card_w);
+        assert_eq!(wide, g.card_w * 2 + GAP_X);
+        let strip = g.strip(0, 0, &all[0], None);
+        let (more, cards) = (strip.hidden(), strip.cards);
+        assert_eq!(cards.len(), 2, "the session and one terminal fit");
+        assert_eq!(more, 2, "the rest are counted on the rule");
+        assert_eq!(cards[0].rect.width, g.card_w);
+        assert_eq!(cards[1].rect.width, wide, "two columns wide");
+        assert_eq!(cards[1].rect.x, cards[0].rect.x + g.card_w + GAP_X);
+
+        let layout = inside_layout(body, &all[0]);
+        let cell = |i: usize| layout.cell(i, 0).expect("the card's cell").rect;
+        let (session, first, second, third) = (cell(0), cell(1), cell(2), cell(3));
+        assert_eq!(first.width, wide, "inside the worktree too");
+        assert_eq!(first.x, session.x, "under the terminals rule, first column");
+        assert_eq!(
+            (second.x, second.y),
+            (first.x + wide + GAP_X, first.y),
+            "two to a row of four columns"
+        );
+        assert_eq!(
+            (third.x, third.y),
+            (first.x, first.y + CARD_H + GAP_Y),
+            "the third wraps"
+        );
+        assert_eq!(layout.rows, vec![vec![0], vec![1, 2], vec![3]]);
+        assert_eq!(
+            layout.stepped(Some(0), 0, 1),
+            Some(1),
+            "j goes down into them"
+        );
+
+        // One column: a terminal's card is the column's width.
+        let narrow = grid(Rect::new(0, 0, 50, 60));
+        assert_eq!(narrow.cols, 1);
+        assert_eq!(terminal_w(narrow.cols, narrow.card_w), narrow.card_w);
+    }
+
+    /// A band's row follows the cursor along it: it starts at the first
+    /// card until the cursor's card would fall off the right edge, then
+    /// slides just far enough to keep that card on the row as its last —
+    /// the follow-window every list scrolls by — and counts what it left
+    /// off either side. A terminal's card is two columns of it.
+    #[test]
+    fn the_bands_row_follows_the_cursor() {
+        let mut app = app();
+        app.tree.agents = (0..5)
+            .map(|i| agent(&format!("s{i}"), "w1", &format!("session-{i}")))
+            .collect();
+        app.tree.terminals = vec![terminal("t1", "w1", "shell-1")];
+        let all = super::bands(&app);
+        assert_eq!(all[0].cards.len(), 6, "five sessions and the terminal");
+        // 80 columns: two cards to a row, a terminal's card the whole row.
+        let g = bands_layout(Rect::new(0, 0, 80, 60));
+        assert_eq!(g.cols, 2);
+        let at = |cursor: Option<usize>| {
+            let s = g.strip(0, 0, &all[0], cursor);
+            (
+                s.cards.iter().map(|c| c.at.card).collect::<Vec<_>>(),
+                s.before,
+                s.after,
+            )
+        };
+        assert_eq!(at(None), (vec![0, 1], 0, 4), "no cursor: from the first");
+        assert_eq!(at(Some(0)), (vec![0, 1], 0, 4));
+        assert_eq!(at(Some(1)), (vec![0, 1], 0, 4), "still on the row");
+        assert_eq!(
+            at(Some(2)),
+            (vec![1, 2], 1, 3),
+            "one step past the edge: the row slides one"
+        );
+        assert_eq!(at(Some(4)), (vec![3, 4], 3, 1));
+        assert_eq!(
+            at(Some(5)),
+            (vec![5], 5, 0),
+            "the terminal's card is the whole row: two columns wide"
+        );
+        // Wherever the window starts, the first card drawn sits in the
+        // row's first column, and the rule counts both sides as hidden.
+        let s = g.strip(0, 0, &all[0], Some(4));
+        assert_eq!(s.cards[0].rect.x, g.area.x);
+        assert_eq!(s.hidden(), 4);
+    }
+
+    /// The screenshot's grid: nine sessions in two columns and three
+    /// terminals one to a row, in a body two rows short of the lot.
+    fn crowded() -> (App, Rect) {
+        let mut app = app();
+        app.tree.agents = (0..9)
+            .map(|i| agent(&format!("s{i}"), "w1", &format!("session {i}")))
+            .collect();
+        app.tree.terminals = (1..=3)
+            .map(|i| terminal(&format!("t{i}"), "w1", &format!("term-{i}")))
+            .collect();
+        (app, Rect::new(0, 0, 100, 58))
+    }
+
+    /// A grid taller than the body scrolls by rows through a window that
+    /// keeps its last row for the `↓` marker, and a card the window's top
+    /// edge cuts is placed cut rather than left out. The cursor walked
+    /// onto the first terminal used to draw the second row of sessions at
+    /// the top and nothing at all where the first row was — one row too
+    /// far up to be drawn whole, so a card-sized hole stood in for it.
+    #[test]
+    fn a_card_the_top_edge_cuts_is_placed_cut_not_dropped() {
+        let (app, body) = crowded();
+        let all = super::bands(&app);
+        let band = all.iter().find(|b| b.worktree.0 == "w1").unwrap();
+        assert_eq!(band.cards.len(), 12);
+        let layout = inside_layout(body, band);
+        assert_eq!(
+            layout.rows.len(),
+            8,
+            "five rows of sessions, three of terminals"
+        );
+        assert!(layout.overflows());
+        assert_eq!(
+            layout.window().height,
+            layout.area.height - BELOW_MARK_H,
+            "the marker's row is kept back"
+        );
+        assert_eq!(
+            layout.max_scroll(),
+            layout.height() - layout.window().height
+        );
+
+        // The first terminal is card 9: bringing it whole on screen
+        // scrolls two rows, and the first row of sessions loses one row
+        // to the top edge — and is still placed, one row short.
+        let scroll = layout.reveal(0, 9);
+        assert_eq!(scroll, 2);
+        let first = layout
+            .cell(0, scroll)
+            .expect("the first card is still placed");
+        assert_eq!((first.cut_top, first.cut_bottom), (1, 0));
+        assert!(!first.whole());
+        assert_eq!(
+            first.rect.y,
+            layout.window().y,
+            "its first row on screen is the window's first"
+        );
+        assert_eq!(first.rect.height, CARD_H - 1);
+        let term = layout.cell(9, scroll).expect("the cursor's card");
+        assert!(term.whole(), "the cursor's card is whole");
+        assert_eq!(
+            term.rect.y + term.rect.height,
+            layout.window().y + layout.window().height,
+            "on the window's last row"
+        );
+        // Both cards on the cut row count as above; the two terminals
+        // past the window count as below.
+        assert_eq!(layout.hidden(scroll), Hidden { above: 2, below: 2 });
+        // The sessions' rule is off the top; the terminals' is on.
+        assert_eq!(
+            layout
+                .rules(scroll)
+                .iter()
+                .map(|(_, l)| *l)
+                .collect::<Vec<_>>(),
+            [TERMINALS_RULE]
+        );
+    }
+
+    /// The scroll follows the cursor only as far as it must: a walk to
+    /// the last card scrolls to the layout's end, a walk back up onto the
+    /// first row scrolls all the way back — the rule over it comes too —
+    /// and a card already whole on screen moves nothing, so a wheel that
+    /// left the cursor's card in view is left alone. A scroll past the
+    /// end comes back to it.
+    #[test]
+    fn reveal_scrolls_just_far_enough_either_way() {
+        let (app, body) = crowded();
+        let all = super::bands(&app);
+        let band = all.iter().find(|b| b.worktree.0 == "w1").unwrap();
+        let layout = inside_layout(body, band);
+        let end = layout.reveal(2, 11);
+        assert_eq!(end, layout.max_scroll(), "the last terminal is at the end");
+        assert!(layout.cell(11, end).unwrap().whole());
+        assert_eq!(
+            layout.reveal(end, 0),
+            0,
+            "the first row brings the rule back"
+        );
+        assert_eq!(
+            layout.reveal(end, 2),
+            layout.cell(2, 0).unwrap().rect.y - layout.area.y - GAP_Y,
+            "the second row brings the air over it"
+        );
+        assert_eq!(layout.reveal(5, 4), 5, "a card already whole moves nothing");
+        assert_eq!(layout.clamp(500), layout.max_scroll());
+        assert_eq!(layout.reveal(500, 11), layout.max_scroll());
+    }
+
+    /// A layout that fits has nothing to scroll: no marker row kept back,
+    /// no scroll at all whatever is asked for, nothing hidden.
+    #[test]
+    fn a_layout_that_fits_never_scrolls() {
+        let app = app();
+        let all = super::bands(&app);
+        let layout = inside_layout(Rect::new(0, 0, 80, 60), &all[0]);
+        assert!(!layout.overflows());
+        assert_eq!(layout.window(), layout.area);
+        assert_eq!(layout.max_scroll(), 0);
+        assert_eq!(layout.reveal(7, 0), 0);
+        assert_eq!(layout.clamp(7), 0);
+        assert_eq!(layout.hidden(0), Hidden::default());
+        assert!(layout.cell(0, 0).unwrap().whole());
+    }
+
+    /// A checkout with no terminal has no `terminals` section inside it:
+    /// the sessions' rule heads the grid alone, the layout ends with the
+    /// last session and the walk on it. The rule comes with the first
+    /// terminal.
+    #[test]
+    fn no_terminals_no_terminals_section() {
+        let body = Rect::new(0, 0, 80, 60);
+        let mut app = app();
+        let all = super::bands(&app);
+        let layout = inside_layout(body, &all[0]);
+        assert_eq!(
+            layout.rules(0).iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            [SESSIONS_RULE],
+            "no rule over nothing"
+        );
+        assert_eq!(layout.rows, vec![vec![0]]);
+        assert_eq!(
+            layout.stepped(Some(0), 0, 1),
+            Some(0),
+            "j has nowhere to go"
+        );
+        assert_eq!(
+            layout.height,
+            BAND_RULE_H + CARD_H,
+            "the layout ends with the session"
+        );
+
+        app.tree.terminals = vec![terminal("t1", "w1", "shell-1")];
+        let all = super::bands(&app);
+        let layout = inside_layout(body, &all[0]);
+        assert_eq!(
+            layout.rules(0).iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            [SESSIONS_RULE, TERMINALS_RULE]
+        );
+        assert_eq!(layout.rows, vec![vec![0], vec![1]]);
     }
 }

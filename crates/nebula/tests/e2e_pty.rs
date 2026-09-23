@@ -244,6 +244,12 @@ fn find_ack(events: &[ServerEvent], want_req: u64) -> Option<&ServerEvent> {
     })
 }
 
+fn find_tail(events: &[ServerEvent], want_req: u64) -> Option<&ServerEvent> {
+    events
+        .iter()
+        .find(|e| matches!(e, ServerEvent::OutputTail { req_id, .. } if *req_id == want_req))
+}
+
 fn collected_output(events: &[ServerEvent]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in events {
@@ -367,6 +373,76 @@ async fn full_crud_attach_and_restart_persistence() {
     assert!(
         text.contains("repo"),
         "terminal cwd should be the worktree: {text}"
+    );
+
+    // ---- TailOutput: the end of the ring, for the grid's terminal card ----
+    write_frame(
+        &mut c,
+        &ClientRequest::TailOutput {
+            req_id: 900,
+            session: sref.clone(),
+            max_bytes: 4096,
+            after_seq: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events =
+        read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_tail(evs, 900).is_some()).await;
+    let Some(ServerEvent::OutputTail {
+        tail: Some(tail), ..
+    }) = find_tail(&events, 900)
+    else {
+        panic!("TailOutput answered with no tail: {events:#?}");
+    };
+    let text = String::from_utf8_lossy(&tail.data).into_owned();
+    assert!(text.contains(marker), "the tail holds the marker: {text}");
+    assert_eq!((tail.cols, tail.rows), (80, 24), "at the attached size");
+    assert!(tail.end_seq as usize >= tail.data.len());
+    // Asked again from where that left off, a ring that has not grown
+    // answers with no bytes.
+    write_frame(
+        &mut c,
+        &ClientRequest::TailOutput {
+            req_id: 901,
+            session: sref.clone(),
+            max_bytes: 4096,
+            after_seq: Some(tail.end_seq),
+        },
+    )
+    .await
+    .unwrap();
+    let events =
+        read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_tail(evs, 901).is_some()).await;
+    let Some(ServerEvent::OutputTail {
+        tail: Some(again), ..
+    }) = find_tail(&events, 901)
+    else {
+        panic!("TailOutput answered with no tail: {events:#?}");
+    };
+    if again.end_seq == tail.end_seq {
+        assert!(again.data.is_empty(), "nothing new, no bytes: {again:?}");
+    }
+    // A session with no PTY has no tail at all.
+    write_frame(
+        &mut c,
+        &ClientRequest::TailOutput {
+            req_id: 902,
+            session: SessionRef::Terminal(nebula_core::TerminalId("no-such".into())),
+            max_bytes: 4096,
+            after_seq: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events =
+        read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_tail(evs, 902).is_some()).await;
+    assert!(
+        matches!(
+            find_tail(&events, 902),
+            Some(ServerEvent::OutputTail { tail: None, .. })
+        ),
+        "{events:#?}"
     );
 
     // ---- CreateAgent (NEBULA_AGENT_CMD=/bin/sh stands in for claude) ----

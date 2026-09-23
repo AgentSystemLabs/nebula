@@ -136,12 +136,17 @@ pub enum Action {
     /// COMPOSER — the next turn typed into the card itself — or fold it
     /// back up.
     FollowUp,
+    /// `Shift+P`: the QUICK PROMPT on the card under the cursor's settings
+    /// — the same harness, model, effort and worktree, and the issue it
+    /// was started from — so the task is all there is to type. `p` opens
+    /// the box on the Agents tab defaults; the shifted key opens it on
+    /// the card.
+    DuplicateSession,
     // files
     FindFile,
     Grep,
     TreeBrowser,
     // terminal
-    Zoom,
     UnlockTerminal,
     // general
     /// `^~`: fold the LAUNCHER VIEW's PANE away and give the cards the
@@ -543,7 +548,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Delete,
         id: "delete",
         label: "Delete selected",
-        hint: "Remove the selected row, behind a confirmation",
+        hint: "Remove the selected row, behind a confirmation. With the PROJECT TABS holding the keys, close the tab under their cursor, behind the same kind of confirmation — x closes it outright",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["d", "delete", "backspace"],
@@ -584,6 +589,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         scope: Scope::Global,
         defaults: &["space"],
     },
+    ActionSpec {
+        action: Action::DuplicateSession,
+        id: "duplicate_session",
+        label: "Duplicate session",
+        hint: "Open the quick prompt set to launch what the selected card runs — the same harness, model, effort and worktree — so only the task is left to type. p opens the box on the defaults; ⇧P on the card",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["shift+p"],
+    },
     // ---- FILES ----
     ActionSpec {
         action: Action::FindFile,
@@ -613,15 +627,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         defaults: &["b"],
     },
     // ---- TERMINAL ----
-    ActionSpec {
-        action: Action::Zoom,
-        id: "zoom",
-        label: "Full-screen terminal",
-        hint: "Collapse the sidebars and lock input into the attached session",
-        group: "TERMINAL",
-        scope: Scope::Global,
-        defaults: &["z"],
-    },
     ActionSpec {
         action: Action::UnlockTerminal,
         id: "unlock_terminal",

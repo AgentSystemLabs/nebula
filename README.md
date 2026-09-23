@@ -1,3 +1,8 @@
+> [!WARNING]
+> **Work in progress.** nebula is built for one person's workflow — mine — and it changes fast as I iterate on it.
+> Expect breaking changes between releases: keys that move, screens that get redrawn, features that come and go
+> without notice. If it's close to what you want, fork or clone it and bend it into what you need it to be.
+
 <div align="center">
 
 *"Whatever you do, work heartily, as for the Lord and not for men."* — Colossians 3:23 (ESV)

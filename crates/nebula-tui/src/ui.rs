@@ -211,6 +211,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_screen(f: &mut Frame, app: &mut App) {
     app.hits.clear();
+    app.tail_cards.clear();
     app.host_cursor = None;
     app.welcome_on_screen = false;
 
@@ -381,6 +382,48 @@ pub(crate) fn over_box_rect(frame: Rect, over: Option<Rect>, width: u16, height:
         }
         _ => centered_rect(frame, width, height),
     }
+}
+
+/// The footer bar's keys while `menu` is up, for the menus that have keys
+/// of their own beyond Enter and Esc: the session pickers (the `?` jump
+/// to the hovered harness's Agents section, and `Tab` on a Claude row
+/// that can go to the cloud, with the state it would flip) and their
+/// type-ahead MODEL / EFFORT submenus. None for a plain context menu,
+/// which keeps the generic `Esc: close  Enter: confirm`. The keys live
+/// down here, not in the modal's bottom border, so the modal stays as
+/// narrow as its rows.
+pub(crate) fn menu_footer_hint(menu: &crate::app::ContextMenu) -> Option<String> {
+    let agent_jump = menu.hovered_agent_kind().is_some();
+    if menu.filter.is_some() {
+        return Some(
+            if agent_jump {
+                "type to filter  ↑/↓: move  Backspace: widen  ?: settings  Enter: pick  Esc: back"
+            } else {
+                "type to filter  ↑/↓: move  Backspace: widen  Enter: pick  Esc: back"
+            }
+            .to_string(),
+        );
+    }
+    let cloud = menu.hovered_claude_cloud().map(|on| {
+        if on {
+            "Tab: cloud on  "
+        } else {
+            "Tab: cloud off  "
+        }
+    });
+    if cloud.is_none() && !agent_jump {
+        return None;
+    }
+    // A picker opened from the QUICK PROMPT is owed its box back.
+    let esc = if crate::event_loop::menu_quick_return(menu).is_some_and(|back| back.from_box) {
+        "Esc: back to the box"
+    } else {
+        "Esc: close"
+    };
+    Some(format!(
+        "{}s/?: settings  Enter: pick  {esc}",
+        cloud.unwrap_or("")
+    ))
 }
 
 /// The box a menu floats over: the QUICK PROMPT its rows owe back, drawn
@@ -643,29 +686,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // Rows that expand into a submenu get a right-aligned ▸ in an
             // extra column so the affordance is visible before hovering.
             let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
-            // A filtered list carries its keys in the bottom border; the
-            // modal widens to fit. Session pickers add the `?` jump to the
-            // hovered harness's Agents section.
-            let agent_jump = menu.hovered_agent_kind().is_some();
-            let hint = if menu.filter.is_some() {
-                Some(if agent_jump {
-                    " type to filter  ?: settings  ↑↓: move  Backspace  Esc: back "
-                } else {
-                    " type to filter  ↑↓: move  Backspace  Esc: back "
-                })
-            } else {
-                match menu.hovered_claude_cloud() {
-                    Some(cloud) => Some(if cloud {
-                        " Tab: cloud on   s/?: settings "
-                    } else {
-                        " Tab: cloud off   s/?: settings "
-                    }),
-                    None => agent_jump.then_some(" s/?: settings "),
-                }
-            };
+            // The modal is as wide as its rows or its title, whichever is
+            // longer, and no wider: its keys go in the footer bar (see
+            // `menu_footer_hint`), not in the bottom border, so a hint
+            // that outgrows the rows — the pickers' `Tab: cloud off  s/?:
+            // settings` did, doubling the width of a six-row list — never
+            // pads the modal with empty space, and hovering a row with more
+            // keys (the Claude row's Tab) never resizes it.
             let width = (label_w + 4 + if any_submenu { 2 } else { 0 })
                 .max(title_width + 2)
-                .max(hint.map_or(0, |h| h.chars().count() + 2))
                 .min(f.area().width as usize) as u16;
             let height = menu.items.len() as u16 + 2;
             let area = match at {
@@ -696,12 +725,13 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ));
             }
-            if let Some(hint) = hint {
-                block =
-                    block.title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
-            }
             let inner = block.inner(area);
             f.render_widget(block, area);
+            // Every row spans the modal — the hovered row's bar reaches
+            // the border, and the ▸ sits at the right edge — so a title
+            // wider than the rows leaves no ragged gap beside them.
+            let row_w = inner.width as usize;
+            let label_w = row_w.saturating_sub(if any_submenu { 4 } else { 2 });
             for (i, item) in menu.items.iter().enumerate() {
                 let Some(row) = row_rect(inner, i) else { break };
                 let mut style = if item.destructive {
@@ -717,7 +747,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 } else if any_submenu {
                     format!(" {:<label_w$}   ", item.label)
                 } else {
-                    format!(" {} ", item.label)
+                    format!(" {:<label_w$} ", item.label)
                 };
                 f.render_widget(Paragraph::new(Span::styled(text, style)), row);
             }
@@ -974,6 +1004,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "SESSIONS",
                     &[
                         (Act(&[New]), "new agent (pick CLI kind)"),
+                        (
+                            Act(&[DuplicateSession]),
+                            "quick prompt on the card's settings",
+                        ),
                         (Act(&[AgentPresets]), "agent presets: saved launches"),
                         (Act(&[NewTerminal]), "new shell terminal"),
                         (Act(&[Activate]), "attach session / open link"),
@@ -990,7 +1024,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "TERMINAL & MOUSE",
                     &[
-                        (Act(&[Activate, Zoom]), "lock input (2nd: full-screen)"),
+                        (Act(&[Activate]), "lock input"),
                         (Act(&[UnlockTerminal]), "unlock, back to panels"),
                         (Lit("drag"), "select + copy (2×click: word)"),
                         (Lit("click / drag"), "an app that took the mouse gets it"),
@@ -2812,6 +2846,62 @@ pub(crate) fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
     }
 }
 
+/// The `↗ open in browser` BUTTON's label, spaces and all.
+pub(crate) const BROWSER_BUTTON: &str = " ↗ open in browser ";
+
+/// The `↗ open in browser` BUTTON on a reading pane's top border — the
+/// ISSUES and PULL REQUESTS MODALS' right frame (`HitTarget::ModalBrowser`).
+/// Drawn over the border after the block has, pinned right, and its rect
+/// handed back for the modal to write into its view, where the click
+/// (`handle_mouse`) and the pointer ([`browser_button_under`]) find it.
+/// `title_w` is the width of the frame's own title on the left, spaces
+/// included: the button is left off — `Rect::default()`, which no point is
+/// inside — when the frame cannot hold both a cell apart, since a label
+/// written over the title would read as neither. `hovered` underlines it in
+/// the accent, the mark the header's buttons take while the pointer rests
+/// on them; otherwise it wears the frame title's muted.
+pub(crate) fn browser_button(
+    f: &mut Frame,
+    frame: Rect,
+    title_w: u16,
+    hovered: bool,
+    th: Theme,
+) -> Rect {
+    let w = BROWSER_BUTTON.chars().count() as u16;
+    // The left corner, the title, a cell of air, the button, the right corner.
+    if frame.height == 0 || frame.width < 1 + title_w + 1 + w + 1 {
+        return Rect::default();
+    }
+    let rect = Rect {
+        x: frame.x + frame.width - 1 - w,
+        y: frame.y,
+        width: w,
+        height: 1,
+    };
+    let style = if hovered {
+        Style::default()
+            .fg(th.accent)
+            .add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(th.muted)
+    };
+    f.render_widget(Paragraph::new(Span::styled(BROWSER_BUTTON, style)), rect);
+    rect
+}
+
+/// The `↗ open in browser` BUTTON under the pointer: `HitTarget::ModalBrowser`
+/// when a modal with one is up and `pos` is on it, what
+/// `event_loop::update_pointer` puts in `App::hover_crumb` — the modals
+/// keep their rects outside the hit map, as they do their list edges.
+pub(crate) fn browser_button_under(app: &App, pos: Position) -> Option<HitTarget> {
+    let button = match &app.overlay {
+        Some(Overlay::PullRequests(v)) => v.browser_area,
+        Some(Overlay::Issues(v)) => v.browser_area,
+        _ => return None,
+    };
+    button.contains(pos).then_some(HitTarget::ModalBrowser)
+}
+
 /// One piece of the PR & ISSUE COUNTS badge: its text, its style, and the
 /// button it is, if it is one.
 pub(crate) type BadgePart = (String, Style, Option<HitTarget>);
@@ -3834,6 +3924,11 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             "type: filter  Enter: open the project  ↑/↓: move  Esc: close",
             Style::default().fg(th.dim),
         )
+    } else if let Some(hint) = app.overlay.as_ref().and_then(|o| match o {
+        Overlay::Menu(m) => menu_footer_hint(m),
+        _ => None,
+    }) {
+        Span::styled(hint, Style::default().fg(th.dim))
     } else if matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::QuickPrompt(_)))
     {
         // `^P`, `^O`, `Tab` and `^N` are on the box itself now, each
@@ -4320,8 +4415,21 @@ pub(crate) fn fuzzy_highlight_spans(
     positions: &[usize],
     th: Theme,
 ) -> Vec<Span<'static>> {
+    fuzzy_highlight_styled(shown, positions, Style::default(), th)
+}
+
+/// [`fuzzy_highlight_spans`] for text that has a color of its own — a
+/// pull request row's title, red for one that cannot merge — `base` on
+/// the runs the filter did not match, the accent highlight on the ones
+/// it did.
+pub(crate) fn fuzzy_highlight_styled(
+    shown: &str,
+    positions: &[usize],
+    base: Style,
+    th: Theme,
+) -> Vec<Span<'static>> {
     if positions.is_empty() {
-        return vec![Span::raw(shown.to_string())];
+        return vec![Span::styled(shown.to_string(), base)];
     }
     let hl = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
@@ -4332,7 +4440,7 @@ pub(crate) fn fuzzy_highlight_spans(
             spans.push(if lit {
                 Span::styled(text, hl)
             } else {
-                Span::raw(text)
+                Span::styled(text, base)
             });
         }
     };

@@ -40,6 +40,7 @@ pub mod remote;
 pub mod review;
 pub mod splash;
 pub mod syntax;
+pub mod terminal_tail;
 pub mod text_input;
 pub mod theme;
 pub mod tree_browser;

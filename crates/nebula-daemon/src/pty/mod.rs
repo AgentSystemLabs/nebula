@@ -431,6 +431,27 @@ impl PtySession {
         self.ring.lock().unwrap().snapshot_from(from_seq)
     }
 
+    /// The end of the ring for a grid card's preview (`TailOutput`): the
+    /// last `max_bytes`, with the PTY's size for the client to lay them
+    /// out against. No bytes when the ring has not grown past `after_seq`
+    /// — the card already has them.
+    pub fn tail(&self, max_bytes: usize, after_seq: Option<u64>) -> nebula_core::OutputTail {
+        let (cols, rows) = *self.last_size.lock().unwrap();
+        let ring = self.ring.lock().unwrap();
+        let end_seq = ring.end_seq();
+        let data = if after_seq == Some(end_seq) {
+            Vec::new()
+        } else {
+            ring.tail(max_bytes)
+        };
+        nebula_core::OutputTail {
+            cols,
+            rows,
+            end_seq,
+            data,
+        }
+    }
+
     /// The child's current kitty keyboard flags (0 = legacy).
     pub fn kitty_flags(&self) -> u8 {
         self.kitty.lock().unwrap().flags()

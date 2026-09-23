@@ -20,8 +20,10 @@ use crate::app::{App, PendingIntent, PlaceholderRows, PromptKind};
 use crate::quick_prompt::{QuickLaunch, QuickTarget};
 use nebula_core::{AgentId, ClientRequest, WorktreeId};
 
-/// Enter in the box, with `text` already sized — and non-empty, unless
-/// the box `launches_empty` (one an AGENT PRESET is on, sent as it is).
+/// Enter in the box, with `text` already sized — and empty as often as
+/// not (`QuickLaunch::launches_empty`): sent as it is, a box an AGENT
+/// PRESET is on launches on the prefix and postfix alone, any other
+/// starts the CLI with no first prompt.
 pub(super) fn submit(
     app: &mut App,
     launch: QuickLaunch,
@@ -116,13 +118,11 @@ pub(super) fn submit(
 
 /// What every launch the screen follows does at once: the new session is
 /// put where it can be seen without the keys going with it. The PANE
-/// under the grid unfolds if `^~` had folded it away, and comes off any
-/// TERMINAL tab it was pinned to — a shell in the same checkout would
-/// otherwise go on standing in front of the session the Ack attaches.
-/// Where FOCUS goes is `focus_pane`'s alone (`quick_prompt_focus`).
+/// beside the grid unfolds if `^~` had folded it away; the Ack lands the
+/// cursor on the new card, inside its worktree. Where FOCUS goes is
+/// `focus_pane`'s alone (`quick_prompt_focus`).
 fn reveal_pane(app: &mut App) {
     app.launcher_pane_hidden = false;
-    app.launcher_terminal = None;
     app.dirty = true;
 }
 
@@ -369,10 +369,11 @@ mod tests {
         });
     }
 
-    /// A pane pinned to a TERMINAL of the same checkout lets it go: the
-    /// shell would otherwise go on standing in front of the new session.
+    /// A pane reading a TERMINAL's chip in the same checkout lets it go:
+    /// the launch lands on the new session, the shell no longer standing
+    /// in front of it.
     #[test]
-    fn enter_takes_the_pane_off_a_terminal_tab() {
+    fn enter_takes_the_pane_off_a_terminal_chip() {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
@@ -391,10 +392,13 @@ mod tests {
             );
             draw(&mut app);
             key(&mut app, KeyCode::Char('`'), KeyModifiers::NONE);
-            assert!(app.pinned_terminal().is_some(), "the pane is on the shell");
+            assert_eq!(
+                pane(&app),
+                Some(SessionRef::Terminal(TerminalId("t1".into()))),
+                "the pane is on the shell"
+            );
 
             let (req_id, worktree) = launch(&mut app, KeyModifiers::NONE);
-            assert_eq!(app.launcher_terminal, None, "the pin is let go of");
             acked(&mut app, req_id, &worktree);
             assert_eq!(pane(&app), new_session());
             assert_eq!(app.focus, Focus::Sessions);

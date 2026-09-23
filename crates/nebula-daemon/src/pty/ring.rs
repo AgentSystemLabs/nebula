@@ -44,6 +44,13 @@ impl ScrollbackRing {
         self.end_seq
     }
 
+    /// The last `max` bytes retained — the whole ring when it holds fewer
+    /// — for a grid card's preview of what the session last printed.
+    pub fn tail(&self, max: usize) -> Vec<u8> {
+        let from = self.end_seq.saturating_sub(max as u64);
+        self.snapshot_from(Some(from)).1
+    }
+
     /// Everything retained from `from_seq` onward. If `from_seq` has fallen
     /// off the ring (or is None), returns the whole ring — the client resets
     /// its parser before applying a replay whose base != its requested seq.
@@ -115,6 +122,17 @@ mod tests {
         let (base, data) = r.snapshot_from(Some(2));
         assert_eq!(base, 4);
         assert_eq!(data, b"efgh");
+    }
+
+    #[test]
+    fn tail_is_the_last_bytes_or_the_whole_ring() {
+        let mut r = ScrollbackRing::new(8);
+        r.append(b"abcdef");
+        assert_eq!(r.tail(4), b"cdef");
+        assert_eq!(r.tail(100), b"abcdef");
+        r.append(b"ghij"); // "cdefghij" retained
+        assert_eq!(r.tail(3), b"hij");
+        assert_eq!(r.tail(0), b"");
     }
 
     #[test]

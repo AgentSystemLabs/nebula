@@ -8,7 +8,7 @@ use nebula_core::{
     TerminalId, TerminalTab, Worktree, WorktreeId,
 };
 use ratatui::layout::{Position, Rect};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Frame duration of the status-sweep text animation: the event loop's
@@ -79,17 +79,27 @@ pub enum HitTarget {
     /// The session URL on the CLOUD SESSION PANEL; a click opens it in the
     /// browser. Registered ahead of the pane it sits on, so it wins.
     CloudSessionLink,
-    /// A card in the LAUNCHER VIEW's GRID, by its place in
-    /// `launcher::rows`.
-    LauncherRow(usize),
-    /// The PULL REQUEST LINE on that card — its `↗ #42 title` row, by the
-    /// same place in `launcher::rows` — registered ahead of the card, so
-    /// it wins: a click lands the cursor on the card and opens the pull
-    /// request in the browser, through the very
-    /// `launcher::open_pull_request` `⇧V` runs. Only a card with a pull
-    /// request has one, and it is only as wide as the line's text, so the
-    /// air after a short title is still the card's.
-    LauncherCardPr(usize),
+    /// A card in the LAUNCHER VIEW's GRID — a session or a terminal — by
+    /// its place in `launcher::bands`: a click lands the cursor on it,
+    /// inside its worktree.
+    LauncherCard(crate::launcher::CardRef),
+    /// A BAND's rule on the grid — the checkout's own row over its cards,
+    /// by the band's place in `launcher::bands`: a click puts the cursor
+    /// on the band, as `j`/`k` walking onto it do.
+    LauncherBand(usize),
+    /// The PULL REQUEST on a band's rule — its `↗ #42 title` — registered
+    /// ahead of the rule, so it wins: a click opens the pull request in
+    /// the browser, through the very `launcher::open_pull_request` `⇧V`
+    /// runs. Only a checkout with a pull request has one, and it is only
+    /// as wide as its text, so the rest of the rule is still the band's.
+    LauncherBandPr(WorktreeId),
+    /// The `❮` / `❯` beside a BAND's row of cards on the grid, by the
+    /// band's place in `launcher::bands` — drawn only while the row has
+    /// cards off that edge: a click steps the cursor one card that way
+    /// along the band, the very step `h` / `l` take on it
+    /// (`event_loop::launcher::walk_band`).
+    LauncherStripLeft(usize),
+    LauncherStripRight(usize),
     /// The `‹ sessions` crumb in a full-screen session's header
     /// (LAUNCHER VIEW): a click leaves the session for the grid, as `^q`
     /// does.
@@ -112,21 +122,6 @@ pub enum HitTarget {
     /// pane opens with, plus the grid row above it. Registered ahead of
     /// the cards so a card ending on that row never swallows the grab.
     LauncherPaneSplitter,
-    /// The `SESSION` tab at the head of the LAUNCHER VIEW's PANE: a click
-    /// takes the pane off whichever TERMINAL it was reading and back onto
-    /// the card under the cursor.
-    LauncherPaneSession,
-    /// A TERMINAL tab in that same header, by its place in
-    /// `App::pane_terminals` — the current checkout's terminals, in tree
-    /// order. A click reads that terminal in the pane.
-    LauncherPaneTerminal(usize),
-    /// The `×` on that tab. Its own target rather than a corner of the
-    /// tab's, so a click on the cross can never read as a click on the
-    /// tab it closes.
-    LauncherPaneCloseTerminal(usize),
-    /// `t opens a terminal here`, where the strip's terminal tabs would
-    /// be in a checkout with none: a click opens one, the way `t` does.
-    LauncherPaneNewTerminal,
     /// The CLOSE BUTTON at the right end of that header: a click folds
     /// the pane away, the same `event_loop::launcher::toggle_pane` `^~`
     /// runs.
@@ -150,6 +145,15 @@ pub enum HitTarget {
     /// The footer's right-edge readout (`2 agents · 1 term · 412 MB`): a
     /// click opens the memory modal — the one `⇧M` opens.
     FooterUsage,
+    /// The `↗ open in browser` BUTTON on the ISSUES and PULL REQUESTS
+    /// MODALS' reading pane, pinned right on its top border: a click opens
+    /// the row under the cursor in the browser, through the very function
+    /// the modal's `o` runs (`pr_modal::open_in_browser`,
+    /// `issues::open_in_browser`). The modals route their own mouse off
+    /// the rects they write back at draw time, so this is never in the hit
+    /// map: it is what `hover_crumb` holds while the pointer rests on the
+    /// button (`ui::browser_button_under`), so the draw can underline it.
+    ModalBrowser,
 }
 
 /// Default widths of the Projects / Worktrees / Sessions panels. Sessions
@@ -289,6 +293,10 @@ pub enum MenuAction {
     /// doesn't: the card is the selection, and Space reads it off the
     /// cursor the same way.
     FollowUp,
+    /// A card menu's **Duplicate**: the QUICK PROMPT on this session's
+    /// settings — `launcher::duplicate_agent`, what `⇧P` runs on the card
+    /// under the cursor. Carries the id, as the row's other verbs do.
+    DuplicateAgent(AgentId),
     EditLink(LinkId),
     DeleteLink(LinkId),
     DeleteWorktree(WorktreeId),
@@ -315,8 +323,8 @@ pub enum MenuAction {
     /// Flip the `hide_draft_prs` SETTING from the Worktrees panel menu:
     /// drafts out of the group and `/`, or back in.
     ToggleDraftPrs,
-    /// A row of the WORKTREE PICKER a click on the NEW SESSION box's branch
-    /// opens: aim this one launch at `target` — one of the project's
+    /// A row of the WORKTREE PICKER `^T` (or a click on the NEW SESSION
+    /// box's branch) opens: aim this one launch at `target` — one of the project's
     /// checkouts, or a fresh worktree — and hand the box back with its
     /// text. It picks where the session runs, never what branch a checkout
     /// is on: that is the BRANCH SWITCHER's (`SwitchBranch`).
@@ -482,8 +490,8 @@ impl ContextMenu {
             .any(|i| matches!(i.action, MenuAction::OpenProject(_)))
     }
 
-    /// Is this the WORKTREE PICKER a click on the NEW SESSION box's branch
-    /// opens? It is drawn hanging from that branch.
+    /// Is this the WORKTREE PICKER `^T` (or a click on the NEW SESSION
+    /// box's branch) opens? It is drawn hanging from that branch.
     pub fn is_launch_worktree_picker(&self) -> bool {
         self.items
             .iter()
@@ -574,6 +582,10 @@ pub enum PendingAction {
         terminals: Vec<TerminalId>,
     },
     RemoveProject(ProjectId),
+    /// `d`, `Delete` or `Backspace` with the PROJECT TABS holding the
+    /// keys: close the tab under the header's cursor once the dialog is
+    /// answered (`event_loop::launcher::close_cursor_tab`, the `x`).
+    CloseProjectTab(ProjectId),
     DeleteLink(LinkId),
     /// `d` in the AGENT PRESETS list: drop the preset at `index` from the
     /// store. Both answers reopen the list for `worktree` — as the QUICK
@@ -765,13 +777,13 @@ pub struct PromptDialog {
     /// same as `^N`. Empty on every other box, and an empty rect contains
     /// no point — so no other box has to know about it.
     pub toggle_area: Rect,
-    /// The box's four details — `project ^P`, `worktree main ▾`, `agent
+    /// The box's four details — `project ^P`, `worktree main ^T`, `agent
     /// Tab`, `model ^O` — and the columns each was drawn in, written
     /// during draw: a click on one opens the picker its chord opens, the
     /// branch the WORKTREE PICKER. Empty on every other box, and on a box
     /// too narrow to draw a field at all.
     pub detail_areas: Vec<(crate::launcher::BoxField, Rect)>,
-    /// The branch alone in that row's `worktree main ▾`, written during
+    /// The branch alone in that row's `worktree main ^T`, written during
     /// draw: the WORKTREE PICKER hangs from it. Empty wherever the branch
     /// is not drawn or names nothing to pick — a PR SESSION's checkout is
     /// the DAEMON's.
@@ -2575,6 +2587,18 @@ pub struct TermCallbacks {
     pub clipboard: Option<String>,
 }
 
+/// The last lines a TERMINAL printed, as its card on the grid shows them
+/// (`launcher_view::draw_chip`): the end of its ring, asked of the daemon on
+/// the grid's beat (`event_loop::request_terminal_tails`) and laid out
+/// through a throwaway screen (`terminal_tail::parse_tail`). `end_seq` is
+/// the ring end the lines came from, sent back with the next ask so an
+/// idle terminal answers with nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalTail {
+    pub lines: Vec<String>,
+    pub end_seq: u64,
+}
+
 impl vt100::Callbacks for TermCallbacks {
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
         // vt100 only gets here with a base64-clean payload.
@@ -2751,6 +2775,10 @@ impl AttachedTerm {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Opaque UI state persisted in the daemon's DB for session restore.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct UiState {
@@ -2787,6 +2815,10 @@ pub struct UiState {
     /// blobs, which open with it showing.
     #[serde(default)]
     pub launcher_pane_hidden: bool,
+    /// The GRID was inside a worktree ([`App::launcher_inside`]). A state
+    /// saved before there were bands opens inside, as every grid did.
+    #[serde(default = "default_true")]
+    pub launcher_inside: bool,
     /// The LAUNCHER VIEW's PROJECT TABS, by project id, far left first;
     /// absent in older blobs, which open with the one project restored.
     #[serde(default)]
@@ -3124,8 +3156,16 @@ pub struct App {
     /// reaped or exited one comes back as a new process whose ring starts
     /// over, and a QUICK PROMPT stand-in never had a PTY.
     pub term_cache: Vec<AttachedTerm>,
+    /// What each TERMINAL was last seen printing, by id, for its card on
+    /// the grid ([`TerminalTail`]). A terminal that exited keeps its last
+    /// lines: they are what it was doing when it went.
+    pub terminal_tails: HashMap<TerminalId, TerminalTail>,
+    /// The terminals whose cards the last frame drew, in the order drawn:
+    /// the ones the grid's beat asks the daemon about. Cleared with `hits`
+    /// at the top of every frame, so a folded grid asks after none.
+    pub tail_cards: Vec<TerminalId>,
     /// Input lock: keys forward to the attached PTY. Focusing the terminal
-    /// pane alone (Tab / arrows) does NOT lock — Enter, a click, or `z` does.
+    /// pane alone (Tab / arrows) does NOT lock — Enter or a click does.
     pub term_locked: bool,
     pub conn: ConnState,
     pub hits: Vec<(Rect, HitTarget)>,
@@ -3183,13 +3223,6 @@ pub struct App {
     /// Appearance, or the Worktrees panel menu). Read on every look at
     /// the list (`listed_open_prs`), never applied to what is stored.
     pub hide_draft_prs: bool,
-    /// PROJECT SETTINGS as the panels read them: each project's own entry
-    /// keyed by repo path, and beside it what a project without one gets;
-    /// mirror CONFIG.JSON's `projects` map and `Config::project_fallback`
-    /// (Settings → Project). Resolved by `project_settings`; the one row
-    /// so far is read through `root_hidden`.
-    pub projects_config: BTreeMap<PathBuf, crate::config::ProjectSettings>,
-    pub project_fallback: crate::config::ProjectSettings,
     /// How many RECENT PROMPTS the SESSIONS PANEL lists under each
     /// session, newest at the bottom; 0 draws none. Mirrors CONFIG.JSON's
     /// `recent_prompts` switch and `recent_prompts_count` (Settings →
@@ -3238,19 +3271,49 @@ pub struct App {
     /// on their own — nothing selected, nothing being read. It is
     /// remembered across restarts with the pane's height.
     pub launcher_pane_hidden: bool,
-    /// Which TERMINAL the LAUNCHER VIEW's PANE is reading instead of the
-    /// card under the cursor — the tab its header's strip is on, None for
-    /// SESSION (`event_loop::launcher::show_pane_tab`).
-    ///
-    /// Scoped to the checkout, because the strip is: it lists that
-    /// worktree's terminals and nobody else's, so a cursor walked into
-    /// another checkout is reading a different strip and the pin no
-    /// longer names anything on it. [`App::pinned_terminal`] is the pin
-    /// read through that rule; [`App::settle_pane_tab`] drops one the
-    /// cursor has walked out from under. Not remembered across restarts:
-    /// a terminal's PTY doesn't outlive the daemon's hold on it, and
-    /// nebula opens on the session.
-    pub launcher_terminal: Option<TerminalId>,
+    /// The GRID is INSIDE a worktree: Enter on a BAND opened it, and the
+    /// grid is that checkout's cards alone — the sessions wrapped into
+    /// rows, the terminals under them — with the keys walking the cards.
+    /// False at the top level, where the grid is every checkout's band
+    /// and the keys walk the bands (`event_loop::launcher::enter_band`,
+    /// `leave_band`). Which worktree is inside is the SELECTED WORKTREE:
+    /// a jump that lands on a session in another checkout — `/`, the
+    /// attention walk, a click on a card, a terminal just opened — is
+    /// inside that one, so the flag stays true and the checkout follows.
+    /// Remembered across restarts, so a project opens where it was left;
+    /// a first run opens inside, on the first checkout's cards, which is
+    /// the grid a one-checkout project has always had.
+    pub launcher_inside: bool,
+    /// How far the GRID inside a worktree is scrolled: rows of its layout
+    /// (`launcher::InsideLayout`) above the window's top edge, the way a
+    /// terminal's screen scrolls through its history. The wheel moves it
+    /// a few rows a notch (`event_loop::launcher::wheel_grid`) and the
+    /// cursor stays where it is — a trackpad never swaps the pane out
+    /// from under the card being read; a cursor move pulls it just far
+    /// enough to bring the cursor's card whole on screen
+    /// (`launcher::InsideLayout::reveal`), so `j` lands on a card that
+    /// is there to see; and every draw holds it within the layout, so
+    /// one kept from a taller list never leaves the window empty.
+    /// Settled by `ui::launcher_view` each frame from the four fields
+    /// after it.
+    pub launcher_scroll: u16,
+    /// The wheel put the scroll where it is: the draw leaves it there,
+    /// whatever the cursor's card does, until a key or a landing asks
+    /// for that card again ([`App::launcher_reveal`]) or the cursor moves
+    /// onto another ([`App::launcher_scroll_on`]). Otherwise the scroll
+    /// keeps in step with the cursor's card — a card that moves down the
+    /// grid as a new session lands over it stays on screen.
+    pub launcher_scroll_held: bool,
+    /// The card the scroll last kept on screen: a frame that finds the
+    /// cursor on another one scrolls to that, wheel or no wheel.
+    pub launcher_scroll_on: Option<SessionRef>,
+    /// The worktree the scroll is through: another's cards open at their
+    /// own top rather than wherever the last one's were left.
+    pub launcher_scroll_in: Option<WorktreeId>,
+    /// A key asked for the cursor's card whether or not the cursor moved
+    /// (`j` against the grid's edge after a wheel away, a landing on the
+    /// card already selected): the next frame scrolls to it.
+    pub launcher_reveal: bool,
     /// In-progress drag of that edge: `boundary row - grab row` at
     /// mouse-down, so the edge tracks the pointer instead of jumping by
     /// one depending on which of the two grab rows was caught (the
@@ -3385,6 +3448,12 @@ pub struct App {
     /// Last left-click on a session row (time + session), for double-click
     /// attach detection (a single click only selects the row).
     pub last_session_click: Option<(std::time::Instant, RowKey)>,
+    /// Last left-click on the LAUNCHER VIEW's pane edge, for the
+    /// double-click that snaps the edge to the middle of the body
+    /// (`event_loop::launcher::center_pane`). The edge is one target
+    /// however wide its grab zone, so the click carries no identity: two
+    /// presses anywhere along it within the window make the double.
+    pub last_pane_edge_click: Option<(std::time::Instant, ())>,
     /// URLs detected on the visible screen during the last draw; hit-tested
     /// on ⌥click and underlined by the renderer.
     pub term_links: Vec<crate::links::TermLink>,
@@ -3703,6 +3772,8 @@ impl App {
             sessions_view_rows: 0,
             term: None,
             term_cache: Vec::new(),
+            terminal_tails: HashMap::new(),
+            tail_cards: Vec::new(),
             term_locked: false,
             conn: ConnState::Disconnected,
             hits: Vec::new(),
@@ -3721,8 +3792,6 @@ impl App {
             issues_collapsed: false,
             collapsed: false,
             hide_draft_prs: false,
-            projects_config: BTreeMap::new(),
-            project_fallback: Default::default(),
             recent_prompts: 0,
             show_key_combos: false,
             pr_issue_counts: true,
@@ -3731,7 +3800,12 @@ impl App {
             launcher_pane_w: None,
             launcher_pane_at: crate::launcher::PaneSide::default(),
             launcher_pane_hidden: false,
-            launcher_terminal: None,
+            launcher_inside: true,
+            launcher_scroll: 0,
+            launcher_scroll_held: false,
+            launcher_scroll_on: None,
+            launcher_scroll_in: None,
+            launcher_reveal: false,
             launcher_pane_drag: None,
             hover_launcher_pane: false,
             hover_crumb: None,
@@ -3761,6 +3835,7 @@ impl App {
             term_mouse_grab: None,
             last_term_click: None,
             last_session_click: None,
+            last_pane_edge_click: None,
             term_links: Vec::new(),
             term_file_links: Vec::new(),
             diff_files_width: DEFAULT_DIFF_FILES_W,
@@ -3902,81 +3977,6 @@ impl App {
     /// first run) the splash's "open a project" comes first.
     pub fn launcher_active(&self) -> bool {
         self.tree.has_projects()
-    }
-
-    /// The checkout the LAUNCHER PANE's TAB STRIP is scoped to: the one
-    /// the card under the GRID's cursor runs in, so the terminals on the
-    /// strip and the session the pane reads beside them always belong to
-    /// the same checkout — which is the whole claim the strip makes by
-    /// naming the branch between them.
-    ///
-    /// Not [`App::selected_worktree`], which is the PANELS' cursor: a
-    /// walk of the grid drags it along (`event_loop::launcher::select`),
-    /// but before the first walk it is still parked on whatever the
-    /// panels were left on, and the strip would name one checkout while
-    /// listing another's terminals. It is the fallback all the same, for
-    /// a grid with no card under the cursor at all.
-    pub fn pane_worktree(&self) -> Option<WorktreeId> {
-        let rows = crate::launcher::rows(self);
-        crate::launcher::cursor(self, &rows)
-            .and_then(|at| rows.get(at))
-            .map(|row| row.agent.worktree_id.clone())
-            .or_else(|| self.selected_worktree().map(|w| w.id.clone()))
-    }
-
-    /// The TERMINALS the strip lists: that checkout's, in tree order.
-    /// [`App::visible_terminals`] is the same list read off the panels'
-    /// cursor, for the panels' own rows.
-    pub fn pane_terminals(&self) -> Vec<TerminalTab> {
-        let Some(wt) = self.pane_worktree() else {
-            return Vec::new();
-        };
-        self.tree
-            .terminals
-            .iter()
-            .filter(|t| t.worktree_id == wt)
-            .cloned()
-            .collect()
-    }
-
-    /// The TERMINAL the LAUNCHER VIEW's PANE is reading, when that pin is
-    /// still good: the view is on and the terminal is one of the
-    /// checkout's ([`App::pane_terminals`] — what the header's TAB STRIP
-    /// lists). None means the pane reads the card under the cursor, which
-    /// is what every other tenant of the pane assumes.
-    ///
-    /// Read rather than trusted, so a pin that has gone stale — the
-    /// cursor walked into another checkout, the terminal was closed —
-    /// simply stops answering instead of leaving the pane on a session
-    /// nobody selected.
-    pub fn pinned_terminal(&self) -> Option<TerminalId> {
-        if !self.launcher_active() {
-            return None;
-        }
-        let id = self.launcher_terminal.as_ref()?;
-        self.pane_terminals()
-            .iter()
-            .any(|t| &t.id == id)
-            .then(|| id.clone())
-    }
-
-    /// Drop a pin that no longer names a tab on the strip. Run by the
-    /// view's draw, as [`App::settle_launcher_focus`] is: the pin goes
-    /// stale by things that happen elsewhere — the cursor walking into
-    /// another checkout, a terminal closing — rather than by anything the
-    /// pane itself does, so there is no one place to clear it from.
-    ///
-    /// A pin on a terminal just created is kept while its row is still
-    /// being followed onto (`select_when_seen`): the Ack that pins it can
-    /// beat the upsert that puts it on the strip.
-    pub fn settle_pane_tab(&mut self) {
-        let arriving = matches!(
-            (&self.select_when_seen, &self.launcher_terminal),
-            (Some(SessionRef::Terminal(seen)), Some(pin)) if seen == pin
-        );
-        if self.launcher_terminal.is_some() && self.pinned_terminal().is_none() && !arriving {
-            self.launcher_terminal = None;
-        }
     }
 
     /// Keep the PROJECT TABS true to the tree: a tab whose project is gone
@@ -4239,6 +4239,17 @@ impl App {
         !self.launcher_unaimed
     }
 
+    /// The band the GRID is inside of ([`App::launcher_inside`]): the
+    /// SELECTED WORKTREE's, while the flag is set and the checkout still
+    /// has a band — one whose last card left the grid has nothing to be
+    /// inside of, and the grid is the bands again.
+    pub fn launcher_inside_band(&self, bands: &[crate::launcher::Band]) -> Option<usize> {
+        if !self.launcher_inside {
+            return None;
+        }
+        crate::launcher::band_cursor(self, bands)
+    }
+
     /// `body` in two the way the LAUNCHER VIEW draws it: the grid's half
     /// and the PANE — along the bottom, or beside the cards on the side
     /// [`App::launcher_pane_side`] names — or the whole body and no pane
@@ -4319,6 +4330,20 @@ impl App {
             }
         } else if let Some(h) = crate::launcher::pane_height(body, Some(want)) {
             self.launcher_pane_h = Some(h);
+        }
+    }
+
+    /// Where the edge between the cards and the PANE sits when the two
+    /// share the body evenly: the middle row of the body under a pane
+    /// along the bottom, its middle column beside one on the right —
+    /// measured as [`App::launcher_pane_boundary`] measures the edge, so
+    /// handing it to [`App::set_launcher_pane`] lands the edge there.
+    pub fn launcher_pane_midpoint(&self) -> i32 {
+        use crate::launcher::PaneSide;
+        let body = self.launcher_body;
+        match self.launcher_pane_side() {
+            PaneSide::Bottom => i32::from(body.y) + i32::from(body.height / 2),
+            PaneSide::Right => i32::from(body.x) + i32::from(body.width / 2),
         }
     }
 
@@ -4481,25 +4506,6 @@ impl App {
     /// The project giving the current selection its context.
     pub fn selected_project(&self) -> Option<&Project> {
         self.tree.projects.get(self.selected_project_index()?)
-    }
-
-    /// `project`'s own settings (Settings → Project): its entry in
-    /// `projects_config`, else the fallback every project without one gets.
-    pub fn project_settings(&self, project: &Project) -> &crate::config::ProjectSettings {
-        self.projects_config
-            .get(&project.repo_path)
-            .unwrap_or(&self.project_fallback)
-    }
-
-    /// Whether `project`'s ROOT WORKTREE row is left out of the WORKTREES
-    /// PANEL — its **Hide root worktree** project setting.
-    pub fn root_hidden(&self, project: &Project) -> bool {
-        self.project_settings(project).hide_root_worktree
-    }
-
-    /// `root_hidden` for the selected project; false while there is none.
-    pub fn selected_root_hidden(&self) -> bool {
-        self.selected_project().is_some_and(|p| self.root_hidden(p))
     }
 
     /// The checkout under the Worktrees cursor — a plain row or one nested
@@ -4822,18 +4828,9 @@ impl App {
             return vec![];
         };
         let now = now_ms();
-        // With the project's **Hide root worktree** on, the ROOT WORKTREE
-        // is not a row: it is still in the tree (its sessions keep running,
-        // the PALETTE still knows them), it just cannot be selected here,
-        // so nothing launched from this panel ever lands in the shared
-        // checkout.
-        let hide_root = self.root_hidden(project);
         let worktrees = &self.tree.worktrees;
         let mut rows: Vec<usize> = (0..worktrees.len())
-            .filter(|&i| {
-                let w = &worktrees[i];
-                w.project_id == project.id && !(hide_root && w.is_main)
-            })
+            .filter(|&i| worktrees[i].project_id == project.id)
             .collect();
         // Rolled up once for every checkout rather than re-walked per
         // comparison the sort makes (`worktree_recencies`).
