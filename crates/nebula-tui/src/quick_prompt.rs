@@ -78,6 +78,96 @@ pub struct QuickLaunch {
     /// ROOT WORKTREE). Kept across the box's pickers, as the issue is;
     /// `Ctrl+N` is refused, the checkout being the DAEMON's to pick.
     pub pr: Option<PrLaunch>,
+    /// A CLAUDE CLOUD launch: `Tab` on the Claude row of the box's own
+    /// `Tab` picker toggles it, as it does in the NEW SESSION PICKER, and
+    /// Enter sends the typed text as the cloud task (`claude --cloud
+    /// <task>`) rather than as a STARTING PROMPT. Only ever on a plain
+    /// Claude launch ([`QuickLaunch::with_cloud`]): the DAEMON refuses a
+    /// cloud task beside a preset, an issue or a pull request.
+    pub cloud: bool,
+    /// The modal the box was opened over — `Enter` / `p` in the ISSUES
+    /// MODAL or the PULL REQUESTS MODAL — which it stands on rather than
+    /// takes away: drawn under the box, and put back when the box goes
+    /// without launching. A launch closes it, the new session's card being
+    /// what there is to see. Kept across the box's pickers, as the issue is.
+    pub under: Option<ModalUnder>,
+}
+
+/// A modal a QUICK PROMPT box stands on ([`QuickLaunch::under`]), as it
+/// stood when the box went up: its cursor, and the rects it was drawn in.
+/// The rows are the [`App`]'s, so it is drawn fresh under the box.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModalUnder {
+    Issues(Box<crate::issues::IssuesView>),
+    PullRequests(Box<crate::pr_modal::PullRequestsView>),
+}
+
+impl ModalUnder {
+    /// The modal `overlay` is, when it is one a box can stand on.
+    pub fn of(overlay: Option<&Overlay>) -> Option<Self> {
+        match overlay? {
+            Overlay::Issues(view) => Some(Self::Issues(Box::new(view.clone()))),
+            Overlay::PullRequests(view) => Some(Self::PullRequests(Box::new(view.clone()))),
+            _ => None,
+        }
+    }
+
+    /// Put the modal back up, on the row it was left on.
+    pub fn reopen(self, app: &mut App) {
+        match self {
+            Self::Issues(view) => crate::issues::reopen(app, *view),
+            Self::PullRequests(view) => crate::pr_modal::reopen(app, *view),
+        }
+    }
+}
+
+/// The modal under `overlay`: the box's own, or the one under the box a
+/// picker opened from it is drawn over — `Tab`'s harness list, `^P`'s
+/// PROJECT PICKER, `Shift+Tab`'s AGENT PRESETS — so the layers stay put
+/// while the box's spec is rewritten.
+pub(crate) fn modal_under(overlay: &Overlay) -> Option<ModalUnder> {
+    match overlay {
+        Overlay::Prompt(prompt) => match &prompt.kind {
+            PromptKind::QuickPrompt(launch) => launch.under.clone(),
+            _ => None,
+        },
+        other => {
+            held_return(other)
+                .filter(|back| back.from_box)?
+                .launch
+                .under
+        }
+    }
+}
+
+/// The box a picker `overlay` owes back, when it is one opened for a QUICK
+/// PROMPT launch — the menus pin it to their root rows, so a nested
+/// submenu is reached through its parent.
+pub(crate) fn held_return(overlay: &Overlay) -> Option<QuickReturn> {
+    match overlay {
+        Overlay::ProjectPicker(picker) => Some(picker.back.clone()),
+        Overlay::AgentPresets(view) => view.quick.clone(),
+        Overlay::Menu(menu) => {
+            let mut menu = menu;
+            loop {
+                if let Some(back) = crate::event_loop::menu_quick_return(menu) {
+                    return Some(back);
+                }
+                menu = menu.parent.as_ref()?;
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A refused launch's box coming back (`event_loop::reopen_prompt_with`)
+/// stands on the modal it was opened over only while one is still up —
+/// that one, its cursor where it is now. Once the modal has closed, the
+/// box comes back on its own rather than raising it again.
+pub(crate) fn restack(app: &App, launch: &mut QuickLaunch) {
+    if launch.under.is_some() {
+        launch.under = ModalUnder::of(app.overlay.as_ref());
+    }
 }
 
 /// What a picker for a QUICK PROMPT launch carries, so the trip loses
@@ -149,7 +239,15 @@ pub(crate) fn draft_of_return(back: &QuickReturn) -> Option<QuickDraft> {
 /// here and pressing Esc is how it is thrown away.
 pub(crate) fn open_box(app: &mut App, launch: QuickLaunch) {
     let (launch, restored) = match app.quick_draft.take() {
-        Some(draft) if draft.launch.aimed_like(&launch) => (draft.launch, Some(draft.input)),
+        // What the box stands on is where it is opened now, never where
+        // the parked one was.
+        Some(draft) if draft.launch.aimed_like(&launch) => (
+            QuickLaunch {
+                under: launch.under,
+                ..draft.launch
+            },
+            Some(draft.input),
+        ),
         Some(draft) => (launch, Some(draft.input)),
         None => (launch, None),
     };
@@ -207,7 +305,17 @@ impl QuickLaunch {
             preset: None,
             issue: None,
             pr: None,
+            under: None,
+            cloud: false,
         }
+    }
+
+    /// The same launch, standing on the modal `under` (or on none). What
+    /// every picker's return trip does to the launch it rebuilt, so the box
+    /// comes back over the modal it was opened over.
+    pub fn with_under(mut self, under: Option<ModalUnder>) -> Self {
+        self.under = under;
+        self
     }
 
     /// The same launch, for the pull request `pr` (or for none). What
@@ -226,21 +334,45 @@ impl QuickLaunch {
         self
     }
 
+    /// The same launch, sent to Claude Cloud when `cloud` — and when the
+    /// launch can go there at all: plain Claude, no preset, no issue, no
+    /// pull request. What the `Tab` picker's pick does last, after the
+    /// issue and the PR are back on the launch it rebuilt.
+    pub fn with_cloud(mut self, cloud: bool) -> Self {
+        self.cloud = cloud
+            && self.kind == AgentKind::Claude
+            && self.custom.is_none()
+            && self.preset.is_none()
+            && self.takes_cloud();
+        self
+    }
+
+    /// Could this box launch in Claude Cloud once its harness is Claude?
+    /// Not one for an issue or a pull request — the DAEMON refuses either
+    /// context beside a cloud task — so their `Tab` picker offers no
+    /// toggle. (A preset does not count: the `Tab` pick clears it.)
+    pub fn takes_cloud(&self) -> bool {
+        self.issue.is_none() && self.pr.is_none()
+    }
+
     /// The task Enter sends when the box is empty: an ISSUE SESSION's box
     /// may be sent as it is, the issue being the task. `None` for every
-    /// other launch, where an empty box is a change of mind.
+    /// other launch, whose empty box sends no task at all — the CLI starts
+    /// bare (`launches_empty`).
     pub fn default_task(&self) -> Option<String> {
         self.issue.as_ref().map(|issue| issue.default_task())
     }
 
-    /// Does Enter on an empty box launch? Only a box an AGENT PRESET is
-    /// on does — a preset's task is optional, so its empty box sends the
-    /// prefix and postfix alone (nothing at all for a bare preset). With
-    /// no preset an empty box is a change of mind: a session with no first
-    /// prompt is the NEW SESSION PICKER's (`n`). (An ISSUE SESSION's empty
-    /// box is `default_task`'s: the issue is the task.)
+    /// Does Enter on an empty box launch? Every box but a CLAUDE CLOUD
+    /// one does: the session starts on the harness, MODEL and EFFORT the
+    /// title names with no first prompt — the CLI's own input is it, as
+    /// after the NEW SESSION PICKER (`n`) — and a box an AGENT PRESET is
+    /// on sends the prefix and postfix alone (nothing at all for a bare
+    /// preset). A cloud box cannot: `claude --cloud` takes its task on the
+    /// command line, so its empty box is a change of mind. (An ISSUE
+    /// SESSION's empty box is `default_task`'s: the issue is the task.)
     pub fn launches_empty(&self) -> bool {
-        self.preset.is_some()
+        !self.cloud
     }
 
     /// The launch an AGENT PRESET describes: its harness, its pinned
@@ -286,10 +418,12 @@ impl QuickLaunch {
     /// `Quick prompt · reviewer (claude · opus · high)`,
     /// `Quick prompt · new worktree yellow-fox-jumps (claude)`,
     /// `Quick prompt · issue #15 · reviewer (claude · opus)`,
-    /// `Quick prompt · PR #42 · reviewer (claude · opus)`.
+    /// `Quick prompt · PR #42 · reviewer (claude · opus)`,
+    /// `Quick prompt (claude · cloud · opus)`.
     pub fn title(&self) -> String {
         let harness = self.custom.as_deref().unwrap_or_else(|| self.kind.as_str());
         let opts: Vec<&str> = std::iter::once(harness)
+            .chain(self.cloud.then_some("cloud"))
             .chain(self.model.as_deref())
             .chain(self.effort.as_deref())
             .collect();
@@ -326,8 +460,12 @@ impl QuickLaunch {
                 issue.number
             ),
             (None, None) => match &self.pr {
-                Some(pr) => format!("what should the agent do about PR #{}?", pr.number),
-                None => "what should the agent do?".into(),
+                Some(pr) => format!(
+                    "what should the agent do about PR #{}? (empty = start with no prompt)",
+                    pr.number
+                ),
+                None if self.cloud => "what should Claude do in the cloud?".into(),
+                None => "what should the agent do? (empty = start with no prompt)".into(),
             },
         }
     }
@@ -367,11 +505,9 @@ impl QuickLaunch {
 ///
 /// The one exception is the WORKTREES PANEL: `p` there means "a fresh
 /// worktree, then this task in it", whatever checkout the cursor is
-/// parked on (the root, another checkout) and whether or not the
-/// project's **Hide root worktree** setting has taken the root row out —
-/// the checkout does not exist yet, so only the PROJECT has to be
-/// selected. Its branch is the same random name the `n` prompt would
-/// have offered.
+/// parked on (the root, another checkout) — the checkout does not exist
+/// yet, so only the PROJECT has to be selected. Its branch is the same
+/// random name the `n` prompt would have offered.
 ///
 /// A cursor parked on an OPEN PRS row — in that panel or, the row still
 /// selected, from any other — makes the box a PR SESSION's, the one `e`
@@ -856,7 +992,10 @@ mod tests {
             &cfg,
         );
         assert_eq!(plain.title(), "Quick prompt (claude · opus · high)");
-        assert_eq!(plain.label(), "what should the agent do?");
+        assert_eq!(
+            plain.label(),
+            "what should the agent do? (empty = start with no prompt)"
+        );
         assert_eq!(plain.compose("do it"), "do it", "no preset, no wrapping");
 
         let wrapped = QuickLaunch::of_preset(
@@ -917,7 +1056,11 @@ mod tests {
         );
         assert!(wrapped.default_task().is_some());
         let none = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg);
-        assert_eq!(none.default_task(), None, "an empty ordinary box cancels");
+        assert_eq!(
+            none.default_task(),
+            None,
+            "an empty ordinary box sends no task"
+        );
     }
 
     /// A PR SESSION's box names the pull request, keeps it through a
@@ -934,9 +1077,15 @@ mod tests {
         let plain = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg)
             .with_pr(Some(pr.clone()));
         assert_eq!(plain.title(), "Quick prompt · PR #42 (claude)");
-        assert_eq!(plain.label(), "what should the agent do about PR #42?");
+        assert_eq!(
+            plain.label(),
+            "what should the agent do about PR #42? (empty = start with no prompt)"
+        );
         assert_eq!(plain.default_task(), None);
-        assert!(!plain.launches_empty(), "no preset: an empty box cancels");
+        assert!(
+            plain.launches_empty(),
+            "an empty box starts the CLI bare in the PR's checkout"
+        );
         assert!(!plain.is_new_worktree());
 
         let wrapped = QuickLaunch::of_preset(
@@ -975,7 +1124,10 @@ mod tests {
             fresh.title(),
             "Quick prompt · new worktree yellow-fox-jumps (claude · opus)"
         );
-        assert_eq!(fresh.label(), "what should the agent do?");
+        assert_eq!(
+            fresh.label(),
+            "what should the agent do? (empty = start with no prompt)"
+        );
 
         let wrapped = QuickLaunch::of_preset(
             new_worktree("yellow-fox-jumps"),
@@ -988,16 +1140,22 @@ mod tests {
         );
     }
 
-    /// An empty box is a change of mind — a session with no first prompt
-    /// is what `n` starts — unless an AGENT PRESET is on it, whose task is
-    /// optional, into a fresh worktree as much as into the selected one.
+    /// An empty box launches: with no preset the CLI starts with no first
+    /// prompt — the session `n` would start, on the harness and model the
+    /// title names — and with an AGENT PRESET on it, whose task is
+    /// optional, on the prefix and postfix alone; into a fresh worktree as
+    /// much as into the selected one. The label says so.
     #[test]
-    fn only_a_preset_lets_an_empty_box_launch() {
+    fn an_empty_box_launches_with_or_without_a_preset() {
         let cfg = Config::default();
         let plain = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg);
         assert_eq!(plain.title(), "Quick prompt (claude)");
-        assert_eq!(plain.label(), "what should the agent do?");
-        assert!(!plain.launches_empty(), "an empty box is a change of mind");
+        assert_eq!(
+            plain.label(),
+            "what should the agent do? (empty = start with no prompt)"
+        );
+        assert!(plain.launches_empty(), "an empty box starts the CLI bare");
+        assert_eq!(plain.compose(""), "", "and sends it no first prompt");
 
         let wrapped = QuickLaunch {
             preset: Some(preset("reviewer", AgentKind::Claude)),
@@ -1011,11 +1169,43 @@ mod tests {
             target: new_worktree("fix-login"),
             ..plain
         };
-        assert!(!flipped.launches_empty());
+        assert!(flipped.launches_empty());
         let flipped_wrapped = QuickLaunch {
             target: new_worktree("fix-login"),
             ..wrapped
         };
         assert!(flipped_wrapped.launches_empty());
+    }
+
+    /// Cloud is a plain Claude launch's alone: another harness, a preset,
+    /// an issue or a pull request keeps it off whatever the picker said,
+    /// and a cloud box names it in the title and asks for the task.
+    #[test]
+    fn only_a_plain_claude_launch_goes_to_the_cloud() {
+        let cfg = Config::default();
+        let claude = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg);
+        let cloud = claude.clone().with_cloud(true);
+        assert!(cloud.cloud);
+        assert_eq!(cloud.title(), "Quick prompt (claude · cloud)");
+        assert_eq!(cloud.label(), "what should Claude do in the cloud?");
+        assert!(!cloud.launches_empty(), "a cloud launch needs its task");
+        assert!(
+            claude.launches_empty(),
+            "off the cloud the same box starts the CLI bare"
+        );
+        assert!(!cloud.clone().with_cloud(false).cloud);
+
+        let codex = QuickLaunch::of_kind(worktree(), AgentKind::Codex, None, None, None, &cfg);
+        assert!(!codex.with_cloud(true).cloud);
+        let wrapped =
+            QuickLaunch::of_preset(worktree(), preset("reviewer", AgentKind::Claude), &cfg);
+        assert!(!wrapped.with_cloud(true).cloud);
+        let issue = claude.clone().with_issue(Some(crate::issues::IssueRef {
+            number: 15,
+            title: "Login fails".into(),
+            url: "https://github.com/o/r/issues/15".into(),
+        }));
+        assert!(!issue.takes_cloud());
+        assert!(!issue.with_cloud(true).cloud);
     }
 }

@@ -45,6 +45,15 @@
 //!   that echo and is ignored — a genuinely new dialog announces itself
 //!   through `PermissionRequest` / `PreToolUse` first, and its own
 //!   notification cannot arrive inside the grace.
+//! - A `nebula worktree` relocation waits on the turn's end, and then the
+//!   daemon kills the CLI and resumes it in the target with a prompt that
+//!   carries the work straight on (`Daemon::complete_pending_move`). The
+//!   end of that turn is not the end of the work: while the daemon says a
+//!   relocation is pending (`set_relocating`), a `Stop`, an `idle_prompt`
+//!   or a progress-clear holds the row at `running` instead of finishing
+//!   it — a death still terminates it — and the respawn starts over as a
+//!   launch. Without the hold the card fell to the bottom of the grid for
+//!   the seconds between the Stop and the respawned CLI's first hook.
 
 use nebula_core::AgentStatus;
 use std::collections::HashMap;
@@ -252,6 +261,12 @@ pub struct AgentStatusMachine {
     /// so it is swallowed once. Any other event is real news and spends
     /// the reprieve.
     launch_idle_pending: bool,
+    /// Set by the daemon while a `nebula worktree` relocation waits on
+    /// this turn's end — refreshed from its own record before every event
+    /// (`Daemon::apply_hook_event`), so it cannot go stale. A turn end
+    /// that arrives meanwhile holds at `running`: the respawn that follows
+    /// it carries the work straight on (`hold_for_relocation`).
+    relocating: bool,
 }
 
 impl AgentStatusMachine {
@@ -269,6 +284,7 @@ impl AgentStatusMachine {
             question_open: false,
             feedback_left_at: None,
             launch_idle_pending: false,
+            relocating: false,
         }
     }
 
@@ -288,6 +304,15 @@ impl AgentStatusMachine {
 
     pub fn status(&self) -> AgentStatus {
         self.status
+    }
+
+    /// Whether a `nebula worktree` relocation is waiting on the turn's
+    /// end. The daemon sets it from its own record before every event; a
+    /// turn end that arrives while it is set holds at `running` (see
+    /// `hold_for_relocation`), and once the CLI has been respawned in the
+    /// target this machine is replaced by [`Self::launching`].
+    pub fn set_relocating(&mut self, relocating: bool) {
+        self.relocating = relocating;
     }
 
     pub fn handle(
@@ -584,8 +609,13 @@ impl AgentStatusMachine {
     /// The foreground turn ended — a `Stop`, or the CLI clearing its
     /// progress bar. Finished outright when no subagent is still tracked;
     /// otherwise the stop is held at running and `tick` promotes it once
-    /// the set has drained and stayed empty for the grace period.
+    /// the set has drained and stayed empty for the grace period. Held at
+    /// running outright while a relocation waits on this very end
+    /// (`hold_for_relocation`).
     fn end_turn(&mut self, now: Instant, effects: &mut Vec<Effect>) {
+        if self.hold_for_relocation(effects) {
+            return;
+        }
         self.subagents.prune_expired(now);
         if self.subagents.is_empty() {
             self.stop_held = false;
@@ -631,6 +661,9 @@ impl AgentStatusMachine {
         ) {
             return;
         }
+        if self.hold_for_relocation(effects) {
+            return;
+        }
         self.subagents.prune_expired(now);
         if !self.subagents.is_empty() {
             self.hold_for_subagents(now, effects);
@@ -644,6 +677,25 @@ impl AgentStatusMachine {
         // own POST, so it must not heal back to running.
         self.finished_at = None;
         self.set_status(AgentStatus::Finished, effects);
+    }
+
+    /// The turn a `nebula worktree` relocation waits on has ended: the
+    /// daemon is about to kill the CLI and resume it in the target with a
+    /// prompt that carries the work straight on, so the row stays (or, out
+    /// of a dialog, goes back to) `running` rather than finishing for the
+    /// seconds until the respawned CLI's first hook. Only a live turn is
+    /// held: a row already finished or dead takes the ordinary path.
+    fn hold_for_relocation(&mut self, effects: &mut Vec<Effect>) -> bool {
+        if !self.relocating
+            || !matches!(
+                self.status,
+                AgentStatus::Running | AgentStatus::NeedsFeedback
+            )
+        {
+            return false;
+        }
+        self.set_status(AgentStatus::Running, effects);
+        true
     }
 
     fn set_status(&mut self, status: AgentStatus, effects: &mut Vec<Effect>) {
@@ -678,6 +730,62 @@ mod tests {
         assert!(fx.contains(&Effect::SaveSessionId("s1".into())));
         let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(10));
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    /// A `nebula worktree` relocation waits on the turn's end and then
+    /// respawns the CLI to carry the work on, so while the daemon says one
+    /// is pending none of the three turn-end signals finishes the row — a
+    /// Stop, the idle notification, or the progress clear that is the only
+    /// word of a cancelled turn. A death is still a death.
+    #[test]
+    fn a_pending_relocation_holds_every_turn_end_at_running() {
+        let now = t0();
+        let ends = [
+            HookEvent::Stop,
+            HookEvent::Notification {
+                notification_type: Some("idle_prompt".into()),
+            },
+            HookEvent::Progress { busy: false },
+        ];
+        for end in &ends {
+            let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+            m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+            m.set_relocating(true);
+            let fx = m.handle(end.clone(), Some("s1"), now + Duration::from_secs(10));
+            assert_eq!(status_of(&fx), None, "{end:?} is held: no change");
+            assert_eq!(m.status(), AgentStatus::Running);
+            // The daemon respawned nothing after all (a silent resume, a
+            // failed spawn): with the hold off, the same end finishes it.
+            m.set_relocating(false);
+            let fx = m.handle(end.clone(), Some("s1"), now + Duration::from_secs(11));
+            assert_eq!(status_of(&fx), Some(AgentStatus::Finished), "{end:?}");
+        }
+
+        // Out of a dialog the held end reads as working again, not done:
+        // the respawn carries the turn on.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            now,
+        );
+        m.set_relocating(true);
+        let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(10));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+
+        // A row that already finished is not revived by a late Stop, and
+        // the process dying is still the end of it.
+        let mut m = AgentStatusMachine::new(AgentStatus::Finished, None);
+        m.set_relocating(true);
+        let fx = m.handle(HookEvent::Stop, Some("s1"), now);
+        assert_eq!(status_of(&fx), None);
+        assert_eq!(m.status(), AgentStatus::Finished);
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.set_relocating(true);
+        let fx = m.handle(HookEvent::SessionEnded { exit_code: Some(1) }, None, now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Terminated));
     }
 
     /// OpenCode's question tool is the same wait, and a permission prompt

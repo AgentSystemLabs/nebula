@@ -1,0 +1,82 @@
+# The quick prompt flipped onto a fresh worktree with ^N: the frame turns green and the NEW WORKTREE
+# chip names the branch Enter will cut.
++
+atlas
+Enter
+F12
+p
+Migrate the checkout page to the new design tokens
+Enter
+F12
+drag 95 33 95 24
++
+relay
+Enter
+F12
+p
+Add a --json flag to every list command
+Enter
+F12
++
+orbit
+Enter
+F12
+p
+C-t
+auth
+Enter
+F12
+Write integration tests for token expiry and refresh
+Tab
+Down
+Enter
+Enter
+F12
+p
+Move the token store from a JSON file to sqlite
+Enter
+F12
+p
+C-t
+Up
+Enter
+F12
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+p
+Sort the changelog entries by date, newest first
+Tab
+Down
+Down
+Down
+Down
+Down
+Enter
+Enter
+F12
+t
+C-q
+Escape
+j
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+p
+Add an index on expires_at and rerun the auth tests
+C-n

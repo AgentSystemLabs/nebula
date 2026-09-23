@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 41;
+pub const PROTOCOL_VERSION: u32 = 42;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -364,6 +364,20 @@ pub enum ClientRequest {
         req_id: u64,
     },
 
+    /// The end of a live session's output ring — what a TERMINAL's card on
+    /// the grid shows as the last lines its shell printed. Answered by
+    /// `ServerEvent::OutputTail` with the same req_id (not an Ack).
+    /// `after_seq` is the ring end the client last heard: a ring that has
+    /// not grown past it answers with no bytes, so a grid asking after
+    /// every terminal on it once a second costs the idle ones nothing.
+    TailOutput {
+        req_id: u64,
+        session: SessionRef,
+        /// At most this many bytes, from the end of the ring.
+        max_bytes: u32,
+        after_seq: Option<u64>,
+    },
+
     Shutdown,
 }
 
@@ -404,6 +418,22 @@ pub struct PrewarmInfo {
     pub worktree: WorktreeId,
     pub kind: AgentKind,
     pub model: Option<String>,
+}
+
+/// The end of a session's ring, for `ClientRequest::TailOutput`: the bytes
+/// and the PTY size they were laid out against, so the client's throwaway
+/// screen wraps them where the pane would.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputTail {
+    pub cols: u16,
+    pub rows: u16,
+    /// Seq the ring's next byte gets — sent back as the next ask's
+    /// `after_seq`.
+    pub end_seq: u64,
+    /// The last `max_bytes` of the ring; empty when it has not grown past
+    /// `after_seq`.
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
 }
 
 /// Daemon-side half of the metrics modal's data; the client stacks its own
@@ -525,5 +555,12 @@ pub enum ServerEvent {
     Metrics {
         req_id: u64,
         snapshot: MetricsSnapshot,
+    },
+    /// Reply to `ClientRequest::TailOutput`: `None` when the session has no
+    /// live PTY — its ring went with its shell.
+    OutputTail {
+        req_id: u64,
+        session: SessionRef,
+        tail: Option<OutputTail>,
     },
 }

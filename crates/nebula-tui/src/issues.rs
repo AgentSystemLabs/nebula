@@ -1,26 +1,34 @@
 //! The ISSUES MODAL: the selected project's open GitHub issues, listed
 //! newest first down the left, the one under the cursor read on the right,
-//! and two ways to put an agent on it — a QUICK PROMPT (`Enter` / `p`) or
-//! one of the saved AGENT PRESETS (`e`). Either launch carries the issue as
+//! and two ways to put an agent on it — a QUICK PROMPT (`Enter`) or one
+//! of the saved AGENT PRESETS (`Shift+Tab`), the QUICK PROMPT box's own
+//! keys for them. Either launch carries the issue as
 //! an [`IssueRef`], and the create that ends it sends the issue URL to the
 //! DAEMON (`ClientRequest::CreateAgent::issue_url`), which folds it into the
 //! harness's context on every spawn — Claude's appended system prompt, a
 //! Codex / Cursor cold spawn's first prompt — so the agent knows which
 //! issue the session is for before it reads the first word of the task.
 //!
-//! `c` leaves a comment on the issue instead: a multi-row box (the task
+//! `Ctrl+c` leaves a comment on the issue instead: a multi-row box (the task
 //! prompts' shape) whose Enter posts the text as you with
 //! `gh issue comment`, off the loop, and puts the modal back on its row —
 //! the pane says the comment is on its way, and the conversation is read
 //! again once it has landed. A post `gh` refused brings the box back with
 //! the text, so nothing typed is lost.
 //!
-//! `E` edits the issue itself, in place: the reading pane becomes a form
+//! `Ctrl+e` edits the issue itself, in place: the reading pane becomes a form
 //! on its title and description ([`IssueEditor`]), and Enter sends both
 //! as one `gh issue edit` off the loop. The form holds until GitHub
 //! answers, so a refusal shows `gh`'s reason over text that is still
 //! there; a save that took lands on the row at once, and the list is
 //! re-asked underneath so the row is GitHub's copy.
+//!
+//! The list's filter is live from the moment the modal opens, as the
+//! DIFF VIEWER's and the FILE FINDER's are: every letter typed narrows
+//! the rows to the fuzzy matches of `#15 title` (`fuzzy::rank`), best
+//! first, the cursor on the best, and Esc clears it before a second Esc
+//! closes. So the verbs are chords — `Ctrl+e`, `Ctrl+c`, `Ctrl+o`,
+//! `Ctrl+r` — and the PULL REQUESTS MODAL's filter is this one.
 //!
 //! Like the pull requests, the issues are the TUI's own business: one
 //! `gh issue list` per project — asked in the background once the cursor
@@ -42,13 +50,13 @@
 //! pane reads the one the cursor rests on the way it reads a pull request
 //! — [`lines`] draws the modal's pane and that one alike — with the
 //! comments asked for on the same debounce ([`schedule_detail`]). `p` and
-//! `e` on the row are the modal's `Enter` and `e` for it
+//! `e` on the row are the modal's `Enter` and `Shift+Tab` for it
 //! ([`open_prompt_for_row`], [`open_preset_for_row`]).
 
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use nebula_core::ProjectId;
+use nebula_core::{ClientRequest, ProjectId};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -56,15 +64,16 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde::{Deserialize, Serialize};
 
-use crate::app::{clamp_selection, window_start, App, Overlay};
+use crate::app::{clamp_selection, window_start, App, HitTarget, Overlay};
 use crate::markdown::{self, Breaks};
 use crate::pr_preview::fit;
-use crate::quick_prompt::{QuickLaunch, QuickReturn, QuickTarget};
+use crate::quick_prompt::{ModalUnder, QuickLaunch, QuickReturn, QuickTarget};
 use crate::text_input::{TextInput, TextView};
 use crate::theme::Theme;
 use crate::ui::{
-    centered_rect_pct, draw_multiline_input, draw_scroll_marks, empty_list_row, input_spans,
-    panel_block, render_row, row_rect, truncate, SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
+    centered_rect_pct, draw_multiline_input, draw_scroll_marks, empty_list_row,
+    fuzzy_highlight_styled, input_spans, panel_block, render_row, row_rect, search_line, truncate,
+    visible_positions, SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
 };
 
 /// How long a lookup may run before we give up on it — the PR lookups'
@@ -276,7 +285,19 @@ pub struct IssuesView {
     /// The list rows and the reading pane, for wheel and click routing.
     pub list_area: Rect,
     pub body_area: Rect,
-    /// `E`: the reading pane turned into the editor for the row under the
+    /// The `↗ open in browser` BUTTON on the reading pane's top border
+    /// (`ui::browser_button`), for the click and the pointer resting on
+    /// it; `Rect::default()` — no point inside — while there is none.
+    pub browser_area: Rect,
+    /// The list's live filter: the rows narrow to the fuzzy matches of
+    /// `#15 title`, best first ([`visible_rows`]), as every letter lands.
+    /// Empty shows every row in the list's order.
+    pub query: TextInput,
+    /// Where the cursor sat among the visible rows as of the last draw:
+    /// the follow-window's anchor, and what a click's row math counts
+    /// from.
+    pub cursor_row: usize,
+    /// `Ctrl+e`: the reading pane turned into the editor for the row under the
     /// cursor, until Enter has saved or Esc has dropped it. Boxed: the
     /// view rides a `Comment` answer, and two text fields would make that
     /// variant several times the others' size.
@@ -296,13 +317,17 @@ impl IssuesView {
             area: Rect::default(),
             list_area: Rect::default(),
             body_area: Rect::default(),
+            browser_area: Rect::default(),
+            query: TextInput::new(),
+            cursor_row: 0,
             editor: None,
         }
     }
 
-    /// First visible row of the list's stateless follow-window.
+    /// First visible row of the list's stateless follow-window, over the
+    /// rows the filter leaves.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.selected, height)
+        window_start(self.cursor_row, height)
     }
 
     pub fn max_scroll(&self) -> u16 {
@@ -340,7 +365,7 @@ pub struct IssueText {
     pub body: String,
 }
 
-/// `E` in the modal: the reading pane as a form for the issue under the
+/// `Ctrl+e` in the modal: the reading pane as a form for the issue under the
 /// cursor — the title on one line, the description in a box under it —
 /// that `Enter` sends to GitHub as one `gh issue edit`. It lives on the
 /// [`IssuesView`] rather than as an overlay of its own: the list stays up
@@ -692,6 +717,41 @@ fn list_len(app: &App, project: &ProjectId) -> usize {
     app.issues.get(project).map_or(0, |l| l.list.len())
 }
 
+/// Is there a filter to apply — text in the row beyond whitespace?
+fn has_query(view: &IssuesView) -> bool {
+    view.query.split_whitespace().next().is_some()
+}
+
+/// The rows the filter leaves, top to bottom: indices into `list`, each
+/// with the matched char positions of its `#15 title` (lit when drawn);
+/// every row in list order with nothing typed. Worked out afresh on every
+/// call rather than kept — a repo's open issues are a screenful — so it
+/// can never go stale against the list.
+fn visible_rows(query: &str, list: &[Issue]) -> Vec<(usize, Vec<usize>)> {
+    let labels: Vec<String> = list.iter().map(|issue| issue.label()).collect();
+    crate::fuzzy::rank(query, labels.iter().map(String::as_str))
+}
+
+/// The row under the cursor, as an index into `list`: `selected` while
+/// the filter shows it, else the filter's best match — a refresh may have
+/// moved the cursor's issue under a row the filter hides — and `selected`
+/// clamped onto the list with nothing typed. None with no row to be on:
+/// an empty list, or a filter nothing matches.
+fn cursor_index(view: &IssuesView, list: &[Issue]) -> Option<usize> {
+    if list.is_empty() {
+        return None;
+    }
+    if !has_query(view) {
+        return Some(clamp_selection(view.selected as i64, list.len()));
+    }
+    let visible = visible_rows(&view.query, list);
+    if visible.iter().any(|(i, _)| *i == view.selected) {
+        Some(view.selected)
+    } else {
+        visible.first().map(|(i, _)| *i)
+    }
+}
+
 /// Put the modal back as it was — the box a comment was typed in stood in
 /// for it — on the same row, clamped in case the list moved underneath,
 /// with the row's comments asked for as landing on it would.
@@ -925,7 +985,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                         Some(Overlay::Issues(view)) if view.project == project => app
                             .issues
                             .get(&project)
-                            .and_then(|l| l.list.get(view.selected))
+                            .and_then(|l| l.list.get(cursor_index(view, &l.list)?))
                             .map(|i| i.url.clone()),
                         _ => None,
                     };
@@ -1058,7 +1118,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
 
 // ---- commenting ----
 
-/// `c`: the comment box for the issue under the cursor. The box replaces
+/// `Ctrl+c`: the comment box for the issue under the cursor. The box replaces
 /// the modal; Enter posts and comes back to it, Esc just comes back.
 fn open_comment_for_selected(app: &mut App) {
     let Some(Overlay::Issues(view)) = &app.overlay else {
@@ -1120,7 +1180,7 @@ pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, tex
     });
 }
 
-/// `r` in the modal: ask for the list again now, and the selected issue's
+/// `Ctrl+r` in the modal: ask for the list again now, and the selected issue's
 /// comments over the cached copy. The rows stay until the answer lands.
 fn refresh(app: &mut App) {
     let Some(Overlay::Issues(view)) = &app.overlay else {
@@ -1152,8 +1212,14 @@ fn selected_issue(app: &App) -> Option<(Issue, PathBuf)> {
     let Some(Overlay::Issues(view)) = &app.overlay else {
         return None;
     };
-    let issue = app.issues.get(&view.project)?.list.get(view.selected)?;
+    let list = app.issues.get(&view.project)?.list.as_slice();
+    let issue = list.get(cursor_index(view, list)?)?;
     Some((issue.clone(), view.dir.clone()))
+}
+
+/// The URL of the issue under the cursor, for the browser.
+fn selected_url(app: &App) -> Option<String> {
+    selected_issue(app).map(|(issue, _)| issue.url)
 }
 
 /// The issue whose comments the pane wants: the modal's row while the
@@ -1184,9 +1250,64 @@ fn select(app: &mut App, index: i64) {
     app.dirty = true;
 }
 
+/// ↑/↓, the wheel: the cursor `delta` rows through the visible ones —
+/// the filter's matches while one is typed — clamped at either end.
+fn step(app: &mut App, delta: i64) {
+    let Some(Overlay::Issues(view)) = &app.overlay else {
+        return;
+    };
+    let list = app
+        .issues
+        .get(&view.project)
+        .map_or(&[][..], |l| l.list.as_slice());
+    let Some(current) = cursor_index(view, list) else {
+        return;
+    };
+    let visible = visible_rows(&view.query, list);
+    let at = visible.iter().position(|(i, _)| *i == current).unwrap_or(0) as i64;
+    let next = clamp_selection(at + delta, visible.len());
+    if let Some((index, _)) = visible.get(next) {
+        select(app, *index as i64);
+    }
+}
+
+/// The filter's text changed: the cursor goes to its best match — the
+/// pane rewinds onto it and its comments are asked for, as any move does
+/// — or stays where it is once nothing is typed, so the row just found
+/// keeps the cursor after Esc has cleared the letters that found it. A
+/// filter nothing matches moves nothing: the list says so, the pane has
+/// no row to read, and the next letter or Backspace decides.
+fn query_changed(app: &mut App) {
+    let Some(Overlay::Issues(view)) = &app.overlay else {
+        return;
+    };
+    let list = app
+        .issues
+        .get(&view.project)
+        .map_or(&[][..], |l| l.list.as_slice());
+    let target = if has_query(view) {
+        visible_rows(&view.query, list).first().map(|(i, _)| *i)
+    } else {
+        cursor_index(view, list)
+    };
+    match target {
+        Some(index) => select(app, index as i64),
+        None => schedule_detail(app),
+    }
+    app.dirty = true;
+}
+
+/// Esc: the filter cleared, the cursor staying on the row it was on.
+fn clear_query(app: &mut App) {
+    if let Some(Overlay::Issues(view)) = &mut app.overlay {
+        view.query.clear();
+    }
+    query_changed(app);
+}
+
 // ---- editing ----
 
-/// `E`: turn the reading pane into the editor for the issue under the
+/// `Ctrl+e`: turn the reading pane into the editor for the issue under the
 /// cursor, prefilled from the row. A list with no rows has nothing to
 /// edit, and says so where the launch keys do.
 fn open_editor(app: &mut App) {
@@ -1296,9 +1417,18 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) {
 }
 
 /// A bracketed paste while the editor is up lands in the field under the
-/// caret — lines kept in the description, flattened in the title. False
-/// when nothing is typing, so the paste falls through as before.
-pub(crate) fn paste(view: &mut IssuesView, text: &str) -> bool {
+/// caret — lines kept in the description, flattened in the title — and
+/// otherwise in the filter, as one line, narrowing the rows as typing it
+/// would. True whenever the modal is up: the filter is always live.
+pub(crate) fn paste(app: &mut App, text: &str) -> bool {
+    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        return false;
+    };
+    if view.editor.is_none() {
+        view.query.insert_str(text);
+        query_changed(app);
+        return true;
+    }
     let Some(editor) = &mut view.editor else {
         return false;
     };
@@ -1318,22 +1448,25 @@ pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
     if view.editor.is_some() {
         "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save to GitHub  Esc: cancel edit"
     } else {
-        "↑/↓: issue  PgUp/PgDn ^d/^u: read  Enter/p: prompt an agent  e: preset  E: edit  c: comment  o: browser  r: refresh  Esc: close"
+        "type to filter  ↑/↓ ^n/^p: issue  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  ⇧Tab: preset  ^e: edit  ^c: comment  ^o: browser  ^r: refresh  Esc: clear / close"
     }
 }
 
 // ---- launching ----
 
-/// Where a launch from the modal lands: the selected WORKTREE when it is
-/// one of this project's real checkouts (not a stand-in git is still
-/// cutting, not an OPEN PRS row), else the project's ROOT WORKTREE — which
-/// every project has whether the panel shows it or not. `Ctrl+N` in the box
-/// flips to a fresh worktree named after the issue.
-fn launch_target(app: &App, project: &ProjectId) -> Option<QuickTarget> {
-    if let Some(w) = app.selected_worktree() {
-        if &w.project_id == project && !app.is_placeholder_worktree(&w.id) {
-            return Some(QuickTarget::Worktree(w.id.clone()));
-        }
+/// Where a launch from the modal lands: the project's ROOT WORKTREE —
+/// which every project has whether the panel shows it or not — as every
+/// new session's box does, never the checkout of the card under the
+/// cursor; or, with the `quick_prompt_new_worktree` SETTING on, a fresh
+/// worktree named after the issue. `Ctrl+N` in the box flips between the
+/// two.
+fn launch_target(app: &App, project: &ProjectId, issue: &IssueRef) -> Option<QuickTarget> {
+    if crate::config::Config::load().quick_prompt_new_worktree {
+        let taken = app.project_branches(project);
+        return Some(QuickTarget::NewWorktree {
+            project: project.clone(),
+            branch: crate::branch_name::issue_name(issue.number, &issue.title, &taken),
+        });
     }
     app.tree
         .worktrees
@@ -1353,25 +1486,26 @@ fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
         app.flash = Some("no issue selected".into());
         return None;
     };
-    let Some(target) = launch_target(app, &project) else {
+    let issue = issue.launch_ref();
+    let Some(target) = launch_target(app, &project, &issue) else {
         app.flash = Some("issues: the project has no worktree to launch into".into());
         return None;
     };
-    Some(
-        QuickLaunch::from_config(target, &crate::config::Config::load())
-            .with_issue(Some(issue.launch_ref())),
-    )
+    Some(QuickLaunch::from_config(target, &crate::config::Config::load()).with_issue(Some(issue)))
 }
 
-/// `Enter` / `p`: the QUICK PROMPT for the issue. The box replaces the
-/// modal; Esc from it lands on the panels, `i` reopens the list.
+/// `Enter`: the QUICK PROMPT for the issue. The box goes up over the
+/// modal, which stays on screen under it: Esc puts the modal back on the
+/// row (`QuickLaunch::under`), and the launch closes it onto the new
+/// session's card.
 fn open_prompt_for_selected(app: &mut App) {
+    let under = ModalUnder::of(app.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
-        crate::quick_prompt::open_box(app, launch);
+        crate::quick_prompt::open_box(app, launch.with_under(under));
     }
 }
 
-/// `e`: pick one of the saved AGENT PRESETS for the issue. The picker hands
+/// `Shift+Tab`: pick one of the saved AGENT PRESETS for the issue. The picker hands
 /// its pick to the same box `Enter` opens, with the preset applied; with no
 /// presets saved the modal stays up and the footer says where to add one.
 fn open_preset_for_selected(app: &mut App) {
@@ -1389,12 +1523,11 @@ fn open_preset_for_selected(app: &mut App) {
 
 /// The launch the PROJECT ISSUES GROUP row under the Worktrees cursor
 /// describes — the modal's for that row: the `quick_prompt_kind`
-/// SETTING's harness aimed at [`launch_target`] (an issue row has no
-/// checkout, so that is the project's root), carrying the issue.
+/// SETTING's harness aimed at [`launch_target`], carrying the issue.
 fn launch_for_row(app: &mut App) -> Option<QuickLaunch> {
     let issue = app.selected_worktree_issue()?.launch_ref();
     let project = app.selected_project()?.id.clone();
-    let Some(target) = launch_target(app, &project) else {
+    let Some(target) = launch_target(app, &project, &issue) else {
         app.flash = Some("issues: the project has no worktree to launch into".into());
         return None;
     };
@@ -1423,11 +1556,25 @@ pub(crate) fn open_preset_for_row(app: &mut App) {
     }
 }
 
+/// `Ctrl+o`, and a click on the reading pane's `↗ open in browser` button
+/// (`HitTarget::ModalBrowser`): the issue under the cursor in the
+/// browser, through the very `event_loop::open_link` a card's `⇧V` and
+/// `⇧I` run — the footer says where it went, or that it could not.
+/// Nothing under the cursor opens nothing. INPUT PARITY: the key and the
+/// click end in the same state.
+pub(crate) fn open_in_browser(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if let Some(url) = selected_url(app) {
+        crate::event_loop::open_link(app, &url, out);
+    }
+}
+
 // ---- keys and mouse ----
 
 /// Keys in the ISSUES MODAL. While the editor is up they are all its
-/// ([`handle_editor_key`]).
-pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
+/// ([`handle_editor_key`]). Otherwise the filter is always live, so
+/// letters type — the modal's own hotkey and `q` among them — and the
+/// verbs are chords; only Esc closes, once the filter is clear.
+pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     if matches!(&app.overlay, Some(Overlay::Issues(v)) if v.editor.is_some()) {
         handle_editor_key(app, key);
         return;
@@ -1439,51 +1586,63 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let half = (view.view_height / 2).max(1) as i32;
     let page = view.view_height.max(1) as i32;
-    let selected = view.selected as i64;
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => app.overlay = None,
-        KeyCode::Char('j') | KeyCode::Down if !shift => select(app, selected + 1),
-        KeyCode::Char('k') | KeyCode::Up if !shift => select(app, selected - 1),
-        // The reading pane scrolls on the diff modal's keys.
+        // Two-stage escape, like every fuzzy overlay: a typed filter is
+        // cleared before the second Esc closes the modal.
+        KeyCode::Esc if !view.query.is_empty() => clear_query(app),
+        KeyCode::Esc => app.overlay = None,
+        // Shift+↑/↓ scroll the pane a line; ↑/↓ walk the rows the filter
+        // leaves, Ctrl+n/p mirroring them.
+        KeyCode::Down if shift => view.scroll_by(1),
+        KeyCode::Up if shift => view.scroll_by(-1),
+        KeyCode::Down => step(app, 1),
+        KeyCode::Up => step(app, -1),
+        KeyCode::Char('n') if ctrl => step(app, 1),
+        KeyCode::Char('p') if ctrl => step(app, -1),
+        // The reading pane scrolls on the DIFF VIEWER's keys. Ctrl+u is
+        // the line editor's kill-to-start while something is typed; only
+        // with an empty filter does it scroll.
         KeyCode::Char('d') if ctrl => view.scroll_by(half),
-        KeyCode::Char('u') if ctrl => view.scroll_by(-half),
-        // Shift+j/k scroll the pane a line: `J` in most terminals, a
-        // shifted `j` under the kitty protocol.
-        KeyCode::Down | KeyCode::Char('j') if shift => view.scroll_by(1),
-        KeyCode::Up | KeyCode::Char('k') if shift => view.scroll_by(-1),
-        KeyCode::Char('J') => view.scroll_by(1),
-        KeyCode::Char('K') => view.scroll_by(-1),
+        KeyCode::Char('u') if ctrl && view.query.is_empty() => view.scroll_by(-half),
         KeyCode::PageDown => view.scroll_by(page),
         KeyCode::PageUp => view.scroll_by(-page),
         KeyCode::Home => view.scroll = 0,
         KeyCode::End => view.scroll = view.max_scroll(),
-        KeyCode::Enter | KeyCode::Char('p') => open_prompt_for_selected(app),
-        // `E` in most terminals, a shifted `e` under the kitty protocol.
-        KeyCode::Char('E') => open_editor(app),
-        KeyCode::Char('e') if shift => open_editor(app),
-        KeyCode::Char('e') => open_preset_for_selected(app),
-        KeyCode::Char('c') => open_comment_for_selected(app),
-        KeyCode::Char('o') => {
-            if let Some((issue, _)) = selected_issue(app) {
-                if !crate::event_loop::open_url(&issue.url) {
-                    app.flash = Some("could not open the browser".into());
-                }
+        // The launches are the QUICK PROMPT box's own keys: Enter prompts,
+        // Shift+Tab picks a preset (a shifted Tab under the kitty protocol
+        // is the same key).
+        KeyCode::Enter => open_prompt_for_selected(app),
+        KeyCode::BackTab => open_preset_for_selected(app),
+        KeyCode::Tab if shift => open_preset_for_selected(app),
+        // The AGENT PRESETS list's edit chord.
+        KeyCode::Char('e') if ctrl => open_editor(app),
+        KeyCode::Char('c') if ctrl => open_comment_for_selected(app),
+        KeyCode::Char('o') if ctrl => open_in_browser(app, out),
+        KeyCode::Char('r') if ctrl => refresh(app),
+        // Everything else feeds the always-live fuzzy filter, which edits
+        // like a terminal line (see text_input).
+        _ => {
+            if view.query.handle_key(&key).changed() {
+                query_changed(app);
             }
         }
-        KeyCode::Char('r') | KeyCode::Char('R') => refresh(app),
-        _ => {}
     }
     app.dirty = true;
 }
 
-/// Mouse in the ISSUES MODAL: the wheel moves the cursor over the list and
-/// scrolls the reading pane over it, a click on a row selects it (a launch
-/// is `Enter`, not a click — the row is something to read first), and a
-/// click outside closes (`overlay_close`); everything else is swallowed.
-/// While the editor is up a click moves the caret between its two fields
-/// and nothing else — the list and the wheel would drop the draft under
-/// the user; Esc is the way out.
-pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Position) {
+/// Mouse in the ISSUES MODAL: the wheel moves the cursor over the rows
+/// the filter leaves and scrolls the reading pane over it, a click on a
+/// row selects it (a launch is `Enter`, not a click — the row is
+/// something to read first), and a click outside closes (`overlay_close`);
+/// everything else is swallowed. While the editor is up a click moves the
+/// caret between its two fields and nothing else — the list and the wheel
+/// would drop the draft under the user; Esc is the way out.
+pub(crate) fn handle_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    mouse_pos: Position,
+    out: &mut Vec<ClientRequest>,
+) {
     if let Some(Overlay::Issues(IssuesView {
         editor: Some(editor),
         ..
@@ -1503,18 +1662,27 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Position
         return;
     };
     let over_body = view.body_area.contains(mouse_pos);
-    let selected = view.selected as i64;
+    let on_button = view.browser_area.contains(mouse_pos);
     match mouse.kind {
         MouseEventKind::ScrollUp if over_body => view.scroll_by(-WHEEL_LINES),
         MouseEventKind::ScrollDown if over_body => view.scroll_by(WHEEL_LINES),
-        MouseEventKind::ScrollUp => select(app, selected - 1),
-        MouseEventKind::ScrollDown => select(app, selected + 1),
+        MouseEventKind::ScrollUp => step(app, -1),
+        MouseEventKind::ScrollDown => step(app, 1),
+        // The `↗ open in browser` button, before the rows: the very open
+        // `Ctrl+o` runs.
+        MouseEventKind::Down(MouseButton::Left) if on_button => open_in_browser(app, out),
         MouseEventKind::Down(MouseButton::Left) => {
             let list = view.list_area;
             let first = view.window_start(list.height as usize);
-            let len = app.issues.get(&view.project).map_or(0, |l| l.list.len());
-            if let Some(index) = crate::list_hit::row_at(list, first, len, mouse_pos) {
-                select(app, index as i64);
+            // The row math counts the filter's matches, not the whole list.
+            let visible = visible_rows(
+                &view.query,
+                app.issues
+                    .get(&view.project)
+                    .map_or(&[][..], |l| l.list.as_slice()),
+            );
+            if let Some(row) = crate::list_hit::row_at(list, first, visible.len(), mouse_pos) {
+                select(app, visible[row].0 as i64);
             }
         }
         _ => {}
@@ -1655,7 +1823,12 @@ pub fn lines(
 }
 
 /// The ISSUES MODAL: the list down the left, the reading pane on the right.
-pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
+/// `backdrop` draws it as the layer under a QUICK PROMPT box opened from it
+/// (`QuickLaunch::under`): dim frames and an unfocused cursor row, the box
+/// in front having the eye.
+pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, backdrop: bool) {
+    // The list holds the keys unless the editor or a box over the modal does.
+    let list_focused = view.editor.is_none() && !backdrop;
     let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
     f.render_widget(Clear, area);
     let list_w = (area.width * LIST_PCT / 100)
@@ -1674,24 +1847,45 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
         .unwrap_or_default();
     let inflight = app.issues_inflight.contains(&view.project);
     let failed = app.issues_failed.contains(&view.project);
-    let selected = view.selected.min(rows.len().saturating_sub(1));
+    // The rows the filter leaves, and where the cursor sits among them.
+    let visible = visible_rows(&view.query, &rows);
+    let cursor = cursor_index(view, &rows);
+    let cursor_row = cursor
+        .and_then(|c| visible.iter().position(|(i, _)| *i == c))
+        .unwrap_or(0);
 
     // ---- left: the list ----
+    // The count reads `matches/all` while a filter is on.
+    let count = if has_query(view) {
+        format!("{}/{}", visible.len(), rows.len())
+    } else {
+        rows.len().to_string()
+    };
     let title = format!(
         "Issues — {} ({}{})",
         view.project_name,
-        rows.len(),
+        count,
         if inflight { ", refreshing…" } else { "" }
     );
-    let block = panel_block(&title, view.editor.is_none(), th).title_bottom(
+    let block = panel_block(&title, list_focused, th).title_bottom(
         Line::from(Span::styled(
-            " Enter/p: prompt  e: preset  E: edit  c: comment  o: browser  r: refresh ",
+            " Enter: prompt  ⇧Tab: preset  ^e: edit  ^c: comment  ^o: browser  ^r: refresh ",
             Style::default().fg(th.dim),
         ))
         .left_aligned(),
     );
     let list_inner = block.inner(list_a);
     f.render_widget(block, list_a);
+    // The always-live filter on the list's first line, the rows under it.
+    if let Some(query_area) = row_rect(list_inner, 0) {
+        let line = search_line(&view.query, "type to filter…", query_area, th);
+        f.render_widget(Paragraph::new(line), query_area);
+    }
+    let rows_area = Rect {
+        y: list_inner.y.saturating_add(1),
+        height: list_inner.height.saturating_sub(1),
+        ..list_inner
+    };
     if rows.is_empty() {
         let text = if failed {
             "couldn't list issues — is gh installed and logged in?"
@@ -1700,34 +1894,50 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
         } else {
             "no open issues"
         };
-        empty_list_row(f, list_inner, text, th);
+        empty_list_row(f, rows_area, text, th);
+    } else if visible.is_empty() {
+        empty_list_row(f, rows_area, "no issues match", th);
     }
-    let start = view.window_start(list_inner.height as usize);
-    for (i, issue) in rows.iter().enumerate().skip(start) {
-        let Some(row_area) = row_rect(list_inner, i - start) else {
+    let start = window_start(cursor_row, rows_area.height as usize);
+    for (row, (index, positions)) in visible.iter().enumerate().skip(start) {
+        let Some(row_area) = row_rect(rows_area, row - start) else {
             break;
         };
-        let budget = (list_inner.width as usize).saturating_sub(2);
-        // `#15 title` left, the day it was opened pinned right, dim.
+        let issue = &rows[*index];
+        let budget = (rows_area.width as usize).saturating_sub(2);
+        // `#15 title` left, the day it was opened pinned right, dim; the
+        // chars the filter matched lit.
         let opened = day(&issue.created_at).to_string();
         let opened_w = opened.chars().count();
         let text_budget = budget.saturating_sub(if opened_w > 0 { opened_w + 2 } else { 0 });
-        let label = truncate(&issue.label(), text_budget);
+        let full = issue.label();
+        let label = truncate(&full, text_budget);
+        let positions = visible_positions(positions, &label, &full);
         let used = label.chars().count();
-        let mut spans = vec![
-            Span::styled(format!("#{} ", issue.number), Style::default().fg(th.dim)),
-            Span::raw(
-                label
-                    .strip_prefix(&format!("#{} ", issue.number))
-                    .unwrap_or(&label)
-                    .to_string(),
-            ),
-        ];
+        let number = format!("#{} ", issue.number);
+        let number_w = number.chars().count();
+        let title = label.strip_prefix(&number).unwrap_or(&label).to_string();
+        // The positions split where the number ends: the title's own
+        // count from its first char.
+        let split = positions.partition_point(|&p| p < number_w);
+        let title_positions: Vec<usize> = positions[split..].iter().map(|p| p - number_w).collect();
+        let mut spans = fuzzy_highlight_styled(
+            &number,
+            &positions[..split],
+            Style::default().fg(th.dim),
+            th,
+        );
+        spans.extend(fuzzy_highlight_styled(
+            &title,
+            &title_positions,
+            Style::default(),
+            th,
+        ));
         if opened_w > 0 && used + opened_w < budget {
             spans.push(Span::raw(" ".repeat(budget - used - opened_w)));
             spans.push(Span::styled(opened, Style::default().fg(th.dim)));
         }
-        render_row(f, row_area, spans, i == selected, view.editor.is_none(), th);
+        render_row(f, row_area, spans, Some(*index) == cursor, list_focused, th);
     }
 
     // ---- right: the editor, while it is up ----
@@ -1735,8 +1945,12 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
         let (title_area, body_area, body_view) = draw_editor(f, body_a, editor, th);
         if let Some(Overlay::Issues(v)) = &mut app.overlay {
             v.area = area;
-            v.list_area = list_inner;
-            v.selected = selected;
+            v.list_area = rows_area;
+            v.cursor_row = cursor_row;
+            v.browser_area = Rect::default();
+            if let Some(index) = cursor {
+                v.selected = index;
+            }
             if let Some(e) = &mut v.editor {
                 e.title_area = title_area;
                 e.body_area = body_area;
@@ -1749,7 +1963,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
     }
 
     // ---- right: the reading pane ----
-    let current = rows.get(selected);
+    let current = cursor.and_then(|i| rows.get(i));
     // The frame names the number; the headline inside carries the title.
     let body_title = match current {
         Some(issue) => format!("Issue #{}", issue.number),
@@ -1780,6 +1994,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
         );
     }
     f.render_widget(block, body_a);
+    // The `↗ open in browser` button over the top border, once the block
+    // has drawn it — only with a row to open.
+    let browser_area = match current {
+        Some(_) => crate::ui::browser_button(
+            f,
+            body_a,
+            (body_title.chars().count() + 2) as u16,
+            app.hover_crumb == Some(HitTarget::ModalBrowser),
+            th,
+        ),
+        None => Rect::default(),
+    };
     let shown: Vec<Line> = lines.iter().skip(scroll as usize).cloned().collect();
     f.render_widget(Paragraph::new(shown), body_inner);
 
@@ -1787,11 +2013,17 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
     // the pane's size for paging, and the clamped cursor and scroll.
     if let Some(Overlay::Issues(v)) = &mut app.overlay {
         v.area = area;
-        v.list_area = list_inner;
+        v.list_area = rows_area;
+        v.cursor_row = cursor_row;
         v.body_area = body_inner;
+        v.browser_area = browser_area;
         v.view_height = body_inner.height;
         v.body_lines = lines.len();
-        v.selected = selected;
+        // A cursor the filter had to move (see `cursor_index`) is settled
+        // onto its row.
+        if let Some(index) = cursor {
+            v.selected = index;
+        }
         v.scroll = scroll;
     }
 }
@@ -2086,7 +2318,7 @@ mod tests {
         assert!(!idle.contains("posting"), "{idle}");
     }
 
-    /// `c` opens the comment box for the issue under the cursor, carrying
+    /// `Ctrl+c` opens the comment box for the issue under the cursor, carrying
     /// the modal so Esc and Enter can put it back on the row; with no rows
     /// it says so and stays.
     #[test]
@@ -2098,8 +2330,8 @@ mod tests {
             "demo".into(),
             "/tmp/demo".into(),
         )));
-        let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
-        handle_key(&mut app, c);
+        let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        handle_key(&mut app, c, &mut Vec::new());
         assert!(
             matches!(&app.overlay, Some(Overlay::Issues(_))),
             "no rows: the modal stays"
@@ -2113,7 +2345,7 @@ mod tests {
             },
         );
         select(&mut app, 1);
-        handle_key(&mut app, c);
+        handle_key(&mut app, c, &mut Vec::new());
         let Some(Overlay::Prompt(prompt)) = &app.overlay else {
             panic!("c should open the comment box, got {:?}", app.overlay);
         };
@@ -2577,21 +2809,33 @@ mod tests {
         }
     }
 
-    /// `E` turns the pane into a form prefilled from the row, caret on
+    /// `Ctrl+e` turns the pane into a form prefilled from the row, caret on
     /// the title; Esc puts the pane back with the draft dropped and the
     /// modal still up. An empty list has nothing to edit.
     #[test]
     fn shift_e_opens_the_editor_on_the_row_and_esc_drops_the_draft() {
         let (mut app, project) = modal_with(vec![issue(15, "Fix login redirect")]);
-        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
         let e = editor(&app).expect("editing");
         assert_eq!(e.title.as_str(), "Fix login redirect");
         assert_eq!(e.body.as_str(), "Login bounces back to /.");
         assert_eq!(e.field, EditField::Title);
         assert!(!e.is_changed());
-        handle_key(&mut app, key(KeyCode::Char('!'), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('!'), KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         assert!(editor(&app).unwrap().is_changed());
-        handle_key(&mut app, key(KeyCode::Esc, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         assert!(editor(&app).is_none(), "back to the reading pane");
         assert!(
             matches!(&app.overlay, Some(Overlay::Issues(_))),
@@ -2601,12 +2845,20 @@ mod tests {
             app.issues[&project].list[0].title, "Fix login redirect",
             "nothing sent"
         );
-        // A shifted `e` under the kitty protocol is the same key; a plain
-        // one is still the preset picker, not the editor.
-        handle_key(&mut app, key(KeyCode::Char('e'), KeyModifiers::SHIFT));
-        assert!(editor(&app).is_some());
+        // A plain `e` is the filter's, not the editor's.
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert!(editor(&app).is_none());
+        assert_eq!(issues_view(&app).query.as_str(), "e");
         let (mut empty, _) = modal_with(vec![]);
-        handle_key(&mut empty, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        handle_key(
+            &mut empty,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
         assert!(editor(&empty).is_none());
         assert_eq!(empty.flash.as_deref(), Some("no issue selected"));
     }
@@ -2619,50 +2871,98 @@ mod tests {
     #[test]
     fn the_editor_fields_take_the_form_keys() {
         let (mut app, _) = modal_with(vec![issue(15, "Fix login redirect")]);
-        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
-        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::SHIFT),
+            &mut Vec::new(),
+        );
         let e = editor(&app).expect("a line break on the title is not a save");
         assert_eq!(e.title.as_str(), "Fix login redirect", "no line in a title");
         assert_eq!(e.field, EditField::Body, "it steps into the description");
-        handle_key(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         assert_eq!(editor(&app).unwrap().field, EditField::Title);
-        handle_key(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         assert_eq!(editor(&app).unwrap().field, EditField::Body);
-        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::SHIFT));
-        handle_key(&mut app, key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::SHIFT),
+            &mut Vec::new(),
+        );
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
         assert_eq!(
             editor(&app).unwrap().body.as_str(),
             "Login bounces back to /.\n\n"
         );
         // ↑ walks the description's three lines before it leaves the field.
-        handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Up, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         let e = editor(&app).unwrap();
         assert_eq!((e.field, e.body.cursor_chars()), (EditField::Body, 25));
-        handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Up, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         let e = editor(&app).unwrap();
         assert_eq!((e.field, e.body.cursor_chars()), (EditField::Body, 0));
-        handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Up, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         assert_eq!(editor(&app).unwrap().field, EditField::Title);
-        handle_key(&mut app, key(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         assert_eq!(editor(&app).unwrap().field, EditField::Body);
-        handle_key(&mut app, key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        handle_key(
+            &mut app,
+            key(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &mut Vec::new(),
+        );
         assert_eq!(editor(&app).unwrap().field, EditField::Title);
 
+        assert!(paste(&mut app, "a\nb"));
+        assert_eq!(
+            editor(&app).unwrap().title.as_str(),
+            "Fix login redirecta b"
+        );
+        editor_mut(&mut app).field = EditField::Body;
+        assert!(paste(&mut app, "c\r\nd"));
+        // The walk above left the description's caret on its first
+        // character, so the paste lands there — lines kept.
+        assert!(editor(&app).unwrap().body.starts_with("c\nd"));
         let Some(Overlay::Issues(view)) = &mut app.overlay else {
             unreachable!()
         };
-        assert!(paste(view, "a\nb"));
-        assert_eq!(
-            view.editor.as_ref().unwrap().title.as_str(),
-            "Fix login redirecta b"
-        );
-        view.editor.as_mut().unwrap().field = EditField::Body;
-        assert!(paste(view, "c\r\nd"));
-        // The walk above left the description's caret on its first
-        // character, so the paste lands there — lines kept.
-        assert!(view.editor.as_ref().unwrap().body.starts_with("c\nd"));
         view.editor = None;
-        assert!(!paste(view, "x"), "nothing typing: the paste falls through");
+        assert!(
+            paste(&mut app, "x"),
+            "with the form down, the paste is the filter's"
+        );
+        assert_eq!(issues_view(&app).query.as_str(), "x");
     }
 
     /// Enter refuses a blank title on the spot, closes an unchanged form
@@ -2671,25 +2971,57 @@ mod tests {
     #[test]
     fn enter_validates_before_it_saves() {
         let (mut app, _) = modal_with(vec![issue(15, "Fix login redirect")]);
-        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
-        handle_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
         assert_eq!(editor(&app).unwrap().title.as_str(), "");
-        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         let e = editor(&app).expect("refused, still editing");
         assert_eq!(e.notice.as_deref(), Some("the issue needs a title"));
         assert!(!e.saving);
         // Typing clears the notice.
-        handle_key(&mut app, key(KeyCode::Char('x'), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         assert!(editor(&app).unwrap().notice.is_none());
         // Back to the original text: nothing to send.
         editor_mut(&mut app).title.set_text("Fix login redirect");
-        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         assert!(editor(&app).is_none(), "an unchanged form just closes");
         assert_eq!(app.flash.as_deref(), Some("issue unchanged"));
         // A changed one with no sender installed stays put, unsent.
-        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
-        handle_key(&mut app, key(KeyCode::Char('!'), KeyModifiers::NONE));
-        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('!'), KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         let e = editor(&app).expect("still editing");
         assert!(!e.saving);
         assert_eq!(e.title.as_str(), "Fix login redirect!");
@@ -2702,12 +3034,20 @@ mod tests {
     fn an_edit_landing_updates_the_row_or_keeps_the_form() {
         let (mut app, project) = modal_with(vec![issue(15, "Fix login redirect")]);
         let url = "https://github.com/o/r/issues/15".to_string();
-        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
         let e = editor_mut(&mut app);
         e.title.set_text("Fix the login redirect");
         e.saving = true;
         // Keys wait on the answer; Esc would not.
-        handle_key(&mut app, key(KeyCode::Char('?'), KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
         assert_eq!(
             editor(&app).unwrap().title.as_str(),
             "Fix the login redirect"
@@ -2751,7 +3091,11 @@ mod tests {
         assert_eq!(app.flash.as_deref(), Some("issue #15 updated"));
 
         // A form reopened meanwhile is left alone by a late answer.
-        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
         land_answer(
             &mut app,
             IssuesAnswer::Edited {
@@ -2828,7 +3172,7 @@ mod tests {
             let Some(Overlay::Issues(v)) = app.overlay.clone() else {
                 panic!("no issues modal");
             };
-            draw(f, app, &v, app.theme);
+            draw(f, app, &v, app.theme, false);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -2842,6 +3186,299 @@ mod tests {
             .join("\n")
     }
 
+    fn type_str(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle_key(
+                app,
+                key(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+    }
+
+    fn issues_view(app: &App) -> &IssuesView {
+        match &app.overlay {
+            Some(Overlay::Issues(v)) => v,
+            other => panic!("expected the issues modal, got {other:?}"),
+        }
+    }
+
+    fn cursor_number(app: &App) -> Option<u64> {
+        selected_issue(app).map(|(issue, _)| issue.number)
+    }
+
+    /// Typing narrows the rows the moment the modal is up — no key to
+    /// press first — to the fuzzy matches, best first, the cursor on the
+    /// best with its comments asked for as any move's are, the count
+    /// reading `matches/all`; the modal's own hotkey types too. ↑/↓ walk
+    /// the matches alone and Ctrl+e edits the one found. The first Esc
+    /// clears the filter, the cursor staying on the row it found, and the
+    /// second closes.
+    #[test]
+    fn typing_filters_the_rows_at_once_and_esc_clears_before_closing() {
+        let (mut app, _) = modal_with(vec![
+            issue(15, "Fix login redirect"),
+            issue(14, "Docs pass"),
+            issue(13, "Login page"),
+        ]);
+        app.pending_issue_detail = None;
+        assert!(footer_hint(issues_view(&app)).starts_with("type to filter"));
+        type_str(&mut app, "login");
+        assert_eq!(issues_view(&app).query.as_str(), "login");
+        let shot = screen(&mut app, 120, 40);
+        assert!(shot.contains("(2/3)"), "{shot}");
+        assert!(
+            !shot.contains("#14"),
+            "the docs row is filtered out:\n{shot}"
+        );
+        let found = cursor_number(&app).expect("a row under the cursor");
+        assert_ne!(found, 14);
+        assert!(
+            app.pending_issue_detail.is_some(),
+            "its comments are asked for"
+        );
+
+        // `i` types, rather than closing.
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(issues_view(&app).query.as_str(), "logini");
+        assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+        handle_key(
+            &mut app,
+            key(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+
+        let first = cursor_number(&app).unwrap();
+        handle_key(
+            &mut app,
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        let second = cursor_number(&app).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(second, 14, "↓ walks the matches alone");
+        handle_key(
+            &mut app,
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            cursor_number(&app),
+            Some(second),
+            "and stops at the last one"
+        );
+        // The verbs act on the row found: Ctrl+e edits it.
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
+        assert_eq!(editor(&app).expect("editing").number, second);
+        handle_key(
+            &mut app,
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert!(editor(&app).is_none());
+        assert_eq!(
+            issues_view(&app).query.as_str(),
+            "login",
+            "leaving the editor keeps the filter"
+        );
+
+        // The first Esc clears the filter, the cursor staying put; the
+        // second closes.
+        handle_key(
+            &mut app,
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+        assert!(issues_view(&app).query.is_empty());
+        assert_eq!(cursor_number(&app), Some(second));
+        let shot = screen(&mut app, 120, 40);
+        assert!(shot.contains("(3)"), "{shot}");
+        assert!(shot.contains("type to filter…"), "{shot}");
+        handle_key(
+            &mut app,
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert!(app.overlay.is_none());
+    }
+
+    /// A filter nothing matches empties the list and says so — nothing
+    /// under the cursor, no comments asked for — and the row is back the
+    /// moment the filter widens. Ctrl+u kills the typed filter, as in any
+    /// line editor, and scrolls the pane only once there is none.
+    #[test]
+    fn a_filter_nothing_matches_says_so_and_leaves_the_cursor_put() {
+        let (mut app, _) = modal_with(vec![
+            issue(15, "Fix login redirect"),
+            issue(14, "Docs pass"),
+        ]);
+        select(&mut app, 1);
+        assert_eq!(cursor_number(&app), Some(14));
+        type_str(&mut app, "fix");
+        assert_eq!(
+            cursor_number(&app),
+            Some(15),
+            "the cursor goes to the best match"
+        );
+        type_str(&mut app, "zzz");
+        let shot = screen(&mut app, 120, 40);
+        assert!(shot.contains("no issues match"), "{shot}");
+        assert!(shot.contains("(0/2)"), "{shot}");
+        assert_eq!(cursor_number(&app), None, "nothing under the cursor");
+        assert!(app.pending_issue_detail.is_none());
+        for _ in 0..3 {
+            handle_key(
+                &mut app,
+                key(KeyCode::Backspace, KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(
+            cursor_number(&app),
+            Some(15),
+            "the row is back as the filter widens"
+        );
+        if let Some(Overlay::Issues(v)) = &mut app.overlay {
+            v.scroll = 3;
+        }
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
+        assert!(
+            issues_view(&app).query.is_empty(),
+            "Ctrl+u kills the typed filter"
+        );
+        assert_eq!(issues_view(&app).scroll, 3, "and does not scroll the pane");
+        assert_eq!(
+            cursor_number(&app),
+            Some(15),
+            "the row found keeps the cursor"
+        );
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            issues_view(&app).scroll,
+            0,
+            "with nothing typed, it scrolls"
+        );
+    }
+
+    /// A click on a row while a filter is typed picks that row — the row
+    /// math counting the filter's matches, not the whole list — and the
+    /// filter stays. A paste lands in the filter as one line.
+    #[test]
+    fn a_row_click_counts_the_matches_not_the_list() {
+        let (mut app, project) = modal_with(vec![
+            issue(15, "Fix login redirect"),
+            issue(14, "Docs pass"),
+            issue(13, "Login page"),
+        ]);
+        assert!(paste(&mut app, "log\nin"));
+        assert_eq!(issues_view(&app).query.as_str(), "log in");
+        for _ in 0..3 {
+            handle_key(
+                &mut app,
+                key(KeyCode::Backspace, KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+        type_str(&mut app, "in");
+        screen(&mut app, 120, 40);
+        let list = issues_view(&app).list_area;
+        // The second visible row: the second match, whichever it is.
+        let at = Position::new(list.x + 1, list.y + 1);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut Vec::new());
+        assert_eq!(
+            issues_view(&app).query.as_str(),
+            "login",
+            "the filter is kept"
+        );
+        let picked = cursor_number(&app).unwrap();
+        let visible = visible_rows("login", &app.issues[&project].list);
+        assert_eq!(picked, app.issues[&project].list[visible[1].0].number);
+        assert_ne!(picked, 14);
+    }
+
+    /// A refresh that retires the row under the cursor while a filter is
+    /// typed lands the cursor on the filter's next match, never on a row
+    /// the filter hides.
+    #[test]
+    fn a_refresh_under_a_filter_lands_on_a_visible_row() {
+        let (mut app, project) = modal_with(vec![
+            issue(15, "Fix login redirect"),
+            issue(14, "Docs pass"),
+            issue(13, "Login page"),
+        ]);
+        type_str(&mut app, "login");
+        select(&mut app, 2);
+        assert_eq!(cursor_number(&app), Some(13));
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project,
+                list: Some(vec![
+                    issue(15, "Fix login redirect"),
+                    issue(14, "Docs pass"),
+                ]),
+            },
+        );
+        assert_eq!(
+            cursor_number(&app),
+            Some(15),
+            "not #14, which the filter hides"
+        );
+        screen(&mut app, 120, 40);
+        assert_eq!(
+            issues_view(&app).selected,
+            0,
+            "settled onto the row it shows"
+        );
+    }
+
+    /// The verbs the letters used to be are chords now: Ctrl+r asks
+    /// GitHub again, saying so in the footer, while the plain letters go
+    /// to the filter.
+    #[test]
+    fn the_verb_chords_run_and_the_plain_letters_type() {
+        let (mut app, _) = modal_with(vec![issue(15, "Fix login redirect")]);
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
+        assert_eq!(app.flash.as_deref(), Some("refreshing issues…"));
+        for letter in "roce".chars() {
+            handle_key(
+                &mut app,
+                key(KeyCode::Char(letter), KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(issues_view(&app).query.as_str(), "roce");
+        assert!(editor(&app).is_none());
+        assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+    }
+
     /// The form paints in the reading pane's place — the list still on
     /// the left — and the frame's foot carries the keys, the in-flight
     /// state, or the notice.
@@ -2851,7 +3488,11 @@ mod tests {
         let read = screen(&mut app, 100, 30);
         assert!(read.contains("Issue #15"), "{read}");
         assert!(!read.contains("Edit issue"), "{read}");
-        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
         let form = screen(&mut app, 100, 30);
         assert!(form.contains("Edit issue #15"), "{form}");
         assert!(form.contains("Title  Fix login redirect"), "{form}");
@@ -2870,5 +3511,73 @@ mod tests {
         e.saving = false;
         e.notice = Some("the issue needs a title".into());
         assert!(screen(&mut app, 100, 30).contains("the issue needs a title"));
+    }
+
+    /// `Ctrl+o` and a click on the reading pane's `↗ open in browser` button run
+    /// one open: the footer names where the browser went either way (INPUT
+    /// PARITY), and the modal stays up. The button sits pinned right on the
+    /// pane's top border with its rect written back for the click, the
+    /// pointer resting on it is what `hover_crumb` holds — and the editor
+    /// taking the pane over takes the button with it, rect and all.
+    #[test]
+    fn o_and_the_browser_button_open_the_issue_the_same_way() {
+        let (mut app, _project) = modal_with(vec![issue(15, "Fix login redirect")]);
+        let shot = screen(&mut app, 120, 40);
+        assert!(shot.contains("↗ open in browser"), "{shot}");
+        let button = match &app.overlay {
+            Some(Overlay::Issues(v)) => v.browser_area,
+            other => panic!("expected the issues modal, got {other:?}"),
+        };
+        assert!(button.width > 0, "the button's rect is written back");
+        let at = Position::new(button.x + 1, button.y);
+        assert_eq!(
+            crate::ui::browser_button_under(&app, at),
+            Some(HitTarget::ModalBrowser)
+        );
+        assert_eq!(
+            crate::ui::browser_button_under(&app, Position::new(button.x - 1, button.y)),
+            None
+        );
+
+        let mut out = Vec::new();
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut out,
+        );
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("opened github.com/o/r/issues/15")
+        );
+        app.flash = None;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut out);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("opened github.com/o/r/issues/15")
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::Issues(_))),
+            "the modal stays up"
+        );
+
+        // `Ctrl+e`: the editor has the pane, and the button goes with it.
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut out,
+        );
+        let shot = screen(&mut app, 120, 40);
+        assert!(!shot.contains("open in browser"), "{shot}");
+        let Some(Overlay::Issues(v)) = &app.overlay else {
+            panic!("no issues modal");
+        };
+        assert_eq!(v.browser_area, Rect::default());
+        assert_eq!(crate::ui::browser_button_under(&app, at), None);
     }
 }

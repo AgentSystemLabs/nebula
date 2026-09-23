@@ -37,13 +37,16 @@ mod optimistic;
 mod pacing;
 mod placeholder;
 mod quick_launch;
+mod release_watch;
 use focus_walk::{
     double_tapped, enter_terminal_pane, land_click_focus, walk_focus_back, walk_focus_forward,
 };
 pub use host_terminal::restore_terminal;
 use host_terminal::{
-    on_host_resize, reassert_modes, repaint, setup_terminal, take_worker_panic, MODE_REASSERT,
+    on_host_resize, reassert_modes, repaint, setup_terminal, take_worker_panic, watch_held_key,
+    MODE_REASSERT,
 };
+pub use release_watch::ReleaseWatch;
 
 /// Wheel step for the pull-request reading pane, in lines. Prose wants a
 /// bigger bite than a session list of two-row pills.
@@ -217,6 +220,15 @@ const METRICS_POLL: Duration = Duration::from_secs(2);
 /// refreshed.
 const FOOTER_METRICS_POLL: Duration = Duration::from_secs(5);
 
+/// How often the grid asks the daemon what each TERMINAL on it last
+/// printed, for the lines on its card (`request_terminal_tails`).
+const TAIL_POLL: Duration = Duration::from_secs(1);
+
+/// How much of a terminal's ring one such ask brings back: enough to lay
+/// its last screenful out, little enough that a grid of shells asking once
+/// a second is nothing on the socket — and an idle one answers with none.
+const TAIL_BYTES: u32 = 16 * 1024;
+
 /// The one hotkey that isn't only a hotkey. Whatever the user binds to
 /// [`crate::keymap::Action::UnlockTerminal`], Ctrl+q also unlocks a locked
 /// pane, force-closes the VIM MODAL and closes any OVERLAY outright — the
@@ -337,6 +349,7 @@ async fn main_loop(
     let update_interval = crate::update_check::interval();
     let mut next_update_check = tokio::time::Instant::now();
     let mut next_metrics_poll = tokio::time::Instant::now();
+    let mut next_tail_poll = tokio::time::Instant::now();
     let mut next_splash_frame = tokio::time::Instant::now();
     let mut next_sweep_frame = tokio::time::Instant::now();
     // The last sweep tick still had something to animate (see the tick).
@@ -439,6 +452,14 @@ async fn main_loop(
                 };
                 next_metrics_poll = tokio::time::Instant::now() + period;
             }
+            // The grid's TERMINAL cards: what each shell last printed, asked
+            // on a beat of its own for as long as any is on screen — with
+            // the grid folded away or no terminal drawn there is nothing
+            // to ask after, and the beat sleeps with it.
+            _ = tokio::time::sleep_until(next_tail_poll), if !app.tail_cards.is_empty() => {
+                request_terminal_tails(&mut app, &mut out);
+                next_tail_poll = tokio::time::Instant::now() + TAIL_POLL;
+            }
             // First-run splash, or the empty grid's welcome drawn over the
             // same sky: while either is on screen nothing else repaints an
             // idle app, so tick the animation on a fixed cadence.
@@ -484,6 +505,11 @@ async fn main_loop(
             // stops growing a couple of seconds into every long drag. The
             // beat resumes on the release.
             _ = tokio::time::sleep_until(next_mode_reassert), if !app.mouse_held() => {
+                // A RELEASE WATCH nothing has touched for a while goes
+                // first, so the beat re-asks the resting flags, not its.
+                if release_watch::expire(&mut app.release_watch, std::time::Instant::now()) {
+                    let _ = watch_held_key(terminal.backend_mut(), false);
+                }
                 let _ = reassert_modes(terminal.backend_mut());
                 next_mode_reassert = tokio::time::Instant::now() + MODE_REASSERT;
             }
@@ -534,7 +560,14 @@ async fn main_loop(
                         .as_ref()
                         .and_then(|_| crate::perf::label(&event))
                         .map(|label| (label, std::time::Instant::now()));
+                    let watching = app.release_watch.is_some();
                     handle_terminal_event(&mut app, event, &mut out);
+                    // A RELEASE WATCH armed by this key flips the host's
+                    // keyboard flags now, ahead of the key's first repeat;
+                    // one ended by it flips them back (release_watch.rs).
+                    if watching != app.release_watch.is_some() {
+                        let _ = watch_held_key(terminal.backend_mut(), !watching);
+                    }
                     if let (Some(perf), Some((label, arrived))) = (&mut perf, probe) {
                         perf.input(label, arrived, &app);
                     }
@@ -1994,6 +2027,64 @@ fn request_metrics(app: &mut App, out: &mut Vec<ClientRequest>) {
     send(app, out, |req_id| ClientRequest::GetMetrics { req_id });
 }
 
+/// Ask the daemon what each TERMINAL whose card the last frame drew has
+/// printed since its card last heard ([`App::tail_cards`],
+/// [`App::terminal_tails`]), for the lines under its name. The one the
+/// pane is on is skipped — its screen is right here, live — and so is a
+/// dead one: its ring went with its shell, and the card keeps the lines
+/// it had. Each ask carries the ring end the card has, so an idle shell
+/// answers with no bytes. The frame's notes are read, not taken: a grid
+/// nothing repaints keeps asking after the same cards until the next
+/// frame says otherwise. The reply is `ServerEvent::OutputTail`.
+fn request_terminal_tails(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let attached = app.term.as_ref().map(|t| t.sref.clone());
+    let mut asked = std::collections::HashSet::new();
+    for id in app.tail_cards.clone() {
+        if !asked.insert(id.clone()) {
+            continue;
+        }
+        let sref = SessionRef::Terminal(id.clone());
+        if attached.as_ref() == Some(&sref) {
+            continue;
+        }
+        if !app.tree.terminals.iter().any(|t| t.id == id && t.alive) {
+            continue;
+        }
+        let after_seq = app.terminal_tails.get(&id).map(|t| t.end_seq);
+        send(app, out, |req_id| ClientRequest::TailOutput {
+            req_id,
+            session: sref,
+            max_bytes: TAIL_BYTES,
+            after_seq,
+        });
+    }
+}
+
+/// The daemon's answer to [`request_terminal_tails`]: the end of the ring,
+/// laid out through a throwaway screen the PTY's size and kept as the
+/// card's lines. No bytes means nothing new since the card last heard,
+/// and no tail at all that the shell is gone — either way the lines stay.
+/// A frame only when they changed.
+fn land_terminal_tail(app: &mut App, id: TerminalId, tail: Option<nebula_core::OutputTail>) {
+    let Some(tail) = tail else { return };
+    let entry = app.terminal_tails.entry(id).or_default();
+    if tail.data.is_empty() {
+        entry.end_seq = tail.end_seq;
+        return;
+    }
+    let lines = crate::terminal_tail::parse_tail(
+        &tail.data,
+        tail.cols,
+        tail.rows,
+        crate::launcher::PROMPT_LINES,
+    );
+    if entry.lines != lines {
+        entry.lines = lines;
+        app.dirty = true;
+    }
+    entry.end_seq = tail.end_seq;
+}
+
 /// Open the memory modal — `⇧M`, and a click on the footer's readout.
 /// A reading is requested right away: the main loop's poll may be up to
 /// FOOTER_METRICS_POLL out.
@@ -2067,6 +2158,7 @@ fn ui_state_json(app: &App) -> String {
         launcher_pane_h: app.launcher_pane_h,
         launcher_pane_w: app.launcher_pane_w,
         launcher_pane_hidden: app.launcher_pane_hidden,
+        launcher_inside: app.launcher_inside,
         launcher_tabs: app.launcher_tabs.iter().map(|id| id.to_string()).collect(),
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
@@ -2101,6 +2193,7 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
     // height does. Nothing is unselected on the way back in: the restore
     // lands on the cards either way.
     app.launcher_pane_hidden = state.launcher_pane_hidden;
+    app.launcher_inside = state.launcher_inside;
     // The PROJECT TABS come back in the order they were left, less any
     // project the tree no longer has; the draw's settle gives the
     // restored project its tab if it had none.
@@ -2321,6 +2414,10 @@ fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequ
 /// [`dispatch_terminal_event`]'s body: the event to its handler.
 fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
     match event {
+        // The RELEASE WATCH reads every key first: a held unarchive key's
+        // repeats end here, one unarchive per press (release_watch.rs).
+        Event::Key(key)
+            if release_watch::take(&mut app.release_watch, &key, std::time::Instant::now()) => {}
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             let typing = typing_into_pane(app);
             app.flash = None;
@@ -2360,10 +2457,11 @@ fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
             if app.focus == Focus::Terminal && app.term_locked && !app.pane_shows_placeholder() {
-                if let Some(term) = &app.term {
+                if let Some(session) = app.term.as_ref().map(|t| t.sref.clone()) {
+                    typed_into(app, &session);
                     // Bracketed paste so the child (claude, vim…) knows.
                     out.push(ClientRequest::Input {
-                        session: term.sref.clone(),
+                        session,
                         data: bracketed(&text),
                     });
                 }
@@ -2402,7 +2500,7 @@ fn typing_into_pane(app: &App) -> bool {
         && app
             .term
             .as_ref()
-            .is_some_and(|t| !t.exited && t.scroll == 0)
+            .is_some_and(|t| !t.exited && t.scroll_offset() == 0)
 }
 
 /// Is `chord` one of the pane fold's (`^~`, `^``, whatever the Hotkeys tab
@@ -2440,6 +2538,15 @@ fn bracketed(text: &str) -> Vec<u8> {
 /// live. Returns false when nothing is typing, so the paste falls through to
 /// the terminal pane.
 fn paste_into_overlay(app: &mut App, text: &str) -> bool {
+    // The ISSUE EDITOR's field under the caret, or either modal's `/`
+    // FILTER ROW while it has the caret — resolved against the rows, so
+    // the cursor lands on the best match as a typed letter's would.
+    if matches!(&app.overlay, Some(Overlay::Issues(_))) {
+        return crate::issues::paste(app, text);
+    }
+    if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
+        return crate::pr_modal::paste(app, text);
+    }
     let Some(overlay) = &mut app.overlay else {
         return false;
     };
@@ -2482,12 +2589,6 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
         // The query, or the commit message while that is being typed.
         Overlay::BranchSwitch(view) => {
             if !crate::branch_switch::paste(view, text) {
-                return false;
-            }
-        }
-        // The ISSUE EDITOR's field under the caret, while it is up.
-        Overlay::Issues(view) => {
-            if !crate::issues::paste(view, text) {
                 return false;
             }
         }
@@ -2679,12 +2780,35 @@ fn send_turn(app: &mut App, id: &AgentId, text: &str, out: &mut Vec<ClientReques
         session: sref.clone(),
         data,
     });
+    typed_into(app, &sref);
     out.push(ClientRequest::Input {
         session: sref,
         data: b"\r".to_vec(),
     });
     app.flash = Some(format!("sent to {}", agent.name));
     TurnSent::Sent
+}
+
+/// A key, a paste or a turn is going down `session`'s PTY: that is work in
+/// its project, whose PROJECT TAB comes to the far left
+/// ([`App::bring_tab_forward`]). Runs on every keystroke typed at an agent,
+/// so the project already at the front costs a lookup and no allocation.
+fn typed_into(app: &mut App, session: &SessionRef) {
+    if let Some(project) = app
+        .project_of_session(session)
+        .filter(|p| app.launcher_tabs.first() != Some(*p))
+        .cloned()
+    {
+        app.bring_tab_forward(&project);
+    }
+}
+
+/// A session launched, a shell opened or a checkout cut in `worktree`'s
+/// project: [`typed_into`]'s work, by the checkout.
+fn worked_in(app: &mut App, worktree: &WorktreeId) {
+    if let Some(project) = project_of_worktree(app, worktree) {
+        app.bring_tab_forward(&project);
+    }
 }
 
 /// The LAUNCHER VIEW's FOLLOW-UP MODAL for `id`, carrying `text`: opened
@@ -2805,17 +2929,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     app.term_selection = None;
                 }
                 // Typing exits scroll mode (tmux behavior).
-                if term.scroll > 0 {
+                if term.scroll_offset() > 0 {
                     term.set_scroll(0);
                 }
                 if stand_in {
                     return;
                 }
                 if let Some(data) = keys::encode_key(&key, term.kitty_flags) {
-                    out.push(ClientRequest::Input {
-                        session: term.sref.clone(),
-                        data,
-                    });
+                    let session = term.sref.clone();
+                    typed_into(app, &session);
+                    out.push(ClientRequest::Input { session, data });
                 }
             }
             return;
@@ -2828,18 +2951,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             leave_terminal_lock(app);
             return;
         }
-    }
-
-    // Splash preview up: the next key just dismisses it, back to the
-    // panels — even q, which asks to quit on the press after.
-    if app.splash_preview {
-        crate::key_combo::note(
-            app,
-            &[crate::keymap::KeyChord::from_event(&key)],
-            Some("Back to panels"),
-        );
-        app.splash_preview = false;
-        return;
     }
 
     // A session card expanded into its FOLLOW-UP COMPOSER: the box owns
@@ -2930,12 +3041,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Help => app.overlay = Some(Overlay::Help(HelpView::default())),
         Action::Settings => open_settings(app),
         Action::Metrics => open_metrics(app, out),
-        // Replay the first-run nebula splash, fade-in included.
-        Action::Splash => {
-            app.splash_epoch = std::time::Instant::now();
-            app.splash_preview = true;
-            app.collapsed = false;
-        }
         // Tab / ^⇧L walk forward and stop dead at the terminal pane —
         // leaning on the key can't spill past the pane and back round to
         // the first column. Landing on the pane takes the input lock:
@@ -2958,6 +3063,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::FocusLeft => walk_focus_back(app),
         Action::Hosts => open_hosts_picker(app),
         Action::AgentPresets => crate::preset_overlays::open_agent_presets(app),
+        // Full-screen over a session with a project anywhere: the same box
+        // the GRID's `p` opens, in the checkout under the grid's cursor —
+        // the session on screen's own worktree — on the root branch with
+        // the aim let go, or on a fresh worktree.
+        Action::QuickPrompt if app.launcher_active() => launcher::open_box(app),
         Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
         Action::Issues => crate::issues::open_issues(app),
         Action::PullRequests => crate::pr_modal::open(app),
@@ -3127,9 +3237,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Archive => {
             if app.focus == Focus::Sessions {
                 match app.selected_session_row() {
-                    Some(SessionRow::Agent(a)) if !a.archived => {
-                        archive_agent(app, a.id, out);
-                    }
+                    Some(SessionRow::Agent(a)) if !a.archived => archive_agent(app, a.id),
                     Some(SessionRow::Terminal(_)) => {
                         app.flash = Some("terminals can't be archived — d closes them".into());
                     }
@@ -3145,6 +3253,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 if let Some(a) = app.selected_session() {
                     if a.archived {
                         activate::unarchive(app, a.id, out);
+                        // One card per press of `u`, however long it is held.
+                        release_watch::arm(
+                            &mut app.release_watch,
+                            chord,
+                            std::time::Instant::now(),
+                        );
                     }
                 }
             }
@@ -3205,6 +3319,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // reaches here over a full-screen session the keys got past, which
         // is still the selected session's card.
         Action::OpenPullRequest => launcher::open_pull_request(app, out),
+        Action::OpenIssue => launcher::open_issue(app, out),
+        Action::DuplicateSession => launcher::duplicate_session(app),
         Action::OpenGhosttyTab => open_ghostty_tab(app),
         // Shift+Enter / Shift+O: the selected worktree's OPEN COMMAND, from
         // any panel — the cursor's worktree is the context wherever the
@@ -3220,13 +3336,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // New shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
         Action::NewTerminal => create_terminal_for_context(app, out),
-        Action::Zoom => {
-            if app.term.is_some() {
-                zoom_pane(app, out);
-            } else {
-                app.flash = Some("attach a session first".into());
-            }
-        }
         // Terminal-scope only; never resolved here.
         Action::UnlockTerminal => {}
     }
@@ -4300,31 +4409,26 @@ fn handle_vim_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Archive is cheap to undo (u), so by default it skips the confirm
-/// dialog `d` goes behind. The `confirm_on_archive` SETTING puts one in
-/// front of it — for anyone whose typing keeps landing on the panel and
-/// archiving the session under the cursor. The `a` key and the row menu
-/// both come through here, so the two never differ.
-fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
-    if crate::config::Config::load().confirm_on_archive {
-        if let Some(a) = app.tree.agents.iter().find(|a| a.id == id) {
-            app.overlay = Some(Overlay::Confirm(confirm_archive_agent(&a.name, id)));
-        }
-        return;
+/// Archive asks first, always — the CONFIRM DIALOG `d` goes behind — so
+/// a letter aimed at an agent that lands on the grid archives nothing
+/// until it is answered. The `a` key and the row menu's Archive both
+/// come through here, so the two never differ; the archive itself runs
+/// on the dialog's Enter ([`archive_agent_now`]).
+fn archive_agent(app: &mut App, id: AgentId) {
+    if let Some(a) = app.tree.agents.iter().find(|a| a.id == id) {
+        app.overlay = Some(Overlay::Confirm(confirm_archive_agent(&a.name, id)));
     }
-    archive_agent_now(app, id, out);
 }
 
 /// The archive itself: release the pane if it shows the agent, then ask
-/// the daemon. Straight from `a` with the confirm off, or from the
-/// dialog's Enter with it on.
+/// the daemon. From the dialog's Enter (`run_pending_action`).
 fn archive_agent_now(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
     optimistic::set_archived(app, id, true, out);
 }
 
-/// The confirm before an agent is archived, when the setting asks for
-/// one. The message says why saying yes is cheap: `u` undoes it.
+/// The confirm before an agent is archived. The message says why saying
+/// yes is cheap: `u` undoes it.
 fn confirm_archive_agent(name: &str, id: AgentId) -> ConfirmDialog {
     ConfirmDialog {
         title: "Archive agent".into(),
@@ -4437,6 +4541,7 @@ fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequ
         app.flash = Some(WORKTREE_STILL_CREATING.into());
         return;
     }
+    worked_in(app, &worktree);
     send_with(
         app,
         out,
@@ -4704,6 +4809,7 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 "Send to cloud session",
                 MenuAction::SendCloudMessage(a.id.clone()),
             ),
+            MenuItem::new("Duplicate", MenuAction::DuplicateAgent(a.id.clone())),
             MenuItem::new("Rename", MenuAction::RenameAgent(a.id.clone())),
             MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
@@ -4712,6 +4818,7 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
     if a.archived {
         vec![
             MenuItem::new("Unarchive", MenuAction::UnarchiveAgent(a.id.clone())),
+            MenuItem::new("Duplicate", MenuAction::DuplicateAgent(a.id.clone())),
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
         ]
     } else {
@@ -4722,6 +4829,7 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
             ),
             MenuItem::new("Follow-up prompt", MenuAction::FollowUp),
             MenuItem::new("Restart", MenuAction::RestartAgent(a.id.clone())),
+            MenuItem::new("Duplicate", MenuAction::DuplicateAgent(a.id.clone())),
             MenuItem::new("Rename", MenuAction::RenameAgent(a.id.clone())),
             MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
@@ -4736,16 +4844,23 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
 /// menu is where they go.
 fn menu_items_for_session_in(app: &App, a: &nebula_core::Agent) -> Vec<MenuItem> {
     let mut items = menu_items_for_session(a);
-    // The card's pull request, what `⇧P` opens (`launcher::open_pull_request`):
+    // The card's pull request and the issue it was started from, what `⇧V`
+    // and `⇧I` open (`launcher::open_pull_request`, `launcher::open_issue`):
     // ahead of the trailing Delete on an archived card, which keeps no
     // checkout verbs, and after the checkout's Open on a live one.
-    let pr = crate::launcher::row(app, &a.id)
+    let links: Vec<MenuItem> = crate::launcher::row(app, &a.id)
         .and_then(|row| row.pr)
-        .map(|pr| MenuItem::new("Open pull request", MenuAction::OpenLink(pr.url)));
+        .map(|pr| MenuItem::new("Open pull request", MenuAction::OpenLink(pr.url)))
+        .into_iter()
+        .chain(
+            a.issue_url
+                .clone()
+                .map(|url| MenuItem::new("Open issue", MenuAction::OpenLink(url))),
+        )
+        .collect();
     if a.archived {
-        if let Some(pr) = pr {
-            items.insert(items.len().saturating_sub(1), pr);
-        }
+        let at = items.len().saturating_sub(1);
+        items.splice(at..at, links);
         return items;
     }
     let Some(w) = app
@@ -4769,7 +4884,7 @@ fn menu_items_for_session_in(app: &App, a: &nebula_core::Agent) -> Vec<MenuItem>
         "Open",
         MenuAction::OpenWorktree(w.id.clone()),
     ));
-    items.extend(pr);
+    items.extend(links);
     if w.is_main {
         items.push(MenuItem::new(
             "Switch branch…",
@@ -5120,10 +5235,13 @@ fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
 /// CONTEXT MENU. The right button used to set the cursor fields itself, so
 /// a right-click on another checkout left the pane on the old one's
 /// session under a cursor that had moved away. False for a target that is
-/// not a row.
+/// not a row. A card's PULL REQUEST LINE is the card to this button: the
+/// menu it opens carries **Open pull request** already.
 fn select_clicked_row(app: &mut App, target: &HitTarget, out: &mut Vec<ClientRequest>) -> bool {
     match *target {
-        HitTarget::LauncherRow(i) => launcher::select_row(app, i, out),
+        HitTarget::LauncherCard(at) => launcher::select_card_row(app, at, out),
+        HitTarget::LauncherBand(i) => launcher::select_band_row(app, i, out),
+        HitTarget::LauncherBandPr(ref wid) => launcher::select_band_of(app, wid, out),
         _ => false,
     }
 }
@@ -5235,8 +5353,8 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         }
         Overlay::AgentPresets(_) => crate::preset_overlays::handle_list_key(app, key, out),
         Overlay::AgentPresetEditor(_) => crate::preset_overlays::handle_editor_key(app, key),
-        Overlay::Issues(_) => crate::issues::handle_key(app, key),
-        Overlay::PullRequests(_) => crate::pr_modal::handle_key(app, key),
+        Overlay::Issues(_) => crate::issues::handle_key(app, key, out),
+        Overlay::PullRequests(_) => crate::pr_modal::handle_key(app, key, out),
         Overlay::BranchSwitch(_) => crate::branch_switch::handle_key(app, key),
         Overlay::ProjectPicker(_) => launcher::handle_picker_key(app, key),
         Overlay::Menu(menu) => match key.code {
@@ -5304,8 +5422,10 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     *menu = *parent;
                 }
             }
-            // The root picker's Claude row owns Tab as a launch-mode
-            // toggle. Submenus and every other menu leave it untouched.
+            // The NEW SESSION PICKER's Claude row — and the QUICK PROMPT
+            // `Tab` picker's, for a box that can go to the cloud — owns
+            // Tab as a launch-mode toggle. Submenus and every other menu
+            // leave it untouched.
             KeyCode::Tab if menu.toggle_hovered_claude_cloud() => {}
             KeyCode::Enter => {
                 let hover = menu.hover;
@@ -5337,6 +5457,12 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     PromptKind::PrComment { back, .. } => back.clone(),
                     _ => None,
                 };
+                // A QUICK PROMPT opened over either modal stood on it: Esc
+                // takes the box off and leaves the modal on its row.
+                let back_to_modal = match &prompt.kind {
+                    PromptKind::QuickPrompt(launch) => launch.under.clone(),
+                    _ => None,
+                };
                 // Esc on a box with something typed in it is the accident
                 // that costs nothing: the box is parked as a DRAFT, and the
                 // next QUICK PROMPT opens on it.
@@ -5351,6 +5477,8 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     crate::issues::reopen(app, view);
                 } else if let Some(view) = back_to_prs {
                     crate::pr_modal::reopen(app, *view);
+                } else if let Some(under) = back_to_modal {
+                    under.reopen(app);
                 } else if let Some((worktree, name)) = back_to_presets {
                     let index = crate::agent_presets::load()
                         .iter()
@@ -5363,25 +5491,20 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             // Ctrl+J, as in Claude Code's prompt — is the line editor's
             // (the `_` arm below); the guard keeps the send off it. Enter
             // on a highlighted listing row adds that directory; on the
-            // input row it submits the typed path as before. `⌘Enter` in
-            // the QUICK PROMPT launches and takes the new session's pane
-            // (`quick_launch::submit`); `^Enter` is the same, unadvertised,
-            // for the terminal that keeps `⌘Enter` (Ghostty's fullscreen).
+            // input row it submits the typed path as before.
             KeyCode::Enter if !prompt.input.takes_newline(&key) => {
                 let mut prompt = prompt.clone();
                 if let Some(path) = prompt.hovered_path() {
                     prompt.input.set_text(path);
                 }
                 app.overlay = None;
-                let take_pane = key
-                    .modifiers
-                    .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL);
-                submit_prompt(app, prompt, take_pane, out);
+                submit_prompt(app, prompt, out);
             }
-            // The LAUNCHER VIEW's box chords: `^P` the project, `^O` the
-            // model, and a `^N` that flips between a fresh worktree and the
-            // project the box is aimed at (not the one under the cursor).
-            KeyCode::Char('p' | 'P' | 'o' | 'O' | 'n' | 'N')
+            // The LAUNCHER VIEW's box chords: `^P` the project, `^T` the
+            // checkout in it, `^O` the model, and a `^N` that flips between
+            // a fresh worktree and the project the box is aimed at (not the
+            // one under the cursor).
+            KeyCode::Char('p' | 'P' | 't' | 'T' | 'o' | 'O' | 'n' | 'N')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(prompt.kind, PromptKind::QuickPrompt(_)) =>
             {
@@ -6085,9 +6208,9 @@ fn save_config(app: &mut App, cfg: &crate::config::Config) -> bool {
 
 fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
     if let Some(spec) = crate::config::setting_at(tab, index) {
-        // A PROJECT TAB row edits the selected project's entry. With no
-        // project to edit — an empty tree — say so rather than toggle
-        // nothing or open a prompt with nowhere to write.
+        // A PROJECT TAB row edits the selected project's entry — every
+        // one of them typed. With no project to edit — an empty tree —
+        // say so rather than open a prompt with nowhere to write.
         let project = if spec.kind.is_project() {
             let Some(path) = app.selected_project().map(|p| p.repo_path.clone()) else {
                 if let Some(view) = settings_mut(app) {
@@ -6117,14 +6240,6 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
             }
             return;
         }
-        if let Some(path) = project {
-            let mut cfg = crate::config::Config::load();
-            cfg.cycle_project(&path, spec.kind);
-            if save_config(app, &cfg) {
-                apply_config(app, &cfg);
-            }
-            return;
-        }
     }
     let mut cfg = crate::config::Config::load();
     cfg.cycle(tab, index, delta);
@@ -6149,9 +6264,8 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
 fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.theme = cfg.theme();
     app.animations = cfg.animations;
-    app.focus_tint = cfg.focus_tint;
+    app.black_background = cfg.black_background;
     app.launcher_pane_at = cfg.pane_side();
-    set_projects_config(app, cfg.projects.clone(), cfg.project_fallback());
     set_hide_draft_prs(app, cfg.hide_draft_prs);
     app.recent_prompts = cfg.recent_prompts_shown();
     app.pr_issue_counts = cfg.pr_issue_counts;
@@ -6244,38 +6358,6 @@ pub(crate) fn close_settings(app: &mut App) {
     app.note_settings_closed();
 }
 
-/// Adopt CONFIG.JSON's PROJECT SETTINGS (Settings → Project): every
-/// project's entry and the fallback for the rest. The one row so far,
-/// **Hide root worktree**, shows or hides the selected project's ROOT
-/// WORKTREE row; it sits at the top, so when it flips every other index
-/// shifts by one: the cursor follows the worktree (or OPEN PRS row) it
-/// was on by identity, as `reconcile_selection` does after any list
-/// change, and a cursor on the root itself lands on the first row left.
-/// The pane catches up on the next move, as it does after any re-sort.
-/// Another project's flip changes nothing on screen until that project
-/// is selected, when `visible_worktrees` reads its entry.
-fn set_projects_config(
-    app: &mut App,
-    projects: std::collections::BTreeMap<std::path::PathBuf, crate::config::ProjectSettings>,
-    fallback: crate::config::ProjectSettings,
-) {
-    let was_hidden = app.selected_root_hidden();
-    let worktree = app.selected_worktree().map(|w| w.id.clone());
-    let pr = app.selected_worktree_pr().map(|pr| pr.url.clone());
-    app.projects_config = projects;
-    app.project_fallback = fallback;
-    if app.selected_root_hidden() == was_hidden {
-        return;
-    }
-    let index = match (&worktree, &pr) {
-        (Some(id), _) => app.worktree_row_of(id),
-        (None, Some(url)) => app.open_pr_row_of(url),
-        (None, None) => None,
-    };
-    let last = app.worktree_row_count().saturating_sub(1);
-    app.sel_worktree = index.unwrap_or(app.sel_worktree).min(last);
-}
-
 /// Show or hide the drafts in the PROJECT OPEN PRS GROUP and `/` (Settings
 /// → Appearance, or the panel menu's **Hide draft PRs**). Nothing stored
 /// changes — `listed_open_prs` reads the flag — but the rows under the
@@ -6344,18 +6426,11 @@ fn toggle_hide_draft_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
 pub(crate) fn submit_prompt_now(app: &mut App, kind: PromptKind, out: &mut Vec<ClientRequest>) {
     open_prompt(app, kind);
     if let Some(Overlay::Prompt(prompt)) = app.overlay.take() {
-        submit_prompt(app, prompt, false, out);
+        submit_prompt(app, prompt, out);
     }
 }
 
-/// `take_pane` is the QUICK PROMPT's `⌘Enter` — launch, and step down into
-/// the new session (`quick_launch::submit`). Every other prompt ignores it.
-fn submit_prompt(
-    app: &mut App,
-    prompt: PromptDialog,
-    take_pane: bool,
-    out: &mut Vec<ClientRequest>,
-) {
+fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
     let value = prompt.input.trim().to_string();
     // An ISSUE SESSION's box may be sent empty: the issue is the task.
     let value = match &prompt.kind {
@@ -6374,7 +6449,9 @@ fn submit_prompt(
             // A preset's task is optional: its prefix and postfix make a
             // first prompt on their own, sized below all the same.
             PromptKind::AgentPresetTask { .. } => (None, "task"),
-            // Nothing typed into a quick prompt is a change of mind, not
+            // An empty quick prompt starts the CLI with no first prompt
+            // (`QuickLaunch::launches_empty`, below). Only its cloud box
+            // needs the task, and that one is a change of mind rather than
             // a half-finished launch: it falls through to the generic
             // empty-input cancel below instead of holding the box open.
             PromptKind::QuickPrompt(_) => (None, "prompt"),
@@ -6425,8 +6502,10 @@ fn submit_prompt(
     // offered, an empty project name undoes the rename — the row goes back
     // to the folder's own name, which is the only way back from a rename —
     // an empty typed setting is that row's default (`auto`), which is the
-    // only way back to it, and an AGENT PRESET's task is optional — its
-    // box, or a QUICK PROMPT it is on, launches on prefix + postfix alone.
+    // only way back to it, an AGENT PRESET's task is optional — its box,
+    // or a QUICK PROMPT it is on, launches on prefix + postfix alone — and
+    // a QUICK PROMPT sent empty starts the CLI with no first prompt, the
+    // way `n` does (its CLAUDE CLOUD box, which needs the task, aside).
     // For every other prompt an empty field is a cancel.
     let empty_is_a_default = match &prompt.kind {
         PromptKind::NewWorktree { .. }
@@ -6437,12 +6516,18 @@ fn submit_prompt(
         _ => false,
     };
     if value.is_empty() && !empty_is_a_default {
-        // An empty comment box goes back to the modal it stood in for.
+        // An empty comment box goes back to the modal it stood in for, and
+        // an empty QUICK PROMPT to the one it stood on.
         match &prompt.kind {
             PromptKind::IssueComment { view, .. } => crate::issues::reopen(app, view.clone()),
             PromptKind::PrComment {
                 back: Some(view), ..
             } => crate::pr_modal::reopen(app, (**view).clone()),
+            PromptKind::QuickPrompt(launch) => {
+                if let Some(under) = launch.under.clone() {
+                    under.reopen(app);
+                }
+            }
             _ => {}
         }
         app.flash = Some("cancelled: empty input".into());
@@ -6467,6 +6552,7 @@ fn submit_prompt(
             // panel never waits on the DAEMON's fetch and `git worktree
             // add`. An Error takes it down and hands this box back.
             let focus = app.focus;
+            app.bring_tab_forward(&project);
             let placeholder =
                 placeholder::stage_worktree(app, project.clone(), branch.clone(), out);
             send_with(
@@ -6531,7 +6617,12 @@ fn submit_prompt(
             };
             create_agent(app, draft, out);
         }
-        PromptKind::QuickPrompt(launch) => quick_launch::submit(app, launch, value, take_pane, out),
+        // A box opened over the ISSUES MODAL or the PULL REQUESTS MODAL
+        // takes the modal with it when it launches: the new session's card
+        // is what the user wants to see, and the Ack puts the grid's cursor
+        // on it (`attach_created`). Only a box that goes without launching
+        // hands the modal back.
+        PromptKind::QuickPrompt(launch) => quick_launch::submit(app, launch, value, out),
         PromptKind::PrComment {
             number,
             url,
@@ -6658,6 +6749,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
                 id,
             });
         }
+        PendingAction::CloseProjectTab(id) => launcher::close_cursor_tab(app, &id, out),
         PendingAction::DeleteAgentPreset {
             index,
             worktree,
@@ -6691,17 +6783,11 @@ fn delete_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
 
 /// Close a terminal tab, detaching the pane first if it's showing it.
 fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<ClientRequest>) {
-    // The LAUNCHER PANE's TAB STRIP may be reading this terminal: work out
-    // which tab it lands on while the row is still there to have
-    // neighbours, so the pane comes back on the next terminal — or on the
-    // card, through SESSION — rather than staying blank where the detach
-    // below left it. None at all from the panels, which have no strip.
-    let next = launcher::tab_after(app, &id);
+    // The grid's cursor may be on this terminal's chip: `keep_cursor`
+    // hands it to the neighbour once the row is gone, and the pane
+    // follows it there.
     detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
     optimistic::close_terminal(app, id, out);
-    if let Some(next) = next {
-        launcher::show_pane_tab(app, next, out);
-    }
 }
 
 /// Delete a worktree optimistically: drop its rows now (the daemon deletes
@@ -6730,10 +6816,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             });
         }
         MenuAction::SendCloudMessage(id) => open_prompt(app, PromptKind::CloudMessage { id }),
+        MenuAction::DuplicateAgent(id) => launcher::duplicate_agent(app, id),
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
-        MenuAction::ArchiveAgent(id) => {
-            archive_agent(app, id, out);
-        }
+        MenuAction::ArchiveAgent(id) => archive_agent(app, id),
         MenuAction::UnarchiveAgent(id) => activate::unarchive(app, id, out),
         MenuAction::DeleteAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
@@ -6775,7 +6860,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     &crate::config::Config::load(),
                 )
                 .with_issue(back.launch.issue.clone())
-                .with_pr(back.launch.pr.clone());
+                .with_pr(back.launch.pr.clone())
+                // The Claude row's `Tab` toggle rides the pick: the box
+                // comes back a CLAUDE CLOUD one, where it can be one.
+                .with_cloud(cloud)
+                .with_under(back.launch.under.clone());
                 crate::quick_prompt::reopen(app, launch, &back.text);
                 return;
             }
@@ -7094,19 +7183,25 @@ pub(super) fn select_worktree_by_id(
     true
 }
 
-/// Land on a project we just added, the way a `/` palette pick of it
-/// would: select its row, show its main checkout, and step into the next
-/// visible child panel. False when its upsert hasn't arrived yet.
+/// Land on a project we just added, the way a pick of it from the PROJECT
+/// DROPDOWN would (`launcher::open_project`): its tab lit, and — with no
+/// session in it yet, which is every project just added — the empty grid,
+/// the pane folded away under it rather than left reading the session or
+/// terminal it was on in the project before. False when its upsert hasn't
+/// arrived yet.
 fn select_created_project(
     app: &mut App,
     id: &nebula_core::ProjectId,
     out: &mut Vec<ClientRequest>,
 ) -> bool {
-    if !select_project_row_by_id(app, id) {
+    if !app
+        .project_rows()
+        .iter()
+        .any(|i| &app.tree.projects[*i].id == id)
+    {
         return false;
     }
-    restore_context(app, out);
-    app.focus = app.next_visible_focus(Focus::Projects);
+    launcher::open_project(app, id, out);
     true
 }
 
@@ -7154,17 +7249,10 @@ fn jump_to_target_inner(
     out: &mut Vec<ClientRequest>,
 ) {
     match target {
-        PaletteTarget::Project(id) => {
-            let changed = app.selected_project().map(|p| p.id != id).unwrap_or(true);
-            if !select_project_row_by_id(app, &id) {
-                app.flash = Some("project no longer exists".into());
-                return;
-            }
-            if changed {
-                restore_context(app, out);
-            }
-            app.focus = app.next_visible_focus(Focus::Projects);
-        }
+        // A project picked by name lands as its tab would
+        // (`launcher::open_tab`): the card it was last left on, or with no
+        // session in it the empty grid and no pane.
+        PaletteTarget::Project(id) => launcher::open_tab(app, &id, out),
         PaletteTarget::Worktree(id) => {
             if app.selected_worktree().is_some_and(|w| w.id == id) {
                 app.focus = Focus::Sessions;
@@ -7185,6 +7273,9 @@ fn jump_to_target_inner(
             app.sel_worktree = index;
             restore_session(app, out);
             app.focus = Focus::Sessions;
+            // A checkout picked by name is its BAND on the grid, with the
+            // pane on the card it was last left on.
+            launcher::land_on_band(app);
         }
         PaletteTarget::Session(id) => {
             let worktree = app
@@ -7222,6 +7313,9 @@ fn jump_to_target_inner(
                 return;
             };
             app.sel_session = index;
+            // A session picked by name is its card, inside its worktree:
+            // the grid opens that checkout's band around it.
+            launcher::land_inside(app);
             match landing {
                 Landing::Attach => attach_selected(app, out),
                 Landing::FocusOnly => {
@@ -7513,17 +7607,6 @@ fn preview_selected_now(app: &mut App, out: &mut Vec<ClientRequest>) {
 }
 
 fn preview_inner(app: &mut App, delay: Duration, out: &mut Vec<ClientRequest>) {
-    // The LAUNCHER VIEW's PANE may be pinned to one of the checkout's
-    // TERMINALS rather than to the card under the cursor — the tab its
-    // header's strip is on (`launcher::show_pane_tab`). The pin is what
-    // the pane reads, so walking the grid inside one checkout never
-    // swaps the terminal out from under the eye; a pin the cursor has
-    // walked out from under stops answering (`App::pinned_terminal`) and
-    // the card is previewed as it always was.
-    if let Some(id) = app.pinned_terminal() {
-        attach_inner(app, SessionRef::Terminal(id), Duration::ZERO, out);
-        return;
-    }
     let Some(row) = app.selected_session_row() else {
         return;
     };
@@ -7573,11 +7656,11 @@ fn cloud_session_url_of(app: &App, sref: &SessionRef) -> Option<String> {
 }
 
 /// Full-screen whatever the pane is showing, with the input lock on:
-/// the sidebars collapse away and the keys go to the PTY. `z`
-/// (`Action::Zoom`) out of the panels, and `z` on a card out of the
-/// LAUNCHER VIEW's GRID, are the same intent and share this — Enter and a
-/// double-click there only step into the pane under the cards
-/// (`launcher::enter_pane`). [`leave_terminal_lock`] is its undo.
+/// the sidebars collapse away and the keys go to the PTY. Enter and a
+/// double-click on a card step into the pane under the cards
+/// (`launcher::enter_pane`); only a body too short to draw that pane
+/// comes here instead (`launcher::open_session`). [`leave_terminal_lock`]
+/// is its undo.
 pub(super) fn zoom_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.collapsed = true;
     app.focus = Focus::Terminal;
@@ -7599,7 +7682,7 @@ fn leave_terminal_lock(app: &mut App) {
 /// "nebula did nothing". A pull request is marked read on the way out: the
 /// conversation is about to be on screen, so the row's unread count starts
 /// again from here.
-fn open_link(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
+pub(crate) fn open_link(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
     if open_url(url) {
         app.flash = Some(format!("opened {}", crate::app::pretty_url(url)));
         mark_pr_seen(app, url, out);
@@ -7893,6 +7976,14 @@ fn project_of_worktree(app: &App, worktree: &WorktreeId) -> Option<ProjectId> {
 }
 
 fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequest>) {
+    // Every launch is work in its project, whose tab goes to the far left
+    // — a BACKGROUND LAUNCH's too, though nothing else it does moves. Not
+    // a create that already carries its stand-in row: that is the second
+    // half of a launch counted when its Enter was pressed, and the user
+    // may have gone on to work somewhere else while the checkout was cut.
+    if draft.placeholder.is_none() {
+        worked_in(app, &draft.worktree);
+    }
     // A stand-in checkout is not a place the DAEMON knows. A launch that
     // made it (a QUICK PROMPT's, a PR SESSION's) follows on its own Ack;
     // one fired into the NEW WORKTREE modal's row waits on that Ack
@@ -8305,47 +8396,47 @@ fn drag_autoscroll_tick(app: &mut App, out: &mut Vec<ClientRequest>) {
     let Some(term) = &app.term else {
         return;
     };
-    // Where the view is: the parser's offset — output arriving while
-    // scrolled back moves it up to keep the view still, which
-    // `AttachedTerm::scroll` does not follow — or the notch asked for
-    // past a history that is not back yet (`rehydrate_history`).
-    let current = term.parser.screen().scrollback().max(term.scroll);
+    // A step past the top of the history stops there, and past a history
+    // that was let go it is what asks for it back (`scroll_pane_to`).
+    let current = term.scroll_offset();
     let target = if up {
-        // A history let go while the screen sat in the cache reads as
-        // empty until the replay brings it back, and the notch past it is
-        // what asks. Otherwise stop at the top: an offset past the real
-        // history would have to be scrolled back down through before the
-        // view moved again.
-        let top = term.parser.screen().scrollback_rows();
-        let asked = current.saturating_add(lines);
-        if term.history_dropped {
-            asked
-        } else {
-            asked.min(top.max(current))
-        }
+        current.saturating_add(lines)
     } else {
         current.saturating_sub(lines)
     };
-    if target != current {
-        scroll_pane_to(app, target, out);
-    }
+    scroll_pane_to(app, target, out);
     place_drag_head(app);
     app.next_drag_autoscroll = Some(std::time::Instant::now() + DRAG_AUTOSCROLL_TICK);
 }
 
-/// Scroll the pane's view of its history to offset `target` — the wheel's
-/// notch, the EDGE AUTO-SCROLL's step. Scrolling up into a history that
-/// was let go asks the DAEMON for it back (`rehydrate_history`).
+/// Scroll the pane's view of its history to `target` lines above the live
+/// edge — the wheel's notch, the EDGE AUTO-SCROLL's step. The view stops
+/// at the top of the history it holds (`AttachedTerm::set_scroll`), so a
+/// notch past it is not a debt the way back down pays off first. Scrolling
+/// up into a history that was let go asks the DAEMON for it back
+/// (`rehydrate_history`), and a notch while that replay is on its way
+/// moves where it lands. Paints only when the view (or where it is headed)
+/// moved: a step at the top or the live bottom is nothing.
 fn scroll_pane_to(app: &mut App, target: usize, out: &mut Vec<ClientRequest>) {
     let Some(term) = &mut app.term else {
         return;
     };
-    let up = target > term.scroll;
-    term.set_scroll(target);
-    if up {
-        rehydrate_history(app, target, out);
+    let before = term.scroll_offset();
+    if term.pending_scroll.is_some() {
+        term.pending_scroll = Some(target);
+    } else {
+        term.set_scroll(target);
+        if target > before {
+            rehydrate_history(app, target, out);
+        }
     }
-    app.dirty = true;
+    if app
+        .term
+        .as_ref()
+        .is_some_and(|t| t.scroll_offset() != before)
+    {
+        app.dirty = true;
+    }
 }
 
 /// Select the maximal run of non-blank cells around `cell` on its row (a
@@ -8636,20 +8727,36 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
     // in `ui::launcher_view`). Only those take it: every other target is
     // a card, which has its own highlight, or the background.
     // The header's PR & ISSUE COUNTS are buttons of the same kind, and
-    // take the same underline; so are the pane's CLOSE BUTTON and the
-    // footer's memory readout.
+    // take the same underline; so are the pane's CLOSE and SIDE BUTTONS
+    // and the footer's memory readout. A card's PULL REQUEST LINE is a
+    // link on a card whose own highlight marks the cursor, not the
+    // pointer, so the line takes it for itself.
     let crumb = hit.filter(|h| {
         matches!(
             h,
             HitTarget::LauncherTab(_)
+                | HitTarget::LauncherBandPr(_)
+                | HitTarget::LauncherStripLeft(_)
+                | HitTarget::LauncherStripRight(_)
                 | HitTarget::LauncherTabClose(_)
                 | HitTarget::LauncherPaneClose
+                | HitTarget::LauncherPaneSide
                 | HitTarget::LauncherTabAdd
                 | HitTarget::LauncherCrumb
                 | HitTarget::LauncherPullRequests
                 | HitTarget::LauncherIssues
                 | HitTarget::LauncherWelcomePrompt
                 | HitTarget::FooterUsage
+        )
+    });
+    // The ISSUES and PULL REQUESTS MODALS' `↗ open in browser` button is
+    // the one thing on a modal a click acts on without the cursor moving
+    // there first, so it takes the same mark; the modals hold their own
+    // rects outside the hit map, as they do their list edges.
+    let crumb = crumb.or_else(|| {
+        crate::ui::browser_button_under(
+            app,
+            ratatui::layout::Position::new(mouse.column, mouse.row),
         )
     });
     if app.hover_crumb != crumb {
@@ -8724,7 +8831,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // does. Every other box leaves the rect empty, and an empty rect
     // contains no point.
     //
-    // So are the four details above it — `project ^P`, `worktree main ▾`,
+    // So are the four details above it — `project ^P`, `worktree main ^T`,
     // `agent Tab`, `model ^O`: a click on one opens the same picker its
     // chord does, the branch the WORKTREE PICKER.
     // Both are tested before the editor gets the click, since both sit
@@ -9001,11 +9108,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     if matches!(&app.overlay, Some(Overlay::Issues(_))) {
-        crate::issues::handle_mouse(app, mouse, mouse_pos);
+        crate::issues::handle_mouse(app, mouse, mouse_pos, out);
         return;
     }
     if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
-        crate::pr_modal::handle_mouse(app, mouse, mouse_pos);
+        crate::pr_modal::handle_mouse(app, mouse, mouse_pos, out);
         return;
     }
     if matches!(&app.overlay, Some(Overlay::BranchSwitch(_))) {
@@ -9203,6 +9310,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             app.term_mouse_grab = None;
             match app.hit_at(mouse.column, mouse.row) {
                 Some(HitTarget::LauncherPaneSplitter) => {
+                    // A second press on the edge within the double-click
+                    // window snaps it to the middle of the body
+                    // (`launcher::center_pane`), and arms no drag: the
+                    // edge has moved out from under the pointer, and a
+                    // drag from there would yank it straight back.
+                    if is_double_click(&mut app.last_pane_edge_click, ()) {
+                        launcher::center_pane(app);
+                        return;
+                    }
                     // The LAUNCHER VIEW's pane edge, armed the same way and
                     // as quietly: the offset from the grabbed row — or,
                     // beside the cards, column — is kept so the edge does
@@ -9213,11 +9329,27 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     let boundary = app.launcher_pane_boundary().unwrap_or(at);
                     app.launcher_pane_drag = Some(boundary - at);
                 }
-                // A LAUNCHER VIEW card: the cursor lands on it; a second
-                // click is Enter, down into the PANE along the bottom —
-                // which comes back first if it was folded away. `z` is
-                // the only way to the whole screen.
-                Some(HitTarget::LauncherRow(i)) => launcher::click_row(app, i, out),
+                // A LAUNCHER VIEW card: the cursor lands on it, inside its
+                // worktree; a second click is Enter, down into the PANE
+                // beside the cards — which comes back first if it was
+                // folded away.
+                Some(HitTarget::LauncherCard(at)) => launcher::click_card(app, at, out),
+                // A BAND's rule: the cursor lands on the band, as `j`/`k`
+                // walking onto it do.
+                Some(HitTarget::LauncherBand(i)) => launcher::click_band(app, i, out),
+                // The `❮` / `❯` beside a band's row: one card that way
+                // along the band, the very step `h` / `l` take.
+                Some(HitTarget::LauncherStripLeft(i)) => {
+                    launcher::click_strip_arrow(app, i, -1, out)
+                }
+                Some(HitTarget::LauncherStripRight(i)) => {
+                    launcher::click_strip_arrow(app, i, 1, out)
+                }
+                // The PULL REQUEST on a band's rule: it opens in the
+                // browser, through the very `open_pull_request` `⇧V` runs.
+                Some(HitTarget::LauncherBandPr(wid)) => {
+                    launcher::click_pull_request(app, &wid, out)
+                }
                 // `‹ sessions` in a full-screen session's header: back to
                 // the grid, the same way `^q` goes back.
                 Some(HitTarget::LauncherCrumb) => leave_terminal_lock(app),
@@ -9242,21 +9374,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // The footer's memory readout: the modal `⇧M` opens,
                 // through the same `open_metrics`.
                 Some(HitTarget::FooterUsage) => open_metrics(app, out),
-                // The PANE's TAB STRIP: `SESSION` takes the pane back to
-                // the card under the cursor, a terminal tab reads that
-                // terminal. Both through the one `show_pane_tab` the
-                // `` ` `` key walks the strip with.
-                Some(HitTarget::LauncherPaneSession) => launcher::show_pane_tab(app, None, out),
-                Some(HitTarget::LauncherPaneTerminal(i)) => launcher::click_pane_tab(app, i, out),
-                // The `×` on a tab: the confirm that kills that shell.
-                // The strip need not be on the tab first — a click on any
-                // cross closes the terminal it belongs to.
-                Some(HitTarget::LauncherPaneCloseTerminal(i)) => launcher::close_pane_tab(app, i),
                 // The CLOSE BUTTON at the strip's right end: the pane
                 // folds away through the one `toggle_pane` `^~` runs. It
                 // is only drawn on a pane that is showing, so the toggle
                 // can only ever fold.
                 Some(HitTarget::LauncherPaneClose) => launcher::toggle_pane(app),
+                // The SIDE BUTTON beside it: the pane moves to the other
+                // side of the cards, written to Settings as the
+                // **Session pane** row's own cycling writes it.
+                Some(HitTarget::LauncherPaneSide) => launcher::move_pane(app),
+                // Never in the hit map: the ISSUES and PULL REQUESTS MODALS route
+                // the click on their button themselves, before this is reached.
+                Some(HitTarget::ModalBrowser) => {}
                 Some(HitTarget::PanelBg(focus)) => {
                     // The LAUNCHER VIEW's GRID lies on the same
                     // background, and a click on the air between its
@@ -9328,6 +9457,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             if let Some(grab) = app.launcher_pane_drag {
                 let at = app.launcher_pane_side().along(mouse.column, mouse.row);
                 app.set_launcher_pane(at + grab);
+                // A press that became a drag is not the first half of a
+                // double-click: letting the edge go and pressing it again
+                // straight away must not snap it to the middle.
+                app.last_pane_edge_click = None;
                 app.dirty = true;
             } else if let Some(sref) = &app.term_mouse_grab {
                 // The program holding the button gets the motion — if it
@@ -9375,18 +9508,28 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             let over = app.hit_at(mouse.column, mouse.row);
-            // The LAUNCHER VIEW's grid takes no wheel. A notch over the
-            // cards used to walk the cursor, and walking it swaps the pane
+            // The LAUNCHER VIEW's grid: a notch over the cards scrolls them
+            // under a cursor that stays put (`launcher::wheel_grid`). A
+            // notch used to walk the cursor, and walking it swaps the pane
             // onto another session and reads it — far too easy to do by
-            // accident on a trackpad while reading the one you are on. The
-            // keys walk the grid; the wheel stops here rather than falling
-            // through to the panels' scrolling, which this view never draws.
+            // accident on a trackpad while reading the one you are on — so
+            // the keys walk the grid and the wheel only moves the window.
+            // It stops here rather than falling through to the panels'
+            // scrolling, which this view never draws.
             if app.launcher_grid()
                 && matches!(
                     over,
-                    Some(HitTarget::LauncherRow(_) | HitTarget::PanelBg(Focus::Sessions))
+                    Some(
+                        HitTarget::LauncherCard(_)
+                            | HitTarget::LauncherBand(_)
+                            | HitTarget::LauncherBandPr(_)
+                            | HitTarget::LauncherStripLeft(_)
+                            | HitTarget::LauncherStripRight(_)
+                            | HitTarget::PanelBg(Focus::Sessions)
+                    )
                 )
             {
+                launcher::wheel_grid(app, up);
                 return;
             }
             let in_term = matches!(over, Some(HitTarget::TerminalPane)) || app.collapsed;
@@ -9439,10 +9582,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             data: arrow.repeat(TERM_WHEEL_LINES),
                         });
                     } else {
+                        let current = term.scroll_offset();
                         let new_scroll = if up {
-                            term.scroll.saturating_add(TERM_WHEEL_LINES)
+                            current.saturating_add(TERM_WHEEL_LINES)
                         } else {
-                            term.scroll.saturating_sub(TERM_WHEEL_LINES)
+                            current.saturating_sub(TERM_WHEEL_LINES)
                         };
                         scroll_pane_to(app, new_scroll, out);
                     }
@@ -9887,6 +10031,17 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.last_metrics = Some(snapshot);
             app.dirty = true;
         }
+        ServerEvent::OutputTail {
+            req_id,
+            session,
+            tail,
+        } => {
+            // Answered with OutputTail, not Ack — clear the slot by hand.
+            app.pending.remove(&req_id);
+            if let SessionRef::Terminal(id) = session {
+                land_terminal_tail(app, id, tail);
+            }
+        }
         ServerEvent::Error { req_id, message } => {
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back. A
@@ -10051,6 +10206,9 @@ fn attach_created(
         }
         return;
     }
+    if matches!(sref, SessionRef::Terminal(_)) && app.launcher_active() {
+        launcher::show_created_terminal(app);
+    }
     app.select_when_seen = Some(sref.clone());
     // Its upsert usually lands just before this Ack; land the selection
     // now, or on the upsert otherwise.
@@ -10066,7 +10224,10 @@ fn attach_created(
 }
 
 /// A refused request's prompt comes back with what was typed in it.
-pub(crate) fn reopen_prompt_with(app: &mut App, kind: PromptKind, text: String) {
+pub(crate) fn reopen_prompt_with(app: &mut App, mut kind: PromptKind, text: String) {
+    if let PromptKind::QuickPrompt(launch) = &mut kind {
+        crate::quick_prompt::restack(app, launch);
+    }
     open_prompt(app, kind);
     if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
         prompt.input.set_text(text);
@@ -10182,7 +10343,10 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree.worktrees.retain(|w| &w.id != id);
         }
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
-        EntityId::Terminal(id) => app.tree.terminals.retain(|t| &t.id != id),
+        EntityId::Terminal(id) => {
+            app.tree.terminals.retain(|t| &t.id != id);
+            app.terminal_tails.remove(id);
+        }
         EntityId::Link(id) => app.tree.links.retain(|l| &l.id != id),
     }
 }
@@ -10450,6 +10614,7 @@ mod tests {
                     sort_order: 9,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -10478,6 +10643,7 @@ mod tests {
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -10703,6 +10869,9 @@ mod tests {
         ));
         app.focus = Focus::Terminal;
         app.term_locked = true;
+        // The tabs as a draw leaves them: the pane's project already
+        // leads, so a key typed at it moves no tab.
+        app.settle_project_tabs();
         app.dirty = false;
         app
     }
@@ -10746,7 +10915,7 @@ mod tests {
         if let Some(term) = &mut app.term {
             term.parser.process(&b"line\r\n".repeat(40));
             term.set_scroll(3);
-            assert!(term.scroll > 0);
+            assert!(term.scroll_offset() > 0);
         }
         handle_terminal_event(
             &mut app,
@@ -10754,7 +10923,7 @@ mod tests {
             &mut out,
         );
         assert!(app.dirty, "typing left the scrollback for the live edge");
-        assert_eq!(app.term.as_ref().map(|t| t.scroll), Some(0));
+        assert_eq!(app.term.as_ref().map(|t| t.scroll_offset()), Some(0));
     }
 
     /// The hatch out of the pane is not a forwarded key: FOCUS moves, and
@@ -10910,6 +11079,133 @@ mod tests {
         });
         let (fg, row) = dot(&mut app);
         assert_eq!(fg, app.theme.done, "a cloud row is never cold: {row}");
+    }
+
+    /// The grid's beat asks the daemon after every terminal the last
+    /// frame drew but the one the pane is on and the dead — each ask
+    /// carrying the ring end its card last heard — and the answer lands
+    /// as the card's lines, laid out at the PTY's width. An answer with
+    /// no bytes, or none at all once the shell is gone, leaves them.
+    #[test]
+    fn terminal_tails_are_asked_after_the_drawn_cards_and_land_as_lines() {
+        use crate::app::TerminalTail;
+        use nebula_core::{OutputTail, TerminalTab};
+        let mut app = App::new();
+        let tab = |id: &str, alive: bool| TerminalTab {
+            id: TerminalId(id.into()),
+            worktree_id: WorktreeId("w1".into()),
+            name: id.into(),
+            sort_order: 0,
+            alive,
+            run_command: None,
+        };
+        app.tree.terminals = vec![tab("t1", true), tab("t2", true), tab("t3", false)];
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Terminal(TerminalId("t2".into())),
+            80,
+            24,
+        ));
+        app.terminal_tails.insert(
+            TerminalId("t1".into()),
+            TerminalTail {
+                lines: vec!["old".into()],
+                end_seq: 40,
+            },
+        );
+        // As a frame leaves them: t1 twice (a band's strip and the pane's
+        // header could both draw it), the attached t2, the dead t3.
+        app.tail_cards = vec![
+            TerminalId("t1".into()),
+            TerminalId("t1".into()),
+            TerminalId("t2".into()),
+            TerminalId("t3".into()),
+        ];
+        let mut out = Vec::new();
+        request_terminal_tails(&mut app, &mut out);
+        let asks: Vec<(&SessionRef, Option<u64>)> = out
+            .iter()
+            .map(|r| match r {
+                ClientRequest::TailOutput {
+                    session, after_seq, ..
+                } => (session, *after_seq),
+                other => panic!("expected TailOutput, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            asks,
+            vec![(&SessionRef::Terminal(TerminalId("t1".into())), Some(40))],
+            "one ask, for the live terminal the pane is not on, from where it left off"
+        );
+        assert_eq!(
+            app.tail_cards.len(),
+            4,
+            "the frame's notes are read, not taken: an idle grid keeps asking"
+        );
+        let req_id = match &out[0] {
+            ClientRequest::TailOutput { req_id, .. } => *req_id,
+            other => panic!("{other:?}"),
+        };
+        assert!(app.pending.contains_key(&req_id));
+
+        // The answer: a shell's last lines, wrapped at the PTY's width.
+        app.dirty = false;
+        hse(
+            &mut app,
+            ServerEvent::OutputTail {
+                req_id,
+                session: SessionRef::Terminal(TerminalId("t1".into())),
+                tail: Some(OutputTail {
+                    cols: 10,
+                    rows: 5,
+                    end_seq: 70,
+                    data: b"$ npm test\r\n\x1b[32mok\x1b[0m 12\r\n\r\n$ ".to_vec(),
+                }),
+            },
+        );
+        assert!(
+            !app.pending.contains_key(&req_id),
+            "the slot is cleared by hand"
+        );
+        let tail = &app.terminal_tails[&TerminalId("t1".into())];
+        assert_eq!(tail.lines, ["$ npm test", "ok 12", "$"]);
+        assert_eq!(tail.end_seq, 70);
+        assert!(app.dirty, "the card changed");
+
+        // Nothing new: the lines stay, the frame is spared.
+        app.dirty = false;
+        hse(
+            &mut app,
+            ServerEvent::OutputTail {
+                req_id: 999,
+                session: SessionRef::Terminal(TerminalId("t1".into())),
+                tail: Some(OutputTail {
+                    cols: 10,
+                    rows: 5,
+                    end_seq: 70,
+                    data: Vec::new(),
+                }),
+            },
+        );
+        assert_eq!(app.terminal_tails[&TerminalId("t1".into())].lines.len(), 3);
+        assert!(!app.dirty);
+        // The shell gone: likewise.
+        hse(
+            &mut app,
+            ServerEvent::OutputTail {
+                req_id: 1000,
+                session: SessionRef::Terminal(TerminalId("t1".into())),
+                tail: None,
+            },
+        );
+        assert_eq!(app.terminal_tails[&TerminalId("t1".into())].lines.len(), 3);
+        // The row removed: the lines go with it.
+        hse(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: EntityId::Terminal(TerminalId("t1".into())),
+            },
+        );
+        assert!(!app.terminal_tails.contains_key(&TerminalId("t1".into())));
     }
 
     pub(super) fn hse(app: &mut App, ev: ServerEvent) {
@@ -11090,6 +11386,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -11327,8 +11624,8 @@ mod tests {
         );
 
         // A pane too narrow for the URL folds it rather than clipping it —
-        // every row of the fold is clickable. Full-screen (`z`), so the
-        // panel is the whole body and its width is the frame's.
+        // every row of the fold is clickable. Full-screen, so the panel
+        // is the whole body and its width is the frame's.
         app.collapsed = true;
         let mut narrow = Terminal::new(TestBackend::new(40, 30)).unwrap();
         narrow.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -11537,33 +11834,27 @@ mod tests {
         assert!(!app.status_anim_active(), "no merged row on screen");
     }
 
-    /// N summons the splash as a preview over a populated tree — full-body
-    /// nebula with the "any key" hint instead of panel columns — and the
-    /// next keypress (even q) only dismisses it.
+    /// `⇧N` used to summon the splash over a populated tree. The key is
+    /// gone: the grid stays on screen, and the splash is the first run's
+    /// alone.
     #[test]
-    fn shift_n_previews_splash_and_any_key_dismisses() {
+    fn shift_n_no_longer_summons_the_splash() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('N'), KeyModifiers::SHIFT, &mut out);
-        assert!(app.splash_preview && app.splash_active());
+        assert!(!app.splash_showing());
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("any key returns"), "{text}");
-        let grid_head = |app: &App| {
+        assert!(!text.contains("any key returns"), "{text}");
+        assert!(
             app.hits
                 .iter()
-                .any(|(_, h)| *h == HitTarget::LauncherTabAdd)
-        };
-        assert!(!grid_head(&app), "the grid is hidden: {text}");
-
-        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut out);
-        assert!(!app.splash_preview, "any key dismisses");
-        assert!(!app.should_quit, "the dismissing key is swallowed");
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        assert!(grid_head(&app), "{}", buffer_text(&terminal));
+                .any(|(_, h)| *h == HitTarget::LauncherTabAdd),
+            "the grid is on screen: {text}"
+        );
     }
 
     /// While the tree is empty, `n` opens the add-project prompt from any
@@ -11582,8 +11873,7 @@ mod tests {
     }
 
     /// The splash hides the panels, so the footer drops the panel keymap
-    /// for the handful of keys that still fire under it — and in preview,
-    /// for the only one there is.
+    /// for the handful of keys that still fire under it.
     #[test]
     fn splash_footer_lists_only_keys_that_work() {
         let mut app = App::new();
@@ -11602,18 +11892,10 @@ mod tests {
             );
         }
 
-        // Preview over a populated tree: the next key only dismisses.
+        // A project lands: the grid, the grid's keymap — without `o`,
+        // which the Help overlay lists; the footer keeps the keys a card
+        // takes.
         seed_tree(&mut app);
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('N'), KeyModifiers::SHIFT, &mut out);
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("any key: back to the sessions"), "{text}");
-        assert!(!text.contains("o: open a folder"), "{text}");
-
-        // The grid back, the grid's keymap back — without `o`, which the
-        // Help overlay lists; the footer keeps the keys a card takes.
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("new session"), "{text}");
@@ -15080,6 +15362,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: sort,
                     status_changed_at: changed_at,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             }
@@ -15134,6 +15417,7 @@ diff --git a/src/c.rs b/src/c.rs
                 sort_order: sort,
                 status_changed_at: at,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             }),
         };
@@ -15215,6 +15499,7 @@ diff --git a/src/c.rs b/src/c.rs
                 sort_order: sort,
                 status_changed_at: at,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             }),
         };
@@ -15274,6 +15559,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -15341,6 +15627,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -17493,6 +17780,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -17929,7 +18217,8 @@ diff --git a/src/c.rs b/src/c.rs
             "history is back"
         );
         assert_eq!(
-            pane.scroll, 3,
+            pane.scroll_offset(),
+            3,
             "and the reader is where the wheel was headed"
         );
 
@@ -18016,6 +18305,7 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: sort,
             status_changed_at: 0,
             alive: false,
+            issue_url: None,
             recent_prompts: Vec::new(),
         })
     }
@@ -18347,7 +18637,7 @@ diff --git a/src/c.rs b/src/c.rs
 
         // The wheel mid-drag scrolls the view; the selection rides along.
         handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 40, 3), &mut out);
-        assert_eq!(app.term.as_ref().unwrap().scroll, 1);
+        assert_eq!(app.term.as_ref().unwrap().scroll_offset(), 1);
         assert_eq!(
             bounds(&app),
             ((0, 17), (6, 20)),
@@ -18386,7 +18676,7 @@ diff --git a/src/c.rs b/src/c.rs
         let mut out = Vec::new();
         // Pane at host rows 3–7: rows 0–2 are past its top edge.
         twenty_line_pane(&mut app, 3);
-        let scroll = |app: &App| app.term.as_ref().unwrap().scroll;
+        let scroll = |app: &App| app.term.as_ref().unwrap().scroll_offset();
 
         // Press at the end of `line 17`, drag to the pane's top row:
         // inside, so no beat.
@@ -18485,7 +18775,7 @@ diff --git a/src/c.rs b/src/c.rs
         // 6 and up are past its bottom edge.
         twenty_line_pane(&mut app, 1);
         app.term.as_mut().unwrap().set_scroll(15);
-        let scroll = |app: &App| app.term.as_ref().unwrap().scroll;
+        let scroll = |app: &App| app.term.as_ref().unwrap().scroll_offset();
 
         // Press on `line 2` (host row 3), drag two rows past the bottom.
         handle_mouse(
@@ -18937,6 +19227,126 @@ diff --git a/src/c.rs b/src/c.rs
         }
     }
 
+    /// A pane over a plain shell with `lines` of output behind its
+    /// 24-row grid, the wheel aimed at it.
+    fn scrolling_pane(app: &mut App, lines: usize) {
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        term.parser.process(&b"line\r\n".repeat(lines));
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+    }
+
+    fn pane_offset(app: &App) -> usize {
+        app.term.as_ref().unwrap().scroll_offset()
+    }
+
+    /// The wheel stops at the top of the history: a notch past it lands on
+    /// the top, not on an offset the next notch down would have to work off
+    /// before the view moved again. (The offset used to count up forever,
+    /// and the way back down took as many notches as were spent up there.)
+    #[test]
+    fn the_wheel_stops_at_the_top_of_the_history() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        scrolling_pane(&mut app, 30);
+        let top = app.term.as_ref().unwrap().parser.screen().scrollback_rows();
+        assert!(top > 0 && top < 20, "a few rows of history: {top}");
+
+        for _ in 0..20 {
+            handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 10, 5), &mut out);
+        }
+        assert_eq!(pane_offset(&app), top, "the top, not twenty notches up");
+        assert!(out.is_empty(), "nothing forwarded: {out:?}");
+
+        app.dirty = false;
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 10, 5), &mut out);
+        assert_eq!(pane_offset(&app), top, "a notch at the top stays there");
+
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, 10, 5), &mut out);
+        assert_eq!(
+            pane_offset(&app),
+            top - 1,
+            "and the first notch down moves the view"
+        );
+        assert!(app.dirty);
+    }
+
+    /// Output arriving while scrolled back moves the offset up under the
+    /// view to keep it still (vt100's rule); the next notch, and the
+    /// header's `scroll N`, count from where the view really is.
+    #[test]
+    fn the_wheel_counts_from_where_output_left_the_view() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        scrolling_pane(&mut app, 30);
+        app.term.as_mut().unwrap().set_scroll(3);
+        // Four more lines scroll out under the view.
+        app.term
+            .as_mut()
+            .unwrap()
+            .parser
+            .process(&b"more\r\n".repeat(4));
+        assert_eq!(pane_offset(&app), 7, "the view held still over them");
+
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, 10, 5), &mut out);
+        assert_eq!(pane_offset(&app), 6, "one line down from there, not from 3");
+    }
+
+    /// Wheel notches while a let-go history is on its way back move where
+    /// the replay lands, rather than being lost or counted past it.
+    #[test]
+    fn notches_while_the_history_is_on_its_way_back_move_the_landing() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        pane_with_history(&mut app, &a1, 200);
+        app.term.as_mut().expect("pane").drop_history();
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+
+        let mut out = Vec::new();
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 10, 5), &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::Attach { from_seq: None, .. })
+            ),
+            "the first notch asks for the whole ring: {out:?}"
+        );
+        assert_eq!(app.term.as_ref().unwrap().pending_scroll, Some(1));
+        assert_eq!(pane_offset(&app), 1, "and the header counts it");
+
+        out.clear();
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 10, 5), &mut out);
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 10, 5), &mut out);
+        assert!(out.is_empty(), "no second ask: {out:?}");
+        assert_eq!(app.term.as_ref().unwrap().pending_scroll, Some(3));
+
+        let mut data = Vec::new();
+        for n in 0..200 {
+            data.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        data.extend_from_slice(b"$ ");
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1,
+                base_seq: 0,
+                data,
+            },
+        );
+        let pane = app.term.as_ref().expect("pane");
+        assert!(pane.pending_scroll.is_none());
+        assert_eq!(
+            pane.scroll_offset(),
+            3,
+            "the replay lands on the last notch"
+        );
+        assert_eq!(pane.parser.screen().scrollback(), 3);
+    }
+
     /// A term whose program asked for the mouse with `modes` (the DECSET
     /// numbers), on a pane sitting right of the sidebars so reports have to
     /// be pane-relative.
@@ -19192,6 +19602,9 @@ diff --git a/src/c.rs b/src/c.rs
     fn launcher_pane_edge_drags_the_pane_taller_and_shorter() {
         use crate::launcher::{pane_height, CARD_H, HEAD_H, PANE_MIN_H};
         let mut app = App::new();
+        // A pane along the bottom, whose edge trades rows; the one beside
+        // the cards has its own drag test in `event_loop::launcher`.
+        app.launcher_pane_at = crate::launcher::PaneSide::Bottom;
         // Tall enough that the default share, and a drag either side of
         // it, sit clear of both stops — the stops get their own drags below.
         let body = ratatui::layout::Rect::new(0, 0, 120, 60);
@@ -19231,6 +19644,10 @@ diff --git a/src/c.rs b/src/c.rs
             app.term_selection.is_none(),
             "a pane-edge grab must not arm a terminal selection"
         );
+        assert!(
+            app.mouse_held(),
+            "the edge is held: the host gets no mode re-ask under the drag"
+        );
 
         // Up five rows: the pane takes them off the cards.
         handle_mouse(
@@ -19239,6 +19656,15 @@ diff --git a/src/c.rs b/src/c.rs
             &mut out,
         );
         assert_eq!(app.launcher_pane_h, Some(body.height - boundary + 5));
+
+        // A motion report with no button named, mid-drag, is still the
+        // drag: a host that lost the button between two reports.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Moved, 60, boundary - 2),
+            &mut out,
+        );
+        assert_eq!(app.launcher_pane_h, Some(body.height - boundary + 2));
 
         // Down again: the cards get them back.
         handle_mouse(
@@ -19270,6 +19696,7 @@ diff --git a/src/c.rs b/src/c.rs
             &mut out,
         );
         assert!(app.launcher_pane_drag.is_none(), "mouse-up ends the drag");
+        assert!(!app.mouse_held(), "…and the mode re-ask beat resumes");
     }
 
     /// The ISSUES fold rides the UI-state blob like the OPEN PRS one, and
@@ -19365,6 +19792,7 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 0,
             status_changed_at: 0,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
 
@@ -19555,6 +19983,7 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 0,
             status_changed_at: at,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         })
     }
@@ -20509,10 +20938,10 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(!app.git_changes_stale(), "the failed read is still cached");
     }
 
-    /// A card prints its checkout's changed-file count right behind the
-    /// branch, from whichever read landed there last; a clean checkout, and
-    /// a count read in some other checkout, print nothing — and the footer
-    /// no longer carries it at all.
+    /// A band's rule prints its checkout's changed-file count right behind
+    /// the branch, from whichever read landed there last; a clean checkout,
+    /// and a count read in some other checkout, print nothing — and the
+    /// footer no longer carries it at all.
     #[test]
     fn a_card_shows_its_checkouts_change_count() {
         let mut app = App::new();
@@ -20535,7 +20964,7 @@ diff --git a/src/c.rs b/src/c.rs
         land_git_changes(&mut app, WorktreeId("w1".into()), Some(1));
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("⌂ main +1 file · "), "singular:\n{text}");
+        assert!(text.contains("⌂ main +1 file "), "singular:\n{text}");
 
         land_git_changes(&mut app, WorktreeId("w1".into()), Some(0));
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -21069,6 +21498,10 @@ diff --git a/src/c.rs b/src/c.rs
             }
             _ => panic!("diff overlay gone"),
         }
+        assert!(
+            app.mouse_held(),
+            "the border is held: no mode re-ask mid-drag"
+        );
         handle_mouse(
             &mut app,
             mev(MouseEventKind::Drag(MouseButton::Left), bx + 9, area.y + 5),
@@ -21118,6 +21551,10 @@ diff --git a/src/c.rs b/src/c.rs
             Some(Overlay::Diff(v)) => assert!(v.files_drag.is_none(), "mouse-up ends the drag"),
             _ => panic!("diff overlay gone"),
         }
+        assert!(
+            !app.mouse_held(),
+            "mouse-up frees the host for the re-ask beat"
+        );
         assert!(out.is_empty(), "resizing never talks to the daemon");
     }
 
@@ -21171,6 +21608,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -21195,6 +21633,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -21507,6 +21946,7 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 5,
             status_changed_at: 500,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         for a in [
@@ -21963,6 +22403,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -22765,7 +23206,7 @@ diff --git a/src/c.rs b/src/c.rs
             let mut app = App::new();
             let mut out = Vec::new();
             open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
-            let row = crate::keymap::index_of(crate::keymap::Action::Splash).unwrap();
+            let row = crate::keymap::index_of(crate::keymap::Action::Metrics).unwrap();
             for _ in 0..row {
                 press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             }
@@ -24180,6 +24621,7 @@ diff --git a/src/c.rs b/src/c.rs
                         sort_order: 1,
                         status_changed_at: 0,
                         alive: true,
+                        issue_url: None,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -24252,15 +24694,16 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 1,
             status_changed_at: 0,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         })
     }
 
     /// Archiving the selected session lands the cursor on the next row AND
     /// attaches it — the pane must show the newly highlighted session, not
-    /// stay blank after the archive's detach. All of it on the keypress
-    /// (an OPTIMISTIC UPDATE): the DAEMON's upsert, when it lands, finds
-    /// the row already archived and changes nothing.
+    /// stay blank after the archive's detach. All of it on the confirm's
+    /// Enter (an OPTIMISTIC UPDATE): the DAEMON's upsert, when it lands,
+    /// finds the row already archived and changes nothing.
     #[test]
     fn archiving_selected_agent_previews_the_next_row() {
         let mut app = App::new();
@@ -24277,12 +24720,12 @@ diff --git a/src/c.rs b/src/c.rs
         app.term = Some(AttachedTerm::new(a1.clone(), 40, 10));
 
         let mut out = Vec::new();
-        // `a` reads `confirm_on_archive`; the default (off) archives at
-        // once, with no dialog in the way.
-        with_default_config(|| press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out));
+        // `a` asks first; Enter on the confirm is the archive.
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
             app.overlay.is_none(),
-            "no confirm by default: {:?}",
+            "Enter answered the confirm: {:?}",
             app.overlay
         );
         assert!(
@@ -24323,12 +24766,13 @@ diff --git a/src/c.rs b/src/c.rs
         assert_eq!(app.term.as_ref().map(|t| t.sref.clone()), Some(a2));
     }
 
-    /// With `confirm_on_archive` on, `a` asks first: nothing is sent until
-    /// the dialog is answered, Esc keeps the session, and Enter archives
-    /// it exactly as the bare key would have — pane released and all.
+    /// `a` asks first: nothing is sent until the dialog is answered, Esc
+    /// keeps the session, and Enter archives it — pane released and all.
+    /// Always, whatever `config.json` says: the retired
+    /// `confirm_on_archive` key is not read.
     #[test]
-    fn confirm_on_archive_puts_a_dialog_in_front_of_a() {
-        with_config_json(r#"{"confirm_on_archive": true}"#, || {
+    fn a_asks_before_archiving_whatever_the_config_says() {
+        with_config_json(r#"{"confirm_on_archive": false}"#, || {
             let mut app = App::new();
             seed_tree(&mut app); // p1 / w1(main) / a1
             app.focus = Focus::Sessions;
@@ -24382,10 +24826,10 @@ diff --git a/src/c.rs b/src/c.rs
         })
     }
 
-    /// The row menu's Archive goes through the same gate as `a`.
+    /// The row menu's Archive asks the same way `a` does.
     #[test]
-    fn confirm_on_archive_gates_the_row_menu_too() {
-        with_config_json(r#"{"confirm_on_archive": true}"#, || {
+    fn the_row_menus_archive_asks_too() {
+        with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
             let mut out = Vec::new();
@@ -24872,6 +25316,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -24938,6 +25383,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -25508,27 +25954,42 @@ diff --git a/src/c.rs b/src/c.rs
                 list: Some(vec![issue(15), issue(14)]),
             },
         );
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         let on_row =
             |app: &App| matches!(&app.overlay, Some(Overlay::Issues(v)) if v.selected == 1);
         assert!(on_row(&app));
 
         // Esc: back, nothing posted.
-        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         assert!(matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.title.contains("#14")));
         type_text(&mut app, "never mind", &mut out);
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         assert!(on_row(&app), "Esc puts the modal back: {:?}", app.overlay);
 
         // An empty Enter: the same.
-        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(on_row(&app), "an empty box is a cancel: {:?}", app.overlay);
         assert_eq!(app.flash.as_deref(), Some("cancelled: empty input"));
 
         // Enter with text: posted — or, off a checkout that isn't on disk,
         // the box comes back with the text, newline and all.
-        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         type_text(&mut app, "on it", &mut out);
         press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
         type_text(&mut app, "today", &mut out);
@@ -25546,6 +26007,209 @@ diff --git a/src/c.rs b/src/c.rs
             app.flash
         );
         assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
+    }
+
+    /// The ISSUES MODAL's box lands where every new session's box does:
+    /// the project's ROOT BRANCH, whatever card the cursor was on — or,
+    /// with the `quick_prompt_new_worktree` SETTING on, a fresh worktree
+    /// named after the issue.
+    #[test]
+    fn the_issue_quick_prompt_starts_on_the_root_branch_or_a_fresh_worktree() {
+        use crate::quick_prompt::QuickTarget;
+        let target = |json: &str| {
+            with_config_json(json, || {
+                let mut app = App::new();
+                seed_tree(&mut app);
+                seed_feat_worktree(&mut app, "w2", "feat");
+                app.sel_worktree = 1;
+                assert_eq!(
+                    app.selected_worktree().map(|w| w.branch.as_str()),
+                    Some("feat")
+                );
+                let mut out = Vec::new();
+                let project = nebula_core::ProjectId("p1".into());
+                app.overlay = Some(Overlay::Issues(crate::issues::IssuesView::new(
+                    project.clone(),
+                    "demo".into(),
+                    "/tmp/demo".into(),
+                )));
+                crate::issues::land_answer(
+                    &mut app,
+                    crate::issues::IssuesAnswer::List {
+                        project,
+                        list: Some(vec![crate::issues::Issue {
+                            number: 15,
+                            url: "https://github.com/o/r/issues/15".into(),
+                            title: "Login fails".into(),
+                            author: "webdevcody".into(),
+                            created_at: "2026-09-10T12:00:00Z".into(),
+                            updated_at: "2026-09-11T12:00:00Z".into(),
+                            labels: vec![],
+                            body: String::new(),
+                        }]),
+                    },
+                );
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+                match &app.overlay {
+                    Some(Overlay::Prompt(prompt)) => match &prompt.kind {
+                        PromptKind::QuickPrompt(launch) => launch.target.clone(),
+                        other => panic!("{other:?}"),
+                    },
+                    other => panic!("Enter: expected the box, got {other:?}"),
+                }
+            })
+        };
+        assert_eq!(
+            target("{}"),
+            QuickTarget::Worktree(WorktreeId("w1".into())),
+            "not the selected card's checkout"
+        );
+        match target(r#"{"quick_prompt_new_worktree": true}"#) {
+            QuickTarget::NewWorktree { branch, .. } => {
+                assert!(branch.starts_with("issue-15"), "{branch}")
+            }
+            other => panic!("the setting cuts a fresh worktree: {other:?}"),
+        }
+    }
+
+    /// `Enter` in the ISSUES MODAL puts the QUICK PROMPT up over the modal
+    /// rather than in its place — both on screen, the box on top. A box
+    /// that goes without launching (Esc, a click outside it) leaves the
+    /// modal on its row; the launch closes the modal too, and its Ack puts
+    /// the grid's cursor on the new session's card, the keys still there.
+    #[test]
+    fn the_issue_quick_prompt_stands_on_the_modal() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let focus = app.focus;
+            let mut out = Vec::new();
+            let project = nebula_core::ProjectId("p1".into());
+            app.overlay = Some(Overlay::Issues(crate::issues::IssuesView::new(
+                project.clone(),
+                "demo".into(),
+                "/tmp/demo".into(),
+            )));
+            let issue = |number: u64| crate::issues::Issue {
+                number,
+                url: format!("https://github.com/o/r/issues/{number}"),
+                title: format!("issue {number}"),
+                author: "webdevcody".into(),
+                created_at: "2026-09-10T12:00:00Z".into(),
+                updated_at: "2026-09-11T12:00:00Z".into(),
+                labels: vec![],
+                body: String::new(),
+            };
+            crate::issues::land_answer(
+                &mut app,
+                crate::issues::IssuesAnswer::List {
+                    project,
+                    list: Some(vec![issue(15), issue(14)]),
+                },
+            );
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            let on_row =
+                |app: &App| matches!(&app.overlay, Some(Overlay::Issues(v)) if v.selected == 1);
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("Enter: expected the box, got {:?}", app.overlay);
+            };
+            let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert!(
+                matches!(&launch.under, Some(crate::quick_prompt::ModalUnder::Issues(v)) if v.selected == 1),
+                "the box carries the modal it stands on: {:?}",
+                launch.under
+            );
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let screen = buffer_text(&terminal);
+            assert!(
+                screen.contains("Issues — demo"),
+                "the modal under:\n{screen}"
+            );
+            assert!(screen.contains("issue #14"), "the box over it:\n{screen}");
+            assert!(screen.contains("Esc: back to issues"), "{screen}");
+
+            // Esc: the box goes, the modal stays.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(on_row(&app), "Esc leaves the modal: {:?}", app.overlay);
+
+            // A click outside the box: the same.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            crate::overlay_close::click_outside(&mut app, &mut out);
+            assert!(on_row(&app), "a click outside: {:?}", app.overlay);
+
+            // The launch, through the loop's own entry point (so a follow
+            // it may not take is caught): the create goes out, and the
+            // modal goes with the box.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            type_text(&mut app, "look into it", &mut out);
+            out.clear();
+            let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            handle_terminal_event(&mut app, enter, &mut out);
+            let (req_id, worktree) = match out.as_slice() {
+                [ClientRequest::CreateAgent {
+                    req_id,
+                    worktree,
+                    issue_url: Some(url),
+                    ..
+                }] if url == "https://github.com/o/r/issues/14" => (*req_id, worktree.clone()),
+                other => panic!("one create, for the issue: {other:?}"),
+            };
+            assert!(
+                app.overlay.is_none(),
+                "the launch closes the modal: {:?}",
+                app.overlay
+            );
+
+            // The DAEMON's side: the row, then the Ack — and the cursor is
+            // on the new card, the keys on the grid.
+            let fresh = AgentId("a9".into());
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: nebula_core::Entity::Agent(nebula_core::Agent {
+                        id: fresh.clone(),
+                        worktree_id: worktree,
+                        name: "agent-2".into(),
+                        status: nebula_core::AgentStatus::Fresh,
+                        archived: false,
+                        archived_at: 0,
+                        unseen: false,
+                        kind: nebula_core::AgentKind::Claude,
+                        custom_harness: None,
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        cloud_session_id: None,
+                        sort_order: 0,
+                        status_changed_at: crate::app::now_ms(),
+                        alive: true,
+                        issue_url: None,
+                        recent_prompts: Vec::new(),
+                    }),
+                },
+            );
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(nebula_core::EntityId::Agent(fresh.clone())),
+                },
+                &mut out,
+            );
+            assert!(app.overlay.is_none(), "nothing comes back up");
+            assert_eq!(
+                app.selected_session().map(|a| a.id),
+                Some(fresh),
+                "the cursor is on the new card"
+            );
+            assert_eq!(app.focus, focus, "the keys stay on the grid");
+            assert!(!app.term_locked);
+        });
     }
 
     #[test]
@@ -26351,227 +27015,14 @@ diff --git a/src/c.rs b/src/c.rs
             .collect()
     }
 
-    /// Hide (or show) the seeded `/tmp/demo` project's ROOT WORKTREE row
-    /// the way its PROJECT SETTING would, without going through the file.
-    pub(super) fn hide_root(app: &mut App, hidden: bool) {
-        app.projects_config.insert(
-            "/tmp/demo".into(),
-            crate::config::ProjectSettings {
-                hide_root_worktree: hidden,
-                ..Default::default()
-            },
-        );
-    }
-
-    /// Settings → Project → Hide root worktree: the ⌂ row leaves the
-    /// WORKTREES PANEL (the checkout and its sessions stay in the tree), the
-    /// cursor keeps naming the same branch across both toggle directions
-    /// even though every index shifts by one, a cursor on the root itself
-    /// lands on the first row left, and switching it off brings the row back.
-    /// It is one project's switch: the other project keeps its root row,
-    /// and the old global key is what a project without an entry reads.
-    #[test]
-    fn hide_root_worktree_drops_the_root_row_from_the_worktrees_panel() {
-        use crate::config::SettingKind;
-        use nebula_core::{Entity, Project, ProjectId, Worktree, WorktreeId};
-        use std::path::Path;
-        with_default_config(|| {
-            let mut app = App::new();
-            seed_tree(&mut app);
-            seed_feat_worktree(&mut app, "w2", "feat");
-            seed_feat_worktree(&mut app, "w3", "feat-2");
-            // A second project, with a root checkout of its own.
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Project(Project {
-                        id: ProjectId("p2".into()),
-                        name: "other".into(),
-                        repo_path: "/tmp/other".into(),
-                        sort_order: 1,
-                    }),
-                },
-            );
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Worktree(Worktree {
-                        id: WorktreeId("w9".into()),
-                        project_id: ProjectId("p2".into()),
-                        path: "/tmp/other".into(),
-                        branch: "main".into(),
-                        is_main: true,
-                        sort_order: 0,
-                    }),
-                },
-            );
-            app.sel_project = 0;
-            assert_eq!(worktree_branches(&app), ["main", "feat", "feat-2"]);
-            let selected = |app: &App| app.selected_worktree().map(|w| w.branch.clone());
-
-            let mut cfg = crate::config::Config::default();
-            cfg.cycle_project(Path::new("/tmp/demo"), SettingKind::HideRootWorktree);
-            app.sel_worktree = 1;
-            assert_eq!(selected(&app).as_deref(), Some("feat"));
-            apply_config(&mut app, &cfg);
-            assert!(app.selected_root_hidden());
-            assert_eq!(worktree_branches(&app), ["feat", "feat-2"]);
-            assert_eq!(
-                selected(&app).as_deref(),
-                Some("feat"),
-                "follows the row, not the index"
-            );
-            assert_eq!(app.tree.worktrees.len(), 4, "hidden, not gone");
-            assert_eq!(app.tree.agents.len(), 1, "its session is still there");
-
-            // The other project is untouched: its root row stays.
-            app.sel_project = 1;
-            assert!(!app.selected_root_hidden());
-            assert_eq!(worktree_branches(&app), ["main"]);
-            app.sel_project = 0;
-
-            cfg.cycle_project(Path::new("/tmp/demo"), SettingKind::HideRootWorktree);
-            apply_config(&mut app, &cfg);
-            assert_eq!(worktree_branches(&app), ["main", "feat", "feat-2"]);
-            assert_eq!(
-                selected(&app).as_deref(),
-                Some("feat"),
-                "showing the root again does not hand it the cursor"
-            );
-
-            // A cursor on the root itself has nowhere to follow: the first
-            // row left, not an index past the end.
-            app.sel_worktree = 0;
-            cfg.cycle_project(Path::new("/tmp/demo"), SettingKind::HideRootWorktree);
-            apply_config(&mut app, &cfg);
-            assert_eq!(selected(&app).as_deref(), Some("feat"));
-
-            // The key the switch lived under while it was global is the
-            // fallback: with it set, a project with no entry hides its
-            // root too.
-            let cfg = crate::config::Config {
-                hide_root_worktree: true,
-                ..Default::default()
-            };
-            apply_config(&mut app, &cfg);
-            assert_eq!(worktree_branches(&app), ["feat", "feat-2"]);
-            app.sel_project = 1;
-            assert_eq!(worktree_branches(&app), [] as [&str; 0]);
-        });
-    }
-
-    /// The PROJECT TAB in the overlay: it names the selected project on
-    /// its first line, Enter on **Hide root worktree** writes that
-    /// project's entry into `projects` (nothing else in the file moves),
-    /// the panel drops the ⌂ row at once, and the tab on another project
-    /// reads that project's own value. With no project in the tree the
-    /// row only says so.
-    #[test]
-    fn the_project_tab_edits_the_selected_projects_entry() {
-        use crate::config::SettingKind;
-        use nebula_core::{Entity, Project, ProjectId};
-        let draw_to_string = |app: &mut App, w: u16, h: u16| {
-            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-            terminal.draw(|f| ui::draw(f, app)).unwrap();
-            buffer_text(&terminal)
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        crate::config::with_config_path(path.clone(), || {
-            let mut app = App::new();
-            let mut out = Vec::new();
-            seed_tree(&mut app);
-            seed_feat_worktree(&mut app, "w2", "feat");
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Project(Project {
-                        id: ProjectId("p2".into()),
-                        name: "other".into(),
-                        repo_path: "/tmp/other".into(),
-                        sort_order: 1,
-                    }),
-                },
-            );
-            app.sel_project = 0;
-            let tab = crate::config::project_tab();
-            let (_, row) = crate::config::locate(SettingKind::HideRootWorktree).unwrap();
-            let open_on_row = |app: &mut App, out: &mut Vec<ClientRequest>| {
-                press(app, KeyCode::Char('s'), KeyModifiers::NONE, out);
-                let digit = char::from_digit(tab as u32 + 1, 10).unwrap();
-                press(app, KeyCode::Char(digit), KeyModifiers::NONE, out);
-                for _ in 0..=row {
-                    press(app, KeyCode::Down, KeyModifiers::NONE, out);
-                }
-                let view = settings(app).expect("settings open");
-                assert_eq!(view.tab, tab);
-                assert_eq!(view.selected, row);
-                assert!(!view.on_tabs);
-            };
-
-            open_on_row(&mut app, &mut out);
-            let screen = draw_to_string(&mut app, 100, 40);
-            assert!(screen.contains("Project"), "{screen}");
-            assert!(screen.contains("demo"), "names the project: {screen}");
-            assert!(screen.contains("/tmp/demo"), "and where it is: {screen}");
-            assert!(screen.contains("Hide root worktree"), "{screen}");
-            assert_eq!(worktree_branches(&app), ["main", "feat"]);
-
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            let saved: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(
-                saved["projects"],
-                serde_json::json!({ "/tmp/demo": { "hide_root_worktree": true } })
-            );
-            assert_eq!(
-                saved.get("hide_root_worktree"),
-                Some(&serde_json::json!(false)),
-                "the old global key is not what the row writes"
-            );
-            assert_eq!(worktree_branches(&app), ["feat"], "applied live");
-            let screen = draw_to_string(&mut app, 100, 40);
-            assert!(screen.contains("[on]"), "{screen}");
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-
-            // The other project reads its own (unset) value.
-            app.sel_project = 1;
-            open_on_row(&mut app, &mut out);
-            let screen = draw_to_string(&mut app, 100, 40);
-            assert!(screen.contains("other"), "{screen}");
-            assert!(screen.contains("/tmp/other"), "{screen}");
-            assert!(screen.contains("[off]"), "{screen}");
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-
-            // No project at all: nothing to write, and the row says why.
-            let mut app = App::new();
-            open_on_row(&mut app, &mut out);
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            let view = settings(&app).unwrap();
-            assert!(
-                matches!(&view.notice, Some((text, _)) if text.contains("no project selected")),
-                "{:?}",
-                view.notice
-            );
-            let screen = draw_to_string(&mut app, 100, 40);
-            assert!(screen.contains("[n/a]"), "{screen}");
-            let saved: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(
-                saved["projects"],
-                serde_json::json!({ "/tmp/demo": { "hide_root_worktree": true } }),
-                "untouched"
-            );
-        });
-    }
-
     /// **Run command** on the PROJECT TAB: Enter opens a prompt titled with
     /// the project, pre-filled with its stored command; Enter there writes
     /// `run_command` into that project's entry (and nothing else), the
     /// row reads it back, the tab on another project still reads
     /// `.nebula.json`; ←/→ only explain themselves; Esc keeps the old
     /// value; an empty Enter puts the file back and drops the key. With
-    /// no project in the tree, Enter opens nothing and says why.
+    /// no project in the tree the row reads `n/a`, and Enter opens nothing
+    /// and says why.
     #[test]
     fn the_project_tab_run_command_is_typed_into_the_selected_projects_entry() {
         use crate::config::SettingKind::RunCommand;
@@ -26657,7 +27108,7 @@ diff --git a/src/c.rs b/src/c.rs
             assert_eq!(
                 saved(&path)["projects"],
                 serde_json::json!({
-                    "/tmp/demo": { "hide_root_worktree": false, "run_command": "npm run dev" }
+                    "/tmp/demo": { "run_command": "npm run dev" }
                 })
             );
             let view = settings_view(&app);
@@ -26723,6 +27174,8 @@ diff --git a/src/c.rs b/src/c.rs
                 "{:?}",
                 view.notice
             );
+            let screen = draw_to_string(&mut app, 100, 40);
+            assert!(screen.contains("[n/a]"), "{screen}");
             assert_eq!(saved(&path)["projects"], serde_json::json!({}), "untouched");
         });
     }
@@ -26923,6 +27376,7 @@ diff --git a/src/c.rs b/src/c.rs
                         sort_order: 1,
                         status_changed_at: 0,
                         alive: true,
+                        issue_url: None,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -26966,6 +27420,69 @@ diff --git a/src/c.rs b/src/c.rs
                 assert!(app.term_locked, "typing goes to the new agent");
             },
         );
+    }
+
+    /// The harness picker is as wide as its title or its rows and no
+    /// wider: its keys are in the footer bar, not in its bottom border,
+    /// where `Tab: cloud off  s/?: settings` doubled a six-row list's
+    /// width with empty space and hovering the Claude row resized it.
+    #[test]
+    fn the_harness_picker_is_no_wider_than_its_rows_and_keeps_its_keys_in_the_footer() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            let mut drawn = |app: &mut App| -> (ratatui::layout::Rect, String) {
+                terminal.draw(|f| ui::draw(f, app)).unwrap();
+                let area = match &app.overlay {
+                    Some(Overlay::Menu(m)) => m.area,
+                    other => panic!("expected the harness picker, got {other:?}"),
+                };
+                (area, buffer_text(&terminal))
+            };
+            let (on_claude, text) = drawn(&mut app);
+            let (title_w, rows_w) = match &app.overlay {
+                Some(Overlay::Menu(m)) => (
+                    m.title.as_deref().unwrap().chars().count() + 4,
+                    m.items
+                        .iter()
+                        .map(|i| i.label.chars().count())
+                        .max()
+                        .unwrap()
+                        + 6,
+                ),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                on_claude.width as usize,
+                title_w.max(rows_w),
+                "the title or the rows set the width, nothing else:\n{text}"
+            );
+            let lines: Vec<&str> = text.lines().collect();
+            let bottom = (on_claude.y + on_claude.height - 1) as usize;
+            assert!(
+                !lines[bottom].contains("cloud") && !lines[bottom].contains("settings"),
+                "no keys in the bottom border: {}",
+                lines[bottom]
+            );
+            let footer = lines
+                .iter()
+                .position(|l| l.contains("Tab: cloud off") && l.contains("s/?: settings"))
+                .unwrap_or_else(|| panic!("the footer names the picker's keys:\n{text}"));
+            assert!(footer > bottom, "below the modal, in the footer bar");
+
+            // Down to Codex: Tab is the Claude row's alone, the width holds.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            let (on_codex, text) = drawn(&mut app);
+            assert_eq!(on_codex, on_claude, "hovering another row never resizes it");
+            assert!(!text.contains("Tab: cloud"), "{text}");
+            assert!(text.contains("s/?: settings"), "{text}");
+        })
     }
 
     /// `Tab` in the box retargets this one launch: the same harness rows
@@ -27029,6 +27546,65 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// `Tab` on the Claude row of the box's own `Tab` picker is the NEW
+    /// SESSION PICKER's cloud toggle: the pick hands back a CLAUDE CLOUD
+    /// box with the text kept, the next `Tab` opens on the toggle as the
+    /// box left it, and Enter sends the text as the cloud task — never as
+    /// a STARTING PROMPT, and with no warm slot consumed or refilled.
+    #[test]
+    fn tab_on_claude_in_the_quick_prompt_picker_launches_in_the_cloud() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let worktree = app.selected_worktree().unwrap().id.clone();
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("Tab should toggle the row in place, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Quick prompt agent"));
+            assert_eq!(menu.items[menu.hover].label, "Claude · cloud");
+            assert_eq!(menu.hovered_claude_cloud(), Some(true));
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the pick should hand the box back, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth", "the text came back");
+            assert_eq!(prompt.title, "Quick prompt (claude · cloud)");
+            assert!(out.is_empty(), "nothing sent yet: {out:?}");
+
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            assert_eq!(menu.hovered_claude_cloud(), Some(true), "opens as left");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree: w,
+                        kind: AgentKind::Claude,
+                        custom_harness: None,
+                        cloud_prompt: Some(task),
+                        starting_prompt: None,
+                        ..
+                    }] if *w == worktree && task == "Fix auth"
+                ),
+                "a cloud launch, no prewarm behind it: {out:?}"
+            );
+        });
+    }
+
     /// Backing out of either picker is a return trip: the box comes back
     /// exactly as it left.
     #[test]
@@ -27062,8 +27638,9 @@ diff --git a/src/c.rs b/src/c.rs
     /// outside and the HARDWIRED UNLOCK park what was typed, and the next
     /// QUICK PROMPT takes it back — whole, harness pick and all, when it
     /// is aimed at the same checkout, and text-only into a box aimed
-    /// somewhere else. Clearing the box and closing it is how a draft is
-    /// thrown away; an empty box parks nothing.
+    /// somewhere else (the cursor moved onto another worktree's band, or
+    /// `^N` flipped the box). Clearing the box and closing it is how a
+    /// draft is thrown away; an empty box parks nothing.
     #[test]
     fn a_closed_quick_prompt_is_parked_and_the_next_box_takes_it_back() {
         with_default_config(|| {
@@ -27110,8 +27687,11 @@ diff --git a/src/c.rs b/src/c.rs
             assert!(app.overlay.is_none(), "^q closes the box");
             assert!(app.quick_draft.is_some(), "and parks it");
 
-            // A box aimed at another checkout keeps its own aim and spec;
-            // the text is the user's, so it still comes back.
+            // The cursor on a checkout with nothing running in it has no
+            // band to be on, so it moves nothing: the box still lands on
+            // the root branch, so it is the same box and comes back whole.
+            let root =
+                crate::quick_prompt::QuickTarget::Worktree(nebula_core::WorktreeId("w1".into()));
             app.sel_worktree = 1;
             assert_eq!(
                 app.selected_worktree().map(|w| w.branch.as_str()),
@@ -27122,13 +27702,57 @@ diff --git a/src/c.rs b/src/c.rs
                 panic!("p should open the box, got {:?}", app.overlay);
             };
             assert_eq!(prompt.input.as_str(), "Fix auth");
+            assert_eq!(prompt.title, "Quick prompt (codex)", "the pick too");
+            assert!(matches!(&prompt.kind, PromptKind::QuickPrompt(launch)
+                if launch.target == root));
+
+            // A box aimed somewhere else — `^N` flipped it onto a fresh
+            // worktree before it was closed — does not hand its aim and
+            // spec to the next box; the text is the user's, so it still
+            // comes back.
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.quick_draft.is_some(), "Esc parks the flipped box");
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("p should open the box, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth");
             assert_eq!(
                 prompt.title, "Quick prompt (claude)",
-                "another checkout's box is the settings' harness again"
+                "a differently aimed box is the settings' harness again"
             );
             assert!(matches!(&prompt.kind, PromptKind::QuickPrompt(launch)
-                if launch.target == crate::quick_prompt::QuickTarget::Worktree(
-                    nebula_core::WorktreeId("w2".into()))));
+                if launch.target == root));
+
+            // A session running in `feat` gives it a band, and the cursor
+            // on that band aims the box there: a different checkout, so
+            // the text comes back into feat's own box.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.quick_draft.is_some(), "Esc parks the root box");
+            seed_agent_in(&mut app, "a2", &nebula_core::WorktreeId("w2".into()));
+            app.sel_worktree = 1;
+            assert_eq!(
+                app.selected_worktree().map(|w| w.branch.as_str()),
+                Some("feat")
+            );
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("p should open the box, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth");
+            let feat =
+                crate::quick_prompt::QuickTarget::Worktree(nebula_core::WorktreeId("w2".into()));
+            assert!(
+                matches!(&prompt.kind, PromptKind::QuickPrompt(launch) if launch.target == feat),
+                "the box is the band's checkout's: {:?}",
+                prompt.kind
+            );
 
             // Cleared and closed: nothing is parked, and the next box is
             // the empty one it should be.
@@ -27588,23 +28212,72 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
-    /// Nothing typed is a change of mind, not an error: the box closes and
-    /// nothing is created (the preset and cloud task boxes hold open on
-    /// empty because their launch is already half-specified; this one is
-    /// one keystroke away from being reopened).
+    /// Nothing typed is not a change of mind: Enter on the empty box
+    /// starts the session the title names — that harness, model and
+    /// effort — with no first prompt, the CLI's own input being it, as
+    /// `n` does. The create carries no task and the stand-in row goes up
+    /// fresh, since nothing is on its way to the CLI. Only a CLAUDE CLOUD
+    /// box, which cannot start without its task, closes instead.
     #[test]
-    fn an_empty_quick_prompt_cancels_without_creating() {
+    fn an_empty_quick_prompt_starts_the_cli_with_no_first_prompt() {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
             seed_tree(&mut app);
             app.focus = Focus::Sessions;
+            let worktree = app.selected_worktree().unwrap().id.clone();
 
             press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(app.overlay.is_none(), "empty Enter closes it");
+            assert!(
+                app.overlay.is_none(),
+                "empty Enter launches and closes the box: {:?}",
+                app.overlay
+            );
+            assert_ne!(app.flash.as_deref(), Some("cancelled: empty input"));
+            // A bare create is one a warm CLI can stand in for, so the
+            // slot is refilled behind it — the same trail `n` leaves.
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [
+                        ClientRequest::CreateAgent {
+                            worktree: w,
+                            kind: AgentKind::Claude,
+                            cloud_prompt: None,
+                            starting_prompt: None,
+                            issue_url: None,
+                            ..
+                        },
+                        ClientRequest::PrewarmAgent { .. }
+                    ] if *w == worktree
+                ),
+                "one bare create in the selected checkout, then the refill: {out:?}"
+            );
+            assert_eq!(
+                app.visible_sessions().first().map(|a| a.status),
+                Some(nebula_core::AgentStatus::Fresh),
+                "the stand-in row goes up fresh: no prompt is on its way"
+            );
+
+            // The cloud box is the one that cannot: there is nothing to
+            // send as the task.
+            out.clear();
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!(
+                    "the pick should hand a cloud box back, got {:?}",
+                    app.overlay
+                );
+            };
+            assert_eq!(prompt.title, "Quick prompt (claude · cloud)");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
             assert_eq!(app.flash.as_deref(), Some("cancelled: empty input"));
-            assert!(out.is_empty(), "{out:?}");
+            assert!(out.is_empty(), "a cloud box needs its task: {out:?}");
         });
     }
 
@@ -28623,6 +29296,7 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 1,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 }),
             },

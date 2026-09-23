@@ -20,7 +20,7 @@ use crossterm::event::KeyboardEnhancementFlags;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{BufWriter, Stdout, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::thread::ThreadId;
 use std::time::Duration;
 
@@ -32,8 +32,25 @@ pub(super) type HostTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 pub(super) const MODE_REASSERT: Duration = Duration::from_secs(2);
 
 /// The kitty keyboard flags pushed on the host: without them Cmd-combos
-/// never reach us and Option/Esc combos arrive ambiguous.
+/// never reach us and Option/Esc combos arrive ambiguous. The flags the
+/// host RESTS on — `HOLD_FLAGS` is the one moment it is asked for more.
 const KITTY_FLAGS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+
+/// The flags while a RELEASE WATCH is on (release_watch.rs): every key as
+/// an escape code, so a held text key's repeats and release are reported
+/// and marked, plus the alternate keys so a shifted key still reads as
+/// the character it types (`CSI 59:58;2u` is `:`, not `;` with shift).
+/// Never the resting flags: under them the host sends key codes in place
+/// of text, and composed text — a dead key's `é`, a non-Latin layout —
+/// is lost.
+pub(super) const HOLD_FLAGS: KeyboardEnhancementFlags = KITTY_FLAGS
+    .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+    .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS)
+    .union(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+
+/// The flags the host holds right now — `KITTY_FLAGS`, or `HOLD_FLAGS`
+/// while a RELEASE WATCH is on — for the beat that re-asks them.
+static HOST_FLAGS: AtomicU8 = AtomicU8::new(KITTY_FLAGS.bits());
 
 /// Re-entering the alternate screen: `?1047h`, not `?1049h`. Both are no-ops
 /// on a terminal already showing it, but 1049 also saves the cursor, and the
@@ -175,10 +192,30 @@ fn write_modes(w: &mut impl Write, kitty: bool) -> std::io::Result<()> {
         // The protocol's *set* form (CSI = flags ; 1 u): it rewrites the
         // entry `setup_terminal` pushed. A second push would leave one
         // entry on the host's stack after the single pop at exit, and the
-        // user's shell in disambiguate mode.
-        write!(w, "\x1b[={};1u", KITTY_FLAGS.bits())?;
+        // user's shell in disambiguate mode. The flags as they stand: a
+        // RELEASE WATCH in progress keeps its own.
+        write_flags(w, HOST_FLAGS.load(Ordering::Relaxed))?;
     }
     Ok(())
+}
+
+/// The set form of the kitty flags (see `write_modes`).
+fn write_flags(w: &mut impl Write, flags: u8) -> std::io::Result<()> {
+    write!(w, "\x1b[={flags};1u")
+}
+
+/// Flip the host onto `HOLD_FLAGS` (`on`) for a RELEASE WATCH, or back to
+/// the resting flags — at once, ahead of the held key's first repeat. A
+/// host that never took the flags is written nothing: it has no repeats
+/// to mark, and the watch there is only as good as legacy presses.
+pub(super) fn watch_held_key(w: &mut impl Write, on: bool) -> std::io::Result<()> {
+    if !KITTY_PUSHED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let flags = if on { HOLD_FLAGS } else { KITTY_FLAGS };
+    HOST_FLAGS.store(flags.bits(), Ordering::Relaxed);
+    write_flags(w, flags.bits())?;
+    w.flush()
 }
 
 #[cfg(test)]
@@ -243,6 +280,21 @@ mod tests {
             !out.contains("\x1b[>"),
             "a push would leak past the exit pop: {out:?}"
         );
+    }
+
+    /// The RELEASE WATCH's flags go the same way — set in place, never
+    /// pushed — and ask for the event types, the alternate keys and every
+    /// key as an escape code on top of the resting disambiguation. A host
+    /// that never took the flags is written nothing.
+    #[test]
+    fn the_hold_flags_are_set_in_place_too() {
+        let mut out = Vec::new();
+        write_flags(&mut out, HOLD_FLAGS.bits()).unwrap();
+        let out = text(&out);
+        assert_eq!(out, "\x1b[=15;1u", "1 | 2 | 4 | 8");
+        let mut none = Vec::new();
+        watch_held_key(&mut none, true).unwrap();
+        assert!(none.is_empty(), "{:?}", text(&none));
     }
 
     #[test]

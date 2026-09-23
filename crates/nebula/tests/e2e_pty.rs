@@ -244,6 +244,12 @@ fn find_ack(events: &[ServerEvent], want_req: u64) -> Option<&ServerEvent> {
     })
 }
 
+fn find_tail(events: &[ServerEvent], want_req: u64) -> Option<&ServerEvent> {
+    events
+        .iter()
+        .find(|e| matches!(e, ServerEvent::OutputTail { req_id, .. } if *req_id == want_req))
+}
+
 fn collected_output(events: &[ServerEvent]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in events {
@@ -367,6 +373,76 @@ async fn full_crud_attach_and_restart_persistence() {
     assert!(
         text.contains("repo"),
         "terminal cwd should be the worktree: {text}"
+    );
+
+    // ---- TailOutput: the end of the ring, for the grid's terminal card ----
+    write_frame(
+        &mut c,
+        &ClientRequest::TailOutput {
+            req_id: 900,
+            session: sref.clone(),
+            max_bytes: 4096,
+            after_seq: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events =
+        read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_tail(evs, 900).is_some()).await;
+    let Some(ServerEvent::OutputTail {
+        tail: Some(tail), ..
+    }) = find_tail(&events, 900)
+    else {
+        panic!("TailOutput answered with no tail: {events:#?}");
+    };
+    let text = String::from_utf8_lossy(&tail.data).into_owned();
+    assert!(text.contains(marker), "the tail holds the marker: {text}");
+    assert_eq!((tail.cols, tail.rows), (80, 24), "at the attached size");
+    assert!(tail.end_seq as usize >= tail.data.len());
+    // Asked again from where that left off, a ring that has not grown
+    // answers with no bytes.
+    write_frame(
+        &mut c,
+        &ClientRequest::TailOutput {
+            req_id: 901,
+            session: sref.clone(),
+            max_bytes: 4096,
+            after_seq: Some(tail.end_seq),
+        },
+    )
+    .await
+    .unwrap();
+    let events =
+        read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_tail(evs, 901).is_some()).await;
+    let Some(ServerEvent::OutputTail {
+        tail: Some(again), ..
+    }) = find_tail(&events, 901)
+    else {
+        panic!("TailOutput answered with no tail: {events:#?}");
+    };
+    if again.end_seq == tail.end_seq {
+        assert!(again.data.is_empty(), "nothing new, no bytes: {again:?}");
+    }
+    // A session with no PTY has no tail at all.
+    write_frame(
+        &mut c,
+        &ClientRequest::TailOutput {
+            req_id: 902,
+            session: SessionRef::Terminal(nebula_core::TerminalId("no-such".into())),
+            max_bytes: 4096,
+            after_seq: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events =
+        read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_tail(evs, 902).is_some()).await;
+    assert!(
+        matches!(
+            find_tail(&events, 902),
+            Some(ServerEvent::OutputTail { tail: None, .. })
+        ),
+        "{events:#?}"
     );
 
     // ---- CreateAgent (NEBULA_AGENT_CMD=/bin/sh stands in for claude) ----
@@ -3921,6 +3997,22 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     })
     .await;
 
+    // A turn is under way — the one about to run the command.
+    let hook = |event: &str| format!("/api/hooks/claude?agentId={}&hookEvent={event}", agent_id.0);
+    let payload = format!(
+        r#"{{"session_id":"s1","cwd":"{}","tool_name":"Bash"}}"#,
+        repo.display()
+    );
+    let (status, _) = hook_post_json(port, &hook("UserPromptSubmit"), &token, &payload).await;
+    assert_eq!(status, 200, "UserPromptSubmit");
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
     // The model obeys the guidance — `nebula worktree feat x` (the space
     // slugifies) with the session's env.
     let out = agent_cli(&env, &agent_id, &["worktree", "feat", "x"]);
@@ -3960,13 +4052,8 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     // Mid-turn the CLI's hooks keep reporting the old checkout's cwd; that
     // must not drag the row back. Then the Stop — same old cwd — ends the
     // turn and triggers the relocation.
-    let payload = format!(
-        r#"{{"session_id":"s1","cwd":"{}","tool_name":"Bash"}}"#,
-        repo.display()
-    );
     for event in ["PostToolUse", "Stop"] {
-        let path = format!("/api/hooks/claude?agentId={}&hookEvent={event}", agent_id.0);
-        let (status, _) = hook_post_json(port, &path, &token, &payload).await;
+        let (status, _) = hook_post_json(port, &hook(event), &token, &payload).await;
         assert_eq!(status, 200, "{event}");
     }
 
@@ -3987,6 +4074,25 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
             .iter()
             .any(|e| matches!(e, ServerEvent::Scrollback { session, .. } if session == &sref)),
         "the rebind replays the new PTY's ring: {events:#?}"
+    );
+    // The turn's Stop did not finish the row on its way to the respawn:
+    // the card would have dropped to the bottom of the grid and climbed
+    // back once the relocated CLI's first hook landed. The respawn opens
+    // on the relocation notice, so the row stays `running` throughout.
+    assert!(
+        !events.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
+                if *agent == agent_id)
+        }),
+        "no finish between the Stop and the respawn: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.worktree_id == feat.id && a.alive
+                    && a.status == nebula_core::AgentStatus::Running)
+        }),
+        "the relocated row reads running: {events:#?}"
     );
     let deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
     loop {

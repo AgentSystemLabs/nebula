@@ -231,20 +231,33 @@ impl Daemon {
             Effects(Vec<Effect>),
             UnknownAgent(HookEvent, Option<String>),
         }
+        // A `nebula worktree` relocation waiting on this agent's turn end
+        // holds that end at `running` (`AgentStatusMachine::set_relocating`;
+        // `complete_pending_move` drains it). Read off the daemon's own
+        // record before every event, so the machine's copy cannot go stale
+        // — and before the machines lock, so the two are never nested.
+        let relocating = self.pending_moves.lock().unwrap().contains_key(agent_id);
         let outcome = {
             let mut machines = self.status_machines.lock().unwrap();
             match machines.entry(agent_id.clone()) {
-                std::collections::hash_map::Entry::Occupied(e) => Outcome::Effects(
-                    e.into_mut()
-                        .handle(event, session_id.as_deref(), Instant::now()),
-                ),
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    let machine = e.into_mut();
+                    machine.set_relocating(relocating);
+                    Outcome::Effects(machine.handle(event, session_id.as_deref(), Instant::now()))
+                }
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     // Lazily seed from the persisted row.
                     match self.store.get_agent(agent_id) {
-                        Ok(Some(agent)) => Outcome::Effects(
-                            slot.insert(AgentStatusMachine::new(agent.status, agent.session_id))
-                                .handle(event, session_id.as_deref(), Instant::now()),
-                        ),
+                        Ok(Some(agent)) => {
+                            let machine = slot
+                                .insert(AgentStatusMachine::new(agent.status, agent.session_id));
+                            machine.set_relocating(relocating);
+                            Outcome::Effects(machine.handle(
+                                event,
+                                session_id.as_deref(),
+                                Instant::now(),
+                            ))
+                        }
                         _ => Outcome::UnknownAgent(event, session_id),
                     }
                 }
@@ -327,6 +340,16 @@ impl Daemon {
 
     pub fn is_alive(&self, sref: &SessionRef) -> bool {
         self.sessions.lock().unwrap().contains_key(sref)
+    }
+
+    /// Whether `session` is still the PTY registered for `sref` — not one
+    /// a kill (restart, move, relocation) has since replaced.
+    fn owns_session(&self, sref: &SessionRef, session: &Arc<PtySession>) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sref)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
     }
 
     /// (session, child pid, prewarm-pool home) for every live PTY — the
@@ -1081,6 +1104,7 @@ impl Daemon {
             sort_order: 0,
             status_changed_at: epoch_ms(),
             alive: false,
+            issue_url: issue_url.clone(),
             recent_prompts: Vec::new(),
         };
         self.store.insert_agent_with_launch_context(
@@ -1234,6 +1258,7 @@ impl Daemon {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
@@ -1596,15 +1621,25 @@ impl Daemon {
     /// with a prompt naming the checkout it now runs in so the conversation
     /// carries straight on (Claude, codex and pi take that prompt as an
     /// argument; cursor resumes silent and waits for the user — see
-    /// `relocation_prompt`). Gated on the turn-end hooks — Stop, and the
-    /// idle notification a Stop-less end still fires — so a Bash hook from
-    /// the same turn never triggers it.
+    /// `relocation_prompt`). Gated on the turn-end signals — Stop, the idle
+    /// notification a Stop-less end still fires, and the progress clear
+    /// that is the only word of a cancelled turn — so a Bash hook from the
+    /// same turn never triggers it.
+    ///
+    /// The status machine held that turn end at `running` for the
+    /// relocation (`AgentStatusMachine::set_relocating`), so the card never
+    /// drops to the bottom of the grid for the seconds until the respawned
+    /// CLI's first hook: a respawn that opens on the notice is seeded as a
+    /// launch, the way a create with a task is, and any other outcome — a
+    /// silent respawn, a failed one, nothing left to respawn — lets the
+    /// held end finish the turn after all.
     pub fn complete_pending_move(self: &Arc<Self>, id: &AgentId, event: &HookEvent) {
         let turn_over = match event {
             HookEvent::Stop => true,
             HookEvent::Notification { notification_type } => {
                 notification_type.as_deref() == Some("idle_prompt")
             }
+            HookEvent::Progress { busy } => !busy,
             _ => false,
         };
         if !turn_over {
@@ -1613,17 +1648,34 @@ impl Daemon {
         let Some(target) = self.pending_moves.lock().unwrap().remove(id) else {
             return;
         };
+        if self.relocate_into(id, &target) {
+            // Working from the moment it boots, on the notice: seeded with
+            // the launch reprieve so its startup progress-clear cannot
+            // green it out before that turn begins (see `create_agent`).
+            self.status_machines
+                .lock()
+                .unwrap()
+                .insert(id.clone(), AgentStatusMachine::launching());
+        } else {
+            self.release_relocation_hold(id);
+        }
+    }
+
+    /// The kill-and-respawn of [`Self::complete_pending_move`]. True when
+    /// the respawn opened on the relocation notice — the one outcome that
+    /// carries on the turn the status machine held.
+    fn relocate_into(self: &Arc<Self>, id: &AgentId, target: &Worktree) -> bool {
         let agent = match self.store.get_agent(id) {
             Ok(Some(agent)) if !agent.archived && agent.worktree_id == target.id => agent,
             // Archived, deleted, or moved elsewhere by hand since: the
             // row's current home wins, nothing to relocate into.
-            _ => return,
+            _ => return false,
         };
         let sref = SessionRef::Agent(id.clone());
         if self.session(&sref).is_none() {
             // Died since (or the user closed it): the next launch boots in
             // the target on its own, only without the relocation notice.
-            return;
+            return false;
         }
         tracing::info!(agent = %id, to = %target.branch, "relocating session into its worktree");
         self.kill_session(&sref);
@@ -1632,19 +1684,47 @@ impl Daemon {
         // itself refuses with the entry's reason, so the notice degrades
         // to none rather than failing the move.
         let prompt = resolve_harness(agent.kind, agent.custom_harness.as_deref())
-            .map(|harness| relocation_prompt(harness.relocation_prompt, &target))
+            .map(|harness| relocation_prompt(harness.relocation_prompt, target))
             .unwrap_or(None);
-        if let Err(e) = self.spawn_agent_session_with(
+        let spawned = self.spawn_agent_session_with(
             &agent,
-            &target,
+            target,
             DEFAULT_COLS,
             DEFAULT_ROWS,
             None,
             prompt.as_deref(),
-        ) {
-            tracing::warn!(agent = %id, error = %e, "respawn after worktree relocation failed");
-        }
+        );
+        let continued = match spawned {
+            Ok(_) => prompt.is_some(),
+            Err(e) => {
+                tracing::warn!(agent = %id, error = %e, "respawn after worktree relocation failed");
+                false
+            }
+        };
         self.try_broadcast_agent(id);
+        continued
+    }
+
+    /// No respawn is carrying the held turn on: the end the status machine
+    /// held for the relocation lands now, as the Stop it was. A machine not
+    /// mid-turn held nothing — the row finished or died the ordinary way —
+    /// and is left alone.
+    fn release_relocation_hold(&self, id: &AgentId) {
+        let effects = {
+            let mut machines = self.status_machines.lock().unwrap();
+            let Some(machine) = machines.get_mut(id) else {
+                return;
+            };
+            if !matches!(
+                machine.status(),
+                AgentStatus::Running | AgentStatus::NeedsFeedback
+            ) {
+                return;
+            }
+            machine.set_relocating(false);
+            machine.handle(HookEvent::Stop, None, Instant::now())
+        };
+        self.apply_status_effects(id, effects);
     }
 
     /// Whether `id` is between `enter_worktree` and its respawn.
@@ -2777,10 +2857,19 @@ impl Daemon {
                     // the only end-of-turn news after a user cancel: Claude
                     // Code fires no Stop for an interrupted turn, and
                     // suppresses the idle notification because the user just
-                    // pressed a key. See `pty::progress`.
+                    // pressed a key. See `pty::progress`. Only while this PTY
+                    // is still the session's: a killed CLI clears its bar as
+                    // it dies, and that must not speak for the replacement a
+                    // restart or relocation has installed by then.
                     Ok(PtyEvent::Progress { busy }) => {
                         if let SessionRef::Agent(id) = &sref {
-                            daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
+                            if daemon.owns_session(&sref, &session) {
+                                daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
+                                // A cancelled turn's only word: a relocation
+                                // waiting on this turn's end goes now, not
+                                // at the end of the next one.
+                                daemon.complete_pending_move(id, &HookEvent::Progress { busy });
+                            }
                         }
                     }
                     // The window title carries Claude's session name, and
@@ -2818,7 +2907,10 @@ impl Daemon {
                         if let (SessionRef::Agent(id), Some(busy)) =
                             (&sref, session.progress_busy())
                         {
-                            daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
+                            if daemon.owns_session(&sref, &session) {
+                                daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
+                                daemon.complete_pending_move(id, &HookEvent::Progress { busy });
+                            }
                         }
                         continue;
                     }
@@ -5258,6 +5350,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             })
             .unwrap();
@@ -5382,6 +5475,127 @@ mod tests {
         assert_eq!(agent_worktree(&daemon, "a1"), "root");
     }
 
+    /// `nebula worktree` from a live session: the turn end that triggers
+    /// the relocation must not finish the row for the seconds until the
+    /// respawned CLI's first hook — the card would drop to the bottom of
+    /// the grid and climb back — so the Stop is held at `running`, the
+    /// respawn is seeded as a launch (its startup progress-clear swallowed),
+    /// and only the relocated turn's own end finishes it.
+    #[tokio::test]
+    async fn a_relocation_keeps_the_row_running_through_the_respawn() {
+        let daemon = test_daemon();
+        let (dir, main) = run_worktree(&daemon);
+        let feat_dir = tempfile::tempdir().unwrap();
+        let feat = Worktree {
+            id: WorktreeId::generate(),
+            project_id: main.project_id.clone(),
+            path: feat_dir.path().to_path_buf(),
+            branch: "feat".into(),
+            is_main: false,
+            sort_order: 1,
+        };
+        daemon.store.insert_worktree(&feat).unwrap();
+        // `/bin/cat` stands in for the CLI, on the first boot and the
+        // respawn alike (an override takes no argv, notice included).
+        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
+        let EntityId::Agent(id) = daemon
+            .create_agent(CreateAgentSpec {
+                worktree: main.id.clone(),
+                name: "a".into(),
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                auto_title: false,
+                cloud_prompt: None,
+                starting_prompt: None,
+                pr_url: None,
+                issue_url: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("a create makes an agent");
+        };
+        let sref = SessionRef::Agent(id.clone());
+        let status = |id: &AgentId| daemon.store.get_agent(id).unwrap().unwrap().status;
+        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("s1".into()));
+        assert_eq!(status(&id), AgentStatus::Running);
+
+        // The turn runs `nebula worktree feat`: the row moves now, the PTY
+        // waits for the turn's end.
+        let (_, outcome) = daemon.enter_worktree(&id, "feat", None).await.unwrap();
+        assert_eq!(outcome, EnterOutcome::Relocating);
+        let first = daemon.session(&sref).expect("still the first PTY");
+        let mut rx = daemon.events.subscribe();
+
+        // The turn's Stop lands as the hook loop delivers it: through the
+        // status machine first, then the relocation.
+        daemon.apply_hook_event(&id, HookEvent::Stop, Some("s1".into()));
+        assert_eq!(
+            status(&id),
+            AgentStatus::Running,
+            "the Stop is held for the relocation"
+        );
+        daemon.complete_pending_move(&id, &HookEvent::Stop);
+        assert!(!daemon.relocation_pending(&id));
+        let second = daemon.session(&sref).expect("respawned in the worktree");
+        assert!(!Arc::ptr_eq(&first, &second), "a new PTY");
+        assert_eq!(status(&id), AgentStatus::Running);
+        // The respawned CLI's startup progress-clear is its boot, not a
+        // turn ending.
+        daemon.apply_hook_event(&id, HookEvent::Progress { busy: false }, None);
+        assert_eq!(status(&id), AgentStatus::Running);
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    ev,
+                    ServerEvent::StatusChanged {
+                        status: AgentStatus::Finished,
+                        ..
+                    }
+                ),
+                "nothing in between said finished: {ev:?}"
+            );
+        }
+        // The relocated turn's own end does.
+        daemon.apply_hook_event(&id, HookEvent::Stop, Some("s1".into()));
+        assert_eq!(status(&id), AgentStatus::Finished);
+        drop(dir);
+    }
+
+    /// The same relocation when the respawn carries no notice (cursor
+    /// resumes silent and waits for the user) or nothing is left to
+    /// respawn: the held turn end finishes the row after all, since no
+    /// prompt is carrying the work on.
+    #[test]
+    fn a_relocation_with_no_respawn_lets_the_held_turn_end_finish() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_agent(&daemon, "a1", "feat", Some("s1"));
+        let a1 = AgentId("a1".into());
+        let feat = daemon
+            .store
+            .get_worktree(&WorktreeId("feat".into()))
+            .unwrap()
+            .unwrap();
+        daemon
+            .pending_moves
+            .lock()
+            .unwrap()
+            .insert(a1.clone(), feat);
+        let status = |id: &AgentId| daemon.store.get_agent(id).unwrap().unwrap().status;
+
+        daemon.apply_hook_event(&a1, HookEvent::Stop, Some("s1".into()));
+        assert_eq!(status(&a1), AgentStatus::Running, "held while pending");
+        // No PTY to relocate: the hold is released and the Stop finishes it.
+        daemon.complete_pending_move(&a1, &HookEvent::Stop);
+        assert!(!daemon.relocation_pending(&a1));
+        assert_eq!(status(&a1), AgentStatus::Finished);
+    }
+
     #[tokio::test]
     async fn enter_worktree_creates_the_checkout_in_nebulas_layout() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5442,6 +5656,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 },
                 true,

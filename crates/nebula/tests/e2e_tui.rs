@@ -28,6 +28,7 @@ const ESC: &[u8] = &[0x1b];
 const DOWN: &[u8] = b"\x1b[B";
 const CTRL_Q: &[u8] = &[0x11];
 const CTRL_R: &[u8] = &[0x12];
+const CTRL_E: &[u8] = &[0x05];
 
 /// A row only the PROJECT's own menu carries.
 const PROJECT_MENU_ROW: &str = "Remove from list";
@@ -557,7 +558,7 @@ fn tui_issues_are_prefetched_before_the_modal_opens() {
     tui.wait_for_gone("Issues — issues-proj");
 }
 
-/// `E` in the ISSUES MODAL edits the issue in place: the reading pane
+/// `Ctrl+e` in the ISSUES MODAL edits the issue in place: the reading pane
 /// becomes a form on the row's title and description, and Enter sends both
 /// as one `gh issue edit` — the title on argv, the description on stdin —
 /// then puts the reading pane back on the new text. A stub `gh` on PATH
@@ -611,7 +612,7 @@ fn tui_issues_modal_edits_the_issue_in_place() {
     tui.wait_for_text("#15 Fix login redirect");
 
     // The form opens on the row's text, caret at the end of the title.
-    tui.send(b"E");
+    tui.send(CTRL_E);
     tui.wait_for_text("Edit issue #15");
     tui.wait_for_text("Title  Fix login redirect");
     tui.send(b"!");
@@ -633,7 +634,7 @@ fn tui_issues_modal_edits_the_issue_in_place() {
     assert!(sent.contains("stdin: Login bounces. Again."), "{sent}");
 
     // Esc from the form drops the draft and keeps the modal.
-    tui.send(b"E");
+    tui.send(CTRL_E);
     tui.wait_for_text("Edit issue #15");
     tui.send(ESC);
     tui.wait_for_gone("Edit issue #15");

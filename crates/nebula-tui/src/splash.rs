@@ -226,9 +226,6 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         }
         hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
         hint.extend(key("?", "help"));
-    } else {
-        // Summoned as a preview over a populated tree.
-        hint.extend(key("any key", "returns"));
     }
     lines.push(Line::from(hint));
 

@@ -2,18 +2,24 @@
 //! listed down the left in the PROJECT OPEN PRS GROUP's order — newest
 //! first, the drafts sunk below the finished ones — the one under the
 //! cursor read on the right, and the ISSUES MODAL's ways to put an agent
-//! on it: a QUICK PROMPT (`Enter` / `p`), one of the saved AGENT PRESETS
-//! (`e`), or a bare harness pick (`n`, the group row's NEW SESSION
-//! PICKER). Every one of them is a PR SESSION, launched exactly as the
-//! group's row launches it (`quick_prompt::pr_launch_for`): the create is
-//! a `CreatePrAgent`, the DAEMON runs the session in the project's
-//! checkout of the pull request's head branch — reused when one is there,
-//! cut otherwise, its stand-in rows up under the pull request from the
-//! moment Enter is pressed — and the PR's URL rides the harness's context.
+//! on it: a QUICK PROMPT (`Enter`), one of the saved AGENT PRESETS
+//! (`Shift+Tab`), or a bare harness pick (`Tab`, the group row's NEW
+//! SESSION PICKER) — the QUICK PROMPT box's own three keys. Every one of
+//! them is a PR SESSION, launched exactly as the group's row launches it
+//! (`quick_prompt::pr_launch_for`): the create is a `CreatePrAgent`, the
+//! DAEMON runs the session in the project's checkout of the pull
+//! request's head branch — reused when one is there, cut otherwise, its
+//! stand-in rows up under the pull request from the moment Enter is
+//! pressed — and the PR's URL rides the harness's context.
 //!
-//! `c` leaves a comment (the COMMENT BOX the row's `y` opens, which comes
-//! back to the modal on its row), `g` reads the whole diff, `o` opens the
-//! pull request in the browser, `r` asks GitHub again.
+//! The list's filter is live from the moment the modal opens, as the
+//! DIFF VIEWER's and the FILE FINDER's are: every letter typed narrows
+//! the rows to the fuzzy matches of `#42 title` (`fuzzy::rank`), best
+//! first, the cursor on the best, and Esc clears it before a second Esc
+//! closes. So the verbs are chords: `Ctrl+c` leaves a comment (the
+//! COMMENT BOX the group row's `y` opens, which comes back to the modal
+//! on its row), `Ctrl+g` reads the whole diff, `Ctrl+o` opens the pull
+//! request in the browser, `Ctrl+r` asks GitHub again.
 //!
 //! Nothing is fetched here the panels do not already keep. The rows are
 //! the project's open list (`App::open_prs`) — kept warm on the OPEN PRS
@@ -26,22 +32,24 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use nebula_core::{ProjectId, WorktreeId};
+use nebula_core::{ClientRequest, ProjectId, WorktreeId};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{clamp_selection, window_start, App, Overlay, PendingPrDetail, PromptKind};
-use crate::keymap::{Action, KeyChord, Scope};
+use crate::app::{
+    clamp_selection, window_start, App, HitTarget, Overlay, PendingPrDetail, PromptKind,
+};
 use crate::pr_preview::fit;
 use crate::pull_request::{OpenPr, PrDetail};
-use crate::quick_prompt::{QuickLaunch, QuickReturn};
+use crate::quick_prompt::{ModalUnder, QuickLaunch, QuickReturn};
+use crate::text_input::TextInput;
 use crate::theme::Theme;
 use crate::ui::{
-    centered_rect_pct, empty_list_row, panel_block, render_row, row_rect, truncate,
-    SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
+    centered_rect_pct, empty_list_row, fuzzy_highlight_styled, panel_block, render_row, row_rect,
+    search_line, truncate, visible_positions, SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
 };
 
 /// A list younger than this is what opening the modal shows, with no
@@ -89,6 +97,18 @@ pub struct PullRequestsView {
     /// The list rows and the reading pane, for wheel and click routing.
     pub list_area: Rect,
     pub body_area: Rect,
+    /// The `↗ open in browser` BUTTON on the reading pane's top border
+    /// (`ui::browser_button`), for the click and the pointer resting on
+    /// it; `Rect::default()` — no point inside — while there is none.
+    pub browser_area: Rect,
+    /// The list's live filter: the rows narrow to the fuzzy matches of
+    /// `#42 title`, best first ([`visible_rows`]), as every letter lands.
+    /// Empty shows every row in the list's order.
+    pub query: TextInput,
+    /// Where the cursor sat among the visible rows as of the last draw:
+    /// the follow-window's anchor, and what a click's row math counts
+    /// from.
+    pub cursor_row: usize,
 }
 
 impl PullRequestsView {
@@ -105,12 +125,16 @@ impl PullRequestsView {
             area: Rect::default(),
             list_area: Rect::default(),
             body_area: Rect::default(),
+            browser_area: Rect::default(),
+            query: TextInput::new(),
+            cursor_row: 0,
         }
     }
 
-    /// First visible row of the list's stateless follow-window.
+    /// First visible row of the list's stateless follow-window, over the
+    /// rows the filter leaves.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.selected, height)
+        window_start(self.cursor_row, height)
     }
 
     pub fn max_scroll(&self) -> u16 {
@@ -187,6 +211,41 @@ fn rows<'a>(app: &'a App, project: &ProjectId) -> &'a [OpenPr] {
         .map_or(&[], |open| open.list.as_slice())
 }
 
+/// Is there a filter to apply — text in the row beyond whitespace?
+fn has_query(view: &PullRequestsView) -> bool {
+    view.query.split_whitespace().next().is_some()
+}
+
+/// The rows the filter leaves, top to bottom: indices into `list`, each
+/// with the matched char positions of its `#42 title` (lit when drawn);
+/// every row in list order with nothing typed. Worked out afresh on every
+/// call rather than kept — a project's open pull requests are a handful
+/// — so it can never go stale against the list.
+fn visible_rows(query: &str, list: &[OpenPr]) -> Vec<(usize, Vec<usize>)> {
+    let labels: Vec<String> = list.iter().map(|pr| pr.label()).collect();
+    crate::fuzzy::rank(query, labels.iter().map(String::as_str))
+}
+
+/// The row under the cursor, as an index into `list`: `selected` while
+/// the filter shows it, else the filter's best match — a refresh may have
+/// moved the cursor's pull request under a row the filter hides — and
+/// `selected` clamped onto the list with nothing typed. None with no row
+/// to be on: an empty list, or a filter nothing matches.
+fn cursor_index(view: &PullRequestsView, list: &[OpenPr]) -> Option<usize> {
+    if list.is_empty() {
+        return None;
+    }
+    if !has_query(view) {
+        return Some(clamp_selection(view.selected as i64, list.len()));
+    }
+    let visible = visible_rows(&view.query, list);
+    if visible.iter().any(|(i, _)| *i == view.selected) {
+        Some(view.selected)
+    } else {
+        visible.first().map(|(i, _)| *i)
+    }
+}
+
 /// A list that landed within [`FRESH`]: the modal opens on it as it is.
 fn is_fresh(app: &App, project: &ProjectId) -> bool {
     app.open_prs
@@ -206,12 +265,18 @@ fn request_list(app: &mut App, project: &ProjectId) {
 }
 
 /// The pull request under the cursor, while the modal is up and the list
-/// has rows.
+/// has a row the filter shows.
 fn selected_pr(app: &App) -> Option<OpenPr> {
     let Some(Overlay::PullRequests(view)) = &app.overlay else {
         return None;
     };
-    rows(app, &view.project).get(view.selected).cloned()
+    let list = rows(app, &view.project);
+    cursor_index(view, list).and_then(|i| list.get(i).cloned())
+}
+
+/// The URL of the pull request under the cursor, for the browser.
+fn selected_url(app: &App) -> Option<String> {
+    selected_pr(app).map(|pr| pr.url)
 }
 
 /// The detail fetch a pull request is owed, if any: none for one already
@@ -295,7 +360,68 @@ fn select(app: &mut App, index: i64) {
     app.dirty = true;
 }
 
-/// `r`: ask for the list again now, and the selected pull request's body
+/// ↑/↓, the wheel: the cursor `delta` rows through the visible ones —
+/// the filter's matches while one is typed — clamped at either end.
+fn step(app: &mut App, delta: i64) {
+    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+        return;
+    };
+    let list = rows(app, &view.project);
+    let Some(current) = cursor_index(view, list) else {
+        return;
+    };
+    let visible = visible_rows(&view.query, list);
+    let at = visible.iter().position(|(i, _)| *i == current).unwrap_or(0) as i64;
+    let next = clamp_selection(at + delta, visible.len());
+    if let Some((index, _)) = visible.get(next) {
+        select(app, *index as i64);
+    }
+}
+
+/// The filter's text changed: the cursor goes to its best match — the
+/// pane rewinds onto it and its body is asked for, as any move does — or
+/// stays where it is once nothing is typed, so the row just found keeps
+/// the cursor after Esc has cleared the letters that found it. A filter
+/// nothing matches moves nothing: the list says so, the pane has no row
+/// to read, and the next letter or Backspace decides.
+fn query_changed(app: &mut App) {
+    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+        return;
+    };
+    let list = rows(app, &view.project);
+    let target = if has_query(view) {
+        visible_rows(&view.query, list).first().map(|(i, _)| *i)
+    } else {
+        cursor_index(view, list)
+    };
+    match target {
+        Some(index) => select(app, index as i64),
+        None => schedule_detail(app),
+    }
+    app.dirty = true;
+}
+
+/// Esc: the filter cleared, the cursor staying on the row it was on.
+fn clear_query(app: &mut App) {
+    if let Some(Overlay::PullRequests(view)) = &mut app.overlay {
+        view.query.clear();
+    }
+    query_changed(app);
+}
+
+/// A bracketed paste lands in the filter, as one line, and narrows the
+/// rows as typing it would. True whenever the modal is up: the filter is
+/// always live.
+pub(crate) fn paste(app: &mut App, text: &str) -> bool {
+    let Some(Overlay::PullRequests(view)) = &mut app.overlay else {
+        return false;
+    };
+    view.query.insert_str(text);
+    query_changed(app);
+    true
+}
+
+/// `Ctrl+r`: ask for the list again now, and the selected pull request's body
 /// over the cached copy. The rows stay until the answer lands.
 fn refresh(app: &mut App) {
     let Some(Overlay::PullRequests(view)) = &app.overlay else {
@@ -346,16 +472,18 @@ fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
     crate::quick_prompt::pr_launch_for(app, &project, &pr)
 }
 
-/// `Enter` / `p`: the QUICK PROMPT for a PR SESSION on the pull request.
-/// The box replaces the modal; Esc from it lands on the panels, and the
-/// hotkey reopens the list.
+/// `Enter`: the QUICK PROMPT for a PR SESSION on the pull request.
+/// The box goes up over the modal, which stays on screen under it: Esc
+/// puts the modal back on the row (`QuickLaunch::under`), and the launch
+/// closes it onto the new session's card.
 fn open_prompt_for_selected(app: &mut App) {
+    let under = ModalUnder::of(app.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
-        crate::quick_prompt::open_pr_box(app, launch);
+        crate::quick_prompt::open_pr_box(app, launch.with_under(under));
     }
 }
 
-/// `e`: one of the saved AGENT PRESETS as a PR SESSION on the pull
+/// `Shift+Tab`: one of the saved AGENT PRESETS as a PR SESSION on the pull
 /// request. The pick hands the same box `Enter` opens back with the preset
 /// applied; with no presets saved the footer says where to add one.
 fn open_preset_for_selected(app: &mut App) {
@@ -371,7 +499,7 @@ fn open_preset_for_selected(app: &mut App) {
     }
 }
 
-/// `n`: the NEW SESSION PICKER's harness rows for a PR SESSION on the pull
+/// `Tab`: the NEW SESSION PICKER's harness rows for a PR SESSION on the pull
 /// request — `n` on the group's row — launching bare on Enter, or through
 /// the MODEL / EFFORT submenus on `→`.
 fn open_harness_picker_for_selected(app: &mut App) {
@@ -393,7 +521,7 @@ fn open_harness_picker_for_selected(app: &mut App) {
     );
 }
 
-/// `c`: the COMMENT BOX for the pull request under the cursor, carrying the
+/// `Ctrl+c`: the COMMENT BOX for the pull request under the cursor, carrying the
 /// modal so Enter and Esc come back to it on the row. A draft a refused
 /// post left for this pull request fills the box.
 fn open_comment_for_selected(app: &mut App) {
@@ -418,17 +546,25 @@ fn open_comment_for_selected(app: &mut App) {
     );
 }
 
+/// `Ctrl+o`, and a click on the reading pane's `↗ open in browser` button
+/// (`HitTarget::ModalBrowser`): the pull request under the cursor in the
+/// browser, through the very `event_loop::open_link` a card's `⇧V` and
+/// `⇧I` run — the footer says where it went, or that it could not — and the pull request is marked
+/// read on the way out, its conversation about to be on screen.
+/// Nothing under the cursor opens nothing. INPUT PARITY: the key and the
+/// click end in the same state.
+pub(crate) fn open_in_browser(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if let Some(url) = selected_url(app) {
+        crate::event_loop::open_link(app, &url, out);
+    }
+}
+
 // ---- keys and mouse ----
 
-/// Keys in the PULL REQUESTS MODAL.
-pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
-    // The hotkey that opened the modal closes it, whatever it is bound to
-    // — after the modal's own keys, so a rebind onto one of them can't
-    // take it away.
-    let toggles = app
-        .keymap
-        .lookup(Scope::Global, &KeyChord::from_event(&key))
-        == Some(Action::PullRequests);
+/// Keys in the PULL REQUESTS MODAL. The filter is always live, so
+/// letters type — the modal's own hotkey and `q` among them — and the
+/// verbs are chords; only Esc closes, once the filter is clear.
+pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let Some(Overlay::PullRequests(view)) = &mut app.overlay else {
         return;
     };
@@ -436,73 +572,90 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let half = (view.view_height / 2).max(1) as i32;
     let page = view.view_height.max(1) as i32;
-    let selected = view.selected as i64;
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => close(app),
-        KeyCode::Char('j') | KeyCode::Down if !shift => select(app, selected + 1),
-        KeyCode::Char('k') | KeyCode::Up if !shift => select(app, selected - 1),
-        // The reading pane scrolls on the ISSUES MODAL's keys.
+        // Two-stage escape, like every fuzzy overlay: a typed filter is
+        // cleared before the second Esc closes the modal.
+        KeyCode::Esc if !view.query.is_empty() => clear_query(app),
+        KeyCode::Esc => close(app),
+        // Shift+↑/↓ scroll the pane a line; ↑/↓ walk the rows the filter
+        // leaves, Ctrl+n/p mirroring them.
+        KeyCode::Down if shift => view.scroll_by(1),
+        KeyCode::Up if shift => view.scroll_by(-1),
+        KeyCode::Down => step(app, 1),
+        KeyCode::Up => step(app, -1),
+        KeyCode::Char('n') if ctrl => step(app, 1),
+        KeyCode::Char('p') if ctrl => step(app, -1),
+        // The reading pane scrolls on the DIFF VIEWER's keys. Ctrl+u is
+        // the line editor's kill-to-start while something is typed; only
+        // with an empty filter does it scroll.
         KeyCode::Char('d') if ctrl => view.scroll_by(half),
-        KeyCode::Char('u') if ctrl => view.scroll_by(-half),
-        // Shift+j/k scroll the pane a line: `J` in most terminals, a
-        // shifted `j` under the kitty protocol.
-        KeyCode::Down | KeyCode::Char('j') if shift => view.scroll_by(1),
-        KeyCode::Up | KeyCode::Char('k') if shift => view.scroll_by(-1),
-        KeyCode::Char('J') => view.scroll_by(1),
-        KeyCode::Char('K') => view.scroll_by(-1),
+        KeyCode::Char('u') if ctrl && view.query.is_empty() => view.scroll_by(-half),
         KeyCode::PageDown => view.scroll_by(page),
         KeyCode::PageUp => view.scroll_by(-page),
         KeyCode::Home => view.scroll = 0,
         KeyCode::End => view.scroll = view.max_scroll(),
-        KeyCode::Enter | KeyCode::Char('p') => open_prompt_for_selected(app),
-        KeyCode::Char('e') => open_preset_for_selected(app),
-        KeyCode::Char('n') => open_harness_picker_for_selected(app),
-        // `y` is the panels' comment key on a pull request row.
-        KeyCode::Char('c') | KeyCode::Char('y') => open_comment_for_selected(app),
-        KeyCode::Char('g') => {
+        // The launches are the QUICK PROMPT box's own keys: Enter prompts,
+        // Tab picks a harness, Shift+Tab a preset (a shifted Tab under the
+        // kitty protocol is the same key).
+        KeyCode::Enter => open_prompt_for_selected(app),
+        KeyCode::BackTab => open_preset_for_selected(app),
+        KeyCode::Tab if shift => open_preset_for_selected(app),
+        KeyCode::Tab => open_harness_picker_for_selected(app),
+        KeyCode::Char('c') if ctrl => open_comment_for_selected(app),
+        KeyCode::Char('g') if ctrl => {
             if let Some(pr) = selected_pr(app) {
                 crate::event_loop::request_pr_diff_for(app, pr.number, pr.url.clone(), pr.label());
             }
         }
-        KeyCode::Char('o') => {
-            if let Some(pr) = selected_pr(app) {
-                if !crate::event_loop::open_url(&pr.url) {
-                    app.flash = Some("could not open the browser".into());
-                }
+        KeyCode::Char('o') if ctrl => open_in_browser(app, out),
+        KeyCode::Char('r') if ctrl => refresh(app),
+        // Everything else feeds the always-live fuzzy filter, which edits
+        // like a terminal line (see text_input).
+        _ => {
+            if view.query.handle_key(&key).changed() {
+                query_changed(app);
             }
         }
-        KeyCode::Char('r') | KeyCode::Char('R') => refresh(app),
-        _ if toggles => close(app),
-        _ => {}
     }
     app.dirty = true;
 }
 
 /// Mouse in the PULL REQUESTS MODAL: the wheel moves the cursor over the
-/// list and scrolls the reading pane over it, a click on a row selects it
-/// (a launch is `Enter`, not a click — the row is something to read
-/// first), and a click outside closes (`overlay_close`); everything else
-/// is swallowed.
-pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Position) {
+/// rows the filter leaves and scrolls the reading pane over it, a click on
+/// a row selects it (a launch is `Enter`, not a click — the row is
+/// something to read first), and a click outside closes (`overlay_close`);
+/// everything else is swallowed.
+pub(crate) fn handle_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    mouse_pos: Position,
+    out: &mut Vec<ClientRequest>,
+) {
     let Some(Overlay::PullRequests(view)) = &mut app.overlay else {
         return;
     };
     let over_body = view.body_area.contains(mouse_pos);
-    let selected = view.selected as i64;
+    let on_button = view.browser_area.contains(mouse_pos);
     match mouse.kind {
         MouseEventKind::ScrollUp if over_body => view.scroll_by(-WHEEL_LINES),
         MouseEventKind::ScrollDown if over_body => view.scroll_by(WHEEL_LINES),
-        MouseEventKind::ScrollUp => select(app, selected - 1),
-        MouseEventKind::ScrollDown => select(app, selected + 1),
+        MouseEventKind::ScrollUp => step(app, -1),
+        MouseEventKind::ScrollDown => step(app, 1),
+        // The `↗ open in browser` button, before the rows: the very open
+        // `Ctrl+o` runs.
+        MouseEventKind::Down(MouseButton::Left) if on_button => open_in_browser(app, out),
         MouseEventKind::Down(MouseButton::Left) => {
             let list = view.list_area;
             let first = view.window_start(list.height as usize);
-            let len = app
-                .open_prs
-                .get(&view.project)
-                .map_or(0, |open| open.list.len());
-            if let Some(index) = crate::list_hit::row_at(list, first, len, mouse_pos) {
-                select(app, index as i64);
+            // The row math counts the filter's matches, not the whole list.
+            let visible = visible_rows(
+                &view.query,
+                app.open_prs
+                    .get(&view.project)
+                    .map_or(&[], |open| open.list.as_slice()),
+            );
+            if let Some(row) = crate::list_hit::row_at(list, first, visible.len(), mouse_pos) {
+                select(app, visible[row].0 as i64);
             }
         }
         _ => {}
@@ -512,7 +665,7 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Position
 
 /// The footer's key line for the modal.
 pub(crate) fn footer_hint() -> &'static str {
-    "↑/↓: pull request  PgUp/PgDn ^d/^u: read  Enter/p: prompt an agent  e: preset  n: harness  c: comment  g: diff  o: browser  r: refresh  Esc: close"
+    "type to filter  ↑/↓ ^n/^p: pull request  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  Tab: harness  ⇧Tab: preset  ^c: comment  ^g: diff  ^o: browser  ^r: refresh  Esc: clear / close"
 }
 
 // ---- drawing ----
@@ -572,8 +725,9 @@ pub fn lines(
 /// One list row's spans: `#42` dim, the title in the group row's color
 /// (`pr_row::look` — dimmed for a draft, red for a pull request GitHub
 /// says cannot merge), and the badge pinned right — the trouble's word,
-/// else `draft` — so a row reads the way its group row does.
-fn row_spans(pr: &OpenPr, budget: usize, th: Theme) -> Vec<Span<'static>> {
+/// else `draft` — so a row reads the way its group row does. The chars
+/// the filter matched (`positions`, into the row's `#42 title`) are lit.
+fn row_spans(pr: &OpenPr, positions: &[usize], budget: usize, th: Theme) -> Vec<Span<'static>> {
     let trouble = pr.trouble();
     let look = crate::pr_row::look(pr.standing(), trouble, th);
     let badge = match trouble {
@@ -582,20 +736,35 @@ fn row_spans(pr: &OpenPr, budget: usize, th: Theme) -> Vec<Span<'static>> {
     };
     let badge_w = badge.map_or(0, |b| b.chars().count());
     let text_budget = budget.saturating_sub(if badge_w > 0 { badge_w + 2 } else { 0 });
-    let label = truncate(&pr.label(), text_budget);
+    let full = pr.label();
+    let label = truncate(&full, text_budget);
+    let positions = visible_positions(positions, &label, &full);
     let number = format!("#{} ", pr.number);
     // A row with no title is its number alone.
     let title = label.strip_prefix(&number).unwrap_or_default().to_string();
-    let used = number.chars().count() + title.chars().count();
+    let number_w = number.chars().count();
+    let used = number_w + title.chars().count();
     let number_color = if trouble.is_some() {
         look.label
     } else {
         th.dim
     };
-    let mut spans = vec![
-        Span::styled(number, Style::default().fg(number_color)),
-        Span::styled(title, Style::default().fg(look.label)),
-    ];
+    // The positions split where the number ends: the title's own count
+    // from its first char.
+    let split = positions.partition_point(|&p| p < number_w);
+    let title_positions: Vec<usize> = positions[split..].iter().map(|p| p - number_w).collect();
+    let mut spans = fuzzy_highlight_styled(
+        &number,
+        &positions[..split],
+        Style::default().fg(number_color),
+        th,
+    );
+    spans.extend(fuzzy_highlight_styled(
+        &title,
+        &title_positions,
+        Style::default().fg(look.label),
+        th,
+    ));
     if let Some(badge) = badge {
         if used + badge_w < budget {
             spans.push(Span::raw(" ".repeat(budget - used - badge_w)));
@@ -606,8 +775,16 @@ fn row_spans(pr: &OpenPr, budget: usize, th: Theme) -> Vec<Span<'static>> {
 }
 
 /// The PULL REQUESTS MODAL: the list down the left, the reading pane on
-/// the right.
-pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &PullRequestsView, th: Theme) {
+/// the right. `backdrop` draws it as the layer under a QUICK PROMPT box
+/// opened from it (`QuickLaunch::under`): dim frames and an unfocused
+/// cursor row, the box in front having the eye.
+pub(crate) fn draw(
+    f: &mut Frame,
+    app: &mut App,
+    view: &PullRequestsView,
+    th: Theme,
+    backdrop: bool,
+) {
     let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
     f.render_widget(Clear, area);
     let list_w = (area.width * LIST_PCT / 100)
@@ -622,51 +799,74 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &PullRequestsView, th: Th
     let rows: Vec<OpenPr> = rows(app, &view.project).to_vec();
     let inflight = app.open_prs_inflight.contains(&view.project);
     let asked = app.open_prs.contains_key(&view.project);
-    let selected = view.selected.min(rows.len().saturating_sub(1));
+    // The rows the filter leaves, and where the cursor sits among them.
+    let visible = visible_rows(&view.query, &rows);
+    let cursor = cursor_index(view, &rows);
+    let cursor_row = cursor
+        .and_then(|c| visible.iter().position(|(i, _)| *i == c))
+        .unwrap_or(0);
 
     // ---- left: the list ----
+    // The count reads `matches/all` while a filter is on.
+    let count = if has_query(view) {
+        format!("{}/{}", visible.len(), rows.len())
+    } else {
+        rows.len().to_string()
+    };
     let title = format!(
         "Pull requests — {} ({}{})",
         view.project_name,
-        rows.len(),
+        count,
         if inflight { ", refreshing…" } else { "" }
     );
-    let block = panel_block(&title, true, th).title_bottom(
+    let block = panel_block(&title, !backdrop, th).title_bottom(
         Line::from(Span::styled(
             // The launches; the footer spells out the rest.
-            " Enter/p: prompt  e: preset  n: harness ",
+            " Enter: prompt  Tab: harness  ⇧Tab: preset ",
             Style::default().fg(th.dim),
         ))
         .left_aligned(),
     );
     let list_inner = block.inner(list_a);
     f.render_widget(block, list_a);
+    // The always-live filter on the list's first line, the rows under it.
+    if let Some(query_area) = row_rect(list_inner, 0) {
+        let line = search_line(&view.query, "type to filter…", query_area, th);
+        f.render_widget(Paragraph::new(line), query_area);
+    }
+    let rows_area = Rect {
+        y: list_inner.y.saturating_add(1),
+        height: list_inner.height.saturating_sub(1),
+        ..list_inner
+    };
     if rows.is_empty() {
         let text = if inflight || !asked {
             "asking GitHub…"
         } else {
             "no open pull requests"
         };
-        empty_list_row(f, list_inner, text, th);
+        empty_list_row(f, rows_area, text, th);
+    } else if visible.is_empty() {
+        empty_list_row(f, rows_area, "no pull requests match", th);
     }
-    let start = view.window_start(list_inner.height as usize);
-    let budget = (list_inner.width as usize).saturating_sub(2);
-    for (i, pr) in rows.iter().enumerate().skip(start) {
-        let Some(row_area) = row_rect(list_inner, i - start) else {
+    let start = window_start(cursor_row, rows_area.height as usize);
+    let budget = (rows_area.width as usize).saturating_sub(2);
+    for (row, (index, positions)) in visible.iter().enumerate().skip(start) {
+        let Some(row_area) = row_rect(rows_area, row - start) else {
             break;
         };
         render_row(
             f,
             row_area,
-            row_spans(pr, budget, th),
-            i == selected,
-            true,
+            row_spans(&rows[*index], positions, budget, th),
+            Some(*index) == cursor,
+            !backdrop,
             th,
         );
     }
 
     // ---- right: the reading pane ----
-    let current = rows.get(selected);
+    let current = cursor.and_then(|i| rows.get(i));
     // The frame names the number; the headline inside carries the title.
     let body_title = match current {
         Some(pr) => format!("Pull request #{}", pr.number),
@@ -697,6 +897,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &PullRequestsView, th: Th
         );
     }
     f.render_widget(block, body_a);
+    // The `↗ open in browser` button over the top border, once the block
+    // has drawn it — only with a row to open.
+    let browser_area = match current {
+        Some(_) => crate::ui::browser_button(
+            f,
+            body_a,
+            (body_title.chars().count() + 2) as u16,
+            app.hover_crumb == Some(HitTarget::ModalBrowser),
+            th,
+        ),
+        None => Rect::default(),
+    };
     let shown: Vec<Line> = lines.iter().skip(scroll as usize).cloned().collect();
     f.render_widget(Paragraph::new(shown), body_inner);
 
@@ -704,11 +916,20 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &PullRequestsView, th: Th
     // the pane's size for paging, and the clamped cursor and scroll.
     if let Some(Overlay::PullRequests(v)) = &mut app.overlay {
         v.area = area;
-        v.list_area = list_inner;
+        v.list_area = rows_area;
+        v.cursor_row = cursor_row;
         v.body_area = body_inner;
+        v.browser_area = browser_area;
         v.view_height = body_inner.height;
         v.body_lines = lines.len();
-        v.selected = selected;
+        // A cursor the filter had to move (see `cursor_index`) is settled
+        // onto its row, URL and all, so a refresh follows that one.
+        if let Some(index) = cursor {
+            if index != v.selected {
+                v.selected = index;
+                v.selected_url = rows.get(index).map(|pr| pr.url.clone());
+            }
+        }
         v.scroll = scroll;
     }
 }
@@ -734,6 +955,14 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn shifted(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     /// An app with one project (`demo`), its ROOT WORKTREE when `root`,
@@ -798,7 +1027,7 @@ mod tests {
             let Some(Overlay::PullRequests(v)) = app.overlay.clone() else {
                 panic!("no pull requests modal");
             };
-            draw(f, app, &v, app.theme);
+            draw(f, app, &v, app.theme, false);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -853,26 +1082,43 @@ mod tests {
         assert_eq!(pending_url(&app), Some(url.as_str()));
     }
 
-    /// `j`/`k` walk the rows, each arming its own fetch; the hotkey, Esc
-    /// and `q` all close.
+    /// ↑/↓ (and Ctrl+n/p) walk the rows, each arming its own fetch; only
+    /// Esc closes — the hotkey and `q` type into the filter, as every
+    /// letter does — and a typed filter takes the first Esc.
     #[test]
-    fn j_and_k_walk_the_rows_and_the_hotkey_closes() {
+    fn arrows_walk_the_rows_and_only_esc_closes() {
         let (mut app, _) = app_with(
             vec![pr(42, "Fix login", false), pr(41, "Spike", true)],
             true,
         );
-        for close_key in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('v')] {
-            open(&mut app);
-            handle_key(&mut app, key(KeyCode::Char('j')));
-            assert_eq!(view(&app).selected, 1);
-            assert_eq!(pending_url(&app), Some("https://github.com/o/r/pull/41"));
-            handle_key(&mut app, key(KeyCode::Char('j')));
-            assert_eq!(view(&app).selected, 1, "clamped at the last row");
-            handle_key(&mut app, key(KeyCode::Char('k')));
-            assert_eq!(view(&app).selected, 0);
-            handle_key(&mut app, key(close_key));
-            assert!(app.overlay.is_none(), "{close_key:?} closes");
+        open(&mut app);
+        handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+        assert_eq!(view(&app).selected, 1);
+        assert_eq!(pending_url(&app), Some("https://github.com/o/r/pull/41"));
+        handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+        assert_eq!(view(&app).selected, 1, "clamped at the last row");
+        handle_key(&mut app, key(KeyCode::Up), &mut Vec::new());
+        assert_eq!(view(&app).selected, 0);
+        handle_key(&mut app, ctrl('n'), &mut Vec::new());
+        assert_eq!(view(&app).selected, 1);
+        handle_key(&mut app, ctrl('p'), &mut Vec::new());
+        assert_eq!(view(&app).selected, 0);
+        for letter in ['q', 'v'] {
+            handle_key(&mut app, key(KeyCode::Char(letter)), &mut Vec::new());
+            assert!(
+                matches!(&app.overlay, Some(Overlay::PullRequests(_))),
+                "{letter} types rather than closing"
+            );
         }
+        assert_eq!(view(&app).query.as_str(), "qv");
+        handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
+        assert!(
+            matches!(&app.overlay, Some(Overlay::PullRequests(_))),
+            "the first Esc only clears the filter"
+        );
+        assert!(view(&app).query.is_empty());
+        handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
+        assert!(app.overlay.is_none(), "the second closes");
     }
 
     /// A refresh that reorders the list keeps the cursor on its pull
@@ -885,7 +1131,7 @@ mod tests {
             true,
         );
         open(&mut app);
-        handle_key(&mut app, key(KeyCode::Char('j')));
+        handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
         app.pending_pr_detail = None;
         app.open_prs.get_mut(&project).unwrap().list = vec![
             pr(43, "New", false),
@@ -911,10 +1157,9 @@ mod tests {
         assert_eq!(pending_url(&app), Some("https://github.com/o/r/pull/42"));
     }
 
-    /// `Enter` and `p` open the QUICK PROMPT for a PR SESSION on the row —
-    /// the group row's launch, addressed to the project's root — `e` the
-    /// AGENT PRESETS as a picker for the same launch, `n` the harness
-    /// picker for it.
+    /// Enter opens the QUICK PROMPT for a PR SESSION on the row under the
+    /// cursor, Shift+Tab the AGENT PRESETS picker for it and Tab the
+    /// harness picker for it — the box's own three keys.
     #[test]
     fn the_launch_keys_start_a_pr_session_on_the_row() {
         pinned(|| {
@@ -927,39 +1172,43 @@ mod tests {
                 head: "branch-41".into(),
                 number: 41,
             };
-            for launch_key in [KeyCode::Enter, KeyCode::Char('p')] {
+            open(&mut app);
+            handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+            handle_key(&mut app, key(KeyCode::Enter), &mut Vec::new());
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("Enter: expected the box, got {:?}", app.overlay);
+            };
+            let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert_eq!(launch.pr.as_ref(), Some(&expected));
+            assert_eq!(
+                launch.target,
+                QuickTarget::Worktree(WorktreeId("w-root".into()))
+            );
+            assert!(prompt.title.contains("PR #41"), "{}", prompt.title);
+
+            // Shift+Tab in either spelling a terminal has for it.
+            for preset_key in [key(KeyCode::BackTab), shifted(KeyCode::Tab)] {
                 open(&mut app);
-                handle_key(&mut app, key(KeyCode::Char('j')));
-                handle_key(&mut app, key(launch_key));
-                let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-                    panic!("{launch_key:?}: expected the box, got {:?}", app.overlay);
+                handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+                handle_key(&mut app, preset_key, &mut Vec::new());
+                let Some(Overlay::AgentPresets(presets)) = &app.overlay else {
+                    panic!(
+                        "Shift+Tab: expected the preset picker, got {:?}",
+                        app.overlay
+                    );
                 };
-                let PromptKind::QuickPrompt(launch) = &prompt.kind else {
-                    panic!("{:?}", prompt.kind);
-                };
-                assert_eq!(launch.pr.as_ref(), Some(&expected));
-                assert_eq!(
-                    launch.target,
-                    QuickTarget::Worktree(WorktreeId("w-root".into()))
-                );
-                assert!(prompt.title.contains("PR #41"), "{}", prompt.title);
+                let back = presets.quick.as_ref().expect("a picker for a launch");
+                assert_eq!(back.launch.pr.as_ref(), Some(&expected));
+                assert!(!back.from_box, "no box to go back to");
             }
 
             open(&mut app);
-            handle_key(&mut app, key(KeyCode::Char('j')));
-            handle_key(&mut app, key(KeyCode::Char('e')));
-            let Some(Overlay::AgentPresets(presets)) = &app.overlay else {
-                panic!("e: expected the preset picker, got {:?}", app.overlay);
-            };
-            let back = presets.quick.as_ref().expect("a picker for a launch");
-            assert_eq!(back.launch.pr.as_ref(), Some(&expected));
-            assert!(!back.from_box, "no box to go back to");
-
-            open(&mut app);
-            handle_key(&mut app, key(KeyCode::Char('j')));
-            handle_key(&mut app, key(KeyCode::Char('n')));
+            handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+            handle_key(&mut app, key(KeyCode::Tab), &mut Vec::new());
             let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("n: expected the harness picker, got {:?}", app.overlay);
+                panic!("Tab: expected the harness picker, got {:?}", app.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("New PR session · #41"));
             assert!(!menu.items.is_empty());
@@ -972,10 +1221,10 @@ mod tests {
     fn without_a_root_the_launch_keys_say_so() {
         pinned(|| {
             let (mut app, _) = app_with(vec![pr(42, "Fix login", false)], false);
-            for launch_key in [KeyCode::Enter, KeyCode::Char('e'), KeyCode::Char('n')] {
+            for launch_key in [KeyCode::Enter, KeyCode::BackTab, KeyCode::Tab] {
                 open(&mut app);
                 app.flash = None;
-                handle_key(&mut app, key(launch_key));
+                handle_key(&mut app, key(launch_key), &mut Vec::new());
                 assert!(
                     matches!(&app.overlay, Some(Overlay::PullRequests(_))),
                     "{launch_key:?}: the modal stays"
@@ -989,7 +1238,7 @@ mod tests {
         });
     }
 
-    /// `c` opens the COMMENT BOX on the row, carrying the modal; Esc puts
+    /// `Ctrl+c` opens the COMMENT BOX on the row, carrying the modal; Esc puts
     /// the modal back on the same pull request.
     #[test]
     fn c_opens_the_comment_box_and_esc_comes_back_to_the_row() {
@@ -999,10 +1248,10 @@ mod tests {
                 true,
             );
             open(&mut app);
-            handle_key(&mut app, key(KeyCode::Char('j')));
-            handle_key(&mut app, key(KeyCode::Char('c')));
+            handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+            handle_key(&mut app, ctrl('c'), &mut Vec::new());
             let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-                panic!("c: expected the comment box, got {:?}", app.overlay);
+                panic!("Ctrl+c: expected the comment box, got {:?}", app.overlay);
             };
             assert!(prompt.is_multiline());
             assert_eq!(prompt.title, "Comment on #41 Spike");
@@ -1015,6 +1264,67 @@ mod tests {
             let mut out = Vec::new();
             crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Esc), &mut out);
             assert_eq!(view(&app).selected, 1, "back on #41");
+        });
+    }
+
+    /// `Enter` puts the QUICK PROMPT up over the modal, not in its place:
+    /// the list stays on screen under the box, the box's Esc leaves the
+    /// modal on the pull request it was opened on, and its launch closes
+    /// the modal with it.
+    #[test]
+    fn enter_stacks_the_box_over_the_modal() {
+        pinned(|| {
+            let (mut app, _) = app_with(
+                vec![pr(42, "Fix login", false), pr(41, "Spike", true)],
+                true,
+            );
+            open(&mut app);
+            handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+            handle_key(&mut app, key(KeyCode::Enter), &mut Vec::new());
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("expected the box, got {:?}", app.overlay);
+            };
+            let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert!(
+                matches!(&launch.under, Some(ModalUnder::PullRequests(v)) if v.selected == 1),
+                "{:?}",
+                launch.under
+            );
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+            term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
+            assert!(
+                screen.contains("Pull requests — demo"),
+                "the modal under the box"
+            );
+            assert!(screen.contains("New session · PR #41"), "the box over it");
+            assert!(
+                screen.contains("Esc: back to pull requests"),
+                "and says where Esc goes"
+            );
+
+            let mut out = Vec::new();
+            crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Esc), &mut out);
+            assert_eq!(view(&app).selected, 1, "Esc: back on #41");
+
+            handle_key(&mut app, key(KeyCode::Enter), &mut Vec::new());
+            for c in "review it".chars() {
+                crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Char(c)), &mut out);
+            }
+            crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Enter), &mut out);
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    nebula_core::ClientRequest::CreatePrAgent { pr_url, .. }
+                        if pr_url == "https://github.com/o/r/pull/41"
+                )),
+                "the PR session is created: {out:?}"
+            );
+            assert!(app.overlay.is_none(), "the launch closes the modal");
         });
     }
 
@@ -1085,5 +1395,309 @@ mod tests {
         assert!(screen(&mut app, 100, 20).contains("no open pull requests"));
         app.open_prs.remove(&project);
         assert!(screen(&mut app, 100, 20).contains("asking GitHub…"));
+    }
+
+    /// `Ctrl+o` and a click on the reading pane's `↗ open in browser` button run
+    /// one open: the footer names where the browser went either way (INPUT
+    /// PARITY), and the modal stays up. The button is drawn pinned right on
+    /// the pane's top border, its rect written back for the click; the
+    /// pointer resting on it is what `hover_crumb` holds, and a cell to its
+    /// left is the frame's.
+    #[test]
+    fn o_and_the_browser_button_open_the_pull_request_the_same_way() {
+        let (mut app, project) = app_with(vec![pr(42, "Fix login", false)], true);
+        app.overlay = Some(Overlay::PullRequests(PullRequestsView::new(
+            project,
+            "demo".into(),
+            DIR.into(),
+        )));
+        let shot = screen(&mut app, 120, 40);
+        assert!(shot.contains("↗ open in browser"), "{shot}");
+        let button = view(&app).browser_area;
+        assert!(button.width > 0, "the button's rect is written back");
+        let at = Position::new(button.x + 1, button.y);
+        assert_eq!(
+            crate::ui::browser_button_under(&app, at),
+            Some(HitTarget::ModalBrowser)
+        );
+        assert_eq!(
+            crate::ui::browser_button_under(&app, Position::new(button.x - 1, button.y)),
+            None
+        );
+
+        let mut out = Vec::new();
+        handle_key(&mut app, ctrl('o'), &mut out);
+        assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/42"));
+        app.flash = None;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/42"));
+        assert!(
+            matches!(app.overlay, Some(Overlay::PullRequests(_))),
+            "the modal stays up"
+        );
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle_key(app, key(KeyCode::Char(c)), &mut Vec::new());
+        }
+    }
+
+    /// Typing narrows the rows the moment the modal is up — no key to
+    /// press first — to the fuzzy matches, best first, the cursor on the
+    /// best with its body asked for as any move's is, the count reading
+    /// `matches/all`; the modal's own hotkey types too. ↑/↓ walk the
+    /// matches alone. The first Esc clears the filter, the cursor staying
+    /// on the row it found, and the second closes.
+    #[test]
+    fn typing_filters_the_rows_at_once_and_esc_clears_before_closing() {
+        let (mut app, _) = app_with(
+            vec![
+                pr(42, "Fix login", false),
+                pr(41, "Docs pass", false),
+                pr(40, "Login page", true),
+            ],
+            true,
+        );
+        open(&mut app);
+        assert!(footer_hint().starts_with("type to filter"));
+        type_str(&mut app, "login");
+        assert_eq!(view(&app).query.as_str(), "login");
+        let shot = screen(&mut app, 120, 40);
+        assert!(shot.contains("(2/3)"), "{shot}");
+        assert!(
+            !shot.contains("#41"),
+            "the docs row is filtered out:\n{shot}"
+        );
+        let found = selected_pr(&app).expect("a row under the cursor");
+        assert_ne!(found.number, 41);
+        assert_eq!(
+            pending_url(&app),
+            Some(found.url.as_str()),
+            "its body is asked for"
+        );
+
+        // `v` types, rather than closing.
+        handle_key(&mut app, key(KeyCode::Char('v')), &mut Vec::new());
+        assert_eq!(view(&app).query.as_str(), "loginv");
+        assert!(matches!(&app.overlay, Some(Overlay::PullRequests(_))));
+        handle_key(&mut app, key(KeyCode::Backspace), &mut Vec::new());
+
+        let first = selected_pr(&app).unwrap().number;
+        handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+        let second = selected_pr(&app).unwrap().number;
+        assert_ne!(first, second);
+        assert_ne!(second, 41, "↓ walks the matches alone");
+        handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+        assert_eq!(
+            selected_pr(&app).unwrap().number,
+            second,
+            "and stops at the last one"
+        );
+
+        // The first Esc clears the filter, the cursor staying put; the
+        // second closes.
+        handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
+        assert!(matches!(&app.overlay, Some(Overlay::PullRequests(_))));
+        assert!(view(&app).query.is_empty());
+        assert_eq!(
+            selected_pr(&app).unwrap().number,
+            second,
+            "the row found keeps the cursor"
+        );
+        let shot = screen(&mut app, 120, 40);
+        assert!(shot.contains("(3)"), "{shot}");
+        assert!(shot.contains("type to filter…"), "{shot}");
+        handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
+        assert!(app.overlay.is_none());
+    }
+
+    /// A filter nothing matches empties the list and says so — nothing
+    /// under the cursor, no body asked for — and the row is back the
+    /// moment the filter widens. Ctrl+u kills the typed filter, as in any
+    /// line editor, and scrolls the pane only once there is none.
+    #[test]
+    fn a_filter_nothing_matches_says_so_and_leaves_the_cursor_put() {
+        let (mut app, _) = app_with(
+            vec![pr(42, "Fix login", false), pr(41, "Docs pass", false)],
+            true,
+        );
+        open(&mut app);
+        select(&mut app, 1);
+        assert_eq!(selected_pr(&app).unwrap().number, 41);
+        type_str(&mut app, "fix");
+        assert_eq!(
+            selected_pr(&app).unwrap().number,
+            42,
+            "the cursor goes to the best match"
+        );
+        type_str(&mut app, "zzz");
+        let shot = screen(&mut app, 120, 40);
+        assert!(shot.contains("no pull requests match"), "{shot}");
+        assert!(shot.contains("(0/2)"), "{shot}");
+        assert!(selected_pr(&app).is_none(), "nothing under the cursor");
+        assert_eq!(pending_url(&app), None);
+        for _ in 0..3 {
+            handle_key(&mut app, key(KeyCode::Backspace), &mut Vec::new());
+        }
+        assert_eq!(
+            selected_pr(&app).unwrap().number,
+            42,
+            "the row is back as the filter widens"
+        );
+        if let Some(Overlay::PullRequests(v)) = &mut app.overlay {
+            v.scroll = 3;
+        }
+        handle_key(&mut app, ctrl('u'), &mut Vec::new());
+        assert!(view(&app).query.is_empty(), "Ctrl+u kills the typed filter");
+        assert_eq!(view(&app).scroll, 3, "and does not scroll the pane");
+        assert_eq!(
+            selected_pr(&app).unwrap().number,
+            42,
+            "the row found keeps the cursor"
+        );
+        handle_key(&mut app, ctrl('u'), &mut Vec::new());
+        assert_eq!(view(&app).scroll, 0, "with nothing typed, it scrolls");
+    }
+
+    /// A click on a row while a filter is typed picks that row — the row
+    /// math counting the filter's matches, not the whole list — and the
+    /// filter stays.
+    #[test]
+    fn a_row_click_counts_the_matches_not_the_list() {
+        let (mut app, _) = app_with(
+            vec![
+                pr(42, "Fix login", false),
+                pr(41, "Docs pass", false),
+                pr(40, "Login page", false),
+            ],
+            true,
+        );
+        open(&mut app);
+        type_str(&mut app, "login");
+        screen(&mut app, 120, 40);
+        let list = view(&app).list_area;
+        // The second visible row: the second match, whichever it is.
+        let at = Position::new(list.x + 1, list.y + 1);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut Vec::new());
+        assert_eq!(view(&app).query.as_str(), "login", "the filter is kept");
+        let picked = selected_pr(&app).unwrap();
+        let list = rows(&app, &view(&app).project);
+        let visible = visible_rows("login", list);
+        assert_eq!(picked.number, list[visible[1].0].number);
+        assert_ne!(picked.number, 41);
+    }
+
+    /// A bracketed paste lands in the filter as one line and narrows the
+    /// rows as typing it would; with no modal up it is not this one's.
+    #[test]
+    fn a_paste_lands_in_the_filter_as_one_line() {
+        let (mut app, _) = app_with(
+            vec![pr(42, "Fix login", false), pr(41, "Docs pass", false)],
+            true,
+        );
+        open(&mut app);
+        assert!(paste(&mut app, "docs\npass"));
+        assert_eq!(view(&app).query.as_str(), "docs pass");
+        assert_eq!(selected_pr(&app).unwrap().number, 41);
+        app.overlay = None;
+        assert!(!paste(&mut app, "x"));
+    }
+
+    /// A refresh that retires the row under the cursor while a filter is
+    /// typed lands the cursor on the filter's next match, never on a row
+    /// the filter hides.
+    #[test]
+    fn a_refresh_under_a_filter_lands_on_a_visible_row() {
+        let (mut app, project) = app_with(
+            vec![
+                pr(42, "Fix login", false),
+                pr(41, "Docs pass", false),
+                pr(40, "Login page", false),
+            ],
+            true,
+        );
+        open(&mut app);
+        type_str(&mut app, "login");
+        select(&mut app, 2);
+        assert_eq!(selected_pr(&app).unwrap().number, 40);
+        app.open_prs.get_mut(&project).unwrap().list =
+            vec![pr(42, "Fix login", false), pr(41, "Docs pass", false)];
+        list_changed(&mut app);
+        assert_eq!(
+            selected_pr(&app).unwrap().number,
+            42,
+            "not #41, which the filter hides"
+        );
+        screen(&mut app, 120, 40);
+        assert_eq!(view(&app).selected, 0, "settled onto the row it shows");
+        assert_eq!(
+            view(&app).selected_url.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+    }
+
+    /// The verbs the letters used to be are chords now: Ctrl+r asks
+    /// GitHub again and Ctrl+g asks for the diff, each saying so in the
+    /// footer, while the plain letters go to the filter.
+    #[test]
+    fn the_verb_chords_run_and_the_plain_letters_type() {
+        let (mut app, project) = app_with(vec![pr(42, "Fix login", false)], true);
+        open(&mut app);
+        handle_key(&mut app, ctrl('r'), &mut Vec::new());
+        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+        assert!(app.pr_refresh_requested);
+        assert!(app.open_prs_lookup_due(&project));
+        app.flash = None;
+        handle_key(&mut app, ctrl('g'), &mut Vec::new());
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.starts_with("repo path missing on disk")),
+            "Ctrl+g reaches the diff fetch: {:?}",
+            app.flash
+        );
+        for letter in "rgoc".chars() {
+            handle_key(&mut app, key(KeyCode::Char(letter)), &mut Vec::new());
+        }
+        assert_eq!(view(&app).query.as_str(), "rgoc");
+        assert!(matches!(&app.overlay, Some(Overlay::PullRequests(_))));
+    }
+
+    /// No button on a frame too narrow to hold it clear of the title, and
+    /// none with no pull request to open — and no stale rect either way.
+    #[test]
+    fn the_browser_button_is_left_off_a_narrow_frame_and_an_empty_list() {
+        let (mut app, project) = app_with(vec![pr(42, "Fix login", false)], true);
+        app.overlay = Some(Overlay::PullRequests(PullRequestsView::new(
+            project,
+            "demo".into(),
+            DIR.into(),
+        )));
+        let shot = screen(&mut app, 60, 20);
+        assert!(!shot.contains("open in browser"), "{shot}");
+        assert_eq!(view(&app).browser_area, Rect::default());
+
+        let (mut app, project) = app_with(vec![], true);
+        app.overlay = Some(Overlay::PullRequests(PullRequestsView::new(
+            project,
+            "demo".into(),
+            DIR.into(),
+        )));
+        let shot = screen(&mut app, 120, 40);
+        assert!(!shot.contains("open in browser"), "{shot}");
+        assert_eq!(view(&app).browser_area, Rect::default());
     }
 }

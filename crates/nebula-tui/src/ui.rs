@@ -203,10 +203,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.rows_memo.arm();
     draw_screen(f, app);
     app.rows_memo.disarm();
+    if app.black_background {
+        let area = f.area();
+        draw_black_background(f.buffer_mut(), area);
+    }
 }
 
 fn draw_screen(f: &mut Frame, app: &mut App) {
     app.hits.clear();
+    app.tail_cards.clear();
     app.host_cursor = None;
     app.welcome_on_screen = false;
 
@@ -217,7 +222,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
 
     if app.collapsed {
         draw_terminal(f, app, body);
-        if app.focus_tint && app.focus == Focus::Terminal {
+        if app.focus == Focus::Terminal {
             draw_focus_tint(f.buffer_mut(), body, app.theme);
         }
         draw_footer(f, app, footer);
@@ -234,9 +239,8 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
     // walked onto. A body too short for both is all grid.
     //
     // Any project on the machine puts it up; with none, the splash below
-    // is the first run's "open a project". The summoned splash (`N`)
-    // still wins — it is a preview the next key dismisses.
-    if app.launcher_active() && !app.splash_preview {
+    // is the first run's "open a project".
+    if app.launcher_active() {
         // `launcher_view::draw` takes `body_area` for the grid's half, so
         // the whole body is kept here for the pane drag to measure against.
         app.launcher_body = body;
@@ -256,7 +260,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         launcher_view::draw(f, app, view_a);
         if let Some(pane_a) = pane_a {
             draw_terminal(f, app, crate::launcher::pane_content(side, pane_a));
-            if app.focus_tint && app.focus == Focus::Terminal {
+            if app.focus == Focus::Terminal {
                 draw_focus_tint(f.buffer_mut(), pane_a, app.theme);
             }
             draw_launcher_pane_grip(f.buffer_mut(), app, side, pane_a);
@@ -267,9 +271,9 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Nothing in the tree yet (first run), or the splash summoned with
-    // `N`: the animated nebula takes the whole body until a project
-    // lands, which is what the view above needs to draw at all.
+    // Nothing in the tree yet (first run): the animated nebula takes the
+    // whole body until a project lands, which is what the view above
+    // needs to draw at all.
     crate::splash::draw_splash(f, app, body);
     draw_footer(f, app, footer);
     draw_overlay(f, app);
@@ -378,6 +382,48 @@ pub(crate) fn over_box_rect(frame: Rect, over: Option<Rect>, width: u16, height:
         }
         _ => centered_rect(frame, width, height),
     }
+}
+
+/// The footer bar's keys while `menu` is up, for the menus that have keys
+/// of their own beyond Enter and Esc: the session pickers (the `?` jump
+/// to the hovered harness's Agents section, and `Tab` on a Claude row
+/// that can go to the cloud, with the state it would flip) and their
+/// type-ahead MODEL / EFFORT submenus. None for a plain context menu,
+/// which keeps the generic `Esc: close  Enter: confirm`. The keys live
+/// down here, not in the modal's bottom border, so the modal stays as
+/// narrow as its rows.
+pub(crate) fn menu_footer_hint(menu: &crate::app::ContextMenu) -> Option<String> {
+    let agent_jump = menu.hovered_agent_kind().is_some();
+    if menu.filter.is_some() {
+        return Some(
+            if agent_jump {
+                "type to filter  ↑/↓: move  Backspace: widen  ?: settings  Enter: pick  Esc: back"
+            } else {
+                "type to filter  ↑/↓: move  Backspace: widen  Enter: pick  Esc: back"
+            }
+            .to_string(),
+        );
+    }
+    let cloud = menu.hovered_claude_cloud().map(|on| {
+        if on {
+            "Tab: cloud on  "
+        } else {
+            "Tab: cloud off  "
+        }
+    });
+    if cloud.is_none() && !agent_jump {
+        return None;
+    }
+    // A picker opened from the QUICK PROMPT is owed its box back.
+    let esc = if crate::event_loop::menu_quick_return(menu).is_some_and(|back| back.from_box) {
+        "Esc: back to the box"
+    } else {
+        "Esc: close"
+    };
+    Some(format!(
+        "{}s/?: settings  Enter: pick  {esc}",
+        cloud.unwrap_or("")
+    ))
 }
 
 /// The box a menu floats over: the QUICK PROMPT its rows owe back, drawn
@@ -584,6 +630,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
     let Some(overlay) = app.overlay.clone() else {
         return;
     };
+    // A box opened from the ISSUES MODAL or the PULL REQUESTS MODAL stands
+    // on it rather than taking it away: the modal is the bottom layer, the
+    // box — and any picker the box has up — is drawn over it.
+    use crate::quick_prompt::ModalUnder;
+    match crate::quick_prompt::modal_under(&overlay) {
+        Some(ModalUnder::Issues(view)) => crate::issues::draw(f, app, &view, th, true),
+        Some(ModalUnder::PullRequests(view)) => crate::pr_modal::draw(f, app, &view, th, true),
+        None => {}
+    }
     match overlay {
         Overlay::ProjectPicker(picker) => {
             // `^P` layers the project list over the box rather than
@@ -631,29 +686,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // Rows that expand into a submenu get a right-aligned ▸ in an
             // extra column so the affordance is visible before hovering.
             let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
-            // A filtered list carries its keys in the bottom border; the
-            // modal widens to fit. Session pickers add the `?` jump to the
-            // hovered harness's Agents section.
-            let agent_jump = menu.hovered_agent_kind().is_some();
-            let hint = if menu.filter.is_some() {
-                Some(if agent_jump {
-                    " type to filter  ?: settings  ↑↓: move  Backspace  Esc: back "
-                } else {
-                    " type to filter  ↑↓: move  Backspace  Esc: back "
-                })
-            } else {
-                match menu.hovered_claude_cloud() {
-                    Some(cloud) => Some(if cloud {
-                        " Tab: cloud on   s/?: settings "
-                    } else {
-                        " Tab: cloud off   s/?: settings "
-                    }),
-                    None => agent_jump.then_some(" s/?: settings "),
-                }
-            };
+            // The modal is as wide as its rows or its title, whichever is
+            // longer, and no wider: its keys go in the footer bar (see
+            // `menu_footer_hint`), not in the bottom border, so a hint
+            // that outgrows the rows — the pickers' `Tab: cloud off  s/?:
+            // settings` did, doubling the width of a six-row list — never
+            // pads the modal with empty space, and hovering a row with more
+            // keys (the Claude row's Tab) never resizes it.
             let width = (label_w + 4 + if any_submenu { 2 } else { 0 })
                 .max(title_width + 2)
-                .max(hint.map_or(0, |h| h.chars().count() + 2))
                 .min(f.area().width as usize) as u16;
             let height = menu.items.len() as u16 + 2;
             let area = match at {
@@ -684,12 +725,13 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ));
             }
-            if let Some(hint) = hint {
-                block =
-                    block.title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
-            }
             let inner = block.inner(area);
             f.render_widget(block, area);
+            // Every row spans the modal — the hovered row's bar reaches
+            // the border, and the ▸ sits at the right edge — so a title
+            // wider than the rows leaves no ragged gap beside them.
+            let row_w = inner.width as usize;
+            let label_w = row_w.saturating_sub(if any_submenu { 4 } else { 2 });
             for (i, item) in menu.items.iter().enumerate() {
                 let Some(row) = row_rect(inner, i) else { break };
                 let mut style = if item.destructive {
@@ -705,7 +747,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 } else if any_submenu {
                     format!(" {:<label_w$}   ", item.label)
                 } else {
-                    format!(" {} ", item.label)
+                    format!(" {:<label_w$} ", item.label)
                 };
                 f.render_widget(Paragraph::new(Span::styled(text, style)), row);
             }
@@ -929,6 +971,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Act(&[OpenRepo, OpenGhosttyTab]),
                             "repo on GitHub / Ghostty tab",
                         ),
+                        (
+                            Act(&[OpenPullRequest, OpenIssue]),
+                            "card's PR / issue on GitHub",
+                        ),
                         (Act(&[RefreshPullRequests]), "refresh pull requests now"),
                         (
                             Act(&[CommentPullRequest]),
@@ -958,6 +1004,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "SESSIONS",
                     &[
                         (Act(&[New]), "new agent (pick CLI kind)"),
+                        (
+                            Act(&[DuplicateSession]),
+                            "quick prompt on the card's settings",
+                        ),
                         (Act(&[AgentPresets]), "agent presets: saved launches"),
                         (Act(&[NewTerminal]), "new shell terminal"),
                         (Act(&[Activate]), "attach session / open link"),
@@ -974,7 +1024,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "TERMINAL & MOUSE",
                     &[
-                        (Act(&[Activate, Zoom]), "lock input (2nd: full-screen)"),
+                        (Act(&[Activate]), "lock input"),
                         (Act(&[UnlockTerminal]), "unlock, back to panels"),
                         (Lit("drag"), "select + copy (2×click: word)"),
                         (Lit("click / drag"), "an app that took the mouse gets it"),
@@ -995,7 +1045,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
                         (Act(&[Settings]), "settings (Hotkeys tab rebinds these)"),
                         (Act(&[Metrics]), "memory usage (nebula + agents)"),
-                        (Act(&[Splash]), "nebula splash (any key returns)"),
                         (Act(&[Quit, Help]), "quit / toggle this help"),
                     ],
                 ),
@@ -2177,8 +2226,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::AgentPresetEditor(editor) => {
             crate::preset_overlays::draw_editor(f, app, &editor, th)
         }
-        Overlay::Issues(view) => crate::issues::draw(f, app, &view, th),
-        Overlay::PullRequests(view) => crate::pr_modal::draw(f, app, &view, th),
+        Overlay::Issues(view) => crate::issues::draw(f, app, &view, th, false),
+        Overlay::PullRequests(view) => crate::pr_modal::draw(f, app, &view, th, false),
         Overlay::BranchSwitch(view) => crate::branch_switch::draw(f, app, &view, th),
         Overlay::FileTabs(mut view) => {
             // The TREE BROWSER's footprint: the editor Enter opens wants the
@@ -2694,17 +2743,35 @@ fn draw_launcher_pane_grip(
 }
 
 /// Subtle focus cue: fill the whole focused panel with the theme's
-/// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
-/// faintly lit surface. Painted after content, and only onto cells whose
+/// `focus_tint` — a near-black shade of the accent, so the panel reads as
+/// a faintly lit surface. Painted after content, and only onto cells whose
 /// background is still untouched, so selection fills and PTY-drawn
-/// colors sit on top of the tint instead of under it. The `focus_tint`
-/// setting decides whether the callers paint it at all.
+/// colors sit on top of the tint instead of under it. The pane wears it
+/// whenever it has the keys; while the grid has them, the cursor's card
+/// wears the same wash instead (`launcher_view::draw_card`).
 fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 if cell.bg == Color::Reset {
                     cell.bg = th.focus_tint;
+                }
+            }
+        }
+    }
+}
+
+/// The BLACK BACKGROUND setting: paint every cell still on the terminal's
+/// default background pure black. Runs last in a frame, after the overlays
+/// and the focus tint, and — like the tint — only touches `Reset` cells, so
+/// selection fills, the tint and the colors a session draws itself stay on
+/// top of it.
+fn draw_black_background(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if cell.bg == Color::Reset {
+                    cell.bg = crate::theme::BLACK_BACKGROUND;
                 }
             }
         }
@@ -2777,6 +2844,62 @@ pub(crate) fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
                 Style::default().fg(th.muted),
             ))
     }
+}
+
+/// The `↗ open in browser` BUTTON's label, spaces and all.
+pub(crate) const BROWSER_BUTTON: &str = " ↗ open in browser ";
+
+/// The `↗ open in browser` BUTTON on a reading pane's top border — the
+/// ISSUES and PULL REQUESTS MODALS' right frame (`HitTarget::ModalBrowser`).
+/// Drawn over the border after the block has, pinned right, and its rect
+/// handed back for the modal to write into its view, where the click
+/// (`handle_mouse`) and the pointer ([`browser_button_under`]) find it.
+/// `title_w` is the width of the frame's own title on the left, spaces
+/// included: the button is left off — `Rect::default()`, which no point is
+/// inside — when the frame cannot hold both a cell apart, since a label
+/// written over the title would read as neither. `hovered` underlines it in
+/// the accent, the mark the header's buttons take while the pointer rests
+/// on them; otherwise it wears the frame title's muted.
+pub(crate) fn browser_button(
+    f: &mut Frame,
+    frame: Rect,
+    title_w: u16,
+    hovered: bool,
+    th: Theme,
+) -> Rect {
+    let w = BROWSER_BUTTON.chars().count() as u16;
+    // The left corner, the title, a cell of air, the button, the right corner.
+    if frame.height == 0 || frame.width < 1 + title_w + 1 + w + 1 {
+        return Rect::default();
+    }
+    let rect = Rect {
+        x: frame.x + frame.width - 1 - w,
+        y: frame.y,
+        width: w,
+        height: 1,
+    };
+    let style = if hovered {
+        Style::default()
+            .fg(th.accent)
+            .add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(th.muted)
+    };
+    f.render_widget(Paragraph::new(Span::styled(BROWSER_BUTTON, style)), rect);
+    rect
+}
+
+/// The `↗ open in browser` BUTTON under the pointer: `HitTarget::ModalBrowser`
+/// when a modal with one is up and `pos` is on it, what
+/// `event_loop::update_pointer` puts in `App::hover_crumb` — the modals
+/// keep their rects outside the hit map, as they do their list edges.
+pub(crate) fn browser_button_under(app: &App, pos: Position) -> Option<HitTarget> {
+    let button = match &app.overlay {
+        Some(Overlay::PullRequests(v)) => v.browser_area,
+        Some(Overlay::Issues(v)) => v.browser_area,
+        _ => return None,
+    };
+    button.contains(pos).then_some(HitTarget::ModalBrowser)
 }
 
 /// One piece of the PR & ISSUE COUNTS badge: its text, its style, and the
@@ -3391,8 +3514,8 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             "exited".to_string(),
             Style::default().fg(th.err).add_modifier(Modifier::BOLD),
         )),
-        Some(t) if t.scroll > 0 => Some(Span::styled(
-            format!("scroll {}", t.scroll),
+        Some(t) if t.scroll_offset() > 0 => Some(Span::styled(
+            format!("scroll {}", t.scroll_offset()),
             Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
         )),
         // Nothing has come off the PTY yet and nothing will for a while:
@@ -3428,17 +3551,10 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         terminal_frame(f, area, left, right, focused, th)
     };
-    // One cell of inset so PTY content doesn't hug the sessions rule — and,
-    // with the LAUNCHER VIEW's pane on the left of the cards, one on the
-    // right too, where the rule down its edge is.
-    let right_air = u16::from(
-        app.launcher_active()
-            && !app.collapsed
-            && app.launcher_pane_side() == crate::launcher::PaneSide::Left,
-    );
+    // One cell of inset so PTY content doesn't hug the sessions rule.
     let inner = Rect {
         x: inner.x + 1,
-        width: inner.width.saturating_sub(1 + right_air),
+        width: inner.width.saturating_sub(1),
         ..inner
     };
     app.term_area = inner;
@@ -3505,6 +3621,10 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
                 crate::links::visible_file_links(term.parser.screen()),
             )
         }
+        // The LAUNCHER VIEW's pane with nothing in it — a project with no
+        // session yet — is an empty panel: the strip over it already says
+        // which key opens a terminal here, and is a button for it.
+        None if app.launcher_active() => (Vec::new(), Vec::new()),
         None => {
             // Empty-pane hero: vertically centered wordmark + a compact
             // key cheat-sheet, so the big blank pane earns its keep.
@@ -3804,15 +3924,31 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             "type: filter  Enter: open the project  ↑/↓: move  Esc: close",
             Style::default().fg(th.dim),
         )
+    } else if let Some(hint) = app.overlay.as_ref().and_then(|o| match o {
+        Overlay::Menu(m) => menu_footer_hint(m),
+        _ => None,
+    }) {
+        Span::styled(hint, Style::default().fg(th.dim))
     } else if matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::QuickPrompt(_)))
     {
         // `^P`, `^O`, `Tab` and `^N` are on the box itself now, each
         // beside the thing it changes — a third copy down here was most
-        // of what made this screen read as a wall of chords.
-        Span::styled(
-            "Enter: launch  ⇧Tab: preset  Esc: back to sessions",
-            Style::default().fg(th.dim),
-        )
+        // of what made this screen read as a wall of chords. A box
+        // standing on a modal goes back to it.
+        let hint = match app
+            .overlay
+            .as_ref()
+            .and_then(crate::quick_prompt::modal_under)
+        {
+            Some(crate::quick_prompt::ModalUnder::Issues(_)) => {
+                "Enter: launch  ⇧Tab: preset  Esc: back to issues"
+            }
+            Some(crate::quick_prompt::ModalUnder::PullRequests(_)) => {
+                "Enter: launch  ⇧Tab: preset  Esc: back to pull requests"
+            }
+            None => "Enter: launch  ⇧Tab: preset  Esc: back to sessions",
+        };
+        Span::styled(hint, Style::default().fg(th.dim))
     } else if matches!(&app.overlay, Some(Overlay::ProjectPicker(_))) {
         Span::styled(
             "type: filter projects  ↑/↓: move  Enter: aim the box there  Esc: clear/back to the box",
@@ -3822,12 +3958,9 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("Esc: close  Enter: confirm", Style::default().fg(th.dim))
     } else if app.splash_showing() {
         // The splash covers the panels, so every panel hotkey is dead here.
-        // List only what actually fires — and in preview, that's one thing:
-        // the next key dismisses it (q included).
+        // List only what actually fires.
         Span::styled(
-            if app.splash_preview {
-                "any key: back to the sessions".to_string()
-            } else {
+            {
                 let k = |a| key_hint(app, a);
                 // Launched inside a repo: Enter opens it, and `o` is for
                 // any other folder.
@@ -4282,8 +4415,21 @@ pub(crate) fn fuzzy_highlight_spans(
     positions: &[usize],
     th: Theme,
 ) -> Vec<Span<'static>> {
+    fuzzy_highlight_styled(shown, positions, Style::default(), th)
+}
+
+/// [`fuzzy_highlight_spans`] for text that has a color of its own — a
+/// pull request row's title, red for one that cannot merge — `base` on
+/// the runs the filter did not match, the accent highlight on the ones
+/// it did.
+pub(crate) fn fuzzy_highlight_styled(
+    shown: &str,
+    positions: &[usize],
+    base: Style,
+    th: Theme,
+) -> Vec<Span<'static>> {
     if positions.is_empty() {
-        return vec![Span::raw(shown.to_string())];
+        return vec![Span::styled(shown.to_string(), base)];
     }
     let hl = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
@@ -4294,7 +4440,7 @@ pub(crate) fn fuzzy_highlight_spans(
             spans.push(if lit {
                 Span::styled(text, hl)
             } else {
-                Span::raw(text)
+                Span::styled(text, base)
             });
         }
     };
@@ -4632,6 +4778,31 @@ mod tests {
         assert!(reversed_rows(&mut app).is_empty());
     }
 
+    /// The BLACK BACKGROUND setting leaves nothing on the terminal's own
+    /// background once a frame is drawn, and paints only what was: a cell
+    /// something else filled keeps its color.
+    #[test]
+    fn black_background_paints_every_default_cell_and_nothing_else() {
+        let resets = |app: &mut App| -> usize {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            buf.content.iter().filter(|c| c.bg == Color::Reset).count()
+        };
+        let mut app = App::new();
+        assert!(resets(&mut app) > 0, "off: the terminal's background shows");
+        app.black_background = true;
+        assert_eq!(resets(&mut app), 0, "on: every default cell goes black");
+
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf[(1, 0)].bg = app.theme.sel_bg;
+        draw_black_background(&mut buf, area);
+        assert_eq!(buf[(0, 0)].bg, crate::theme::BLACK_BACKGROUND);
+        assert_eq!(buf[(1, 0)].bg, app.theme.sel_bg, "a fill stays on top");
+    }
+
     #[test]
     fn truncate_clips_to_max_chars_with_an_ellipsis() {
         assert_eq!(truncate("short", 10), "short");
@@ -4763,6 +4934,8 @@ mod tests {
             preset: None,
             issue: None,
             pr: None,
+            under: None,
+            cloud: false,
         });
         let cloud = PromptKind::CloudMessage {
             id: nebula_core::AgentId::from("a".to_string()),

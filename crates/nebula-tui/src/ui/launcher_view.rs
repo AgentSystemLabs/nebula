@@ -16,10 +16,11 @@ use crate::app::{App, Focus, HitTarget, Overlay};
 use crate::launcher::{BoxField, Hidden, LauncherRow, ProjectPicker, ProjectTab, Tally};
 use crate::quick_prompt::QuickLaunch;
 use crate::theme::Theme;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use ratatui::Frame;
 
 /// Width of the view's QUICK PROMPT, and its height: wider and taller than
@@ -39,6 +40,10 @@ const PROJECT_TAB_MAX: usize = 20;
 /// A name the row has to cut is never cut under this: at that point the
 /// tab gives way whole, and the count at the edge of the row says so.
 const TAB_NAME_MIN: usize = 3;
+/// Room a row of tabs keeps back for the `3›` that counts the tabs past
+/// its right edge, so the last tab that fits is never the one that
+/// leaves no room to say there are more.
+const MORE_ROOM: usize = 5;
 /// The button before the first PROJECT TAB, and what it says with no tab
 /// beside it — the one time the header has room to say what it does.
 /// A column of air either side is part of the button, so the pointer has
@@ -50,24 +55,31 @@ const ADD_EMPTY: &str = "+ open a project";
 /// GRID of the lit project's session cards under it. `body` is what
 /// `crate::launcher::split` left over the PANE along the bottom, which
 /// `ui::draw` fills with the card under the cursor; Enter on a session
-/// card steps down into that pane (`event_loop::launcher::enter_pane`)
-/// and `z` full-screens it over the lot
-/// (`event_loop::launcher::open_session`, the `collapsed` arm of
-/// `ui::draw`).
+/// card steps down into that pane (`event_loop::launcher::enter_pane`);
+/// on a body too short to draw one it full-screens the session over the
+/// lot instead (`event_loop::launcher::open_session`, the `collapsed` arm
+/// of `ui::draw`).
 pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     app.body_area = body;
     app.settle_launcher_focus();
-    // A TAB STRIP pin the cursor has walked out from under goes here, so
-    // the strip and the pane under it agree on this frame.
-    app.settle_pane_tab();
-    // And the project the grid is on gets its tab, whichever way it was
+    // The project the grid is on gets its tab, whichever way it was
     // opened, before the header lays the tabs out.
     app.settle_project_tabs();
-    let g = crate::launcher::grid(body);
-    let rows = crate::launcher::rows(app);
-    let hidden = g.hidden(crate::launcher::cursor(app, &rows), rows.len());
-    draw_head(f, app, body, rows.len(), hidden);
-    if rows.is_empty() {
+    let bands = crate::launcher::bands(app);
+    // INSIDE a worktree (Enter on its band): that checkout's cards alone,
+    // its rule up in the header. A checkout whose last card just left
+    // the grid has no band to be inside of, so the grid is the bands
+    // again until Enter opens another.
+    if let Some(band) = app.launcher_inside_band(&bands) {
+        draw_inside(f, app, body, &bands, band);
+        return;
+    }
+    let g = crate::launcher::bands_layout(body);
+    let cursor = wearing(app, crate::launcher::band_cursor(app, &bands));
+    let hidden = g.hidden(cursor, bands.len());
+    let count = HeadCount::of(&bands);
+    draw_head(f, app, body, count, hidden);
+    if bands.is_empty() {
         // Nothing archived is not nothing at all: the hero's "type a
         // task" would be advice about the wrong list, so the ARCHIVED
         // VIEW gets the plain empty line and the way back out of it.
@@ -78,8 +90,30 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
         }
         return;
     }
-    draw_grid(f, app, g, &rows);
+    draw_bands(f, app, g, &bands, cursor);
 }
+
+/// What the header counts: the cards on the grid, by kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HeadCount {
+    sessions: usize,
+    terminals: usize,
+}
+
+impl HeadCount {
+    fn of(bands: &[crate::launcher::Band]) -> Self {
+        Self {
+            sessions: bands.iter().map(|b| b.sessions()).sum(),
+            terminals: bands.iter().map(|b| b.terminals()).sum(),
+        }
+    }
+}
+
+/// What the header says at the right of the PROJECT TABS while the grid
+/// is inside a worktree: the way back out to the bands.
+const BACK_TO_BANDS: &str = "Esc back to the worktrees";
+/// The same on a rule too narrow for the sentence.
+const BACK_TO_BANDS_SHORT: &str = "Esc back";
 
 /// What the ARCHIVED VIEW says with nothing in it.
 const NO_ARCHIVED: &str = "nothing archived in this project — ⇧A back to the live sessions";
@@ -88,7 +122,7 @@ const NO_ARCHIVED: &str = "nothing archived in this project — ⇧A back to the
 /// status dots, how many cards the grid holds on the right — and how many
 /// of them it could not fit — a rule under both: the same three-row head
 /// the panels' columns sit on.
-fn draw_head(f: &mut Frame, app: &mut App, body: Rect, count: usize, hidden: Hidden) {
+fn draw_head(f: &mut Frame, app: &mut App, body: Rect, count: HeadCount, hidden: Hidden) {
     let th = app.theme;
     if let Some(r) = row_rect(body, 1) {
         let r = pad_x(r);
@@ -415,24 +449,13 @@ fn tab_ramp(tally: Tally, th: Theme) -> Option<[Color; 3]> {
 /// and [`draw_head`] lays their hit rects where the row lands them.
 fn head_count(
     app: &App,
-    count: usize,
+    count: HeadCount,
     hidden: Hidden,
     width: usize,
     th: Theme,
 ) -> Vec<(Span<'static>, Option<HitTarget>)> {
-    // The ARCHIVED VIEW counts the same cards under their own word, so
-    // the header says which of the two lists is on screen without a
-    // second line to read.
-    let noun = if app.show_archived {
-        "archived session"
-    } else {
-        "session"
-    };
     let mut spans = vec![(
-        Span::styled(
-            format!("{count} {noun}{}", plural(count)),
-            Style::default().fg(th.dim),
-        ),
+        Span::styled(count_words(app, count), Style::default().fg(th.dim)),
         None,
     )];
     // The PR & ISSUE COUNTS the PROJECTS PANEL's rows used to carry: how
@@ -463,11 +486,32 @@ fn head_count(
     spans
 }
 
-/// The HIDDEN MARKER: how many cards the grid holds that are not on
-/// screen, with an arrow saying which way they went — `↓` past the bottom
-/// edge, `↑` scrolled off the top, `↑↓` both. Nothing at all when the
-/// window holds every card, so a grid that fits reads exactly as it does
-/// today.
+/// The header's count of what the grid holds: `3 sessions · 2 terminals`
+/// — the terminals only when there are any, since most projects have
+/// none — under the ARCHIVED VIEW's own word there, so the header says
+/// which of the two lists is on screen without a second line to read.
+fn count_words(app: &App, count: HeadCount) -> String {
+    let noun = if app.show_archived {
+        "archived session"
+    } else {
+        "session"
+    };
+    let mut out = format!("{} {noun}{}", count.sessions, plural(count.sessions));
+    if count.terminals > 0 {
+        out.push_str(&format!(
+            " · {} terminal{}",
+            count.terminals,
+            plural(count.terminals)
+        ));
+    }
+    out
+}
+
+/// The HIDDEN MARKER: how many bands — or, inside a worktree, cards — the
+/// grid holds that are not on screen, with an arrow saying which way
+/// they went — `↓` past the bottom edge, `↑` scrolled off the top, `↑↓`
+/// both. Nothing at all when the window holds the lot, so a grid that
+/// fits reads exactly as it does today.
 ///
 /// This is the row's answer to a PANE dragged up over the cards: the
 /// count beside it still says how many sessions the project has, and this
@@ -525,44 +569,728 @@ fn pad_x(r: Rect) -> Rect {
 
 /// The GRID: one card per session, most recent first, left to right and top to
 /// bottom, scrolled by whole rows so the cursor's card is always drawn.
-fn draw_grid(f: &mut Frame, app: &mut App, g: crate::launcher::Grid, rows: &[LauncherRow]) {
+fn draw_bands(
+    f: &mut Frame,
+    app: &mut App,
+    g: crate::launcher::BandsLayout,
+    bands: &[crate::launcher::Band],
+    cursor: Option<usize>,
+) {
     let th = app.theme;
-    // The keys are in the pane, or up on the PROJECT TABS: the card under
-    // the cursor keeps it, unfocused.
-    let focused = app.focus != Focus::Terminal && app.launcher_tab_cursor.is_none();
-    let cursor = crate::launcher::cursor(app, rows);
-    // Nothing selected (`App::launcher_unaimed`): no card wears the
-    // cursor. The window it scrolled to stays where it is — letting the
-    // aim go is not a scroll.
-    let on = wearing(app, cursor);
-    // Scrolling is by row: the window starts on the first card of
-    // whichever row keeps the cursor's on screen.
-    let (start, shown) = g.window(cursor, rows.len());
+    // Scrolling is by band: the window starts on whichever band keeps
+    // the cursor's on screen. Nothing selected (`App::launcher_unaimed`):
+    // no band wears the cursor, and the window stays where it was —
+    // letting the aim go is not a scroll.
+    let (start, shown) = g.window(cursor, bands.len());
     // One CONFIG.JSON read for the whole frame, and only if some card on
     // it runs a CUSTOM harness whose label lives in there — a screenful
     // of cards must not reload the file once per card.
     let mut cfg = None;
-    for (slot, (index, row)) in rows.iter().enumerate().skip(start).enumerate().take(shown) {
-        let Some(cell) = fitting_cell(&g, slot) else {
-            break;
-        };
-        draw_card(f, app, cell, row, on == Some(index), focused, th, &mut cfg);
-        app.hits.push((cell, HitTarget::LauncherRow(index)));
+    // The keys are up on the PROJECT TABS, or down in the pane: the band
+    // under the cursor keeps its bold branch — it still says which
+    // checkout the pane reads — but the accent goes with the keys, so
+    // only the one thing holding them is lit.
+    let keys = app.focus != Focus::Terminal && app.launcher_tab_cursor.is_none();
+    // The band the selection is on, aimed at or let go of: its row
+    // follows its remembered card either way, so Esc scrolls nothing.
+    let aimed = crate::launcher::band_cursor(app, bands);
+    for (slot, (index, band)) in bands.iter().enumerate().skip(start).enumerate().take(shown) {
+        let at = (aimed == Some(index))
+            .then(|| crate::launcher::card_cursor(app, band))
+            .flatten();
+        let strip = g.strip(slot, index, band, at);
+        let on = cursor == Some(index);
+        let hits = draw_band_rule(
+            f.buffer_mut(),
+            app,
+            g.rule_rect(slot),
+            band,
+            BandRule::Band {
+                index,
+                on,
+                lit: on && keys,
+                more: strip.hidden(),
+            },
+        );
+        app.hits.extend(hits);
+        // The cards under the rule: on the band the cursor is on, the
+        // one it remembers — what the pane reads, and what `h`/`l` walk
+        // along the row — wears the cursor's accent outline, the tint
+        // staying with the lit rule; the rest are a preview of what is
+        // inside. A click on any lands the cursor on it
+        // (`HitTarget::LauncherCard`).
+        for slot in &strip.cards {
+            let card = &band.cards[slot.at.card];
+            draw_any_card(
+                f.buffer_mut(),
+                app,
+                slot.rect,
+                card,
+                on && at == Some(slot.at.card),
+                false,
+                th,
+                &mut cfg,
+            );
+            note_tail_card(app, card);
+            app.hits.push((slot.rect, HitTarget::LauncherCard(slot.at)));
+        }
+        draw_strip_arrows(f, app, &strip, index, on && keys, th);
     }
-    draw_more_below(f, &g, shown, rows.len().saturating_sub(start + shown), th);
-    // Last, so the cards themselves win `hit_at`'s first-match scan and
+    draw_more_below(f, &g, shown, bands.len().saturating_sub(start + shown), th);
+    // Last, so the bands themselves win `hit_at`'s first-match scan and
     // only the air between them falls through to the grid.
     app.hits.push((g.area, HitTarget::PanelBg(Focus::Sessions)));
 }
 
+/// The `❮` and `❯` beside a band's row.
+const STRIP_LEFT: &str = "❮";
+const STRIP_RIGHT: &str = "❯";
+
+/// What stands beside a band's row when it holds more cards than it
+/// shows: `❮` in the margin before its first card for the ones scrolled
+/// past the left edge, `❯` after its last card for the ones past the
+/// right, each on the row's middle line — in the accent while the band
+/// holds the keys, muted on any other band, so a glance says the row
+/// goes on without lighting it up. Each is a button: its hit is the
+/// two-cell gap the glyph stands in, the cards' full height, and a click
+/// on it is the step `h` / `l` take that way
+/// (`HitTarget::LauncherStripLeft`, `LauncherStripRight`). Under the
+/// pointer the glyph takes the accent whichever band it is on.
+fn draw_strip_arrows(
+    f: &mut Frame,
+    app: &mut App,
+    strip: &crate::launcher::Strip,
+    index: usize,
+    lit: bool,
+    th: Theme,
+) {
+    use crate::launcher::{CARD_H, PAD_X};
+    let (Some(first), Some(last)) = (strip.cards.first(), strip.cards.last()) else {
+        return;
+    };
+    let frame = f.area();
+    let top = first.rect.y;
+    let y = top + CARD_H / 2;
+    let mut arrow = |hit: HitTarget, x: u16, glyph_x: u16, glyph: &str| {
+        let hovered = app.hover_crumb.as_ref() == Some(&hit);
+        let style = if lit || hovered {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.muted)
+        };
+        let cell = Rect {
+            x: glyph_x,
+            y,
+            width: 1,
+            height: 1,
+        }
+        .intersection(frame);
+        if cell.width > 0 {
+            f.render_widget(Paragraph::new(Span::styled(glyph.to_string(), style)), cell);
+        }
+        let target = Rect {
+            x,
+            y: top,
+            width: PAD_X,
+            height: CARD_H,
+        }
+        .intersection(frame);
+        if target.width > 0 {
+            app.hits.push((target, hit));
+        }
+    };
+    if strip.before > 0 {
+        // The margin before the row: the glyph, then a cell of air
+        // against the first card.
+        let x = first.rect.x.saturating_sub(PAD_X);
+        arrow(HitTarget::LauncherStripLeft(index), x, x, STRIP_LEFT);
+    }
+    if strip.after > 0 {
+        // The gap after the last card drawn — between cards or the
+        // margin, whichever the row ends in: a cell of air, then the
+        // glyph.
+        let x = last.rect.x + last.rect.width;
+        arrow(HitTarget::LauncherStripRight(index), x, x + 1, STRIP_RIGHT);
+    }
+}
+
+/// The GRID inside one worktree: its sessions wrapped into rows under the
+/// checkout's own rule — the band's, kept over its cards for as long as
+/// the grid is in it, with the way back out at its right — its terminals,
+/// when it has any, under a `terminals` rule, the card under the cursor
+/// in its accent outline and the PANE reading it.
+fn draw_inside(
+    f: &mut Frame,
+    app: &mut App,
+    body: Rect,
+    bands: &[crate::launcher::Band],
+    index: usize,
+) {
+    let th = app.theme;
+    let band = &bands[index];
+    let layout = crate::launcher::inside_layout(body, band);
+    let cursor = crate::launcher::card_cursor(app, band);
+    let on = wearing(app, cursor);
+    let scroll = settle_scroll(app, &layout, band, cursor);
+    let hidden = layout.hidden(scroll);
+    draw_head(
+        f,
+        app,
+        body,
+        HeadCount::of(std::slice::from_ref(band)),
+        hidden,
+    );
+    draw_edge_marks(f, body, &layout, hidden, th);
+    // The keys are in the pane, or up on the PROJECT TABS: the card under
+    // the cursor keeps its accent outline — it still says which session
+    // the pane reads — but the tint goes with the keys.
+    let focused = app.focus != Focus::Terminal && app.launcher_tab_cursor.is_none();
+    for (r, label) in layout.rules(scroll) {
+        // The sessions' rule is the checkout's own: the branch, its
+        // changes and its pull request over its cards, and the way back
+        // out at the right — the band's rule, kept for as long as the
+        // grid is in it. The terminals' is a quiet section rule under
+        // them.
+        if label == crate::launcher::SESSIONS_RULE {
+            let hits = draw_band_rule(f.buffer_mut(), app, r, band, BandRule::Inside);
+            app.hits.extend(hits);
+            continue;
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("── ", Style::default().fg(th.edge)),
+                Span::styled(label.to_string(), Style::default().fg(th.dim)),
+                Span::styled(
+                    " ".to_string()
+                        + &"─"
+                            .repeat(usize::from(r.width).saturating_sub(label.chars().count() + 4)),
+                    Style::default().fg(th.edge),
+                ),
+            ])),
+            r,
+        );
+    }
+    let mut cfg = None;
+    for (i, card) in band.cards.iter().enumerate() {
+        let Some(placed) = layout.cell(i, scroll) else {
+            continue;
+        };
+        let selected = on == Some(i);
+        draw_cut(f, placed, |buf, r| {
+            draw_any_card(buf, &*app, r, card, selected, focused, th, &mut cfg)
+        });
+        note_tail_card(app, card);
+        // A card drawn cut is clicked on the rows of it there are: the
+        // click lands the cursor on it, and the landing scrolls the rest
+        // of it into view (`settle_scroll`).
+        app.hits.push((
+            placed.rect,
+            HitTarget::LauncherCard(crate::launcher::CardRef {
+                band: index,
+                card: i,
+            }),
+        ));
+    }
+    app.hits
+        .push((layout.area, HitTarget::PanelBg(Focus::Sessions)));
+}
+
+/// The scroll this frame draws the worktree's cards at, settled from
+/// what the last frame left and what has happened since — the rule
+/// [`App::launcher_scroll`] spells out. Another worktree's cards start
+/// at their own top; a scroll the wheel set is kept unless a key asked
+/// for the cursor's card ([`App::launcher_reveal`]) or the cursor is on
+/// another card than the one it was set under; any other scroll keeps
+/// in step with the cursor's card, whole on screen with the row over it
+/// ([`crate::launcher::InsideLayout::reveal`]). Whatever it lands on is
+/// held within the layout, so a window that grew or a list that shrank
+/// never scrolls past the last row.
+fn settle_scroll(
+    app: &mut App,
+    layout: &crate::launcher::InsideLayout,
+    band: &crate::launcher::Band,
+    cursor: Option<usize>,
+) -> u16 {
+    if app.launcher_scroll_in.as_ref() != Some(&band.worktree) {
+        app.launcher_scroll = 0;
+        app.launcher_scroll_held = false;
+        app.launcher_scroll_in = Some(band.worktree.clone());
+    }
+    let mut scroll = layout.clamp(app.launcher_scroll);
+    if let Some(at) = cursor {
+        let on = Some(band.cards[at].sref());
+        if app.launcher_reveal || !app.launcher_scroll_held || app.launcher_scroll_on != on {
+            scroll = layout.reveal(scroll, at);
+            app.launcher_scroll_held = false;
+            app.launcher_scroll_on = on;
+        }
+    }
+    app.launcher_reveal = false;
+    app.launcher_scroll = scroll;
+    scroll
+}
+
+/// The EDGE MARKERS on a grid taller than its window: `↑ 2 more above`
+/// on the header's row of air over the cards, `↓ 3 more below` on the
+/// row kept under them ([`crate::launcher::InsideLayout::window`]) —
+/// each where the eye looks for the rest, so the grid says it scrolls,
+/// and which way, without a word painted over a card. The header's
+/// `↑↓ 5 hidden` says the same once more in the count. A grid that fits
+/// has neither row marked, and a layout scrolled to an end leaves that
+/// end's row as plain air.
+fn draw_edge_marks(
+    f: &mut Frame,
+    body: Rect,
+    layout: &crate::launcher::InsideLayout,
+    hidden: Hidden,
+    th: Theme,
+) {
+    if !layout.overflows() {
+        return;
+    }
+    let mark = |f: &mut Frame, r: Rect, words: String| {
+        f.render_widget(
+            Paragraph::new(Span::styled(words, Style::default().fg(th.muted)))
+                .alignment(ratatui::layout::Alignment::Center),
+            r,
+        );
+    };
+    if hidden.above > 0 {
+        let r = Rect {
+            y: body.y + crate::launcher::HEAD_H - 1,
+            height: 1,
+            ..layout.area
+        };
+        mark(f, r, format!("↑ {} more above", hidden.above));
+    }
+    if hidden.below > 0 {
+        let window = layout.window();
+        let r = Rect {
+            y: window.y + window.height,
+            height: crate::launcher::BELOW_MARK_H,
+            ..layout.area
+        };
+        mark(f, r, format!("↓ {} more below", hidden.below));
+    }
+}
+
+/// Draw something the window's edges may cut — a card half scrolled off
+/// the top — as the terminal draws a line half scrolled off: the rows of
+/// it inside the window, and only those. `draw` paints the whole thing
+/// into the rect it is handed; one drawn whole paints straight onto the
+/// frame, one that is cut paints onto a scratch buffer its own size and
+/// the rows on screen are copied across. So a card's top border is
+/// never drawn on a card whose top is off screen — a whole-looking card
+/// where a cut one stands would say the wrong thing about what is
+/// above it.
+fn draw_cut(f: &mut Frame, placed: crate::launcher::Placed, draw: impl FnOnce(&mut Buffer, Rect)) {
+    if placed.whole() {
+        draw(f.buffer_mut(), placed.rect);
+        return;
+    }
+    let full = Rect {
+        y: 0,
+        height: placed.rect.height + placed.cut_top + placed.cut_bottom,
+        ..placed.rect
+    };
+    let mut scratch = Buffer::empty(full);
+    draw(&mut scratch, full);
+    let buf = f.buffer_mut();
+    for dy in 0..placed.rect.height {
+        for x in placed.rect.left()..placed.rect.right() {
+            let Some(from) = scratch.cell((x, placed.cut_top + dy)) else {
+                continue;
+            };
+            if let Some(to) = buf.cell_mut((x, placed.rect.y + dy)) {
+                *to = from.clone();
+            }
+        }
+    }
+}
+
+/// A card of either kind, in `area`.
+#[allow(clippy::too_many_arguments)]
+fn draw_any_card(
+    buf: &mut Buffer,
+    app: &App,
+    area: Rect,
+    card: &crate::launcher::Card,
+    selected: bool,
+    focused: bool,
+    th: Theme,
+    cfg: &mut Option<crate::config::Config>,
+) {
+    match card {
+        crate::launcher::Card::Session(row) => {
+            draw_card(buf, app, area, row, selected, focused, th, cfg)
+        }
+        crate::launcher::Card::Terminal(t) => draw_chip(buf, app, area, t, selected, focused, th),
+    }
+}
+
+/// A terminal card just drawn: the grid's beat asks the daemon what its
+/// shell printed since ([`App::tail_cards`], `event_loop::request_terminal_tails`).
+fn note_tail_card(app: &mut App, card: &crate::launcher::Card) {
+    if let crate::launcher::Card::Terminal(t) = card {
+        app.tail_cards.push(t.id.clone());
+    }
+}
+
+/// The least room a band's rule keeps for its glyph and branch before
+/// the Enter hint at its right end gives way: the mark and the counts
+/// stay, the words go.
+const ENTER_HINT_ROOM: usize = 12;
+
+/// Where a band's rule is being drawn: on the grid over its cards, or up
+/// in the header while the grid is inside the worktree.
+#[derive(Debug, Clone, Copy)]
+enum BandRule {
+    Band {
+        /// The band's place in `launcher::bands` — what its hit names.
+        index: usize,
+        /// The cursor is on the band: its branch goes bold.
+        on: bool,
+        /// The keys are on the band too — not up on the PROJECT TABS nor
+        /// down in the pane: the rule takes the accent, the cursor mark
+        /// and the Enter hint.
+        lit: bool,
+        /// Cards its row had no room for.
+        more: usize,
+    },
+    Inside,
+}
+
+/// A BAND's rule: the checkout — `⌂ main` or `↳ feat` in the SCOPE
+/// COLOR, its uncommitted changes behind it in the heads-up color, its
+/// pull request in the PR rows' own colors — a rule to the right end,
+/// and there how many cards are under it (`2 sessions · 1 terminal`), or
+/// off its edges (`▸ 2 more`). On the band the cursor is on the
+/// branch is bold — this is what says which checkout the pane reads,
+/// since no card under it wears the cursor — and for as long as the keys
+/// are on it the rule wears the accent, opens on the CURSOR MARK `❯`
+/// instead of `──`, and says at its right end what Enter does there
+/// (`Enter: see all 8`, or `Enter: open` when the row showed every
+/// card); gray, unmarked and silent like the rest once the keys are up
+/// on the PROJECT TABS or down in the pane.
+/// Returns the rule's hits: the pull request ahead of the rule itself,
+/// so a click on `#42` opens it and one anywhere else lands on the band.
+fn draw_band_rule(
+    buf: &mut Buffer,
+    app: &App,
+    r: Rect,
+    band: &crate::launcher::Band,
+    rule: BandRule,
+) -> Vec<(Rect, HitTarget)> {
+    let th = app.theme;
+    let width = usize::from(r.width);
+    let (on, lit, edge) = match rule {
+        BandRule::Band { on, lit, .. } => (on, lit, if lit { th.accent } else { th.edge }),
+        BandRule::Inside => (true, false, th.edge),
+    };
+    let dash = |n: usize| Span::styled("─".repeat(n), Style::default().fg(edge));
+
+    // The right end first, since the left gives way to it.
+    let right = match rule {
+        BandRule::Band { more, .. } => {
+            let mut words = format!("{} session{}", band.sessions(), plural(band.sessions()));
+            if band.terminals() > 0 {
+                words.push_str(&format!(
+                    " · {} terminal{}",
+                    band.terminals(),
+                    plural(band.terminals())
+                ));
+            }
+            let mut spans = vec![Span::styled(words, Style::default().fg(th.dim))];
+            if more > 0 {
+                spans.push(Span::styled(
+                    format!("  ▸ {more} more"),
+                    Style::default().fg(th.muted),
+                ));
+            }
+            // The VERB, on the band the keys are on: a titled rule reads
+            // as a divider, and nothing about a divider says a key acts
+            // on it, so the rule under the cursor spells what Enter does
+            // at its right end — the spot the inside view's `Esc back to
+            // the worktrees` takes, so the way in and the way out are
+            // said in the same place. It names what the row could not
+            // show (`Enter: see all 8`) when cards hang past the edge,
+            // plain `Enter: open` when they all fit. A rule too narrow to
+            // keep the branch legible beside the words drops them: the
+            // `❯` at the left still says which band is selected.
+            if lit {
+                let key = super::key_hint(app, crate::keymap::Action::Activate);
+                let does = if more > 0 {
+                    format!(": see all {}", band.cards.len())
+                } else {
+                    ": open".to_string()
+                };
+                let taken: usize = spans.iter().map(|s| s.width()).sum();
+                let with_hint = 3 + taken + 2 + key.chars().count() + does.chars().count() + 4;
+                if width >= with_hint + ENTER_HINT_ROOM {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(key, Style::default().fg(th.accent)));
+                    spans.push(Span::styled(does, Style::default().fg(th.dim)));
+                }
+            }
+            spans
+        }
+        // The way back out gives way before the checkout does: the whole
+        // sentence on a wide rule, the key alone beside a pane, nothing
+        // on a rule with no room to spare.
+        BandRule::Inside => {
+            let hint = if width >= 72 {
+                BACK_TO_BANDS
+            } else if width >= 40 {
+                BACK_TO_BANDS_SHORT
+            } else {
+                ""
+            };
+            vec![Span::styled(hint.to_string(), Style::default().fg(th.dim))]
+        }
+    };
+    let right_w: usize = right.iter().map(|s| s.width()).sum();
+
+    // The checkout, as the cards used to paint it: the glyph in its
+    // scope color never yields, the branch truncates around it.
+    let (glyph, scope) = if band.is_main {
+        ("⌂ ", th.root)
+    } else {
+        ("↳ ", th.worktree)
+    };
+    let mut branch_style = Style::default().fg(scope);
+    if on {
+        branch_style = branch_style.add_modifier(Modifier::BOLD);
+    }
+    // `── ` before, ` ` after the words, ` ` before the right end and
+    // ` ──` after it: what the words have to fit between.
+    let room = width.saturating_sub(3 + right_w + 5);
+    let changes = app
+        .worktree_changes(&band.worktree)
+        .filter(|n| *n > 0)
+        .map(|n| {
+            change_labels(
+                n,
+                app.worktree_lines(&band.worktree),
+                band.branch.chars().count(),
+                room.saturating_sub(glyph.chars().count()),
+            )
+        });
+    let taken = changes.as_ref().map_or(0, |(files, lines)| {
+        files.chars().count()
+            + lines.as_ref().map_or(0, |(added, removed)| {
+                added.chars().count() + removed.chars().count()
+            })
+    });
+    let branch = truncate(
+        &band.branch,
+        room.saturating_sub(glyph.chars().count() + taken),
+    );
+    // The rule's left end: `──` like every other band's, or the CURSOR
+    // MARK `❯` on the one the keys are on — the mark a prompt puts before
+    // the line that takes the keys, so a rule that looks like a divider
+    // reads as a row something can be done to. Two cells either way, so
+    // the checkouts stay in one column down the grid.
+    let lead = if lit {
+        Span::styled(
+            "❯ ",
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        dash(2)
+    };
+    let mut left = vec![
+        lead,
+        Span::raw(" "),
+        Span::styled(glyph, Style::default().fg(scope)),
+        Span::styled(branch, branch_style),
+    ];
+    if let Some((files, lines)) = changes {
+        left.push(Span::styled(files, Style::default().fg(th.warn)));
+        if let Some((added, removed)) = lines {
+            left.push(Span::styled(added, Style::default().fg(th.ok)));
+            left.push(Span::styled(removed, Style::default().fg(th.err)));
+        }
+    }
+    let mut hits = Vec::new();
+    let used: usize = left.iter().map(|s| s.width()).sum();
+    // Its pull request, after the checkout, in the PR rows' own colors —
+    // as much of the title as the rule has room for, and none of it on a
+    // rule too short to say the number.
+    if let Some(pr) = &band.pr {
+        let spare = room.saturating_sub(used + 2 - 3);
+        if spare >= 6 {
+            let look = crate::pr_row::look(pr.standing, pr.trouble, th);
+            let label = if pr.title.is_empty() {
+                format!("#{}", pr.number)
+            } else {
+                format!("#{} {}", pr.number, pr.title)
+            };
+            let mut spans = crate::pr_row::spans(
+                look,
+                &label,
+                spare,
+                Some((format!(" {}", pr.badge()), look.badge)),
+            );
+            let hovered = app.hover_crumb == Some(HitTarget::LauncherBandPr(band.worktree.clone()));
+            if hovered {
+                if let Some(label) = spans.get_mut(1) {
+                    label.style = label.style.add_modifier(Modifier::UNDERLINED);
+                }
+            }
+            let pr_w: usize = spans.iter().map(|s| s.width()).sum();
+            left.push(Span::raw("  "));
+            let x = r.x + u16::try_from(used + 2).unwrap_or(u16::MAX);
+            hits.push((
+                Rect {
+                    x,
+                    width: u16::try_from(pr_w)
+                        .unwrap_or(u16::MAX)
+                        .min(r.width.saturating_sub(x - r.x)),
+                    height: 1,
+                    ..r
+                },
+                HitTarget::LauncherBandPr(band.worktree.clone()),
+            ));
+            left.extend(spans);
+        }
+    }
+    let used: usize = left.iter().map(|s| s.width()).sum();
+    let fill = width.saturating_sub(used + 1 + 1 + right_w + 1 + 2);
+    let mut spans = left;
+    spans.push(Span::raw(" "));
+    spans.push(dash(fill));
+    spans.push(Span::raw(" "));
+    spans.extend(right);
+    spans.push(Span::raw(" "));
+    spans.push(dash(2));
+    Paragraph::new(Line::from(spans)).render(r, buf);
+    if let BandRule::Band { index, .. } = rule {
+        hits.push((r, HitTarget::LauncherBand(index)));
+    }
+    hits
+}
+
+/// A TERMINAL's card: what a session's card is to a session, and the
+/// same size — its name behind the glyph the SESSIONS PANEL gave the row
+/// (`▶` for a RUN TERMINAL, `❯` for a plain shell, in `th.ok` while its
+/// PTY is alive, with `exited` at the row's right once the shell is
+/// gone), what runs in it, then the last lines it printed where a
+/// session's card has its prompt ([`terminal_tail_lines`]) — so a glance
+/// down the grid says what each shell is up to, and an exited one what it
+/// was doing when it went. Framed as a card is, the cursor's in the
+/// accent.
+fn draw_chip(
+    buf: &mut Buffer,
+    app: &App,
+    area: Rect,
+    t: &nebula_core::TerminalTab,
+    selected: bool,
+    focused: bool,
+    th: Theme,
+) {
+    let border = if selected { th.accent } else { th.edge };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border));
+    if selected && focused {
+        block = block.style(Style::default().bg(th.focus_tint));
+    }
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
+    let width = usize::from(inner.width);
+    if width == 0 {
+        return;
+    }
+    let glyph = if t.run_command.is_some() {
+        "▶ "
+    } else {
+        "❯ "
+    };
+    // `exited` sits where a session card keeps its ago badge, and the
+    // name gives it the room, as a session's does.
+    let badge = if t.alive { "" } else { EXITED_BADGE };
+    let (badge, name_max) = fit_ago(badge.to_string(), width);
+    let name = truncate(&t.name, name_max.saturating_sub(2));
+    let mut first = vec![
+        Span::styled(
+            glyph,
+            Style::default().fg(if t.alive { th.ok } else { th.dim }),
+        ),
+        Span::styled(
+            name.clone(),
+            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !badge.is_empty() {
+        let badge = badge.trim_start().to_string();
+        let pad = width.saturating_sub(name.chars().count() + 2 + badge.chars().count());
+        first.push(Span::raw(" ".repeat(pad)));
+        first.push(Span::styled(badge, Style::default().fg(th.err)));
+    }
+    let runs = t.run_command.as_deref().unwrap_or("shell");
+    let second = vec![Span::styled(
+        truncate(runs, width),
+        Style::default().fg(th.dim),
+    )];
+    let mut lines = vec![first, second];
+    lines.resize(crate::launcher::CARD_HEAD_H as usize, Vec::new());
+    lines.extend(
+        terminal_tail_lines(app, t)
+            .iter()
+            .take(crate::launcher::PROMPT_LINES)
+            .map(|line| {
+                vec![Span::styled(
+                    truncate(line, width),
+                    Style::default().fg(th.muted),
+                )]
+            }),
+    );
+    for (i, spans) in lines.into_iter().enumerate() {
+        if spans.is_empty() {
+            continue;
+        }
+        let Some(r) = row_rect(inner, i) else { break };
+        Paragraph::new(Line::from(spans)).render(r, buf);
+    }
+}
+
+/// What a dead terminal's card says at its name row's right.
+const EXITED_BADGE: &str = " exited";
+
+/// The lines under a terminal card's head: the pane's own screen while the
+/// pane is on this terminal — live, on the frame it changes — and
+/// otherwise the tail the daemon last answered with
+/// ([`App::terminal_tails`]), which a card keeps once its shell is gone.
+fn terminal_tail_lines(app: &App, t: &nebula_core::TerminalTab) -> Vec<String> {
+    let sref = nebula_core::SessionRef::Terminal(t.id.clone());
+    if let Some(term) = app
+        .term
+        .as_ref()
+        .filter(|term| term.sref == sref && term.painted)
+    {
+        return crate::terminal_tail::screen_tail(
+            term.parser.screen(),
+            crate::launcher::PROMPT_LINES,
+        );
+    }
+    app.terminal_tails
+        .get(&t.id)
+        .map(|tail| tail.lines.clone())
+        .unwrap_or_default()
+}
+
 /// A card's frame color when its status wants one: red for a turn waiting
-/// on you, blue for one finished and unread, a faint yellow (`warn_edge`)
-/// for one still running — the three the PROJECT TABS count, and no other.
-/// A read finish, a fresh or terminated session and a `quiet` card (cold,
-/// pending or archived: nothing on it is live) keep the plain edge. The
-/// focused card's accent outranks all three, which is why running is the
-/// faint one: in a warm preset a full-strength yellow frame sits a shade
-/// off the focus.
+/// on you, blue for one finished and unread, yellow for one still running
+/// — the three the PROJECT TABS count, each in the color its STATUS DOT
+/// wears, and no other. A read finish, a fresh or terminated session and a
+/// `quiet` card (cold, pending or archived: nothing on it is live) keep
+/// the plain edge. The focused card's accent outranks all three.
 fn card_edge(a: &nebula_core::Agent, quiet: bool, th: Theme) -> Option<Color> {
     use nebula_core::AgentStatus;
     if quiet {
@@ -571,7 +1299,7 @@ fn card_edge(a: &nebula_core::Agent, quiet: bool, th: Theme) -> Option<Color> {
     match a.status {
         AgentStatus::NeedsFeedback => Some(th.err),
         AgentStatus::Finished if a.unseen => Some(th.done),
-        AgentStatus::Running => Some(th.warn_edge),
+        AgentStatus::Running => Some(th.warn),
         _ => None,
     }
 }
@@ -581,15 +1309,16 @@ fn card_edge(a: &nebula_core::Agent, quiet: bool, th: Theme) -> Option<Color> {
 /// so the name behind it starts in the same column on both grids.
 const ARCHIVED_MARK: &str = "▪ ";
 
-/// One session's card: its name and how long since it last moved, where
-/// it runs — with that checkout's uncommitted file count — and with what,
-/// its pull request, and the last thing it was
-/// asked to do. The cursor's card takes an accent border and no fill — the
-/// outline alone marks it; every other card's frame answers to its status
-/// ([`card_edge`]).
+/// One session's card: its name and how long since it last moved, what
+/// it runs on, and the last thing it was asked to do. Where it runs —
+/// the checkout, its changes, its pull request — is on its BAND's rule,
+/// said once for every card in the checkout. The cursor's card takes an
+/// accent border wherever the keys are, and — while the grid has them —
+/// the FOCUSED PANEL TINT behind it; every other card's frame answers to
+/// its status ([`card_edge`]).
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
-    f: &mut Frame,
+    buf: &mut Buffer,
     app: &App,
     area: Rect,
     row: &LauncherRow,
@@ -628,16 +1357,14 @@ fn draw_card(
     } else {
         status_dot(Some(a.status), a.unseen, th)
     };
-    let border = if selected && focused {
+    let border = if selected {
         th.accent
     } else if let Some(edge) = card_edge(a, archived || pending || cold, th) {
         edge
-    } else if selected {
-        th.muted
     } else {
         th.edge
     };
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         // Square corners on an archived card, round on a live one: the one
         // difference between the two grids that survives a terminal with
@@ -648,8 +1375,14 @@ fn draw_card(
             BorderType::Rounded
         })
         .border_style(Style::default().fg(border));
+    // The card keys land in wears the same wash the session pane wears
+    // when it has them, so one surface on screen is lit and it follows the
+    // focus between the grid and the pane.
+    if selected && focused {
+        block = block.style(Style::default().bg(th.focus_tint));
+    }
     let inner = block.inner(area);
-    f.render_widget(block, area);
+    block.render(area, buf);
     // One cell of air inside the border, so the text never touches it.
     let inner = Rect {
         x: inner.x + 1,
@@ -710,111 +1443,25 @@ fn draw_card(
         ));
     }
 
-    // Where it runs and with what: the checkout — then the harness and
-    // the model the session was launched on. The project is not on the
-    // card: the grid is one project's sessions and its name is already in
-    // the header's crumb, so repeating it on every card is noise.
-    //
-    // The checkout carries the SCOPE COLOR, glyph and branch both: `⌂` in
-    // `th.root` on the project's root branch, as the WORKTREES PANEL marks
-    // that row, and `↳` in `th.worktree` on a checkout of its own. It is
-    // the one thing on a grid of cards worth sorting by before any of them
-    // is read — an agent on the root branch is editing what everything
-    // else is cut from — so it is the one thing on this row that is not
-    // dim. The glyph is its own span and never yields: a long branch
-    // truncates around it rather than through it, so the scope survives
-    // the narrowest card the grid will draw.
-    //
-    // An ARCHIVED card keeps the glyph and drops the color: `root` is a
-    // warning about what a session is editing right now, and an archived
-    // session is editing nothing. The glyph alone still tells the two
-    // checkouts apart.
-    let glyph = if row.is_main { "⌂ " } else { "↳ " };
-    let scope = quiet_or(if row.is_main { th.root } else { th.worktree });
-    let harness = harness_line(a, cfg);
-    let room = width
-        .saturating_sub(harness.chars().count() + 3)
-        .saturating_sub(glyph.chars().count());
-    // The checkout's uncommitted changes ride right behind its branch, in
-    // the heads-up color — `↳ feat +3 files` — so the count reads as that
-    // branch's, on every card in it, not only the one under the cursor
-    // (`App::worktree_changes`, swept over every checkout the grid lists).
-    // A clean checkout says nothing. The word goes before the branch
-    // gives up a letter for it: `+3` on a card too narrow for both.
-    //
-    // CARD LINE COUNTS follows the count with the lines behind it, in the
-    // DIFF VIEWER's own green and red — `+3 files +120 -45` — and they
-    // yield after the word and before the branch (`change_labels`).
-    let changes = app
-        .worktree_changes(&a.worktree_id)
-        .filter(|n| *n > 0)
-        .map(|n| {
-            change_labels(
-                n,
-                app.worktree_lines(&a.worktree_id),
-                row.branch.chars().count(),
-                room,
-            )
-        });
-    let taken = changes.as_ref().map_or(0, |(files, lines)| {
-        files.chars().count()
-            + lines.as_ref().map_or(0, |(added, removed)| {
-                added.chars().count() + removed.chars().count()
-            })
-    });
-    let branch = truncate(&row.branch, room.saturating_sub(taken));
-    let mut second = vec![
-        Span::styled(glyph, Style::default().fg(scope)),
-        Span::styled(branch, Style::default().fg(scope)),
-    ];
-    if let Some((files, lines)) = changes {
-        second.push(Span::styled(files, Style::default().fg(quiet_or(th.warn))));
-        if let Some((added, removed)) = lines {
-            second.push(Span::styled(added, Style::default().fg(quiet_or(th.ok))));
-            second.push(Span::styled(removed, Style::default().fg(quiet_or(th.err))));
-        }
-    }
-    if !harness.is_empty() {
-        second.push(Span::styled(" · ", Style::default().fg(quiet_or(th.dim))));
-        second.push(Span::styled(harness, Style::default().fg(quiet_or(th.dim))));
-    }
-
-    // Its pull request, in the PR rows' own colors; a session with none
-    // leaves the row blank rather than saying so four times over a screen
-    // of cards.
-    let third = match &row.pr {
-        Some(pr) => {
-            // On an archived card the PR is history too: a merged purple
-            // or a red conflict there would be the loudest thing on a grid
-            // of filed-away work, and neither is a job any more.
-            let look = if archived {
-                crate::pr_row::Look {
-                    glyph: quiet,
-                    label: quiet,
-                    rail: quiet,
-                    badge: quiet,
-                }
-            } else {
-                crate::pr_row::look(pr.standing, pr.trouble, th)
-            };
-            let label = if pr.title.is_empty() {
-                format!("#{}", pr.number)
-            } else {
-                format!("#{} {}", pr.number, pr.title)
-            };
-            crate::pr_row::spans(
-                look,
-                &label,
-                width,
-                Some((format!(" {}", pr.badge()), look.badge)),
-            )
-        }
-        None => Vec::new(),
+    // What it runs on: the harness, the model and the reasoning effort
+    // the session was launched with, dim. Where it runs — the checkout,
+    // its changes, its pull request — is the BAND's rule over the card,
+    // said once for every card in the checkout rather than on each. The
+    // project is not on the card either: the grid is one project's,
+    // named in the header.
+    let harness = runs_on_line(a, cfg);
+    let second = if harness.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(
+            truncate(&harness, width),
+            Style::default().fg(quiet_or(th.dim)),
+        )]
     };
 
     // The last thing it was asked to do, on the prompt's own `›`, over
     // the card's last rows rather than clipped at the first.
-    let mut lines = vec![first, second, third];
+    let mut lines = vec![first, second];
     lines.resize(crate::launcher::CARD_HEAD_H as usize, Vec::new());
     lines.extend(prompt_lines(
         crate::launcher::last_prompt(a).unwrap_or_default(),
@@ -828,7 +1475,7 @@ fn draw_card(
             continue;
         }
         let Some(r) = row_rect(inner, i) else { break };
-        f.render_widget(Paragraph::new(Line::from(spans)), r);
+        Paragraph::new(Line::from(spans)).render(r, buf);
     }
 }
 
@@ -841,17 +1488,17 @@ fn wearing(app: &App, cursor: Option<usize>) -> Option<usize> {
     (!app.launcher_unaimed).then_some(cursor).flatten()
 }
 
-/// The MORE-BELOW CUE: the air under the last whole row of cards — rows
-/// too few for another card — says how many cards the window left past
-/// its bottom edge, so a screenful that happens to end on a full row
-/// does not read as the whole project, and the arrow says the way to
-/// them is down. Centered in that air, in the header's HIDDEN MARKER
-/// color. Nothing once every card from the window down is on screen, and
-/// nothing when the cards fill the grid to its last row: the header's
-/// marker still counts them then.
+/// The MORE-BELOW CUE: the air under the last whole band — rows too few
+/// for another — says how many bands the window left past its bottom
+/// edge, so a screenful that happens to end on a band does not read as
+/// the whole project, and the arrow says the way to them is down.
+/// Centered in that air, in the header's HIDDEN MARKER color. Nothing
+/// once every band from the window down is on screen, and nothing when
+/// the bands fill the grid to its last row: the header's marker still
+/// counts them then.
 fn draw_more_below(
     f: &mut Frame,
-    g: &crate::launcher::Grid,
+    g: &crate::launcher::BandsLayout,
     shown: usize,
     below: usize,
     th: Theme,
@@ -859,36 +1506,25 @@ fn draw_more_below(
     if below == 0 || shown == 0 {
         return;
     }
-    let last = g.cell(shown - 1);
+    let last = g.band_rect(shown - 1);
     let top = last.y + last.height;
     let bottom = g.area.y + g.area.height;
     if top >= bottom {
         return;
     }
-    // Centered under the cards themselves, not the area: the columns'
-    // even split leaves a sliver of the area spare on the right.
-    let edge = g.cell(g.cols.min(shown) - 1);
     let r = Rect {
         y: top + (bottom - top) / 2,
-        width: edge.x + edge.width - g.area.x,
         height: 1,
         ..g.area
     };
     f.render_widget(
         Paragraph::new(Span::styled(
-            format!("↓ {below} more session{} below", plural(below)),
+            format!("↓ {below} more worktree{} below", plural(below)),
             Style::default().fg(th.muted),
         ))
         .alignment(ratatui::layout::Alignment::Center),
         r,
     );
-}
-
-/// Where the card in `slot` goes, or None once the grid has run out of
-/// rows for it — a card is drawn whole or not at all.
-fn fitting_cell(g: &crate::launcher::Grid, slot: usize) -> Option<Rect> {
-    let cell = g.cell(slot);
-    (cell.y + cell.height <= g.area.y + g.area.height).then_some(cell)
 }
 
 /// What the ARCHIVED VIEW shows with no cards at all — one line where the
@@ -950,9 +1586,10 @@ fn prompt_lines(prompt: &str, width: usize, mark: Color, text: Color) -> Vec<Vec
         .collect()
 }
 
-/// The harness (and model) a session runs on, as its card names it:
-/// `claude opus`. A Claude Cloud row says `cloud` — the sandbox is the
-/// harness that matters there.
+/// The harness (and model) a session runs on, as the PANE's breadcrumb
+/// names it: `claude opus`. A Claude Cloud row says `cloud` — the sandbox
+/// is the harness that matters there. The card adds the reasoning effort
+/// through [`runs_on_line`].
 ///
 /// `cfg` is the frame's CONFIG.JSON slot, filled on the first card that
 /// needs it: only a CUSTOM harness's label comes out of the file, so a
@@ -1001,6 +1638,20 @@ fn harness_line(a: &nebula_core::Agent, cfg: &mut Option<crate::config::Config>)
     if let Some(model) = a.model.as_deref().filter(|m| !m.is_empty()) {
         out.push(' ');
         out.push_str(model);
+    }
+    out
+}
+
+/// What a session's card says it runs on: [`harness_line`] with the
+/// reasoning effort the session was launched with after the model —
+/// `claude opus high`, `codex gpt-5.5 xhigh`. A session on the CLI's own
+/// default effort names none, so the line is the harness line alone
+/// rather than one with a hole in it.
+fn runs_on_line(a: &nebula_core::Agent, cfg: &mut Option<crate::config::Config>) -> String {
+    let mut out = harness_line(a, cfg);
+    if let Some(effort) = a.effort.as_deref().filter(|e| !e.is_empty()) {
+        out.push(' ');
+        out.push_str(effort);
     }
     out
 }
@@ -1108,37 +1759,25 @@ impl PaneTab {
     }
 }
 
-/// Longest a TERMINAL's name is drawn on the strip before it is clipped:
-/// enough for the names nebula gives them (`shell-1`) and for a renamed
-/// one to still be recognisable, short enough that one long name cannot
-/// push every other tab off the row.
-const TAB_MAX: usize = 18;
-/// The button that closes a TERMINAL from its own tab — one click, then
-/// the same confirm the SESSIONS PANEL's `d` puts up on a terminal row.
-const CLOSE: &str = " ×";
-/// Room the strip keeps back for the `+N` that counts the terminals past
-/// the right edge, so the last tab that fits is never the one that
-/// leaves no room to say there are more.
-const MORE_ROOM: usize = 5;
-/// The PANE's CLOSE BUTTON, at the right end of its TAB STRIP: one click
+/// The PANE's CLOSE BUTTON, at the right end of its header: one click
 /// folds the pane away, as `^~` does. A cell of air either side, so the
 /// target is wider than the glyph.
 const PANE_CLOSE: &str = " × ";
+/// The PANE's SIDE BUTTON, just before the CLOSE BUTTON: a picture of the
+/// layout one click moves it to — the pane down the right of the cards on
+/// a pane along the bottom, the pane along the bottom on one down the
+/// right. The click writes Settings → Appearance → **Session pane**, so
+/// the move lasts. Aired like the close button.
+const PANE_TO_RIGHT: &str = " ◨ ";
+const PANE_TO_BOTTOM: &str = " ⬓ ";
 
-/// The PANE's own header in the LAUNCHER VIEW: the TAB STRIP that says
-/// what the pane is reading and is how it gets swapped — the `SESSION`
-/// tab, the checkout the strip is scoped to, a divider, then one tab per
-/// TERMINAL open in that checkout. A rule under it, and the rect the PTY
-/// draws in returned, exactly as `ui::terminal_frame` does for the
-/// panels' pane.
-///
-/// The checkout is named up here because the terminals beside it are its
-/// and nobody else's (`App::visible_terminals`): walking the cursor onto
-/// a card in another one swaps the whole strip, and without the branch
-/// next to them that reads as terminals coming and going at random.
-///
-/// INPUT PARITY: a click on a tab and the `` ` `` key walk this same
-/// strip through the one `event_loop::launcher::show_pane_tab`.
+/// The PANE's own header in the LAUNCHER VIEW: what the pane is reading
+/// — the card under the cursor, session or terminal, and the checkout
+/// it runs in — then the state tag (`scroll 4`, `exited`) right-aligned
+/// before the SIDE and CLOSE BUTTONS. A rule under it, and the rect the
+/// PTY draws in returned, exactly as `ui::terminal_frame` does for the
+/// panels' pane. Opening a terminal is `t`'s alone: the grid offers no
+/// `+` for it.
 pub(super) fn pane_frame(
     f: &mut Frame,
     app: &mut App,
@@ -1149,15 +1788,23 @@ pub(super) fn pane_frame(
     let th = app.theme;
     if let Some(r) = row_rect(area, 1) {
         let r = pad_x(r);
-        // The CLOSE BUTTON holds the right end of the row and the state
-        // tag (`scroll 4`, exited) is right-aligned just before it: the
-        // strip gets what those two leave.
+        // The CLOSE BUTTON holds the right end of the row, the SIDE
+        // BUTTON stands before it — unless there is nowhere to move the
+        // pane (`App::launcher_pane_move_to`) — and the state tag
+        // (`scroll 4`, exited) is right-aligned before those: the title
+        // gets what the three leave.
+        let side_button = app.launcher_pane_move_to().map(|to| match to {
+            crate::launcher::PaneSide::Right => PANE_TO_RIGHT,
+            crate::launcher::PaneSide::Bottom => PANE_TO_BOTTOM,
+        });
+        let side_w = side_button.map_or(0, |b| b.chars().count() as u16);
         let close_w = PANE_CLOSE.chars().count() as u16;
-        let taken = usize::from(close_w)
+        let buttons_w = side_w + close_w;
+        let taken = usize::from(buttons_w)
             + right
                 .as_ref()
                 .map_or(0, |tag| tag.content.chars().count() + 2);
-        let tabs = pane_tabs(app, usize::from(r.width).saturating_sub(taken));
+        let tabs = pane_title(app, usize::from(r.width).saturating_sub(taken));
         let mut spans = Vec::new();
         let mut x = r.x;
         for tab in tabs {
@@ -1178,7 +1825,7 @@ pub(super) fn pane_frame(
         }
         f.render_widget(Paragraph::new(Line::from(spans)), r);
         let tag_r = Rect {
-            width: r.width.saturating_sub(close_w),
+            width: r.width.saturating_sub(buttons_w),
             ..r
         };
         if let Some(tag) = right {
@@ -1188,9 +1835,30 @@ pub(super) fn pane_frame(
                 tag_r,
             );
         }
-        if r.width >= close_w {
+        if r.width >= buttons_w {
+            let mut x = tag_r.x + tag_r.width;
+            if let Some(glyph) = side_button {
+                let side = Rect {
+                    x,
+                    width: side_w,
+                    ..r
+                };
+                // Lit under the pointer as the header's other buttons are:
+                // a half-filled square does not say it is one until then.
+                let fg = if app.hover_crumb == Some(HitTarget::LauncherPaneSide) {
+                    th.accent
+                } else {
+                    th.muted
+                };
+                f.render_widget(
+                    Paragraph::new(Span::styled(glyph, Style::default().fg(fg))),
+                    side,
+                );
+                app.hits.push((side, HitTarget::LauncherPaneSide));
+                x += side_w;
+            }
             let close = Rect {
-                x: tag_r.x + tag_r.width,
+                x,
                 width: close_w,
                 ..r
             };
@@ -1216,53 +1884,59 @@ pub(super) fn pane_frame(
     }
 }
 
-/// The strip itself, laid out left to right in `room` columns. The
-/// SESSION tab and the checkout never give way — they are what the rest
-/// of the strip is scoped by — and a terminal that will not fit is
-/// counted in the `+N` at the end rather than drawn half.
-fn pane_tabs(app: &App, room: usize) -> Vec<PaneTab> {
+/// The pane's title, laid out left to right in `room` columns: the card
+/// the cursor is on — its STATUS DOT and name for a session, the
+/// SESSIONS PANEL's `❯`/`▶` and name for a terminal — in the accent,
+/// since it is what the keys reach; the checkout it runs in after it,
+/// in the SCOPE COLOR the band's rule paints it. With the pane on
+/// something the grid no longer lists — a card just archived out from
+/// under it — the attached session's own name, muted.
+fn pane_title(app: &App, room: usize) -> Vec<PaneTab> {
     let th = app.theme;
-    // Active tab in the accent, the rest muted — and a terminal whose PTY
-    // the daemon no longer holds dimmer still, the way the SESSIONS
-    // PANEL dims an exited shell's row.
-    let look = |active: bool, alive: bool| {
-        if active {
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-        } else if alive {
-            Style::default().fg(th.muted)
-        } else {
-            Style::default().fg(th.dim)
+    let bands = crate::launcher::bands(app);
+    let at = crate::launcher::cursor(app, &bands);
+    let card = at.and_then(|at| crate::launcher::card_at(&bands, at));
+    let name_room = (room / 2).max(8);
+    let lit = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
+    let mut tabs = Vec::new();
+    match card {
+        Some(crate::launcher::Card::Session(row)) => {
+            let a = &row.agent;
+            tabs.push(PaneTab::plain(vec![
+                status_dot(Some(a.status), a.unseen, th),
+                Span::styled(truncate(&a.name, name_room), lit),
+            ]));
         }
-    };
-    let pinned = app.pinned_terminal();
-
-    // The SESSION tab names the card under the cursor, not whatever is
-    // attached: with the pane on a terminal the attachment is that
-    // terminal, and the tab has to go on saying what SESSION would come
-    // back to.
-    let rows = crate::launcher::rows(app);
-    let card = crate::launcher::cursor(app, &rows).and_then(|at| rows.get(at));
-    let mut label = vec![Span::styled("SESSION", look(pinned.is_none(), true))];
-    if let Some(row) = card {
-        label.push(Span::styled(" · ", Style::default().fg(th.dim)));
-        label.push(Span::styled(
-            truncate(&row.agent.name, (room / 4).max(8)),
-            look(pinned.is_none(), true),
-        ));
+        Some(crate::launcher::Card::Terminal(t)) => {
+            let glyph = if t.run_command.is_some() {
+                "▶ "
+            } else {
+                "❯ "
+            };
+            tabs.push(PaneTab::plain(vec![
+                Span::styled(
+                    glyph,
+                    Style::default().fg(if t.alive { th.ok } else { th.dim }),
+                ),
+                Span::styled(truncate(&t.name, name_room), lit),
+            ]));
+        }
+        None => {
+            if let Some(name) = app.term.as_ref().and_then(|t| attached_name(app, &t.sref)) {
+                tabs.push(PaneTab::plain(vec![Span::styled(
+                    truncate(&name, name_room),
+                    Style::default().fg(th.muted),
+                )]));
+            }
+        }
     }
-    let mut tabs = vec![PaneTab {
-        spans: label,
-        hit: Some(HitTarget::LauncherPaneSession),
-    }];
-
-    // The checkout everything after it belongs to, in the SCOPE COLOR the
-    // cards paint theirs in — `⌂` on the project's root branch, `↳` on a
-    // checkout of its own — so the header and the card under the cursor
-    // say the same thing the same way. This is what makes the terminals
-    // beside it read as that checkout's rather than as tabs coming and
-    // going at random as the grid is walked.
-    let checkout = card
-        .map(|row| (row.is_main, row.branch.clone()))
+    // The checkout everything in the pane belongs to, in the SCOPE COLOR
+    // the band's rule paints it — `⌂` on the project's root branch, `↳`
+    // on a checkout of its own — so the pane and the grid say the same
+    // thing the same way.
+    let checkout = at
+        .and_then(|at| bands.get(at.band))
+        .map(|b| (b.is_main, b.branch.clone()))
         .or_else(|| {
             app.selected_worktree()
                 .map(|w| (w.is_main, w.branch.clone()))
@@ -1273,8 +1947,10 @@ fn pane_tabs(app: &App, room: usize) -> Vec<PaneTab> {
         } else {
             ("↳ ", th.worktree)
         };
+        if !tabs.is_empty() {
+            tabs.push(PaneTab::plain(vec![Span::raw("  ")]));
+        }
         tabs.push(PaneTab::plain(vec![
-            Span::raw("  "),
             Span::styled(glyph, Style::default().fg(scope)),
             Span::styled(
                 truncate(&branch, (room / 4).max(8)),
@@ -1282,114 +1958,25 @@ fn pane_tabs(app: &App, room: usize) -> Vec<PaneTab> {
             ),
         ]));
     }
-    tabs.push(PaneTab::plain(vec![Span::styled(
-        "  │  ",
-        Style::default().fg(th.edge),
-    )]));
-
-    let terminals = app.pane_terminals();
-    if terminals.is_empty() {
-        // Nothing to tab to yet: the strip says which key opens one
-        // rather than trailing off after the divider.
-        tabs.push(PaneTab::plain(vec![Span::styled(
-            format!(
-                "{} opens a terminal here",
-                super::key_hint(app, crate::keymap::Action::NewTerminal)
-            ),
-            Style::default().fg(th.dim),
-        )]));
-        return tabs;
-    }
-    // The tabs that fit, from `start`, within `budget` columns: the tabs
-    // themselves and the index one past the last one drawn.
-    let fit = |start: usize, budget: usize| -> (Vec<PaneTab>, usize) {
-        let mut out: Vec<PaneTab> = Vec::new();
-        let mut left = budget;
-        let mut end = start;
-        for (i, t) in terminals.iter().enumerate().skip(start) {
-            let gap = if i == start { 0 } else { 2 };
-            // The glyph the SESSIONS PANEL gives the same row: `▶` for a
-            // RUN TERMINAL, `❯` for a plain shell, in `th.ok` while its
-            // PTY is alive.
-            let glyph = if t.run_command.is_some() {
-                "▶ "
-            } else {
-                "❯ "
-            };
-            let name = truncate(&t.name, TAB_MAX);
-            let need = gap + glyph.chars().count() + name.chars().count() + CLOSE.chars().count();
-            let spare = if i + 1 == terminals.len() {
-                0
-            } else {
-                MORE_ROOM
-            };
-            if need + spare > left {
-                break;
-            }
-            left -= need;
-            if gap > 0 {
-                out.push(PaneTab::plain(vec![Span::raw("  ")]));
-            }
-            let active = pinned.as_ref() == Some(&t.id);
-            out.push(PaneTab {
-                spans: vec![
-                    Span::styled(
-                        glyph,
-                        Style::default().fg(if t.alive { th.ok } else { th.dim }),
-                    ),
-                    Span::styled(name, look(active, t.alive)),
-                ],
-                hit: Some(HitTarget::LauncherPaneTerminal(i)),
-            });
-            // The `×` is a tab of its own, not part of the name's: two
-            // hits that cannot overlap, so a click on the cross never
-            // reads as a click on the tab it closes. Quiet on the tabs
-            // the pane is not reading — it is an affordance, not a
-            // warning — and one notch brighter on the one it is, which
-            // is the tab `d` closes.
-            out.push(PaneTab {
-                spans: vec![Span::styled(
-                    CLOSE,
-                    Style::default().fg(if active { th.muted } else { th.dim }),
-                )],
-                hit: Some(HitTarget::LauncherPaneCloseTerminal(i)),
-            });
-            end = i + 1;
-        }
-        (out, end)
-    };
-
-    let fixed: usize = tabs.iter().map(PaneTab::width).sum();
-    let budget = room.saturating_sub(fixed);
-    // Lay the tabs out from the first terminal; if that leaves the tab the
-    // pane is READING past the right edge, lay them out again starting at
-    // it. The same rule the GRID's scroll follows — the window is whatever
-    // keeps what is selected on screen — and without it `` ` `` could walk
-    // onto a tab nothing on the strip shows as active.
-    let at = pinned
-        .as_ref()
-        .and_then(|id| terminals.iter().position(|t| &t.id == id));
-    let (mut window, mut end) = fit(0, budget);
-    let mut start = 0;
-    if at.is_some_and(|at| at >= end) {
-        start = at.unwrap_or(0);
-        (window, end) = fit(start, budget.saturating_sub(MORE_ROOM));
-    }
-    // What the window left off either side is counted, never clipped.
-    if start > 0 {
-        tabs.push(PaneTab::plain(vec![Span::styled(
-            format!("+{start}  "),
-            Style::default().fg(th.dim),
-        )]));
-    }
-    tabs.extend(window);
-    if end < terminals.len() {
-        tabs.push(PaneTab::plain(vec![Span::styled(
-            format!("  +{}", terminals.len() - end),
-            Style::default().fg(th.dim),
-        )]));
-    }
     tabs
+}
+
+/// The name of the session `sref` attaches, whichever kind it is.
+fn attached_name(app: &App, sref: &nebula_core::SessionRef) -> Option<String> {
+    match sref {
+        nebula_core::SessionRef::Agent(id) => app
+            .tree
+            .agents
+            .iter()
+            .find(|a| &a.id == id)
+            .map(|a| a.name.clone()),
+        nebula_core::SessionRef::Terminal(id) => app
+            .tree
+            .terminals
+            .iter()
+            .find(|t| &t.id == id)
+            .map(|t| t.name.clone()),
+    }
 }
 
 /// The full-screen session's own header, in place of the pane's
@@ -1476,8 +2063,8 @@ pub(super) fn crumb_frame(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
 /// The view's box, row 0: where the session runs — the project and the
 /// checkout in it — what runs there and on which model, each named with
 /// the chord that changes it, set far enough apart that no two read as
-/// one phrase. The checkout wears a `▾` where the others wear a chord: a
-/// click on it drops the WORKTREE PICKER down from it.
+/// one phrase. The checkout's chord is `^T`: it, or a click on the
+/// branch, drops the WORKTREE PICKER down from it.
 ///
 /// Widest form that fits, in order: labelled and airy; labelled and
 /// tight; the values and their chords alone; then the same without the
@@ -1490,8 +2077,8 @@ pub(super) fn crumb_frame(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
 /// green the box's frame turns. A box aimed away from the grid behind it
 /// fires a BACKGROUND LAUNCH: the project is the half that changed, and
 /// nothing on screen will move when Enter lands, so the project is lit.
-/// A PR SESSION's head branch wears no `▾` and is no button: its checkout
-/// is the DAEMON's to pick.
+/// A PR SESSION's head branch wears no `^T` and is no button: its
+/// checkout is the DAEMON's to pick.
 ///
 /// Returns the row, each field's own columns within it — the label, the
 /// value and the chord together, never the air between two fields — so a
@@ -1533,7 +2120,7 @@ pub(super) fn detail_line(app: &App, launch: &QuickLaunch, width: u16, th: Theme
 
 /// [`detail_line`]'s answer: the row, each drawn field's `(field, first
 /// column, width)` within it, and the branch's `(first column, width)` —
-/// the value and its `▾`, None when it was dropped for room or names a
+/// the value and its `^T`, None when it was dropped for room or names a
 /// checkout nobody picks.
 pub(super) struct DetailLine {
     pub line: Line<'static>,
@@ -1550,7 +2137,7 @@ const MIN_PROJECT: usize = 8;
 const MIN_BRANCH: usize = 12;
 
 /// The gap between two of [`detail_line`]'s fields — wide enough that
-/// `api-server ^P` and `agent claude` never read as one phrase — and the
+/// `api-server ^P` and `harness claude` never read as one phrase — and the
 /// one a box too narrow for that falls back to.
 const DETAIL_GAP: &str = "   ·   ";
 const DETAIL_TIGHT: &str = " · ";
@@ -1573,11 +2160,15 @@ struct Details {
 
 impl Details {
     fn of(app: &App, launch: &QuickLaunch) -> Self {
-        let harness = launch
+        let mut harness = launch
             .custom
             .as_deref()
             .unwrap_or_else(|| launch.kind.as_str())
             .to_string();
+        // A CLAUDE CLOUD box says so on the button that toggles it.
+        if launch.cloud {
+            harness.push_str(" · cloud");
+        }
         let mut model = launch.model.clone().unwrap_or_else(|| "default".into());
         if let Some(effort) = launch.effort.as_deref().filter(|e| !e.is_empty()) {
             model.push(' ');
@@ -1651,11 +2242,11 @@ impl Details {
                 "worktree",
                 &self.branch,
                 branch_fg,
-                self.pickable.then_some("▾"),
+                self.pickable.then_some("^T"),
             ),
             (
                 BoxField::Agent,
-                "agent",
+                "harness",
                 &self.harness,
                 th.text,
                 Some("Tab"),
@@ -1791,24 +2382,23 @@ pub(super) fn box_title(launch: &QuickLaunch) -> String {
     if let Some(preset) = &launch.preset {
         head.push(preset.name.clone());
     }
+    if launch.cloud {
+        head.push("Claude Cloud".into());
+    }
     head.join(" · ")
 }
 
 /// The view's box hints, widest that fits in `width`. `^P`, `Tab`, `^O`
 /// and `^N` are not here: each one is now inside the box beside the thing
 /// it changes, and a second copy along the border was most of what made
-/// this box read as a wall of text. `⌘Enter` — launch and step down into
-/// the new session — outlasts the newline and the preset, since nothing
-/// else in the box says it exists.
+/// this box read as a wall of text.
 pub(super) fn box_hint(width: u16) -> &'static str {
-    if width >= 84 {
-        " Enter launch · ⌘Enter launch + focus · ⇧Enter newline · ⇧Tab preset · Esc cancel "
-    } else if width >= 67 {
-        " Enter launch · ⌘Enter launch + focus · ⇧Tab preset · Esc cancel "
-    } else if width >= 46 {
-        " Enter launch · ⌘Enter + focus · Esc cancel "
+    if width >= 60 {
+        " Enter launch · ⇧Enter newline · ⇧Tab preset · Esc cancel "
+    } else if width >= 43 {
+        " Enter launch · ⇧Tab preset · Esc cancel "
     } else if width >= 29 {
-        " ↵ launch · ⌘↵ focus · Esc "
+        " Enter launch · Esc cancel "
     } else if width >= 25 {
         " ↵ launch · Esc cancel "
     } else {
@@ -1910,6 +2500,28 @@ pub(super) fn draw_project_picker(f: &mut Frame, app: &mut App, picker: &Project
 mod tests {
     use super::*;
 
+    /// [`draw_card`] for the tests that draw one card alone.
+    fn draw_one(
+        f: &mut Frame,
+        app: &App,
+        area: Rect,
+        row: &LauncherRow,
+        selected: bool,
+        focused: bool,
+        th: Theme,
+    ) {
+        draw_card(
+            f.buffer_mut(),
+            app,
+            area,
+            row,
+            selected,
+            focused,
+            th,
+            &mut None,
+        );
+    }
+
     /// `^P` opens the PROJECT PICKER *over* the box, so the rect it takes
     /// is strictly inside the box's on all four sides — the frame, the
     /// title and the details row above the list stay on screen however
@@ -1965,7 +2577,7 @@ mod tests {
         // beside what they change, so the hint must not name them again.
         for width in 11..=120u16 {
             let hint = box_hint(width);
-            for chord in ["^P", "^O", "^N", "Tab agent"] {
+            for chord in ["^P", "^T", "^O", "^N", "Tab agent"] {
                 assert!(
                     !hint.contains(chord),
                     "{width}: {hint:?} still says {chord}"
@@ -1974,7 +2586,7 @@ mod tests {
         }
         // And the box at its own size names every key it has.
         let full = box_hint(BOX_SIZE.0);
-        for key in ["Enter launch", "⌘Enter launch + focus", "⇧Enter newline"] {
+        for key in ["Enter launch", "⇧Enter newline", "⇧Tab preset"] {
             assert!(full.contains(key), "{full:?} lost {key}");
         }
     }
@@ -2010,8 +2622,8 @@ mod tests {
         assert_eq!(box_title(&launch), "New session");
     }
 
-    /// The details row names all four values, the three chords and the
-    /// branch's `▾`, and fits the box it is drawn in.
+    /// The details row names all four values and their four chords, and
+    /// fits the box it is drawn in.
     #[test]
     fn the_details_row_carries_every_chord() {
         let th = Theme::default();
@@ -2026,8 +2638,8 @@ mod tests {
             "project ",
             "^P",
             "worktree ",
-            "▾",
-            "agent ",
+            "^T",
+            "harness ",
             "claude",
             "Tab",
             "model ",
@@ -2055,7 +2667,7 @@ mod tests {
 
     /// Every field the row draws hands back the columns it was drawn in,
     /// and those columns hold exactly that field's own text — so a click
-    /// on `agent claude Tab` cannot open the model list. A tier that drops
+    /// on `harness claude Tab` cannot open the model list. A tier that drops
     /// a field hands back nothing for it: what is not drawn is no button.
     #[test]
     fn every_drawn_detail_hands_back_its_own_columns() {
@@ -2079,7 +2691,7 @@ mod tests {
                 let cut: String = text[x..x + w].iter().collect();
                 let chord = match field {
                     BoxField::Project => "^P",
-                    BoxField::Worktree => "▾",
+                    BoxField::Worktree => "^T",
                     BoxField::Agent => "Tab",
                     BoxField::Model => "^O",
                 };
@@ -2159,6 +2771,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             })
             .collect();
@@ -2195,66 +2808,251 @@ mod tests {
             .expect("a row for the session");
     }
 
-    /// The whole view, drawn: a body too short for every card says so in
-    /// its header, and says it about exactly the cards the grid left off.
-    /// This is what a PANE dragged up over the grid looks like — the
-    /// cards that lost their room are counted rather than simply gone.
+    /// The whole view, drawn inside a worktree: a body too short for every
+    /// card says so on the worktree's rule, and says it about exactly the
+    /// cards the grid left off. This is what a PANE dragged up over the
+    /// grid looks like — the cards that lost their room are counted rather
+    /// than simply gone — and the grid's own edge says it again where the
+    /// eye looks for the rest.
     #[test]
     fn a_body_too_short_for_its_cards_counts_them_in_the_header() {
-        use crate::launcher::{CARD_H, HEAD_H};
+        use crate::launcher::{BAND_RULE_H, BELOW_MARK_H, CARD_H, GAP_Y, HEAD_H};
         let mut app = a_crowded_tree(9);
         select(&mut app, "api");
         // The cursor on the grid's first card, the way a project opens:
         // everything missing is under the fold.
         let first = crate::launcher::rows(&app)[0].agent.id.0.clone();
         aim_at(&mut app, &first);
-        // One column, room for two rows of cards: seven of the nine are
+        // One column, the `sessions` rule, room for two rows of cards and
+        // the row under them the `↓` marker takes: seven of the nine are
         // under the fold.
-        let body = Rect::new(0, 0, 60, HEAD_H + CARD_H * 2 + 1);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(body.width, body.height))
-                .unwrap();
-        terminal.draw(|f| draw(f, &mut app, body)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let text = |row: u16| -> String {
-            (0..body.width)
-                .filter_map(|x| buf.cell((x, row)))
-                .map(|c| c.symbol().to_string())
-                .collect()
-        };
-        let head = text(1);
+        let body = Rect::new(
+            0,
+            0,
+            60,
+            HEAD_H + BAND_RULE_H + CARD_H * 2 + GAP_Y + BELOW_MARK_H,
+        );
+        let lines = drawn_lines(&mut app, body);
+        let head = &lines[1];
         assert!(head.contains("9 sessions"), "{head:?}");
         assert!(head.contains("↓ 7 hidden"), "{head:?}");
 
         // And the grid really did draw two of them: the header is not
         // guessing at a number the drawing disagrees with.
-        let drawn = (0..body.height)
-            .map(text)
+        let drawn = lines
+            .iter()
             .filter(|line| line.contains("session "))
             .count();
-        assert_eq!(drawn, 2, "two cards on screen, seven hidden");
+        assert_eq!(drawn, 2, "two cards on screen, seven hidden: {lines:#?}");
+
+        // The EDGE MARKERS: the row under the cards says what is below;
+        // nothing is scrolled off the top, so the row of air over them
+        // says nothing.
+        let last = lines.last().unwrap();
+        assert!(last.contains("↓ 7 more below"), "{last:?}");
+        let air = &lines[usize::from(HEAD_H) - 1];
+        assert!(air.trim().is_empty(), "nothing above: {air:?}");
     }
 
-    /// A grid with room for every card keeps the header it has today —
+    /// The screenshot: nine sessions and three terminals, the cursor
+    /// walked down onto the first terminal in a body two rows short of
+    /// the lot. The window scrolls two rows, and the first row of
+    /// sessions — one row too far up to be drawn whole — is drawn to the
+    /// edge, its top border off screen and its name row on the window's
+    /// first, where a card-sized hole used to stand. The row of air over
+    /// the grid says what is above, the row kept under it what is below,
+    /// and the header counts both.
+    #[test]
+    fn a_card_cut_by_the_top_edge_is_drawn_to_the_edge_not_dropped() {
+        use crate::launcher::HEAD_H;
+        use nebula_core::{TerminalId, TerminalTab, WorktreeId};
+        let mut app = a_crowded_tree(9);
+        select(&mut app, "api");
+        for i in 1..=3 {
+            app.tree.terminals.push(TerminalTab {
+                id: TerminalId(format!("t{i}")),
+                worktree_id: WorktreeId("w0".into()),
+                name: format!("term-{i}"),
+                sort_order: i,
+                alive: true,
+                run_command: None,
+            });
+        }
+        app.sel_session = app
+            .visible_session_rows()
+            .iter()
+            .position(|row| matches!(row, crate::app::SessionRow::Terminal(t) if t.id.0 == "t1"))
+            .expect("a row for the terminal");
+        let body = Rect::new(0, 0, 100, 58);
+        let lines = drawn_lines(&mut app, body);
+        assert_eq!(
+            app.launcher_scroll, 2,
+            "two rows, the least that shows the cursor's card"
+        );
+        let head = &lines[1];
+        assert!(head.contains("↑↓ 4 hidden"), "{head:?}");
+        let air = &lines[usize::from(HEAD_H) - 1];
+        assert!(air.contains("↑ 2 more above"), "{air:?}");
+        let top = &lines[usize::from(HEAD_H)];
+        assert!(
+            top.contains("session "),
+            "the cut card's name row is the window's first: {top:?}"
+        );
+        assert!(!top.contains('╭'), "its top border is off screen: {top:?}");
+        let last = lines.last().unwrap();
+        assert!(last.contains("↓ 2 more below"), "{last:?}");
+        // The cursor's card is whole: its bottom border on the window's
+        // last row, just over the marker.
+        let bottom = &lines[lines.len() - 2];
+        assert!(bottom.contains('╰'), "{bottom:?}");
+        assert!(lines.iter().any(|l| l.contains("term-1")), "{lines:#?}");
+    }
+
+    /// A grid with room for every card keeps the rule it has today —
     /// the marker is a thing that appears, not a thing that is always
     /// there saying zero.
     #[test]
     fn a_grid_that_fits_says_nothing_about_hiding() {
-        use crate::launcher::{CARD_H, HEAD_H};
+        use crate::launcher::{BAND_RULE_H, CARD_H, GAP_Y, HEAD_H};
         let mut app = a_crowded_tree(2);
         select(&mut app, "api");
-        let body = Rect::new(0, 0, 60, HEAD_H + CARD_H * 2 + 1);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(body.width, body.height))
-                .unwrap();
-        terminal.draw(|f| draw(f, &mut app, body)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let head: String = (0..body.width)
-            .filter_map(|x| buf.cell((x, 1)))
-            .map(|c| c.symbol().to_string())
-            .collect();
+        let body = Rect::new(0, 0, 60, HEAD_H + BAND_RULE_H + CARD_H * 2 + GAP_Y);
+        let lines = drawn_lines(&mut app, body);
+        let head = &lines[1];
         assert!(head.contains("2 sessions"), "{head:?}");
         assert!(!head.contains("hidden"), "{head:?}");
+    }
+
+    /// A terminal's card is two session cards wide and carries, under its
+    /// name and what runs in it, the last lines its shell printed — the
+    /// tail the daemon answered with — and the frame notes the card for
+    /// the next ask. Once the shell is gone the lines stay and `exited`
+    /// sits at the name row's right: the card says what it was doing
+    /// when it went.
+    #[test]
+    fn a_terminal_card_shows_what_its_shell_last_printed() {
+        use crate::app::TerminalTail;
+        use nebula_core::{TerminalId, TerminalTab, WorktreeId};
+        let mut app = a_tree();
+        select(&mut app, "api");
+        app.tree.terminals.push(TerminalTab {
+            id: TerminalId("t1".into()),
+            worktree_id: WorktreeId("w0".into()),
+            name: "shell-1".into(),
+            sort_order: 0,
+            alive: true,
+            run_command: None,
+        });
+        app.terminal_tails.insert(
+            TerminalId("t1".into()),
+            TerminalTail {
+                lines: vec!["$ npm test".into(), "ok 12 tests".into()],
+                end_seq: 9,
+            },
+        );
+        let body = Rect::new(0, 0, 100, 30);
+        let lines = drawn_lines(&mut app, body);
+        let row = lines
+            .iter()
+            .position(|l| l.contains("shell-1"))
+            .expect("the terminal's card");
+        assert!(
+            lines[row + 1].contains("shell"),
+            "what runs in it: {:?}",
+            lines[row + 1]
+        );
+        assert!(
+            lines[row + 2].contains("$ npm test"),
+            "{:?}",
+            lines[row + 2]
+        );
+        assert!(
+            lines[row + 3].contains("ok 12 tests"),
+            "{:?}",
+            lines[row + 3]
+        );
+        assert!(!lines[row].contains("exited"), "alive: {:?}", lines[row]);
+        let widths: Vec<u16> = app
+            .hits
+            .iter()
+            .filter(|(_, h)| matches!(h, HitTarget::LauncherCard(_)))
+            .map(|(r, _)| r.width)
+            .collect();
+        assert_eq!(widths.len(), 2, "the session and the terminal: {widths:?}");
+        assert_eq!(
+            widths[1],
+            widths[0] * 2 + crate::launcher::GAP_X,
+            "the terminal's card spans two columns"
+        );
+        assert_eq!(
+            app.tail_cards,
+            vec![TerminalId("t1".into())],
+            "the frame notes the terminal for the grid's next ask"
+        );
+
+        app.tree.terminals[0].alive = false;
+        let lines = drawn_lines(&mut app, body);
+        let row = lines
+            .iter()
+            .position(|l| l.contains("shell-1"))
+            .expect("the terminal's card");
+        assert!(lines[row].contains("exited │"), "{:?}", lines[row]);
+        assert!(
+            lines[row + 2].contains("$ npm test"),
+            "the lines stay: {:?}",
+            lines[row + 2]
+        );
+    }
+
+    /// A session card's second row says what the session runs on — the
+    /// harness, the model and the reasoning effort it was launched with,
+    /// `claude opus high` — and a session on the CLI's own default effort
+    /// ends at the model.
+    #[test]
+    fn a_session_card_names_its_effort_beside_the_model() {
+        let mut app = a_tree();
+        select(&mut app, "api");
+        app.tree.agents[0].model = Some("opus".into());
+        app.tree.agents[0].effort = Some("high".into());
+        let body = Rect::new(0, 0, 100, 30);
+        let lines = drawn_lines(&mut app, body);
+        let row = lines
+            .iter()
+            .position(|l| l.contains("s0"))
+            .expect("the session's card");
+        assert!(
+            lines[row + 1].contains("claude opus high"),
+            "what it runs on: {:?}",
+            lines[row + 1]
+        );
+
+        app.tree.agents[0].effort = None;
+        let lines = drawn_lines(&mut app, body);
+        let row = lines
+            .iter()
+            .position(|l| l.contains("s0"))
+            .expect("the session's card");
+        assert!(
+            lines[row + 1].contains("claude opus") && !lines[row + 1].contains("high"),
+            "the CLI's default effort is unnamed: {:?}",
+            lines[row + 1]
+        );
+    }
+
+    /// The runs-on line is the harness, then the model, then the effort,
+    /// each only while the row carries it; a cloud row names the sandbox
+    /// in place of harness and model and keeps the effort, as the pane's
+    /// breadcrumb does.
+    #[test]
+    fn the_runs_on_line_is_harness_model_effort() {
+        let mut a = a_tree().tree.agents[0].clone();
+        assert_eq!(runs_on_line(&a, &mut None), "claude");
+        a.effort = Some("high".into());
+        assert_eq!(runs_on_line(&a, &mut None), "claude high");
+        a.model = Some("opus".into());
+        assert_eq!(runs_on_line(&a, &mut None), "claude opus high");
+        a.cloud_session_id = Some("c1".into());
+        assert_eq!(runs_on_line(&a, &mut None), "cloud high");
     }
 
     /// Every row of `body` as drawn with the view on it.
@@ -2274,54 +3072,91 @@ mod tests {
             .collect()
     }
 
-    /// The air under the last whole row of cards says how many more are
-    /// down there — in that air, under the cards, not over them — and
-    /// says nothing once the walk down has brought the last one on screen.
+    /// `a_tree` with `count` checkouts in `api` instead of one, a session
+    /// in each, so the grid can be given more bands than the body has
+    /// room for.
+    fn a_tree_with_worktrees(count: usize) -> App {
+        use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, Worktree, WorktreeId};
+        let mut app = a_tree();
+        let one = app.tree.agents[0].clone();
+        app.tree.worktrees = (0..count)
+            .map(|i| Worktree {
+                id: WorktreeId(format!("wt{i}")),
+                project_id: nebula_core::ProjectId("p0".into()),
+                path: format!("/tmp/wt{i}").into(),
+                branch: format!("feat-{i}"),
+                is_main: false,
+                sort_order: i as i64,
+            })
+            .collect();
+        app.tree.agents = (0..count)
+            .map(|i| Agent {
+                id: AgentId(format!("api{i}")),
+                worktree_id: WorktreeId(format!("wt{i}")),
+                name: format!("session {i}"),
+                status: AgentStatus::Finished,
+                kind: AgentKind::Claude,
+                sort_order: i as i64,
+                ..one.clone()
+            })
+            .collect();
+        app.launcher_inside = false;
+        app
+    }
+
+    /// Put the cursor on the band of checkout `id`, at the band level.
+    fn aim_at_band(app: &mut App, id: &str) {
+        app.sel_worktree = app
+            .worktree_row_of(&nebula_core::WorktreeId(id.into()))
+            .expect("a row for the checkout");
+        app.launcher_inside = false;
+    }
+
+    /// The air under the last whole band says how many more are down
+    /// there — in that air, under the bands, not over them — and says
+    /// nothing once the walk down has brought the last one on screen.
     #[test]
     fn the_air_under_the_cards_says_how_many_more_are_below() {
-        use crate::launcher::{CARD_H, GAP_Y, HEAD_H};
-        let mut app = a_crowded_tree(9);
+        use crate::launcher::{BAND_H, GAP_Y, HEAD_H};
+        let mut app = a_tree_with_worktrees(9);
         select(&mut app, "api");
-        let ids: Vec<String> = crate::launcher::rows(&app)
-            .iter()
-            .map(|row| row.agent.id.0.clone())
-            .collect();
-        aim_at(&mut app, &ids[0]);
-        // One column, two rows of cards and four rows of air under them.
-        let cards_end = HEAD_H + CARD_H * 2 + GAP_Y;
-        let body = Rect::new(0, 0, 60, cards_end + 4);
+        aim_at_band(&mut app, "wt0");
+        // Room for two bands and four rows of air under them.
+        let bands_end = HEAD_H + BAND_H * 2 + GAP_Y;
+        let body = Rect::new(0, 0, 60, bands_end + 4);
         let lines = drawn_lines(&mut app, body);
         let cue: Vec<usize> = (0..lines.len())
-            .filter(|&y| lines[y].contains("more session"))
+            .filter(|&y| lines[y].contains("more worktree"))
             .collect();
         assert_eq!(cue.len(), 1, "{lines:#?}");
         assert!(
-            lines[cue[0]].contains("↓ 7 more sessions below"),
+            lines[cue[0]].contains("↓ 7 more worktrees below"),
             "{:?}",
             lines[cue[0]]
         );
-        assert!(cue[0] >= cards_end as usize, "under the cards: {lines:#?}");
+        assert!(cue[0] >= bands_end as usize, "under the bands: {lines:#?}");
 
-        // Walked to the last card, nothing is left below to point at.
-        aim_at(&mut app, &ids[8]);
+        // Walked to the last band, nothing is left below to point at.
+        aim_at_band(&mut app, "wt8");
         let lines = drawn_lines(&mut app, body);
         assert!(
-            lines.iter().all(|line| !line.contains("more session")),
+            lines.iter().all(|line| !line.contains("more worktree")),
             "{lines:#?}"
         );
     }
 
-    /// A grid with every card on screen leaves its air empty, however
+    /// A grid with every band on screen leaves its air empty, however
     /// much of it there is.
     #[test]
     fn a_grid_that_fits_leaves_its_air_empty() {
-        use crate::launcher::{CARD_H, HEAD_H};
-        let mut app = a_crowded_tree(2);
+        use crate::launcher::{BAND_H, HEAD_H};
+        let mut app = a_tree_with_worktrees(2);
         select(&mut app, "api");
-        let body = Rect::new(0, 0, 60, HEAD_H + CARD_H * 2 + 6);
+        aim_at_band(&mut app, "wt0");
+        let body = Rect::new(0, 0, 60, HEAD_H + BAND_H * 2 + 6);
         let lines = drawn_lines(&mut app, body);
         assert!(
-            lines.iter().all(|line| !line.contains("more session")),
+            lines.iter().all(|line| !line.contains("more worktree")),
             "{lines:#?}"
         );
     }
@@ -2335,128 +3170,6 @@ mod tests {
             .iter()
             .position(|i| app.tree.projects[*i].name == name)
             .expect("a row for the project");
-    }
-
-    /// The PANE's TAB STRIP, as one string.
-    fn strip_text(app: &App, room: usize) -> String {
-        pane_tabs(app, room)
-            .iter()
-            .flat_map(|tab| tab.spans.iter())
-            .map(|s| s.content.as_ref())
-            .collect()
-    }
-
-    /// A tree whose `api` card runs in a `feat` checkout holding `count`
-    /// terminals — the strip's whole subject.
-    fn a_tree_with_terminals(count: usize) -> App {
-        use nebula_core::{TerminalId, TerminalTab, WorktreeId};
-        let mut app = a_tree();
-        select(&mut app, "api");
-        app.tree.terminals = (1..=count)
-            .map(|i| TerminalTab {
-                id: TerminalId(format!("t{i}")),
-                worktree_id: WorktreeId("w0".into()),
-                name: format!("shell-{i}"),
-                sort_order: i as i64,
-                alive: true,
-                run_command: None,
-            })
-            .collect();
-        app
-    }
-
-    /// A strip too narrow for every tab counts what it could not draw
-    /// rather than clipping a name in half — and never gives up the
-    /// SESSION tab or the checkout to do it, since those are what the
-    /// terminals after them are scoped by.
-    #[test]
-    fn a_narrow_strip_counts_the_tabs_it_cannot_draw() {
-        let app = a_tree_with_terminals(6);
-        let width = |room| {
-            pane_tabs(&app, room)
-                .iter()
-                .map(PaneTab::width)
-                .sum::<usize>()
-        };
-
-        let wide = strip_text(&app, 140);
-        assert!(wide.contains("shell-6"), "all six fit: {wide:?}");
-        assert!(!wide.contains('+'), "so nothing is counted: {wide:?}");
-
-        let tight = strip_text(&app, 60);
-        assert!(tight.contains("SESSION"), "{tight:?}");
-        assert!(
-            tight.contains("feat"),
-            "the checkout never gives way: {tight:?}"
-        );
-        assert!(
-            tight.contains('+'),
-            "what did not fit is counted: {tight:?}"
-        );
-        assert!(
-            !tight.contains("shell-6"),
-            "and is not also drawn: {tight:?}"
-        );
-        assert!(width(60) <= 60, "the strip fits its room: {tight:?}");
-    }
-
-    /// The window slides to keep the tab the pane is READING on screen:
-    /// with more terminals than fit, a pinned one past the right edge
-    /// pulls the strip to it and what is now behind is counted on the
-    /// left. Otherwise `` ` `` could walk onto a tab that nothing on the
-    /// strip shows as active.
-    #[test]
-    fn the_strip_keeps_the_tab_it_is_reading_on_screen() {
-        use nebula_core::TerminalId;
-        let mut app = a_tree_with_terminals(6);
-        // Narrow enough that the last terminals fall off the end.
-        let room = 60;
-        let drawn = |app: &App| -> Vec<usize> {
-            pane_tabs(app, room)
-                .iter()
-                .filter_map(|tab| match tab.hit {
-                    Some(HitTarget::LauncherPaneTerminal(i)) => Some(i),
-                    _ => None,
-                })
-                .collect()
-        };
-        assert!(
-            !drawn(&app).contains(&5),
-            "the last tab is off the end to begin with: {:?}",
-            drawn(&app)
-        );
-
-        app.launcher_terminal = Some(TerminalId("t6".into()));
-        assert!(
-            drawn(&app).contains(&5),
-            "reading it pulls the strip to it: {:?}",
-            drawn(&app)
-        );
-        let text = strip_text(&app, room);
-        assert!(text.contains("shell-6"), "and draws it: {text:?}");
-        assert!(
-            text.contains('+'),
-            "with what is behind it counted: {text:?}"
-        );
-        assert!(
-            pane_tabs(&app, room)
-                .iter()
-                .map(PaneTab::width)
-                .sum::<usize>()
-                <= room,
-            "and still fits: {text:?}"
-        );
-    }
-
-    /// With no terminals in the checkout the strip names the key that
-    /// opens one rather than trailing off after the divider.
-    #[test]
-    fn an_empty_checkout_says_which_key_opens_a_terminal() {
-        let app = a_tree_with_terminals(0);
-        let text = strip_text(&app, 120);
-        assert!(text.contains("SESSION"), "{text:?}");
-        assert!(text.contains('│'), "the divider is still drawn: {text:?}");
-        assert!(text.contains("opens a terminal here"), "{text:?}");
     }
 
     /// The HIDDEN MARKER: a grid that holds every card says nothing, and
@@ -2515,6 +3228,10 @@ mod tests {
         width: usize,
         th: Theme,
     ) -> Vec<Span<'static>> {
+        let count = HeadCount {
+            sessions: count,
+            terminals: 0,
+        };
         head_count(app, count, hidden, width, th)
             .into_iter()
             .map(|(span, _)| span)
@@ -2787,7 +3504,7 @@ mod tests {
             assert!(line.width() <= width as usize, "{width}: {text:?}");
             assert!(text.contains("new worktree"), "{width}: {text:?}");
             assert!(
-                !text.contains(" / ") && !text.contains('▾'),
+                !text.contains(" / ") && !text.contains("^T"),
                 "{width}: the header carries no checkout crumb: {text:?}"
             );
             let (x, w) = toggle.expect("a worktree launch has a toggle to click");
@@ -2796,10 +3513,10 @@ mod tests {
     }
 
     /// The branch in the details row is the WORKTREE PICKER's button: the
-    /// columns handed back are exactly the branch and its `▾`, inside the
+    /// columns handed back are exactly the branch and its `^T`, inside the
     /// `worktree` field's own, however the row had to shrink — and none
     /// once the field is dropped for room. A PR SESSION's branch is no
-    /// button at all, and wears no `▾`: its checkout is the DAEMON's to
+    /// button at all, and wears no `^T`: its checkout is the DAEMON's to
     /// pick.
     #[test]
     fn the_details_row_hands_back_the_branch_button() {
@@ -2814,14 +3531,15 @@ mod tests {
                 .iter()
                 .find(|(f, _, _)| *f == BoxField::Worktree);
             let Some((x, w)) = details.branch else {
-                assert!(!text.contains(&'▾'), "{width}: no button, no ▾");
+                let row: String = text.iter().collect();
+                assert!(!row.contains("^T"), "{width}: no button, no ^T");
                 assert!(field.is_none(), "{width}: no branch, no field");
                 continue;
             };
             seen += 1;
             let under: String = text[usize::from(x)..usize::from(x + w)].iter().collect();
             assert!(
-                under.starts_with("(worktree") && under.ends_with(" ▾"),
+                under.starts_with("(worktree") && under.ends_with(" ^T"),
                 "{width}: {under:?}"
             );
             let (_, fx, fw) = field.expect("a drawn branch is a field");
@@ -2840,7 +3558,7 @@ mod tests {
         let details = detail_line(&app, &pr, 120, th);
         let text = text_of(&details.line);
         assert!(text.contains("worktree fix-nav"), "{text:?}");
-        assert!(!text.contains('▾'), "{text:?}");
+        assert!(!text.contains("^T"), "{text:?}");
         assert_eq!(details.branch, None);
         assert!(
             !details
@@ -2883,15 +3601,16 @@ mod tests {
         assert!(text.contains("yellow-fox-"), "the branch cut: {text:?}");
         assert!(!text.contains("lazy-dog"), "the branch cut: {text:?}");
     }
-    /// A card names its checkout in the SCOPE COLOR — `⌂` root, `↳`
-    /// worktree — glyph and branch both, and nothing else on that row, so
-    /// the two scopes sort a screenful of cards before a word is read.
-    #[test]
-    fn a_card_paints_its_checkout_in_the_scope_color() {
+    /// One checkout's BAND, with one session in it, for the rule tests.
+    fn a_band(is_main: bool, branch: &str) -> crate::launcher::Band {
         use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
-
-        fn card(is_main: bool, branch: &str) -> LauncherRow {
-            LauncherRow {
+        crate::launcher::Band {
+            worktree: WorktreeId("w1".into()),
+            project: "nebula".into(),
+            branch: branch.into(),
+            is_main,
+            pr: None,
+            cards: vec![crate::launcher::Card::Session(LauncherRow {
                 agent: Agent {
                     id: AgentId("a1".into()),
                     worktree_id: WorktreeId("w1".into()),
@@ -2909,107 +3628,208 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 },
                 project: "nebula".into(),
                 branch: branch.into(),
                 is_main,
                 pr: None,
-            }
+            })],
         }
-
-        let th = Theme::default();
-        let app = App::new();
-        let area = Rect::new(0, 0, 44, crate::launcher::CARD_H);
-        let painted = |row: &LauncherRow, want: Color| -> String {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                    .unwrap();
-            terminal
-                .draw(|f| draw_card(f, &app, area, row, false, true, th, &mut None))
-                .unwrap();
-            let buf = terminal.backend().buffer().clone();
-            // Row 2 of the buffer is the card's second line: one row of
-            // border, one of name, then this one.
-            (0..area.width)
-                .filter_map(|x| buf.cell((x, 2)))
-                .filter(|c| c.fg == want)
-                .map(|c| c.symbol().to_string())
-                .collect()
-        };
-
-        let root = card(true, "main");
-        let worktree = card(false, "feat-x");
-        assert_eq!(painted(&root, th.root), "⌂ main");
-        assert_eq!(painted(&worktree, th.worktree), "↳ feat-x");
-        // And neither wears the other's color anywhere on that row.
-        assert_eq!(painted(&root, th.worktree), "");
-        assert_eq!(painted(&worktree, th.root), "");
     }
 
-    /// The checkout's changed-file count rides right behind the branch in
-    /// the heads-up color, and on a card too narrow for the word it keeps
-    /// the number and drops `files` before the branch gives up more.
-    #[test]
-    fn a_card_counts_its_checkouts_changes_behind_the_branch() {
-        use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
-        let row = LauncherRow {
-            agent: Agent {
-                id: AgentId("a1".into()),
-                worktree_id: WorktreeId("w1".into()),
-                name: "fix login".into(),
-                status: AgentStatus::Finished,
-                archived: false,
-                archived_at: 0,
-                unseen: false,
-                kind: AgentKind::Claude,
-                custom_harness: None,
-                model: None,
-                effort: None,
-                session_id: None,
-                cloud_session_id: None,
-                sort_order: 0,
-                status_changed_at: 0,
-                alive: true,
-                recent_prompts: Vec::new(),
+    /// A band's rule drawn on one row `width` wide, as the buffer: a
+    /// band the cursor is not on, with every card on its row.
+    fn rule_row(app: &App, band: &crate::launcher::Band, width: u16) -> ratatui::buffer::Buffer {
+        rule_row_as(
+            app,
+            band,
+            width,
+            BandRule::Band {
+                index: 0,
+                on: false,
+                lit: false,
+                more: 0,
             },
-            project: "nebula".into(),
-            branch: "feat-x".into(),
-            is_main: false,
-            pr: None,
-        };
-        let th = Theme::default();
+        )
+    }
+
+    /// [`rule_row`] for a band drawn as `rule` says.
+    fn rule_row_as(
+        app: &App,
+        band: &crate::launcher::Band,
+        width: u16,
+        rule: BandRule,
+    ) -> ratatui::buffer::Buffer {
+        let area = Rect::new(0, 0, width, 1);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                draw_band_rule(f.buffer_mut(), app, area, band, rule);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The cells of a buffer's row `y` painted in `want`, as text.
+    fn painted(buf: &ratatui::buffer::Buffer, y: u16, want: Color) -> String {
+        (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, y)))
+            .filter(|c| c.fg == want)
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    /// A buffer's row `y` as text.
+    fn row_string(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, y)))
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    /// A band's rule names its checkout in the SCOPE COLOR — `⌂` root,
+    /// `↳` worktree — glyph and branch both, and nothing else on the rule,
+    /// so the two scopes sort a screenful of bands before a word is read.
+    #[test]
+    fn a_band_paints_its_checkout_in_the_scope_color() {
+        let app = App::new();
+        let th = app.theme;
+        let root = rule_row(&app, &a_band(true, "main"), 44);
+        let worktree = rule_row(&app, &a_band(false, "feat-x"), 44);
+        assert_eq!(painted(&root, 0, th.root), "⌂ main");
+        assert_eq!(painted(&worktree, 0, th.worktree), "↳ feat-x");
+        // And neither wears the other's color anywhere on that row.
+        assert_eq!(painted(&root, 0, th.worktree), "");
+        assert_eq!(painted(&worktree, 0, th.root), "");
+        // The cards under it say what runs in the checkout, not where.
+        let text = row_string(&worktree, 0);
+        assert!(text.contains("1 session"), "{text:?}");
+    }
+
+    /// The checkout's changed-file count rides right behind the branch on
+    /// its band's rule, in the heads-up color, and on a rule too narrow
+    /// for the word it keeps the number and drops `files` before the
+    /// branch gives up more.
+    #[test]
+    fn a_band_counts_its_checkouts_changes_behind_the_branch() {
+        use nebula_core::WorktreeId;
         let mut app = App::new();
+        let th = app.theme;
         app.worktree_changes.insert(
             WorktreeId("w1".into()),
             (Some(3), std::time::Instant::now()),
         );
-        let second_row = |width: u16| -> (String, String) {
-            let area = Rect::new(0, 0, width, crate::launcher::CARD_H);
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, area.height))
-                    .unwrap();
-            terminal
-                .draw(|f| draw_card(f, &app, area, &row, false, true, th, &mut None))
-                .unwrap();
-            let buf = terminal.backend().buffer().clone();
-            let cells = || (0..width).filter_map(|x| buf.cell((x, 2)));
-            (
-                cells().map(|c| c.symbol().to_string()).collect(),
-                cells()
-                    .filter(|c| c.fg == th.warn)
-                    .map(|c| c.symbol().to_string())
-                    .collect(),
-            )
+        let band = a_band(false, "feat-x");
+
+        let buf = rule_row(&app, &band, 44);
+        let text = row_string(&buf, 0);
+        assert!(text.contains("↳ feat-x +3 files"), "{text:?}");
+        assert_eq!(painted(&buf, 0, th.warn).trim(), "+3 files");
+
+        let buf = rule_row(&app, &band, 24);
+        let text = row_string(&buf, 0);
+        assert_eq!(painted(&buf, 0, th.warn).trim(), "+3", "narrow: {text:?}");
+    }
+
+    /// The band the keys are on says so, and what Enter does: its rule
+    /// opens on the CURSOR MARK `❯` in the accent where every other
+    /// band's opens on `──`, and past its counts it spells the key —
+    /// `Enter: see all 8` when cards hang past the row's edge, `Enter:
+    /// open` when the row showed them all. A titled rule looks like a
+    /// divider, and nothing about a divider says a key acts on it. With
+    /// the cursor on the band but the keys elsewhere (up on the PROJECT
+    /// TABS, down in the pane) the rule is the plain gray one again:
+    /// Enter does something else from there.
+    #[test]
+    fn the_band_the_keys_are_on_marks_itself_and_says_what_enter_does() {
+        let app = App::new();
+        let th = app.theme;
+        let key = crate::ui::key_hint(&app, crate::keymap::Action::Activate);
+        let mut band = a_band(true, "main");
+        let card = band.cards[0].clone();
+        band.cards.extend(std::iter::repeat_n(card, 7));
+        let lit = |more| BandRule::Band {
+            index: 0,
+            on: true,
+            lit: true,
+            more,
         };
 
-        let (text, warn) = second_row(44);
-        assert!(text.contains("↳ feat-x +3 files · claude"), "{text:?}");
-        assert_eq!(warn.trim(), "+3 files");
+        let buf = rule_row_as(&app, &band, 96, lit(6));
+        let text = row_string(&buf, 0);
+        assert!(text.starts_with("❯  ⌂ main"), "{text:?}");
+        assert!(
+            text.contains(&format!("8 sessions  ▸ 6 more  {key}: see all 8 ──")),
+            "{text:?}"
+        );
+        // The mark and the key in the accent, the checkout still in its
+        // own color and nothing else in it.
+        let accent = painted(&buf, 0, th.accent);
+        assert!(accent.starts_with('❯'), "{accent:?}");
+        assert!(accent.contains(&key), "{accent:?}");
+        assert_eq!(painted(&buf, 0, th.root), "⌂ main");
 
-        let (text, warn) = second_row(22);
-        assert_eq!(warn.trim(), "+3", "narrow: {text:?}");
-        assert!(text.contains("· claude"), "{text:?}");
+        // Every card on the row: nothing to see more of, so plain `open`.
+        let buf = rule_row_as(&app, &band, 96, lit(0));
+        let text = row_string(&buf, 0);
+        assert!(
+            text.contains(&format!("8 sessions  {key}: open ──")),
+            "{text:?}"
+        );
+
+        // The cursor's band with the keys elsewhere: bold branch, and
+        // that is all — no mark, no hint, the count as on any band.
+        let buf = rule_row_as(
+            &app,
+            &band,
+            96,
+            BandRule::Band {
+                index: 0,
+                on: true,
+                lit: false,
+                more: 6,
+            },
+        );
+        let text = row_string(&buf, 0);
+        assert!(text.starts_with("── ⌂ main"), "keys elsewhere: {text:?}");
+        assert!(text.contains("8 sessions  ▸ 6 more ──"), "{text:?}");
+        assert!(!text.contains(&key), "{text:?}");
+        assert_eq!(painted(&buf, 0, th.accent), "", "{text:?}");
+    }
+
+    /// A rule too narrow to keep the branch legible beside the words
+    /// drops the Enter hint before the branch gives way — the `❯` still
+    /// says which band is selected, and the count still says what hangs
+    /// past the edge. Give it the room and the words are back.
+    #[test]
+    fn a_narrow_rule_keeps_the_cursor_mark_and_drops_the_enter_hint() {
+        let app = App::new();
+        let key = crate::ui::key_hint(&app, crate::keymap::Action::Activate);
+        let mut band = a_band(false, "feat-x");
+        let card = band.cards[0].clone();
+        band.cards.extend(std::iter::repeat_n(card, 2));
+        let rule = BandRule::Band {
+            index: 0,
+            on: true,
+            lit: true,
+            more: 2,
+        };
+
+        let buf = rule_row_as(&app, &band, 40, rule);
+        let text = row_string(&buf, 0);
+        assert!(text.starts_with("❯  ↳ feat-x"), "{text:?}");
+        assert!(text.contains("3 sessions  ▸ 2 more ──"), "{text:?}");
+        assert!(!text.contains(&key), "{text:?}");
+
+        let buf = rule_row_as(&app, &band, 72, rule);
+        let text = row_string(&buf, 0);
+        assert!(
+            text.contains(&format!("3 sessions  ▸ 2 more  {key}: see all 3 ──")),
+            "{text:?}"
+        );
     }
 
     /// A card's frame carries its status — red asking, blue done unread,
@@ -3036,6 +3856,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         };
         let th = Theme::by_name("amber");
@@ -3054,7 +3875,7 @@ mod tests {
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                     .unwrap();
             terminal
-                .draw(|f| draw_card(f, &app, area, &row, selected, focused, th, &mut None))
+                .draw(|f| draw_one(f, &app, area, &row, selected, focused, th))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             let corner = buf.cell((0, 0)).unwrap().fg;
@@ -3078,7 +3899,7 @@ mod tests {
         );
         assert_eq!(
             frame(with(AgentStatus::Running, false), false, true),
-            th.warn_edge
+            th.warn
         );
         assert_eq!(
             frame(with(AgentStatus::Finished, false), false, true),
@@ -3096,8 +3917,9 @@ mod tests {
         };
         assert_eq!(frame(archived, false, true), th.edge);
 
-        // The focus wins over every status; off the grid, the cursor's
-        // card shows its status like any other.
+        // The cursor wins over every status, and keeps winning with the
+        // keys off the grid: the outline still says which card the pane
+        // reads while the wash has moved to the pane.
         assert_eq!(
             frame(with(AgentStatus::Running, false), true, true),
             th.accent
@@ -3108,21 +3930,20 @@ mod tests {
         );
         assert_eq!(
             frame(with(AgentStatus::Running, false), true, false),
-            th.warn_edge
+            th.accent
         );
         assert_eq!(
             frame(with(AgentStatus::Finished, false), true, false),
-            th.muted
+            th.accent
         );
-        assert_ne!(th.warn_edge, th.accent);
+        assert_ne!(th.warn, th.accent);
     }
 
-    /// CARD LINE COUNTS: with the setting on and a count read, the lines
-    /// follow the file count in the DIFF VIEWER's green and red; a card too
-    /// narrow for all of it drops the word, then the lines; with the setting
-    /// off they never show.
+    /// The card keys land in is filled with the FOCUSED PANEL TINT, frame
+    /// and all; the cursor's card off the grid (outlined, the wash gone to
+    /// the pane) and any other card stay on the terminal's background.
     #[test]
-    fn card_line_counts_follow_the_file_count_in_green_and_red() {
+    fn only_the_focused_card_wears_the_focus_tint() {
         use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
         let row = LauncherRow {
             agent: Agent {
@@ -3142,6 +3963,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: true,
+                issue_url: None,
                 recent_prompts: Vec::new(),
             },
             project: "nebula".into(),
@@ -3149,8 +3971,37 @@ mod tests {
             is_main: false,
             pr: None,
         };
-        let th = Theme::default();
+        let th = Theme::by_name("coral");
         let mut app = App::new();
+        app.theme = th;
+        let fill = |app: &App, selected: bool, focused: bool| {
+            let area = Rect::new(0, 0, 40, crate::launcher::CARD_H);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .unwrap();
+            terminal
+                .draw(|f| draw_one(f, app, area, &row, selected, focused, th))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let corner = buf.cell((0, 0)).unwrap().bg;
+            let inside = buf.cell((20, area.height - 2)).unwrap().bg;
+            assert_eq!(corner, inside, "one fill, frame and all");
+            inside
+        };
+        assert_eq!(fill(&app, true, true), th.focus_tint);
+        assert_eq!(fill(&app, true, false), Color::Reset);
+        assert_eq!(fill(&app, false, true), Color::Reset);
+    }
+
+    /// CARD LINE COUNTS: with the setting on, the lines behind the file
+    /// count follow it on the band's rule in the DIFF VIEWER's green and
+    /// red — `+3 files +120 -45` — and yield after the word and before the
+    /// branch as the rule narrows. Off, the rule says the files alone.
+    #[test]
+    fn card_line_counts_follow_the_file_count_in_green_and_red() {
+        use nebula_core::WorktreeId;
+        let mut app = App::new();
+        let th = app.theme;
         app.worktree_changes.insert(
             WorktreeId("w1".into()),
             (Some(3), std::time::Instant::now()),
@@ -3162,49 +4013,33 @@ mod tests {
                 removed: 45,
             },
         );
-        let second_row = |app: &App, width: u16| -> (String, String, String, String) {
-            let area = Rect::new(0, 0, width, crate::launcher::CARD_H);
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, area.height))
-                    .unwrap();
-            terminal
-                .draw(|f| draw_card(f, app, area, &row, false, true, th, &mut None))
-                .unwrap();
-            let buf = terminal.backend().buffer().clone();
-            let cells = || (0..width).filter_map(|x| buf.cell((x, 2)));
-            let painted = |color| -> String {
-                cells()
-                    .filter(|c| c.fg == color)
-                    .map(|c| c.symbol().to_string())
-                    .collect()
-            };
+        let band = a_band(false, "feat-x");
+        let rule = |app: &App, width: u16| {
+            let buf = rule_row(app, &band, width);
             (
-                cells().map(|c| c.symbol().to_string()).collect(),
-                painted(th.warn),
-                painted(th.ok),
-                painted(th.err),
+                row_string(&buf, 0),
+                painted(&buf, 0, th.warn),
+                painted(&buf, 0, th.ok),
+                painted(&buf, 0, th.err),
             )
         };
 
-        let (text, _, added, removed) = second_row(&app, 60);
+        let (text, _, added, removed) = rule(&app, 60);
         assert!(!text.contains("+120"), "off: {text:?}");
         assert_eq!((added.trim(), removed.trim()), ("", ""));
 
         app.card_line_changes = true;
-        let (text, warn, added, removed) = second_row(&app, 60);
-        assert!(
-            text.contains("↳ feat-x +3 files +120 -45 · claude"),
-            "{text:?}"
-        );
+        let (text, warn, added, removed) = rule(&app, 60);
+        assert!(text.contains("↳ feat-x +3 files +120 -45"), "{text:?}");
         assert_eq!(warn.trim(), "+3 files");
         assert_eq!(added.trim(), "+120");
         assert_eq!(removed.trim(), "-45");
 
-        let (text, warn, added, _) = second_row(&app, 36);
-        assert!(text.contains("↳ feat-x +3 +120 -45 · claude"), "{text:?}");
+        let (text, warn, added, _) = rule(&app, 37);
+        assert!(text.contains("↳ feat-x +3 +120 -45"), "{text:?}");
         assert_eq!((warn.trim(), added.trim()), ("+3", "+120"));
 
-        let (text, warn, added, _) = second_row(&app, 24);
+        let (text, warn, added, _) = rule(&app, 24);
         assert_eq!(warn.trim(), "+3", "narrowest: {text:?}");
         assert_eq!(added.trim(), "", "the lines go before the branch does");
     }
@@ -3239,6 +4074,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: crate::app::now_ms() - 60_000,
                     alive: true,
+                    issue_url: None,
                     recent_prompts: Vec::new(),
                 },
                 project: "nebula".into(),
@@ -3256,7 +4092,7 @@ mod tests {
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                     .unwrap();
             terminal
-                .draw(|f| draw_card(f, &app, area, row, false, true, th, &mut None))
+                .draw(|f| draw_one(f, &app, area, row, false, true, th))
                 .unwrap();
             terminal.backend().buffer().clone()
         };
@@ -3319,10 +4155,10 @@ mod tests {
         assert!(line(&live, 1).ends_with("1m ago"), "{:?}", line(&live, 1));
         assert!(line(&gone, 1).ends_with("2h ago"), "{:?}", line(&gone, 1));
 
-        // And the SCOPE COLOR goes with the rest of the color, the glyph
-        // left to tell the two checkouts apart.
-        assert_eq!(colored(&live, 2, th.root), "\u{2302} main");
-        assert_eq!(colored(&gone, 2, th.root), "");
-        assert_eq!(colored(&gone, 2, th.dim), "\u{2302} main \u{b7} claude");
+        // And the harness row is quiet on both: where the session runs is
+        // its band's rule, not the card's.
+        assert_eq!(colored(&live, 2, th.dim), "claude");
+        assert_eq!(colored(&gone, 2, th.dim), "claude");
+        assert_eq!(colored(&live, 2, th.root), "");
     }
 }

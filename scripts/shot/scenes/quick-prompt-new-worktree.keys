@@ -1,14 +1,4 @@
-# Switch Hide root worktree on, close settings, walk to the WORKTREES PANEL, press p.
-s
-Tab
-Tab
-Tab
-Tab
-j
-j
-j
-Enter
-Escape
-Escape
+# p on the grid, then ^N: the QUICK PROMPT aimed at a fresh worktree.
 Tab
 p
+C-n

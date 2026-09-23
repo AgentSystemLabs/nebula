@@ -73,17 +73,23 @@ pub enum Action {
     /// `x`: close the PROJECT TAB the grid is on, landing on the tab that
     /// slides into its place.
     CloseProjectTab,
-    /// `⌘P` / `+`: the PROJECT DROPDOWN, the list the `+` after the PROJECT
-    /// TABS drops — type to narrow it, Enter or a click opens the project.
+    /// `+` (and `⌘P` where the terminal sends ⌘): the PROJECT DROPDOWN, the
+    /// list the `+` after the PROJECT TABS drops — type to narrow it, Enter
+    /// or a click opens the project.
     ProjectDropdown,
     // projects & worktrees
     AddProject,
     New,
     GitDiff,
     OpenRepo,
-    /// `Shift+P`: the pull request of the session card under the cursor,
-    /// in the browser — the `#42 title` line on the card.
+    /// `Shift+V`: the pull request of the session card under the cursor,
+    /// in the browser — the `#42 title` line on the card. `v` lists the
+    /// project's pull requests in nebula; the shifted key goes to GitHub.
     OpenPullRequest,
+    /// `Shift+I`: the GitHub issue the session card under the cursor was
+    /// started from, in the browser. `i` lists the project's issues in
+    /// nebula; the shifted key goes to GitHub.
+    OpenIssue,
     /// `Shift+C`: a new Ghostty tab in the selected worktree's directory —
     /// a silent no-op on a machine without Ghostty.
     OpenGhosttyTab,
@@ -130,12 +136,17 @@ pub enum Action {
     /// COMPOSER — the next turn typed into the card itself — or fold it
     /// back up.
     FollowUp,
+    /// `Shift+P`: the QUICK PROMPT on the card under the cursor's settings
+    /// — the same harness, model, effort and worktree, and the issue it
+    /// was started from — so the task is all there is to type. `p` opens
+    /// the box on the Agents tab defaults; the shifted key opens it on
+    /// the card.
+    DuplicateSession,
     // files
     FindFile,
     Grep,
     TreeBrowser,
     // terminal
-    Zoom,
     UnlockTerminal,
     // general
     /// `^~`: fold the LAUNCHER VIEW's PANE away and give the cards the
@@ -156,7 +167,6 @@ pub enum Action {
     Hosts,
     Settings,
     Metrics,
-    Splash,
     Help,
     Quit,
 }
@@ -352,13 +362,14 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::ProjectDropdown,
         id: "project_dropdown",
         label: "Switch project",
-        hint: "Launcher view: drop the list of every project under the + in the header — type to narrow it, Enter or a click opens one. ⌘P works from inside the pane too and puts the list away again, but needs the kitty protocol (Ghostty/kitty send it, Terminal.app never does); the bare + is the header's own button and arrives everywhere",
+        hint: "Launcher view: drop the list of every project under the + in the header — type to narrow it, Enter or a click opens one. + is the header's own button and arrives in every terminal and in nebula browser; ⌘P does the same from inside the pane, where the terminal sends ⌘ at all (Ghostty/kitty do, Terminal.app and the browser never do)",
         group: "NAVIGATE",
         scope: Scope::Global,
-        // `⌘P` is the chord to reach for; `+`, the header button's own
-        // glyph, is bound beside it for the terminals that never encode ⌘
-        // — as the bare digits are beside `⌘1`–`⌘9`.
-        defaults: &["cmd+p", "+"],
+        // `+`, the header button's own glyph, is the key the app shows —
+        // it arrives everywhere, where `⌘P` is the browser's print dialog
+        // and Terminal.app's nothing. `⌘P` stays bound behind it as the
+        // one chord a LOCKED PANE lets through in Ghostty and kitty.
+        defaults: &["+", "cmd+p"],
     },
     // ---- PROJECTS & WORKTREES ----
     ActionSpec {
@@ -401,10 +412,19 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::OpenPullRequest,
         id: "open_pull_request",
         label: "Open pull request in browser",
-        hint: "Send the pull request of the session card under the cursor — its checkout's branch — to your browser",
+        hint: "Send the pull request of the session card under the cursor — its checkout's branch — to your browser, as a click on the card's #42 line does. v lists the pull requests in nebula; ⇧V goes to GitHub",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
-        defaults: &["shift+p"],
+        defaults: &["shift+v"],
+    },
+    ActionSpec {
+        action: Action::OpenIssue,
+        id: "open_issue",
+        label: "Open issue in browser",
+        hint: "Send the GitHub issue the session card under the cursor was started from to your browser. i lists the issues in nebula; ⇧I goes to GitHub",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["shift+i"],
     },
     ActionSpec {
         action: Action::OpenGhosttyTab,
@@ -528,7 +548,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Delete,
         id: "delete",
         label: "Delete selected",
-        hint: "Remove the selected row, behind a confirmation",
+        hint: "Remove the selected row, behind a confirmation. With the PROJECT TABS holding the keys, close the tab under their cursor, behind the same kind of confirmation — x closes it outright",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["d", "delete", "backspace"],
@@ -569,6 +589,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         scope: Scope::Global,
         defaults: &["space"],
     },
+    ActionSpec {
+        action: Action::DuplicateSession,
+        id: "duplicate_session",
+        label: "Duplicate session",
+        hint: "Open the quick prompt set to launch what the selected card runs — the same harness, model, effort and worktree — so only the task is left to type. p opens the box on the defaults; ⇧P on the card",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["shift+p"],
+    },
     // ---- FILES ----
     ActionSpec {
         action: Action::FindFile,
@@ -598,15 +627,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         defaults: &["b"],
     },
     // ---- TERMINAL ----
-    ActionSpec {
-        action: Action::Zoom,
-        id: "zoom",
-        label: "Full-screen terminal",
-        hint: "Collapse the sidebars and lock input into the attached session",
-        group: "TERMINAL",
-        scope: Scope::Global,
-        defaults: &["z"],
-    },
     ActionSpec {
         action: Action::UnlockTerminal,
         id: "unlock_terminal",
@@ -677,15 +697,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["shift+m"],
-    },
-    ActionSpec {
-        action: Action::Splash,
-        id: "splash",
-        label: "Nebula splash",
-        hint: "Replay the startup splash (any key returns)",
-        group: "GENERAL",
-        scope: Scope::Global,
-        defaults: &["shift+n"],
     },
     ActionSpec {
         action: Action::Help,

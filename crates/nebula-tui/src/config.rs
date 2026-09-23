@@ -34,11 +34,11 @@ pub const DEFAULT_RECENT_PROMPTS_COUNT: usize = 3;
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 
 /// The **Session pane** choices (Settings → Appearance), in the order the
-/// row cycles them: the [`crate::launcher::PaneSide`] sides by name.
+/// row cycles them: the [`crate::launcher::PaneSide`] sides by name, the
+/// default first.
 pub const PANE_SIDES: &[&str] = &[
-    crate::launcher::PaneSide::Bottom.as_str(),
     crate::launcher::PaneSide::Right.as_str(),
-    crate::launcher::PaneSide::Left.as_str(),
+    crate::launcher::PaneSide::Bottom.as_str(),
 ];
 
 /// The **Preset text** choices (Settings → Sessions), in the order the row
@@ -346,7 +346,7 @@ pub const AGENTS_HEAD: &[SettingSpec] = &[
     SettingSpec {
         kind: SettingKind::QuickPromptNewWorktree,
         label: "New worktree",
-        hint: "Each new quick prompt starts on a fresh worktree (off = the selected checkout; ^N flips one box)",
+        hint: "Each new session's box starts on a fresh worktree (off = the project's root branch; ^N flips one box)",
         group: "Quick prompt",
     },
     SettingSpec {
@@ -374,7 +374,6 @@ pub enum SettingKind {
     Editor,
     CloseFinderOnOpen,
     SshSyncConfig,
-    ConfirmOnArchive,
     SessionIdleTimeout,
     PrewarmAgents,
     PrewarmSessions,
@@ -383,7 +382,7 @@ pub enum SettingKind {
     PresetText,
     Theme,
     Animations,
-    FocusTint,
+    BlackBackground,
     SessionPane,
     HideProjects,
     HideWorktrees,
@@ -393,7 +392,6 @@ pub enum SettingKind {
     QuickPromptKind,
     QuickPromptFocus,
     QuickPromptNewWorktree,
-    HideRootWorktree,
     RunCommand,
     OpenCommand,
     RecentPrompts,
@@ -439,15 +437,12 @@ impl SettingKind {
 
     /// A row on the PROJECT TAB: its value is the focused project's, kept
     /// in that project's `projects` entry rather than at the top level of
-    /// the file. [`Config::cycle`] leaves such a row alone;
-    /// [`Config::cycle_project`] (or [`Config::set_project_text`], for a
-    /// row that is typed as well) is what writes it, and
+    /// the file. Every one of them is typed ([`SettingKind::is_text`]):
+    /// [`Config::cycle`] leaves such a row alone,
+    /// [`Config::set_project_text`] is what writes it, and
     /// [`ProjectSettings::value_label`] what reads it.
     pub fn is_project(self) -> bool {
-        matches!(
-            self,
-            SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand
-        )
+        matches!(self, SettingKind::RunCommand | SettingKind::OpenCommand)
     }
 }
 
@@ -499,12 +494,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
     SettingsTab {
         title: "Sessions",
         body: TabBody::Values(&[
-            SettingSpec {
-                kind: SettingKind::ConfirmOnArchive,
-                label: "Confirm on archive",
-                hint: "a asks before archiving the selected session (off archives at once; u undoes)",
-                group: "",
-            },
             SettingSpec {
                 kind: SettingKind::SessionIdleTimeout,
                 label: "Idle session timeout",
@@ -559,15 +548,15 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 group: "",
             },
             SettingSpec {
-                kind: SettingKind::FocusTint,
-                label: "Focused panel tint",
-                hint: "Faint accent wash behind the focused panel (off shows the terminal's background)",
+                kind: SettingKind::BlackBackground,
+                label: "Black background",
+                hint: "Paint the window pure black instead of the terminal's own background (off keeps the terminal's, transparency included)",
                 group: "",
             },
             SettingSpec {
                 kind: SettingKind::SessionPane,
                 label: "Session pane",
-                hint: "Where the session under the cursor is read: under the cards, or beside them on the right or left",
+                hint: "Where the session under the cursor is read: beside the cards on the right, or under them",
                 group: "",
             },
             SettingSpec {
@@ -627,12 +616,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::OpenCommand,
                 label: "Open command",
                 hint: "Shell line ⇧Enter / ⇧O runs to open a worktree of this project, e.g. open http://localhost:3000 (empty = its .nebula.json \"open\")",
-                group: "",
-            },
-            SettingSpec {
-                kind: SettingKind::HideRootWorktree,
-                label: "Hide root worktree",
-                hint: "Drop this project's ⌂ root row so nothing launched from Worktrees lands in its shared checkout",
                 group: "",
             },
         ]),
@@ -938,11 +921,12 @@ pub struct Config {
     /// it any more. Still loaded and written back as stored, so an older
     /// build sharing the file keeps the behavior its user chose.
     pub skip_session_naming: bool,
-    /// Put a CONFIRM DIALOG in front of archiving a session — the `a` key
-    /// and the row menu's Archive alike. Off by default: archive is cheap
-    /// to undo with `u`, so it is the one verb on the SESSIONS PANEL that
-    /// skips the dialog `d` goes behind. On, for anyone whose typing keeps
-    /// landing on the panel and archiving the session under the cursor.
+    /// RETIRED with the archive confirm made unconditional. Through 0.33,
+    /// on, it put a CONFIRM DIALOG in front of archiving a session — the
+    /// `a` key and the row menu's Archive alike — and off (the default)
+    /// archived at once. Every archive asks now, so no tab shows the row
+    /// and nothing reads it. Still loaded and written back as stored, so
+    /// an older build sharing the file keeps the behavior its user chose.
     pub confirm_on_archive: bool,
     /// How long an idle session in an unviewed worktree lives before the
     /// daemon reaps its PTY: "1m", "5m", "15m", "30m", "1h"; "off"
@@ -989,18 +973,29 @@ pub struct Config {
     /// status-text sweep and the splash's motion). Off trades them for
     /// fewer repaints on constrained machines.
     pub animations: bool,
-    /// Faint accent-tinted background fill on the focused panel. On by
-    /// default — it is the one cue that says which panel keys land in.
-    /// Off leaves every cell on the terminal's own background, so a
-    /// transparency or image configured in the terminal shows through
-    /// the whole frame instead of stopping at the focused panel.
+    /// The key of the **Focused panel tint** SETTING (Settings →
+    /// Appearance, through 0.33): whether the faint accent wash behind
+    /// whatever keys land in — the card under the cursor, or the session
+    /// pane — was painted at all. It always is now: the wash is the one
+    /// cue that says which surface keys land in, so this build never
+    /// reads the key and no tab edits it. Still loaded and written back
+    /// as stored, so an older build sharing the file keeps the choice its
+    /// user made.
     pub focus_tint: bool,
+    /// BLACK BACKGROUND: paint every cell nothing else colored pure black
+    /// — the grid, the cards, the session pane, the overlays — instead of
+    /// leaving it on the terminal's own background, which in a stock
+    /// Ghostty is a dark gray. On by default; off lets a transparency or
+    /// image configured in the terminal show through.
+    pub black_background: bool,
     /// Where the LAUNCHER VIEW's PANE — the session under the cursor, live
-    /// — sits against the GRID of cards: `bottom` (under them, the
-    /// default), `right` or `left` (down that side of them). Read through
-    /// [`Config::pane_side`], so a word off the list is the bottom; a
-    /// window too narrow for the pane beside the cards lays it out along
-    /// the bottom until there is room (`launcher::fitted_side`).
+    /// — sits against the GRID of cards: `right` (down that side of them,
+    /// the default) or `bottom` (under them). Also written by the SIDE
+    /// BUTTON on the pane's own TAB STRIP. Read through
+    /// [`Config::pane_side`], so a word off the list — the `left` older
+    /// builds offered too — is the right; a window too narrow for the
+    /// pane beside the cards lays it out along the bottom until there is
+    /// room (`launcher::fitted_side`).
     pub session_pane: String,
     /// The key of the **Workspaces bar** SETTING (Settings → Appearance,
     /// through 0.33): whether the bar of WORKSPACE tabs was drawn across
@@ -1038,20 +1033,24 @@ pub struct Config {
     /// already runs, which only happens while this is on. Off by default:
     /// the file count alone is what a card has always said.
     pub card_line_changes: bool,
-    /// What every project without a `projects` entry gets for **Hide root
-    /// worktree** — the key the setting lived under while it was one
-    /// switch for every project (Settings → Experimental, through 0.27).
-    /// Still read and written back, so a file that set it keeps hiding
-    /// the root everywhere until a project's own row says otherwise, and
-    /// an older build sharing the file still sees its key; no tab edits
-    /// it any more. See [`Config::project_fallback`].
+    /// RETIRED with the root always listed. Through 0.27 one switch for
+    /// every project (Settings → Experimental), then through 0.33 the
+    /// fallback for a project whose `projects` entry had no **Hide root
+    /// worktree** row of its own: on, a project's ROOT WORKTREE was left
+    /// out of everything the grid launched into. Nothing hides the root
+    /// now — a launch that must not land in the shared checkout cuts a
+    /// fresh worktree instead — so no tab shows the row and nothing reads
+    /// this key, nor the one an entry may still carry (which rides through
+    /// [`ProjectSettings::other`]). Still loaded and written back as
+    /// stored, so an older build sharing the file keeps the choice its
+    /// user made.
     pub hide_root_worktree: bool,
     /// PROJECT SETTINGS: one [`ProjectSettings`] per project set up
     /// differently from the rest, keyed by the project's repo path as the
     /// DAEMON stores it — what the Settings → Project tab edits for the
-    /// selected project. A project with no entry reads as
-    /// [`Config::project_fallback`], and an entry that says nothing the
-    /// fallback doesn't is dropped on save ([`Config::set_project`]), so
+    /// selected project. A project with no entry reads as the defaults
+    /// ([`ProjectSettings::default`]), and an entry that says nothing they
+    /// don't is dropped on save ([`Config::set_project`]), so
     /// the map names only the projects that differ. One key to the file's
     /// rules: a value in here this build can't read costs the whole map,
     /// not one project.
@@ -1171,9 +1170,10 @@ pub struct Config {
     /// still enters the pane.
     pub quick_prompt_focus: bool,
     /// Whether each new QUICK PROMPT starts aimed at a fresh worktree
-    /// rather than an existing checkout. `^N` flips the one box that is
-    /// up; the next box starts from this again. Off by default: most
-    /// launches are more work on a checkout that already exists.
+    /// rather than the project's ROOT BRANCH — never the checkout of the
+    /// card under the cursor, whose session takes more work as a
+    /// FOLLOW-UP. `^N` flips the one box that is up; the next box starts
+    /// from this again. Off by default.
     pub quick_prompt_new_worktree: bool,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
@@ -1191,7 +1191,7 @@ pub struct Config {
 
 /// One project's own settings — the PROJECT TAB's rows — kept under the
 /// project's repo path in [`Config::projects`]. Read through
-/// [`Config::project`], which supplies the fallback for a project with no
+/// [`Config::project`], which supplies the defaults for a project with no
 /// entry; written through [`Config::set_project`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
@@ -1214,15 +1214,10 @@ pub struct ProjectSettings {
     /// empty, like `run_command`.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub open_command: String,
-    /// Leave this project's ROOT WORKTREE row out of the WORKTREES PANEL,
-    /// so nothing launched there lands in its shared checkout. The root's
-    /// sessions keep running and the PALETTE still finds them. (A `p` on
-    /// that panel cuts a fresh worktree with this on or off — that is the
-    /// panel's doing, not this switch's.)
-    pub hide_root_worktree: bool,
     /// Keys in the entry this build doesn't know — a newer nebula's, most
-    /// likely — carried through a save untouched, as the file's top-level
-    /// keys are. An entry holding one is never dropped as "all default".
+    /// likely, or the retired `hide_root_worktree` an older one wrote —
+    /// carried through a save untouched, as the file's top-level keys
+    /// are. An entry holding one is never dropped as "all default".
     #[serde(flatten)]
     pub other: BTreeMap<String, serde_json::Value>,
 }
@@ -1232,7 +1227,6 @@ impl ProjectSettings {
     /// empty for a row that is not one.
     pub fn value_label(&self, kind: SettingKind) -> String {
         match kind {
-            SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
             SettingKind::RunCommand => match self.run_command.trim() {
                 "" => PROJECT_FILE_CHOICE.into(),
                 command => command.to_string(),
@@ -1242,16 +1236,6 @@ impl ProjectSettings {
                 command => command.to_string(),
             },
             _ => String::new(),
-        }
-    }
-
-    /// Activate a PROJECT TAB row. A toggle flips on ←, → and Enter alike;
-    /// a typed row ([`SettingKind::is_text`]) is left alone, since its
-    /// prompt writes it through [`ProjectSettings::set_text`]; so is a row
-    /// that is not a project row.
-    pub fn cycle(&mut self, kind: SettingKind) {
-        if kind == SettingKind::HideRootWorktree {
-            self.hide_root_worktree = !self.hide_root_worktree;
         }
     }
 
@@ -1304,7 +1288,8 @@ impl Default for Config {
             theme: "default".into(),
             animations: true,
             focus_tint: true,
-            session_pane: crate::launcher::PaneSide::Bottom.as_str().into(),
+            black_background: true,
+            session_pane: crate::launcher::PaneSide::default().as_str().into(),
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
@@ -2059,43 +2044,21 @@ impl Config {
     }
 
     /// The settings of the project checked out at `repo_path`: its
-    /// `projects` entry, else what every project without one gets
-    /// ([`Config::project_fallback`]).
+    /// `projects` entry, else the defaults every project without one gets.
     pub fn project(&self, repo_path: &Path) -> ProjectSettings {
-        self.projects
-            .get(repo_path)
-            .cloned()
-            .unwrap_or_else(|| self.project_fallback())
-    }
-
-    /// What a project with no entry of its own reads as: the top-level
-    /// `hide_root_worktree`, the key the setting had while it applied to
-    /// every project at once, so a file written then keeps its meaning.
-    pub fn project_fallback(&self) -> ProjectSettings {
-        ProjectSettings {
-            hide_root_worktree: self.hide_root_worktree,
-            ..Default::default()
-        }
+        self.projects.get(repo_path).cloned().unwrap_or_default()
     }
 
     /// Store `settings` as the entry of the project at `repo_path`. An
-    /// entry that says nothing the fallback doesn't is dropped rather than
+    /// entry that says nothing the defaults don't is dropped rather than
     /// written, so `projects` names only the projects set up differently
     /// — and a project turned back to match the rest leaves no trace.
     pub fn set_project(&mut self, repo_path: &Path, settings: ProjectSettings) {
-        if settings == self.project_fallback() {
+        if settings == ProjectSettings::default() {
             self.projects.remove(repo_path);
         } else {
             self.projects.insert(repo_path.to_path_buf(), settings);
         }
-    }
-
-    /// Activate a PROJECT TAB row for the project at `repo_path` — what
-    /// [`Config::cycle`] is for every other row.
-    pub fn cycle_project(&mut self, repo_path: &Path, kind: SettingKind) {
-        let mut settings = self.project(repo_path);
-        settings.cycle(kind);
-        self.set_project(repo_path, settings);
     }
 
     /// The stored text of a typed PROJECT TAB row for the project at
@@ -2130,7 +2093,6 @@ impl Config {
             SettingKind::Editor => self.editor.clone(),
             SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
             SettingKind::SshSyncConfig => on_off(self.ssh_sync_config).into(),
-            SettingKind::ConfirmOnArchive => on_off(self.confirm_on_archive).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::PrewarmAgents => on_off(self.prewarm_agents).into(),
             SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
@@ -2139,15 +2101,17 @@ impl Config {
             SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
-            SettingKind::FocusTint => on_off(self.focus_tint).into(),
+            SettingKind::BlackBackground => on_off(self.black_background).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
             SettingKind::HideSessions => shown_hidden(self.hide_sessions).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             SettingKind::CardLineChanges => on_off(self.card_line_changes).into(),
-            SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand => {
-                self.project_fallback().value_label(kind)
+            // A project row with no project to speak of: what one without
+            // an entry would show.
+            SettingKind::RunCommand | SettingKind::OpenCommand => {
+                ProjectSettings::default().value_label(kind)
             }
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
             SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
@@ -2167,8 +2131,8 @@ impl Config {
     /// `delta == 0` means activate (toggle a bool, cycle a choice forward).
     /// Non-zero delta cycles a choice; bools still toggle. `index` is
     /// tab-local — the Hotkeys tab has no cyclable values and no-ops here,
-    /// and so does a PROJECT TAB row, which [`Config::cycle_project`]
-    /// flips for one project. The Agents tab resolves its head rows
+    /// and so does a PROJECT TAB row, which is typed for one project
+    /// ([`Config::set_project_text`]). The Agents tab resolves its head rows
     /// statically and its harness rows through the registry.
     pub fn cycle(&mut self, tab: usize, index: usize, delta: i32) {
         if tab == agents_tab() {
@@ -2207,9 +2171,6 @@ impl Config {
             SettingKind::SshSyncConfig => {
                 self.ssh_sync_config = !self.ssh_sync_config;
             }
-            SettingKind::ConfirmOnArchive => {
-                self.confirm_on_archive = !self.confirm_on_archive;
-            }
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
@@ -2238,12 +2199,12 @@ impl Config {
             SettingKind::Animations => {
                 self.animations = !self.animations;
             }
-            SettingKind::FocusTint => {
-                self.focus_tint = !self.focus_tint;
+            SettingKind::BlackBackground => {
+                self.black_background = !self.black_background;
             }
             SettingKind::SessionPane => {
                 // Cycled from the resolved side, so a hand edit off the
-                // list steps on from the bottom it reads as.
+                // list steps on from the right it reads as.
                 self.session_pane =
                     cycle_choice(self.pane_side().as_str(), PANE_SIDES, step).into();
             }
@@ -2262,8 +2223,8 @@ impl Config {
             SettingKind::CardLineChanges => {
                 self.card_line_changes = !self.card_line_changes;
             }
-            // One project's, not the file's: see `cycle_project`.
-            SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand => {}
+            // One project's, not the file's, and typed: see `set_project_text`.
+            SettingKind::RunCommand | SettingKind::OpenCommand => {}
             SettingKind::RecentPrompts => {
                 self.recent_prompts = !self.recent_prompts;
             }
@@ -2659,11 +2620,11 @@ mod tests {
             BTreeSet::from(["recent_prompts_count".to_string()])
         );
 
-        cfg.focus_tint = false;
+        cfg.black_background = false;
         cfg.save_to(&path).unwrap();
         let saved = read_json_file(&path);
         assert_eq!(saved["recent_prompts_count"], "auto", "left as stored");
-        assert_eq!(saved["focus_tint"], false);
+        assert_eq!(saved["black_background"], false);
         assert_eq!(saved["theme"], "ocean");
 
         let (t, r) = locate(SettingKind::RecentPromptsCount).unwrap();
@@ -2867,35 +2828,35 @@ mod tests {
         assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
         assert!(cfg.skip_session_naming);
 
-        cfg.focus_tint = false;
+        cfg.black_background = false;
         cfg.save_to(&path).unwrap();
         assert_eq!(read_json_file(&path)["skip_session_naming"], true);
     }
 
+    /// Retired with the archive confirm made unconditional: no tab shows
+    /// the row, and a `true` an earlier release wrote still loads and is
+    /// written back unchanged for the older builds that read it.
     #[test]
-    fn confirm_on_archive_defaults_off_toggles_and_persists() {
-        assert!(
-            !Config::default().confirm_on_archive,
-            "archive skips the confirm by default; the dialog is opt-in"
-        );
+    fn confirm_on_archive_has_no_row_and_is_written_back_for_older_builds() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|row| row.label != "Confirm on archive")
+            }
+            TabBody::Hotkeys | TabBody::Agents => true,
+        }));
+        assert!(!Config::default().confirm_on_archive);
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.confirm_on_archive);
 
-        let mut cfg = Config::default();
-        let (tab, row) = locate(SettingKind::ConfirmOnArchive).unwrap();
-        assert_eq!(
-            SETTINGS_TABS[tab].title, "Sessions",
-            "lives on the Sessions tab"
-        );
-        assert_eq!(cfg.value_label(SettingKind::ConfirmOnArchive), "off");
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.confirm_on_archive);
-        assert_eq!(cfg.value_label(SettingKind::ConfirmOnArchive), "on");
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"confirm_on_archive": true}"#).unwrap();
+        let cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(cfg.confirm_on_archive);
+
         cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).confirm_on_archive);
+        assert_eq!(read_json_file(&path)["confirm_on_archive"], true);
     }
 
     #[test]
@@ -3183,7 +3144,7 @@ mod tests {
         assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
         assert!(!cfg.show_workspaces);
 
-        cfg.focus_tint = false;
+        cfg.black_background = false;
         cfg.save_to(&path).unwrap();
         assert_eq!(read_json_file(&path)["show_workspaces"], false);
     }
@@ -3277,73 +3238,95 @@ mod tests {
         assert!(!legacy.card_line_changes);
     }
 
-    /// The FOCUS TINT: on out of the box, toggled from its Appearance row,
-    /// persisted under `focus_tint`. A config.json written while the key
-    /// was ignored (2026-08-29 to v0.26) is honoured again: `false` in
-    /// it switches the tint off on the next launch (issue #51), and a
-    /// file predating the key keeps the default.
+    /// The tint is always on now, so **Focused panel tint** has no row to
+    /// be edited on — but the key an earlier release wrote still loads,
+    /// and is written back unchanged for the older builds that read it.
     #[test]
-    fn focus_tint_default_on_toggle_and_persist() {
+    fn focus_tint_has_no_row_and_is_written_back_for_older_builds() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|row| row.label != "Focused panel tint")
+            }
+            TabBody::Hotkeys | TabBody::Agents => true,
+        }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"focus_tint": false}"#).unwrap();
+        let mut cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(!cfg.focus_tint);
+
+        cfg.black_background = false;
+        cfg.save_to(&path).unwrap();
+        assert_eq!(read_json_file(&path)["focus_tint"], false);
+    }
+
+    /// The BLACK BACKGROUND: on out of the box, toggled off from its
+    /// Appearance row (the terminal's own background shows), persisted
+    /// under `black_background`; a config predating the key turns it on,
+    /// and a saved `false` is honoured.
+    #[test]
+    fn black_background_default_on_toggle_and_persist() {
         let mut cfg = Config::default();
-        assert!(cfg.focus_tint);
-        let (tab, row) = locate(SettingKind::FocusTint).unwrap();
+        assert!(cfg.black_background);
+        let (tab, row) = locate(SettingKind::BlackBackground).unwrap();
         assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
         cfg.cycle(tab, row, 0);
-        assert!(!cfg.focus_tint);
+        assert!(!cfg.black_background);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        assert!(!load_from(&path).focus_tint);
+        assert!(!load_from(&path).black_background);
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(raw.get("focus_tint"), Some(&serde_json::json!(false)));
+        assert_eq!(raw.get("black_background"), Some(&serde_json::json!(false)));
 
-        let legacy: Config = serde_json::from_str(r#"{"focus_tint": false}"#).unwrap();
-        assert!(!legacy.focus_tint, "a hand-edited key is honoured");
         let older: Config = serde_json::from_str("{}").unwrap();
         assert!(
-            older.focus_tint,
-            "a config predating the key keeps the tint"
+            older.black_background,
+            "a config predating the key turns it on"
         );
     }
 
-    /// The **Session pane**: along the bottom out of the box, cycled from
-    /// its Appearance row through right and left and back, persisted
-    /// under `session_pane`. A config predating the key, or holding a
-    /// word off the list, reads as the bottom.
+    /// The **Session pane**: down the right out of the box, cycled from
+    /// its Appearance row to the bottom and back, persisted under
+    /// `session_pane`. A config predating the key, or holding a word off
+    /// the list — `left`, which older builds offered, included — reads as
+    /// the right.
     #[test]
-    fn session_pane_defaults_to_the_bottom_cycles_and_persists() {
+    fn session_pane_defaults_to_the_right_cycles_and_persists() {
         use crate::launcher::PaneSide;
         let mut cfg = Config::default();
-        assert_eq!(cfg.pane_side(), PaneSide::Bottom);
+        assert_eq!(cfg.pane_side(), PaneSide::Right);
         let (tab, row) = locate(SettingKind::SessionPane).unwrap();
         assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
-        assert_eq!(cfg.value_label(SettingKind::SessionPane), "bottom");
+        assert_eq!(cfg.value_label(SettingKind::SessionPane), "right");
         cfg.cycle(tab, row, 0);
-        assert_eq!(cfg.pane_side(), PaneSide::Right);
+        assert_eq!(cfg.pane_side(), PaneSide::Bottom);
+        assert_eq!(cfg.value_label(SettingKind::SessionPane), "bottom");
         cfg.cycle(tab, row, 1);
-        assert_eq!(cfg.pane_side(), PaneSide::Left);
-        assert_eq!(cfg.value_label(SettingKind::SessionPane), "left");
-        cfg.cycle(tab, row, 1);
-        assert_eq!(cfg.pane_side(), PaneSide::Bottom, "and round again");
+        assert_eq!(cfg.pane_side(), PaneSide::Right, "and round again");
         cfg.cycle(tab, row, -1);
-        assert_eq!(cfg.pane_side(), PaneSide::Left, "either arrow walks it");
+        assert_eq!(cfg.pane_side(), PaneSide::Bottom, "either arrow walks it");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        assert_eq!(load_from(&path).pane_side(), PaneSide::Left);
+        assert_eq!(load_from(&path).pane_side(), PaneSide::Bottom);
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(raw.get("session_pane"), Some(&serde_json::json!("left")));
+        assert_eq!(raw.get("session_pane"), Some(&serde_json::json!("bottom")));
 
         let older: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(older.pane_side(), PaneSide::Bottom, "predating the key");
+        assert_eq!(older.pane_side(), PaneSide::Right, "predating the key");
         let mut odd: Config = serde_json::from_str(r#"{"session_pane": "top"}"#).unwrap();
-        assert_eq!(odd.pane_side(), PaneSide::Bottom, "a word off the list");
+        assert_eq!(odd.pane_side(), PaneSide::Right, "a word off the list");
         odd.cycle(tab, row, 0);
-        assert_eq!(odd.pane_side(), PaneSide::Right, "steps on from the bottom");
+        assert_eq!(odd.pane_side(), PaneSide::Bottom, "steps on from the right");
+        let left: Config = serde_json::from_str(r#"{"session_pane": "left"}"#).unwrap();
+        assert_eq!(left.pane_side(), PaneSide::Right, "the retired left side");
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,
@@ -3373,81 +3356,11 @@ mod tests {
         assert!(!cfg.quick_prompt_focus);
     }
 
-    /// **Hide root worktree** is the PROJECT TAB's row: off for every
-    /// project by default, flipped for one project at a time through
-    /// `cycle_project`, stored under that project's repo path in
-    /// `projects` — and only while it differs from what the rest get, so
-    /// flipping it back leaves no entry behind. `Config::cycle` on the
-    /// row, which has no project to speak of, changes nothing.
-    #[test]
-    fn hide_root_worktree_is_a_project_setting_kept_per_repo_path() {
-        let demo = Path::new("/tmp/demo");
-        let other = Path::new("/tmp/other");
-        let mut cfg = Config::default();
-        assert!(!cfg.project(demo).hide_root_worktree, "off out of the box");
-        assert!(cfg.projects.is_empty());
-
-        let (tab, row) = locate(SettingKind::HideRootWorktree).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Project");
-        assert_eq!(tab, project_tab());
-        assert!(SettingKind::HideRootWorktree.is_project());
-        cfg.cycle(tab, row, 0);
-        assert_eq!(
-            serde_json::to_value(&cfg).unwrap(),
-            serde_json::to_value(Config::default()).unwrap(),
-            "no project named: nothing to flip"
-        );
-
-        cfg.cycle_project(demo, SettingKind::HideRootWorktree);
-        assert!(cfg.project(demo).hide_root_worktree);
-        assert_eq!(
-            cfg.project(demo).value_label(SettingKind::HideRootWorktree),
-            "on"
-        );
-        assert!(
-            !cfg.project(other).hide_root_worktree,
-            "one project's, not every project's"
-        );
-        assert_eq!(
-            cfg.project(other)
-                .value_label(SettingKind::HideRootWorktree),
-            "off"
-        );
-        assert!(
-            !cfg.hide_root_worktree,
-            "the old global key is not what was written"
-        );
-        assert_eq!(cfg.projects.keys().collect::<Vec<_>>(), [demo]);
-
-        // Persisted under the project's path, as its own object.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        cfg.save_to(&path).unwrap();
-        assert_eq!(
-            read_json_file(&path)["projects"],
-            serde_json::json!({ "/tmp/demo": { "hide_root_worktree": true } })
-        );
-        let loaded = load_from(&path);
-        assert!(loaded.project(demo).hide_root_worktree);
-        assert!(!loaded.project(other).hide_root_worktree);
-
-        // Back to what the rest get: the entry goes, not just its value.
-        cfg.cycle_project(demo, SettingKind::HideRootWorktree);
-        assert!(!cfg.project(demo).hide_root_worktree);
-        assert!(cfg.projects.is_empty(), "an all-default entry is dropped");
-        cfg.save_to(&path).unwrap();
-        assert_eq!(read_json_file(&path)["projects"], serde_json::json!({}));
-
-        // A config predating the key has no entries.
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(cfg.projects.is_empty());
-    }
-
     /// **Run command** on the Project tab: a typed row (Enter prompts,
     /// ←/→ and cycle change nothing) kept per repo path as `run_command`,
     /// shown as `.nebula.json` while empty — the file decides then — and
-    /// left out of the file while empty, so an entry that only sets the
-    /// toggle is written as it always was.
+    /// left out of the file while empty, so an entry with nothing else in
+    /// it is dropped rather than written.
     #[test]
     fn run_command_is_a_typed_project_row_kept_per_repo_path() {
         let demo = Path::new("/tmp/demo");
@@ -3466,19 +3379,18 @@ mod tests {
         assert_eq!(cfg.value_label(SettingKind::RunCommand), ".nebula.json");
         assert_eq!(cfg.project_text_value(demo, SettingKind::RunCommand), "");
 
-        // Neither the tab's cycle nor the project's touches a typed row.
+        // The tab's cycle never touches a typed row.
         for delta in [0, 1, -1] {
             cfg.cycle(tab, row, delta);
         }
-        cfg.cycle_project(demo, SettingKind::RunCommand);
         assert!(cfg.projects.is_empty());
         assert!(
             !cfg.set_text(SettingKind::RunCommand, "npm run dev"),
             "not a top-level row"
         );
         assert!(
-            !cfg.set_project_text(demo, SettingKind::HideRootWorktree, "on"),
-            "not a typed row"
+            !cfg.set_project_text(demo, SettingKind::Theme, "dark"),
+            "not a project row"
         );
         assert!(cfg.projects.is_empty());
 
@@ -3497,22 +3409,23 @@ mod tests {
             PROJECT_FILE_CHOICE,
             "one project's, not every project's"
         );
-        assert!(
-            !cfg.project(demo).hide_root_worktree,
-            "the toggle is untouched"
+        assert_eq!(
+            cfg.project(demo).open_command,
+            "",
+            "open's key is untouched"
         );
 
-        // Persisted in the project's entry beside the toggle; the toggle
-        // alone is still written without the key.
+        // Persisted in the project's entry, under its path, beside no key
+        // it did not set.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        cfg.cycle_project(other, SettingKind::HideRootWorktree);
+        assert!(cfg.set_project_text(other, SettingKind::OpenCommand, "open x"));
         cfg.save_to(&path).unwrap();
         assert_eq!(
             read_json_file(&path)["projects"],
             serde_json::json!({
-                "/tmp/demo": { "hide_root_worktree": false, "run_command": "npm run dev" },
-                "/tmp/other": { "hide_root_worktree": true },
+                "/tmp/demo": { "run_command": "npm run dev" },
+                "/tmp/other": { "open_command": "open x" },
             })
         );
         let loaded = load_from(&path);
@@ -3525,7 +3438,7 @@ mod tests {
         cfg.save_to(&path).unwrap();
         assert_eq!(
             read_json_file(&path)["projects"],
-            serde_json::json!({ "/tmp/other": { "hide_root_worktree": true } })
+            serde_json::json!({ "/tmp/other": { "open_command": "open x" } })
         );
     }
 
@@ -3554,9 +3467,9 @@ mod tests {
         );
         assert_eq!(cfg.value_label(SettingKind::OpenCommand), ".nebula.json");
 
-        // A typed row: cycling it changes nothing, and the top-level
-        // setter is not its.
-        cfg.cycle_project(demo, SettingKind::OpenCommand);
+        // A typed row: cycling its tab row changes nothing, and the
+        // top-level setter is not its.
+        cfg.cycle(tab, row, 0);
         assert!(cfg.projects.is_empty());
         assert!(!cfg.set_text(SettingKind::OpenCommand, "open x"));
 
@@ -3582,7 +3495,7 @@ mod tests {
         assert_eq!(
             read_json_file(&path)["projects"],
             serde_json::json!({
-                "/tmp/demo": { "hide_root_worktree": false, "open_command": "open http://localhost:3000" },
+                "/tmp/demo": { "open_command": "open http://localhost:3000" },
             })
         );
         assert_eq!(
@@ -3595,14 +3508,23 @@ mod tests {
         assert!(cfg.projects.is_empty());
     }
 
-    /// The top-level `hide_root_worktree` a 0.27 file set keeps its
-    /// meaning as the fallback: every project without an entry hides its
-    /// root, a project's own row can still say `off` (and that entry is
-    /// kept, since it differs from the fallback), and the key itself is
-    /// written back unchanged for the older builds that read it. Keys in
-    /// an entry this build doesn't know ride through a save too.
+    /// The root is always listed now, so **Hide root worktree** has no row
+    /// to be edited on — but the keys earlier releases wrote still load
+    /// and are written back unchanged for the older builds that read
+    /// them: the top-level `hide_root_worktree` (one switch for every
+    /// project, through 0.27) as a retired field of its own, and the one
+    /// in a project's entry (the Project tab's row, through 0.33) as a key
+    /// this build doesn't know — which also keeps that entry from being
+    /// dropped as all-default. Neither hides anything.
     #[test]
-    fn the_old_global_key_is_the_fallback_every_project_without_an_entry_gets() {
+    fn hide_root_worktree_has_no_row_and_is_written_back_for_older_builds() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|row| row.label != "Hide root worktree")
+            }
+            TabBody::Hotkeys | TabBody::Agents => true,
+        }));
+
         let demo = Path::new("/tmp/demo");
         let other = Path::new("/tmp/other");
         let dir = tempfile::tempdir().unwrap();
@@ -3612,7 +3534,7 @@ mod tests {
             r#"{
               "hide_root_worktree": true,
               "projects": {
-                "/tmp/other": { "hide_root_worktree": false, "future_row": "x" }
+                "/tmp/other": { "hide_root_worktree": true, "future_row": "x" }
               }
             }"#,
         )
@@ -3620,28 +3542,21 @@ mod tests {
         let mut cfg = load_from(&path);
         assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
         assert!(cfg.hide_root_worktree);
-        assert!(
-            cfg.project(demo).hide_root_worktree,
-            "no entry: the fallback"
+        assert_eq!(
+            cfg.project(demo),
+            ProjectSettings::default(),
+            "no entry: the defaults, whatever the old global key says"
         );
         assert_eq!(
-            cfg.value_label(SettingKind::HideRootWorktree),
-            "on",
-            "the fallback's label"
-        );
-        assert!(!cfg.project(other).hide_root_worktree, "its own row wins");
-        assert_eq!(
-            cfg.project(other).other.get("future_row"),
-            Some(&serde_json::json!("x"))
+            cfg.project(other).other.get("hide_root_worktree"),
+            Some(&serde_json::json!(true)),
+            "an entry's key rides along unread"
         );
 
-        // Turning demo off writes an entry, since off now differs from
-        // the fallback; turning other on makes it match the fallback —
-        // but its unknown key keeps the entry from being dropped.
-        cfg.cycle_project(demo, SettingKind::HideRootWorktree);
-        cfg.cycle_project(other, SettingKind::HideRootWorktree);
-        assert!(!cfg.project(demo).hide_root_worktree);
-        assert!(cfg.project(other).hide_root_worktree);
+        // A save writes both back; the entry that only carries the old
+        // key is kept for it, not dropped as all-default.
+        let kept = cfg.project(other);
+        cfg.set_project(other, kept);
         cfg.save_to(&path).unwrap();
         let saved = read_json_file(&path);
         assert_eq!(
@@ -3651,7 +3566,6 @@ mod tests {
         assert_eq!(
             saved["projects"],
             serde_json::json!({
-                "/tmp/demo": { "hide_root_worktree": false },
                 "/tmp/other": { "hide_root_worktree": true, "future_row": "x" }
             })
         );

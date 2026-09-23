@@ -186,6 +186,7 @@ pub(super) fn stage_agent(
         // the row does not jump when the real one replaces it.
         status_changed_at: now_ms(),
         alive: false,
+        issue_url: None,
         recent_prompts: Vec::new(),
     });
     if let Some(i) = project.and_then(|id| {
@@ -538,8 +539,8 @@ fn forget_worktree(app: &mut App, id: &WorktreeId) {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        buffer_text, hide_root, hse, press, seed_feat_worktree, seed_open_prs, seed_tree,
-        with_default_config, with_seeded_presets, worktree_branches,
+        buffer_text, hse, press, seed_feat_worktree, seed_open_prs, seed_tree, with_default_config,
+        with_seeded_presets, worktree_branches,
     };
     use super::super::{
         fire_pending_prewarm, handle_server_event, handle_terminal_event, paste_into_overlay,
@@ -558,15 +559,13 @@ mod tests {
     /// `p` on the WORKTREES PANEL with the cursor on `feat`, "Fix auth"
     /// typed, Enter pressed. Returns the branch the box offered, the
     /// stand-in ids the intent carries, and the request id of the
-    /// `CreateWorktree` it sent. The root row is hidden only to keep the
-    /// panel down to the rows under test. `p` opens on the checkout (the
+    /// `CreateWorktree` it sent. `p` opens on the checkout (the
     /// new-worktree SETTING is off) and `^N` flips it to a fresh one.
     fn stage_launch(app: &mut App, out: &mut Vec<ClientRequest>) -> (String, PlaceholderRows, u64) {
         seed_tree(app);
         seed_feat_worktree(app, "w2", "feat");
-        hide_root(app, true);
         app.focus = Focus::Worktrees;
-        app.sel_worktree = 0;
+        app.sel_worktree = 1;
         assert_eq!(
             app.selected_worktree().map(|w| w.branch.as_str()),
             Some("feat")
@@ -646,6 +645,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: crate::app::now_ms(),
             alive: true,
+            issue_url: None,
             recent_prompts: Vec::new(),
         }
     }
@@ -667,7 +667,10 @@ mod tests {
             let mut out = Vec::new();
             let (branch, rows, _) = stage_launch(&mut app, &mut out);
 
-            assert_eq!(worktree_branches(&app), [branch.clone(), "feat".into()]);
+            assert_eq!(
+                worktree_branches(&app),
+                ["main".into(), branch.clone(), "feat".into()]
+            );
             let selected = app.selected_worktree().expect("a row is selected");
             assert_eq!(selected.id, rows.worktree, "the cursor is on the stand-in");
             assert!(app.is_placeholder_worktree(&rows.worktree));
@@ -726,7 +729,7 @@ mod tests {
             );
             assert_eq!(
                 worktree_branches(&app),
-                [branch.clone(), "feat".into()],
+                ["main".into(), branch.clone(), "feat".into()],
                 "one row, not two"
             );
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
@@ -826,7 +829,10 @@ mod tests {
                 },
                 &mut out,
             );
-            assert_eq!(worktree_branches(&app), [branch.clone(), "feat".into()]);
+            assert_eq!(
+                worktree_branches(&app),
+                ["main".into(), branch.clone(), "feat".into()]
+            );
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
             assert!(!app.is_placeholder_worktree(&WorktreeId("w3".into())));
             assert_eq!(
@@ -848,7 +854,7 @@ mod tests {
             seed_feat_worktree(&mut app, "w3", &branch);
             assert_eq!(
                 worktree_branches(&app),
-                [branch.clone(), "feat".into()],
+                ["main".into(), branch.clone(), "feat".into()],
                 "still one row"
             );
             assert_eq!(
@@ -904,7 +910,7 @@ mod tests {
                 },
                 &mut out,
             );
-            assert_eq!(worktree_branches(&app), ["feat"]);
+            assert_eq!(worktree_branches(&app), ["main", "feat"]);
             assert!(!app.tree.agents.iter().any(|a| a.id == rows.agent));
             assert_eq!(
                 app.selected_worktree().map(|w| w.branch.as_str()),
@@ -953,7 +959,7 @@ mod tests {
             // under `feat` again; the cursor follows the row.
             assert_eq!(
                 worktree_branches(&app),
-                ["feat".to_string(), branch.clone()]
+                ["main".to_string(), "feat".to_string(), branch.clone()]
             );
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
             assert!(app.visible_session_rows().is_empty());

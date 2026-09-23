@@ -59,8 +59,8 @@ pub struct Config {
 }
 
 /// One project's entry under `projects` — the rows of the TUI's Project
-/// tab, of which the daemon reads one. The rest (`hide_root_worktree`)
-/// are the TUI's and pass through unread.
+/// tab, of which the daemon reads one. The rest (`open_command`) are the
+/// TUI's and pass through unread.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ProjectConfig {
@@ -271,7 +271,7 @@ mod tests {
         assert_eq!(Config::default().run_command(Path::new("/tmp/demo")), None);
         let cfg: Config = serde_json::from_str(
             r#"{"projects": {
-                "/tmp/demo": { "hide_root_worktree": true, "run_command": "  npm run dev " },
+                "/tmp/demo": { "open_command": "open http://localhost:3000", "run_command": "  npm run dev " },
                 "/tmp/blank": { "run_command": "   " },
                 "/tmp/other": { "hide_root_worktree": false, "future_row": 1 }
             }}"#,
