@@ -3605,7 +3605,6 @@ mod tests {
         use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
         crate::launcher::Band {
             worktree: WorktreeId("w1".into()),
-            project: "nebula".into(),
             branch: branch.into(),
             is_main,
             pr: None,
@@ -3632,7 +3631,6 @@ mod tests {
                 },
                 project: "nebula".into(),
                 branch: branch.into(),
-                is_main,
                 pr: None,
             })],
         }
@@ -3870,7 +3868,6 @@ mod tests {
                 agent,
                 project: "nebula".into(),
                 branch: "feat-x".into(),
-                is_main: false,
                 pr: None,
             };
             let area = Rect::new(0, 0, 40, crate::launcher::CARD_H);
@@ -3971,7 +3968,6 @@ mod tests {
             },
             project: "nebula".into(),
             branch: "feat-x".into(),
-            is_main: false,
             pr: None,
         };
         let th = Theme::by_name("coral");
@@ -4082,7 +4078,6 @@ mod tests {
                 },
                 project: "nebula".into(),
                 branch: "main".into(),
-                is_main: true,
                 pr: None,
             }
         }

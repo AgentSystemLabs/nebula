@@ -92,11 +92,6 @@ pub struct FileTabsView {
 }
 
 impl FileTabsView {
-    /// Tabs on `paths` in the order given, the first one previewed.
-    pub fn new(root: PathBuf, editor: String, paths: Vec<PathBuf>) -> Self {
-        Self::with_jobs(root, editor, paths, None)
-    }
-
     /// [`FileTabsView::new`], reading its files off the loop when there
     /// are BACKGROUND READS to read them with.
     pub fn with_jobs(
@@ -444,6 +439,15 @@ fn open_in_editor(app: &mut App) {
         if let Some(vim) = &mut app.vim {
             vim.embedded = true;
         }
+    }
+}
+
+/// Test-only accessors: nothing in the app reads these any more.
+#[cfg(test)]
+impl FileTabsView {
+    /// Tabs on `paths` in the order given, the first one previewed.
+    pub fn new(root: PathBuf, editor: String, paths: Vec<PathBuf>) -> Self {
+        Self::with_jobs(root, editor, paths, None)
     }
 }
 

@@ -50,7 +50,7 @@ on a tab tells you exactly where to look without opening anything.
 
 | | |
 |---|---|
-| **One grid, every session** | PROJECT TABS across the top, a BAND per WORKTREE, a CARD per SESSION, and the PANE — the live terminal of the card under the cursor — along the bottom or down the right. Terminals are cards too, two columns wide, showing the last lines their shell printed. `j`/`k` walk the bands, `Enter` opens one, `h`/`j`/`k`/`l` walk its cards, `Enter` again steps into the pane and starts typing at the agent, `` Ctrl+` `` hands the keys back. |
+| **One grid, every session** | PROJECT TABS across the top, a BAND per WORKTREE, a CARD per SESSION, and the PANE — the live terminal of the card under the cursor — along the bottom or down the right. Terminals are cards too, two columns wide, showing the last lines their shell printed. `j`/`k` walk the bands, `Tab` opens one in place, `h`/`l` walk its cards, `Enter` steps into the pane and starts typing at the agent, `` Ctrl+` `` hands the keys back. |
 | **A DAEMON that owns the PTYs** | Quit the TUI, shut the laptop, come back tomorrow. The agents never stopped, and the SCROLLBACK RING is replayed on ATTACH. |
 | **STATUS DOTS you read instead of screens** | ● yellow mid-turn, ● blue finished and UNSEEN, ● green finished and read, ● red waiting on you — on every card, and counted on every PROJECT TAB (`orbit-api ●1 ●1 ●1`), so a project you aren't looking at still tells you what it owes you. A finish you haven't read wears a blue `done` badge until you do. |
 | **A task box, not a picker** | `p` opens the QUICK PROMPT: type the task, `Enter`, and an agent is working on it. The row over the box spells out the launch — `project orbit-api ^P · worktree main ^T · harness claude Tab · model opus high ^O` — and each of those is a picker you can open without losing the text. `Space` on a card is the same box for a session already running: its next turn, sent straight down its PTY, without stepping into it. |
@@ -142,7 +142,7 @@ the BANDS: two agents in two WORKTREES edit two directories and never collide, a
 carries the branch, its uncommitted changes (`+3 files +60 -28`) and its pull request.
 
 **5. Read the grid, not the screens.** `j` / `k` walk the bands and the pane reads each checkout's
-session as you pass; `Enter` opens a band to walk its cards, and `Enter` on a card steps into the pane
+session as you pass; `Tab` opens a band to walk its cards, and `Enter` on a card steps into the pane
 with the grid still up — `Ctrl+q` or `` Ctrl+` `` hands the keys back. `Space` on a card opens a
 small box for that session's next turn and sends it without opening the session, so a wall of agents
 gets its next instructions one card at a time.

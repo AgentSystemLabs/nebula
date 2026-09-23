@@ -127,7 +127,7 @@ shot: ## Screenshot the debug TUI with demo data (SCENE=open-prs KEYS="…")
 	scripts/shot/shot.sh $(SCENE)
 
 # The LATENCY HARNESS: the same isolation as `make shot`, against a clone of this repository, with the
-# INPUT LATENCY PROBE on (NEBULA_PERF_LOG). Drives scripts/perf/scenario.steps — every panel, modal and
+# INPUT LATENCY PROBE on (NEBULA_PERF_LOG). Drives scripts/perf/scenario.steps — every view, modal and
 # verb — and prints per step how long the key held the loop, how long it waited for its frame, how long
 # the screen took to settle, and the TUI's and daemon's peak RSS. `make perf BIN=target/release/nebula`
 # measures the release build; `python3 scripts/perf/report.py BEFORE AFTER` compares two runs.

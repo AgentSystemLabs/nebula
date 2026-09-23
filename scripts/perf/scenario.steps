@@ -1,9 +1,7 @@
 # label<TAB>key — see run.sh. The demo starts with one project (three checkouts, main dirty) and no
-# sessions, FOCUS on the Projects panel.
-focus worktrees	l
-worktree down	j
-worktree up	k
-focus sessions	l
+# sessions, the cursor on the grid.
+band down	j
+band up	k
 new session picker	n
 picker: take harness	Enter
 task box: launch empty	Enter
@@ -27,8 +25,6 @@ wheel up in pane (2)	wheel:120,20
 leave pane (4)	C-q
 click session row	click:50,12
 click other session row	click:50,9
-click worktree row	click:25,20
-click worktree row back	click:25,9
 open diff	g
 diff: next file	Down
 diff: next file (2)	Down
@@ -81,13 +77,11 @@ quick prompt: type	text:fix the login redirect
 quick prompt: cancel	Escape
 context menu	m
 context menu: close	Escape
-toggle projects panel	P
-toggle projects panel back	P
-fullscreen pane	z
-leave fullscreen	C-q
-next attention	]
+fold the pane	C-b
+bring the pane back	C-b
+next attention	.
 leave pane (5)	C-q
-prev attention	[
+prev attention	,
 leave pane (6)	C-q
 rename session	r
 rename: type	text:x
@@ -98,22 +92,19 @@ hide archived	A
 delete session	d
 delete: confirm	y
 open repo in browser	G
-focus worktrees (2)	h
-new worktree prompt	n
+context menu (2)	m
+new worktree prompt	Enter
 new worktree: type	text:perf branch
 new worktree: submit	Enter
 wait for worktree	wait:3
-worktree down to new	j
-worktree up again	k
+band down to new	j
+band up again	k
 quick prompt new worktree	p
 quick prompt nw: type	text:do the thing
 quick prompt nw: launch	Enter
 wait for launch	wait:3
-focus projects	h
-project down	j
-project up	k
 add project prompt	o
 add project: cancel	Escape
 project tab 1	1
-next project tab	.
-prev project tab	,
+next project tab	]
+prev project tab	[

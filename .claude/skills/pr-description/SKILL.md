@@ -154,7 +154,7 @@ One diagram that shows the change, ten to twenty nodes at most. Choose by shape:
 - a status or mode that gained or lost a transition (RUNNING → FINISHED → UNSEEN) → `stateDiagram-v2`
 - crates or modules touched → `flowchart` with the changed nodes given a `classDef` fill
 
-Name nodes in TERMS or real identifiers; quote any label with punctuation (`A["nebula kill"]`). Keep
+Name nodes by real identifiers; quote any label with punctuation (`A["nebula kill"]`). Keep
 the fence exactly ```` ```mermaid ```` — a language tag GitHub does not know renders as text.
 
 ### 6. Write the body to a file, and fix the anchors

@@ -918,7 +918,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // every one of these is rebindable in Settings → Hotkeys, and
             // help that lies about that is worse than no help. Literals
             // are for keys that belong to an overlay rather than the
-            // panels, which is why they aren't rebindable.
+            // grid, which is why they aren't rebindable.
             use crate::keymap::Action::*;
             enum HelpKeys {
                 Lit(&'static str),
@@ -930,16 +930,21 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "NAVIGATE & SEARCH",
                     &[
+                        (Act(&[MoveDown, MoveUp]), "walk the cards (2×: tabs)"),
+                        (Act(&[FocusLeft, FocusRight]), "step along a row of cards"),
+                        (Act(&[FocusNext]), "open / fold the checkout"),
+                        (Act(&[Activate]), "into the pane (attach)"),
+                        (Act(&[HalfPageDown, HalfPageUp]), "jump two rows of cards"),
                         (
-                            Act(&[FocusNext, FocusPrev]),
-                            "walk panels (fwd locks input)",
+                            Act(&[NextProjectTab, PrevProjectTab]),
+                            "next / previous project tab",
                         ),
+                        (Lit("⌘1-9 / 1-9"), "open that project tab"),
                         (
-                            Act(&[FocusLeft, FocusRight]),
-                            "focus left / right (2×: jump)",
+                            Act(&[ProjectDropdown, CloseProjectTab]),
+                            "project list / close tab",
                         ),
-                        (Act(&[MoveDown, MoveUp]), "move selection (2×: bar)"),
-                        (Act(&[Activate]), "drill in / attach session"),
+                        (Act(&[AddProject]), "add a project"),
                         (Act(&[Palette]), "fuzzy jump to anything"),
                         (Lit("^o / ^f"), "jump pick: open / focus row"),
                         (
@@ -952,21 +957,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     ],
                 ),
                 (
-                    "PROJECTS",
+                    "CHECKOUTS & GITHUB",
                     &[
-                        (Act(&[New, AddProject]), "add project (2nd: from anywhere)"),
-                        (Act(&[Rename]), "rename row (folder keeps its name)"),
-                        (Act(&[Delete]), "remove from list"),
-                    ],
-                ),
-                (
-                    "WORKTREES",
-                    &[
-                        (Act(&[New]), "new worktree (PR row: Claude)"),
-                        (Act(&[Rename]), "run / stop the project's run command"),
-                        (Act(&[OpenWorktree]), "fire its open command"),
-                        (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
-                        (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓, ^t: tree)"),
+                        (Act(&[ContextMenu]), "menu: worktree · run · delete"),
+                        (Act(&[OpenWorktree]), "fire the open command"),
+                        (Act(&[GitDiff]), "diff (^r reviewed, ^t tree)"),
                         (
                             Act(&[OpenRepo, OpenGhosttyTab]),
                             "repo on GitHub / Ghostty tab",
@@ -976,17 +971,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             "card's PR / issue on GitHub",
                         ),
                         (Act(&[RefreshPullRequests]), "refresh pull requests now"),
-                        (
-                            Act(&[CommentPullRequest]),
-                            "comment on the pull request row",
-                        ),
-                        (Act(&[Issues]), "github issues: prompt / preset / edit one"),
-                        (
-                            Act(&[PullRequests]),
-                            "pull requests: read one, launch a PR session on it",
-                        ),
-                        (Act(&[SwitchBranch]), "switch the ⌂ root checkout's branch"),
-                        (Act(&[Delete, DeleteAll]), "delete one / delete all"),
+                        (Act(&[Issues]), "issues: prompt, preset, edit"),
+                        (Act(&[PullRequests]), "pull requests: read / launch"),
+                        (Act(&[CommentPullRequest]), "comment on the pane's PR"),
+                        (Act(&[SwitchBranch]), "switch the ⌂ root's branch"),
                     ],
                 ),
                 (
@@ -1003,16 +991,13 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "SESSIONS",
                     &[
-                        (Act(&[New]), "new agent (pick CLI kind)"),
-                        (
-                            Act(&[DuplicateSession]),
-                            "quick prompt on the card's settings",
-                        ),
+                        (Act(&[QuickPrompt]), "quick prompt: Enter launches"),
+                        (Act(&[New]), "new session: pick a CLI first"),
+                        (Act(&[DuplicateSession]), "quick prompt as this card"),
                         (Act(&[AgentPresets]), "agent presets: saved launches"),
                         (Act(&[NewTerminal]), "new shell terminal"),
-                        (Act(&[Activate]), "attach session / open link"),
-                        (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
-                        (Act(&[Rename]), "rename agent / edit link URL"),
+                        (Act(&[FollowUp]), "follow-up prompt to the agent"),
+                        (Act(&[Rename]), "rename the session"),
                         (
                             Act(&[Archive, Unarchive, ToggleArchived]),
                             "archive / unarchive / show",
@@ -1025,9 +1010,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "TERMINAL & MOUSE",
                     &[
                         (Act(&[Activate]), "lock input"),
-                        (Act(&[UnlockTerminal]), "unlock, back to panels"),
+                        (Act(&[UnlockTerminal]), "unlock, back to the card"),
+                        (Act(&[PaneTabs]), "pane: session ↔ its terminals"),
                         (Lit("drag"), "select + copy (2×click: word)"),
-                        (Lit("click / drag"), "an app that took the mouse gets it"),
+                        (Lit("click / drag"), "the app that took the mouse"),
                         (Lit("⌥click"), "open URL / file under cursor"),
                         (Lit("⇧drag"), "select via your terminal"),
                         (Lit("drag the pane edge"), "resize the pane"),
@@ -1039,12 +1025,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &[
                         (
                             Act(&[ToggleLauncherPane, ToggleSidebars]),
-                            "fold the pane away / bring it back",
+                            "fold / unfold the pane",
                         ),
-                        (Lit("⌘1-9 / 1-9"), "open that project tab"),
-                        (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
-                        (Act(&[Settings]), "settings (Hotkeys tab rebinds these)"),
-                        (Act(&[Metrics]), "memory usage (nebula + agents)"),
+                        (Act(&[Hosts]), "ssh hosts (a: new, d: del)"),
+                        (Act(&[Settings]), "settings; Hotkeys tab rebinds"),
+                        (Act(&[Metrics]), "memory: nebula + agents"),
                         (Act(&[Quit, Help]), "quit / toggle this help"),
                     ],
                 ),
@@ -4081,10 +4066,8 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 // The LAUNCHER VIEW has its grid of sessions to go back to.
                 if app.launcher_grid() {
                     "back to the card"
-                } else if app.launcher_active() {
-                    "sessions"
                 } else {
-                    "panels"
+                    "sessions"
                 },
                 // A program that asked for the mouse gets the drag (its
                 // own selection copies); promising nebula's would lie.

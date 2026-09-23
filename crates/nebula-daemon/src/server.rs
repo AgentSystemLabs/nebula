@@ -466,13 +466,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::AutoRenameAgent { req_id, id, name } => {
                     reply_done(&out_tx, req_id, daemon.auto_rename_agent(&id, &name)).await;
                 }
-                ClientRequest::MoveAgent {
-                    req_id,
-                    id,
-                    worktree,
-                } => {
-                    reply_done(&out_tx, req_id, daemon.move_agent(&id, &worktree)).await;
-                }
                 ClientRequest::SpawnSiblingAgent {
                     req_id,
                     id,
@@ -568,18 +561,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         &out_tx,
                         req_id,
                         daemon.create_terminal(&worktree, name).map(Some),
-                    )
-                    .await;
-                }
-                ClientRequest::CreateLink {
-                    req_id,
-                    worktree,
-                    url,
-                } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.create_link(&worktree, &url).map(Some),
                     )
                     .await;
                 }

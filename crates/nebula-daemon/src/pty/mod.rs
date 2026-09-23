@@ -470,6 +470,8 @@ impl PtySession {
     }
 
     /// The child's current window title, or `None` if it never set one.
+    /// Test-only: the daemon reads titles off the scanner's change edge.
+    #[cfg(test)]
     pub fn window_title(&self) -> Option<String> {
         self.title.lock().unwrap().title().map(str::to_string)
     }
@@ -686,22 +688,6 @@ mod tests {
             flush_deadline(now, Some(just_flushed)),
             just_flushed + COALESCE_HOLD
         );
-    }
-
-    fn echo_session() -> Arc<PtySession> {
-        PtySession::spawn(
-            SessionRef::Agent(AgentId::generate()),
-            SpawnSpec {
-                program: "/bin/cat".into(),
-                args: vec![],
-                cwd: std::env::temp_dir(),
-                env: vec![],
-                scrub_env: &[],
-                cols: DEFAULT_COLS,
-                rows: DEFAULT_ROWS,
-            },
-        )
-        .unwrap()
     }
 
     /// A window title set by the child reaches subscribers as its own

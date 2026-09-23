@@ -35,9 +35,6 @@ pub struct LauncherRow {
     pub project: String,
     /// The checkout's branch — what the panels call the worktree.
     pub branch: String,
-    /// The checkout is the project's ROOT WORKTREE (drawn with the `⌂`
-    /// the WORKTREES PANEL gives it).
-    pub is_main: bool,
     /// The pull request on that branch, when one is known.
     pub pr: Option<RowPr>,
 }
@@ -161,7 +158,6 @@ fn row_of(
         agent: agent.clone(),
         project: project.name.clone(),
         branch: worktree.branch.clone(),
-        is_main: worktree.is_main,
         pr: row_pr(app, &worktree.id, &project.id, &worktree.branch),
     })
 }
@@ -225,14 +221,6 @@ impl Card {
         }
     }
 
-    /// The session, on a session card.
-    pub fn agent(&self) -> Option<&Agent> {
-        match self {
-            Card::Session(row) => Some(&row.agent),
-            Card::Terminal(_) => None,
-        }
-    }
-
     pub fn is_terminal(&self) -> bool {
         matches!(self, Card::Terminal(_))
     }
@@ -244,8 +232,6 @@ impl Card {
 #[derive(Debug, Clone)]
 pub struct Band {
     pub worktree: WorktreeId,
-    /// The PROJECT's display name.
-    pub project: String,
     pub branch: String,
     /// The checkout is the project's ROOT WORKTREE (`⌂`).
     pub is_main: bool,
@@ -304,7 +290,6 @@ pub fn bands(app: &App) -> Vec<Band> {
         }
         out.push(Band {
             worktree: w.id.clone(),
-            project: project.name.clone(),
             branch: w.branch.clone(),
             is_main: w.is_main,
             pr: row_pr(app, &w.id, &project.id, &w.branch),
@@ -349,14 +334,6 @@ pub fn cursor(app: &App, bands: &[Band]) -> Option<CardRef> {
     let band = band_cursor(app, bands)?;
     let card = card_cursor(app, &bands[band])?;
     Some(CardRef { band, card })
-}
-
-/// The row the cursor is on in a flat list of session rows — the selected
-/// session, when it is one of the list's. What the full-screen crumb and
-/// the counts read; the grid itself reads [`cursor`].
-pub fn row_cursor(app: &App, rows: &[LauncherRow]) -> Option<usize> {
-    let selected = app.selected_session()?;
-    rows.iter().position(|row| row.agent.id == selected.id)
 }
 
 // ---- the GRID ----
@@ -675,9 +652,9 @@ pub fn grid(body: Rect) -> Grid {
     }
 }
 
+/// Test-only: where a card slot lands, for the column tests.
+#[cfg(test)]
 impl Grid {
-    /// Where the card in `slot` goes, counting from the first card drawn
-    /// (slot 0 is the top-left of the scrolled window, not of the list).
     pub fn cell(&self, slot: usize) -> Rect {
         let (row, col) = (slot / self.cols, slot % self.cols);
         Rect {
@@ -687,43 +664,9 @@ impl Grid {
             height: CARD_H,
         }
     }
-
-    /// Cards the window holds at once.
-    pub fn page(&self) -> usize {
-        self.cols * self.rows_fit
-    }
-
-    /// The slice of `total` cards this window actually draws, with the
-    /// cursor on `cursor`: where it starts, and how many cards follow it
-    /// on screen. The count stops at the last WHOLE row the area has room
-    /// for — a card is drawn entire or not at all — so a body too short
-    /// for even one reports none rather than a clipped one.
-    ///
-    /// The grids and the header both read this, so the number the header
-    /// says is hidden is exactly the number the grid left off.
-    pub fn window(&self, cursor: Option<usize>, total: usize) -> (usize, usize) {
-        let start =
-            crate::app::window_start(cursor.unwrap_or(0) / self.cols, self.rows_fit) * self.cols;
-        let bottom = self.area.y + self.area.height;
-        let fits = (0..self.page())
-            .take_while(|&slot| {
-                let cell = self.cell(slot);
-                cell.y + cell.height <= bottom
-            })
-            .count();
-        (start, total.saturating_sub(start).min(fits))
-    }
-
-    /// How many of `total` cards the window leaves off screen, split by
-    /// which way they went: scrolled off the top, or past the bottom edge.
-    pub fn hidden(&self, cursor: Option<usize>, total: usize) -> Hidden {
-        let (start, shown) = self.window(cursor, total);
-        Hidden {
-            above: start.min(total),
-            below: total.saturating_sub(start + shown),
-        }
-    }
 }
+
+impl Grid {}
 
 /// Cards a grid holds but does not draw — what the PANE along the bottom
 /// took the room for, or what a screenful of sessions simply outruns.
@@ -1001,11 +944,6 @@ pub fn panel_layout(body: Rect, bands: &[Band], expanded: Option<&WorktreeId>) -
 }
 
 impl PanelLayout {
-    /// Rows the whole panel takes, scrolled or not.
-    pub fn height(&self) -> u16 {
-        self.height
-    }
-
     /// The band open as the ACCORDION, if one of these is.
     pub fn open(&self) -> Option<usize> {
         self.bands.iter().position(|b| b.content.is_some())
@@ -1300,14 +1238,6 @@ impl ExpandedLayout {
     }
 }
 
-/// How many of `rows` are waiting on a human — the count the grid's
-/// header puts in red, the same status the red dot marks.
-pub fn needs_you(rows: &[LauncherRow]) -> usize {
-    rows.iter()
-        .filter(|row| row.agent.status == nebula_core::AgentStatus::NeedsFeedback)
-        .count()
-}
-
 /// The last thing this session was asked to do — the newest of the
 /// RECENT PROMPTS the daemon captures off the `UserPromptSubmit` hook,
 /// already one line. None for a session that predates the capture, or one
@@ -1318,11 +1248,6 @@ pub fn last_prompt(agent: &Agent) -> Option<&str> {
         .last()
         .map(|p| p.text.as_str())
         .filter(|t| !t.is_empty())
-}
-
-/// The id of the session on row `index`, if the list has one there.
-pub fn agent_at(app: &App, index: usize) -> Option<AgentId> {
-    rows(app).get(index).map(|row| row.agent.id.clone())
 }
 
 // ---- the PROJECT DROPDOWN's list ----
@@ -1756,6 +1681,15 @@ impl ProjectPicker {
     }
 }
 
+/// Test-only accessors: nothing in the app reads these any more.
+#[cfg(test)]
+impl PanelLayout {
+    /// Rows the whole panel takes, scrolled or not.
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1852,20 +1786,12 @@ mod tests {
         let rows = super::rows(&app);
         assert_eq!(names(&rows), ["add-search", "fix-login"]);
         assert_eq!(
-            (
-                rows[0].project.as_str(),
-                rows[0].branch.as_str(),
-                rows[0].is_main
-            ),
-            ("api", "feat", false)
+            (rows[0].project.as_str(), rows[0].branch.as_str()),
+            ("api", "feat")
         );
         assert_eq!(
-            (
-                rows[1].project.as_str(),
-                rows[1].branch.as_str(),
-                rows[1].is_main
-            ),
-            ("api", "main", true)
+            (rows[1].project.as_str(), rows[1].branch.as_str()),
+            ("api", "main")
         );
 
         // Switched to `web`, and the list is its one session instead —
@@ -2119,46 +2045,6 @@ mod tests {
         // all grid, and a session is only seen full-screen.
         let short = Rect::new(0, 0, 80, HEAD_H + CARD_H + PANE_MIN_H - 1);
         assert_eq!(split(short, None), (short, None));
-    }
-
-    /// The window counts what it left off, and which way it went: cards
-    /// past the bottom edge when the cursor is at the top, cards behind
-    /// the cursor once it has walked down. A grid with room for the lot
-    /// hides nothing — that is the case the header stays quiet for.
-    #[test]
-    fn the_window_counts_the_cards_it_could_not_draw() {
-        // Two columns, two rows of cards on screen: four at a time.
-        let body = Rect::new(0, 0, 100, HEAD_H + CARD_H * 2 + GAP_Y);
-        let g = grid(body);
-        assert_eq!((g.cols, g.rows_fit), (2, 2));
-
-        assert_eq!(g.hidden(Some(0), 4), Hidden::default(), "the lot fits");
-        assert_eq!(g.hidden(None, 4), Hidden::default(), "and with no cursor");
-        assert_eq!(
-            g.hidden(Some(0), 9),
-            Hidden { above: 0, below: 5 },
-            "from the top, the rest are under the fold"
-        );
-        // The cursor on the last card: the window has scrolled to it, so
-        // what is missing is behind it rather than ahead. Nine cards over
-        // two columns is five rows; the last two of them are on screen.
-        assert_eq!(g.hidden(Some(8), 9), Hidden { above: 6, below: 0 });
-        // And in the middle, both ways at once.
-        assert_eq!(g.hidden(Some(5), 12), Hidden { above: 2, below: 6 });
-        assert_eq!(g.hidden(Some(5), 12).total(), 8);
-
-        // A body with room for one row of cards hides everything under it
-        // — the PANE dragged up to its stop.
-        let squeezed = grid(Rect::new(0, 0, 100, HEAD_H + CARD_H));
-        assert_eq!(squeezed.rows_fit, 1);
-        assert_eq!(squeezed.hidden(Some(0), 9), Hidden { above: 0, below: 7 });
-    }
-
-    #[test]
-    fn a_tiny_body_still_has_one_cell() {
-        let g = grid(Rect::new(0, 0, 10, 4));
-        assert_eq!((g.cols, g.rows_fit), (1, 1));
-        assert_eq!(g.page(), 1);
     }
 
     /// With `^N` off the box lands in the checkout under the grid's

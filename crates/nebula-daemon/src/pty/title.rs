@@ -63,6 +63,7 @@ impl TitleScanner {
     }
 
     /// The last title the child set, if any.
+    #[cfg(test)]
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }

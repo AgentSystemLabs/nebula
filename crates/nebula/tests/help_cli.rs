@@ -11,7 +11,7 @@
 use std::process::Command;
 
 /// Every command `nebula --help` lists.
-/// Hidden ones (`_raw-attach`, `_stale-daemon-note`) are deliberately absent.
+/// The hidden `_stale-daemon-note` is deliberately absent.
 const VISIBLE: &[&[&str]] = &[
     &["add"],
     &["daemon"],
@@ -165,9 +165,10 @@ fn hidden_commands_stay_hidden() {
         pages.push(help_at("100", &with_help));
     }
     for page in pages {
-        for hidden in ["_raw-attach", "_stale-daemon-note"] {
-            assert!(!page.contains(hidden), "{hidden} is listed in:\n{page}");
-        }
+        assert!(
+            !page.contains("_stale-daemon-note"),
+            "_stale-daemon-note is listed in:\n{page}"
+        );
     }
 }
 

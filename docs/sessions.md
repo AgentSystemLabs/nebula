@@ -97,8 +97,7 @@ one included.
 ## AGENT PRESETS
 
 If you keep starting the same kind of session with the same framing, save it as an **agent preset**:
-`e` in the Sessions column — or on a worktree's row in the Worktrees column, which launches into
-that worktree without walking over to its sessions — lists them. Type to find one by name: letters
+`e` on a card lists them, and the launch lands in that card's checkout. Type to find one by name: letters
 narrow the list to the fuzzy matches, `↑`/`↓` move, `Backspace` widens and `Esc` clears — as in the
 model and effort submenus. `Ctrl+a` opens a small form — name, harness, model, effort, **Text**
 (which side of the task the preset's text goes: `prefix`, `postfix` or `prefix & postfix`, with a
@@ -120,17 +119,16 @@ live in `agent_presets.json` beside `config.json`. The form's Harness row lists 
 by id alongside the built-ins — a preset on one launches with the entry's program and defaults, and
 refuses with the reason when its entry is switched off or gone.
 
-On an open pull request's row in the Worktrees column (the project's `OPEN PRS` group), `e` is a
+In the PULL REQUESTS MODAL (`v`), `Shift+Tab` on a pull request is a
 picker instead of the manager: the preset you pick launches a PR SESSION on that pull request. The
 box comes back with the preset applied and the PR in its title, and `Enter` starts the agent in the
 project's worktree on the PR's head branch — reused when one is already checked out on it, cut by
 the daemon otherwise — with the PR link and its work rule in the system prompt and the preset's
 `prefix + task + postfix` as the first prompt, so the agent is already working on the PR when the
-pane opens. A `skip`-task preset launches straight from the picker. `p` on the row is the same launch
+pane opens. A `skip`-task preset launches straight from the picker. `Enter` on the pull request is the same launch
 without a preset: the box titled for the PR, your text alone as the first prompt, and the checkout's
 row up under the pull request as soon as you press `Enter` — never a random-branch worktree the
-session would have to move onto the pull request by hand. Both keys work from whichever panel has
-focus while the pull request's row is selected, the pane reading it included.
+session would have to move onto the pull request by hand.
 
 A contributor's pull request from a fork gets a checkout named for the fork: `givemeurhats/main`,
 `wende/feat/settings-hotkey`. A fork's branch shares nothing with yours but possibly a name — `main`
@@ -158,7 +156,7 @@ PTY — the same path your keystrokes take in the pane — so the CLI sees it as
 the pane swaps to that session so you can watch the turn land. A prompt with line breaks in it crosses
 as one bracketed paste rather than as typing, so nothing auto-indents it to mush.
 
-While the box is open it owns the keyboard: the panel's own verbs are bare letters, so `a`, `d` and `r`
+While the box is open it owns the keyboard: the grid's own verbs are bare letters, so `a`, `d` and `r`
 are letters in your prompt and not archive, delete and rename aimed at the session you are prompting.
 `Tab` still walks to the next panel and leaves the card expanded behind it, and clicking another card
 folds the box. The toggle on each card says which state it is in — `▸` folded, `▾` expanded — and a
@@ -195,12 +193,9 @@ a dropped image there itself.
 
 ## RECENT PROMPTS
 
-An experimental read on what each session was last asked to do. Turn on **Recent prompts** under
-Settings → Experimental (`recent_prompts` in CONFIG.JSON) and every session card carries the last
-thing it was asked, oldest first so the bottom line is the latest ask, each condensed to one line and
-clipped to the card, with a dim `30m ago` pinned to the right. **Recent prompts shown**
-(`recent_prompts_count`, `3` by default, `1` to `5` in the overlay) says how many; the DAEMON keeps the
-newest ten per session, so raising the number later has history to draw from at once.
+Every session card carries the last thing its session was asked to do, condensed to one line and
+clipped to the card, with a dim `30m ago` pinned to the right. The DAEMON keeps the newest ten prompts
+per session behind it.
 
 The text is the prompt as you typed it, not a paraphrase. The DAEMON reads it off the
 `UserPromptSubmit` hook payload every harness sends (Claude, Codex and Cursor name it `prompt`; Pi's
@@ -208,11 +203,9 @@ managed extension and OpenCode's managed plugin post the same field), collapses 
 so a pasted file shows as its opening line. It costs the agent nothing — no extra turn, no tool call,
 nothing added to its context — which is why it is the prompt and not a summary the model wrote.
 Prompts nebula composes itself, such as a PR SESSION's scope or the note a `nebula worktree`
-relocation reopens on, are left out, and so are blank ones. The lines belong to their row: they sit
-inside its pill, and on the row the cursor is on they take the pill's fill with the rail running down
-beside them, so the list reads as part of the selected session rather than as rows beneath it. A
-click on any of them lands on the session, archived rows list none, and a session created before the
-feature simply has nothing to show until its next prompt.
+relocation reopens on, are left out, and so are blank ones. A click on the line lands on the card,
+archived cards show none, and a session created before the feature simply has nothing to show until
+its next prompt.
 
 ## The GRID
 
@@ -328,7 +321,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   card that is not on screen reads as something taking its room rather than as a session gone, and
   the arrow says whether the way back to it is `j` down through the grid or the pane's edge dragged
   back down. It holds the right edge on a narrow terminal: the pr and issue counts give way first.
-  Inside a worktree the grid's own edges say it again where the eye looks for the rest: `↑ 2 more
+  An open band's edges say it again where the eye looks for the rest: `↑ 2 more
   above` on the row of air under the PROJECT TABS once the top has scrolled off, `↓ 3 more below`
   on a row kept under the cards while there is more past the bottom — the row stays as air once the
   grid is scrolled to its end, and neither appears on a grid that fits.
@@ -349,10 +342,8 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   the pane, open band or collapsed. Which band is open is remembered across restarts, and a jump that
   names a session — `/`, the attention walk, a terminal just opened — lands inside its checkout.
   The wheel never walks the cursor, so a trackpad cannot swap the pane out from under the card you
-  are reading: at the band level a notch over the grid is ignored, and the window scrolls only as
-  far as it must to keep the cursor's band on screen. Inside a worktree the grid scrolls the way a
-  terminal's screen does — the wheel moves the cards three rows a notch under a cursor that stays
-  put, held at the grid's ends, and a card the window's edge cuts is drawn to the edge rather than
+  are reading: the grid scrolls the way a terminal's screen does — the wheel moves the bands three
+  rows a notch under a cursor that stays put, held at the grid's ends, and a card the window's edge cuts is drawn to the edge rather than
   left out, so the window is full to its edges and no card-sized hole opens over the cards. The
   next key that walks the cursor, or `j`/`k` against the grid's edge, scrolls just far enough to
   bring the cursor's card whole back on screen — with the checkout's rule when it is on the first
@@ -361,14 +352,14 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   the bottom, under them, with the `⬓` button just before the `×` on its header (`◨` there moves
   it back) or Settings → Appearance → **Session pane** (`session_pane`, which the button writes; a
   window too narrow for it beside a column of cards lays it along the bottom until there is
-  room) — and reads whichever card the cursor is on — at the band level, the band's remembered
+  room) — and reads whichever card the cursor is on — on a collapsed band, its remembered
   card: `● polish-nav  ↳ feat` on its header, the card's name and its checkout, with a `+` after
   them that opens a terminal there, and that session live under it, swapping as you walk the
   grid, so stepping across the bands reads each checkout's progress in turn. A terminal's chip
   puts its shell there the same way. It is the selected session, so
   it comes and goes with the selection: clicking a card opens the pane on it — reading only, the keys
-  stay on the cards, and the grid keeps its level, so a card clicked from the bands stays a
-  preview under its rule — and letting the card go (`Esc` at the band level, or `^~`) collapses
+  stay on the cards, so a clicked card stays a
+  preview under its rule — and letting the card go (`Esc`, or `^~`) collapses
   the pane and gives the grid the whole body back. A click on the air between the cards does not: a
   miss with the pointer leaves the pane exactly where it is. It takes a second click, or Enter, to type into it. It is the same pane the
   a full-screen session has — the same attach, the same scrollback and wheel, and the card it shows is marked read
@@ -389,8 +380,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   type as that session's next turn, straight down its PTY. The pane is left exactly as it is — this is
   the way to hand a wall of sessions their next instructions one after another without opening any of
   them. See [the FOLLOW-UP COMPOSER](#the-follow-up-composer).
-- **Stepping into one** is Enter inside a worktree (or `Tab`, `^→`, or a double-click — from the
-  bands, a double-click on a card is Enter twice, into the worktree and then in): the keys cross
+- **Stepping into one** is Enter on a card (or `^→`, or a double-click): the keys cross
   into the pane beside the cards, where that session is already running, with its input locked and
   the grid still up over it — the same place a click into the pane lands. `` ^` `` hands the keys
   back to the cards, and a second `` ^` `` folds the pane away.
@@ -406,8 +396,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   would launch into, and **Delete worktree** when that is a linked one; **Rename**, a label only —
   the folder on disk keeps its name, and an empty name goes back to it; and **Remove from list**,
   behind a confirm, which leaves the clone on disk alone. There is nothing above the bands to walk
-  out to: `Esc` inside a worktree backs out to them, `Esc` there lets the band go, a third does
-  nothing, and `k` on the first band stays put.
+  out to: `Esc` lets the card go, a second does nothing, and `k` on the first band stays put.
 
 Every other key acts on the session under the cursor — `a` archives, `d` deletes, `g` opens its
 diff, `m` its menu, `/` jumps, `s` opens Settings. `a` asks first, always: a CONFIRM DIALOG names
@@ -415,7 +404,7 @@ the session, `Enter` or `y` archives it and `Esc` or `n` keeps it, so a letter a
 that lands on the grid archives nothing — and saying yes is cheap, since `u` brings it back. The
 cursor lands on the card after the one archived in its band — the one that slides up into its
 place — or, when the band's last card went, on the one before it; a band's only card leaving takes
-the band with it, and the grid is the bands again, on the one that slid up into its slot. `d` lands
+the band with it, and the cursor lands on the one that slid up into its slot. `d` lands
 the same way. A held `a` opens one dialog and
 archives nothing by itself; a held `u` in the ARCHIVED VIEW unarchives one card, and the next needs
 the key let go and pressed again (on a terminal with the kitty keyboard protocol, which is what
@@ -439,108 +428,9 @@ cursor the whole card lifts a step, so the one you are about to unarchive stays 
 focus tint, and with color off entirely the two shapes still tell the grids apart. No card says
 the word `archived`: the header says it once, for all of them.
 
-## The PROJECT OPEN PRS group
-
-Under the checkouts, an `OPEN PRS` group lists every pull request still open on the repo — drafts
-included, sunk to the bottom of the group, dimmed and badged `draft` so they are told apart from the
-ones asking for a reviewer (the `/` PALETTE lists the same rows and spells both states out, `draft` and
-`ready for review`). A pull request GitHub says cannot merge — its branch conflicts with the base, or a
-check is failing — is red end to end instead, arrow, title and rail, and badged `conflicts` or `failing`
-in place of its state (`merge conflicts` / `checks failing` in the PALETTE), draft or not: that row needs
-a person, and the red is the one the STATUS DOT wears on a session that needs someone. Conflicts win
-the badge when both hold; the row goes back to its state on the refresh that finds it clean. All of it is
-fetched with `gh` when you open the project, re-asked every 15 seconds once
-that PROJECT has answered with at least one open pull request, and again whenever the Worktrees or
-Sessions panel or the terminal window takes focus (one `gh pr list` per project, so a repo with a
-hundred open PRs still costs one API call) — or at once, past every timer, when you press `Shift+R`
-from any panel, which also re-reads the pull request the pane is showing. A PROJECT that answers empty — or one where `gh` is
-missing, unauthenticated, or too slow to answer at all — never settles onto that beat and backs off
-instead: 30 seconds to the next attempt, doubling every round to a 10-minute ceiling, so a repo with
-nothing open, or a machine with no `gh` on it, stops asking all day. A call that fails outright keeps
-whatever list was already on screen; one flaky round trip is no reason to blank the group. The 15-second
-beat is also how rows retire: merge or close a pull request and it stops coming back, so it leaves the
-list on its own, and the one under your cursor goes the moment GitHub says it's merged. Rest the cursor
-on one and the right-hand pane reads it to you — description, stats and the whole conversation — without
-leaving nebula; `g` opens its diff in the same viewer your worktree diffs use, `y` opens a COMMENT BOX
-whose `Enter` posts what you typed on the pull request through `gh pr comment` (the pane re-reads the
-conversation once it lands, and a post `gh` refused brings the box back with your text), `Enter` or a double-click
-opens it in the browser, and `/` finds it by title. Press `n` — or choose **New Claude session**, **New
-Codex session**, **New Cursor session**, **New Pi session**, **New Muse session**, **New Grok Build session** or **New OpenCode session** from `m` / right-click — to start a SESSION on any enabled
-harness in a checkout of the pull request's head branch — the project's worktree already on that
-branch, or one the DAEMON cuts for it — through the same MODEL / EFFORT submenus as the NEW SESSION
-PICKER, and as directly (`Enter` on a row starts it; `p` or `e` on the row is the launch that takes a
-task first), with a rule that limits all work to that PR and includes its URL: Claude and Pi get it as an appended
-system prompt, Grok Build through `--rules`, and Codex, Cursor, Muse and OpenCode as their first prompt. The URL is kept with the AGENT, so RESUME
-reapplies the same scope. Only the row you actually stop on is fetched. While the cursor rests on a
-pull request the Sessions column folds to its bare rule — a pull request has no checkout, so it has
-no sessions to list, and the pane reading it takes the width — and opens again on the next checkout.
-That fold is the row's, not yours: `Shift+S` (`hide_sessions`) is neither read nor written by it, so a
-Sessions panel you collapsed stays a rail on the checkout too, chevron and all.
-
-That checkout lists under its pull request. A worktree on an open pull request's head branch — the
-one a PR SESSION or a PR-scoped AGENT PRESET works in, or one you cut with `n` and later opened a pull
-request from — is not among the plain checkouts above the group but directly beneath the pull
-request's row, stepped in behind a `└` that runs into its status dot, so the checkout and the pull
-request it is for read as one thing and there is no guessing which worktree a review is happening
-in. It is still a worktree row: the cursor on it has that checkout's sessions in the Sessions panel
-(its own PR ROW among them), `n` starts a session there, `d` deletes it, and the pull request itself
-is the row above. A PR SESSION's stand-in checkout goes up in the same place, so nothing jumps when
-the DAEMON's real row replaces it. Move away while it is being cut — a key or a click onto another
-row, panel or project — and you stay there: the session starts in its row, and neither the cursor
-nor FOCUS is taken back to it (true of every launch, not only a pull request's). The ROOT WORKTREE
-never nests, whatever branch it is on, and a branch two open pull requests share nests under the
-first listed. Only a pull request on screen
-takes its checkout: fold the group, or keep the draft it is out with **Hide draft PRs**, and the
-checkout is a plain row again — hiding pull requests never hides work you have. The cursor follows
-its checkout through every one of those moves, and through the `gh pr list` answer that first lists
-the pull request (the checkout moves under it) or retires it (the checkout moves back out).
-
-The group folds. Click its header — or pick **Show/hide open PRs** from the panel's right-click
-menu — and the list drops to the one line `▸ OPEN PRS · 12`, the triangle turned sideways and the
-count still honest, because `gh pr list` keeps its beat behind the fold; open, the header reads
-`▾ OPEN PRS · 12` over the rows. Folding away the row the cursor is on lands it on the last checkout
-and brings that checkout's session back into the pane, a checkout that sat under its pull request
-rejoins the plain rows with the cursor still on it, `↑/↓` then stop at the checkouts, and `/`
-still finds every pull request either way. Stepping `↓` off the last checkout into a folded group
-opens it onto its first pull request rather than stopping at the header. The fold is remembered
-across restarts, like the ARCHIVED toggle.
-
-Drafts can be kept out altogether. **Draft pull requests** under Settings → Appearance
-(`hide_draft_prs` in CONFIG.JSON, `shown` by default) — or **Hide draft PRs** from the panel's
-right-click menu, offered whenever the list holds one — drops them from the group and from `/` alike,
-and the header counts `9/12`: nine rows listed of twelve open, so the rows that are not there read as
-a setting rather than a loss. It is a view, not a fetch: the list still holds every draft, so **Show
-draft PRs** brings them back without a round trip, and a draft marked ready on GitHub joins the rows
-on the refresh that says so (one converted back to a draft leaves on the next). A checkout on a
-draft's branch keeps its sessions and the pull request under their cards — the toggle is
-for browsing what is open, not for hiding work you have. Hiding the row the cursor is on lands it on
-the nearest row left, as a fold does. The choice is remembered across restarts.
-
-## The PROJECT ISSUES group
-
-Under the pull requests, an `ISSUES` group lists every issue open on the repo — the ISSUES MODAL's
-rows (`gh issue list`, newest first, pull requests left out), so it is there as soon as the cursor
-has rested on the project, kept fresh on the modal's own beat, and counts `100+` when the answer hit
-the fetch cap. Each row is `↗ #15 title`, in the green the modal paints `open` in. Rest the cursor on
-one and the pane reads it the way it reads a pull request — number and title, who opened it and
-when, its labels, the description as markdown and, once the cursor has rested a moment, its comments
-(one `gh issue view` per row you actually stop on, remembered for the session); `PgUp`/`PgDn`,
-`Home`/`End` and the wheel scroll it. The Sessions column folds to its rule meanwhile, as it does
-beside a pull request. `Enter` or a double-click opens the issue in the browser, `p` is the modal's
-`Enter` for it — the QUICK PROMPT carrying the issue, into the project's root checkout — `e`
-launches an AGENT PRESET on it, and `m` / right-click offers the browser. The checkout verbs (`n`,
-`d`, `r`, `Shift+Enter`) say there is no checkout here, as they do on a pull request.
-
-The group folds like the one above it: click its header — or pick **Show/hide issues** from the
-panel's right-click menu — and it drops to `▸ ISSUES · 12`; open, the header reads `▾ ISSUES · 12`
-over the rows. Folding away the row the cursor is on lands it on the row above the header — the last
-pull request, or the last checkout, whose session comes back into the pane. Stepping `↓` off that
-row into a folded group opens it onto its first issue (a folded OPEN PRS group opens first, on its
-own step). The fold is remembered across restarts, beside the OPEN PRS one.
-
 ## The ISSUES MODAL and ISSUE SESSIONS
 
-`i` from any panel lists the selected PROJECT's open GitHub issues — `gh issue list`, newest first,
+`i` lists the selected PROJECT's open GitHub issues — `gh issue list`, newest first,
 pull requests left out — down the left of a modal, and reads the one under the cursor on the right:
 number and title, who opened it and when, its labels, the description rendered as markdown (a newline
 is a line break, as GitHub shows a comment), and,
@@ -612,10 +502,10 @@ ordinary agent from then on: auto-title, hooks, status, resume.
 
 ## The PULL REQUESTS MODAL
 
-`v` from any panel is the ISSUES MODAL for pull requests: the selected PROJECT's open pull requests
-down the left of a modal — in the OPEN PRS group's order, newest first with the drafts sunk below the
-finished ones, and drafts listed even while `hide_draft_prs` keeps them out of the panel — and the one
-under the cursor read on the right, as the pane reads a group row: state, checks and mergeability,
+`v` is the ISSUES MODAL for pull requests: the selected PROJECT's open pull requests
+down the left of a modal — newest first with the drafts sunk below the
+finished ones, and drafts listed even while `hide_draft_prs` keeps them out of the `/` palette — and the one
+under the cursor read on the right, as the pane reads a pull request: state, checks and mergeability,
 author, branches and size, the description rendered as markdown, then the conversation. A row reads
 the way its group row does — a draft dimmed with a `draft` badge, one GitHub says cannot merge red
 end to end with `conflicts` or `failing` — and the modal opens on the pull request the Worktrees

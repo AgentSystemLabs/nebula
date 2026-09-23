@@ -391,8 +391,7 @@ fn tui_help_modal_grouped_keymap() {
     // once (the old single list clipped its tail on short terminals).
     tui.send(b"?");
     tui.wait_for_text("NAVIGATE & SEARCH");
-    tui.wait_for_text("PROJECTS");
-    tui.wait_for_text("WORKTREES");
+    tui.wait_for_text("CHECKOUTS & GITHUB");
     tui.wait_for_text("SESSIONS");
     tui.wait_for_text("TERMINAL & MOUSE");
     tui.wait_for_text("GENERAL");

@@ -6,7 +6,7 @@
 # transcript so the pane beside the list has something to show.
 mkdir -p "$WORK/data"
 cat > "$WORK/data/config.json" <<'JSON'
-{"launcher_view": true, "prewarm_agents": false, "prewarm_sessions": false}
+{"prewarm_agents": false, "prewarm_sessions": false}
 JSON
 for extra in api-server web-app; do
   mkdir -p "$WORK/$extra"

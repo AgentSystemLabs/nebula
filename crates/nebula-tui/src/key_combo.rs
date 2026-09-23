@@ -41,31 +41,9 @@ pub struct KeyCombo {
 }
 
 impl KeyCombo {
-    /// The keys as shown, space-separated: `j`, `^d`, `h h`.
-    pub fn keys_text(&self) -> String {
-        self.keys
-            .iter()
-            .map(|c| c.display())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    /// The whole line: `j - Move down`, or a bare `x` for a key that fired
-    /// nothing.
-    pub fn text(&self) -> String {
-        match &self.does {
-            Some(does) => format!("{} - {does}", self.keys_text()),
-            None => self.keys_text(),
-        }
-    }
-
     /// When the loop takes it back down.
     pub fn deadline(&self) -> Instant {
         self.at + LINGER
-    }
-
-    pub fn expired(&self, now: Instant) -> bool {
-        now >= self.deadline()
     }
 }
 
@@ -110,6 +88,32 @@ pub fn is_text_key(chord: &KeyChord) -> bool {
         chord.code,
         KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
     )
+}
+
+/// Test-only accessors: nothing in the app reads these any more.
+#[cfg(test)]
+impl KeyCombo {
+    /// The keys as shown, space-separated: `j`, `^d`, `h h`.
+    pub fn keys_text(&self) -> String {
+        self.keys
+            .iter()
+            .map(|c| c.display())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The whole line: `j - Move down`, or a bare `x` for a key that fired
+    /// nothing.
+    pub fn text(&self) -> String {
+        match &self.does {
+            Some(does) => format!("{} - {does}", self.keys_text()),
+            None => self.keys_text(),
+        }
+    }
+
+    pub fn expired(&self, now: Instant) -> bool {
+        now >= self.deadline()
+    }
 }
 
 #[cfg(test)]

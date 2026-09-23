@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 43;
+pub const PROTOCOL_VERSION: u32 = 44;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -210,17 +210,6 @@ pub enum ClientRequest {
         id: AgentId,
         name: String,
     },
-    /// Re-home the agent row under another worktree of the same project,
-    /// right now. A live PTY is killed and respawned (resumed) in the new
-    /// path — left running, its hooks would keep reporting the old
-    /// checkout's cwd and the daemon would re-home the row right back.
-    /// The daemon-side primitive behind `EnterWorktree`; no TUI verb sends
-    /// it any more.
-    MoveAgent {
-        req_id: u64,
-        id: AgentId,
-        worktree: WorktreeId,
-    },
     /// `nebula worktree <name>`, run by the agent from inside its own
     /// session: create the worktree `branch` under the agent's project (or
     /// take the existing one with that branch), re-home the agent row under
@@ -292,15 +281,9 @@ pub enum ClientRequest {
         worktree: WorktreeId,
         name: Option<String>,
     },
-    /// Pin a URL to a worktree. `url` is normalized daemon-side (a bare
-    /// `github.com/...` gains an https:// scheme) and refused if it can't be
-    /// made into an http(s) URL.
-    CreateLink {
-        req_id: u64,
-        worktree: WorktreeId,
-        url: String,
-    },
-    /// Rewrite a link's URL (same normalization as CreateLink).
+    /// Rewrite a link's URL. It is normalized daemon-side (a bare
+    /// `github.com/...` gains an https:// scheme) and refused if it can't
+    /// be made into an http(s) URL.
     UpdateLink {
         req_id: u64,
         id: LinkId,

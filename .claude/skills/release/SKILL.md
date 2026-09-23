@@ -77,8 +77,8 @@ release worktree exercises `origin/main`'s binary until you `cargo clean -p` the
   processes accumulate over days and starve new test daemons. Check with
   `pgrep -f "target/debug/nebula daemon" | wc -l`.
 - A single `e2e_tui` timeout waiting for footer text is usually a stale expectation in
-  `crates/nebula/tests/e2e_tui.rs` (e.g. `FOOTER_TERMINAL_LOCKED = "Ctrl+q: panels"` while the footer
-  renders `^q: panels`), not a regression.
+  `crates/nebula/tests/e2e_tui.rs` (e.g. `FOOTER_TERMINAL_LOCKED = "Ctrl+q: sessions"` while the footer
+  renders `^q: sessions`), not a regression.
 
 Under zsh, quote shell separators (`echo '-----'`): a bare `=====` is `=cmd` expansion and sinks the
 whole `&&` chain.
