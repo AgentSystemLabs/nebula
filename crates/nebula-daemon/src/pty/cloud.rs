@@ -16,9 +16,22 @@
 //! The agent then runs in the cloud sandbox: nebula never attaches to or
 //! teleports the session, it shows the row's pane as a panel linking to
 //! the session's page.
+//!
+//! The `Created cloud session:` line before them carries the title Claude
+//! Cloud gave the session — its own summary of the task — and that is
+//! read too (issue #92): the agent runs where no hook ever reaches
+//! nebula, so nothing else would ever name the row, and a grid of cloud
+//! cards all called `agent` tells nobody which is which. It is reported
+//! ahead of the id, the order the CLI prints them in.
 
 /// Byte sequences that immediately precede a session id.
 const ID_MARKERS: [&[u8]; 2] = [b"claude.ai/code/session_", b"--teleport session_"];
+
+/// What precedes the session's title on the create's first line.
+const TITLE_MARKER: &[u8] = b"Created cloud session: ";
+/// A title run longer than this is taken as it stands rather than waiting
+/// for its line end; the CLI's own titles are a short sentence.
+const MAX_TITLE_LEN: usize = 256;
 
 /// An id longer than this is accepted as-is rather than waiting for its
 /// terminator; real ids are ~28 characters.
@@ -26,6 +39,9 @@ const MAX_ID_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloudSighting {
+    /// The title the child printed for the session — Claude Cloud's own
+    /// name for it, raw: the row's name is sanitized where it is applied.
+    Title(String),
     /// The session id the child printed, `session_` prefix included.
     SessionId(String),
 }
@@ -41,12 +57,14 @@ enum IdScan {
     None,
 }
 
-/// Tracks the sighting across chunk boundaries. It is reported once.
+/// Tracks the sightings across chunk boundaries. Each is reported once.
 #[derive(Debug)]
 pub struct CloudScanner {
     /// Unconsumed tail of prior chunks: enough to complete a marker that
-    /// straddles chunks, or a marker plus an id still being printed.
+    /// straddles chunks, or a marker plus a title or id still being
+    /// printed.
     tail: Vec<u8>,
+    title_found: bool,
     id_found: bool,
 }
 
@@ -60,13 +78,16 @@ impl CloudScanner {
     pub fn new() -> Self {
         Self {
             tail: Vec::new(),
+            title_found: false,
             id_found: false,
         }
     }
 
     /// Scan a chunk of child output. Markers split across chunks are fine —
     /// the retained tail bridges them. Returns the sightings this chunk
-    /// completed (at most one, ever: the id).
+    /// completed (at most two, ever: the title, then the id). The id ends
+    /// the scan: the CLI prints the title first, so a title not seen by
+    /// then was never printed.
     pub fn feed(&mut self, data: &[u8]) -> Vec<CloudSighting> {
         let mut out = Vec::new();
         if self.id_found {
@@ -75,27 +96,63 @@ impl CloudScanner {
         self.tail.extend_from_slice(data);
 
         let mut keep_from = None;
+        if !self.title_found {
+            match self.scan_title() {
+                IdScan::Found(title) => {
+                    self.title_found = true;
+                    out.push(CloudSighting::Title(title));
+                }
+                IdScan::Pending { start } => keep_from = Some(start),
+                IdScan::None => {}
+            }
+        }
         match self.scan_id() {
             IdScan::Found(id) => {
                 self.id_found = true;
                 out.push(CloudSighting::SessionId(id));
             }
-            IdScan::Pending { start } => keep_from = Some(start),
+            IdScan::Pending { start } => {
+                keep_from = Some(keep_from.map_or(start, |t| t.min(start)));
+            }
             IdScan::None => {}
         }
 
         if self.id_found {
             self.tail.clear();
         } else {
-            // Keep a pending id whole; otherwise only what a marker that
-            // straddles the boundary could need.
+            // Keep a pending title or id whole; otherwise only what a
+            // marker that straddles the boundary could need.
             let keep = keep_from.unwrap_or_else(|| {
-                let longest = ID_MARKERS.iter().map(|m| m.len()).max().unwrap_or(0);
+                let longest = ID_MARKERS
+                    .iter()
+                    .map(|m| m.len())
+                    .chain([TITLE_MARKER.len()])
+                    .max()
+                    .unwrap_or(0);
                 self.tail.len().saturating_sub(longest - 1)
             });
             self.tail.drain(..keep);
         }
         out
+    }
+
+    /// The title line: from its marker to the end of its line. A run
+    /// past [`MAX_TITLE_LEN`] with no line end yet is taken as it stands,
+    /// like an overlong id.
+    fn scan_title(&self) -> IdScan {
+        let buf = &self.tail;
+        let Some(start) = find(buf, TITLE_MARKER) else {
+            return IdScan::None;
+        };
+        let title_bytes = &buf[start + TITLE_MARKER.len()..];
+        let len = title_bytes
+            .iter()
+            .take_while(|b| **b != b'\r' && **b != b'\n')
+            .count();
+        if len == title_bytes.len() && len < MAX_TITLE_LEN {
+            return IdScan::Pending { start };
+        }
+        IdScan::Found(String::from_utf8_lossy(&title_bytes[..len]).into_owned())
     }
 
     fn scan_id(&self) -> IdScan {
@@ -142,6 +199,7 @@ impl CloudScanner {
 impl From<CloudSighting> for super::PtyEvent {
     fn from(sighting: CloudSighting) -> Self {
         match sighting {
+            CloudSighting::Title(title) => super::PtyEvent::CloudTitle { title },
             CloudSighting::SessionId(id) => super::PtyEvent::CloudSession { id },
         }
     }
@@ -166,10 +224,18 @@ Resume with: claude --teleport session_016SiQW5Lem2LbnUf1A3undt\r\n";
 
     const ID: &str = "session_016SiQW5Lem2LbnUf1A3undt";
 
+    /// What the whole create yields, in the order the CLI prints it.
+    fn both() -> Vec<CloudSighting> {
+        vec![
+            CloudSighting::Title("Hello world".into()),
+            CloudSighting::SessionId(ID.into()),
+        ]
+    }
+
     #[test]
-    fn create_output_yields_the_id_once() {
+    fn create_output_yields_the_title_then_the_id_once() {
         let mut s = CloudScanner::new();
-        assert_eq!(s.feed(CREATE), vec![CloudSighting::SessionId(ID.into())]);
+        assert_eq!(s.feed(CREATE), both());
         // The teleport line repeats the id; it is not reported again.
         assert!(s
             .feed(b"Resume with: claude --teleport session_016SiQW5Lem2LbnUf1A3undt\r\n")
@@ -182,11 +248,7 @@ Resume with: claude --teleport session_016SiQW5Lem2LbnUf1A3undt\r\n";
             let mut s = CloudScanner::new();
             let mut got = s.feed(&CREATE[..cut]);
             got.extend(s.feed(&CREATE[cut..]));
-            assert_eq!(
-                got,
-                vec![CloudSighting::SessionId(ID.into())],
-                "cut at {cut}"
-            );
+            assert_eq!(got, both(), "cut at {cut}");
         }
     }
 
@@ -197,7 +259,36 @@ Resume with: claude --teleport session_016SiQW5Lem2LbnUf1A3undt\r\n";
         for b in CREATE {
             got.extend(s.feed(std::slice::from_ref(b)));
         }
-        assert_eq!(got, vec![CloudSighting::SessionId(ID.into())]);
+        assert_eq!(got, both());
+    }
+
+    /// An older CLI, or a JSON-mode one, that never prints the title line:
+    /// the id alone is reported, and the scan ends on it all the same.
+    #[test]
+    fn id_without_a_title_line_ends_the_scan() {
+        let mut s = CloudScanner::new();
+        assert_eq!(
+            s.feed(b"View: https://claude.ai/code/session_abc?x\r\n"),
+            vec![CloudSighting::SessionId("session_abc".into())]
+        );
+        assert!(s.feed(b"Created cloud session: Late\r\n").is_empty());
+    }
+
+    /// The title is whatever sits between its marker and the line end —
+    /// spaces, punctuation and a `session_` in it included — and an
+    /// unterminated one waits for its line end rather than reporting a
+    /// prefix.
+    #[test]
+    fn title_runs_to_its_line_end() {
+        let mut s = CloudScanner::new();
+        assert!(s.feed(b"Created cloud session: Fix the").is_empty());
+        assert_eq!(
+            s.feed(b" session_ handoff: part 2\nView: https://claude.ai/code/session_q1?m=0\n"),
+            vec![
+                CloudSighting::Title("Fix the session_ handoff: part 2".into()),
+                CloudSighting::SessionId("session_q1".into()),
+            ]
+        );
     }
 
     #[test]
