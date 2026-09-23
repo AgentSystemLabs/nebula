@@ -291,12 +291,6 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Phase-2 debug client: raw passthrough to a scratch session (Ctrl+\ detaches).
-    #[command(hide = true, name = "_raw-attach")]
-    RawAttach {
-        #[arg(default_value = "0")]
-        name: String,
-    },
     /// Installer hook: print the cutover note only when a live daemon is on
     /// a different build than this binary (see `make install` / install.sh).
     #[command(hide = true, name = "_stale-daemon-note")]

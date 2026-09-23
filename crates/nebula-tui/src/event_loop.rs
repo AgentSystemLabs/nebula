@@ -3096,26 +3096,20 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // The pane under the LAUNCHER VIEW's cards. The grid takes this
         // key itself (`launcher::handle_action`); it reaches here with a
         // session full-screen over the view — where folding the pane is
-        // still what `^q` comes back to — and with the view off, where
-        // there are no cards to have a pane under.
+        // still what `^q` comes back to — and before the first project,
+        // where there are no cards to have a pane under.
         Action::ToggleLauncherPane if app.launcher_active() => launcher::toggle_pane(app),
-        Action::ToggleLauncherPane => app.flash = Some(
-            "no cards to fold a pane under — Settings › Experimental turns the launcher view on"
-                .into(),
-        ),
+        Action::ToggleLauncherPane => {
+            app.flash = Some("no cards to fold a pane under — add a project first".into())
+        }
         // The strip across the LAUNCHER PANE's header. The grid takes this
         // key itself (`launcher::handle_action`); it reaches here over a
-        // full-screen session, which has no strip, and with the view off,
-        // where terminals are rows of the Sessions panel and the cursor
-        // walks onto them.
+        // full-screen session, which has no strip, and before the first
+        // project, where there is no pane at all.
         Action::PaneTabs if app.launcher_active() => {
             app.flash = Some(launcher::NO_PANE_HERE.into())
         }
-        Action::PaneTabs => {
-            app.flash = Some(
-                "terminals are rows of the Sessions panel here — j and k walk onto them".into(),
-            )
-        }
+        Action::PaneTabs => app.flash = Some("no pane here — add a project first".into()),
         // The one thing left to fold away: the PANE under the cards.
         // The GRID itself is the view, so there is nothing else to give
         // its room to.
@@ -6269,7 +6263,6 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.black_background = cfg.black_background;
     app.launcher_pane_at = cfg.pane_side();
     set_hide_draft_prs(app, cfg.hide_draft_prs);
-    app.recent_prompts = cfg.recent_prompts_shown();
     app.pr_issue_counts = cfg.pr_issue_counts;
     app.card_line_changes = cfg.card_line_changes;
     if !app.card_line_changes {
@@ -12239,14 +12232,12 @@ mod tests {
                 .map(|r| match r {
                     WorktreeRow::Checkout(w) => w.branch.clone(),
                     WorktreeRow::Pr(pr) => format!("#{}", pr.number),
-                    WorktreeRow::PrCheckout { worktree, pr } => {
-                        format!("#{} └ {}", pr.number, worktree.branch)
-                    }
+                    WorktreeRow::PrCheckout(worktree) => format!("└ {}", worktree.branch),
                     WorktreeRow::Issue(issue) => format!("issue #{}", issue.number),
                 })
                 .collect()
         };
-        assert_eq!(rows(&app), ["main", "feat", "#7", "#7 └ pr-7-head", "#9"]);
+        assert_eq!(rows(&app), ["main", "feat", "#7", "└ pr-7-head", "#9"]);
         assert_eq!(app.worktree_row_count(), 5);
 
         app.sel_worktree = 2;
@@ -12277,11 +12268,11 @@ mod tests {
         app.hide_draft_prs = true;
         assert_eq!(rows(&app), ["main", "pr-7-head", "feat", "#9"]);
         app.hide_draft_prs = false;
-        assert_eq!(rows(&app), ["main", "feat", "#7", "#7 └ pr-7-head", "#9"]);
+        assert_eq!(rows(&app), ["main", "feat", "#7", "└ pr-7-head", "#9"]);
 
         // The ROOT WORKTREE never nests, whatever branch it is on.
         app.open_prs.get_mut(&pid).unwrap().list[1].head = "main".into();
-        assert_eq!(rows(&app), ["main", "feat", "#7", "#7 └ pr-7-head", "#9"]);
+        assert_eq!(rows(&app), ["main", "feat", "#7", "└ pr-7-head", "#9"]);
     }
 
     /// The cursor keeps its checkout as the rows regroup around it: the
@@ -13885,16 +13876,14 @@ diff --git a/docs/keys.md b/docs/keys.md
     }
 
     /// A turn that finishes unread sweeps blue for `ONE_SHOT_SWEEP` on its
-    /// row and on every row that rolls it up, so the sweep clock runs for
-    /// those seconds and no longer. Reading it ends the sweep on the spot;
+    /// card, so the sweep clock runs for those seconds and no longer. Reading it ends the sweep on the spot;
     /// an old unread finish, an unstamped one and an archived one never ask
     /// for a frame.
     #[test]
     fn a_fresh_unread_finish_keeps_the_sweep_ticking_for_a_few_seconds() {
-        use nebula_core::{AgentStatus, ProjectId, WorktreeId};
+        use nebula_core::AgentStatus;
         let mut app = App::new();
         seed_tree(&mut app);
-        let (w1, p1) = (WorktreeId("w1".into()), ProjectId("p1".into()));
         let now = crate::app::now_ms();
         let finish = |app: &mut App, at: i64| {
             let a = &mut app.tree.agents[0];
@@ -13903,35 +13892,29 @@ diff --git a/docs/keys.md b/docs/keys.md
             a.archived = false;
             a.status_changed_at = at;
         };
-        let fresh_everywhere = |app: &App| {
-            [
-                app.agent_fresh_done(&app.tree.agents[0]),
-                app.worktree_fresh(&w1),
-                app.project_fresh_done(&p1),
-            ]
-        };
+        let fresh = |app: &App| app.agent_fresh_done(&app.tree.agents[0]);
 
         finish(&mut app, now);
-        assert_eq!(fresh_everywhere(&app), [true; 3], "every tier sweeps");
+        assert!(fresh(&app), "the card sweeps");
         assert!(app.status_anim_active());
         app.animations = false;
         assert!(!app.status_anim_active(), "unless animations are off");
         app.animations = true;
 
         app.tree.agents[0].unseen = false;
-        assert_eq!(fresh_everywhere(&app), [false; 3], "read: over");
+        assert!(!fresh(&app), "read: over");
         assert!(!app.status_anim_active());
 
         finish(&mut app, now - settled().as_millis() as i64);
-        assert_eq!(fresh_everywhere(&app), [false; 3], "settled");
+        assert!(!fresh(&app), "settled");
         assert!(!app.status_anim_active(), "an old unread finish is still");
 
         finish(&mut app, 0);
-        assert_eq!(fresh_everywhere(&app), [false; 3], "never stamped");
+        assert!(!fresh(&app), "never stamped");
 
         finish(&mut app, now);
         app.tree.agents[0].archived = true;
-        assert_eq!(fresh_everywhere(&app), [false; 3], "archived: out of sight");
+        assert!(!fresh(&app), "archived: out of sight");
         assert!(!app.status_anim_active());
 
         // A DAEMON clock a little ahead of this one still sweeps — and one
@@ -14734,55 +14717,6 @@ diff --git a/src/c.rs b/src/c.rs
         mark_pr_seen(&mut app, "https://example.dev/spec", &mut out);
         assert!(out.is_empty());
         assert_eq!(app.pr_seen.len(), 1);
-    }
-
-    /// The end-to-end shape the badge reads: a comment arrives after the
-    /// last open, the row counts it, opening the row clears it again.
-    #[test]
-    fn the_link_row_counts_comments_that_landed_since_the_last_open() {
-        use nebula_core::WorktreeId;
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let url = "https://github.com/o/r/pull/7";
-        let wt = WorktreeId("w1".into());
-        let pr = |activity: Vec<String>| crate::pull_request::PullRequest {
-            number: 7,
-            url: url.into(),
-            title: "Attach links".into(),
-            state: crate::pull_request::STATE_OPEN.into(),
-            is_draft: false,
-            health: Default::default(),
-            activity,
-        };
-
-        app.pull_requests
-            .insert(wt.clone(), Some(pr(vec!["2024-04-25T19:55:42Z".into()])));
-        fn unseen(app: &App) -> usize {
-            app.visible_links()
-                .into_iter()
-                .next()
-                .expect("the pull request row")
-                .unseen_comments(&app.pr_seen)
-        }
-        assert_eq!(
-            unseen(&app),
-            1,
-            "never opened: the whole conversation is unread"
-        );
-
-        let mut out = Vec::new();
-        mark_pr_seen(&mut app, url, &mut out);
-        assert_eq!(unseen(&app), 0, "opening clears it");
-
-        // Somebody replies; the next poll brings it back.
-        app.pull_requests.insert(
-            wt,
-            Some(pr(vec![
-                "2024-04-25T19:55:42Z".into(),
-                "2024-04-27T09:00:00Z".into(),
-            ])),
-        );
-        assert_eq!(unseen(&app), 1, "one new comment");
     }
 
     /// A lookup in flight blocks a second one, so the 2s git tick can't
@@ -16290,62 +16224,6 @@ diff --git a/src/c.rs b/src/c.rs
             "small prompt lost its editor: {text}"
         );
         assert!(text.contains("Esc") && text.contains("^J") && text.contains("Enter"));
-    }
-
-    /// The retired `skip_session_naming` key changes nothing either way:
-    /// a file that still says `false` — the old "ask first" — launches
-    /// straight from the picker like every other.
-    #[test]
-    fn a_stored_skip_session_naming_false_still_launches_from_the_picker() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"skip_session_naming": false}"#).unwrap();
-        crate::config::with_config_path(path, || {
-            let mut app = App::new();
-            seed_tree(&mut app);
-            app.focus = Focus::Sessions;
-            let mut out = Vec::new();
-
-            open_picker(&mut app);
-            assert!(
-                matches!(app.overlay, Some(Overlay::Menu(_))),
-                "kind picker still opens: {:?}",
-                app.overlay
-            );
-            assert!(out.is_empty(), "opening the picker sends nothing: {out:?}");
-
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
-            assert!(matches!(
-                &out[0],
-                ClientRequest::CreateAgent {
-                    name,
-                    kind: AgentKind::Claude,
-                    custom_harness: None,
-                    model: None,
-                    effort: None,
-                    auto_title: true,
-                    ..
-                } if name == "agent-2"
-            ));
-            // Only the refill behind the create.
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    ..
-                })
-            ));
-            assert_eq!(
-                out.iter()
-                    .filter(|r| matches!(r, ClientRequest::PrewarmAgent { .. }))
-                    .count(),
-                1,
-                "one prewarm, the refill: {out:?}"
-            );
-        })
     }
 
     /// The submenu picks apply to the direct launch: the model row Enter
@@ -23022,9 +22900,12 @@ diff --git a/src/c.rs b/src/c.rs
         let text = buffer_text(&terminal);
         assert!(text.contains("Hotkeys"), "tab strip:\n{text}");
         assert!(text.contains("NAVIGATE"), "group header:\n{text}");
-        assert!(text.contains("Next panel"), "an action label:\n{text}");
         assert!(
-            text.contains("Next panel                  Tab"),
+            text.contains("Open / fold checkout"),
+            "an action label:\n{text}"
+        );
+        assert!(
+            text.contains("Open / fold checkout        Tab"),
             "its chord, in the value column:\n{text}"
         );
     }

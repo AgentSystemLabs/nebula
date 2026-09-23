@@ -90,7 +90,6 @@ fn main() -> Result<()> {
             println!("{}", nebula_core::PROTOCOL_VERSION);
             Ok(())
         }
-        Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),
         None => match cli.dir {
             Some(dir) => nebula_tui::run_add_project(dir),
             None => {

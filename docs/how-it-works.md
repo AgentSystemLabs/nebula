@@ -39,7 +39,7 @@
 - **…and that is measured, not felt.** `NEBULA_PERF_LOG=<file>` turns on the INPUT LATENCY PROBE: one
   JSON line per input (how long its handler held the loop), per frame (draw time, what it showed, and
   how long each input waited for it) and per DAEMON event. `make perf` drives the real TUI through
-  every panel, modal and verb inside a private tmux — isolated daemon, a clone of this repository as
+  every view, modal and verb inside a private tmux — isolated daemon, a clone of this repository as
   the checkout, a stand-in agent with a full 1 MB ring — and prints handler / paint / settle / echo
   per step plus the peak RSS of the TUI and the DAEMON; `python3 scripts/perf/report.py BEFORE AFTER`
   compares two runs. A change to anything on a key path is judged by that table.
@@ -84,13 +84,13 @@
   the git files a worktree operation touches — the repo's shared `.git/HEAD`, the `.git/worktrees`
   directory, and each linked checkout's own `HEAD` — and only when the newest of those stamps has moved
   does it spend a `git worktree list` and reconcile the rows. So an agent that runs `git worktree add`
-  itself, a `git checkout` you did in another terminal, or a worktree someone removed lands in the
-  panel within a couple of seconds without a restart, while an idle repo costs nothing but a few
+  itself, a `git checkout` you did in another terminal, or a worktree someone removed lands on the
+  grid within a couple of seconds without a restart, while an idle repo costs nothing but a few
   `stat` calls (`NEBULA_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
   100 ms). This structural sync is the *only* git polling the DAEMON does — the pull request lookups
   further down are the TUI's own.
-- **The root checkout changes branch in place — the BRANCH SWITCHER.** `c` on the ROOT WORKTREE (or
-  from the Projects panel) lists the repo's branches with one `git for-each-ref` and switches with
+- **The root checkout changes branch in place — the BRANCH SWITCHER.** `c` on a root-branch card (or
+  with no card selected) lists the repo's branches with one `git for-each-ref` and switches with
   `git switch`, asking first when the checkout has uncommitted changes whether to stash, bring along,
   commit or discard them. That git is the TUI's, like the diff viewer's: the writes and the background
   `git fetch --all` run in a session of their own with stdin closed, so an `ssh` passphrase prompt fails
@@ -113,7 +113,7 @@
   PTY's life is the worktree's RUNNING state, broadcast as that terminal's `alive` and drawn as the
   row's `▶ running`; `r` again kills the process tree and drops the row. The idle reaper and the prewarm
   sweep leave that terminal alone, and a run that exits on its own keeps its PTY, so an attach replays
-  the ending instead of respawning — a command starts only on the keypress. `Shift+Enter` (or `Shift+O`, from any panel) runs `open`
+  the ending instead of respawning — a command starts only on the keypress. `Shift+Enter` (or `Shift+O`) runs `open`
   once, from the TUI. See [Configuration](configuration.md#the-project-file-nebulajson).
 - **Agents boot `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `opencode`, or a custom registry program.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
@@ -135,7 +135,7 @@
   dir for the id (`~/.claude/jobs/<first 8 of the id>/`), the DAEMON asks `claude agents --json`
   before the spawn, and an id listed as a `background` session opens as `claude attach <id>`
   instead — the live conversation, which detaching (Ctrl+Z) or archiving the row leaves running. A
-  refused resume the job-dir look missed is asked about the same way and re-opened attached. An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
+  refused resume the job-dir look missed is asked about the same way and re-opened attached. An AGENT created from the PULL REQUESTS MODAL also receives the PR URL and a PR-only
   work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex, Cursor, Muse and OpenCode as the first prompt of
   their cold spawn (their transcripts carry it through a resume); nebula persists that URL. An AGENT
   launched from the ISSUES MODAL (`i`) carries the GitHub issue's URL the same way — persisted with
@@ -310,23 +310,23 @@
 
 ## Pull requests
 
-nebula finds the pull request on each branch with `gh` and shows it in the Sessions panel's
-PULL REQUESTS group, including a count of comments that landed while you were away. The row outlives
+nebula finds the pull request on each branch with `gh` and shows it on the band's rule and on its
+cards' `#42 title` line. The row outlives
 the pull request: once it is merged or closed the row stays, badged `merged` or `closed` (an open one is
 badged `ready` — ready for review, the state and nothing more — and a draft is dimmed and badged `draft`;
 one GitHub says cannot merge, its branch conflicting with the base or a check failing, is red end to end
 and badged `conflicts` or `failing` instead, the PR PREVIEW spelling the same out beside the state),
 for as long as the checkout does — a worktree whose PR has shipped is the one
 you are about to archive or delete, and the PR is what you check first. A merged one also takes over the
-checkout's row in the Worktrees panel: purple dot, purple rail and purple branch name, so the checkout to
+checkout's band: purple dot and purple branch name, so the checkout to
 delete stands out from across the room (a session still running or asking there keeps its yellow or red —
 that is not a checkout to pull out from under it). The name sweeps the way a running row's does for about
 five seconds after nebula sees the merge land, then holds still in solid purple — nothing about a landed
 checkout is live, so it says so once; one found already merged (last run's cache, a first lookup) never
-sweeps, and a merged checkout left lying around costs an idle nebula no repaints. Rest on that
-row and the pane reads the pull request — description, stats, conversation — exactly as it does for the
-project-wide OPEN PRS rows under the worktrees, which do retire on merge (and which the `hide_draft_prs`
-setting can thin to the non-drafts — this row is never thinned, it is the checkout's own); `g` shows its diff. Manual link
+sweeps, and a merged checkout left lying around costs an idle nebula no repaints. Jump to it with
+`/` and the pane reads the pull request — description, stats, conversation — exactly as the PULL REQUESTS
+MODAL does (whose list retires a pull request on merge, and which `hide_draft_prs` never thins — the
+modal lists drafts too); `g` shows its diff. Manual link
 attachment is currently unavailable; previously saved links remain visible so the change does not
 discard data.
 
@@ -345,8 +345,8 @@ worktree and the open list settle onto a steady 15 s beat; the swept checkouts o
 merge reaches them sooner anyway — the moment a pull request drops out of the open list, the checkout on
 its branch is asked again on the next tick, and turns purple seconds after the merge. An empty answer
 backs off by doubling — out to 3 min for a branch that never grows a PR, 10 min for a project with none
-open — so a machine with thirty repos does not cost thirty API calls a beat. Focusing a sidebar panel or
-the terminal window pulls the next lookup forward, floored at a few seconds; `Shift+R` is the one
+open — so a machine with thirty repos does not cost thirty API calls a beat. Focusing the
+terminal window pulls the next lookup forward, floored at a few seconds; `Shift+R` is the one
 gesture that asks straight away, every checkout of the project included.
 
 Settings and hotkeys live in [Configuration](configuration.md). The process model, the IPC CODEC and

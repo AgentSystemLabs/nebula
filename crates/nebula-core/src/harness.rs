@@ -974,19 +974,6 @@ pub fn resolve<'a>(
     Ok(descriptor)
 }
 
-/// Find a usable legacy entry by id: present, valid, and enabled.
-pub fn find_custom<'a>(list: &'a [CustomHarness], id: &str) -> Option<&'a CustomHarness> {
-    list.iter()
-        .find(|entry| entry.id.trim() == id.trim() && entry.enabled && entry.problem().is_none())
-}
-
-/// Every usable legacy entry, in list order.
-pub fn usable_custom<'a>(list: &'a [CustomHarness]) -> Vec<&'a CustomHarness> {
-    list.iter()
-        .filter(|entry| entry.enabled && entry.problem().is_none())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

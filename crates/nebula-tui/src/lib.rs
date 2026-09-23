@@ -35,7 +35,6 @@ pub mod pr_row;
 pub mod preset_overlays;
 pub mod pull_request;
 pub mod quick_prompt;
-pub mod raw_attach;
 pub mod remote;
 pub mod review;
 pub mod splash;
@@ -72,11 +71,6 @@ pub fn run_config(op: ConfigOp) -> Result<()> {
 /// `nebula ssh` at it.
 pub fn run_tui() -> Result<Option<hosts::HostEntry>> {
     runtime()?.block_on(event_loop::run_app())
-}
-
-/// Phase-2 throwaway raw-mode client (`nebula _raw-attach`).
-pub fn run_raw_attach(name: &str) -> Result<()> {
-    runtime()?.block_on(raw_attach::run(name))
 }
 
 /// Post-upgrade daemon handoff: shut the daemon down only when it holds no

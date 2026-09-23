@@ -287,12 +287,6 @@ impl PullRequest {
         Standing::of(&self.state, self.is_draft)
     }
 
-    /// Short word for the row's trailing badge — the same slot the agent
-    /// rows use for their CLI kind: `ready`, `draft`, `merged` or `closed`.
-    pub fn badge(&self) -> &'static str {
-        self.standing().badge()
-    }
-
     /// What the row goes red for, while the pull request is still open:
     /// a merged or closed one is past needing its branch resolved.
     pub fn trouble(&self) -> Option<Trouble> {
@@ -305,15 +299,6 @@ impl PullRequest {
     /// it, so the next comment to land counts as new.
     pub fn seen_marker(&self) -> &str {
         self.activity.last().map(String::as_str).unwrap_or("")
-    }
-
-    /// How many comments and reviews arrived after `marker`. `None` — a PR
-    /// never opened from nebula — leaves the whole conversation unread,
-    /// which is the honest answer: the user hasn't looked at any of it.
-    pub fn unseen(&self, marker: Option<&str>) -> usize {
-        marker.map_or(self.activity.len(), |mark| {
-            self.activity.iter().filter(|at| at.as_str() > mark).count()
-        })
     }
 }
 
@@ -729,11 +714,6 @@ impl PrDetail {
     pub fn is_open(&self) -> bool {
         state_is_open(&self.state)
     }
-
-    /// What the row goes red for, while the pull request is still open.
-    pub fn trouble(&self) -> Option<Trouble> {
-        self.is_open().then(|| self.health.trouble()).flatten()
-    }
 }
 
 /// One thing somebody said on a pull request.
@@ -974,6 +954,16 @@ fn header_path(rest: &str) -> String {
     }
 }
 
+/// Test-only accessors: nothing in the app reads these any more.
+#[cfg(test)]
+impl PullRequest {
+    /// Short word for the row's trailing badge — the same slot the agent
+    /// rows use for their CLI kind: `ready`, `draft`, `merged` or `closed`.
+    pub fn badge(&self) -> &'static str {
+        self.standing().badge()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,19 +979,6 @@ mod tests {
         );
         assert_eq!(comment_error("   \n\n"), GH_NOT_RUN);
         assert_eq!(comment_error(""), GH_NOT_RUN);
-    }
-
-    /// A PR carrying `activity`, for the counting tests.
-    fn with_activity(stamps: &[&str]) -> PullRequest {
-        PullRequest {
-            number: 1,
-            url: "https://github.com/o/r/pull/1".into(),
-            title: "t".into(),
-            state: STATE_OPEN.into(),
-            is_draft: false,
-            health: Default::default(),
-            activity: stamps.iter().map(|s| s.to_string()).collect(),
-        }
     }
 
     #[test]
@@ -1040,7 +1017,7 @@ mod tests {
         let detail = r#"{"number":9,"url":"https://github.com/o/r/pull/9","state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[]}"#;
         let d = parse_detail(detail).expect("parsed");
         assert_eq!(d.health, Health::default());
-        assert_eq!(d.trouble(), None);
+        assert_eq!(d.health.trouble(), None);
 
         // Not asked for — an older payload shape — reads as healthy.
         let bare = parse(
@@ -1271,33 +1248,6 @@ mod tests {
         assert_eq!(pr.seen_marker(), "");
     }
 
-    /// The unread count is a comparison against the mark stored on the last
-    /// open — no mark means nothing has been read.
-    #[test]
-    fn unseen_counts_what_landed_after_the_mark() {
-        let pr = with_activity(&[
-            "2024-04-25T19:55:42Z",
-            "2024-04-26T21:44:55Z",
-            "2024-04-27T09:00:00Z",
-        ]);
-        assert_eq!(pr.unseen(None), 3, "never opened: all of it is unread");
-        assert_eq!(pr.unseen(Some("2024-04-25T19:55:42Z")), 2);
-        assert_eq!(pr.unseen(Some(pr.seen_marker())), 0, "opening clears it");
-    }
-
-    /// Opening a PR nobody has posted on stores an empty mark, and that
-    /// mark still does its job: every real timestamp sorts above it, so the
-    /// next comment to land reads as new.
-    #[test]
-    fn an_empty_mark_still_catches_the_next_comment() {
-        let quiet = with_activity(&[]);
-        assert_eq!(quiet.seen_marker(), "");
-        assert_eq!(quiet.unseen(Some("")), 0);
-
-        let later = with_activity(&["2024-04-26T21:44:55Z"]);
-        assert_eq!(later.unseen(Some("")), 1);
-    }
-
     #[test]
     fn parses_a_gh_pr_list_payload() {
         let prs = parse_list(
@@ -1497,14 +1447,6 @@ rename to new.rs
     fn an_empty_diff_yields_no_files() {
         assert!(split_unified_diff("").is_empty());
         assert!(split_unified_diff("some banner\nwith no diff\n").is_empty());
-    }
-
-    /// Deleted comments shrink the list; the count must not go negative or
-    /// wrap — it just reports nothing new.
-    #[test]
-    fn a_deleted_comment_does_not_invent_unread_ones() {
-        let pr = with_activity(&["2024-04-25T19:55:42Z"]);
-        assert_eq!(pr.unseen(Some("2024-04-27T09:00:00Z")), 0);
     }
 
     /// `gh pr view` exits 1 both for a branch with no pull request and for

@@ -156,19 +156,6 @@ pub enum HitTarget {
     ModalBrowser,
 }
 
-/// Default widths of the Projects / Worktrees / Sessions panels. Sessions
-/// is the widest because its rows carry the most: name, "23m ago", harness.
-pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
-/// A panel can't be dragged narrower than this.
-pub const MIN_PANEL_W: u16 = 10;
-/// Width of a collapsed sidebar panel's rail: the column rule itself,
-/// with the expand chevron drawn over it on the header row. Clickable
-/// along its whole height. The panel's remembered width is untouched
-/// while it is a rail, so expanding restores it.
-pub const COLLAPSED_RAIL_W: u16 = 1;
-/// The terminal pane always keeps at least this much width.
-pub const MIN_TERM_W: u16 = 20;
-
 /// Default outer width of the diff modal's file-list panel.
 pub const DEFAULT_DIFF_FILES_W: u16 = 34;
 /// The diff modal's file list can't be dragged narrower than this.
@@ -2141,16 +2128,6 @@ impl LinkRow {
         }
     }
 
-    /// Comments and reviews other people left on this row's pull request
-    /// since it was last opened from nebula. Zero for a row that isn't a
-    /// pull request — nothing else has a conversation to fall behind on.
-    pub fn unseen_comments(&self, seen: &HashMap<String, String>) -> usize {
-        match self.pull_request() {
-            Some(pr) => pr.unseen(seen.get(&pr.url).map(String::as_str)),
-            None => 0,
-        }
-    }
-
     /// Row text: a pull request reads as `#42 title`, anything else as its
     /// URL with the noise (scheme, `www.`, trailing slash) stripped.
     pub fn label(&self) -> String {
@@ -2211,15 +2188,6 @@ impl SessionRow {
             _ => None,
         }
     }
-
-    /// Identity for double-click tracking: distinct per row, and stable
-    /// across the repaints between the two clicks.
-    pub fn click_key(&self) -> RowKey {
-        match self.sref() {
-            Some(sref) => RowKey::Session(sref),
-            None => RowKey::Link(self.name().to_string()),
-        }
-    }
 }
 
 /// One row of the WORKTREES PANEL, in cursor order — what `sel_worktree`
@@ -2237,10 +2205,7 @@ pub enum WorktreeRow<'a> {
     /// opened from — listed under that pull request's row rather than
     /// among the plain checkouts, so the checkout and the pull request it
     /// is for read as one thing.
-    PrCheckout {
-        worktree: &'a Worktree,
-        pr: &'a OpenPr,
-    },
+    PrCheckout(&'a Worktree),
     /// A PROJECT ISSUES GROUP row: an issue open on the repo, listed under
     /// the pull requests. No checkout and no sessions — the pane reads it,
     /// as it reads a pull request row.
@@ -2252,7 +2217,7 @@ impl<'a> WorktreeRow<'a> {
     /// nested under its pull request. None on a pull request or issue row.
     pub fn checkout(self) -> Option<&'a Worktree> {
         match self {
-            WorktreeRow::Checkout(w) | WorktreeRow::PrCheckout { worktree: w, .. } => Some(w),
+            WorktreeRow::Checkout(w) | WorktreeRow::PrCheckout(w) => Some(w),
             WorktreeRow::Pr(_) | WorktreeRow::Issue(_) => None,
         }
     }
@@ -2261,7 +2226,7 @@ impl<'a> WorktreeRow<'a> {
     pub fn open_issue(self) -> Option<&'a crate::issues::Issue> {
         match self {
             WorktreeRow::Issue(issue) => Some(issue),
-            WorktreeRow::Checkout(_) | WorktreeRow::Pr(_) | WorktreeRow::PrCheckout { .. } => None,
+            WorktreeRow::Checkout(_) | WorktreeRow::Pr(_) | WorktreeRow::PrCheckout(_) => None,
         }
     }
 
@@ -2271,28 +2236,16 @@ impl<'a> WorktreeRow<'a> {
     pub fn open_pr(self) -> Option<&'a OpenPr> {
         match self {
             WorktreeRow::Pr(pr) => Some(pr),
-            WorktreeRow::Checkout(_) | WorktreeRow::PrCheckout { .. } | WorktreeRow::Issue(_) => {
-                None
-            }
-        }
-    }
-
-    /// The pull request a nested checkout sits under.
-    pub fn nested_under(self) -> Option<&'a OpenPr> {
-        match self {
-            WorktreeRow::PrCheckout { pr, .. } => Some(pr),
-            WorktreeRow::Checkout(_) | WorktreeRow::Pr(_) | WorktreeRow::Issue(_) => None,
+            WorktreeRow::Checkout(_) | WorktreeRow::PrCheckout(_) | WorktreeRow::Issue(_) => None,
         }
     }
 }
 
 /// What a click landed on, for the double-click window. Sessions are their
-/// own reference; a link has none (the pull-request row isn't even stored),
-/// so its URL is the identity; a checkout is its id.
+/// own reference; a checkout is its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKey {
     Session(SessionRef),
-    Link(String),
     Worktree(WorktreeId),
 }
 
@@ -2354,22 +2307,6 @@ pub fn fresh_done(agent: &Agent, now: i64) -> bool {
         && !agent.archived
         && agent.status_changed_at > 0
         && (now - agent.status_changed_at).abs() < window
-}
-
-/// [`fresh_done`] rolled up to a worktree row, the way [`worktree_unseen`]
-/// rolls the count up: some session under it just finished unread.
-pub fn worktree_fresh_done(tree: &Tree, worktree_id: &WorktreeId, now: i64) -> bool {
-    tree.agents
-        .iter()
-        .any(|a| &a.worktree_id == worktree_id && fresh_done(a, now))
-}
-
-/// The same over every worktree of a project.
-pub fn project_fresh_done(tree: &Tree, project_id: &ProjectId, now: i64) -> bool {
-    tree.worktrees
-        .iter()
-        .filter(|w| &w.project_id == project_id)
-        .any(|w| worktree_fresh_done(tree, &w.id, now))
 }
 
 /// A session that is mid-turn or blocked on the user. These count as
@@ -3126,27 +3063,6 @@ pub struct App {
     pub sel_project: usize,
     pub sel_worktree: usize,
     pub sel_session: usize,
-    /// First visible row of the Sessions panel, in panel rows (not list
-    /// indices — group headers and pill pads take rows too). The wheel
-    /// moves it freely; the draw clamps it to the content height and
-    /// re-anchors it on the selected row whenever `sessions_anchor` shows
-    /// the selection moved (so arrows follow the cursor but the wheel
-    /// doesn't fight it).
-    pub sessions_scroll: usize,
-    /// `(sel_worktree, sel_session, follow-up rows)` as of the last draw —
-    /// the draw re-anchors `sessions_scroll` only when this changes. The
-    /// third member is how tall the FOLLOW-UP COMPOSER drew: expanding a
-    /// card, and every line typed into it, scrolls the column after the box
-    /// the way a moved cursor scrolls it after the selection.
-    pub sessions_anchor: Option<(usize, usize, usize)>,
-    /// First visible row of the Worktrees panel, in panel rows. Same
-    /// contract as `sessions_scroll`: the wheel moves it freely, the draw
-    /// clamps it and re-anchors on the cursor when `worktrees_anchor` shows
-    /// the selection moved. A project with a long open-PR list routinely
-    /// outgrows the column.
-    pub worktrees_scroll: usize,
-    /// `(sel_project, sel_worktree)` as of the last draw.
-    pub worktrees_anchor: Option<(usize, usize)>,
     /// How many pill rows the Worktrees column had room for as of the
     /// last draw — the page Ctrl+d / Ctrl+u jump by half of. Zero before
     /// the first frame, when a half page is a single row.
@@ -3233,11 +3149,6 @@ pub struct App {
     /// Appearance, or the Worktrees panel menu). Read on every look at
     /// the list (`listed_open_prs`), never applied to what is stored.
     pub hide_draft_prs: bool,
-    /// How many RECENT PROMPTS the SESSIONS PANEL lists under each
-    /// session, newest at the bottom; 0 draws none. Mirrors CONFIG.JSON's
-    /// `recent_prompts` switch and `recent_prompts_count` (Settings →
-    /// Experimental), resolved through `Config::recent_prompts_shown`.
-    pub recent_prompts: usize,
     /// The KEY COMBO DISPLAY is on; mirrors CONFIG.JSON's `show_key_combos`
     /// (Settings → Experimental). `key_combo` is what it is showing.
     pub show_key_combos: bool,
@@ -3770,11 +3681,7 @@ impl App {
             sel_project: 0,
             sel_worktree: 0,
             sel_session: 0,
-            sessions_scroll: 0,
-            sessions_anchor: None,
             follow_up: None,
-            worktrees_scroll: 0,
-            worktrees_anchor: None,
             worktrees_view_rows: 0,
             sessions_view_rows: 0,
             term: None,
@@ -3799,7 +3706,6 @@ impl App {
             issues_collapsed: false,
             collapsed: false,
             hide_draft_prs: false,
-            recent_prompts: 0,
             show_key_combos: false,
             pr_issue_counts: true,
             launcher_unaimed: false,
@@ -4214,21 +4120,6 @@ impl App {
         fresh_done(agent, now_ms())
     }
 
-    /// The same for a worktree row's rollup — or, on a row that wears its
-    /// merged pull request, whether the merge still sweeps: the one flag a
-    /// checkout's row needs, whichever story it is telling.
-    pub fn worktree_fresh(&self, worktree_id: &WorktreeId) -> bool {
-        if self.worktree_wears_merge(worktree_id) {
-            self.merge_is_fresh(worktree_id)
-        } else {
-            worktree_fresh_done(&self.tree, worktree_id, now_ms())
-        }
-    }
-
-    pub fn project_fresh_done(&self, project_id: &ProjectId) -> bool {
-        project_fresh_done(&self.tree, project_id, now_ms())
-    }
-
     /// Frame counter for the status-sweep text animation — a pure function
     /// of elapsed time (same model as the splash), so a missed tick just
     /// skips ahead instead of stuttering.
@@ -4531,16 +4422,6 @@ impl App {
             .and_then(|row| row.checkout())
     }
 
-    /// The cached changed-file count when it belongs to the selected
-    /// worktree; `None` while unknown or the checkout is unreadable.
-    pub fn selected_worktree_changes(&self) -> Option<usize> {
-        let wt = self.selected_worktree()?;
-        match &self.git_changes {
-            Some((id, count)) if *id == wt.id => *count,
-            _ => None,
-        }
-    }
-
     /// A checkout's last-read changed-file count, for its cards: None until
     /// one has been read there, or when git couldn't say.
     pub fn worktree_changes(&self, id: &WorktreeId) -> Option<usize> {
@@ -4782,14 +4663,6 @@ impl App {
         self.follow_up_row().is_some()
     }
 
-    /// Shell terminals of the selected worktree, in tree order.
-    pub fn visible_terminals(&self) -> Vec<TerminalTab> {
-        let Some(wt) = self.selected_worktree() else {
-            return vec![];
-        };
-        self.terminals_in(&wt.id)
-    }
-
     /// The same for a checkout already in hand ([`App::sessions_in`]).
     fn terminals_in(&self, wt: &WorktreeId) -> Vec<TerminalTab> {
         self.tree
@@ -4902,17 +4775,6 @@ impl App {
             .collect()
     }
 
-    /// How many drafts `hide_draft_prs` is keeping out of the group right
-    /// now — what its header owns up to (`9/12`), so a pull request that
-    /// is not where it was reads as a setting, not a loss. Zero while
-    /// drafts show.
-    pub fn hidden_draft_prs(&self) -> usize {
-        if !self.hide_draft_prs {
-            return 0;
-        }
-        self.all_open_prs().iter().filter(|pr| pr.is_draft).count()
-    }
-
     /// The open pull requests with rows under the checkouts: the listed
     /// ones, or none while the group is folded — a folded group has no
     /// rows for the cursor to walk into, the way a collapsed ARCHIVED
@@ -5001,7 +4863,7 @@ impl App {
                     .iter()
                     .zip(&under)
                     .filter(|(_, under)| **under == Some(i))
-                    .map(|(w, _)| WorktreeRow::PrCheckout { worktree: w, pr }),
+                    .map(|(w, _)| WorktreeRow::PrCheckout(w)),
             );
         }
         rows.extend(self.visible_issues().iter().map(WorktreeRow::Issue));
@@ -5194,14 +5056,6 @@ impl App {
         rows
     }
 
-    /// (live, archived) agent counts for the selected worktree.
-    pub fn session_group_counts(&self) -> (usize, usize) {
-        let Some(wt) = self.selected_worktree() else {
-            return (0, 0);
-        };
-        self.group_counts_in(&wt.id)
-    }
-
     /// The same for a checkout already in hand ([`App::sessions_in`]).
     fn group_counts_in(&self, wt: &WorktreeId) -> (usize, usize) {
         let live = self
@@ -5287,14 +5141,6 @@ impl App {
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
-    /// The body and conversation behind the pull request the pane is
-    /// reading: `Some(Some(_))` once fetched, `Some(None)` while it's still
-    /// coming (or came back empty), `None` when the pane isn't reading one.
-    pub fn selected_pr_detail(&self) -> Option<Option<&PrDetail>> {
-        let pr = self.previewed_pr()?;
-        Some(self.pr_detail.get(&pr.url))
-    }
-
     /// Every pull request still on some row, by URL: each project's open
     /// list, and each checkout's own PR ROW whatever its state — a merged
     /// pull request stays on that row (see `pull_request::PullRequest`).
@@ -5345,10 +5191,6 @@ impl App {
         worktree_rollup(&self.tree, worktree_id)
     }
 
-    pub fn project_rollup(&self, project_id: &ProjectId) -> Option<AgentStatus> {
-        project_rollup(&self.tree, project_id)
-    }
-
     /// Whether the checkout's row wears its pull request's merge instead of
     /// its sessions' status. The PR ROW keeps a merged pull request
     /// (`pull_requests` holds it, state and all), and a checkout whose
@@ -5384,28 +5226,16 @@ impl App {
         self.run_terminal(worktree_id).is_some_and(|t| t.alive)
     }
 
-    /// When the worktree last saw a turn — what its row sorts and labels on.
-    pub fn worktree_recency(&self, worktree_id: &WorktreeId) -> Recency {
-        worktree_recency(&self.tree, worktree_id, now_ms())
-    }
-
-    pub fn project_recency(&self, project_id: &ProjectId) -> Recency {
-        project_recency(&self.tree, project_id, now_ms())
-    }
-
     /// Sessions under a worktree that went green with nobody looking.
+    /// Test-only: the grid reads the free functions through the palette.
+    #[cfg(test)]
     pub fn worktree_unseen(&self, worktree_id: &WorktreeId) -> usize {
         worktree_unseen(&self.tree, worktree_id)
     }
 
+    #[cfg(test)]
     pub fn project_unseen(&self, project_id: &ProjectId) -> usize {
         project_unseen(&self.tree, project_id)
-    }
-
-    /// Where a walk out of the pane lands: the GRID, which is the only
-    /// thing beside it.
-    pub fn first_sidebar_focus(&self) -> Focus {
-        Focus::Sessions
     }
 
     /// The two places FOCUS can rest: the LAUNCHER VIEW's GRID of cards
@@ -5450,12 +5280,6 @@ impl App {
         .unwrap_or(focus)
     }
 
-    /// First stop in the Tab walk, and where a jump into another project
-    /// lands: the GRID.
-    pub fn first_focus(&self) -> Focus {
-        Focus::Sessions
-    }
-
     /// Where `target` was drawn on the last frame — the rect the hit was
     /// registered with. A dropdown hangs off the word it belongs to, so
     /// it needs the word's own cell and not the pointer's.
@@ -5473,6 +5297,28 @@ impl App {
                 x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
             })
             .map(|(_, t)| t.clone())
+    }
+}
+
+/// Test-only accessors: nothing in the app reads these any more.
+#[cfg(test)]
+impl App {
+    /// The cached changed-file count when it belongs to the selected
+    /// worktree; `None` while unknown or the checkout is unreadable.
+    pub fn selected_worktree_changes(&self) -> Option<usize> {
+        let wt = self.selected_worktree()?;
+        match &self.git_changes {
+            Some((id, count)) if *id == wt.id => *count,
+            _ => None,
+        }
+    }
+
+    /// (live, archived) agent counts for the selected worktree.
+    pub fn session_group_counts(&self) -> (usize, usize) {
+        let Some(wt) = self.selected_worktree() else {
+            return (0, 0);
+        };
+        self.group_counts_in(&wt.id)
     }
 }
 
@@ -5854,10 +5700,6 @@ mod tests {
         let rows = app.visible_session_rows();
         assert!(rows[0].sref().is_none(), "a link is not attachable");
         assert!(!rows[0].is_archived_agent());
-        assert_eq!(
-            rows[0].click_key(),
-            RowKey::Link("https://a.dev/spec".into())
-        );
     }
 
     #[test]

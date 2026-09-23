@@ -422,11 +422,6 @@ impl IssueEditor {
         }
     }
 
-    /// Whether Enter has anything to send.
-    pub fn is_changed(&self) -> bool {
-        self.text() != self.original
-    }
-
     /// The field under the caret.
     pub fn field_mut(&mut self) -> &mut TextInput {
         match self.field {
@@ -2120,6 +2115,15 @@ fn draw_editor(
         }
     }
     (title_area, body_area, body_view)
+}
+
+/// Test-only accessors: nothing in the app reads these any more.
+#[cfg(test)]
+impl IssueEditor {
+    /// Whether Enter has anything to send.
+    pub fn is_changed(&self) -> bool {
+        self.text() != self.original
+    }
 }
 
 #[cfg(test)]

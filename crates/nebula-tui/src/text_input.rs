@@ -151,11 +151,6 @@ impl TextInput {
         input
     }
 
-    /// Does the field hold hard line breaks?
-    pub fn is_multiline(&self) -> bool {
-        self.multiline
-    }
-
     /// Switch line breaks on or off for a field built before its shape was
     /// known — a prompt dialog decides by its kind.
     pub fn set_multiline(&mut self, multiline: bool) {
@@ -283,11 +278,6 @@ impl TextInput {
                 start <= caret && (caret < end || (caret == end && !is_soft(rows, i)))
             })
             .unwrap_or(rows.len().saturating_sub(1))
-    }
-
-    /// Where the field was last drawn.
-    pub fn view(&self) -> TextView {
-        self.view
     }
 
     /// Record where the field was drawn — what [`view_for`](Self::view_for)
@@ -677,6 +667,15 @@ impl PartialEq<&str> for TextInput {
 impl PartialEq<String> for TextInput {
     fn eq(&self, other: &String) -> bool {
         &self.text == other
+    }
+}
+
+/// Test-only accessors: nothing in the app reads these any more.
+#[cfg(test)]
+impl TextInput {
+    /// Where the field was last drawn.
+    pub fn view(&self) -> TextView {
+        self.view
     }
 }
 

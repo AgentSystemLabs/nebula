@@ -12,9 +12,9 @@ use anyhow::{bail, Context, Result};
 use nebula_core::env;
 use nebula_core::project_file::{self, ProjectCommand};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId,
-    PrewarmInfo, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Worktree,
-    WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, LinkId, PrewarmInfo,
+    Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Worktree, WorktreeId,
+    MAX_CLOUD_PROMPT_BYTES,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1501,56 +1501,6 @@ impl Daemon {
         Ok(())
     }
 
-    /// Re-home an agent row under another worktree of the same project. A
-    /// live PTY still runs — and its hooks still report a cwd — inside the
-    /// old checkout, so left alone `reparent_agent_by_cwd` would snap the
-    /// row straight back on the next hook event: kill it and respawn resumed
-    /// in the target so the process and the row agree. A respawn failure
-    /// degrades to a dead session the next attach/prewarm revives via
-    /// `ensure_session`.
-    pub fn move_agent(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
-        let agent = self.store.get_agent(id)?.context("agent not found")?;
-        if &agent.worktree_id == worktree_id {
-            return Ok(());
-        }
-        let target = self.sibling_worktree(&agent, worktree_id)?;
-        self.pending_moves.lock().unwrap().remove(id);
-        let sref = SessionRef::Agent(id.clone());
-        let was_alive = self.session(&sref).is_some();
-        if was_alive {
-            self.kill_session(&sref);
-        }
-        // A deliberate move invalidates the remembered hook cwd: it still
-        // points at the old checkout, and the next worktree sync would
-        // replay it straight back over the user's choice.
-        self.last_cwd.lock().unwrap().remove(id);
-        self.store.set_agent_worktree(id, worktree_id)?;
-        if was_alive {
-            if let Err(e) = self.spawn_agent_session(&agent, &target, DEFAULT_COLS, DEFAULT_ROWS) {
-                tracing::warn!(agent = %id, error = %e, "respawn after move failed");
-            }
-        }
-        self.broadcast_agent(id)?;
-        Ok(())
-    }
-
-    /// The worktree `worktree_id`, checked to belong to the same project as
-    /// `agent`'s current one — the only kind of move a row can make.
-    fn sibling_worktree(&self, agent: &Agent, worktree_id: &WorktreeId) -> Result<Worktree> {
-        let target = self
-            .store
-            .get_worktree(worktree_id)?
-            .context("worktree not found")?;
-        let current = self
-            .store
-            .get_worktree(&agent.worktree_id)?
-            .context("worktree not found")?;
-        if target.project_id != current.project_id {
-            bail!("target worktree belongs to a different project");
-        }
-        Ok(target)
-    }
-
     /// `nebula worktree <branch>`, run by the agent inside its own session.
     /// The row moves under `branch`'s worktree of the same project now —
     /// created when the project has no checkout for that branch yet — and
@@ -2160,24 +2110,6 @@ impl Daemon {
     }
 
     // ---- links ----
-
-    pub fn create_link(self: &Arc<Self>, worktree_id: &WorktreeId, url: &str) -> Result<EntityId> {
-        let url = normalize_url(url)?;
-        self.store
-            .get_worktree(worktree_id)?
-            .context("worktree not found")?;
-        let link = Link {
-            id: LinkId::generate(),
-            worktree_id: worktree_id.clone(),
-            url,
-            sort_order: self.store.next_link_sort_order(worktree_id)?,
-        };
-        self.store.insert_link(&link)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Link(link.clone()),
-        });
-        Ok(EntityId::Link(link.id))
-    }
 
     pub fn update_link(self: &Arc<Self>, id: &LinkId, url: &str) -> Result<()> {
         let url = normalize_url(url)?;
@@ -5404,33 +5336,6 @@ mod tests {
             .to_string()
     }
 
-    #[test]
-    fn move_agent_rehomes_row_and_broadcasts() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p"]);
-        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
-        seed_agent(&daemon, "a1", "root", None);
-        let mut rx = daemon.events.subscribe();
-
-        daemon
-            .move_agent(&AgentId("a1".into()), &WorktreeId("feat".into()))
-            .unwrap();
-        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
-        match rx.try_recv().unwrap() {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(a),
-            } => assert_eq!(a.worktree_id.to_string(), "feat"),
-            other => panic!("expected agent upsert, got {other:?}"),
-        }
-
-        // Moving to the worktree it already lives in is a silent no-op.
-        daemon
-            .move_agent(&AgentId("a1".into()), &WorktreeId("feat".into()))
-            .unwrap();
-        assert!(rx.try_recv().is_err(), "no broadcast for a no-op move");
-    }
-
     #[tokio::test]
     async fn enter_worktree_takes_an_existing_branch_and_moves_the_row_now() {
         let daemon = test_daemon();
@@ -5772,21 +5677,6 @@ mod tests {
     }
 
     #[test]
-    fn move_agent_rejects_cross_project_targets() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p", "q"]);
-        seed_worktree(&daemon, "p", "p-root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "q", "q-root", "/nebula-test/q", true);
-        seed_agent(&daemon, "a1", "p-root", None);
-
-        let err = daemon
-            .move_agent(&AgentId("a1".into()), &WorktreeId("q-root".into()))
-            .unwrap_err();
-        assert!(err.to_string().contains("different project"));
-        assert_eq!(agent_worktree(&daemon, "a1"), "p-root");
-    }
-
-    #[test]
     fn reparent_by_cwd_picks_deepest_matching_worktree() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p"]);
@@ -5863,19 +5753,6 @@ mod tests {
             .find(|w| w.branch == "feat")
             .expect("feat worktree adopted");
         assert_eq!(agent_worktree(&daemon, "a1"), adopted.id.to_string());
-
-        // A deliberate move back must survive the next adoption: the move
-        // drops the remembered cwd, so replaying it can't overrule the user.
-        daemon
-            .move_agent(&AgentId("a1".into()), &WorktreeId("root".into()))
-            .unwrap();
-        let other = root.join("repo-worktrees").join("other");
-        git_in(
-            &repo,
-            &["worktree", "add", &other.to_string_lossy(), "-b", "other"],
-        );
-        daemon.sync_project_worktrees(&project).await.unwrap();
-        assert_eq!(agent_worktree(&daemon, "a1"), "root");
     }
 
     /// The replay is scoped to the synced project and skips archived rows.

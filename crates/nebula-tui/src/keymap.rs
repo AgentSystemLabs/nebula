@@ -35,15 +35,6 @@ pub enum Scope {
     Terminal,
 }
 
-impl Scope {
-    pub fn label(self) -> &'static str {
-        match self {
-            Scope::Global => "panels",
-            Scope::Terminal => "locked terminal",
-        }
-    }
-}
-
 /// Everything a hotkey can do. Overlay-local keys (Esc to close, j/k inside
 /// a picker, the line-editor bindings) are deliberately absent: they're the
 /// modal grammar every overlay shares, not application hotkeys.
@@ -208,8 +199,8 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         action: Action::FocusNext,
         id: "focus_next",
-        label: "Next panel",
-        hint: "Walk focus forward through visible panels to the terminal, where it stops and takes input (^⇧L needs the kitty protocol). On the launcher grid: open every card of the checkout under the cursor in place, or fold it back to one row — one checkout open at a time",
+        label: "Open / fold checkout",
+        hint: "Open every card of the checkout under the cursor in place, or fold it back to one row — one checkout open at a time (^⇧L needs the kitty protocol)",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["tab", "ctrl+shift+l"],
@@ -217,8 +208,8 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         action: Action::FocusPrev,
         id: "focus_prev",
-        label: "Previous panel",
-        hint: "Walk focus back through visible panels, stopping at the first visible sidebar (^⇧H needs the kitty protocol)",
+        label: "Walk focus back",
+        hint: "Nothing on the launcher grid — Tab folds the checkout back itself (^⇧H needs the kitty protocol)",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["shift+tab", "ctrl+shift+h"],
@@ -227,7 +218,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FocusLeft,
         id: "focus_left",
         label: "Focus left",
-        hint: "Move focus one visible panel left, stopping at the first visible sidebar",
+        hint: "Step to the card on the left, stopping at the row's first",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["h", "left"],
@@ -236,7 +227,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FocusRight,
         id: "focus_right",
         label: "Focus right",
-        hint: "Move focus one panel right, stopping at sessions; a double tap there jumps into the terminal pane and takes input, like Tab",
+        hint: "Step to the card on the right, stopping at the row's last",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["l", "right"],
@@ -245,7 +236,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FocusTerminal,
         id: "focus_terminal",
         label: "Focus terminal pane",
-        hint: "Cross into the terminal pane without locking input",
+        hint: "Into the pane under the cards, as Enter is",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["ctrl+right"],
@@ -254,7 +245,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::MoveDown,
         id: "move_down",
         label: "Move down",
-        hint: "Move the selection down in the focused panel; twice from the project tabs, into the one under their cursor",
+        hint: "Move the cursor down a row of cards; twice from the project tabs, into the one under their cursor",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["j", "down"],
@@ -263,7 +254,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::MoveUp,
         id: "move_up",
         label: "Move up",
-        hint: "Move the selection up in the focused panel, stopping at the first row; twice there, up to the project tabs",
+        hint: "Move the cursor up a row of cards, stopping at the first; twice there, up to the project tabs",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["k", "up"],
@@ -272,7 +263,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::HalfPageDown,
         id: "half_page_down",
         label: "Half page down",
-        hint: "In the Worktrees and Sessions panels, jump the selection down by half the rows the column shows — checkouts and open pull requests, or sessions and archived rows, alike — stopping at the end",
+        hint: "Jump the cursor down two rows of cards, stopping at the last",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["ctrl+d"],
@@ -281,7 +272,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::HalfPageUp,
         id: "half_page_up",
         label: "Half page up",
-        hint: "In the Worktrees and Sessions panels, jump the selection up by half the rows the column shows, stopping at the first row",
+        hint: "Jump the cursor up two rows of cards, stopping at the first",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["ctrl+u"],
@@ -290,7 +281,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Activate,
         id: "activate",
         label: "Open / attach",
-        hint: "Drill into the next panel, attach a session, or lock terminal input",
+        hint: "Into the pane on the card under the cursor, or lock the pane's input",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["enter"],
@@ -376,7 +367,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::AddProject,
         id: "add_project",
         label: "Add project",
-        hint: "Add a project from any panel (unlike New, never changes meaning)",
+        hint: "Add a project from anywhere (unlike New, never changes meaning)",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["o"],
@@ -394,7 +385,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::GitDiff,
         id: "git_diff",
         label: "Git diff",
-        hint: "Open the diff viewer for the selected worktree — or, on an open-PR row, that pull request's diff",
+        hint: "Open the diff viewer for the checkout under the cursor — or, with the pane reading a pull request, that pull request's diff",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["g"],
@@ -448,7 +439,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::CommentPullRequest,
         id: "comment_pull_request",
         label: "Comment on pull request",
-        hint: "On a pull request row, open a box to type a comment and post it on that PR through gh",
+        hint: "With the pane reading a pull request (a / jump lands on one), open a box to type a comment and post it on that PR through gh",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["y"],
@@ -503,7 +494,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Rename,
         id: "rename",
         label: "Rename",
-        hint: "Rename the selected session, or edit a link's URL; on a worktree, start or stop its run command (Settings → Project, else .nebula.json \"run\")",
+        hint: "Rename the session under the cursor (the checkout's run command is the menu's Run / Stop)",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["r"],
@@ -530,7 +521,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::ToggleArchived,
         id: "toggle_archived",
         label: "Show / hide archived",
-        hint: "Toggle archived sessions in the sessions panel",
+        hint: "Show or hide archived sessions among the cards",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["shift+a"],
@@ -556,8 +547,8 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         action: Action::DeleteAll,
         id: "delete_all",
-        label: "Delete all in panel",
-        hint: "Remove every row of the focused panel, behind a confirmation",
+        label: "Delete all sessions",
+        hint: "Remove every session listed for the checkout under the cursor, behind a confirmation",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["shift+d"],
@@ -566,7 +557,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::AgentPresets,
         id: "agent_presets",
         label: "Agent presets",
-        hint: "Saved launch presets (CLI, model, effort, prefix/postfix) for the selected worktree, from its row or its sessions; Enter asks for an optional task, or skips it; on an open PR row, a PR session in that branch's worktree",
+        hint: "Saved launch presets (CLI, model, effort, prefix/postfix) for the checkout under the cursor; Enter asks for an optional task, or skips it; from the pull requests list, a PR session in that branch's worktree",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["e"],
@@ -631,7 +622,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::UnlockTerminal,
         id: "unlock_terminal",
         label: "Unlock terminal input",
-        hint: "Leave the locked pane and go back to the panels (^q always works)",
+        hint: "Leave the locked pane and go back to the card (^q always works)",
         group: "TERMINAL",
         scope: Scope::Terminal,
         defaults: &["ctrl+q", "ctrl+shift+h", "ctrl+]", "ctrl+esc", "ctrl+left"],
@@ -1230,12 +1221,6 @@ impl Keymap {
         if let Some(slot) = self.binds.get_mut(index) {
             slot.clear();
         }
-    }
-
-    pub fn is_default(&self, index: usize) -> bool {
-        ACTIONS
-            .get(index)
-            .is_some_and(|spec| self.binds[index] == parse_list(spec.defaults))
     }
 
     /// A row sharing a chord with another action in the same scope. The

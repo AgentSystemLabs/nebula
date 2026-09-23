@@ -826,6 +826,10 @@ impl Store {
 
     // ---- links ----
 
+    /// Test seeding only: nothing creates a link any more (the request
+    /// that did is gone), but rows older databases hold are still read,
+    /// edited and deleted.
+    #[cfg(test)]
     pub fn insert_link(&self, l: &Link) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO links (id, worktree_id, url, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -841,6 +845,7 @@ impl Store {
     }
 
     /// Sort slot for a new link: after everything else on its worktree.
+    #[cfg(test)]
     pub fn next_link_sort_order(&self, worktree_id: &WorktreeId) -> Result<i64> {
         Ok(self.conn.lock().unwrap().query_row(
             "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM links WHERE worktree_id = ?1",
