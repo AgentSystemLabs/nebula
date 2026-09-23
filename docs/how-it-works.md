@@ -347,7 +347,7 @@ its branch is asked again on the next tick, and turns purple seconds after the m
 backs off by doubling — out to 3 min for a branch that never grows a PR, 10 min for a project with none
 open — so a machine with thirty repos does not cost thirty API calls a beat. Focusing the
 terminal window pulls the next lookup forward, floored at a few seconds; `Shift+R` is the one
-gesture that asks straight away, every checkout of the project included.
+gesture that asks straight away, every checkout of the project and its open issues included.
 
 Settings and hotkeys live in [Configuration](configuration.md). The process model, the IPC CODEC and
 the crate layout are covered in more depth in [ARCHITECTURE.md](../ARCHITECTURE.md).
