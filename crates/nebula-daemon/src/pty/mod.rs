@@ -188,6 +188,12 @@ pub enum PtyEvent {
     Title {
         title: String,
     },
+    /// The child printed the title Claude Cloud gave the session it
+    /// created — the line before the id. Only scanned for on `--cloud`
+    /// launches (`arm_cloud_scan`).
+    CloudTitle {
+        title: String,
+    },
     /// The child printed the id of the Claude Cloud session it created.
     /// Only scanned for on `--cloud` launches (`arm_cloud_scan`).
     CloudSession {

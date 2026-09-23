@@ -4425,7 +4425,7 @@ n=$(cat "{state}/runs" 2>/dev/null || echo 0)
 n=$((n + 1))
 echo "$n" > "{state}/runs"
 pwd >> "{state}/cwds"
-printf 'Created cloud session: Hello world\r\n'
+printf 'Created cloud session: Greet the world\r\n'
 printf 'View: https://claude.ai/code/session_016SiQW5Lem2LbnUf1A3undt?from=cli&m=0\r\n'
 printf 'Resume with: claude --teleport session_016SiQW5Lem2LbnUf1A3undt\r\n'
 exit 0
@@ -4453,13 +4453,16 @@ exit 0
         &ClientRequest::CreateAgent {
             req_id: 10,
             worktree: main_worktree.id.clone(),
-            name: "cloud".into(),
+            // The stand-in name the TUI sends with AUTO-TITLE on: the
+            // sandbox fires no hook, so the title comes off the create's
+            // own output instead (issue #92).
+            name: "agent".into(),
             kind: AgentKind::Claude,
             custom_harness: None,
             model: None,
             effort: None,
-            auto_title: false,
-            cloud_prompt: Some("Hello world".into()),
+            auto_title: true,
+            cloud_prompt: Some("  Hello,\n  world  ".into()),
             starting_prompt: None,
             issue_url: None,
         },
@@ -4478,6 +4481,27 @@ exit 0
             })
     })
     .await;
+    // The task is the row's first prompt from the create's own upsert on,
+    // condensed like a typed one: the card says what the session was
+    // asked to do before the CLI has printed a thing.
+    let created = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if a.cloud_session_id.is_none() => Some(a.clone()),
+            _ => None,
+        })
+        .expect("the create's own upsert");
+    assert_eq!(
+        created
+            .recent_prompts
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Hello, world"],
+        "{created:#?}"
+    );
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -4531,6 +4555,16 @@ exit 0
     );
     assert_eq!(row.cloud_session_id.as_deref(), Some(CLOUD_ID));
     assert!(!row.alive);
+    // Claude Cloud's title for the session is the row's name, read off
+    // the `Created cloud session:` line, and the task stays its prompt.
+    assert_eq!(row.name, "Greet the world");
+    assert_eq!(
+        row.recent_prompts
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Hello, world"]
+    );
 
     // The create ran in the user's checkout, and left its branch alone.
     let cwds = std::fs::read_to_string(state.join("cwds")).unwrap();

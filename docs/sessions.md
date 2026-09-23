@@ -31,7 +31,12 @@ with `--` would be read as another Claude flag instead. The CLI creates the sess
 exits — nebula reads the session id off that output, and that is where the local side ends. The agent
 runs in Claude's cloud sandbox, not in a terminal here, so the row wears a `cloud` badge and its pane is
 the **CLOUD SESSION PANEL** instead of a terminal: a line saying so, and the session's
-`https://claude.ai/code/session_…` link, underlined. `Enter` on the row — or a click on the link — opens
+`https://claude.ai/code/session_…` link, underlined. The card reads like any other card's: the task
+you typed is its first prompt (the `›` line, and every message you later **Send to cloud session**
+joins the RECENT PROMPTS behind it), and the row takes the title Claude Cloud gives the session —
+the `Created cloud session:` line of the same output — as its name, since no hook ever reaches
+nebula from the sandbox to let the session title itself; a name you typed stands, and `r` renames
+it whenever you like. `Enter` on the row — or a click on the link — opens
 the page in the browser. Nothing is attached, teleported or re-homed on your behalf, the checkout never
 switches branch, and **Attach** and **Restart** are not offered: there is no local session behind the
 row, and the daemon refuses to boot a bare `claude` in its name. To steer the cloud agent without a

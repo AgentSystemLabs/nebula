@@ -207,9 +207,12 @@ async fn step(
         // and reaches clients as a StatusChanged, not as session output;
         // the cloud session id and a title change reach them as the row's
         // own upsert (the title bytes themselves are in Output).
-        Ok(PtyEvent::Progress { .. } | PtyEvent::Title { .. } | PtyEvent::CloudSession { .. }) => {
-            Step::Continue
-        }
+        Ok(
+            PtyEvent::Progress { .. }
+            | PtyEvent::Title { .. }
+            | PtyEvent::CloudTitle { .. }
+            | PtyEvent::CloudSession { .. },
+        ) => Step::Continue,
         Err(RecvError::Lagged(_)) => {
             // Catch up from the ring. If the missed bytes are still
             // retained, send them as a plain Output continuation so the

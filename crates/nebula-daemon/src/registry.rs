@@ -1113,6 +1113,23 @@ impl Daemon {
             pr_url.as_deref(),
             issue_url.as_deref(),
         )?;
+        // A cloud task is the session's first prompt, and the only one
+        // nebula will ever see typed for it: the agent runs in the sandbox,
+        // where no `UserPromptSubmit` hook reaches the daemon. Recorded
+        // here, the card says what the session was asked to do like any
+        // other card's does (issue #92).
+        let mut agent = agent;
+        if let Some(task) = cloud_prompt.as_deref() {
+            if let Some(text) = crate::prompt_history::condense(task) {
+                let entry = nebula_core::PromptEntry {
+                    text,
+                    submitted_at: epoch_ms(),
+                };
+                self.store.push_prompt(&agent.id, &entry)?;
+                agent.recent_prompts.push(entry);
+            }
+        }
+        let agent = agent;
         if optimistic_run {
             // Seeded by hand, ahead of the spawn, so the CLI's own startup
             // progress-clear cannot green the row out before its turn has
@@ -1987,6 +2004,11 @@ impl Daemon {
             );
         }
         tracing::info!(agent = %id, cloud_session = %cloud_id, bytes = message.len(), "message sent to cloud session");
+        // Its next prompt, for the card: the sandbox reports no hook for
+        // it, so this is where nebula learns it was asked.
+        if let Some(text) = crate::prompt_history::condense(&message) {
+            self.record_prompt(id, text);
+        }
         Ok(())
     }
 
@@ -2885,6 +2907,29 @@ impl Daemon {
                     // is typically gone within milliseconds of printing it —
                     // and re-broadcast so the row grows its `cloud` badge and
                     // its pane becomes the panel linking to the session.
+                    Ok(PtyEvent::CloudTitle { title }) => {
+                        // Claude Cloud's own name for the session names the
+                        // row, when nothing else has: the agent runs where
+                        // no hook reaches nebula, so the AUTO-TITLE a local
+                        // session gives itself never comes (issue #92). A
+                        // name the user typed stands.
+                        if let SessionRef::Agent(id) = &sref {
+                            let title = sanitize_title(&title);
+                            if title.is_empty() {
+                                continue;
+                            }
+                            match daemon.store.rename_agent_if_auto_pending(id, &title) {
+                                Ok(true) => {
+                                    tracing::info!(agent = %id, %title, "cloud session title adopted");
+                                    daemon.try_broadcast_agent(id);
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    tracing::warn!(agent = %id, error = %e, "cloud session title not persisted")
+                                }
+                            }
+                        }
+                    }
                     Ok(PtyEvent::CloudSession { id: cloud_id }) => {
                         if let SessionRef::Agent(id) = &sref {
                             match daemon.store.set_agent_cloud_session_id(id, Some(&cloud_id)) {
