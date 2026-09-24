@@ -227,13 +227,9 @@ fn head_tabs(app: &mut App, r: Rect, taken: usize) -> Vec<Span<'static>> {
     // The `+` is laid out first: it is the only way to a project with no
     // tab, so the tabs shrink around it rather than push it off the row.
     let budget = room.saturating_sub(add_w + 1);
-    // A lone tab is the project on screen with nothing to hand the grid
-    // to, so it carries no `×` (`event_loop::launcher::close_tab` refuses
-    // it too).
-    let closable = tabs.len() > 1;
     let mut chips: Vec<[PaneTab; 2]> = tabs
         .iter()
-        .map(|t| project_chip(t, PROJECT_TAB_MAX, hover.as_ref(), closable, sweep, th))
+        .map(|t| project_chip(t, PROJECT_TAB_MAX, hover.as_ref(), sweep, th))
         .collect();
     let width = |chip: &[PaneTab; 2]| chip.iter().map(PaneTab::width).sum::<usize>();
     // The tabs that fit from `start` in `budget` columns: the index one
@@ -270,8 +266,7 @@ fn head_tabs(app: &mut App, r: Rect, taken: usize) -> Vec<Span<'static>> {
         let overhead = width(&chips[start]) - tabs[start].name.chars().count().min(PROJECT_TAB_MAX);
         let name_room = budget.saturating_sub(markers + overhead);
         if name_room >= TAB_NAME_MIN {
-            chips[start] =
-                project_chip(&tabs[start], name_room, hover.as_ref(), closable, sweep, th);
+            chips[start] = project_chip(&tabs[start], name_room, hover.as_ref(), sweep, th);
             end = start + 1;
         }
     }
@@ -348,9 +343,8 @@ fn head_tabs(app: &mut App, r: Rect, taken: usize) -> Vec<Span<'static>> {
 /// STATUS DOTS — and the `×` that closes it, a target of its own so a
 /// click on the cross never reads as a click on the tab. The lit tab is a
 /// raised chip, pads and all, with its name in the accent; the rest sit
-/// flat and muted. The name is cut to `name_max`. A tab that cannot be
-/// closed (`closable` false: the only one) ends on a plain pad instead of
-/// the cross.
+/// flat and muted. The name is cut to `name_max`. Every tab closes, the
+/// last one included: that one closes to the splash.
 ///
 /// `sweep` is the frame's sweep phase, `None` with the animations off:
 /// with it, the name sweeps on the loudest thing its sessions are doing
@@ -361,7 +355,6 @@ fn project_chip(
     tab: &ProjectTab,
     name_max: usize,
     hover: Option<&HitTarget>,
-    closable: bool,
     sweep: Option<usize>,
     th: Theme,
 ) -> [PaneTab; 2] {
@@ -416,13 +409,9 @@ fn project_chip(
             spans: label,
             hit: Some(HitTarget::LauncherTab(tab.id.clone())),
         },
-        if closable {
-            PaneTab {
-                spans: vec![Span::styled(" × ", fill(Style::default().fg(cross)))],
-                hit: Some(HitTarget::LauncherTabClose(tab.id.clone())),
-            }
-        } else {
-            PaneTab::plain(vec![Span::styled(" ", fill(Style::default()))])
+        PaneTab {
+            spans: vec![Span::styled(" × ", fill(Style::default().fg(cross)))],
+            hit: Some(HitTarget::LauncherTabClose(tab.id.clone())),
         },
     ]
 }
@@ -626,8 +615,21 @@ fn draw_bands(
     // The band the selection is on, aimed at or let go of: its row
     // follows its remembered card either way, so Esc scrolls nothing.
     let aimed = crate::launcher::band_cursor(app, bands);
+    // Each band's whole rectangle, rule to last row of cards: a click on
+    // the air around its cards picks the band as a click on its rule
+    // does. Pushed after every card, rule and arrow so they keep their
+    // own targets under `hit_at`'s first-match scan.
+    let mut band_areas = Vec::with_capacity(bands.len());
     for (index, band) in bands.iter().enumerate() {
         let pb = &panel.bands[index];
+        let whole = Rect {
+            y: pb.rule_y,
+            height: pb.height,
+            ..g.area
+        };
+        if let Some(placed) = crate::launcher::place(window, scroll, whole) {
+            band_areas.push((placed.rect, HitTarget::LauncherBand(index)));
+        }
         let on = cursor == Some(index);
         let at = (aimed == Some(index))
             .then(|| crate::launcher::card_cursor(app, band))
@@ -771,6 +773,7 @@ fn draw_bands(
         }
     }
     draw_panel_edge_marks(f, panel, scroll, th);
+    app.hits.extend(band_areas);
     // Last, so the bands themselves win `hit_at`'s first-match scan and
     // only the air between them falls through to the grid.
     app.hits.push((g.area, HitTarget::PanelBg(Focus::Sessions)));
@@ -3345,18 +3348,16 @@ mod tests {
         );
     }
 
-    /// A lone tab is the project on screen with nothing to hand the grid
-    /// to, so it draws no `×` and lays down no target for one — the key
-    /// that would close it says why instead (`event_loop::launcher::
-    /// close_tab`). A second tab brings the crosses back on both.
+    /// A lone tab carries its `×` like any other: closing it goes back
+    /// to the splash (`event_loop::launcher::close_tab`).
     #[test]
-    fn a_lone_tab_has_no_cross() {
+    fn a_lone_tab_has_a_cross() {
         let r = Rect::new(0, 0, 80, 1);
         let mut app = a_tabbed_tree();
         app.launcher_tabs = vec![ProjectId("p0".into())];
         let spans = head_tabs(&mut app, r, 0);
-        assert_eq!(row_text(&spans), " +   api ");
-        assert!(!head_hits(&app)
+        assert_eq!(row_text(&spans), " +   api × ");
+        assert!(head_hits(&app)
             .iter()
             .any(|h| matches!(h, HitTarget::LauncherTabClose(_))));
 

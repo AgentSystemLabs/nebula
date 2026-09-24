@@ -266,8 +266,9 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   down, or `Esc` — hands the keys back to the cards of the project on screen. The `×` on a tab, or `x` for the one the
   grid is on (the one under the header's cursor while it has the keys), closes it and the grid
   moves to the tab that slides into its place. Closing a tab
-  changes nothing about the project — its sessions run on — and the last tab open stays: it is the
-  project on screen, so a lone tab draws no `×`, and `x` on it says to open another first. The
+  changes nothing about the project — its sessions run on. Closing the last tab puts nebula back on
+  the splash it opens on before there is any project, where `+` lists every project, `Enter` opens
+  the repo nebula was started in and `o` another folder; the splash stays across a restart. The
   tabs are remembered across restarts. Each tab carries its project's STATUS DOTS right of the name — one
   per state its sessions are in, carrying that state's count and no word at all: red waiting on
   you, blue an unread finish, yellow mid-turn, in that fixed order and left out where a state is
@@ -379,7 +380,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   type as that session's next turn, straight down its PTY. The pane is left exactly as it is — this is
   the way to hand a wall of sessions their next instructions one after another without opening any of
   them. See [the FOLLOW-UP COMPOSER](#the-follow-up-composer).
-- **Stepping into one** is Enter on a card (or `^→`, or a double-click): the keys cross
+- **Stepping into one** is Enter on a card (or a double-click): the keys cross
   into the pane beside the cards, where that session is already running, with its input locked and
   the grid still up over it — the same place a click into the pane lands. `` ^` `` hands the keys
   back to the cards, and a second `` ^` `` folds the pane away.

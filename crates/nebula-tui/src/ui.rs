@@ -994,7 +994,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[RefreshPullRequests]), "reload PRs + issues (GitHub)"),
                         (Act(&[Issues]), "issues: prompt, preset, edit"),
                         (Act(&[PullRequests]), "pull requests: read / launch"),
-                        (Act(&[CommentPullRequest]), "comment on the pane's PR"),
+                        (Act(&[CommentPullRequest]), "comment on the card's PR"),
                         (Act(&[SwitchBranch]), "switch the ⌂ root's branch"),
                     ],
                 ),
@@ -1047,10 +1047,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "GENERAL",
                     &[
-                        (
-                            Act(&[ToggleLauncherPane, ToggleSidebars]),
-                            "fold / unfold the pane",
-                        ),
+                        (Act(&[ToggleLauncherPane]), "fold / unfold the pane"),
                         // The SHIFT PAIRS' rule (#93), once, for every
                         // letter above that has a shifted twin.
                         (Lit("⇧ + letter"), "bigger, or outside nebula"),

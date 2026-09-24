@@ -1573,10 +1573,33 @@ fn land_pr_detail(
 /// wants. A draft a refused post handed back while another modal was up
 /// (`pr_comment_drafts`) fills the box, so the refusal cost nothing typed.
 fn open_pr_comment(app: &mut App) {
-    let Some(pr) = app.previewed_pr() else {
-        app.flash = Some("move onto a pull request row to comment on it".into());
-        app.dirty = true;
-        return;
+    // The pane reading a pull request (a `/` jump lands on one) is the one
+    // to comment on; otherwise, on the grid, the card's — the pull request
+    // `⇧V` opens.
+    let found = match app.previewed_pr() {
+        Some(pr) => Ok(pr),
+        None if app.launcher_grid() => {
+            launcher::card_pull_request(app, launcher::NO_CARD_FOR_COMMENT).map(|pr| {
+                crate::app::PreviewedPr {
+                    label: if pr.title.is_empty() {
+                        format!("#{}", pr.number)
+                    } else {
+                        format!("#{} {}", pr.number, pr.title)
+                    },
+                    number: pr.number,
+                    url: pr.url,
+                }
+            })
+        }
+        None => Err("move onto a pull request row to comment on it".into()),
+    };
+    let pr = match found {
+        Ok(pr) => pr,
+        Err(why) => {
+            app.flash = Some(why);
+            app.dirty = true;
+            return;
+        }
     };
     let draft = app.pr_comment_drafts.remove(&pr.url).unwrap_or_default();
     reopen_prompt_with(
@@ -2159,6 +2182,7 @@ fn ui_state_json(app: &App) -> String {
         launcher_pane_hidden: app.launcher_pane_hidden,
         launcher_expanded: app.launcher_expanded.as_ref().map(|w| w.to_string()),
         launcher_tabs: app.launcher_tabs.iter().map(|id| id.to_string()).collect(),
+        projects_closed: app.projects_closed,
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
 }
@@ -2202,6 +2226,7 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
         .map(ProjectId)
         .filter(|id| app.tree.projects.iter().any(|p| &p.id == id))
         .collect();
+    app.projects_closed = state.projects_closed && app.launcher_tabs.is_empty();
     if let Some(pid) = &state.project {
         let row = app
             .project_rows()
@@ -2851,10 +2876,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     }
 
     // Terminal input-locked with a live session: forward everything except
-    // the escape hatches. Enter and the forward panel walk (Tab / ^⇧L, or
-    // l/→ double-tapped at Sessions) lock; Ctrl+→ is the way to stand in
-    // the pane without locking, and an unlocked pane falls through to
-    // panel navigation, so the user always has a way back that isn't a
+    // the escape hatches. Enter locks; an unlocked pane falls through to
+    // the grid's keys, so the user always has a way back that isn't a
     // hatch.
     if app.focus == Focus::Terminal && app.term.is_some() && app.term_locked {
         // Ctrl+q is the primary hatch: a plain control byte (0x11) that
@@ -2862,13 +2885,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // needed — unbound in macOS and unused by Claude Code. The inner
         // session loses XON (unfreeze after an accidental Ctrl+S), which
         // nobody will miss.
-        // Fallback hatches: Ctrl+Shift+H (the walk-back-a-panel key, which
-        // doubles as the way out of a locked pane — needs the kitty
-        // protocol, so Ghostty/kitty only, never Terminal.app), Ctrl+]
-        // (telnet's escape char — byte 0x1D, which crossterm spells Ctrl+5
-        // in legacy mode), Ctrl+Esc (kitty-only), and Ctrl+← (stolen by
-        // Mission Control on stock macOS).
-        // All five are rebindable in Settings → Hotkeys, but Ctrl+q stays
+        // Fallback hatches: Ctrl+] (telnet's escape char — byte 0x1D,
+        // which crossterm spells Ctrl+5 in legacy mode) and Ctrl+Shift+H
+        // (needs the kitty protocol, so Ghostty/kitty only, never
+        // Terminal.app). Ctrl+← went: it took word-left from the agent.
+        // All three are rebindable in Settings → Hotkeys, but Ctrl+q stays
         // wired in on top of whatever is bound: unbinding your way out of
         // a locked session would trap you in it with no way back.
         let chord = crate::keymap::KeyChord::from_event(&key);
@@ -3027,6 +3048,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let Some(action) = action else {
         return;
     };
+    // Every PROJECT TAB closed: the splash is on screen with the projects'
+    // rows still selected under it, so only the keys that open a project,
+    // or put up nothing but a modal, mean anything. The rest would walk or
+    // attach rows nobody can see.
+    if app.projects_closed && !opens_from_closed_splash(action) {
+        return;
+    }
     // The LAUNCHER VIEW's GRID takes the keys that walk it and open a
     // card; the rest keep their panel meaning. Only the grid: over a
     // full-screen session the keys are the PTY's, and the ones that get
@@ -3040,24 +3068,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Help => app.overlay = Some(Overlay::Help(HelpView::default())),
         Action::Settings => open_settings(app),
         Action::Metrics => open_metrics(app, out),
-        // Tab / ^⇧L walk forward and stop dead at the terminal pane —
+        // Tab walks forward and stops dead at the terminal pane —
         // leaning on the key can't spill past the pane and back round to
         // the first column. Landing on the pane takes the input lock:
         // walking that far means the user is going to type at the agent,
         // and the preview under the Sessions cursor is already the session
         // they picked.
         Action::FocusNext => walk_focus_forward(app, out),
-        // ⇧Tab / ^⇧H walk back and stop dead at the first visible
-        // sidebar. Neither wraps into the pane: ^⇧H is also the unlock hatch out of
-        // a locked pane, so a wrap made the key cycle first column → pane
-        // → Sessions → … → first column forever, with nothing to stop
-        // against. Forward (Tab / ^⇧L) is the way into the pane, and
-        // Ctrl+→ crosses into it without taking the input lock.
-        Action::FocusPrev => walk_focus_back(app),
-        // h/← and l/→ are the vim twins of the ⇧Tab/Tab walk: one panel
-        // at a time, stopping at the ends of the row. A single press at an
-        // end stays put — leaning on the key can't spill over — and a
-        // double tap jumps the boundary the way ^⇧L would: l,l at Sessions
+        // h/← and l/→ walk one panel at a time, stopping at the ends of
+        // the row: h never wraps into the pane. A single press at an end
+        // stays put — leaning on the key can't spill over — and a double
+        // tap jumps the boundary the way Tab would: l,l at Sessions
         // crosses into the pane and takes its input.
         Action::FocusLeft => walk_focus_back(app),
         Action::Hosts => open_hosts_picker(app),
@@ -3071,19 +3092,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Issues => crate::issues::open_issues(app),
         Action::PullRequests => crate::pr_modal::open(app),
         Action::SwitchBranch => crate::branch_switch::open_branch_switch(app),
-        // Ctrl+→ still reaches the terminal pane (the counterpart of the
-        // Ctrl+← escape hatch).
-        Action::FocusTerminal => {
-            app.focus = app.next_visible_focus(app.focus);
-        }
         Action::FocusRight => match app.focus {
             Focus::Sessions => {
                 if double_tapped(app, action, armed, &chord, "enter pane") {
                     walk_focus_forward(app, out);
                 }
             }
-            // Standing in the pane unlocked (Ctrl+→): l,l takes the lock,
-            // as ^⇧L does. A dead or empty pane has nothing to lock into.
+            // Standing in the pane unlocked: l,l takes the lock, as Tab
+            // does. A dead or empty pane has nothing to lock into.
             Focus::Terminal => {
                 let live = app.term.as_ref().is_some_and(|t| !t.exited);
                 if live && double_tapped(app, action, armed, &chord, "type into terminal") {
@@ -3109,13 +3125,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.flash = Some(launcher::NO_PANE_HERE.into())
         }
         Action::PaneTabs => app.flash = Some("no pane here — add a project first".into()),
-        // The one thing left to fold away: the PANE under the cards.
-        // The GRID itself is the view, so there is nothing else to give
-        // its room to.
-        Action::ToggleSidebars => launcher::toggle_pane(app),
         // The header's PROJECT TABS. The grid takes these keys itself
         // (`launcher::handle_action`); they reach here with a session
         // full-screen over it, where the header is not on screen.
+        // Every tab closed: `+` drops the same PROJECT DROPDOWN the
+        // header's `+` does.
+        Action::ProjectDropdown if app.projects_closed => launcher::open_project_menu(app),
         Action::NextProjectTab
         | Action::PrevProjectTab
         | Action::CloseProjectTab
@@ -3149,9 +3164,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         // The first-run SPLASH, started inside a git repo: Enter opens it —
         // the one-key way from a fresh install to a project.
-        Action::Activate if app.splash_showing() && !app.tree.has_projects() => {
-            open_launch_repo(app, out)
-        }
+        Action::Activate if app.splash_showing() => open_launch_repo(app, out),
         Action::Activate => match app.focus {
             Focus::Projects => app.focus = app.next_visible_focus(Focus::Projects),
             // An open-PR row leads out of nebula, so Enter hands it to the
@@ -3170,7 +3183,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // thing `n` can mean there is the project it tells you to open.
         // (With a project anywhere the GRID has this key — it is the box
         // — and only gets here full-screen over a session.)
-        Action::New if !app.tree.has_projects() => open_prompt(app, PromptKind::AddProject),
+        Action::New if !app.launcher_active() => open_prompt(app, PromptKind::AddProject),
         Action::New => match app.focus {
             Focus::Projects => open_prompt(app, PromptKind::AddProject),
             Focus::Worktrees => {
@@ -3561,6 +3574,29 @@ fn add_project_prefill(app: &App) -> String {
         (None, Some(_)) => "~/".to_string(),
         (None, None) => String::new(),
     }
+}
+
+/// The keys the all-tabs-closed SPLASH answers ([`App::projects_closed`]):
+/// the ones that open a project — Enter, `n`, `o`, `+`, a `/` pick, the
+/// attention walk — and the ones that only put a modal up.
+fn opens_from_closed_splash(action: crate::keymap::Action) -> bool {
+    use crate::keymap::Action;
+    matches!(
+        action,
+        Action::Activate
+            | Action::New
+            | Action::AddProject
+            | Action::ProjectDropdown
+            | Action::Palette
+            | Action::NextAttention
+            | Action::PrevAttention
+            | Action::Quit
+            | Action::Help
+            | Action::Settings
+            | Action::Metrics
+            | Action::Hosts
+            | Action::AgentPresets
+    )
 }
 
 /// Enter on the first-run SPLASH: open the repo nebula was started in —
@@ -7336,6 +7372,7 @@ fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool 
     app.select_worktree_when_seen = None;
     remember_context(app);
     app.sel_project = row;
+    app.reopen_projects();
     true
 }
 
@@ -7689,6 +7726,7 @@ fn select_project_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
     remember_context(app);
     let owner_before = app.selected_project().map(|p| p.id.clone());
     app.sel_project = i;
+    app.reopen_projects();
     if app.selected_project().map(|p| p.id.clone()) != owner_before {
         restore_context(app, out);
     }
@@ -13455,17 +13493,19 @@ mod tests {
         let items = menu_items_for_link(&app.selected_link().expect("the PR ROW"));
         assert!(items.iter().any(|i| i.label == "Comment…"), "{items:?}");
 
-        // Off a pull request row there is nothing to comment on.
+        // Off a pull request row, on a card, `y` comments on the card's
+        // pull request — its checkout's, the one `⇧V` opens.
         app.overlay = None;
         let pr_row = sessions_pr_row(&app);
         app.sel_session = (0..app.visible_session_rows().len())
             .find(|i| *i != pr_row)
             .expect("an agent row");
         press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
-        assert!(app.overlay.is_none(), "{:?}", app.overlay);
-        assert_eq!(
-            app.flash.as_deref(),
-            Some("move onto a pull request row to comment on it")
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p))
+                if matches!(&p.kind, PromptKind::PrComment { number: 9, .. })),
+            "{:?}",
+            app.overlay
         );
     }
 
@@ -17679,15 +17719,9 @@ diff --git a/src/c.rs b/src/c.rs
         let sref = SessionRef::Agent(AgentId("a1".into()));
         app.term = Some(AttachedTerm::new(sref, 80, 24));
 
-        // Ctrl+q plus the fallbacks: Ctrl+] in both spellings (kitty reports
-        // ']', legacy 0x1D parses as Ctrl+5), Ctrl+Esc, and Ctrl+←.
-        let hatches = [
-            KeyCode::Char('q'),
-            KeyCode::Char(']'),
-            KeyCode::Char('5'),
-            KeyCode::Esc,
-            KeyCode::Left,
-        ];
+        // Ctrl+q plus the fallback: Ctrl+] in both spellings (kitty reports
+        // ']', legacy 0x1D parses as Ctrl+5).
+        let hatches = [KeyCode::Char('q'), KeyCode::Char(']'), KeyCode::Char('5')];
         for code in hatches {
             app.focus = Focus::Terminal;
             app.term_locked = true;
@@ -17705,10 +17739,9 @@ diff --git a/src/c.rs b/src/c.rs
             assert!(out.is_empty(), "Ctrl+{code:?} must not reach the pty");
         }
 
-        // Ctrl+Shift+H is the same key that walks back a panel when nothing
-        // is locked, so inside a locked session it means the same thing:
-        // leave. Kitty-protocol emulators only — crossterm may spell it
-        // either as 'H' or as shift + 'h', and `from_event` folds both.
+        // Ctrl+Shift+H leaves too. Kitty-protocol emulators only —
+        // crossterm may spell it either as 'H' or as shift + 'h', and
+        // `from_event` folds both.
         for code in [KeyCode::Char('H'), KeyCode::Char('h')] {
             app.focus = Focus::Terminal;
             app.term_locked = true;
@@ -17726,20 +17759,21 @@ diff --git a/src/c.rs b/src/c.rs
             assert!(out.is_empty(), "Ctrl+Shift+{code:?} must not reach the pty");
         }
 
-        // Ctrl+Shift+L is not a hatch — it walks forward, and forward from a
-        // locked pane is nowhere. It stays in the session.
-        app.focus = Focus::Terminal;
-        app.term_locked = true;
-        handle_key(
-            &mut app,
-            KeyEvent::new(
-                KeyCode::Char('L'),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-            ),
-            &mut out,
-        );
-        assert_eq!(app.focus, Focus::Terminal, "Ctrl+Shift+L does not escape");
-        assert!(app.term_locked, "Ctrl+Shift+L keeps the input lock");
+        // Ctrl+Esc and Ctrl+← are hatches no more: Ctrl+← is the agent's
+        // word-left, as Ctrl+→ is its word-right. They stay in the
+        // session and reach the pty.
+        for code in [KeyCode::Esc, KeyCode::Left] {
+            app.focus = Focus::Terminal;
+            app.term_locked = true;
+            out.clear();
+            handle_key(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::CONTROL),
+                &mut out,
+            );
+            assert_eq!(app.focus, Focus::Terminal, "Ctrl+{code:?} does not escape");
+            assert!(app.term_locked, "Ctrl+{code:?} keeps the input lock");
+        }
         out.clear();
 
         // Bare Esc is NOT a hatch: it forwards to the pty untouched — Claude
@@ -17806,8 +17840,7 @@ diff --git a/src/c.rs b/src/c.rs
             "Enter on a session locks input into the terminal"
         );
 
-        // `^q` hands the keys back to the cards; `^→` steps into the pane
-        // again, which in this view is Enter on it — lock and all.
+        // `^q` hands the keys back to the cards.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
@@ -17815,13 +17848,6 @@ diff --git a/src/c.rs b/src/c.rs
         );
         assert_eq!(app.focus, Focus::Sessions);
         assert!(!app.term_locked);
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
-            &mut out,
-        );
-        assert_eq!(app.focus, Focus::Terminal);
-        assert!(app.term_locked, "^→ into the pane is Enter on it");
     }
 
     /// The other half of the rule above: a session the daemon has reaped
@@ -23227,10 +23253,7 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
             assert_eq!(app.keymap.label(crate::keymap::Action::FocusNext), "—");
             press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
-            assert_eq!(
-                app.keymap.label(crate::keymap::Action::FocusNext),
-                "Tab ^⇧L"
-            );
+            assert_eq!(app.keymap.label(crate::keymap::Action::FocusNext), "Tab");
             assert!(
                 crate::config::Config::load().keybindings.is_empty(),
                 "back to the default = nothing left to write down"
@@ -23247,10 +23270,7 @@ diff --git a/src/c.rs b/src/c.rs
             open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
             press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::F(7), KeyModifiers::NONE, &mut out);
-            assert_eq!(
-                app.keymap.label(crate::keymap::Action::FocusNext),
-                "Tab ^⇧L F7"
-            );
+            assert_eq!(app.keymap.label(crate::keymap::Action::FocusNext), "Tab F7");
         });
     }
 
@@ -23266,10 +23286,7 @@ diff --git a/src/c.rs b/src/c.rs
             matches!(app.overlay, Some(Overlay::Settings(_))),
             "Esc left the capture, not the overlay"
         );
-        assert_eq!(
-            app.keymap.label(crate::keymap::Action::FocusNext),
-            "Tab ^⇧L"
-        );
+        assert_eq!(app.keymap.label(crate::keymap::Action::FocusNext), "Tab");
     }
 
     /// A capture swallows the overlay's own keys — otherwise half the

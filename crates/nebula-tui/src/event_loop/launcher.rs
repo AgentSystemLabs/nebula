@@ -624,14 +624,12 @@ pub(super) fn handle_action(
         // beside the cards, where the session is already running and
         // reading it only takes the keys — expanded or not, and on a
         // band aimed at rather than any one card, its remembered card
-        // (`enter_pane`'s own `cursor_or_first`). `^→` does the same.
-        Action::Activate | Action::FocusTerminal => enter_pane(app, out),
+        // (`enter_pane`'s own `cursor_or_first`).
+        Action::Activate => enter_pane(app, out),
         // Tab — the panels' "next panel" — is the grid's own here: the
         // ACCORDION, opening the band under the cursor's cards in place
         // or folding them back up. Never what Enter does.
         Action::FocusNext => toggle_band_expand(app, out),
-        // There is nothing to the left of the grid to walk back to.
-        Action::FocusPrev => {}
         // `` ` ``: the checkout's TERMINAL chips, one after another.
         Action::PaneTabs => walk_terminals(app, out),
         // `t`: a terminal in the cursor's checkout, as its chip.
@@ -656,13 +654,10 @@ pub(super) fn handle_action(
         // `⇧P` on a card: another session with its settings, nothing typed.
         Action::DuplicateSession => duplicate_session(app),
         // The fold is a preference the view keeps, and its key is the way
-        // out of the pane first ([`fold_key`]). `⇧Z` / `^B` is the same
-        // fold under its old "give it the full width" name, since the pane
-        // is the only thing left to fold.
+        // out of the pane first ([`fold_key`]).
         Action::ToggleLauncherPane => {
             fold_key(app);
         }
-        Action::ToggleSidebars => toggle_pane(app),
         // The PROJECT TABS across the header.
         Action::NextProjectTab => step_tab(app, 1, out),
         Action::PrevProjectTab => step_tab(app, -1, out),
@@ -718,22 +713,34 @@ const NO_CARD_FOR_PR: &str = "no card selected — j/k onto one, then ⇧V opens
 /// INPUT PARITY: the menu row's `MenuAction::OpenLink` carries the URL
 /// this reads, and ends in the same `open_link`.
 pub(super) fn open_pull_request(app: &mut App, out: &mut Vec<ClientRequest>) {
+    match card_pull_request(app, NO_CARD_FOR_PR) {
+        Ok(pr) => super::open_link(app, &pr.url, out),
+        Err(why) => app.flash = Some(why),
+    }
+}
+
+/// What `y` says with no card under the cursor to comment on the pull
+/// request of.
+pub(super) const NO_CARD_FOR_COMMENT: &str =
+    "no card selected — j/k onto one, then y comments on its pull request";
+
+/// The pull request of the checkout under the grid's cursor — the
+/// `#42 title` on its band's rule — or what to say instead: `no_card`
+/// with the aim let go of, or that the checkout has none yet. `⇧V` opens
+/// it in the browser; `y` comments on it.
+pub(super) fn card_pull_request(app: &App, no_card: &str) -> Result<view::RowPr, String> {
     let aimed = !(app.launcher_grid() && app.launcher_unaimed);
     let bands = view::bands(app);
     let Some(band) = view::band_cursor(app, &bands).filter(|_| aimed) else {
-        app.flash = Some(NO_CARD_FOR_PR.into());
-        return;
+        return Err(no_card.into());
     };
     let band = &bands[band];
-    match &band.pr {
-        Some(pr) => super::open_link(app, &pr.url, out),
-        None => {
-            app.flash = Some(format!(
-                "no pull request on {} yet — ⇧R reloads from GitHub",
-                band.branch
-            ))
-        }
-    }
+    band.pr.clone().ok_or_else(|| {
+        format!(
+            "no pull request on {} yet — ⇧R reloads from GitHub",
+            band.branch
+        )
+    })
 }
 
 /// A click on the pull request on a band's rule — its `↗ #42 title`
@@ -1069,9 +1076,9 @@ const NO_TABS: &str = "no projects open — + in the header opens one";
 const ONE_TAB: &str = "one project open — + in the header opens another";
 /// The PROJECT DROPDOWN's last row: a folder that is not a project yet.
 const OPEN_FOLDER: &str = "+ open a folder…";
-/// What closing the only tab says: it is the project on screen, and there
-/// is no tab beside it to hand the grid to.
-const LAST_TAB: &str = "the only project open stays open — + opens another first";
+/// What closing the last tab says: nebula is back on the splash, and
+/// nothing about the projects changed.
+const LAST_TAB: &str = "all projects closed — their sessions run on; + opens one again";
 
 /// A click on a PROJECT TAB, `[` / `]` onto it, and the tab that slides
 /// into a closed one's place: that project's sessions, through the one
@@ -1275,8 +1282,8 @@ pub(super) fn click_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientReque
 /// of `d`, `Delete` or `Backspace` there ([`confirm_close_cursor_tab`]):
 /// close the tab the header's cursor is on, through the same
 /// [`close_tab`] the `×` takes, and put the cursor on the tab that slid
-/// into its place. The last tab is refused there, and the cursor stays on
-/// it. A cursor that has moved off the tab by the time the dialog is
+/// into its place. The last tab closes to the SPLASH ([`close_tab`]). A
+/// cursor that has moved off the tab by the time the dialog is
 /// answered stays where it is.
 pub(super) fn close_cursor_tab(app: &mut App, on: &ProjectId, out: &mut Vec<ClientRequest>) {
     let at = open_tabs(app).iter().position(|t| t == on);
@@ -1295,13 +1302,8 @@ pub(super) fn close_cursor_tab(app: &mut App, on: &ProjectId, out: &mut Vec<Clie
 /// `d`, `Delete` or `Backspace` with the PROJECT TABS holding the keys:
 /// the confirm before the tab under the header's cursor closes. Its Enter
 /// is [`close_cursor_tab`], the `x`; its Esc leaves the tab and the cursor
-/// where they are. The last tab is refused before any dialog, as `x`
-/// refuses it — there is nothing a dialog could close.
+/// where they are.
 fn confirm_close_cursor_tab(app: &mut App, on: &ProjectId) {
-    if open_tabs(app).len() == 1 {
-        app.flash = Some(LAST_TAB.into());
-        return;
-    }
     let name = app
         .tree
         .projects
@@ -1344,16 +1346,16 @@ fn close_active_tab(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// Closing the tab the grid is on moves the grid to the tab that slides
 /// into its place — the one to its right, else the one to its left — as
 /// closing a TERMINAL tab moves the pane ([`tab_after`]). Closing any
-/// other tab moves nothing. The only tab left is refused: it is the
-/// project on screen, and there is no tab to hand the grid to — the `+`
-/// opens another first.
+/// other tab moves nothing. Closing the last tab leaves nebula where it
+/// starts before there is any project: the SPLASH, the pane let go
+/// ([`App::projects_closed`]). Enter, `+` or `o` there opens one again.
 pub(super) fn close_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
     let mut tabs = open_tabs(app);
     let Some(at) = tabs.iter().position(|t| t == id) else {
         return;
     };
     if tabs.len() == 1 {
-        app.flash = Some(LAST_TAB.into());
+        close_every_project(app, out);
         return;
     }
     let showing = app.selected_project().is_some_and(|p| &p.id == id);
@@ -1370,6 +1372,24 @@ pub(super) fn close_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientReque
     if let Some(next) = next {
         open_tab(app, &next, out);
     }
+}
+
+/// The last PROJECT TAB closed: the grid goes and the SPLASH comes back.
+/// The pane lets go of its session — nothing on the splash shows it — and
+/// the header's cursor, the aim and the accordion go with the grid.
+fn close_every_project(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.launcher_tabs.clear();
+    app.launcher_tab_cursor = None;
+    app.launcher_expanded = None;
+    app.follow_up = None;
+    clear_aim(app);
+    if app.term.is_some() {
+        super::detach_pane(app, out);
+    }
+    app.focus = Focus::Sessions;
+    app.projects_closed = true;
+    app.flash = Some(LAST_TAB.into());
+    app.dirty = true;
 }
 
 /// The PROJECT DROPDOWN: a click on the `+` after the PROJECT TABS drops
@@ -1399,7 +1419,12 @@ pub(super) fn close_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientReque
 /// query hands the cursor back to the project you are already in rather
 /// than to the top of the list.
 pub(super) fn open_project_menu(app: &mut App) {
-    let open = app.selected_project().map(|p| p.id.clone());
+    // With every tab closed the selection under the splash is no project
+    // in front of you, so nothing is ticked.
+    let open = app
+        .launcher_active()
+        .then(|| app.selected_project().map(|p| p.id.clone()))
+        .flatten();
     let cards = view::project_cards(app);
     if cards.is_empty() {
         app.flash = Some(NO_PROJECTS.into());
@@ -1428,7 +1453,9 @@ pub(super) fn open_project_menu(app: &mut App) {
         .as_ref()
         .and_then(|id| cards.iter().position(|card| &card.id == id))
         .unwrap_or(0);
-    let at = crumb_anchor(app, &HitTarget::LauncherTabAdd);
+    // On the splash there is no header `+` to hang it off, so it sits in
+    // the middle of the screen, over the nebula, rather than in a corner.
+    let at = (!app.splash_showing()).then(|| crumb_anchor(app, &HitTarget::LauncherTabAdd));
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some("Project".into()),
         filter: Some(MenuFilter {
@@ -1436,7 +1463,7 @@ pub(super) fn open_project_menu(app: &mut App) {
             all: items.clone(),
         }),
         items,
-        at: Some(at),
+        at,
         hover,
         area: ratatui::layout::Rect::default(),
         parent: None,
@@ -1751,7 +1778,7 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
     select_card(app, next_sref, out);
 }
 
-/// Enter anywhere on the GRID (or `^→`, or a double-click on a card): the
+/// Enter anywhere on the GRID (or a double-click on a card): the
 /// card under the cursor in the PANE beside the cards, with the input
 /// lock on — focus crosses into the pane where it stands, the grid still
 /// up over it (expanded or not — this never touches the ACCORDION), and
@@ -4108,8 +4135,7 @@ mod tests {
     }
 
     /// The header is the PROJECT TABS: the `+`, then a tab for the project
-    /// the view opened on — no `nebula`, no trail. A lone tab
-    /// has no `×`: it is the project on screen.
+    /// the view opened on, with its `×` — no `nebula`, no trail.
     #[test]
     fn the_header_is_the_project_tabs_and_nothing_else() {
         with_default_config(|| {
@@ -4136,7 +4162,11 @@ mod tests {
                 .collect();
             assert_eq!(
                 head,
-                vec![HitTarget::LauncherTabAdd, HitTarget::LauncherTab(demo)],
+                vec![
+                    HitTarget::LauncherTabAdd,
+                    HitTarget::LauncherTab(demo.clone()),
+                    HitTarget::LauncherTabClose(demo),
+                ],
                 "{head:?}"
             );
         });
@@ -5052,8 +5082,8 @@ mod tests {
 
     /// `x` and the `×` on the lit tab close it the same way: the tab goes
     /// and the grid lands on the one that slides into its place. The last
-    /// tab is the project on screen, with nothing to hand the grid to, so
-    /// it stays — and says why.
+    /// tab closes too, back to the SPLASH nebula opens on with no project,
+    /// the projects and their sessions untouched.
     #[test]
     fn closing_the_lit_tab_lands_on_the_one_beside_it() {
         with_default_config(|| {
@@ -5075,12 +5105,57 @@ mod tests {
             // The project itself is untouched: its sessions run on.
             assert!(by_key.tree.projects.iter().any(|p| p.name == "demo"));
 
-            let before = tab_state(&by_key);
             key(&mut by_key, KeyCode::Char('x'), KeyModifiers::NONE);
-            assert_eq!(tab_state(&by_key), before, "the last tab stays");
+            assert!(by_key.launcher_tabs.is_empty(), "the last tab closes");
+            assert!(by_key.projects_closed);
+            assert!(!by_key.launcher_active() && by_key.splash_showing());
             assert_eq!(by_key.flash.as_deref(), Some(super::LAST_TAB));
+            assert_eq!(by_key.tree.projects.len(), 2, "no project went");
             draw(&mut by_key);
-            assert_eq!(tabs_drawn(&by_key), ["web"]);
+            assert!(by_key.launcher_tabs.is_empty(), "the draw gives none back");
+        });
+    }
+
+    /// With every tab closed nebula is back on the SPLASH it opens on with
+    /// no project: the grid's keys walk nothing under it, and the `+` there
+    /// lists every project as the header's does, in the middle of the
+    /// screen — a pick brings the grid back on it, with its tab. The next
+    /// start opens on the splash too.
+    #[test]
+    fn closing_every_tab_goes_back_to_the_splash() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            keys(&mut app, &[KeyCode::Char('x'), KeyCode::Char('x')]);
+            assert!(app.projects_closed && app.splash_showing());
+            assert!(app.term.is_none(), "the pane let go");
+            draw(&mut app);
+            assert!(app.launcher_tabs.is_empty());
+
+            // Keys that would walk the hidden rows do nothing.
+            let before = (app.sel_project, app.sel_worktree, app.sel_session);
+            keys(&mut app, &[KeyCode::Char('j'), KeyCode::Char('l')]);
+            assert_eq!((app.sel_project, app.sel_worktree, app.sel_session), before);
+            assert!(app.projects_closed);
+
+            let json = super::super::ui_state_json(&app);
+            let mut next = two_sessions();
+            super::super::restore_ui_state(&mut next, &json);
+            draw(&mut next);
+            assert!(next.projects_closed && next.launcher_tabs.is_empty());
+
+            // `+`: every project, none ticked; picking one reopens it.
+            key(&mut app, KeyCode::Char('+'), KeyModifiers::NONE);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("no dropdown: {:?}", app.overlay);
+            };
+            let labels: Vec<_> = menu.items.iter().map(|i| i.label.clone()).collect();
+            assert_eq!(labels, vec!["demo  (2)", "web  (1)", super::OPEN_FOLDER]);
+            assert_eq!(menu.at, None, "no header + here: it sits mid-screen");
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(!app.projects_closed && app.launcher_active());
+            draw(&mut app);
+            assert_eq!(tabs_drawn(&app), ["demo"]);
         });
     }
 
@@ -5526,9 +5601,8 @@ mod tests {
     /// before closing the tab under the cursor: the tab is still there
     /// behind the dialog, `Esc` keeps it with the cursor on it, and the
     /// dialog's Enter is `x` — the grid and the cursor land where `x` lands
-    /// them. The last tab is refused before any dialog, the way `x`
-    /// refuses it. Down on the cards the same keys are still the card's
-    /// own delete.
+    /// them — the last tab too, which closes to the SPLASH. Down on the
+    /// cards the same keys are still the card's own delete.
     #[test]
     fn the_delete_keys_in_the_header_ask_before_closing_the_tab() {
         with_default_config(|| {
@@ -5578,12 +5652,18 @@ mod tests {
                 assert_eq!(app.launcher_tab_cursor, by_x.launcher_tab_cursor);
                 assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
 
-                // The only tab left is refused before any dialog.
+                // The only tab left asks too, and its Enter closes it.
                 key(&mut app, code, KeyModifiers::NONE);
-                assert!(app.overlay.is_none(), "{code:?} asked about the last tab");
-                assert_eq!(app.launcher_tabs, [ProjectId("p1".into())]);
-                assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
-                assert_eq!(app.flash.as_deref(), Some(super::LAST_TAB));
+                assert!(
+                    matches!(&app.overlay, Some(Overlay::Confirm(c))
+                        if c.action == PendingAction::CloseProjectTab(ProjectId("p1".into()))),
+                    "{code:?} asks about the last tab: {:?}",
+                    app.overlay
+                );
+                key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                assert!(app.launcher_tabs.is_empty());
+                assert_eq!(app.launcher_tab_cursor, None);
+                assert!(app.projects_closed);
             }
 
             // Down on the cards the same key is the card's own delete.
@@ -7291,6 +7371,56 @@ mod tests {
         });
     }
 
+    /// `y` on a card comments on the pull request `⇧V` opens — its
+    /// checkout's, the `#42 title` on its band's rule — with no PR row
+    /// to stand on first.
+    #[test]
+    fn y_on_a_card_comments_on_its_pull_request() {
+        with_default_config(|| {
+            let mut app = card_on_a_pull_request();
+            let sent = key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert!(sent.is_empty(), "{sent:?}");
+            match &app.overlay {
+                Some(Overlay::Prompt(prompt)) => match &prompt.kind {
+                    crate::app::PromptKind::PrComment {
+                        number, url, label, ..
+                    } => {
+                        assert_eq!(*number, 42);
+                        assert_eq!(url, PR_42);
+                        assert_eq!(label, "#42 Polish the nav");
+                    }
+                    other => panic!("expected the comment box, got {other:?}"),
+                },
+                other => panic!("expected the comment box, got {other:?}"),
+            }
+        });
+    }
+
+    /// `y` refuses as `⇧V` does: with no card selected, and on a card
+    /// whose checkout has no pull request yet.
+    #[test]
+    fn y_without_a_cards_pull_request_says_why() {
+        with_default_config(|| {
+            let mut app = card_on_a_pull_request();
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert_eq!(app.flash.as_deref(), Some(super::NO_CARD_FOR_COMMENT));
+
+            let mut app = two_sessions();
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(
+                app.flash
+                    .as_deref()
+                    .is_some_and(|f| f.starts_with("no pull request on ")),
+                "{:?}",
+                app.flash
+            );
+        });
+    }
+
     /// The pull request on a band's rule is a link: a click on its
     /// `↗ #42 title` opens it in the browser exactly as `⇧V` does — the
     /// same URL, marked read the same way — and the target is only as
@@ -7444,6 +7574,47 @@ mod tests {
             mouse(&mut app, MouseEventKind::Moved, line.x, line.y + 2);
             assert_eq!(app.hover_crumb, None, "the card under the rule is no link");
             assert_eq!(underlined(&draw(&mut app)), "");
+        });
+    }
+
+    /// The air around a band's cards — beside the last one, in the rows
+    /// under the rule — is the band's: a click there lands the cursor on
+    /// that checkout as a click on its rule does, not on nothing.
+    #[test]
+    fn clicking_the_air_inside_a_band_selects_its_worktree() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let bands = crate::launcher::bands(&app);
+            let cursor =
+                crate::launcher::band_cursor(&app, &bands).expect("a band under the cursor");
+            let other = (0..bands.len())
+                .find(|&i| i != cursor)
+                .expect("a second band");
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            draw_at(&mut app, 130, 50);
+            let rule = app
+                .hit_rect(&HitTarget::LauncherBand(other))
+                .expect("the other band's rule");
+            let whole = app
+                .hits
+                .iter()
+                .filter(|(_, h)| *h == HitTarget::LauncherBand(other))
+                .map(|(r, _)| *r)
+                .find(|r| r.height > 1)
+                .expect("the other band's whole rectangle");
+            assert_eq!(whole.y, rule.y, "it starts at the band's rule");
+            let (x, y) = (whole.y + 1..whole.y + whole.height)
+                .flat_map(|y| (whole.x..whole.x + whole.width).map(move |x| (x, y)))
+                .find(|&(x, y)| app.hit_at(x, y) == Some(HitTarget::LauncherBand(other)))
+                .expect("air beside the band's cards");
+
+            click_at(&mut app, x, y);
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.clone()),
+                Some(bands[other].worktree.clone()),
+                "the cursor is on the band whose air was clicked"
+            );
         });
     }
 

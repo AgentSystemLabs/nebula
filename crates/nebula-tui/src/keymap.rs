@@ -28,7 +28,7 @@ use std::fmt;
 /// things in each, so conflicts are only conflicts within one scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    /// Panel navigation: the three sidebars and an unlocked terminal pane.
+    /// The launcher grid, and a terminal pane that isn't input-locked.
     Global,
     /// Input-locked terminal pane, where every other key is forwarded to
     /// the child process.
@@ -42,10 +42,8 @@ pub enum Scope {
 pub enum Action {
     // navigate
     FocusNext,
-    FocusPrev,
     FocusLeft,
     FocusRight,
-    FocusTerminal,
     MoveDown,
     MoveUp,
     HalfPageDown,
@@ -89,8 +87,9 @@ pub enum Action {
     /// open pull requests and issues, the worktree's PR, the one the pane
     /// is reading.
     RefreshPullRequests,
-    /// `y`: reply — the COMMENT BOX on the pull request under the cursor,
-    /// posted to GitHub with `gh pr comment` on Enter.
+    /// `y`: reply — the COMMENT BOX on the card's pull request (the one
+    /// `Shift+V` opens), or on the one the pane is reading, posted to
+    /// GitHub with `gh pr comment` on Enter.
     CommentPullRequest,
     /// `i`: the ISSUES MODAL — the project's open GitHub issues, read in
     /// place, commented on, with a QUICK PROMPT or an AGENT PRESET launched
@@ -102,15 +101,14 @@ pub enum Action {
     /// `c`: the BRANCH SWITCHER — move the project's ROOT WORKTREE onto
     /// another branch, asking what to do with uncommitted changes.
     SwitchBranch,
-    /// `Shift+Enter` / `Shift+O` / `Alt+Enter`, from any panel: fire the
+    /// `Shift+Enter` / `Shift+O` / `Alt+Enter`, on the grid: fire the
     /// selected worktree's OPEN COMMAND — the project's **Open command**
     /// setting, else its `.nebula.json` `open` (`open http://localhost:3000`,
     /// say). Three chords because only the kitty protocol carries a shifted
     /// Enter: Terminal.app sends a plain one and tmux flattens it, while
     /// `ESC CR` — what `/terminal-setup` gives Shift+Enter in VS Code, and
     /// Option+Enter on a Mac with Option as Meta — gets through both and
-    /// parses as Alt+Enter. Its RUN COMMAND is `r`, which takes that
-    /// meaning on the Worktrees panel, where nothing is renamed.
+    /// parses as Alt+Enter. Its RUN COMMAND is the project menu's **Run**.
     OpenWorktree,
     // sessions
     NewTerminal,
@@ -124,9 +122,8 @@ pub enum Action {
     AgentPresets,
     /// The QUICK PROMPT: type a task, launch an agent on it.
     QuickPrompt,
-    /// `Space`: expand the selected session card into its FOLLOW-UP
-    /// COMPOSER — the next turn typed into the card itself — or fold it
-    /// back up.
+    /// `Space`: the FOLLOW-UP MODAL for the selected session card — its
+    /// next turn, typed in a box over the grid and sent on Enter.
     FollowUp,
     /// `Shift+P`: the QUICK PROMPT on the card under the cursor's settings
     /// — the same harness, model, effort and worktree, and the issue it
@@ -150,10 +147,6 @@ pub enum Action {
     /// to the session. What the pane READS, where `^~` is whether it is
     /// drawn at all.
     PaneTabs,
-    /// Fold the LAUNCHER PANE away and give the cards the whole body,
-    /// or bring it back — the same thing [`Action::ToggleLauncherPane`]
-    /// does, on the chord the panels' "collapse everything" used to own.
-    ToggleSidebars,
     /// Open the Nth PROJECT TAB (1-based) in the LAUNCHER VIEW's header.
     SelectProjectTab(u8),
     Hosts,
@@ -203,19 +196,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FocusNext,
         id: "focus_next",
         label: "Open / fold checkout",
-        hint: "Open every card of the checkout under the cursor in place, or fold it back to one row — one checkout open at a time (^⇧L needs the kitty protocol)",
+        hint: "Open every card of the checkout under the cursor in place, or fold it back to one row — one checkout open at a time",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["tab", "ctrl+shift+l"],
-    },
-    ActionSpec {
-        action: Action::FocusPrev,
-        id: "focus_prev",
-        label: "Walk focus back",
-        hint: "Nothing on the launcher grid — Tab folds the checkout back itself (^⇧H needs the kitty protocol)",
-        group: "NAVIGATE",
-        scope: Scope::Global,
-        defaults: &["shift+tab", "ctrl+shift+h"],
+        defaults: &["tab"],
     },
     ActionSpec {
         action: Action::FocusLeft,
@@ -234,15 +218,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["l", "right"],
-    },
-    ActionSpec {
-        action: Action::FocusTerminal,
-        id: "focus_terminal",
-        label: "Focus terminal pane",
-        hint: "Into the pane under the cards, as Enter is",
-        group: "NAVIGATE",
-        scope: Scope::Global,
-        defaults: &["ctrl+right"],
     },
     ActionSpec {
         action: Action::MoveDown,
@@ -370,7 +345,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::AddProject,
         id: "add_project",
         label: "Open a folder as a project",
-        hint: "Open a folder as a project in nebula, from anywhere (unlike New, never changes meaning); ⇧O opens a checkout outside it, in your editor",
+        hint: "Open a folder as a project in nebula, from anywhere; ⇧O opens a checkout outside it, in your editor",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["o"],
@@ -433,7 +408,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::CommentPullRequest,
         id: "comment_pull_request",
         label: "Comment on pull request",
-        hint: "With the pane reading a pull request (a / jump lands on one), open a box to type a comment and post it on that PR through gh",
+        hint: "Open a box to type a comment and post it through gh on the card's pull request — the one ⇧V opens — or, with the pane reading a pull request (a / jump lands on one), on that one",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["y"],
@@ -570,7 +545,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FollowUp,
         id: "follow_up",
         label: "Follow-up prompt",
-        hint: "Expand the selected session's card into a box for its next turn, sent to the running agent on Enter; the cards below move down, and Esc or the card's chevron folds it back",
+        hint: "Open a box over the grid for the selected session's next turn, sent to the running agent on Enter; the pane stays as it is",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["space"],
@@ -617,10 +592,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::UnlockTerminal,
         id: "unlock_terminal",
         label: "Unlock terminal input",
-        hint: "Leave the locked pane and go back to the card (^q always works)",
+        hint: "Leave the locked pane and go back to the card (^q always works; ^⇧H needs the kitty protocol)",
         group: "TERMINAL",
         scope: Scope::Terminal,
-        defaults: &["ctrl+q", "ctrl+shift+h", "ctrl+]", "ctrl+esc", "ctrl+left"],
+        defaults: &["ctrl+q", "ctrl+]", "ctrl+shift+h"],
     },
     // ---- GENERAL ----
     ActionSpec {
@@ -647,15 +622,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["`"],
-    },
-    ActionSpec {
-        action: Action::ToggleSidebars,
-        id: "toggle_sidebars",
-        label: "Full-width cards",
-        hint: "Fold the pane under the cards away and give the grid the whole body, or bring it back",
-        group: "GENERAL",
-        scope: Scope::Global,
-        defaults: &["ctrl+b", "cmd+b", "shift+z"],
     },
     ActionSpec {
         action: Action::Hosts,
@@ -1167,7 +1133,7 @@ impl Keymap {
     /// The chords Help and the footer print for an action: every one it
     /// answers to but the ⌘ ones. ⌘ never reaches nebula in Terminal.app
     /// or `nebula browser`, and every ⌘ default has a plain key beside it
-    /// (`1`–`9`, `^b`, `+`), so the ⌘ chords stay bound as silent aliases
+    /// (`1`–`9`, `+`), so the ⌘ chords stay bound as silent aliases
     /// that only Settings → Hotkeys lists. An action bound to ⌘ chords
     /// alone — a binding of the user's own — still shows them.
     pub fn shown_chords(&self, action: Action) -> Vec<KeyChord> {
@@ -1474,21 +1440,20 @@ mod tests {
     #[test]
     fn shown_chords_leave_the_cmd_aliases_out() {
         let mut map = Keymap::default();
-        let cmd_b = KeyChord::parse("cmd+b").unwrap();
+        let cmd_p = KeyChord::parse("cmd+p").unwrap();
         assert!(
-            map.chords(Action::ToggleSidebars).contains(&cmd_b),
+            map.chords(Action::ProjectDropdown).contains(&cmd_p),
             "still bound"
         );
         assert_eq!(
-            map.lookup(Scope::Global, &cmd_b),
-            Some(Action::ToggleSidebars),
+            map.lookup(Scope::Global, &cmd_p),
+            Some(Action::ProjectDropdown),
             "and still answers"
         );
         assert!(
-            map.label(Action::ToggleSidebars).contains('⌘'),
+            map.label(Action::ProjectDropdown).contains('⌘'),
             "Hotkeys lists it"
         );
-        assert!(!map.shown_label(Action::ToggleSidebars).contains('⌘'));
         assert!(!map.shown_label(Action::ProjectDropdown).contains('⌘'));
         assert_eq!(map.shown_label(Action::ProjectDropdown), "+");
         for n in 1..=9u8 {
@@ -1608,16 +1573,11 @@ mod tests {
 
     #[test]
     fn every_action_ships_with_a_reachable_chord() {
-        // Some defaults are deliberately iffy (^→ fights Mission Control,
-        // ^] is a fallback hatch), but no action may be *only* reachable
-        // through a chord the host terminal is likely to eat.
+        // Some defaults are deliberately iffy (^] is a fallback hatch, ⌘P
+        // an alias), but no action may be *only* reachable through a chord
+        // the host terminal is likely to eat.
         let map = Keymap::default();
         for (i, spec) in ACTIONS.iter().enumerate() {
-            // focus_terminal is the one exception: ^→ is its only binding,
-            // and Tab cycling round to the pane covers the same ground.
-            if spec.action == Action::FocusTerminal {
-                continue;
-            }
             assert!(
                 map.chords_at(i).iter().any(|c| host_warning(c).0.is_fine()),
                 "{} has no chord a stock terminal delivers",

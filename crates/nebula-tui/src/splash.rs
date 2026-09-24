@@ -226,6 +226,24 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         }
         hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
         hint.extend(key("?", "help"));
+    } else if app.projects_closed {
+        // Every tab closed: the projects are all still there, so `+`
+        // lists them; Enter still opens the repo nebula was started in.
+        let here = app.launch_repo.as_deref().and_then(|path| {
+            app.tree
+                .project_at_path(path)
+                .map(|p| p.name.clone())
+                .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        });
+        if let Some(name) = here {
+            hint.extend(key("Enter", &format!("open {name}")));
+            hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
+        }
+        hint.extend(key("+", "your projects"));
+        hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
+        hint.extend(key("o", "another folder"));
+        hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
+        hint.extend(key("?", "help"));
     }
     lines.push(Line::from(hint));
 

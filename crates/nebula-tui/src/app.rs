@@ -2788,6 +2788,10 @@ pub struct UiState {
     /// absent in older blobs, which open with the one project restored.
     #[serde(default)]
     pub launcher_tabs: Vec<String>,
+    /// Every PROJECT TAB was closed ([`App::projects_closed`]): the next
+    /// start opens on the splash too. Absent in older blobs.
+    #[serde(default)]
+    pub projects_closed: bool,
 }
 
 /// A mouse selection over the terminal pane (drag or double-click word),
@@ -3266,6 +3270,13 @@ pub struct App {
     /// one at a time by `event_loop::launcher::close_tab`, and remembered
     /// across restarts.
     pub launcher_tabs: Vec<ProjectId>,
+    /// Every PROJECT TAB has been closed: nebula is back on the SPLASH it
+    /// opens on before there is any project, with the projects themselves
+    /// and their sessions untouched. Set by closing the last tab
+    /// (`event_loop::launcher::close_tab`); any way into a project — the
+    /// splash's Enter, `+`, `o`, `/` — clears it
+    /// ([`App::reopen_projects`]). Remembered across restarts.
+    pub projects_closed: bool,
     /// The PROJECT TABS have the keyboard, and this is the tab their
     /// cursor is on: `k`,`k` (↑,↑) on the GRID's top row walks up into the
     /// header (`event_loop::launcher::focus_tabs`), `h` / `l` move this
@@ -3725,6 +3736,7 @@ impl App {
             hover_launcher_pane: false,
             hover_crumb: None,
             launcher_tabs: Vec::new(),
+            projects_closed: false,
             launcher_tab_cursor: None,
             launch_repo: None,
             launcher_body: Rect::default(),
@@ -3887,10 +3899,21 @@ impl App {
     }
 
     /// The LAUNCHER VIEW is what the body draws — which is nebula's only
-    /// view — once this machine knows a project. With none at all (a
-    /// first run) the splash's "open a project" comes first.
+    /// view — once this machine knows a project and one is open. With none
+    /// at all (a first run), or every tab closed ([`App::projects_closed`]),
+    /// the splash's "open a project" comes first.
     pub fn launcher_active(&self) -> bool {
-        self.tree.has_projects()
+        self.tree.has_projects() && !self.projects_closed
+    }
+
+    /// A project is being opened: out of the all-tabs-closed SPLASH and
+    /// back onto the grid. Run by every move that selects a project, so
+    /// the flag never outlives the first project landed on.
+    pub fn reopen_projects(&mut self) {
+        if self.projects_closed {
+            self.projects_closed = false;
+            self.dirty = true;
+        }
     }
 
     /// Keep the PROJECT TABS true to the tree: a tab whose project is gone
@@ -3915,6 +3938,11 @@ impl App {
             self.launcher_tab_cursor = None;
             self.dirty = true;
         }
+        // Every tab closed: the selection stays where it was under the
+        // splash, and gets no tab back until a project is opened.
+        if self.projects_closed {
+            return;
+        }
         let Some(id) = self.selected_project().map(|p| p.id.clone()) else {
             return;
         };
@@ -3938,6 +3966,7 @@ impl App {
         {
             return;
         }
+        self.reopen_projects();
         self.launcher_tabs.retain(|id| id != project);
         self.launcher_tabs.insert(0, project.clone());
         self.dirty = true;
@@ -4034,7 +4063,7 @@ impl App {
     /// it's animating or drawn as a still frame, so the footer can key its
     /// hints off it.
     pub fn splash_showing(&self) -> bool {
-        !self.collapsed && !self.tree.has_projects()
+        !self.collapsed && !self.launcher_active()
     }
 
     /// The animated splash is on screen and should be ticking: nothing in
