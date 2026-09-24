@@ -323,14 +323,14 @@ fn add_project(tui: &mut TuiHarness, path: &Path, expect_name: &str) {
     tui.wait_for_text(expect_name);
 }
 
-/// The project's own menu, where its verbs live: Esc lets the card under
-/// the cursor go, and `m` with nothing selected is the project's menu.
-/// The pause keeps the two keys apart — an ESC with a letter hard behind
-/// it in the same read parses as Alt+letter.
-fn open_project_menu(tui: &mut TuiHarness) {
-    tui.send(ESC);
-    std::thread::sleep(Duration::from_millis(150));
-    tui.send(b"m");
+/// The project's own menu, where its verbs live: a right-click on its
+/// PROJECT TAB, which reads `tab` — the header is the top of the screen,
+/// so the first place it appears is the tab.
+fn open_project_menu(tui: &mut TuiHarness, tab: &str) {
+    let at = find_text(tui.parser.lock().unwrap().screen(), tab);
+    let (row, col) = at.unwrap_or_else(|| panic!("no {tab:?} tab:\n{}", tui.screen_text()));
+    tui.send(&sgr_mouse(2, col, row, false));
+    tui.send(&sgr_mouse(2, col, row, true));
     tui.wait_for_text(PROJECT_MENU_ROW);
 }
 
@@ -455,7 +455,7 @@ fn tui_project_rename_shows_the_folder_and_empty_undoes_it() {
     add_project(&mut tui, &repo, "acme-repo");
 
     // ---- rename: the tab takes the label ----
-    open_project_menu(&mut tui);
+    open_project_menu(&mut tui, "acme-repo");
     choose_menu_row(&mut tui, "Rename");
     tui.wait_for_text("Rename project");
     // The field is prefilled with the current name; clear it first.
@@ -466,7 +466,7 @@ fn tui_project_rename_shows_the_folder_and_empty_undoes_it() {
     tui.wait_for_text("Acme API");
 
     // ---- undo: an empty name puts the tab back on the folder name ----
-    open_project_menu(&mut tui);
+    open_project_menu(&mut tui, "Acme API");
     choose_menu_row(&mut tui, "Rename");
     tui.wait_for_text("Rename project");
     tui.send(b"\x15"); // ^u clears the prefill

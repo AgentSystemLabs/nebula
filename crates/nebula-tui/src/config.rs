@@ -364,7 +364,6 @@ pub struct SettingsTab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKind {
     PaletteEnterAttaches,
-    GitInitOnCreate,
     WorktreeBaseBranch,
     Editor,
     CloseFinderOnOpen,
@@ -375,20 +374,18 @@ pub enum SettingKind {
     DoneSound,
     FeedbackSound,
     PresetText,
+    DeleteEmptyWorktree,
     Theme,
     Animations,
     BlackBackground,
     SessionPane,
     HideDraftPrs,
-    CardLineChanges,
     QuickPromptKind,
     QuickPromptFocus,
     QuickPromptNewWorktree,
     RunCommand,
     OpenCommand,
-    ShowKeyCombos,
     RememberHarness,
-    PrIssueCounts,
     HideUninstalledHarnesses,
 }
 
@@ -447,12 +444,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::PaletteEnterAttaches,
                 label: "Search Enter attaches",
                 hint: "Enter in / search opens the session in the terminal (a red one always does)",
-                group: "",
-            },
-            SettingSpec {
-                kind: SettingKind::GitInitOnCreate,
-                label: "git init new projects",
-                hint: "When adding a missing directory, run git init in it",
                 group: "",
             },
             SettingSpec {
@@ -520,6 +511,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 hint: "Where a new agent preset's text goes: a prefix before the task, a postfix after it, or both (its Text row can change one)",
                 group: "",
             },
+            SettingSpec {
+                kind: SettingKind::DeleteEmptyWorktree,
+                label: "Delete emptied worktree",
+                hint: "Deleting a worktree's last session or terminal deletes the worktree with it, no question asked (off = that delete's confirm asks first)",
+                group: "",
+            },
         ]),
     },
     SettingsTab {
@@ -555,12 +552,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 hint: "Show or hide drafts in the OPEN PRS group and / search; checkouts always stay",
                 group: "",
             },
-            SettingSpec {
-                kind: SettingKind::CardLineChanges,
-                label: "Card line counts",
-                hint: "Follow each card's changed-file count with its lines, +3 files +120 -45 in green and red",
-                group: "",
-            },
         ]),
     },
     // Generated from the harness registry: the static quick-prompt head
@@ -592,28 +583,16 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             },
         ]),
     },
-    // Behaviors that change how the tree is worked, off by default (PR &
-    // ISSUE COUNTS excepted) until they have earned a tab of their own. Before Hotkeys, which stays
-    // last for the reason above.
+    // Behaviors that change how the tree is worked, off by default until
+    // they have earned a tab of their own. Before Hotkeys, which stays last
+    // for the reason above.
     SettingsTab {
         title: "Experimental",
         body: TabBody::Values(&[
             SettingSpec {
-                kind: SettingKind::ShowKeyCombos,
-                label: "Key combo display",
-                hint: "Spell each key you press bottom-left with what it did, for anyone watching",
-                group: "",
-            },
-            SettingSpec {
                 kind: SettingKind::RememberHarness,
                 label: "Remember harness",
                 hint: "A harness (and model) picked for a session becomes the Agents tab default the next launch starts on",
-                group: "",
-            },
-            SettingSpec {
-                kind: SettingKind::PrIssueCounts,
-                label: "PR & issue counts",
-                hint: "Count each project's open pull requests and issues after its name, 3 prs · 2 issues",
                 group: "",
             },
         ]),
@@ -813,9 +792,15 @@ pub struct Config {
     /// FEEDBACK, the red row, which always attaches. Ctrl+O / Ctrl+F
     /// always pick open / focus explicitly, regardless of this setting.
     pub palette_enter_attaches: bool,
-    /// Run `git init` after AddProject creates a missing directory.
-    /// Owned by the daemon; the TUI writes it so the settings overlay can
-    /// toggle every key in the shared file.
+    /// RETIRED with every project a git repository. Through 0.37 the
+    /// daemon-owned **git init new projects** SETTING (Settings → General,
+    /// on by default) could leave a directory the open-project prompt
+    /// created without a repository, which then failed to open. The
+    /// daemon now always runs `git init` in a folder the user confirmed —
+    /// a new one, or an existing one outside any repository — so no tab
+    /// shows the row and nothing reads it. Still loaded and written back
+    /// as stored, so an older build sharing the file keeps the choice its
+    /// user made.
     pub git_init_on_create: bool,
     /// The branch every new WORKTREE nobody named a base for starts from
     /// (`n` in the WORKTREES PANEL, a bare `nebula worktree`, the QUICK
@@ -885,6 +870,17 @@ pub struct Config {
     /// by [`Config::preset_text`]; `prefix` by default, the framing most
     /// people reach for and one box to fill.
     pub preset_text: String,
+    /// DELETE EMPTIED WORKTREE: what the delete of a linked worktree's
+    /// last live card asks — its last session's `d`, its last terminal's
+    /// close, or a `D` that takes them all. Off (the default), the card's
+    /// own CONFIRM DIALOG carries the question too, before anything is
+    /// deleted: `Enter`/`y` deletes the card and then the worktree, `n`
+    /// the card alone, `Esc` nothing. On, the question is skipped and the
+    /// card's ordinary confirm deletes both — as long as no archived
+    /// session is still filed under the checkout: those hold history the
+    /// delete would take, so they always get the question. The ROOT
+    /// WORKTREE is never offered, whatever this says.
+    pub delete_empty_worktree: bool,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -917,12 +913,12 @@ pub struct Config {
     /// the SESSIONS PANEL — those describe work you have, not work you are
     /// browsing. Off by default: a config predating the key hides nothing.
     pub hide_draft_prs: bool,
-    /// CARD LINE COUNTS: each LAUNCHER VIEW card follows its checkout's
-    /// changed-file count with the lines behind it — `+3 files +120 -45`,
-    /// the added in the DIFF VIEWER's green and the removed in its red —
-    /// read by a `git diff --numstat` beside every `git status` the count
-    /// already runs, which only happens while this is on. Off by default:
-    /// the file count alone is what a card has always said.
+    /// RETIRED with the line counts always drawn. Through 0.37 the **Card
+    /// line counts** SETTING (Settings → Appearance, off by default)
+    /// switched each card's `+3 files` to `+3 files +120 -45`. Every card
+    /// counts its lines now, whatever this says, so no tab shows the row
+    /// and nothing reads it. Still loaded and written back as stored, so
+    /// an older build sharing the file keeps the choice its user made.
     pub card_line_changes: bool,
     /// The key of the **Skip starting prompt** SETTING (Settings →
     /// Sessions, through 0.30): on, `n` created the session straight from
@@ -989,6 +985,15 @@ pub struct Config {
     /// RETIRED with `recent_prompts`: how many prompts that build listed
     /// (`1` to `5` in its overlay). Loaded and written back as stored.
     pub recent_prompts_count: usize,
+    /// RETIRED with the KEY COMBO DISPLAY always on. Through 0.37 the
+    /// **Key combo display** SETTING (Settings → Experimental) switched
+    /// the readout — each key pressed spelled at the bottom left of the
+    /// screen with what it did, `j - Move down` — on, off by default.
+    /// Every key shows now, whatever this says (`key_combo.rs`), so no
+    /// tab shows the row and nothing reads it. Still loaded and written
+    /// back as stored, so an older build sharing the file keeps the
+    /// choice its user made.
+    pub show_key_combos: bool,
     /// PROJECT SETTINGS: one [`ProjectSettings`] per project set up
     /// differently from the rest, keyed by the project's repo path as the
     /// DAEMON stores it — what the Settings → Project tab edits for the
@@ -999,13 +1004,6 @@ pub struct Config {
     /// rules: a value in here this build can't read costs the whole map,
     /// not one project.
     pub projects: BTreeMap<PathBuf, ProjectSettings>,
-    /// Experimental: the KEY COMBO DISPLAY — each key pressed in the
-    /// panels spelled at the bottom left of the screen with what it did
-    /// (`j - Move down`), vim's `showcmd` for people watching a screen
-    /// share learn the shortcuts. Keys typed into a LOCKED PANE or an
-    /// overlay's text field never show. Off by default: it is a teaching
-    /// aid, and a row of chrome nobody asked for otherwise.
-    pub show_key_combos: bool,
     /// Experimental: REMEMBER HARNESS — a launch walked through the NEW
     /// SESSION PICKER, the PR SESSION picker or the QUICK PROMPT's `Tab`
     /// picker writes its harness into `quick_prompt_kind`, and a model or
@@ -1014,16 +1012,14 @@ pub struct Config {
     /// ([`Config::remember_launch`]). Off by default: a pick is one
     /// session's, and the AGENTS TAB is where the defaults are set.
     pub remember_harness: bool,
-    /// Experimental: PR & ISSUE COUNTS — each PROJECTS PANEL row counts
-    /// the repo's open pull requests and issues after its name (`3 prs ·
-    /// 2 issues`), so what is waiting on a repo reads off the column
-    /// without visiting it. The pull requests are the lists the OPEN PRS
-    /// sweep already keeps warm for every project; the issues take a
-    /// sweep of their own (`issues::sweep_others`), one project per tick,
-    /// that only runs while this is on. On by default — the sweep is one
-    /// `gh issue list` per project every five minutes, well inside the
-    /// budget — and the one Experimental switch that is; off, the rows
-    /// are what they were and no project but the selected one is asked.
+    /// RETIRED with the counts always drawn. Through 0.37 the **PR & issue
+    /// counts** SETTING (Settings → Experimental, on by default) switched
+    /// the GRID header's `3 prs · 2 issues` off, and with it the issue
+    /// sweep over the other projects. The header always counts now — what
+    /// is waiting on a repo is the one thing the grid must say — so no tab
+    /// shows the row and nothing reads it. Still loaded and written back
+    /// as stored, so an older build sharing the file keeps the choice its
+    /// user made.
     pub pr_issue_counts: bool,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
@@ -1216,6 +1212,7 @@ impl Default for Config {
             done_sound: "Glass".into(),
             feedback_sound: "Sosumi".into(),
             preset_text: PresetText::DEFAULT.as_str().into(),
+            delete_empty_worktree: false,
             theme: "default".into(),
             animations: true,
             black_background: true,
@@ -1981,7 +1978,6 @@ impl Config {
     pub fn value_label(&self, kind: SettingKind) -> String {
         match kind {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
-            SettingKind::GitInitOnCreate => on_off(self.git_init_on_create).into(),
             SettingKind::WorktreeBaseBranch => match self.worktree_base_branch.trim() {
                 "" => AUTO_CHOICE.into(),
                 name => name.to_string(),
@@ -1995,20 +1991,18 @@ impl Config {
             SettingKind::DoneSound => self.done_sound.clone(),
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::PresetText => self.preset_text().as_str().into(),
+            SettingKind::DeleteEmptyWorktree => on_off(self.delete_empty_worktree).into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::BlackBackground => on_off(self.black_background).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
-            SettingKind::CardLineChanges => on_off(self.card_line_changes).into(),
             // A project row with no project to speak of: what one without
             // an entry would show.
             SettingKind::RunCommand | SettingKind::OpenCommand => {
                 ProjectSettings::default().value_label(kind)
             }
-            SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
             SettingKind::RememberHarness => on_off(self.remember_harness).into(),
-            SettingKind::PrIssueCounts => on_off(self.pr_issue_counts).into(),
             SettingKind::HideUninstalledHarnesses => on_off(self.hide_uninstalled_harnesses).into(),
             SettingKind::QuickPromptKind => self.quick_prompt_kind.clone(),
             SettingKind::QuickPromptFocus => on_off(self.quick_prompt_focus).into(),
@@ -2045,9 +2039,6 @@ impl Config {
             SettingKind::PaletteEnterAttaches => {
                 self.palette_enter_attaches = !self.palette_enter_attaches;
             }
-            SettingKind::GitInitOnCreate => {
-                self.git_init_on_create = !self.git_init_on_create;
-            }
             // Typed, not cycled: see `SettingKind::is_text` / `set_text`.
             SettingKind::WorktreeBaseBranch => {}
             SettingKind::Editor => {
@@ -2081,6 +2072,9 @@ impl Config {
                 self.preset_text =
                     cycle_choice(self.preset_text().as_str(), PRESET_TEXTS, step).into();
             }
+            SettingKind::DeleteEmptyWorktree => {
+                self.delete_empty_worktree = !self.delete_empty_worktree;
+            }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
             }
@@ -2099,19 +2093,10 @@ impl Config {
             SettingKind::HideDraftPrs => {
                 self.hide_draft_prs = !self.hide_draft_prs;
             }
-            SettingKind::CardLineChanges => {
-                self.card_line_changes = !self.card_line_changes;
-            }
             // One project's, not the file's, and typed: see `set_project_text`.
             SettingKind::RunCommand | SettingKind::OpenCommand => {}
-            SettingKind::ShowKeyCombos => {
-                self.show_key_combos = !self.show_key_combos;
-            }
             SettingKind::RememberHarness => {
                 self.remember_harness = !self.remember_harness;
-            }
-            SettingKind::PrIssueCounts => {
-                self.pr_issue_counts = !self.pr_issue_counts;
             }
             SettingKind::HideUninstalledHarnesses => {
                 self.hide_uninstalled_harnesses = !self.hide_uninstalled_harnesses;
@@ -2693,30 +2678,27 @@ mod tests {
         let path = dir.path().join("config.json");
         std::fs::write(
             &path,
-            r#"{"theme": "ocean", "card_line_changes": "auto", "animations": false}"#,
+            r#"{"theme": "ocean", "hide_draft_prs": "auto", "animations": false}"#,
         )
         .unwrap();
         let mut cfg = load_from(&path);
         assert_eq!(cfg.theme, "ocean");
         assert!(!cfg.animations);
-        assert!(!cfg.card_line_changes);
-        assert_eq!(
-            cfg.skipped,
-            BTreeSet::from(["card_line_changes".to_string()])
-        );
+        assert!(!cfg.hide_draft_prs);
+        assert_eq!(cfg.skipped, BTreeSet::from(["hide_draft_prs".to_string()]));
 
         cfg.black_background = false;
         cfg.save_to(&path).unwrap();
         let saved = read_json_file(&path);
-        assert_eq!(saved["card_line_changes"], "auto", "left as stored");
+        assert_eq!(saved["hide_draft_prs"], "auto", "left as stored");
         assert_eq!(saved["black_background"], false);
         assert_eq!(saved["theme"], "ocean");
 
-        let (t, r) = locate(SettingKind::CardLineChanges).unwrap();
+        let (t, r) = locate(SettingKind::HideDraftPrs).unwrap();
         cfg.cycle(t, r, 1);
         cfg.save_to(&path).unwrap();
         assert_eq!(
-            read_json_file(&path)["card_line_changes"],
+            read_json_file(&path)["hide_draft_prs"],
             true,
             "changing it here is a real edit"
         );
@@ -2802,8 +2784,8 @@ mod tests {
         assert!(!load_from(&path).close_finder_on_open);
     }
 
-    /// The two prewarm keys are daemon-owned but overlay-toggled, like
-    /// `git_init_on_create`: on by default, a missing key reads as on, and
+    /// The two prewarm keys are daemon-owned but overlay-toggled: on by
+    /// default, a missing key reads as on, and
     /// the Sessions-tab rows round-trip through the saved file.
     #[test]
     fn prewarm_toggles_default_on_and_round_trip() {
@@ -2886,11 +2868,25 @@ mod tests {
         });
     }
 
+    /// GIT INIT NEW PROJECTS: retired with every project a repository.
+    /// No tab shows the row; the key still loads and is written back as
+    /// stored for an older daemon sharing the file.
     #[test]
-    fn daemon_fields_are_ignored() {
-        let cfg: Config = serde_json::from_str(r#"{"git_init_on_create": false}"#).unwrap();
+    fn git_init_on_create_is_retired_but_still_round_trips() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|r| r.label != "git init new projects")
+            }
+            _ => true,
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"git_init_on_create": false}"#).unwrap();
+        let cfg = load_from(&path);
         assert!(cfg.palette_enter_attaches);
         assert!(!cfg.git_init_on_create);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(read_json_file(&path)["git_init_on_create"], false);
     }
 
     #[test]
@@ -2907,7 +2903,7 @@ mod tests {
         let (tab, row) = locate(SettingKind::WorktreeBaseBranch).unwrap();
         assert_eq!(
             SETTINGS_TABS[tab].title, "General",
-            "sits beside git init new projects"
+            "sits on the General tab"
         );
         // Enter / ←/→ on a typed row change nothing; the prompt does.
         let mut cfg = Config::default();
@@ -3075,6 +3071,28 @@ mod tests {
         assert_eq!(cfg.session_idle_timeout, "1m");
     }
 
+    /// DELETE EMPTIED WORKTREE starts off — the last card's delete asks
+    /// before the checkout goes — sits on the Sessions tab, toggles like
+    /// any bool, and a config predating the key reads as off.
+    #[test]
+    fn delete_empty_worktree_is_off_by_default_and_toggles() {
+        let mut cfg = Config::default();
+        assert!(!cfg.delete_empty_worktree);
+        let (tab, row) = locate(SettingKind::DeleteEmptyWorktree).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        assert_eq!(cfg.value_label(SettingKind::DeleteEmptyWorktree), "off");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.delete_empty_worktree);
+        assert_eq!(cfg.value_label(SettingKind::DeleteEmptyWorktree), "on");
+        cfg.cycle(tab, row, -1);
+        assert!(!cfg.delete_empty_worktree, "←/→ toggle it like Enter does");
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.delete_empty_worktree, "a missing key reads as off");
+        let cfg: Config = serde_json::from_str(r#"{"delete_empty_worktree": true}"#).unwrap();
+        assert!(cfg.delete_empty_worktree);
+    }
+
     #[test]
     fn editor_defaults_cycles_and_persists() {
         let mut cfg = Config::default();
@@ -3189,33 +3207,40 @@ mod tests {
         assert!(!legacy.hide_draft_prs);
     }
 
-    /// CARD LINE COUNTS: an Appearance row, off by default so a config that
-    /// predates the key keeps its cards as they were, persisted under
-    /// `card_line_changes`.
+    /// CARD LINE COUNTS: retired with every card counting its lines. The
+    /// key an older build wrote (`card_line_changes`, off by default) still
+    /// loads to what it wrote and is written back as stored, but no tab
+    /// shows it any more — Appearance ends on DRAFT PULL REQUESTS.
     #[test]
-    fn card_line_counts_default_off_toggle_on_the_appearance_tab_and_persist() {
-        let mut cfg = Config::default();
+    fn card_line_counts_is_retired_but_still_round_trips() {
         assert!(
-            !cfg.card_line_changes,
-            "cards count files alone until asked"
+            !Config::default().card_line_changes,
+            "the default an older build reads"
         );
-        assert_eq!(cfg.value_label(SettingKind::CardLineChanges), "off");
-
-        let (tab, row) = locate(SettingKind::CardLineChanges).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.card_line_changes);
-        assert_eq!(cfg.value_label(SettingKind::CardLineChanges), "on");
+        let cfg: Config = serde_json::from_str(r#"{"card_line_changes": true}"#).unwrap();
+        assert!(cfg.card_line_changes, "loaded to what an older build wrote");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains(r#""card_line_changes": true"#), "{raw}");
-        assert!(load_from(&path).card_line_changes);
+        assert!(load_from(&path).card_line_changes, "written back as stored");
 
-        let legacy: Config = serde_json::from_str("{}").unwrap();
-        assert!(!legacy.card_line_changes);
+        let appearance = SETTINGS_TABS
+            .iter()
+            .position(|t| t.title == "Appearance")
+            .unwrap();
+        let TabBody::Values(rows) = SETTINGS_TABS[appearance].body else {
+            panic!("Appearance lists switches");
+        };
+        assert!(
+            rows.iter().all(|r| r.label != "Card line counts"),
+            "no row edits it"
+        );
+        assert_eq!(
+            rows.last().map(|r| r.kind),
+            Some(SettingKind::HideDraftPrs),
+            "Appearance ends on DRAFT PULL REQUESTS"
+        );
     }
 
     /// The BLACK BACKGROUND: on out of the box, toggled off from its
@@ -3490,33 +3515,35 @@ mod tests {
         }
     }
 
-    /// The KEY COMBO DISPLAY: an Experimental switch, off by default, a
-    /// plain toggle persisted under `show_key_combos`, unknown to a config
-    /// written before it (which reads as off).
+    /// The KEY COMBO DISPLAY is always on now, so **Key combo display**
+    /// has no row to be edited on — but the key an earlier release wrote
+    /// still loads, and is written back unchanged for the older builds
+    /// that read it.
     #[test]
-    fn key_combo_display_is_off_by_default_on_the_experimental_tab_and_persists() {
-        let mut cfg = Config::default();
-        assert!(!cfg.show_key_combos, "a teaching aid nobody asked for yet");
-        assert_eq!(cfg.value_label(SettingKind::ShowKeyCombos), "off");
-
-        let (tab, row) = locate(SettingKind::ShowKeyCombos).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
-        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.show_key_combos);
-        assert_eq!(cfg.value_label(SettingKind::ShowKeyCombos), "on");
-        cfg.cycle(tab, row, 1);
-        assert!(!cfg.show_key_combos, "either arrow toggles it back");
-        cfg.cycle(tab, row, -1);
-        assert!(cfg.show_key_combos);
+    fn show_key_combos_has_no_row_and_is_written_back_for_older_builds() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|row| row.label != "Key combo display")
+            }
+            TabBody::Hotkeys | TabBody::Agents => true,
+        }));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"show_key_combos": true}"#).unwrap();
+        let mut cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(cfg.show_key_combos);
+
+        cfg.remember_harness = true;
         cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).show_key_combos);
+        assert_eq!(read_json_file(&path)["show_key_combos"], true);
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(!cfg.show_key_combos);
+        assert!(
+            !cfg.show_key_combos,
+            "unknown to a config written before it"
+        );
     }
 
     /// REMEMBER HARNESS: an Experimental switch, off by default, a plain
@@ -3536,11 +3563,9 @@ mod tests {
         let (tab, row) = locate(SettingKind::RememberHarness).unwrap();
         assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
         assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
-        let (combo_tab, combo_row) = locate(SettingKind::ShowKeyCombos).unwrap();
         assert_eq!(
-            (combo_tab, combo_row + 1),
-            (tab, row),
-            "the newest switch sits last"
+            row, 0,
+            "the tab's first row, the KEY COMBO DISPLAY being always on"
         );
         cfg.cycle(tab, row, 0);
         assert!(cfg.remember_harness);
@@ -3625,43 +3650,37 @@ mod tests {
         );
     }
 
-    /// PR & ISSUE COUNTS: an Experimental switch, on by default — the one
-    /// on the tab that is — a plain toggle persisted under
-    /// `pr_issue_counts`, unknown to a config written before it (which
-    /// reads as on). The newest switch, so it sits last on the tab, under
-    /// REMEMBER HARNESS.
+    /// PR & ISSUE COUNTS: retired with the header always counting. The
+    /// key an older build wrote (`pr_issue_counts`, on by default) still
+    /// loads to what it wrote and is written back as stored, but no tab
+    /// shows it any more — Experimental ends on REMEMBER HARNESS.
     #[test]
-    fn pr_issue_counts_is_on_by_default_on_the_experimental_tab_and_persists() {
-        let mut cfg = Config::default();
-        assert!(cfg.pr_issue_counts, "the rows count out of the box");
-        assert_eq!(cfg.value_label(SettingKind::PrIssueCounts), "on");
-
-        let (tab, row) = locate(SettingKind::PrIssueCounts).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
-        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
-        let (harness_tab, harness_row) = locate(SettingKind::RememberHarness).unwrap();
-        assert_eq!(
-            (harness_tab, harness_row + 1),
-            (tab, row),
-            "the newest switch sits last"
-        );
-        cfg.cycle(tab, row, 0);
-        assert!(!cfg.pr_issue_counts);
-        assert_eq!(cfg.value_label(SettingKind::PrIssueCounts), "off");
-        cfg.cycle(tab, row, 1);
-        assert!(cfg.pr_issue_counts, "either arrow toggles it back");
-        cfg.cycle(tab, row, -1);
-        assert!(!cfg.pr_issue_counts);
+    fn pr_issue_counts_is_retired_but_still_round_trips() {
+        let cfg = Config::default();
+        assert!(cfg.pr_issue_counts, "the default an older build reads");
+        let cfg: Config = serde_json::from_str(r#"{"pr_issue_counts": false}"#).unwrap();
+        assert!(!cfg.pr_issue_counts, "loaded to what an older build wrote");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        assert!(!load_from(&path).pr_issue_counts, "off survives a save");
+        assert!(!load_from(&path).pr_issue_counts, "written back as stored");
 
-        let cfg: Config = serde_json::from_str("{}").unwrap();
+        let experimental = SETTINGS_TABS
+            .iter()
+            .position(|t| t.title == "Experimental")
+            .unwrap();
+        let TabBody::Values(rows) = SETTINGS_TABS[experimental].body else {
+            panic!("Experimental lists switches");
+        };
         assert!(
-            cfg.pr_issue_counts,
-            "a config from before the key reads as on"
+            rows.iter().all(|r| r.label != "PR & issue counts"),
+            "no row edits it"
+        );
+        assert_eq!(
+            rows.last().map(|r| r.kind),
+            Some(SettingKind::RememberHarness),
+            "Experimental ends on REMEMBER HARNESS again"
         );
     }
 

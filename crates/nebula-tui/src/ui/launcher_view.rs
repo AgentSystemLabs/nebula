@@ -3992,10 +3992,10 @@ mod tests {
         assert_eq!(fill(&app, false, true), Color::Reset);
     }
 
-    /// CARD LINE COUNTS: with the setting on, the lines behind the file
-    /// count follow it on the band's rule in the DIFF VIEWER's green and
-    /// red — `+3 files +120 -45` — and yield after the word and before the
-    /// branch as the rule narrows. Off, the rule says the files alone.
+    /// CARD LINE COUNTS: the lines behind the file count always follow it
+    /// on the band's rule in the DIFF VIEWER's green and red — `+3 files
+    /// +120 -45` — and yield after the word and before the branch as the
+    /// rule narrows.
     #[test]
     fn card_line_counts_follow_the_file_count_in_green_and_red() {
         use nebula_core::WorktreeId;
@@ -4023,11 +4023,6 @@ mod tests {
             )
         };
 
-        let (text, _, added, removed) = rule(&app, 60);
-        assert!(!text.contains("+120"), "off: {text:?}");
-        assert_eq!((added.trim(), removed.trim()), ("", ""));
-
-        app.card_line_changes = true;
         let (text, warn, added, removed) = rule(&app, 60);
         assert!(text.contains("↳ feat-x +3 files +120 -45"), "{text:?}");
         assert_eq!(warn.trim(), "+3 files");

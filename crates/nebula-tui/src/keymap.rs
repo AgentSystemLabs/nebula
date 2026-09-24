@@ -81,11 +81,13 @@ pub enum Action {
     /// started from, in the browser. `i` lists the project's issues in
     /// nebula; the shifted key goes to GitHub.
     OpenIssue,
-    /// `Shift+C`: a new Ghostty tab in the selected worktree's directory —
-    /// a silent no-op on a machine without Ghostty.
+    /// `Shift+T`: a terminal *outside* nebula — a new Ghostty tab in the
+    /// selected worktree's directory, where `t` opens one inside nebula; a
+    /// silent no-op on a machine without Ghostty.
     OpenGhosttyTab,
-    /// `Shift+R`: ask GitHub for the pull requests again now, past every
-    /// timer — the open list, the worktree's PR, the one the pane is reading.
+    /// `Shift+R`: reload from GitHub now, past every timer — the project's
+    /// open pull requests and issues, the worktree's PR, the one the pane
+    /// is reading.
     RefreshPullRequests,
     /// `y`: reply — the COMMENT BOX on the pull request under the cursor,
     /// posted to GitHub with `gh pr comment` on Enter.
@@ -116,7 +118,6 @@ pub enum Action {
     Archive,
     Unarchive,
     ToggleArchived,
-    ContextMenu,
     Delete,
     DeleteAll,
     /// The AGENT PRESETS list: saved launch definitions for the SESSIONS PANEL.
@@ -189,7 +190,9 @@ macro_rules! project_tab_slot {
             hint: "Launcher view: open the project on that tab of the header, counting from the left (⌘N only in emulators that send ⌘)",
             group: "NAVIGATE",
             scope: Scope::Global,
-            defaults: &[$cmd, $digit],
+            // The digit first: it arrives everywhere, and ⌘N is a silent
+            // alias Help and the footer leave out (`shown_chords`).
+            defaults: &[$digit, $cmd],
         }
     };
 }
@@ -366,8 +369,8 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         action: Action::AddProject,
         id: "add_project",
-        label: "Add project",
-        hint: "Add a project from anywhere (unlike New, never changes meaning)",
+        label: "Open a folder as a project",
+        hint: "Open a folder as a project in nebula, from anywhere (unlike New, never changes meaning); ⇧O opens a checkout outside it, in your editor",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["o"],
@@ -418,19 +421,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         defaults: &["shift+i"],
     },
     ActionSpec {
-        action: Action::OpenGhosttyTab,
-        id: "open_ghostty_tab",
-        label: "Open in Ghostty tab",
-        hint: "Open a new Ghostty tab in the selected worktree's directory; does nothing without Ghostty.app",
-        group: "PROJECTS & WORKTREES",
-        scope: Scope::Global,
-        defaults: &["shift+c"],
-    },
-    ActionSpec {
         action: Action::RefreshPullRequests,
         id: "refresh_pull_requests",
-        label: "Refresh pull requests",
-        hint: "Ask GitHub again now for the project's open PRs, the selected worktree's PR and the one the pane is reading",
+        label: "Reload from GitHub",
+        hint: "Ask GitHub again now for the project's open pull requests and issues, the selected worktree's PR and the one the pane is reading",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["shift+r"],
@@ -474,8 +468,8 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         action: Action::OpenWorktree,
         id: "open_worktree",
-        label: "Open worktree",
-        hint: "Open the selected worktree: its project's Open command (Settings → Project), else .nebula.json \"open\" — e.g. open http://localhost:3000 (⇧Enter needs the kitty protocol; ⇧O arrives everywhere; ⌥Enter is the ESC CR that VS Code's Shift+Enter setup sends and tmux passes through)",
+        label: "Open checkout in editor",
+        hint: "Open the selected checkout outside nebula, usually in your editor: its project's Open command (Settings → Project), else .nebula.json \"open\" — e.g. open http://localhost:3000 (⇧Enter needs the kitty protocol; ⇧O arrives everywhere; ⌥Enter is the ESC CR that VS Code's Shift+Enter setup sends and tmux passes through)",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["shift+enter", "shift+o", "alt+enter"],
@@ -485,10 +479,20 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::NewTerminal,
         id: "new_terminal",
         label: "New shell terminal",
-        hint: "Spawn a plain shell in the selected worktree's directory",
+        hint: "Spawn a plain shell inside nebula, in the selected worktree's directory; ⇧T opens one outside it, in a Ghostty tab",
         group: "SESSIONS",
         scope: Scope::Global,
-        defaults: &["t", "shift+t"],
+        defaults: &["t"],
+    },
+    // `t`'s shift pair: the same terminal, outside nebula.
+    ActionSpec {
+        action: Action::OpenGhosttyTab,
+        id: "open_ghostty_tab",
+        label: "Terminal in a Ghostty tab",
+        hint: "Open a new Ghostty tab in the selected worktree's directory — t's terminal, outside nebula; does nothing without Ghostty.app",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["shift+t"],
     },
     ActionSpec {
         action: Action::Rename,
@@ -525,15 +529,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["shift+a"],
-    },
-    ActionSpec {
-        action: Action::ContextMenu,
-        id: "context_menu",
-        label: "Context menu",
-        hint: "Open the menu for the selected row (same as right-click)",
-        group: "SESSIONS",
-        scope: Scope::Global,
-        defaults: &["m"],
     },
     ActionSpec {
         action: Action::Delete,
@@ -1169,6 +1164,44 @@ impl Keymap {
         index_of(action).map_or_else(|| UNBOUND.into(), |i| self.display_at(i))
     }
 
+    /// The chords Help and the footer print for an action: every one it
+    /// answers to but the ⌘ ones. ⌘ never reaches nebula in Terminal.app
+    /// or `nebula browser`, and every ⌘ default has a plain key beside it
+    /// (`1`–`9`, `^b`, `+`), so the ⌘ chords stay bound as silent aliases
+    /// that only Settings → Hotkeys lists. An action bound to ⌘ chords
+    /// alone — a binding of the user's own — still shows them.
+    pub fn shown_chords(&self, action: Action) -> Vec<KeyChord> {
+        let all = self.chords(action);
+        let plain: Vec<KeyChord> = all
+            .iter()
+            .filter(|c| !c.mods.contains(KeyModifiers::SUPER))
+            .copied()
+            .collect();
+        if plain.is_empty() {
+            all.to_vec()
+        } else {
+            plain
+        }
+    }
+
+    /// [`Self::label`] without the ⌘ aliases ([`Self::shown_chords`]).
+    pub fn shown_label(&self, action: Action) -> String {
+        let chords = self.shown_chords(action);
+        if chords.is_empty() {
+            return UNBOUND.into();
+        }
+        chords
+            .iter()
+            .map(|c| c.display())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The first of [`Self::shown_chords`], for a footer hint.
+    pub fn shown_first(&self, action: Action) -> Option<KeyChord> {
+        self.shown_chords(action).first().copied()
+    }
+
     fn spec_list(&self, index: usize) -> String {
         self.binds[index]
             .iter()
@@ -1420,6 +1453,60 @@ mod tests {
         // Plain, kitty-free control bytes: every emulator delivers them.
         assert!(host_warning(&ctrl_d).0.is_fine());
         assert!(host_warning(&ctrl_u).0.is_fine());
+    }
+
+    /// `t` / `⇧T` is a SHIFT PAIR (#93): the lowercase key does it inside
+    /// nebula, the shifted one outside — a shell terminal in the pane, a
+    /// Ghostty tab. `⇧C`, the Ghostty tab's old key, is free.
+    #[test]
+    fn t_is_a_terminal_in_nebula_and_shift_t_one_in_ghostty() {
+        let map = Keymap::default();
+        let at = |spec: &str| map.lookup(Scope::Global, &KeyChord::parse(spec).unwrap());
+        assert_eq!(at("t"), Some(Action::NewTerminal));
+        assert_eq!(at("shift+t"), Some(Action::OpenGhosttyTab));
+        assert_eq!(at("shift+c"), None, "⇧C is free");
+        assert_eq!(map.label(Action::NewTerminal), "t");
+    }
+
+    /// Help and the footer leave the ⌘ aliases out: they are bound, and
+    /// Settings → Hotkeys lists them, but only the key that arrives in
+    /// every terminal is printed. A ⌘-only binding still shows.
+    #[test]
+    fn shown_chords_leave_the_cmd_aliases_out() {
+        let mut map = Keymap::default();
+        let cmd_b = KeyChord::parse("cmd+b").unwrap();
+        assert!(
+            map.chords(Action::ToggleSidebars).contains(&cmd_b),
+            "still bound"
+        );
+        assert_eq!(
+            map.lookup(Scope::Global, &cmd_b),
+            Some(Action::ToggleSidebars),
+            "and still answers"
+        );
+        assert!(
+            map.label(Action::ToggleSidebars).contains('⌘'),
+            "Hotkeys lists it"
+        );
+        assert!(!map.shown_label(Action::ToggleSidebars).contains('⌘'));
+        assert!(!map.shown_label(Action::ProjectDropdown).contains('⌘'));
+        assert_eq!(map.shown_label(Action::ProjectDropdown), "+");
+        for n in 1..=9u8 {
+            let action = Action::SelectProjectTab(n);
+            assert_eq!(map.shown_label(action), n.to_string());
+            assert_eq!(
+                map.first(action).map(|c| c.display()),
+                Some(n.to_string()),
+                "the digit leads the slot's defaults"
+            );
+        }
+        let help = index_of(Action::Help).unwrap();
+        map.bind(help, KeyChord::parse("cmd+k").unwrap(), false);
+        assert_eq!(map.shown_label(Action::Help), "⌘k", "⌘ alone still shows");
+        assert_eq!(
+            map.shown_first(Action::Help).map(|c| c.display()),
+            Some("⌘k".to_string())
+        );
     }
 
     #[test]

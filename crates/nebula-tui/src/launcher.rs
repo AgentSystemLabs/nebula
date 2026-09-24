@@ -1531,6 +1531,44 @@ pub fn project_of(app: &App, target: &QuickTarget) -> Option<ProjectId> {
     }
 }
 
+/// A fresh worktree for `launch` in `project`, on a branch nobody has
+/// yet: named after the issue for an ISSUE SESSION, the random name `n`
+/// would offer otherwise.
+pub fn fresh_worktree(
+    app: &App,
+    project: ProjectId,
+    launch: &crate::quick_prompt::QuickLaunch,
+) -> QuickTarget {
+    let taken = app.project_branches(&project);
+    let branch = match &launch.issue {
+        Some(issue) => crate::branch_name::issue_name(issue.number, &issue.title, &taken),
+        None => crate::branch_name::random_name(&taken),
+    };
+    QuickTarget::NewWorktree { project, branch }
+}
+
+/// Where `launch` lands with its NEW WORKTREE toggle flipped: a fresh
+/// worktree of the project it is aimed at, or — flipping off — an existing
+/// checkout of it, the one under the grid's cursor else the ROOT BRANCH
+/// ([`launch_checkout`]). The box's `^N` and the AGENT PRESETS list's
+/// `Tab` both flip through here. A PR SESSION's checkout is the DAEMON's
+/// to pick, so it has nothing to flip; the error says why for the footer.
+pub fn flipped_target(
+    app: &App,
+    launch: &crate::quick_prompt::QuickLaunch,
+) -> Result<QuickTarget, &'static str> {
+    if launch.pr.is_some() {
+        return Err("a PR session runs in the pull request's own checkout");
+    }
+    let project = project_of(app, &launch.target).ok_or("project no longer exists")?;
+    if !launch.is_new_worktree() {
+        return Ok(fresh_worktree(app, project, launch));
+    }
+    launch_checkout(app, &project)
+        .map(QuickTarget::Worktree)
+        .ok_or("no checkout to launch on — keeping the new worktree")
+}
+
 /// Is a launch into `project` a BACKGROUND LAUNCH — one that lands
 /// outside what the screen is showing? The grid is one project's, so a box re-aimed with `^P` starts its session in a list
 /// nobody is looking at, and that is the point: a prompt fired into

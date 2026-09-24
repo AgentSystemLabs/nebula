@@ -760,8 +760,37 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // Bulk deletes itemize their casualties across several message
             // lines — size the dialog to fit them.
             let msg_lines: Vec<&str> = confirm.message.lines().collect();
-            let longest = msg_lines.iter().map(|l| l.chars().count()).max();
-            let width = (longest.unwrap_or(0) as u16 + 4).max(CONFIRM_MIN_W);
+            // A delete that empties a linked worktree asks about the
+            // checkout in the same dialog, so its legend has three
+            // answers: yes takes both, no takes the card alone, and
+            // cancel keeps the card alive. The dialog is sized to the
+            // legend too, so the three never wrap.
+            let three_way = matches!(
+                confirm.action,
+                crate::app::PendingAction::ThenDeleteWorktree { offered: true, .. }
+            );
+            let legend = if three_way {
+                Line::from(vec![
+                    Span::styled("[Enter/y] yes, both", Style::default().fg(th.err)),
+                    Span::raw("   "),
+                    Span::styled("[n] no, the card only", Style::default().fg(th.err)),
+                    Span::raw("   "),
+                    Span::styled("[Esc] cancel", Style::default().fg(th.dim)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("[Enter/y] confirm", Style::default().fg(th.err)),
+                    Span::raw("   "),
+                    Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
+                ])
+            };
+            let longest = msg_lines
+                .iter()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(legend.width());
+            let width = (longest as u16 + 4).max(CONFIRM_MIN_W);
             let height = msg_lines.len() as u16 + 4;
             let area = centered_rect(f.area(), width, height);
             f.render_widget(Clear, area);
@@ -780,11 +809,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .map(|l| Line::from(l.to_string()))
                 .collect();
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("[Enter/y] confirm", Style::default().fg(th.err)),
-                Span::raw("   "),
-                Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
-            ]));
+            lines.push(legend);
             f.render_widget(Paragraph::new(lines), inner);
             // Record the drawn area for click hit-testing.
             if let Some(Overlay::Confirm(c)) = &mut app.overlay {
@@ -939,12 +964,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Act(&[NextProjectTab, PrevProjectTab]),
                             "next / previous project tab",
                         ),
-                        (Lit("⌘1-9 / 1-9"), "open that project tab"),
+                        (Lit("1-9"), "open that project tab"),
                         (
                             Act(&[ProjectDropdown, CloseProjectTab]),
                             "project list / close tab",
                         ),
-                        (Act(&[AddProject]), "add a project"),
+                        (Act(&[AddProject]), "open a folder as a project"),
                         (Act(&[Palette]), "fuzzy jump to anything"),
                         (Lit("^o / ^f"), "jump pick: open / focus row"),
                         (
@@ -959,18 +984,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "CHECKOUTS & GITHUB",
                     &[
-                        (Act(&[ContextMenu]), "menu: worktree · run · delete"),
-                        (Act(&[OpenWorktree]), "fire the open command"),
+                        (Act(&[OpenWorktree]), "open in editor (open command)"),
                         (Act(&[GitDiff]), "diff (^r reviewed, ^t tree)"),
-                        (
-                            Act(&[OpenRepo, OpenGhosttyTab]),
-                            "repo on GitHub / Ghostty tab",
-                        ),
+                        (Act(&[OpenRepo]), "the repo on GitHub"),
                         (
                             Act(&[OpenPullRequest, OpenIssue]),
                             "card's PR / issue on GitHub",
                         ),
-                        (Act(&[RefreshPullRequests]), "refresh pull requests now"),
+                        (Act(&[RefreshPullRequests]), "reload PRs + issues (GitHub)"),
                         (Act(&[Issues]), "issues: prompt, preset, edit"),
                         (Act(&[PullRequests]), "pull requests: read / launch"),
                         (Act(&[CommentPullRequest]), "comment on the pane's PR"),
@@ -995,14 +1016,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[New]), "new session: pick a CLI first"),
                         (Act(&[DuplicateSession]), "quick prompt as this card"),
                         (Act(&[AgentPresets]), "agent presets: saved launches"),
-                        (Act(&[NewTerminal]), "new shell terminal"),
+                        (
+                            Act(&[NewTerminal, OpenGhosttyTab]),
+                            "terminal: here / in Ghostty",
+                        ),
                         (Act(&[FollowUp]), "follow-up prompt to the agent"),
                         (Act(&[Rename]), "rename the session"),
                         (
                             Act(&[Archive, Unarchive, ToggleArchived]),
                             "archive / unarchive / show",
                         ),
-                        (Act(&[ContextMenu]), "context menu (right-click)"),
                         (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
                 ),
@@ -1016,6 +1039,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Lit("click / drag"), "the app that took the mouse"),
                         (Lit("⌥click"), "open URL / file under cursor"),
                         (Lit("⇧drag"), "select via your terminal"),
+                        (Lit("right-click"), "card / tab menu: run, restart"),
                         (Lit("drag the pane edge"), "resize the pane"),
                         (Lit("click outside"), "dismiss any modal (= Esc)"),
                     ],
@@ -1027,6 +1051,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Act(&[ToggleLauncherPane, ToggleSidebars]),
                             "fold / unfold the pane",
                         ),
+                        // The SHIFT PAIRS' rule (#93), once, for every
+                        // letter above that has a shifted twin.
+                        (Lit("⇧ + letter"), "bigger, or outside nebula"),
                         (Act(&[Hosts]), "ssh hosts (a: new, d: del)"),
                         (Act(&[Settings]), "settings; Hotkeys tab rebinds"),
                         (Act(&[Metrics]), "memory: nebula + agents"),
@@ -1035,7 +1062,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ),
             ];
             // What to print in the key column: a literal, or every chord
-            // each action currently answers to.
+            // each action currently answers to but the ⌘ aliases
+            // (`Keymap::shown_chords`).
             // An action bound to more chords than the key column holds —
             // open's ⇧Enter ⇧O ⌥Enter — loses whole chords off the end
             // and gains an ellipsis, never a cut mid-chord; the Hotkeys
@@ -1046,7 +1074,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     Act(actions) => {
                         let full = actions
                             .iter()
-                            .map(|a| app.keymap.label(*a))
+                            .map(|a| app.keymap.shown_label(*a))
                             .collect::<Vec<_>>()
                             .join(" / ");
                         if actions.len() != 1 || full.chars().count() <= HELP_KEY_W {
@@ -1054,7 +1082,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         }
                         let chords: Vec<String> = app
                             .keymap
-                            .chords(actions[0])
+                            .shown_chords(actions[0])
                             .iter()
                             .map(|c| c.display().to_string())
                             .collect();
@@ -2485,7 +2513,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 /// which is the truth: that verb has no key right now.
 fn key_hint(app: &App, action: crate::keymap::Action) -> String {
     app.keymap
-        .first(action)
+        .shown_first(action)
         .map(|c| c.display())
         .unwrap_or_else(|| "—".into())
 }
@@ -3366,7 +3394,7 @@ fn draw_cloud_session(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         Span::styled(" or click: open in browser", Style::default().fg(th.dim)),
         Span::styled("   ·   ", Style::default().fg(th.dim)),
         Span::styled(
-            key_hint(app, Action::ContextMenu),
+            "right-click",
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(": send a message", Style::default().fg(th.dim)),
@@ -3746,14 +3774,13 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     draw_key_combo(f, app, area);
 }
 
-/// The KEY COMBO DISPLAY (Settings → Experimental): the last key press
+/// The KEY COMBO DISPLAY: the last key press
 /// and what it did — `j - Move down` — on the footer's padding row at the
 /// far left, the one blank row on screen and right where vim keeps
 /// `showcmd`. Each key sits in a keycap (the selected-row fill) so it
 /// reads across a screen share; the label is plain text. Nothing is drawn
-/// once the press has aged out (`key_combo::LINGER`; the loop clears it)
-/// or while the setting is off, so the row stays the breathing space it
-/// was.
+/// once the press has aged out (`key_combo::LINGER`; the loop clears it),
+/// so the row stays the breathing space it was.
 fn draw_key_combo(f: &mut Frame, app: &App, area: Rect) {
     let Some(combo) = &app.key_combo else {
         return;
@@ -4084,41 +4111,38 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Focus::Terminal => "select a session and press Enter to attach".to_string(),
             Focus::Projects => format!(
-                "{}/{}: add  {}: rename  {}: remove  {}: search  {}: menu  {}: help",
+                "{}/{}: add  {}: rename  {}: remove  {}: search  {}: help",
                 k(Action::New),
                 k(Action::AddProject),
                 k(Action::Rename),
                 k(Action::Delete),
                 k(Action::Palette),
-                k(Action::ContextMenu),
                 k(Action::Help)
             ),
             // An open-PR row answers to a different set of verbs than a
             // checkout does, so the hint follows the cursor into the group.
             Focus::Worktrees if app.selected_worktree_pr().is_some() => format!(
-                "{}: new session  {}: preset  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: search  {}: menu  {}: help",
+                "{}: new session  {}: preset  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: search  {}: help",
                 k(Action::New),
                 k(Action::AgentPresets),
                 k(Action::Activate),
                 k(Action::GitDiff),
                 k(Action::RefreshPullRequests),
                 k(Action::Palette),
-                k(Action::ContextMenu),
                 k(Action::Help)
             ),
             // An issue row: the browser, a prompt or a preset on it, and
             // the pane's scroll keys.
             Focus::Worktrees if app.selected_worktree_issue().is_some() => format!(
-                "{}: open in browser  {}: prompt  {}: preset  PgUp/PgDn: scroll  {}: search  {}: menu  {}: help",
+                "{}: open in browser  {}: prompt  {}: preset  PgUp/PgDn: scroll  {}: search  {}: help",
                 k(Action::Activate),
                 k(Action::QuickPrompt),
                 k(Action::AgentPresets),
                 k(Action::Palette),
-                k(Action::ContextMenu),
                 k(Action::Help)
             ),
             Focus::Worktrees => format!(
-                "{}: new worktree  {}: presets  {}: {}  {}: open  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {}: menu  {}: help",
+                "{}: new worktree  {}: presets  {}: {}  {}: open  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {}: help",
                 k(Action::New),
                 k(Action::AgentPresets),
                 k(Action::Rename),
@@ -4135,7 +4159,6 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 k(Action::Delete),
                 k(Action::RefreshPullRequests),
                 k(Action::Palette),
-                k(Action::ContextMenu),
                 k(Action::Help)
             ),
             // A discovered pull request opens, reads in the pane and shows
@@ -4148,35 +4171,32 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                     .is_some_and(|row| row.id().is_none()) =>
             {
                 format!(
-                    "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: menu  {}: help",
+                    "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: help",
                     k(Action::Activate),
                     k(Action::GitDiff),
                     k(Action::RefreshPullRequests),
-                    k(Action::ContextMenu),
                     k(Action::Help)
                 )
             }
             Focus::Sessions if app.selected_link().is_some() => format!(
-                "{}: open in browser  {}: edit URL  {}: delete  {}: menu  {}: help",
+                "{}: open in browser  {}: edit URL  {}: delete  {}: help",
                 k(Action::Activate),
                 k(Action::Rename),
                 k(Action::Delete),
-                k(Action::ContextMenu),
                 k(Action::Help)
             ),
             // A Cloud row leads out of nebula like a link row does; the
             // menu holds the one verb that reaches the session from here.
             Focus::Sessions if app.previewed_cloud().is_some() => format!(
-                "{}: open in browser  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
+                "{}: open in browser  {}: rename  {}: archive  {}: del  {}: help",
                 k(Action::Activate),
                 k(Action::Rename),
                 k(Action::Archive),
                 k(Action::Delete),
-                k(Action::ContextMenu),
                 k(Action::Help)
             ),
             Focus::Sessions => format!(
-                "{}: focus  {}: agent  {}: presets  {}: terminal  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
+                "{}: focus  {}: agent  {}: presets  {}: terminal  {}: rename  {}: archive  {}: del  {}: help",
                 k(Action::Activate),
                 k(Action::New),
                 k(Action::AgentPresets),
@@ -4184,7 +4204,6 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 k(Action::Rename),
                 k(Action::Archive),
                 k(Action::Delete),
-                k(Action::ContextMenu),
                 k(Action::Help)
             ),
         };

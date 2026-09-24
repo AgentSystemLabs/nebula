@@ -145,8 +145,7 @@ pub fn parse_status_z(bytes: &[u8]) -> Vec<DiffFile> {
 /// Lines added and removed across a checkout's uncommitted changes, as the
 /// DIFF VIEWER shows them: tracked files against HEAD, staged or not, and
 /// every line of an untracked file as added. What the LAUNCHER VIEW's cards
-/// print after their changed-file count while CARD LINE COUNTS
-/// (`card_line_changes`) is on.
+/// print after their changed-file count (CARD LINE COUNTS).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LineChanges {
     pub added: u64,

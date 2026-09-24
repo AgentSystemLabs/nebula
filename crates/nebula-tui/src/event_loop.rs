@@ -82,8 +82,8 @@ const MIN_PANE_DIM: u16 = 2;
 /// requested that early never boots a 0×0 PTY.
 const FALLBACK_PANE: (u16, u16) = (80, 24);
 
-/// Where a keyboard-invoked context menu is anchored: near the panels,
-/// where the selected row lives.
+/// Where a menu hangs when there is no drawn word to hang it under: near
+/// the top left, where the selected row lives.
 pub(super) const KEYBOARD_MENU_ANCHOR: (u16, u16) = (30, 4);
 
 /// Bracketed-paste markers around a pasted block, so the child (claude,
@@ -804,46 +804,41 @@ fn request_git_changes(app: &mut App, git_tx: &tokio::sync::mpsc::UnboundedSende
     };
     app.git_changes_inflight = Some(id.clone());
     let git_tx = git_tx.clone();
-    let count_lines = app.card_line_changes;
     tokio::task::spawn_blocking(move || {
         let files = crate::git_diff::changed_files(&path).ok();
-        let lines = line_changes_if(count_lines, &path, files.as_deref());
+        let lines = line_changes_of(&path, files.as_deref());
         let _ = git_tx.send((id, files, lines));
     });
 }
 
 /// What the badge's `git status` found in a checkout, and the lines behind
-/// it while CARD LINE COUNTS is on; None when git could not say (or, for
-/// the lines, when they weren't asked for).
+/// it; None when git could not say.
 type ChangedFiles = (
     WorktreeId,
     Option<Vec<crate::git_diff::DiffFile>>,
     Option<crate::git_diff::LineChanges>,
 );
 
-/// The sweep's answer for one checkout: its changed-file count and, while
-/// CARD LINE COUNTS is on, its line counts.
+/// The sweep's answer for one checkout: its changed-file count and its
+/// line counts.
 type SweptChanges = (
     WorktreeId,
     Option<usize>,
     Option<crate::git_diff::LineChanges>,
 );
 
-/// The line counts behind `files` when `wanted` (CARD LINE COUNTS is on)
-/// and the `git status` read them; a second git process, so only then.
-fn line_changes_if(
-    wanted: bool,
+/// The line counts behind `files` when the `git status` read them; a
+/// second git process, so only then.
+fn line_changes_of(
     path: &std::path::Path,
     files: Option<&[crate::git_diff::DiffFile]>,
 ) -> Option<crate::git_diff::LineChanges> {
-    files
-        .filter(|_| wanted)
-        .and_then(|files| crate::git_diff::line_changes(path, files))
+    files.and_then(|files| crate::git_diff::line_changes(path, files))
 }
 
 /// Record the line counts a read found in `worktree`, for its cards; None
-/// (switched off, unreadable) or nothing changed by the line drops what
-/// was there. A change redraws.
+/// (unreadable) or nothing changed by the line drops what was there. A
+/// change redraws.
 fn note_worktree_lines(
     app: &mut App,
     worktree: &WorktreeId,
@@ -917,10 +912,9 @@ fn sweep_git_changes(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<Swep
     };
     app.worktree_changes_inflight = Some(id.clone());
     let tx = tx.clone();
-    let count_lines = app.card_line_changes;
     tokio::task::spawn_blocking(move || {
         let files = crate::git_diff::changed_files(&path).ok();
-        let lines = line_changes_if(count_lines, &path, files.as_deref());
+        let lines = line_changes_of(&path, files.as_deref());
         let _ = tx.send((id, files.map(|f| f.len()), lines));
     });
 }
@@ -1948,8 +1942,12 @@ fn schedule_pull_request_refresh(app: &mut App) {
     schedule_pr_lookup(app);
 }
 
-/// `Shift+R`, from any panel: ask GitHub again *now* — the selected
-/// project's open list, every one of its checkouts' own PR, and the body
+/// What `Shift+R` says in the footer the moment it is heard.
+pub(crate) const RELOAD_FLASH: &str = "reloading pull requests and issues from GitHub…";
+
+/// `Shift+R`, from any panel: reload from GitHub *now* — the selected
+/// project's open list and its open issues (`issues::reload_selected`),
+/// every one of its checkouts' own PR, and the body
 /// and conversation of the pull request the pane is reading — past
 /// every timer and floor the beats keep. `schedule_pull_request_refresh`
 /// is what a focus event may do; this is what a deliberate keypress may
@@ -1970,7 +1968,8 @@ fn refresh_pull_requests(app: &mut App) {
     schedule_pr_sweep(app);
     refetch_pr_detail(app);
     app.pr_refresh_requested = true;
-    app.flash = Some("refreshing pull requests…".into());
+    crate::issues::reload_selected(app);
+    app.flash = Some(RELOAD_FLASH.into());
     app.dirty = true;
 }
 
@@ -3293,7 +3292,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // Delete EVERY row of the focused panel (behind a confirm that
         // lists the casualties).
         Action::DeleteAll => open_delete_all_confirm(app),
-        Action::ContextMenu => open_context_menu_for_selection(app),
         // Space on a session card: expand it into its FOLLOW-UP COMPOSER,
         // or fold it back up. Sessions only — the other panels have no
         // card to expand, and Space stays unbound there.
@@ -3580,7 +3578,8 @@ fn open_launch_repo(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// Enter and the SPLASH's. A folder that is already a project (it, a
 /// checkout of it, or a folder inside either) opens that project instead
 /// of asking the daemon to register it twice; one that does not exist yet
-/// asks first whether to create it.
+/// asks first whether to create it, and one in no git repository asks
+/// whether to `git init` it.
 fn open_folder(app: &mut App, path: std::path::PathBuf, out: &mut Vec<ClientRequest>) {
     if !path.exists() {
         app.overlay = Some(Overlay::Confirm(ConfirmDialog {
@@ -3604,6 +3603,18 @@ fn open_folder(app: &mut App, path: std::path::PathBuf, out: &mut Vec<ClientRequ
         app.flash = Some(format!("{name} is already a project — opened it"));
         return;
     }
+    if canon.is_dir() && !in_git_repo(&canon) {
+        app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+            title: "Not a git repository".into(),
+            message: format!(
+                "{} isn't a git repository — nebula projects are. Run git init in it?",
+                path.display()
+            ),
+            action: PendingAction::InitProjectRepo(path),
+            area: ratatui::layout::Rect::default(),
+        }));
+        return;
+    }
     send_with(app, out, PendingIntent::SelectCreatedProject, |req_id| {
         ClientRequest::AddProject {
             req_id,
@@ -3612,6 +3623,14 @@ fn open_folder(app: &mut App, path: std::path::PathBuf, out: &mut Vec<ClientRequ
             create_missing: false,
         }
     });
+}
+
+/// Whether `dir` sits in a git repository — a `.git` (a directory, or the
+/// file a linked worktree carries) in it or above it, as git itself looks.
+/// A stat per ancestor, so it is cheap enough for a keypress; the daemon
+/// asks git itself before it runs `git init`.
+fn in_git_repo(dir: &std::path::Path) -> bool {
+    dir.ancestors().any(|d| d.join(".git").exists())
 }
 
 /// Open the selected repo's page on its git host (`G`). Any worktree
@@ -4583,10 +4602,10 @@ fn open_delete_confirm(app: &mut App) {
         }
         Focus::Sessions => match app.selected_session_row() {
             Some(SessionRow::Agent(a)) => {
-                app.overlay = Some(Overlay::Confirm(confirm_delete_agent(&a.name, a.id)));
+                app.overlay = Some(Overlay::Confirm(confirm_delete_agent_in(app, &a)));
             }
             Some(SessionRow::Terminal(t)) => {
-                app.overlay = Some(Overlay::Confirm(confirm_close_terminal(&t.name, t.id)));
+                app.overlay = Some(Overlay::Confirm(confirm_close_terminal_in(app, &t)));
             }
             Some(SessionRow::Link(l)) => delete_link(app, &l),
             None => {}
@@ -4755,7 +4774,14 @@ fn open_delete_all_confirm(app: &mut App) {
                     SessionRow::Link(_) => unreachable!("filtered out above"),
                 }
             }
-            app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+            // The rows are the selected worktree's: a `D` that takes every
+            // live card there asks about the checkout in the same dialog.
+            let live_taken = agents
+                .iter()
+                .filter(|id| app.tree.agents.iter().any(|a| &a.id == *id && !a.archived))
+                .count()
+                + terminals.len();
+            let dialog = ConfirmDialog {
                 title: format!("Delete ALL {} session(s)", names.len()),
                 message: format!(
                     "Delete these {} session(s)? Their history goes away.\n{}",
@@ -4764,7 +4790,12 @@ fn open_delete_all_confirm(app: &mut App) {
                 ),
                 action: PendingAction::DeleteAllSessions { agents, terminals },
                 area: ratatui::layout::Rect::default(),
-            }));
+            };
+            let dialog = match app.selected_worktree().map(|w| w.id.clone()) {
+                Some(wt) => with_worktree_offer(app, dialog, &wt, live_taken),
+                None => dialog,
+            };
+            app.overlay = Some(Overlay::Confirm(dialog));
         }
         Focus::Projects | Focus::Terminal => {}
     }
@@ -5123,19 +5154,10 @@ fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
     items
 }
 
-/// `m`: the CONTEXT MENU of the row under the focused panel's cursor.
-fn open_context_menu_for_selection(app: &mut App) {
-    if let Some(items) = context_menu_items(app, app.focus) {
-        open_menu(app, items, KEYBOARD_MENU_ANCHOR);
-    }
-}
-
-/// The CONTEXT MENU of the row under `focus`'s cursor — what `m` opens
-/// there, and what a right-click on a row opens once the click has moved
-/// the cursor onto it (`select_clicked_row`). One list per row kind, built
-/// here and nowhere else: the right button used to build the PROJECTS
-/// PANEL's by hand beside `m`'s, and the two had already drifted apart in
-/// how they were put together. None where there is no row to have one.
+/// The CONTEXT MENU of the row under `focus`'s cursor — what a
+/// right-click on a row opens once the click has moved the cursor onto it
+/// (`select_clicked_row`). One list per row kind, built here and nowhere
+/// else. None where there is no row to have one.
 fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
     match focus {
         Focus::Projects => {
@@ -5588,6 +5610,20 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             }
         },
         Overlay::Confirm(confirm) => match key.code {
+            // The three-way dialog's "no": the card goes, the emptied
+            // worktree stays. Esc below is the "cancel" that keeps both.
+            KeyCode::Char('n')
+                if matches!(
+                    confirm.action,
+                    PendingAction::ThenDeleteWorktree { offered: true, .. }
+                ) =>
+            {
+                let PendingAction::ThenDeleteWorktree { first, .. } = confirm.action.clone() else {
+                    unreachable!("guarded above");
+                };
+                app.overlay = None;
+                run_pending_action(app, *first, out);
+            }
             KeyCode::Esc | KeyCode::Char('n') => {
                 // Backing out lands where you were: a settings reset
                 // reopens the overlay, a preset delete the presets list —
@@ -6263,19 +6299,6 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.black_background = cfg.black_background;
     app.launcher_pane_at = cfg.pane_side();
     set_hide_draft_prs(app, cfg.hide_draft_prs);
-    app.pr_issue_counts = cfg.pr_issue_counts;
-    app.card_line_changes = cfg.card_line_changes;
-    if !app.card_line_changes {
-        // Switched off: no read refreshes these any more, so none is left
-        // to come back stale when it is switched on again.
-        app.worktree_lines.clear();
-    }
-    app.show_key_combos = cfg.show_key_combos;
-    if !app.show_key_combos {
-        // Switched off: whatever the display was showing comes down now
-        // rather than lingering out.
-        app.key_combo = None;
-    }
 }
 
 /// `R` in the settings overlay, confirmed: rewrite config.json from the
@@ -6693,7 +6716,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
 
 fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<ClientRequest>) {
     match action {
-        PendingAction::CreateProjectDir(path) => {
+        PendingAction::CreateProjectDir(path) | PendingAction::InitProjectRepo(path) => {
             send_with(app, out, PendingIntent::SelectCreatedProject, |req_id| {
                 ClientRequest::AddProject {
                     req_id,
@@ -6709,16 +6732,14 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
         PendingAction::DeleteLink(id) => {
             send(app, out, |req_id| ClientRequest::DeleteLink { req_id, id });
         }
-        PendingAction::DeleteWorktree(id) => {
-            // Optimistic: drop the rows now (the daemon deletes in the
-            // background — `git worktree remove` can take seconds). The
-            // eventual EntityRemoved is a no-op; an Error for this req_id
-            // restores the rows via the rollback stashed in the intent.
-            let before = selection_snapshot(app);
-            delete_worktree(app, id, out);
-            // Deleting the selected worktree lands the cursor on a neighbor
-            // — bring up that neighbor's session like a manual switch would.
-            reconcile_selection(app, before, out);
+        PendingAction::DeleteWorktree(id) => delete_worktree_and_settle(app, id, out),
+        PendingAction::ThenDeleteWorktree {
+            first, worktree, ..
+        } => {
+            // The row's own delete drops its card; the worktree delete
+            // then takes the emptied band and settles the cursor once.
+            run_pending_action(app, *first, out);
+            delete_worktree_and_settle(app, worktree, out);
         }
         PendingAction::DeleteAllWorktrees(ids) => {
             // Each delete is its own request with its own optimistic
@@ -6785,6 +6806,103 @@ fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<ClientRequest>) {
     optimistic::close_terminal(app, id, out);
 }
 
+/// A confirmed worktree delete, and the cursor after it. Optimistic: the
+/// rows drop now (the daemon deletes in the background — `git worktree
+/// remove` can take seconds); the eventual EntityRemoved is a no-op and an
+/// Error for this req_id restores the rows via the rollback stashed in the
+/// intent. Deleting the selected worktree lands the cursor on a neighbor —
+/// its session comes up like a manual switch would.
+fn delete_worktree_and_settle(app: &mut App, id: WorktreeId, out: &mut Vec<ClientRequest>) {
+    let before = selection_snapshot(app);
+    delete_worktree(app, id, out);
+    reconcile_selection(app, before, out);
+}
+
+/// Live cards a worktree still holds: its unarchived agents and its
+/// terminals — what its band on the grid shows.
+fn live_cards_in(app: &App, id: &WorktreeId) -> usize {
+    app.tree
+        .agents
+        .iter()
+        .filter(|a| &a.worktree_id == id && !a.archived)
+        .count()
+        + app
+            .tree
+            .terminals
+            .iter()
+            .filter(|t| &t.worktree_id == id)
+            .count()
+}
+
+/// A row delete's confirm, with the checkout's fate folded in when the
+/// delete would empty a linked worktree. `dialog` is the row's ordinary
+/// confirm; `live_taken` how many live cards it removes from `worktree`
+/// (one for a card, zero for an archived row, the doomed count for a
+/// `D`). When that is every live card the worktree has — and it is not
+/// the ROOT WORKTREE or a stand-in git is still cutting — the dialog asks
+/// in the same breath whether the worktree goes too: `Enter`/`y` deletes
+/// the card and then the checkout, `n` deletes the card alone, `Esc`
+/// keeps the card. Archived sessions still filed under the worktree are
+/// counted in the question, since the delete takes their history. With
+/// the **Delete emptied worktree** SETTING on and nothing archived left
+/// the question is skipped: the dialog stays two-way, says the worktree
+/// goes with the card, and `Enter` does both. Anything else leaves the
+/// dialog as it came.
+fn with_worktree_offer(
+    app: &App,
+    mut dialog: ConfirmDialog,
+    worktree: &WorktreeId,
+    live_taken: usize,
+) -> ConfirmDialog {
+    let Some(w) = app.tree.worktrees.iter().find(|w| &w.id == worktree) else {
+        return dialog;
+    };
+    if w.is_main
+        || app.is_placeholder_worktree(worktree)
+        || live_cards_in(app, worktree) != live_taken
+    {
+        return dialog;
+    }
+    let archived = app
+        .tree
+        .agents
+        .iter()
+        .filter(|a| &a.worktree_id == worktree && a.archived)
+        .count();
+    let force = crate::config::Config::load().delete_empty_worktree;
+    let offered = !(force && archived == 0);
+    let branch = &w.branch;
+    dialog.message.push('\n');
+    dialog.message.push_str(&match (offered, archived) {
+        (false, _) => format!("Worktree '{branch}' goes with it: nothing else is left there."),
+        (true, 0) => format!("Nothing else is left in worktree '{branch}': delete it from disk too?"),
+        (true, n) => format!(
+            "Nothing live is left in worktree '{branch}': delete it from disk too?\nIts {n} archived session(s) would go with it."
+        ),
+    });
+    dialog.action = PendingAction::ThenDeleteWorktree {
+        first: Box::new(dialog.action),
+        worktree: worktree.clone(),
+        offered,
+    };
+    dialog
+}
+
+/// The confirm before an agent is deleted, with the worktree question
+/// folded in when the agent is the last card of a linked worktree
+/// ([`with_worktree_offer`]). From the `d` key and the row menu alike.
+fn confirm_delete_agent_in(app: &App, a: &nebula_core::Agent) -> ConfirmDialog {
+    let dialog = confirm_delete_agent(&a.name, a.id.clone());
+    with_worktree_offer(app, dialog, &a.worktree_id, usize::from(!a.archived))
+}
+
+/// The confirm before a terminal is closed, with the worktree question
+/// folded in when the terminal is the last card of a linked worktree.
+fn confirm_close_terminal_in(app: &App, t: &nebula_core::TerminalTab) -> ConfirmDialog {
+    let dialog = confirm_close_terminal(&t.name, t.id.clone());
+    with_worktree_offer(app, dialog, &t.worktree_id, 1)
+}
+
 /// Delete a worktree optimistically: drop its rows now (the daemon deletes
 /// in the background — `git worktree remove` can take seconds). The
 /// eventual EntityRemoved is a no-op; an Error for this req_id restores the
@@ -6817,7 +6935,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::UnarchiveAgent(id) => activate::unarchive(app, id, out),
         MenuAction::DeleteAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(confirm_delete_agent(&a.name, id)));
+                app.overlay = Some(Overlay::Confirm(confirm_delete_agent_in(app, &a)));
             }
         }
         MenuAction::NewAgent(worktree) => open_new_agent_picker(app, worktree),
@@ -6825,7 +6943,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::RenameTerminal(id) => open_prompt(app, PromptKind::RenameTerminal { id }),
         MenuAction::CloseTerminal(id) => {
             if let Some(t) = app.tree.terminals.iter().find(|t| t.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(confirm_close_terminal(&t.name, id)));
+                app.overlay = Some(Overlay::Confirm(confirm_close_terminal_in(app, &t)));
             }
         }
         MenuAction::NewAgentOfKind {
@@ -8646,7 +8764,10 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Whether this click on `key` is the second of a double-click. The slot
 /// is consumed either way: a double-click is spent, so a third click starts
 /// over; a single click re-arms the slot with itself for the next one.
-fn is_double_click<T: PartialEq>(slot: &mut Option<(std::time::Instant, T)>, key: T) -> bool {
+pub(crate) fn is_double_click<T: PartialEq>(
+    slot: &mut Option<(std::time::Instant, T)>,
+    key: T,
+) -> bool {
     let now = std::time::Instant::now();
     let double = slot
         .take()
@@ -11498,6 +11619,15 @@ mod tests {
 
     const CLOUD_ID: &str = "session_01SQugK2HDyk33coSrfqFJk4";
 
+    /// The CONTEXT MENU of the row under the focused panel's cursor, as a
+    /// right-click on that row opens it — these tests never draw, so there
+    /// is no cell to click.
+    fn open_row_menu(app: &mut App) {
+        if let Some(items) = context_menu_items(app, app.focus) {
+            open_menu(app, items, KEYBOARD_MENU_ANCHOR);
+        }
+    }
+
     /// Turn the seeded row into a Claude Cloud row — the upsert the daemon
     /// sends once the create has printed its session id.
     fn make_cloud_row(app: &mut App, out: &mut Vec<ClientRequest>) {
@@ -11523,7 +11653,7 @@ mod tests {
         make_cloud_row(&mut app, &mut out);
         app.focus = Focus::Sessions;
 
-        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        open_row_menu(&mut app);
         let Some(Overlay::Menu(menu)) = &app.overlay else {
             panic!("no menu: {:?}", app.overlay)
         };
@@ -11957,6 +12087,53 @@ mod tests {
         };
         assert_eq!(p.kind, crate::app::PromptKind::AddProject);
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A project is a git repository: opening a folder in none asks to
+    /// `git init` it — `y` sends the add with `create_missing`, which is
+    /// the daemon's cue to init, and `n` sends nothing. A folder inside a
+    /// repository opens without asking.
+    #[test]
+    fn opening_a_folder_outside_git_asks_to_git_init_it() {
+        let mut app = App::new();
+        let tmp = launched_in_alpha(&mut app);
+        let beta = tmp.path().join("ws/beta");
+        let mut out = Vec::new();
+
+        open_folder(&mut app, beta.clone(), &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Confirm(c))
+                if c.title == "Not a git repository"
+                    && c.action == PendingAction::InitProjectRepo(beta.clone())),
+            "{:?}",
+            app.overlay
+        );
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+        assert!(out.is_empty(), "{out:?}");
+
+        open_folder(&mut app, beta.clone(), &mut out);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ClientRequest::AddProject { path, create_missing: true, .. }] if path == &beta
+            ),
+            "{out:?}"
+        );
+
+        out.clear();
+        let inner = tmp.path().join("ws/alpha/src");
+        std::fs::create_dir_all(&inner).unwrap();
+        open_folder(&mut app, inner.clone(), &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ClientRequest::AddProject { path, create_missing: false, .. }] if path == &inner
+            ),
+            "{out:?}"
+        );
     }
 
     /// The open-project prompt starts on the folder nebula was started in:
@@ -14360,7 +14537,7 @@ diff --git a/src/c.rs b/src/c.rs
             "fired on the loop's next turn, not the next git tick"
         );
         assert!(app.overlay.is_none(), "nothing to rename here");
-        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+        assert_eq!(app.flash.as_deref(), Some(RELOAD_FLASH));
         assert!(out.is_empty(), "no daemon traffic — gh runs client-side");
 
         // The same from an open-PR row of the group, which the pane is
@@ -14421,7 +14598,7 @@ diff --git a/src/c.rs b/src/c.rs
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
         assert!(app.overlay.is_none(), "no prompt");
-        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+        assert_eq!(app.flash.as_deref(), Some(RELOAD_FLASH));
         assert!(app.pr_lookup_due(&wid), "the row's own lookup is due");
         assert!(app.pr_refresh_requested);
         let (pending, at) = app
@@ -14453,7 +14630,7 @@ diff --git a/src/c.rs b/src/c.rs
         app.flash = None;
         press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
         assert!(app.pr_refresh_requested && app.overlay.is_none());
-        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+        assert_eq!(app.flash.as_deref(), Some(RELOAD_FLASH));
 
         // …while `r` there still renames.
         press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
@@ -17243,7 +17420,7 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     #[test]
-    fn shift_t_creates_terminal_in_selected_worktree() {
+    fn t_creates_terminal_in_selected_worktree() {
         use nebula_core::WorktreeId;
         let mut app = App::new();
         seed_tree(&mut app);
@@ -17252,7 +17429,7 @@ diff --git a/src/c.rs b/src/c.rs
 
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
             &mut out,
         );
         assert!(matches!(
@@ -17262,10 +17439,10 @@ diff --git a/src/c.rs b/src/c.rs
         ));
     }
 
-    /// From the Projects panel, Shift+T targets the project's main checkout
+    /// From the Projects panel, `t` targets the project's main checkout
     /// (root), not whatever worktree row happens to be selected.
     #[test]
-    fn shift_t_from_projects_targets_the_root_checkout() {
+    fn t_from_projects_targets_the_root_checkout() {
         use nebula_core::{Entity, Worktree, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -17288,7 +17465,7 @@ diff --git a/src/c.rs b/src/c.rs
 
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
             &mut out,
         );
         assert!(matches!(
@@ -17310,7 +17487,7 @@ diff --git a/src/c.rs b/src/c.rs
 
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
             &mut out,
         );
         let Some(ClientRequest::CreateTerminal { req_id, .. }) = out.last() else {
@@ -20525,14 +20702,14 @@ diff --git a/src/c.rs b/src/c.rs
         };
 
         app.sel_worktree = 1;
-        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        open_row_menu(&mut app);
         let linked = labels(&app);
         assert!(linked.iter().any(|l| l == "Delete worktree"), "{linked:?}");
         assert!(!linked.iter().any(|l| l == "Switch branch…"), "{linked:?}");
         app.overlay = None;
 
         app.sel_worktree = 0;
-        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        open_row_menu(&mut app);
         let root = labels(&app);
         assert!(!root.iter().any(|l| l == "Delete worktree"), "{root:?}");
         let at = root
@@ -26110,6 +26287,246 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// `Shift+Tab` in the ISSUES MODAL puts the AGENT PRESETS picker up over
+    /// the modal rather than in its place. Esc and a click outside leave the
+    /// modal on its row; a pick hands the box over, still on the modal, and
+    /// the box's own Esc goes back to it too.
+    #[test]
+    fn the_issue_preset_picker_stands_on_the_modal() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+            let project = nebula_core::ProjectId("p1".into());
+            app.overlay = Some(Overlay::Issues(crate::issues::IssuesView::new(
+                project.clone(),
+                "demo".into(),
+                "/tmp/demo".into(),
+            )));
+            let issue = |number: u64| crate::issues::Issue {
+                number,
+                url: format!("https://github.com/o/r/issues/{number}"),
+                title: format!("issue {number}"),
+                author: "webdevcody".into(),
+                created_at: "2026-09-10T12:00:00Z".into(),
+                updated_at: "2026-09-11T12:00:00Z".into(),
+                labels: vec![],
+                body: String::new(),
+            };
+            crate::issues::land_answer(
+                &mut app,
+                crate::issues::IssuesAnswer::List {
+                    project,
+                    list: Some(vec![issue(15), issue(14)]),
+                },
+            );
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            let on_row =
+                |app: &App| matches!(&app.overlay, Some(Overlay::Issues(v)) if v.selected == 1);
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+
+            press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+            let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                panic!(
+                    "Shift+Tab: expected the preset picker, got {:?}",
+                    app.overlay
+                );
+            };
+            let back = view.quick.as_ref().expect("a picker for a launch");
+            assert!(
+                matches!(&back.launch.under, Some(crate::quick_prompt::ModalUnder::Issues(v)) if v.selected == 1),
+                "the picker carries the modal it stands on: {:?}",
+                back.launch.under
+            );
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let screen = buffer_text(&terminal);
+            assert!(
+                screen.contains("Issues — demo"),
+                "the modal under:\n{screen}"
+            );
+            assert!(screen.contains("reviewer"), "the picker over it:\n{screen}");
+
+            // Esc: the picker goes, the modal stays on its row.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(on_row(&app), "Esc leaves the modal: {:?}", app.overlay);
+
+            // A click outside the picker: the same.
+            press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            crate::overlay_close::click_outside(&mut app, &mut out);
+            assert!(on_row(&app), "a click outside: {:?}", app.overlay);
+
+            // A pick: the box, preset applied, still standing on the modal.
+            press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the pick: expected the box, got {:?}", app.overlay);
+            };
+            let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert_eq!(
+                launch.preset.as_ref().map(|p| p.name.as_str()),
+                Some("reviewer")
+            );
+            assert!(
+                matches!(&launch.under, Some(crate::quick_prompt::ModalUnder::Issues(v)) if v.selected == 1),
+                "{:?}",
+                launch.under
+            );
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let screen = buffer_text(&terminal);
+            assert!(
+                screen.contains("Issues — demo"),
+                "the modal under:\n{screen}"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(on_row(&app), "the box's Esc: {:?}", app.overlay);
+        });
+    }
+
+    /// `Tab` on the AGENT PRESETS list `e` opens flips the launch onto a
+    /// fresh worktree of the project, and back; a click on the list's
+    /// `[ ] new worktree` row is the same flip (INPUT PARITY). Enter on a
+    /// preset flipped on puts the QUICK PROMPT up with the preset on it,
+    /// aimed at the fresh branch, and its Enter cuts the worktree first.
+    #[test]
+    fn the_preset_list_tab_flips_a_new_worktree() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            open_presets(&mut app, &mut out);
+            let fresh = |app: &App| match &app.overlay {
+                Some(Overlay::AgentPresets(v)) => v.is_new_worktree(),
+                other => panic!("expected the presets list, got {other:?}"),
+            };
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let screen = buffer_text(&terminal);
+            assert!(!fresh(&app), "the list starts on the worktree `e` was on");
+            assert!(screen.contains("worktree: main"), "{screen}");
+            assert!(screen.contains("[ ] new worktree Tab"), "{screen}");
+
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            assert!(fresh(&app), "Tab flips it on");
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let screen = buffer_text(&terminal);
+            assert!(screen.contains("NEW WORKTREE"), "{screen}");
+            assert!(screen.contains("[✓] new worktree Tab"), "{screen}");
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            assert!(!fresh(&app), "and off again");
+
+            // The click: the same flip.
+            let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                unreachable!()
+            };
+            let row = view.toggle_area;
+            click(&mut app, row.x + row.width - 4, row.y, &mut out);
+            assert!(fresh(&app), "a click on the row flips it on");
+            let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                unreachable!()
+            };
+            let Some(crate::quick_prompt::QuickTarget::NewWorktree { branch, .. }) =
+                view.aim.clone()
+            else {
+                panic!("{:?}", view.aim);
+            };
+
+            // Enter on "reviewer": the box, preset on, aimed at the branch.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("expected the quick prompt, got {:?}", app.overlay);
+            };
+            let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert_eq!(
+                launch.preset.as_ref().map(|p| p.name.as_str()),
+                Some("reviewer")
+            );
+            assert!(
+                matches!(&launch.target, crate::quick_prompt::QuickTarget::NewWorktree { branch: b, .. } if *b == branch),
+                "{:?}",
+                launch.target
+            );
+            out.clear();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                out.iter().any(
+                    |r| matches!(r, ClientRequest::CreateWorktree { branch: b, .. } if *b == branch)
+                ),
+                "the worktree is cut first: {out:?}"
+            );
+        });
+    }
+
+    /// `Shift+Tab` in the ISSUES MODAL, then `Tab`: the picker flips the
+    /// launch onto a fresh worktree named after the issue, and the box its
+    /// Enter hands over is aimed there — still standing on the modal. Esc
+    /// before a pick drops the flip with the picker.
+    #[test]
+    fn the_issue_preset_picker_tab_flips_a_new_worktree() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+            let project = nebula_core::ProjectId("p1".into());
+            app.overlay = Some(Overlay::Issues(crate::issues::IssuesView::new(
+                project.clone(),
+                "demo".into(),
+                "/tmp/demo".into(),
+            )));
+            crate::issues::land_answer(
+                &mut app,
+                crate::issues::IssuesAnswer::List {
+                    project,
+                    list: Some(vec![crate::issues::Issue {
+                        number: 15,
+                        url: "https://github.com/o/r/issues/15".into(),
+                        title: "Fix login redirect".into(),
+                        author: "webdevcody".into(),
+                        created_at: "2026-09-10T12:00:00Z".into(),
+                        updated_at: "2026-09-11T12:00:00Z".into(),
+                        labels: vec![],
+                        body: String::new(),
+                    }]),
+                },
+            );
+            let fresh = |app: &App| match &app.overlay {
+                Some(Overlay::AgentPresets(v)) => v.is_new_worktree(),
+                other => panic!("expected the preset picker, got {other:?}"),
+            };
+
+            press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+            assert!(!fresh(&app), "the root worktree, as Enter's box");
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            assert!(fresh(&app));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+            press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+            assert!(!fresh(&app), "Esc dropped the flip");
+
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the pick: expected the box, got {:?}", app.overlay);
+            };
+            let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert!(
+                matches!(&launch.target, crate::quick_prompt::QuickTarget::NewWorktree { branch, .. } if branch.starts_with("issue-15")),
+                "{:?}",
+                launch.target
+            );
+            assert_eq!(launch.issue.as_ref().map(|i| i.number), Some(15));
+            assert!(matches!(
+                &launch.under,
+                Some(crate::quick_prompt::ModalUnder::Issues(_))
+            ));
+        });
+    }
+
     #[test]
     fn presets_a_fills_the_editor_and_enter_persists() {
         use crate::preset_overlays::PresetField;
@@ -29707,7 +30124,7 @@ diff --git a/src/c.rs b/src/c.rs
                 |app| {
                     seed_tree(app);
                     app.focus = Focus::Sessions;
-                    press(app, KeyCode::Char('m'), KeyModifiers::NONE, &mut Vec::new());
+                    open_row_menu(app);
                 },
                 None,
             ),
@@ -30355,24 +30772,21 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
-    // ---- KEY COMBO DISPLAY (Settings → Experimental) ----
+    // ---- KEY COMBO DISPLAY ----
 
     fn combo_text(app: &App) -> Option<String> {
         app.key_combo.as_ref().map(|c| c.text())
     }
 
-    /// With the display on, a panel key shows as `key - label` and an
-    /// unbound one bare; off (the default) nothing is recorded at all.
-    /// Inside a modal only the keys that cannot be text show, bare.
+    /// A panel key shows as `key - label` and an unbound one bare, out of
+    /// the box: the display is always on. Inside a modal only the keys
+    /// that cannot be text show, bare.
     #[test]
     fn key_combo_display_spells_each_press_with_what_it_did() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-        assert!(app.key_combo.is_none(), "off by default");
-
-        app.show_key_combos = true;
+        assert!(app.key_combo.is_none(), "nothing pressed yet");
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         assert_eq!(combo_text(&app).as_deref(), Some("j - Move down"));
         press(
@@ -30434,7 +30848,6 @@ diff --git a/src/c.rs b/src/c.rs
     fn key_combo_display_never_echoes_what_is_typed_into_a_locked_pane() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.show_key_combos = true;
         let sref = SessionRef::Agent(AgentId("a1".into()));
         app.term = Some(AttachedTerm::new(sref, 80, 24));
         app.focus = Focus::Terminal;
@@ -30467,36 +30880,35 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(!app.term_locked);
     }
 
-    /// The setting is live: switching it off in the overlay takes down
-    /// whatever the display was showing rather than letting it linger out.
+    /// The retired `show_key_combos` key changes nothing: a config that
+    /// still says `false` — written by a build where the display was an
+    /// Experimental switch — leaves every press showing, and applying it
+    /// live takes nothing down.
     #[test]
-    fn switching_the_key_combo_display_off_takes_the_last_combo_down() {
+    fn the_key_combo_display_shows_whatever_the_retired_key_says() {
         let mut app = App::new();
-        let mut cfg = crate::config::Config {
-            show_key_combos: true,
+        seed_tree(&mut app);
+        let cfg = crate::config::Config {
+            show_key_combos: false,
             ..Default::default()
         };
         apply_config(&mut app, &cfg);
-        assert!(app.show_key_combos);
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-        assert!(app.key_combo.is_some());
-        cfg.show_key_combos = false;
+        assert_eq!(combo_text(&app).as_deref(), Some("j - Move down"));
         apply_config(&mut app, &cfg);
-        assert!(!app.show_key_combos);
-        assert!(app.key_combo.is_none(), "nothing lingers once it is off");
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-        assert!(app.key_combo.is_none());
+        assert!(app.key_combo.is_some(), "a config apply leaves it standing");
     }
 
     /// PR & ISSUE COUNTS is live the same way: the switch reaches the
     /// running app on apply, on and off, so the rows change on the next
     /// paint and the issues sweep starts (or stops) on the next tick.
-    /// CARD LINE COUNTS follows the config live, and switching it off
-    /// drops the counts already read so none comes back stale; a read that
-    /// finds nothing changed by the line drops its checkout's entry too.
+    /// CARD LINE COUNTS are always read: a config that still says
+    /// `card_line_changes: false` (an older build's) turns nothing off,
+    /// and a read that finds nothing changed by the line drops its
+    /// checkout's entry.
     #[test]
-    fn card_line_changes_follows_the_config_and_drops_its_counts_when_off() {
+    fn card_line_counts_are_always_kept_and_drop_when_nothing_changed() {
         use crate::git_diff::LineChanges;
         let mut app = App::new();
         let w1 = WorktreeId("w1".into());
@@ -30504,12 +30916,7 @@ diff --git a/src/c.rs b/src/c.rs
             added: 12,
             removed: 4,
         };
-        let on = crate::config::Config {
-            card_line_changes: true,
-            ..Default::default()
-        };
-        apply_config(&mut app, &on);
-        assert!(app.card_line_changes);
+        apply_config(&mut app, &crate::config::Config::default());
         note_worktree_lines(&mut app, &w1, Some(lines));
         assert_eq!(app.worktree_lines(&w1), Some(lines));
 
@@ -30522,27 +30929,8 @@ diff --git a/src/c.rs b/src/c.rs
 
         note_worktree_lines(&mut app, &w1, Some(lines));
         apply_config(&mut app, &crate::config::Config::default());
-        assert!(!app.card_line_changes);
-        assert!(app.worktree_lines.is_empty(), "off drops what was read");
-        assert_eq!(
-            line_changes_if(false, std::path::Path::new("."), Some(&[])),
-            None
-        );
-    }
-
-    #[test]
-    fn pr_issue_counts_follows_the_config_on_apply() {
-        let mut app = App::new();
-        assert!(app.pr_issue_counts, "on out of the box, as the config is");
-        let mut cfg = crate::config::Config {
-            pr_issue_counts: false,
-            ..Default::default()
-        };
-        apply_config(&mut app, &cfg);
-        assert!(!app.pr_issue_counts);
-        cfg.pr_issue_counts = true;
-        apply_config(&mut app, &cfg);
-        assert!(app.pr_issue_counts);
+        assert_eq!(app.worktree_lines(&w1), Some(lines), "no setting drops it");
+        assert_eq!(line_changes_of(std::path::Path::new("."), None), None);
     }
 
     /// Where it draws: the footer's padding row, far left — the one blank
@@ -30552,7 +30940,6 @@ diff --git a/src/c.rs b/src/c.rs
     fn key_combo_display_sits_on_the_footers_padding_row_at_the_left() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.show_key_combos = true;
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -30578,5 +30965,373 @@ diff --git a/src/c.rs b/src/c.rs
             "",
             "gone: the row is breathing space again"
         );
+    }
+
+    // ---- DELETE EMPTIED WORKTREE -------------------------------------
+
+    fn terminal_entity(id: &str, wt: &str, name: &str) -> nebula_core::Entity {
+        nebula_core::Entity::Terminal(nebula_core::TerminalTab {
+            id: TerminalId(id.into()),
+            worktree_id: WorktreeId(wt.into()),
+            name: name.into(),
+            sort_order: 0,
+            alive: true,
+            run_command: None,
+        })
+    }
+
+    /// p1 / w1 (main, a1) plus a linked worktree w2 on `feature`, holding
+    /// whatever rows the test upserts next.
+    fn seed_emptiable_tree(app: &mut App) {
+        seed_tree(app);
+        seed_linked_worktree(app);
+    }
+
+    fn delete_worktree_requests(out: &[ClientRequest]) -> Vec<&str> {
+        out.iter()
+            .filter_map(|r| match r {
+                ClientRequest::DeleteWorktree { id, .. } => Some(id.0.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The row menu's Delete on `id`, with the confirm it opens.
+    fn menu_delete(app: &mut App, id: &str) -> ConfirmDialog {
+        let mut out = Vec::new();
+        run_menu_action(app, MenuAction::DeleteAgent(AgentId(id.into())), &mut out);
+        match &app.overlay {
+            Some(Overlay::Confirm(c)) => c.clone(),
+            other => panic!("expected a confirm, got {other:?}"),
+        }
+    }
+
+    fn upsert_agent(app: &mut App, id: &str, wt: &str, name: &str, archived: bool) {
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity(id, wt, name, archived),
+            },
+        );
+    }
+
+    /// The last card of a linked worktree: `d`'s confirm asks about the
+    /// checkout in the same dialog, BEFORE anything is deleted — and the
+    /// key and the row menu build the very same dialog (INPUT PARITY).
+    #[test]
+    fn deleting_the_last_card_asks_about_the_worktree_first() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            let by_menu = menu_delete(&mut app, "a2");
+            app.overlay = None;
+
+            app.focus = Focus::Sessions;
+            app.sel_worktree = app
+                .visible_worktrees()
+                .iter()
+                .position(|w| w.id.0 == "w2")
+                .unwrap();
+            app.sel_session = 0;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+            let by_key = match &app.overlay {
+                Some(Overlay::Confirm(c)) => c.clone(),
+                other => panic!("d opens the confirm, got {other:?}"),
+            };
+            assert_eq!(
+                by_key.action, by_menu.action,
+                "key and menu share the dialog"
+            );
+            assert_eq!(by_key.message, by_menu.message);
+
+            assert_eq!(
+                by_key.action,
+                PendingAction::ThenDeleteWorktree {
+                    first: Box::new(PendingAction::DeleteAgent(AgentId("a2".into()))),
+                    worktree: WorktreeId("w2".into()),
+                    offered: true,
+                }
+            );
+            assert_eq!(by_key.title, "Delete agent", "still the card's own delete");
+            assert!(
+                by_key.message.contains("Delete agent 'agent-2'?")
+                    && by_key.message.contains("worktree 'feature'")
+                    && by_key.message.contains("delete it from disk too?"),
+                "one dialog carries both questions: {}",
+                by_key.message
+            );
+            assert!(
+                out.is_empty(),
+                "nothing is deleted before the answer: {out:?}"
+            );
+            assert!(app.tree.agents.iter().any(|a| a.id.0 == "a2"));
+        });
+    }
+
+    /// `Enter`/`y` is yes: the card's delete goes out, then the same
+    /// forced worktree delete the band's own `d` sends, and the band drops.
+    #[test]
+    fn yes_deletes_the_card_and_then_the_worktree() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            menu_delete(&mut app, "a2");
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "y answered it: {:?}", app.overlay);
+            let kinds: Vec<&str> = out
+                .iter()
+                .filter_map(|r| match r {
+                    ClientRequest::DeleteAgent { id, .. } if id.0 == "a2" => Some("delete-agent"),
+                    ClientRequest::DeleteWorktree {
+                        force: true, id, ..
+                    } if id.0 == "w2" => Some("delete-worktree"),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(kinds, ["delete-agent", "delete-worktree"], "{out:?}");
+            assert!(!app.tree.agents.iter().any(|a| a.id.0 == "a2"));
+            assert!(
+                !app.tree.worktrees.iter().any(|w| w.id.0 == "w2"),
+                "the band drops optimistically"
+            );
+        });
+    }
+
+    /// `n` is no: the card goes, the emptied checkout stays.
+    #[test]
+    fn no_deletes_the_card_and_keeps_the_worktree() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            menu_delete(&mut app, "a2");
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "n answered it: {:?}", app.overlay);
+            assert!(
+                out.iter()
+                    .any(|r| matches!(r, ClientRequest::DeleteAgent { id, .. } if id.0 == "a2")),
+                "the card's own delete goes out: {out:?}"
+            );
+            assert!(
+                delete_worktree_requests(&out).is_empty(),
+                "the worktree stays: {out:?}"
+            );
+            assert!(app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
+        });
+    }
+
+    /// `Esc` is cancel: the card stays alive and nothing is sent.
+    #[test]
+    fn esc_keeps_the_last_card_alive() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            menu_delete(&mut app, "a2");
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none());
+            assert!(out.is_empty(), "Esc deletes nothing: {out:?}");
+            assert!(
+                app.tree.agents.iter().any(|a| a.id.0 == "a2"),
+                "the card lives"
+            );
+            assert!(app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
+        });
+    }
+
+    /// The last terminal of a linked worktree asks the same way.
+    #[test]
+    fn closing_the_last_terminal_asks_about_the_worktree() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: terminal_entity("t1", "w2", "shell-1"),
+                },
+            );
+            let mut out = Vec::new();
+            run_menu_action(
+                &mut app,
+                MenuAction::CloseTerminal(TerminalId("t1".into())),
+                &mut out,
+            );
+            match &app.overlay {
+                Some(Overlay::Confirm(c)) => {
+                    assert_eq!(c.title, "Close terminal");
+                    assert_eq!(
+                        c.action,
+                        PendingAction::ThenDeleteWorktree {
+                            first: Box::new(PendingAction::CloseTerminal(TerminalId("t1".into()))),
+                            worktree: WorktreeId("w2".into()),
+                            offered: true,
+                        }
+                    );
+                }
+                other => panic!("expected the close confirm, got {other:?}"),
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                out.iter()
+                    .any(|r| matches!(r, ClientRequest::CloseTerminal { .. })),
+                "{out:?}"
+            );
+            assert_eq!(delete_worktree_requests(&out), ["w2"]);
+        });
+    }
+
+    /// A card left behind, or the ROOT WORKTREE, and the confirm is the
+    /// plain one: `n` cancels as it does everywhere else.
+    #[test]
+    fn a_card_left_behind_or_the_root_worktree_asks_nothing_extra() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            upsert_agent(&mut app, "a3", "w2", "agent-3", false);
+            let c = menu_delete(&mut app, "a2");
+            assert_eq!(
+                c.action,
+                PendingAction::DeleteAgent(AgentId("a2".into())),
+                "agent-3 still holds the worktree"
+            );
+            assert!(!c.message.contains("worktree"), "{}", c.message);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            assert!(out.is_empty(), "n on a plain confirm cancels: {out:?}");
+            assert!(app.tree.agents.iter().any(|a| a.id.0 == "a2"));
+
+            // a1 is the root worktree's only session: the root is never offered.
+            let c = menu_delete(&mut app, "a1");
+            assert_eq!(c.action, PendingAction::DeleteAgent(AgentId("a1".into())));
+        });
+    }
+
+    /// A `D` that takes every live row of a worktree asks about the
+    /// checkout in its own dialog, the same way.
+    #[test]
+    fn deleting_all_sessions_asks_about_the_worktree() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: terminal_entity("t1", "w2", "shell-1"),
+                },
+            );
+            app.focus = Focus::Sessions;
+            app.sel_worktree = app
+                .visible_worktrees()
+                .iter()
+                .position(|w| w.id.0 == "w2")
+                .unwrap();
+            open_delete_all_confirm(&mut app);
+            let action = match &app.overlay {
+                Some(Overlay::Confirm(c)) => c.action.clone(),
+                other => panic!("expected the delete-all confirm, got {other:?}"),
+            };
+            match action {
+                PendingAction::ThenDeleteWorktree {
+                    first,
+                    worktree,
+                    offered: true,
+                } => {
+                    assert_eq!(worktree, WorktreeId("w2".into()));
+                    assert!(
+                        matches!(*first, PendingAction::DeleteAllSessions { .. }),
+                        "{first:?}"
+                    );
+                }
+                other => panic!("expected the worktree question, got {other:?}"),
+            }
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(
+                out.iter()
+                    .filter(|r| matches!(
+                        r,
+                        ClientRequest::DeleteAgent { .. } | ClientRequest::CloseTerminal { .. }
+                    ))
+                    .count(),
+                2,
+                "both rows' own deletes went out: {out:?}"
+            );
+            assert_eq!(delete_worktree_requests(&out), ["w2"]);
+        });
+    }
+
+    /// With **Delete emptied worktree** on, the question is not asked: the
+    /// card's ordinary confirm says the worktree goes with it, `Enter`
+    /// deletes both, and `n` cancels like any two-way confirm.
+    #[test]
+    fn delete_empty_worktree_setting_skips_the_question() {
+        with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            let c = menu_delete(&mut app, "a2");
+            assert_eq!(
+                c.action,
+                PendingAction::ThenDeleteWorktree {
+                    first: Box::new(PendingAction::DeleteAgent(AgentId("a2".into()))),
+                    worktree: WorktreeId("w2".into()),
+                    offered: false,
+                }
+            );
+            let last = c.message.lines().last().unwrap();
+            assert!(
+                last.contains("goes with it") && !last.contains('?'),
+                "a statement, not a question, after the card's own one: {last}"
+            );
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            assert!(out.is_empty(), "n cancels a two-way confirm: {out:?}");
+
+            menu_delete(&mut app, "a2");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                out.iter()
+                    .any(|r| matches!(r, ClientRequest::DeleteAgent { id, .. } if id.0 == "a2")),
+                "{out:?}"
+            );
+            assert_eq!(delete_worktree_requests(&out), ["w2"]);
+            assert!(!app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
+        });
+    }
+
+    /// Archived sessions still filed under the worktree hold history the
+    /// delete would take, so even the forcing setting asks — and the
+    /// dialog says how many.
+    #[test]
+    fn archived_sessions_keep_the_question_even_when_forced() {
+        with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            upsert_agent(&mut app, "a3", "w2", "agent-3", true);
+            let c = menu_delete(&mut app, "a2");
+            assert!(
+                matches!(
+                    c.action,
+                    PendingAction::ThenDeleteWorktree { offered: true, .. }
+                ),
+                "{:?}",
+                c.action
+            );
+            assert!(
+                c.message.contains("1 archived session"),
+                "names the history at stake: {}",
+                c.message
+            );
+        });
     }
 }

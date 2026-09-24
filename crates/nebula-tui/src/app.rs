@@ -552,14 +552,32 @@ impl ContextMenu {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingAction {
     /// AddProject aimed at a path that doesn't exist yet: create the
-    /// directory (daemon-side, `git init` per its config) and add it.
+    /// directory, `git init` it (both daemon-side) and add it.
     CreateProjectDir(std::path::PathBuf),
+    /// AddProject aimed at a folder that is in no git repository: `git
+    /// init` it (daemon-side) and add it. A project is a repository, so
+    /// the folder is never added as it stands.
+    InitProjectRepo(std::path::PathBuf),
     /// `a` (or the row menu's Archive): archive the agent once the dialog
     /// is answered.
     ArchiveAgent(AgentId),
     DeleteAgent(AgentId),
     CloseTerminal(TerminalId),
     DeleteWorktree(WorktreeId),
+    /// A row delete that empties a linked worktree — the last card of the
+    /// band going — with the checkout's fate decided in the same dialog:
+    /// `Enter`/`y` runs `first` (the row's own delete) and then deletes
+    /// `worktree`. `offered` is the three-way dialog: `n` runs `first`
+    /// alone and keeps the empty checkout, `Esc` keeps the card too. With
+    /// the **Delete emptied worktree** SETTING on the question is not
+    /// asked (`offered == false`): the dialog is the row's ordinary
+    /// confirm, its message saying the worktree goes with it, and `n`
+    /// cancels as it does everywhere else.
+    ThenDeleteWorktree {
+        first: Box<PendingAction>,
+        worktree: WorktreeId,
+        offered: bool,
+    },
     /// Shift+D: every deletable worktree of the selected project.
     DeleteAllWorktrees(Vec<WorktreeId>),
     /// Shift+D: every session row the panel currently shows — agents and
@@ -3149,15 +3167,6 @@ pub struct App {
     /// Appearance, or the Worktrees panel menu). Read on every look at
     /// the list (`listed_open_prs`), never applied to what is stored.
     pub hide_draft_prs: bool,
-    /// The KEY COMBO DISPLAY is on; mirrors CONFIG.JSON's `show_key_combos`
-    /// (Settings → Experimental). `key_combo` is what it is showing.
-    pub show_key_combos: bool,
-    /// PR & ISSUE COUNTS are on: each PROJECTS PANEL row counts its repo's
-    /// open pull requests and issues after its name; mirrors CONFIG.JSON's
-    /// `pr_issue_counts` (Settings → Experimental). Read through
-    /// `project_open_counts`, and what lets `issues::sweep_others` ask
-    /// about the projects the cursor is not on.
-    pub pr_issue_counts: bool,
     /// Nothing in the LAUNCHER VIEW's GRID is selected: the aim has been
     /// let go of — by a click on the air between the cards, or by the
     /// first Esc (`event_loop::launcher::clear_aim`). No card is drawn
@@ -3276,8 +3285,8 @@ pub struct App {
     /// its bounds from here.
     pub launcher_body: Rect,
     /// The last key press, spelled for the bottom-left of the screen with
-    /// what it did, while the display is on and the press is fresh; the
-    /// loop clears it after `key_combo::LINGER`. See `key_combo.rs`.
+    /// what it did, while the press is fresh; the loop clears it after
+    /// `key_combo::LINGER`. See `key_combo.rs`.
     pub key_combo: Option<crate::key_combo::KeyCombo>,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
@@ -3464,14 +3473,9 @@ pub struct App {
     /// The checkout the sweep is reading right now; its answer clears it.
     pub worktree_changes_inflight: Option<WorktreeId>,
     /// The lines added and removed in each checkout, read beside its
-    /// changed-file count while CARD LINE COUNTS is on: what its cards
-    /// print after `+3 files`. Only a checkout with changed lines has an
-    /// entry.
+    /// changed-file count: what its cards print after `+3 files`. Only a
+    /// checkout with changed lines has an entry.
     pub worktree_lines: HashMap<WorktreeId, crate::git_diff::LineChanges>,
-    /// Mirrors CONFIG.JSON's `card_line_changes` (Settings → Appearance):
-    /// the reads behind `worktree_lines` run, and the cards print them,
-    /// only while it is on.
-    pub card_line_changes: bool,
     /// What `gh pr view` last said about each worktree's branch: `Some(pr)`
     /// when one exists, `None` when the lookup came back empty (no PR, no
     /// `gh`, no remote). A missing key means "not looked up yet" — briefly,
@@ -3706,8 +3710,6 @@ impl App {
             issues_collapsed: false,
             collapsed: false,
             hide_draft_prs: false,
-            show_key_combos: false,
-            pr_issue_counts: true,
             launcher_unaimed: false,
             launcher_pane_h: None,
             launcher_pane_w: None,
@@ -3775,7 +3777,6 @@ impl App {
             worktree_changes: HashMap::new(),
             worktree_changes_inflight: None,
             worktree_lines: HashMap::new(),
-            card_line_changes: false,
             pull_requests: HashMap::new(),
             merge_landed: HashMap::new(),
             pr_seen: HashMap::new(),
@@ -4428,13 +4429,9 @@ impl App {
         self.worktree_changes.get(id).and_then(|(count, _)| *count)
     }
 
-    /// A checkout's last-read line counts, for its cards: None while CARD
-    /// LINE COUNTS is off, until one has been read there, or when nothing
-    /// changed by the line.
+    /// A checkout's last-read line counts, for its cards: None until one
+    /// has been read there, or when nothing changed by the line.
     pub fn worktree_lines(&self, id: &WorktreeId) -> Option<crate::git_diff::LineChanges> {
-        if !self.card_line_changes {
-            return None;
-        }
         self.worktree_lines.get(id).copied()
     }
 
@@ -5165,16 +5162,13 @@ impl App {
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
-    /// PR & ISSUE COUNTS for a project row, while the switch is on: how
-    /// many open pull requests its OPEN PRS GROUP lists (drafts left out
-    /// with `hide_draft_prs`, so the number is the group header's), and
-    /// how many issues are open on the repo. Each is `None` until its list
-    /// has landed — a repo nobody has asked about yet says nothing rather
-    /// than `0` — and both are `None` with the switch off.
+    /// PR & ISSUE COUNTS for a project row: how many open pull requests
+    /// its OPEN PRS GROUP lists (drafts left out with `hide_draft_prs`, so
+    /// the number is the group header's), and how many issues are open on
+    /// the repo. Each is `None` until its list has landed — a repo nobody
+    /// has asked about yet says nothing rather than `0`. Always counted:
+    /// there is no switch.
     pub fn project_open_counts(&self, project_id: &ProjectId) -> (Option<usize>, Option<usize>) {
-        if !self.pr_issue_counts {
-            return (None, None);
-        }
         let prs = self.open_prs.get(project_id).map(|open| {
             open.list
                 .iter()

@@ -19,6 +19,7 @@ use crate::agent_presets::{AgentPreset, PresetText};
 use crate::app::{
     clamp_selection, window_start, App, ConfirmDialog, Focus, Overlay, PendingAction, PromptKind,
 };
+use crate::quick_prompt::QuickTarget;
 use crate::text_input::TextInput;
 use crate::theme::Theme;
 use crate::ui::{
@@ -78,6 +79,15 @@ pub struct AgentPresetsView {
     /// editor and the delete confirm carry this along so both come back to
     /// the picker, not to a manager launching into `worktree`.
     pub quick: Option<crate::quick_prompt::QuickReturn>,
+    /// Where the launch lands once `Tab` (or a click on the list's
+    /// `[ ] new worktree` row) has flipped it: a fresh worktree, or back
+    /// to a checkout. None is where the list was opened for — `worktree`
+    /// in the manager, the launch's own target in a picker — so Esc on a
+    /// picker still hands its box back unchanged.
+    pub aim: Option<QuickTarget>,
+    /// Screen rect of the NEW WORKTREE row, written back during draw so a
+    /// click there flips it as `Tab` does.
+    pub toggle_area: Rect,
 }
 
 impl AgentPresetsView {
@@ -90,7 +100,34 @@ impl AgentPresetsView {
             area: Rect::default(),
             list_area: Rect::default(),
             quick: None,
+            aim: None,
+            toggle_area: Rect::default(),
         }
+    }
+
+    /// Where Enter launches: the flipped `aim`, else the picker's launch
+    /// target, else the manager's `worktree`.
+    pub fn target(&self) -> QuickTarget {
+        self.aim
+            .clone()
+            .or_else(|| self.quick.as_ref().map(|q| q.launch.target.clone()))
+            .unwrap_or_else(|| QuickTarget::Worktree(self.worktree.clone()))
+    }
+
+    /// Does Enter cut a fresh worktree first?
+    pub fn is_new_worktree(&self) -> bool {
+        matches!(self.target(), QuickTarget::NewWorktree { .. })
+    }
+
+    /// The picker's box with the flipped `aim` applied — what Enter hands
+    /// over, and what the editor and the delete confirm carry so the flip
+    /// survives the trip.
+    pub fn aimed_quick(&self) -> Option<crate::quick_prompt::QuickReturn> {
+        let mut back = self.quick.clone()?;
+        if let Some(aim) = &self.aim {
+            back.launch.target = aim.clone();
+        }
+        Some(back)
     }
 
     /// Is this list a QUICK PROMPT picker rather than the manager?
@@ -795,7 +832,7 @@ pub(crate) fn open_delete_preset_confirm(app: &mut App, view: &AgentPresetsView)
         action: PendingAction::DeleteAgentPreset {
             index: view.selected,
             worktree: view.worktree.clone(),
-            quick: view.quick.clone().map(Box::new),
+            quick: view.aimed_quick().map(Box::new),
         },
         area: ratatui::layout::Rect::default(),
     }));
@@ -826,6 +863,22 @@ pub(crate) fn open_agent_preset_task(
         return;
     }
     let skip = preset.skip_task;
+    // Flipped onto a fresh worktree: only the QUICK PROMPT's launch cuts
+    // one first, so the preset goes on that box — sent at once for a
+    // `skip`-task preset, as the task box would be.
+    if let Some(target @ QuickTarget::NewWorktree { .. }) = view.aim.clone() {
+        let launch = crate::quick_prompt::QuickLaunch::of_preset(
+            target,
+            preset,
+            &crate::config::Config::load(),
+        );
+        if skip {
+            crate::event_loop::submit_prompt_now(app, PromptKind::QuickPrompt(launch), out);
+        } else {
+            crate::quick_prompt::reopen(app, launch, "");
+        }
+        return;
+    }
     let kind = PromptKind::AgentPresetTask {
         worktree: view.worktree.clone(),
         preset,
@@ -893,11 +946,18 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<Client
         // close: the box comes back exactly as it left, text and all. A
         // picker reached with no box up (`e` on a pull request or an
         // issue) closes as the manager does — it used to put up an empty
-        // box nobody asked for.
+        // box nobody asked for — unless it stands on the ISSUES or PULL
+        // REQUESTS MODAL (their `Shift+Tab`), which it leaves on its row.
         KeyCode::Esc => match view.box_behind().cloned() {
             Some(back) => crate::quick_prompt::reopen(app, back.launch, &back.text),
-            None => app.overlay = None,
+            None => match view.quick.clone().and_then(|back| back.launch.under) {
+                Some(under) => under.reopen(app),
+                None => app.overlay = None,
+            },
         },
+        // Letters type ahead and Enter picks, so the NEW WORKTREE toggle
+        // is the one key left free on the list — in every mode.
+        KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => toggle_new_worktree(app),
         KeyCode::Down => view.step(1),
         KeyCode::Up => view.step(-1),
         KeyCode::Char('n') if ctrl => view.step(1),
@@ -911,14 +971,14 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<Client
         // request, and the next Enter launched a plain session into the
         // picker's context checkout (for a PR SESSION, the ROOT WORKTREE).
         KeyCode::Char('a') if ctrl => {
-            let (worktree, quick) = (view.worktree.clone(), view.quick.clone());
+            let (worktree, quick) = (view.worktree.clone(), view.aimed_quick());
             open_agent_preset_editor(app, worktree, quick, None);
         }
         KeyCode::Char('e') if ctrl => {
             if view.presets.is_empty() {
                 app.flash = Some("no preset selected — Ctrl+a creates one".into());
             } else {
-                let (worktree, quick) = (view.worktree.clone(), view.quick.clone());
+                let (worktree, quick) = (view.worktree.clone(), view.aimed_quick());
                 let index = view.selected;
                 open_agent_preset_editor(app, worktree, quick, Some(index));
             }
@@ -967,10 +1027,55 @@ fn activate_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
         return;
     };
     let view = view.clone();
-    match view.quick {
+    match view.aimed_quick() {
         Some(back) => apply_preset_to_quick_prompt(app, &view.presets, view.selected, back, out),
         None => open_agent_preset_task(app, &view, out),
     }
+}
+
+/// `Tab` on the AGENT PRESETS list, and a click on its `[ ] new worktree`
+/// row: flip where the launch lands between a fresh worktree and a
+/// checkout — the manager's between the worktree `e` was pressed on and a
+/// fresh one of its project, a picker's through the same flip the QUICK
+/// PROMPT's `^N` makes (`launcher::flipped_target`), so the box it hands
+/// over is already aimed. A PR SESSION has nothing to flip: its checkout
+/// is the pull request's own, and the footer says so. INPUT PARITY: the
+/// key and the click both call this.
+pub(crate) fn toggle_new_worktree(app: &mut App) {
+    let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+        return;
+    };
+    let home = QuickTarget::Worktree(view.worktree.clone());
+    let flipped = match view.aimed_quick() {
+        Some(back) => crate::launcher::flipped_target(app, &back.launch),
+        None if view.is_new_worktree() => Ok(home.clone()),
+        None => app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.id == view.worktree)
+            .map(|w| {
+                let taken = app.project_branches(&w.project_id);
+                QuickTarget::NewWorktree {
+                    project: w.project_id.clone(),
+                    branch: crate::branch_name::random_name(&taken),
+                }
+            })
+            .ok_or("worktree no longer exists"),
+    };
+    match flipped {
+        Ok(target) => {
+            if let Some(Overlay::AgentPresets(view)) = &mut app.overlay {
+                let own = view
+                    .quick
+                    .as_ref()
+                    .map_or(home, |q| q.launch.target.clone());
+                view.aim = (target != own).then_some(target);
+            }
+        }
+        Err(why) => app.flash = Some(format!("agent presets: {why}")),
+    }
+    app.dirty = true;
 }
 
 /// Keys in the PRESET EDITOR: Tab order between fields, choice cycling,
@@ -1070,6 +1175,9 @@ pub(crate) fn handle_list_mouse(
             app.dirty = true;
         }
         // Rows are the visible ones — whatever the type-ahead left.
+        MouseEventKind::Down(MouseButton::Left) if view.toggle_area.contains(mouse_pos) => {
+            toggle_new_worktree(app);
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             let list = view.list_area;
             let first = view.window_start(list.height as usize);
@@ -1120,10 +1228,10 @@ pub(crate) fn draw_list(f: &mut Frame, app: &mut App, view: &AgentPresetsView, t
     let cursor = view.cursor(&visible);
     let selected = visible.get(cursor).map_or(0, |(index, _)| *index);
     // Sized for every preset, not the filtered few, so the frame holds
-    // still under the typing.
+    // still under the typing — plus the NEW WORKTREE row under them.
     let height = (total.max(1) as u16)
-        .saturating_add(2)
-        .clamp(5, f.area().height.max(5));
+        .saturating_add(3)
+        .clamp(6, f.area().height.max(6));
     let area = centered_rect(f.area(), AGENT_PRESETS_W, height);
     f.render_widget(Clear, area);
     // In QUICK PROMPT picker mode Enter applies the row to the launch
@@ -1144,8 +1252,23 @@ pub(crate) fn draw_list(f: &mut Frame, app: &mut App, view: &AgentPresetsView, t
     let hint = modal_hint(view);
     let block = modal_block(&title, th)
         .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
-    let inner = block.inner(area);
+    let frame_inner = block.inner(area);
     f.render_widget(block, area);
+    // The last row inside the frame is where the launch lands; the
+    // presets fill the rest.
+    let toggle_area = Rect {
+        y: frame_inner.bottom().saturating_sub(1),
+        height: frame_inner.height.min(1),
+        ..frame_inner
+    };
+    let inner = Rect {
+        height: frame_inner.height.saturating_sub(1),
+        ..frame_inner
+    };
+    f.render_widget(
+        Paragraph::new(worktree_line(app, view, toggle_area.width, th)),
+        toggle_area,
+    );
 
     if total == 0 {
         empty_list_row(f, inner, "no presets yet — Ctrl+a creates one", th);
@@ -1195,8 +1318,75 @@ pub(crate) fn draw_list(f: &mut Frame, app: &mut App, view: &AgentPresetsView, t
     if let Some(Overlay::AgentPresets(v)) = &mut app.overlay {
         v.area = area;
         v.list_area = inner;
+        v.toggle_area = toggle_area;
         v.selected = selected;
     }
+}
+
+/// The list's bottom row: where Enter launches, and the `[ ] new worktree
+/// Tab` toggle, drawn as the QUICK PROMPT's target row is — quiet on a
+/// checkout, a green NEW WORKTREE chip and the branch it will cut once
+/// flipped. A PR SESSION names the pull request's head branch, the
+/// checkout the DAEMON reuses or cuts, with nothing to flip. The right
+/// half is dropped whole before the left is cut short.
+fn worktree_line(app: &App, view: &AgentPresetsView, width: u16, th: Theme) -> Line<'static> {
+    let dim = Style::default().fg(th.dim);
+    let target = view.target();
+    let branch = match &target {
+        QuickTarget::NewWorktree { branch, .. } => branch.clone(),
+        QuickTarget::Worktree(id) => app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| &w.id == id)
+            .map_or_else(|| "(worktree gone)".into(), |w| w.branch.clone()),
+    };
+    let pr = view.quick.as_ref().and_then(|q| q.launch.pr.as_ref());
+    let (left, right) = if let Some(pr) = pr {
+        (
+            vec![
+                Span::styled(format!(" PR #{} · worktree: ", pr.number), dim),
+                Span::styled(pr.head.clone(), Style::default().fg(th.muted)),
+            ],
+            vec![Span::styled("reused or cut on Enter ", dim)],
+        )
+    } else if view.is_new_worktree() {
+        let chip = Style::default()
+            .fg(th.on_accent)
+            .bg(th.ok)
+            .add_modifier(Modifier::BOLD);
+        let on = Style::default().fg(th.ok).add_modifier(Modifier::BOLD);
+        (
+            vec![
+                Span::raw(" "),
+                Span::styled(" NEW WORKTREE ", chip),
+                Span::styled(format!(" {branch}"), on),
+            ],
+            vec![
+                Span::styled("[✓] new worktree", on),
+                Span::styled(" Tab ", Style::default().fg(th.ok)),
+            ],
+        )
+    } else {
+        (
+            vec![
+                Span::styled(" worktree: ", dim),
+                Span::styled(branch, Style::default().fg(th.muted)),
+            ],
+            vec![
+                Span::styled("[ ] new worktree", dim),
+                Span::styled(" Tab ", dim),
+            ],
+        )
+    };
+    let left_w: usize = left.iter().map(|s| s.width()).sum();
+    let right_w: usize = right.iter().map(|s| s.width()).sum();
+    let mut spans = left;
+    if usize::from(width) > left_w + right_w {
+        spans.push(Span::raw(" ".repeat(usize::from(width) - left_w - right_w)));
+        spans.extend(right);
+    }
+    Line::from(spans)
 }
 
 /// The PRESET EDITOR form — under a banner saying why the last Enter saved

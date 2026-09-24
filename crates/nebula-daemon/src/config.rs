@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Run `git init` after AddProject creates a missing directory.
-    pub git_init_on_create: bool,
     /// Pre-spawn agent CLIs while the user is still naming the session so
     /// creation feels instant. Costs one idle CLI process per warm slot.
     pub prewarm_agents: bool,
@@ -73,7 +71,6 @@ pub struct ProjectConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            git_init_on_create: true,
             prewarm_agents: true,
             prewarm_sessions: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
@@ -158,15 +155,6 @@ fn parse_timeout(s: &str) -> Option<Option<std::time::Duration>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn defaults_enable_git_init() {
-        assert!(Config::default().git_init_on_create);
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(cfg.git_init_on_create);
-        let cfg: Config = serde_json::from_str(r#"{"git_init_on_create": false}"#).unwrap();
-        assert!(!cfg.git_init_on_create);
-    }
-
     /// One mistyped key — or a key a newer nebula changed the type of —
     /// takes its default without dragging every other setting down with it.
     #[test]
@@ -174,13 +162,13 @@ mod tests {
         let obj = serde_json::json!({
             "prewarm_agents": "nope",
             "session_idle_timeout": "1h",
-            "git_init_on_create": false,
+            "prewarm_sessions": false,
         });
         let (cfg, skipped) =
             nebula_core::settings::parse_lenient::<Config>(obj.as_object().unwrap());
         assert!(cfg.prewarm_agents, "the unreadable key takes its default");
         assert_eq!(cfg.session_idle_timeout, "1h");
-        assert!(!cfg.git_init_on_create);
+        assert!(!cfg.prewarm_sessions);
         assert_eq!(skipped.len(), 1);
     }
 
@@ -192,7 +180,7 @@ mod tests {
         let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(raw).unwrap();
         let (cfg, skipped) = nebula_core::settings::parse_lenient::<Config>(&obj);
         assert!(skipped.is_empty(), "{skipped:?}");
-        assert!(!cfg.git_init_on_create && !cfg.prewarm_agents && !cfg.prewarm_sessions);
+        assert!(!cfg.prewarm_agents && !cfg.prewarm_sessions);
         assert_eq!(cfg.session_idle_timeout, "30m");
         assert_eq!(cfg.worktree_base_branch, "develop");
         assert_eq!(cfg.custom_harnesses.len(), 1, "the legacy list reads");

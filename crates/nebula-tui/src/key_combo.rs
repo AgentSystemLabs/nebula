@@ -1,4 +1,5 @@
-//! The KEY COMBO DISPLAY (Settings → Experimental, `show_key_combos`):
+//! The KEY COMBO DISPLAY, always on (through 0.37 an Experimental
+//! switch, `show_key_combos` — retired, and never read now):
 //! each key pressed in the panels, spelled at the bottom left of the
 //! screen with what it did — `j - Move down`, `^d - Half page down`,
 //! `l l - Enter pane` — so someone watching over a shoulder or a screen
@@ -47,10 +48,10 @@ impl KeyCombo {
     }
 }
 
-/// Record a press for the display. A no-op while the setting is off, so
-/// callers need not check; the newest press always replaces the last.
+/// Record a press for the display; the newest press always replaces the
+/// last. An empty press is not a combo and leaves the last one standing.
 pub fn note(app: &mut App, keys: &[KeyChord], does: Option<&str>) {
-    if !app.show_key_combos || keys.is_empty() {
+    if keys.is_empty() {
         return;
     }
     app.key_combo = Some(KeyCombo {
@@ -163,13 +164,11 @@ mod tests {
     }
 
     #[test]
-    fn note_is_a_no_op_while_the_setting_is_off_and_replaces_the_last_press_while_on() {
+    fn note_records_the_press_and_replaces_the_last() {
         let mut app = App::new();
         let j = chord(KeyCode::Char('j'), KeyModifiers::NONE);
-        note(&mut app, &[j], Some("Move down"));
-        assert!(app.key_combo.is_none(), "off by default: nothing recorded");
+        assert!(app.key_combo.is_none(), "nothing pressed yet");
 
-        app.show_key_combos = true;
         app.dirty = false;
         note(&mut app, &[j], Some("Move down"));
         assert_eq!(app.key_combo.as_ref().unwrap().text(), "j - Move down");
@@ -193,7 +192,6 @@ mod tests {
     #[test]
     fn a_double_tap_is_one_combo_worded_from_the_footer_hint() {
         let mut app = App::new();
-        app.show_key_combos = true;
         let l = chord(KeyCode::Right, KeyModifiers::NONE);
         note_double_tap(&mut app, &l, "enter pane");
         assert_eq!(app.key_combo.as_ref().unwrap().text(), "→ → - Enter pane");

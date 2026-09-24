@@ -8,7 +8,6 @@
 mkdir -p "$WORK/data"
 cat > "$WORK/data/config.json" <<JSON
 {"prewarm_agents": false, "prewarm_sessions": false, "session_pane": "${NEBULA_SHOT_PANE:-bottom}",
- "card_line_changes": true,
  "claude_model": "opus", "claude_effort": "high", "codex_model": "gpt-5.6-sol", "codex_effort": "high"}
 JSON
 mk() {

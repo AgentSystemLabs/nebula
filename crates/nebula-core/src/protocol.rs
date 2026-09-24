@@ -60,8 +60,10 @@ pub enum ClientRequest {
         req_id: u64,
         path: PathBuf,
         name: Option<String>,
-        /// Create `path` (and `git init` it, per config) when it doesn't
-        /// exist on disk. Set only after the user confirmed in the client.
+        /// Make `path` a repository if it isn't one: create the directory
+        /// when it doesn't exist on disk, and `git init` it when it isn't
+        /// inside a repository. Set only after the user confirmed in the
+        /// client.
         create_missing: bool,
     },
     RemoveProject {

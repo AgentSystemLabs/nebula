@@ -124,19 +124,15 @@ impl ModalUnder {
 /// The modal under `overlay`: the box's own, or the one under the box a
 /// picker opened from it is drawn over — `Tab`'s harness list, `^P`'s
 /// PROJECT PICKER, `Shift+Tab`'s AGENT PRESETS — so the layers stay put
-/// while the box's spec is rewritten.
+/// while the box's spec is rewritten. A picker the modal opened itself
+/// (`Shift+Tab` in the ISSUES MODAL) stands on it the same way.
 pub(crate) fn modal_under(overlay: &Overlay) -> Option<ModalUnder> {
     match overlay {
         Overlay::Prompt(prompt) => match &prompt.kind {
             PromptKind::QuickPrompt(launch) => launch.under.clone(),
             _ => None,
         },
-        other => {
-            held_return(other)
-                .filter(|back| back.from_box)?
-                .launch
-                .under
-        }
+        other => held_return(other)?.launch.under,
     }
 }
 

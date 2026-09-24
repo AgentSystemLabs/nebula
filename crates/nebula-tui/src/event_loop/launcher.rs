@@ -655,12 +655,6 @@ pub(super) fn handle_action(
         Action::OpenIssue => open_issue(app, out),
         // `⇧P` on a card: another session with its settings, nothing typed.
         Action::DuplicateSession => duplicate_session(app),
-        // `m` with no card selected — the aim let go of, or a project with
-        // no sessions yet — is the PROJECT's menu: there is no session
-        // under the cursor for it to be the menu of.
-        Action::ContextMenu if app.launcher_unaimed || view::bands(app).is_empty() => {
-            project_menu(app, super::KEYBOARD_MENU_ANCHOR)
-        }
         // The fold is a preference the view keeps, and its key is the way
         // out of the pane first ([`fold_key`]). `⇧Z` / `^B` is the same
         // fold under its old "give it the full width" name, since the pane
@@ -735,7 +729,7 @@ pub(super) fn open_pull_request(app: &mut App, out: &mut Vec<ClientRequest>) {
         Some(pr) => super::open_link(app, &pr.url, out),
         None => {
             app.flash = Some(format!(
-                "no pull request on {} yet — ⇧R asks GitHub again",
+                "no pull request on {} yet — ⇧R reloads from GitHub",
                 band.branch
             ))
         }
@@ -884,11 +878,10 @@ fn issue_ref(app: &App, project: &ProjectId, url: &str) -> Option<crate::issues:
     })
 }
 
-/// The PROJECT's own menu — `m` with no card selected, and a right-click
-/// on its PROJECT TAB ([`tab_menu`]): what the PROJECTS and WORKTREES
-/// panels' rows carried between them — a checkout cut in it, the project
-/// renamed or dropped, and the RUN COMMAND of the checkout the grid would
-/// launch into started or stopped. These have no key of their own on the
+/// The PROJECT's own menu — a right-click on its PROJECT TAB ([`tab_menu`]):
+/// what the PROJECTS and WORKTREES panels' rows carried between them — a
+/// checkout cut in it, the project renamed or dropped, and the RUN COMMAND
+/// of the checkout the grid would launch into started or stopped. These have no key of their own on the
 /// grid, whose letters belong to the session under the cursor, so the
 /// project's menu is where they live. `at` is where it hangs.
 fn project_menu(app: &mut App, at: (u16, u16)) {
@@ -2020,40 +2013,11 @@ pub(super) fn click_new_worktree(app: &mut App) {
 /// `quick_prompt_new_worktree` SETTING. A PR SESSION's checkout is the
 /// DAEMON's to pick, so it has nothing to flip.
 fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
-    if launch.pr.is_some() {
-        app.flash =
-            Some("quick prompt: a PR session runs in the pull request's own checkout".into());
-        return;
+    match view::flipped_target(app, &launch) {
+        Ok(target) => reopen_with(app, QuickLaunch { target, ..launch }, input),
+        Err(why) if launch.pr.is_some() => app.flash = Some(format!("quick prompt: {why}")),
+        Err(why) => app.flash = Some(why.into()),
     }
-    let Some(project) = view::project_of(app, &launch.target) else {
-        app.flash = Some("project no longer exists".into());
-        return;
-    };
-    let fresh = !launch.is_new_worktree();
-    let target = if fresh {
-        fresh_worktree(app, project, &launch)
-    } else {
-        match view::launch_checkout(app, &project) {
-            Some(worktree) => QuickTarget::Worktree(worktree),
-            None => {
-                app.flash = Some("no checkout to launch on — keeping the new worktree".into());
-                return;
-            }
-        }
-    };
-    reopen_with(app, QuickLaunch { target, ..launch }, input);
-}
-
-/// A fresh worktree for `launch` in `project`, on a branch nobody has
-/// yet: named after the issue for an ISSUE SESSION, the random name `n`
-/// would offer otherwise.
-fn fresh_worktree(app: &App, project: ProjectId, launch: &QuickLaunch) -> QuickTarget {
-    let taken = app.project_branches(&project);
-    let branch = match &launch.issue {
-        Some(issue) => crate::branch_name::issue_name(issue.number, &issue.title, &taken),
-        None => crate::branch_name::random_name(&taken),
-    };
-    QuickTarget::NewWorktree { project, branch }
 }
 
 /// The WORKTREE PICKER for the box `back` owes — `^T`, or a click on the
@@ -2111,7 +2075,7 @@ fn open_worktree_picker(app: &mut App, back: QuickReturn) {
     };
     let fresh = match &back.launch.target {
         QuickTarget::NewWorktree { .. } => back.launch.target.clone(),
-        QuickTarget::Worktree(_) => fresh_worktree(app, project.clone(), &back.launch),
+        QuickTarget::Worktree(_) => view::fresh_worktree(app, project.clone(), &back.launch),
     };
     let QuickTarget::NewWorktree { branch, .. } = &fresh else {
         unreachable!("fresh_worktree mints a new worktree")
@@ -3397,8 +3361,8 @@ mod tests {
         });
     }
 
-    /// INPUT PARITY: **Follow-up prompt** in the card's `m` menu opens the
-    /// same modal Space does.
+    /// INPUT PARITY: **Follow-up prompt** in the card's right-click menu
+    /// opens the same modal Space does.
     #[test]
     fn the_menu_row_opens_the_same_modal_space_does() {
         with_default_config(|| {
@@ -3406,7 +3370,7 @@ mod tests {
             draw(&mut app);
             let id = app.selected_session().map(|a| a.id.clone()).unwrap();
 
-            key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+            right_click_card(&mut app);
             let at = match &app.overlay {
                 Some(Overlay::Menu(menu)) => menu
                     .items
@@ -3445,7 +3409,7 @@ mod tests {
             assert!(app.overlay.is_none(), "no box over a cloud session");
             assert_eq!(
                 app.flash.as_deref(),
-                Some("cloud sessions take a queued message — m, then Send to cloud session"),
+                Some("cloud sessions take a queued message — right-click, then Send to cloud session"),
             );
         });
     }
@@ -3663,6 +3627,13 @@ mod tests {
     fn row_cell(app: &App, index: usize) -> (u16, u16) {
         let id = crate::launcher::rows(app)[index].agent.id.clone();
         card_cell(app, &SessionRef::Agent(id))
+    }
+
+    /// A right-click on the card under the cursor: its CONTEXT MENU.
+    fn right_click_card(app: &mut App) {
+        let id = app.selected_session().expect("a card under the cursor").id;
+        let (x, y) = card_cell(app, &SessionRef::Agent(id));
+        mouse(app, MouseEventKind::Down(MouseButton::Right), x, y);
     }
 
     /// A cell inside the card of `sref`, as drawn — whichever band it is
@@ -4845,33 +4816,20 @@ mod tests {
         });
     }
 
-    /// `m` with no card selected is the PROJECT's menu — there is no
-    /// session under the cursor for it to be the menu of — and with a
-    /// card selected it is still that card's.
+    /// `m` opens no menu — not a card's, and with no card selected not
+    /// the project's either. The menus are the right button's alone.
     #[test]
-    fn m_with_nothing_selected_is_the_projects_menu() {
+    fn m_opens_no_menu() {
         with_default_config(|| {
             let mut app = two_sessions();
             draw(&mut app);
             key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("the card's menu: {:?}", app.overlay);
-            };
-            assert!(
-                !menu.items.iter().any(|i| i.label == "Remove from list"),
-                "a card's menu is the card's"
-            );
-            app.overlay = None;
+            assert!(app.overlay.is_none(), "on a card: {:?}", app.overlay);
 
             keys(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
             assert!(app.launcher_unaimed);
             key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("the project's menu: {:?}", app.overlay);
-            };
-            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
-            assert!(labels.contains(&"Rename"), "{labels:?}");
-            assert!(labels.contains(&"Remove from list"), "{labels:?}");
+            assert!(app.overlay.is_none(), "unaimed: {:?}", app.overlay);
         });
     }
 
@@ -7226,10 +7184,10 @@ mod tests {
         out
     }
 
-    /// Where **Open pull request** sits on the card's `m` menu, if it is
-    /// there at all.
+    /// Where **Open pull request** sits on the card's right-click menu, if
+    /// it is there at all.
     fn pr_menu_row(app: &mut App) -> Option<usize> {
-        key(app, KeyCode::Char('m'), KeyModifiers::NONE);
+        right_click_card(app);
         match &app.overlay {
             Some(Overlay::Menu(menu)) => menu
                 .items
@@ -7272,6 +7230,28 @@ mod tests {
         });
     }
 
+    /// `⇧R` on the grid reloads from GitHub: the pull requests on the
+    /// loop's next turn, past every timer, and the project's issues with
+    /// them — asked of a checkout that is not on disk here, so the ask is
+    /// the miss it records without a process.
+    #[test]
+    fn shift_r_on_the_grid_reloads_pull_requests_and_issues() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let pid = app.selected_project().expect("a project").id.clone();
+            for p in app.tree.projects.iter_mut() {
+                p.repo_path = "/nonexistent/nebula-shift-r".into();
+            }
+            assert!(!app.issues_failed.contains(&pid));
+            let sent = key(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT);
+            assert!(sent.is_empty(), "gh runs client-side: {sent:?}");
+            assert!(app.pr_refresh_requested, "the pull requests are re-asked");
+            assert!(app.issues_failed.contains(&pid), "and the issues with them");
+            assert_eq!(app.flash.as_deref(), Some(crate::event_loop::RELOAD_FLASH));
+        });
+    }
+
     /// A card whose checkout has no pull request yet says so, naming the
     /// branch, and its menu carries no row for one.
     #[test]
@@ -7289,7 +7269,7 @@ mod tests {
             assert_eq!(
                 app.flash,
                 Some(format!(
-                    "no pull request on {branch} yet — ⇧R asks GitHub again"
+                    "no pull request on {branch} yet — ⇧R reloads from GitHub"
                 ))
             );
             assert_eq!(pr_menu_row(&mut app), None);
@@ -7522,9 +7502,9 @@ mod tests {
         app
     }
 
-    /// Where **Duplicate** sits on the card's `m` menu.
+    /// Where **Duplicate** sits on the card's right-click menu.
     fn duplicate_menu_row(app: &mut App) -> usize {
-        key(app, KeyCode::Char('m'), KeyModifiers::NONE);
+        right_click_card(app);
         match &app.overlay {
             Some(Overlay::Menu(menu)) => menu
                 .items
@@ -7682,9 +7662,10 @@ mod tests {
         app
     }
 
-    /// Where **Open issue** sits on the card's `m` menu, if it is there.
+    /// Where **Open issue** sits on the card's right-click menu, if it is
+    /// there.
     fn issue_menu_row(app: &mut App) -> Option<usize> {
-        key(app, KeyCode::Char('m'), KeyModifiers::NONE);
+        right_click_card(app);
         match &app.overlay {
             Some(Overlay::Menu(menu)) => menu.items.iter().position(|i| i.label == "Open issue"),
             other => panic!("expected the card's menu, got {other:?}"),

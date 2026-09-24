@@ -623,12 +623,18 @@ impl Daemon {
         name: Option<String>,
         create_missing: bool,
     ) -> Result<EntityId> {
-        if create_missing && !path.exists() {
-            tokio::fs::create_dir_all(path)
-                .await
-                .with_context(|| format!("create {}", path.display()))?;
-            if crate::config::Config::load().git_init_on_create {
-                git::init(path).await?;
+        if create_missing {
+            if !path.exists() {
+                tokio::fs::create_dir_all(path)
+                    .await
+                    .with_context(|| format!("create {}", path.display()))?;
+            }
+            // A project is a repository, so the confirmed folder becomes
+            // one — unless it already sits inside one, or git is missing
+            // and the check below should say so.
+            match git::repo_toplevel(path).await {
+                Err(e) if !git::is_missing(&e) => git::init(path).await?,
+                _ => {}
             }
         }
         // "not a git repository" is the right explanation only when git ran and

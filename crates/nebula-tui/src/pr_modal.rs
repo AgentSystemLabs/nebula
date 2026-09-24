@@ -16,7 +16,7 @@
 //! DIFF VIEWER's and the FILE FINDER's are: every letter typed narrows
 //! the rows to the fuzzy matches of `#42 title` (`fuzzy::rank`), best
 //! first, the cursor on the best, and Esc clears it before a second Esc
-//! closes. So the verbs are chords: `Ctrl+c` leaves a comment (the
+//! closes. So the verbs are chords: `Ctrl+c` or `Ctrl+y` leaves a comment (the
 //! COMMENT BOX the group row's `y` opens, which comes back to the modal
 //! on its row), `Ctrl+g` reads the whole diff, `Ctrl+o` opens the pull
 //! request in the browser, `Ctrl+r` asks GitHub again.
@@ -109,6 +109,10 @@ pub struct PullRequestsView {
     /// the follow-window's anchor, and what a click's row math counts
     /// from.
     pub cursor_row: usize,
+    /// The last click on a row — when, and which pull request — so a
+    /// second click on the same row inside the DOUBLE-CLICK window opens it
+    /// in the browser (`event_loop::is_double_click`).
+    pub last_row_click: Option<(std::time::Instant, u64)>,
 }
 
 impl PullRequestsView {
@@ -128,6 +132,7 @@ impl PullRequestsView {
             browser_area: Rect::default(),
             query: TextInput::new(),
             cursor_row: 0,
+            last_row_click: None,
         }
     }
 
@@ -484,14 +489,16 @@ fn open_prompt_for_selected(app: &mut App) {
 }
 
 /// `Shift+Tab`: one of the saved AGENT PRESETS as a PR SESSION on the pull
-/// request. The pick hands the same box `Enter` opens back with the preset
-/// applied; with no presets saved the footer says where to add one.
+/// request. The picker goes up over the modal, as `Enter`'s box does, and
+/// hands its pick to that same box with the preset applied; Esc puts the
+/// modal back on the row.
 fn open_preset_for_selected(app: &mut App) {
+    let under = ModalUnder::of(app.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
         crate::quick_prompt::open_preset_picker(
             app,
             QuickReturn {
-                launch,
+                launch: launch.with_under(under),
                 text: String::new(),
                 from_box: false,
             },
@@ -601,7 +608,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         KeyCode::BackTab => open_preset_for_selected(app),
         KeyCode::Tab if shift => open_preset_for_selected(app),
         KeyCode::Tab => open_harness_picker_for_selected(app),
-        KeyCode::Char('c') if ctrl => open_comment_for_selected(app),
+        // `Ctrl+y` is the grid's `y` (reply) as a chord, the letters being
+        // the filter's.
+        KeyCode::Char('c') | KeyCode::Char('y') if ctrl => open_comment_for_selected(app),
         KeyCode::Char('g') if ctrl => {
             if let Some(pr) = selected_pr(app) {
                 crate::event_loop::request_pr_diff_for(app, pr.number, pr.url.clone(), pr.label());
@@ -623,7 +632,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
 /// Mouse in the PULL REQUESTS MODAL: the wheel moves the cursor over the
 /// rows the filter leaves and scrolls the reading pane over it, a click on
 /// a row selects it (a launch is `Enter`, not a click — the row is
-/// something to read first), and a click outside closes (`overlay_close`);
+/// something to read first), a double-click on a row opens that pull
+/// request in the browser — the very open `Ctrl+o` and the `↗ open in
+/// browser` button run — and a click outside closes (`overlay_close`);
 /// everything else is swallowed.
 pub(crate) fn handle_mouse(
     app: &mut App,
@@ -648,14 +659,19 @@ pub(crate) fn handle_mouse(
             let list = view.list_area;
             let first = view.window_start(list.height as usize);
             // The row math counts the filter's matches, not the whole list.
-            let visible = visible_rows(
-                &view.query,
-                app.open_prs
-                    .get(&view.project)
-                    .map_or(&[], |open| open.list.as_slice()),
-            );
+            let prs: &[OpenPr] = app
+                .open_prs
+                .get(&view.project)
+                .map_or(&[], |open| open.list.as_slice());
+            let visible = visible_rows(&view.query, prs);
             if let Some(row) = crate::list_hit::row_at(list, first, visible.len(), mouse_pos) {
-                select(app, visible[row].0 as i64);
+                let index = visible[row].0;
+                let double =
+                    crate::event_loop::is_double_click(&mut view.last_row_click, prs[index].number);
+                select(app, index as i64);
+                if double {
+                    open_in_browser(app, out);
+                }
             }
         }
         _ => {}
@@ -665,7 +681,7 @@ pub(crate) fn handle_mouse(
 
 /// The footer's key line for the modal.
 pub(crate) fn footer_hint() -> &'static str {
-    "type to filter  ↑/↓ ^n/^p: pull request  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  Tab: harness  ⇧Tab: preset  ^c: comment  ^g: diff  ^o: browser  ^r: refresh  Esc: clear / close"
+    "type to filter  ↑/↓ ^n/^p: pull request  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  Tab: harness  ⇧Tab: preset  ^c/^y: comment  ^g: diff  ^o: browser  ^r: refresh  Esc: clear / close"
 }
 
 // ---- drawing ----
@@ -1203,6 +1219,21 @@ mod tests {
                 assert_eq!(back.launch.pr.as_ref(), Some(&expected));
                 assert!(!back.from_box, "no box to go back to");
             }
+            // A PR SESSION runs in the pull request's own checkout: the
+            // list's NEW WORKTREE `Tab` has nothing to flip, and says so.
+            app.flash = None;
+            crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Tab), &mut Vec::new());
+            let Some(Overlay::AgentPresets(presets)) = &app.overlay else {
+                panic!("Tab keeps the picker up, got {:?}", app.overlay);
+            };
+            assert!(presets.aim.is_none(), "{:?}", presets.aim);
+            assert!(
+                app.flash
+                    .as_deref()
+                    .is_some_and(|f| f.contains("own checkout")),
+                "{:?}",
+                app.flash
+            );
 
             open(&mut app);
             handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
@@ -1264,6 +1295,33 @@ mod tests {
             let mut out = Vec::new();
             crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Esc), &mut out);
             assert_eq!(view(&app).selected, 1, "back on #41");
+        });
+    }
+
+    /// `Ctrl+y` is `Ctrl+c`: the grid's `y` (reply) as a chord, onto the
+    /// same COMMENT BOX for the same row.
+    #[test]
+    fn ctrl_y_opens_the_comment_box_as_ctrl_c_does() {
+        pinned(|| {
+            let (mut app, _) = app_with(
+                vec![pr(42, "Fix login", false), pr(41, "Spike", true)],
+                true,
+            );
+            open(&mut app);
+            handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+            handle_key(&mut app, ctrl('y'), &mut Vec::new());
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("Ctrl+y: expected the comment box, got {:?}", app.overlay);
+            };
+            let PromptKind::PrComment { number, back, .. } = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert_eq!(*number, 41);
+            assert_eq!(
+                back.as_ref().map(|v| v.query.as_str()),
+                Some(""),
+                "not typed into the filter"
+            );
         });
     }
 
@@ -1598,6 +1656,55 @@ mod tests {
         let visible = visible_rows("login", list);
         assert_eq!(picked.number, list[visible[1].0].number);
         assert_ne!(picked.number, 41);
+    }
+
+    /// A double-click on a row opens that pull request in the browser —
+    /// the same open as `Ctrl+o` and the button (INPUT PARITY) — and the
+    /// modal stays up on the row. A single click only selects, and two
+    /// clicks on different rows are two single clicks.
+    #[test]
+    fn a_double_click_on_a_row_opens_it_in_the_browser() {
+        let (mut app, _) = app_with(
+            vec![pr(42, "Fix login", false), pr(41, "Docs pass", false)],
+            true,
+        );
+        open(&mut app);
+        screen(&mut app, 120, 40);
+        let list = view(&app).list_area;
+        let click_at = |app: &mut App, row: u16| {
+            let at = Position::new(list.x + 1, list.y + row);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: at.x,
+                row: at.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            let mut out = Vec::new();
+            handle_mouse(app, click, at, &mut out);
+        };
+
+        click_at(&mut app, 1);
+        assert_eq!(selected_pr(&app).unwrap().number, 41);
+        assert_eq!(app.flash, None, "one click only selects");
+        click_at(&mut app, 0);
+        assert_eq!(selected_pr(&app).unwrap().number, 42);
+        assert_eq!(app.flash, None, "a click on another row is a single click");
+        click_at(&mut app, 0);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("opened github.com/o/r/pull/42"),
+            "the second click on the row opens it"
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::PullRequests(_))),
+            "the modal stays up"
+        );
+        app.flash = None;
+        click_at(&mut app, 0);
+        assert_eq!(
+            app.flash, None,
+            "a double-click is spent: the third click starts over"
+        );
     }
 
     /// A bracketed paste lands in the filter as one line and narrows the

@@ -2068,9 +2068,10 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     wait_for_exit(&mut daemon);
 }
 
-/// AddProject with `create_missing` makes the directory and `git init`s it;
-/// with `git_init_on_create: false` in config.json the directory is still
-/// created but adding fails (not a git repository).
+/// AddProject with `create_missing` makes the directory and `git init`s it.
+/// An existing folder outside any repository is refused as it stands (not a
+/// git repository) and `git init`ed with `create_missing` — the client's
+/// confirm.
 #[tokio::test]
 async fn add_project_creates_missing_dir_and_inits() {
     let env = TestEnv::new();
@@ -2105,31 +2106,47 @@ async fn add_project_creates_missing_dir_and_inits() {
     );
     assert!(new_dir.join(".git").is_dir(), "git init ran in the new dir");
 
-    // Opt out of git init via config: the dir is created, the add errors.
-    std::fs::write(
-        env.tmp.path().join("data").join("config.json"),
-        r#"{"git_init_on_create": false}"#,
-    )
-    .unwrap();
-    let bare_dir = env.tmp.path().join("bare-new-project");
-    write_frame(
-        &mut c,
-        &ClientRequest::AddProject {
-            req_id: 2,
-            path: bare_dir.clone(),
-            name: None,
-            create_missing: true,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
-    assert!(
-        matches!(find_ack(&events, 2), Some(ServerEvent::Error { .. })),
-        "expected not-a-git-repo error: {events:#?}"
-    );
-    assert!(bare_dir.is_dir(), "dir created even without git init");
-    assert!(!bare_dir.join(".git").exists(), "git init skipped");
+    // An existing folder in no repository: refused as it stands…
+    let plain_dir = env.tmp.path().join("plain-folder");
+    std::fs::create_dir_all(&plain_dir).unwrap();
+    for (req_id, create_missing) in [(2, false), (3, true)] {
+        write_frame(
+            &mut c,
+            &ClientRequest::AddProject {
+                req_id,
+                path: plain_dir.clone(),
+                name: None,
+                create_missing,
+            },
+        )
+        .await
+        .unwrap();
+        let events =
+            read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, req_id).is_some()).await;
+        if create_missing {
+            // …and `git init`ed once the user said yes.
+            assert!(
+                matches!(
+                    find_ack(&events, req_id),
+                    Some(ServerEvent::Ack {
+                        created: Some(EntityId::Project(_)),
+                        ..
+                    })
+                ),
+                "AddProject with create_missing on a plain folder failed: {events:#?}"
+            );
+            assert!(
+                plain_dir.join(".git").is_dir(),
+                "git init ran in the folder"
+            );
+        } else {
+            assert!(
+                matches!(find_ack(&events, req_id), Some(ServerEvent::Error { .. })),
+                "expected not-a-git-repo error: {events:#?}"
+            );
+            assert!(!plain_dir.join(".git").exists(), "nothing inited unasked");
+        }
+    }
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
