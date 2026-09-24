@@ -275,7 +275,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   red while a session waits on you, else yellow while one is mid-turn, else blue while a finish is
   left unread — and holds still once the project is quiet. The sweep recolors the name in place,
   so no tab moves; the animations setting turns it off. The `+` in front of the tabs — or the
-  key `+` from the cards, or `⌘P` from inside the pane where the terminal sends ⌘ —
+  key `+` from the cards (`⌘P` is its silent alias inside the pane, where the terminal sends ⌘) —
   drops the PROJECT DROPDOWN: every project on the machine — the
   ones with a session waiting on you first, then the ones running, then the rest most recently
   worked in — the one in front of you ticked and each with how many sessions it holds, and a last
@@ -449,7 +449,7 @@ The list filters as you type, from the moment the modal is up — the FILE FINDE
 VIEWER's way, no key to press first: letters narrow the rows to the fuzzy matches of `#15 title`,
 best first, the cursor on the best with its comments asked for as any move asks for them, the matched
 letters lit in each row and the title's count reading `2/14`. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
-matches, and `Enter`, `Shift+Tab`, `Ctrl+e`, `Ctrl+c` and `Ctrl+o` act on the issue you found. `Esc`
+matches, and `Enter`, `Shift+Tab`, `Ctrl+e`, `Ctrl+c` (or `Ctrl+y`) and `Ctrl+o` act on the issue you found. `Esc`
 clears the filter, the cursor staying on that row, and a second `Esc` closes the modal, as in every
 fuzzy overlay; a filter nothing matches says `no issues match` and leaves the cursor where it was for
 the next letter or `Backspace` to decide. A refresh that retires the row under the cursor lands it on
@@ -529,7 +529,7 @@ one is there and cut by the DAEMON otherwise, its stand-in rows up under the pul
 moment you launch, and the PR's URL and work rule in the harness's context. The QUICK PROMPT stands
 on the modal as the ISSUES MODAL's does: the list stays under the box, `Esc` or a click outside puts
 you back on the pull request you opened it on, and the launch closes the modal onto the new
-session's card, the grid's cursor on it. `Ctrl+c` opens the
+session's card, the grid's cursor on it. `Ctrl+c` (or `Ctrl+y`) opens the
 COMMENT BOX on the pull request and comes back to the modal on the row — after `Enter` posts, after
 `Esc`, and after a post `gh` refused, with your text back in the box — `Ctrl+g` opens the pull request's
 whole diff, `Ctrl+o` — or a click on the `↗ open in browser` button pinned right on the reading pane's

@@ -16,7 +16,7 @@
 //! DIFF VIEWER's and the FILE FINDER's are: every letter typed narrows
 //! the rows to the fuzzy matches of `#42 title` (`fuzzy::rank`), best
 //! first, the cursor on the best, and Esc clears it before a second Esc
-//! closes. So the verbs are chords: `Ctrl+c` leaves a comment (the
+//! closes. So the verbs are chords: `Ctrl+c` or `Ctrl+y` leaves a comment (the
 //! COMMENT BOX the group row's `y` opens, which comes back to the modal
 //! on its row), `Ctrl+g` reads the whole diff, `Ctrl+o` opens the pull
 //! request in the browser, `Ctrl+r` asks GitHub again.
@@ -601,7 +601,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         KeyCode::BackTab => open_preset_for_selected(app),
         KeyCode::Tab if shift => open_preset_for_selected(app),
         KeyCode::Tab => open_harness_picker_for_selected(app),
-        KeyCode::Char('c') if ctrl => open_comment_for_selected(app),
+        // `Ctrl+y` is the grid's `y` (reply) as a chord, the letters being
+        // the filter's.
+        KeyCode::Char('c') | KeyCode::Char('y') if ctrl => open_comment_for_selected(app),
         KeyCode::Char('g') if ctrl => {
             if let Some(pr) = selected_pr(app) {
                 crate::event_loop::request_pr_diff_for(app, pr.number, pr.url.clone(), pr.label());
@@ -665,7 +667,7 @@ pub(crate) fn handle_mouse(
 
 /// The footer's key line for the modal.
 pub(crate) fn footer_hint() -> &'static str {
-    "type to filter  ↑/↓ ^n/^p: pull request  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  Tab: harness  ⇧Tab: preset  ^c: comment  ^g: diff  ^o: browser  ^r: refresh  Esc: clear / close"
+    "type to filter  ↑/↓ ^n/^p: pull request  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  Tab: harness  ⇧Tab: preset  ^c/^y: comment  ^g: diff  ^o: browser  ^r: refresh  Esc: clear / close"
 }
 
 // ---- drawing ----
@@ -1264,6 +1266,33 @@ mod tests {
             let mut out = Vec::new();
             crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Esc), &mut out);
             assert_eq!(view(&app).selected, 1, "back on #41");
+        });
+    }
+
+    /// `Ctrl+y` is `Ctrl+c`: the grid's `y` (reply) as a chord, onto the
+    /// same COMMENT BOX for the same row.
+    #[test]
+    fn ctrl_y_opens_the_comment_box_as_ctrl_c_does() {
+        pinned(|| {
+            let (mut app, _) = app_with(
+                vec![pr(42, "Fix login", false), pr(41, "Spike", true)],
+                true,
+            );
+            open(&mut app);
+            handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
+            handle_key(&mut app, ctrl('y'), &mut Vec::new());
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("Ctrl+y: expected the comment box, got {:?}", app.overlay);
+            };
+            let PromptKind::PrComment { number, back, .. } = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert_eq!(*number, 41);
+            assert_eq!(
+                back.as_ref().map(|v| v.query.as_str()),
+                Some(""),
+                "not typed into the filter"
+            );
         });
     }
 

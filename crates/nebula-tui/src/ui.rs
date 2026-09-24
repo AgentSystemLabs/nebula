@@ -939,12 +939,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Act(&[NextProjectTab, PrevProjectTab]),
                             "next / previous project tab",
                         ),
-                        (Lit("⌘1-9 / 1-9"), "open that project tab"),
+                        (Lit("1-9"), "open that project tab"),
                         (
                             Act(&[ProjectDropdown, CloseProjectTab]),
                             "project list / close tab",
                         ),
-                        (Act(&[AddProject]), "add a project"),
+                        (Act(&[AddProject]), "open a folder as a project"),
                         (Act(&[Palette]), "fuzzy jump to anything"),
                         (Lit("^o / ^f"), "jump pick: open / focus row"),
                         (
@@ -960,17 +960,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "CHECKOUTS & GITHUB",
                     &[
                         (Act(&[ContextMenu]), "menu: worktree · run · delete"),
-                        (Act(&[OpenWorktree]), "fire the open command"),
+                        (Act(&[OpenWorktree]), "open in editor (open command)"),
                         (Act(&[GitDiff]), "diff (^r reviewed, ^t tree)"),
-                        (
-                            Act(&[OpenRepo, OpenGhosttyTab]),
-                            "repo on GitHub / Ghostty tab",
-                        ),
+                        (Act(&[OpenRepo]), "the repo on GitHub"),
                         (
                             Act(&[OpenPullRequest, OpenIssue]),
                             "card's PR / issue on GitHub",
                         ),
-                        (Act(&[RefreshPullRequests]), "refresh pull requests now"),
+                        (Act(&[RefreshPullRequests]), "reload PRs + issues (GitHub)"),
                         (Act(&[Issues]), "issues: prompt, preset, edit"),
                         (Act(&[PullRequests]), "pull requests: read / launch"),
                         (Act(&[CommentPullRequest]), "comment on the pane's PR"),
@@ -995,7 +992,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[New]), "new session: pick a CLI first"),
                         (Act(&[DuplicateSession]), "quick prompt as this card"),
                         (Act(&[AgentPresets]), "agent presets: saved launches"),
-                        (Act(&[NewTerminal]), "new shell terminal"),
+                        (
+                            Act(&[NewTerminal, OpenGhosttyTab]),
+                            "terminal: here / in Ghostty",
+                        ),
                         (Act(&[FollowUp]), "follow-up prompt to the agent"),
                         (Act(&[Rename]), "rename the session"),
                         (
@@ -1027,6 +1027,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Act(&[ToggleLauncherPane, ToggleSidebars]),
                             "fold / unfold the pane",
                         ),
+                        // The SHIFT PAIRS' rule (#93), once, for every
+                        // letter above that has a shifted twin.
+                        (Lit("⇧ + letter"), "bigger, or outside nebula"),
                         (Act(&[Hosts]), "ssh hosts (a: new, d: del)"),
                         (Act(&[Settings]), "settings; Hotkeys tab rebinds"),
                         (Act(&[Metrics]), "memory: nebula + agents"),
@@ -1035,7 +1038,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ),
             ];
             // What to print in the key column: a literal, or every chord
-            // each action currently answers to.
+            // each action currently answers to but the ⌘ aliases
+            // (`Keymap::shown_chords`).
             // An action bound to more chords than the key column holds —
             // open's ⇧Enter ⇧O ⌥Enter — loses whole chords off the end
             // and gains an ellipsis, never a cut mid-chord; the Hotkeys
@@ -1046,7 +1050,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     Act(actions) => {
                         let full = actions
                             .iter()
-                            .map(|a| app.keymap.label(*a))
+                            .map(|a| app.keymap.shown_label(*a))
                             .collect::<Vec<_>>()
                             .join(" / ");
                         if actions.len() != 1 || full.chars().count() <= HELP_KEY_W {
@@ -1054,7 +1058,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         }
                         let chords: Vec<String> = app
                             .keymap
-                            .chords(actions[0])
+                            .shown_chords(actions[0])
                             .iter()
                             .map(|c| c.display().to_string())
                             .collect();
@@ -2485,7 +2489,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 /// which is the truth: that verb has no key right now.
 fn key_hint(app: &App, action: crate::keymap::Action) -> String {
     app.keymap
-        .first(action)
+        .shown_first(action)
         .map(|c| c.display())
         .unwrap_or_else(|| "—".into())
 }

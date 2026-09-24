@@ -9,7 +9,8 @@
 //! Codex / Cursor cold spawn's first prompt — so the agent knows which
 //! issue the session is for before it reads the first word of the task.
 //!
-//! `Ctrl+c` leaves a comment on the issue instead: a multi-row box (the task
+//! `Ctrl+c` (or `Ctrl+y`, the grid's reply key as a chord) leaves a
+//! comment on the issue instead: a multi-row box (the task
 //! prompts' shape) whose Enter posts the text as you with
 //! `gh issue comment`, off the loop, and puts the modal back on its row —
 //! the pane says the comment is on its way, and the conversation is read
@@ -814,6 +815,20 @@ pub(crate) fn refresh_selected(app: &mut App) {
     ask_selected_if_due(app);
 }
 
+/// `Shift+R` on the grid, reload from GitHub: ask for the selected
+/// project's open issues now, past the beat and a miss already
+/// remembered — the modal's `Ctrl+r` for the list, from outside it.
+pub(crate) fn reload_selected(app: &mut App) {
+    let Some((project, dir)) = app
+        .selected_project()
+        .map(|p| (p.id.clone(), p.repo_path.clone()))
+    else {
+        return;
+    };
+    app.issues_failed.remove(&project);
+    request_list(app, project, dir);
+}
+
 fn ask_selected_if_due(app: &mut App) {
     let Some((project, dir)) = app
         .selected_project()
@@ -1443,7 +1458,7 @@ pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
     if view.editor.is_some() {
         "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save to GitHub  Esc: cancel edit"
     } else {
-        "type to filter  ↑/↓ ^n/^p: issue  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  ⇧Tab: preset  ^e: edit  ^c: comment  ^o: browser  ^r: refresh  Esc: clear / close"
+        "type to filter  ↑/↓ ^n/^p: issue  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  ⇧Tab: preset  ^e: edit  ^c/^y: comment  ^o: browser  ^r: refresh  Esc: clear / close"
     }
 }
 
@@ -1611,7 +1626,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         KeyCode::Tab if shift => open_preset_for_selected(app),
         // The AGENT PRESETS list's edit chord.
         KeyCode::Char('e') if ctrl => open_editor(app),
-        KeyCode::Char('c') if ctrl => open_comment_for_selected(app),
+        // `Ctrl+y` is the grid's `y` (reply) as a chord, the letters being
+        // the filter's.
+        KeyCode::Char('c') | KeyCode::Char('y') if ctrl => open_comment_for_selected(app),
         KeyCode::Char('o') if ctrl => open_in_browser(app, out),
         KeyCode::Char('r') if ctrl => refresh(app),
         // Everything else feeds the always-live fuzzy filter, which edits
@@ -3481,6 +3498,55 @@ mod tests {
         assert_eq!(issues_view(&app).query.as_str(), "roce");
         assert!(editor(&app).is_none());
         assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+    }
+
+    /// `Shift+R` on the grid reloads the issues with the pull requests
+    /// (`reload_selected`): the list is asked for now, past a beat that
+    /// is not due.
+    #[test]
+    fn reload_asks_for_the_selected_projects_issues_past_the_beat() {
+        let mut app = App::new();
+        let project = seed_project(&mut app, "p1", "/nonexistent/nebula-issues-reload");
+        app.issues_due.insert(
+            project.clone(),
+            IssuesBeat {
+                due: std::time::Instant::now() + RECHECK_MAX,
+                backoff: None,
+            },
+        );
+        refresh_selected(&mut app);
+        assert!(app.issues_failed.is_empty(), "the tick waits for the beat");
+        reload_selected(&mut app);
+        assert!(
+            app.issues_failed.contains(&project),
+            "asked at once: not on disk, so a miss without a process"
+        );
+        reload_selected(&mut App::new());
+    }
+
+    /// `Ctrl+y` comments as `Ctrl+c` does: the grid's reply key, as a
+    /// chord because the letters are the filter's.
+    #[test]
+    fn ctrl_y_opens_the_comment_box_as_ctrl_c_does() {
+        for letter in ['c', 'y'] {
+            let (mut app, _) = modal_with(vec![issue(15, "Fix login redirect")]);
+            handle_key(
+                &mut app,
+                key(KeyCode::Char(letter), KeyModifiers::CONTROL),
+                &mut Vec::new(),
+            );
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!(
+                    "^{letter} should open the comment box, got {:?}",
+                    app.overlay
+                );
+            };
+            assert!(
+                matches!(prompt.kind, crate::app::PromptKind::IssueComment { .. }),
+                "{:?}",
+                prompt.kind
+            );
+        }
     }
 
     /// The form paints in the reading pane's place — the list still on

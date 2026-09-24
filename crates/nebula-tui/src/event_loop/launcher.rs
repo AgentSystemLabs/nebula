@@ -735,7 +735,7 @@ pub(super) fn open_pull_request(app: &mut App, out: &mut Vec<ClientRequest>) {
         Some(pr) => super::open_link(app, &pr.url, out),
         None => {
             app.flash = Some(format!(
-                "no pull request on {} yet — ⇧R asks GitHub again",
+                "no pull request on {} yet — ⇧R reloads from GitHub",
                 band.branch
             ))
         }
@@ -7272,6 +7272,28 @@ mod tests {
         });
     }
 
+    /// `⇧R` on the grid reloads from GitHub: the pull requests on the
+    /// loop's next turn, past every timer, and the project's issues with
+    /// them — asked of a checkout that is not on disk here, so the ask is
+    /// the miss it records without a process.
+    #[test]
+    fn shift_r_on_the_grid_reloads_pull_requests_and_issues() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let pid = app.selected_project().expect("a project").id.clone();
+            for p in app.tree.projects.iter_mut() {
+                p.repo_path = "/nonexistent/nebula-shift-r".into();
+            }
+            assert!(!app.issues_failed.contains(&pid));
+            let sent = key(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT);
+            assert!(sent.is_empty(), "gh runs client-side: {sent:?}");
+            assert!(app.pr_refresh_requested, "the pull requests are re-asked");
+            assert!(app.issues_failed.contains(&pid), "and the issues with them");
+            assert_eq!(app.flash.as_deref(), Some(crate::event_loop::RELOAD_FLASH));
+        });
+    }
+
     /// A card whose checkout has no pull request yet says so, naming the
     /// branch, and its menu carries no row for one.
     #[test]
@@ -7289,7 +7311,7 @@ mod tests {
             assert_eq!(
                 app.flash,
                 Some(format!(
-                    "no pull request on {branch} yet — ⇧R asks GitHub again"
+                    "no pull request on {branch} yet — ⇧R reloads from GitHub"
                 ))
             );
             assert_eq!(pr_menu_row(&mut app), None);

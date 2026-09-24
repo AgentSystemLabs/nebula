@@ -1948,8 +1948,12 @@ fn schedule_pull_request_refresh(app: &mut App) {
     schedule_pr_lookup(app);
 }
 
-/// `Shift+R`, from any panel: ask GitHub again *now* — the selected
-/// project's open list, every one of its checkouts' own PR, and the body
+/// What `Shift+R` says in the footer the moment it is heard.
+pub(crate) const RELOAD_FLASH: &str = "reloading pull requests and issues from GitHub…";
+
+/// `Shift+R`, from any panel: reload from GitHub *now* — the selected
+/// project's open list and its open issues (`issues::reload_selected`),
+/// every one of its checkouts' own PR, and the body
 /// and conversation of the pull request the pane is reading — past
 /// every timer and floor the beats keep. `schedule_pull_request_refresh`
 /// is what a focus event may do; this is what a deliberate keypress may
@@ -1970,7 +1974,8 @@ fn refresh_pull_requests(app: &mut App) {
     schedule_pr_sweep(app);
     refetch_pr_detail(app);
     app.pr_refresh_requested = true;
-    app.flash = Some("refreshing pull requests…".into());
+    crate::issues::reload_selected(app);
+    app.flash = Some(RELOAD_FLASH.into());
     app.dirty = true;
 }
 
@@ -14360,7 +14365,7 @@ diff --git a/src/c.rs b/src/c.rs
             "fired on the loop's next turn, not the next git tick"
         );
         assert!(app.overlay.is_none(), "nothing to rename here");
-        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+        assert_eq!(app.flash.as_deref(), Some(RELOAD_FLASH));
         assert!(out.is_empty(), "no daemon traffic — gh runs client-side");
 
         // The same from an open-PR row of the group, which the pane is
@@ -14421,7 +14426,7 @@ diff --git a/src/c.rs b/src/c.rs
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
         assert!(app.overlay.is_none(), "no prompt");
-        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+        assert_eq!(app.flash.as_deref(), Some(RELOAD_FLASH));
         assert!(app.pr_lookup_due(&wid), "the row's own lookup is due");
         assert!(app.pr_refresh_requested);
         let (pending, at) = app
@@ -14453,7 +14458,7 @@ diff --git a/src/c.rs b/src/c.rs
         app.flash = None;
         press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
         assert!(app.pr_refresh_requested && app.overlay.is_none());
-        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+        assert_eq!(app.flash.as_deref(), Some(RELOAD_FLASH));
 
         // …while `r` there still renames.
         press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
@@ -17243,7 +17248,7 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     #[test]
-    fn shift_t_creates_terminal_in_selected_worktree() {
+    fn t_creates_terminal_in_selected_worktree() {
         use nebula_core::WorktreeId;
         let mut app = App::new();
         seed_tree(&mut app);
@@ -17252,7 +17257,7 @@ diff --git a/src/c.rs b/src/c.rs
 
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
             &mut out,
         );
         assert!(matches!(
@@ -17262,10 +17267,10 @@ diff --git a/src/c.rs b/src/c.rs
         ));
     }
 
-    /// From the Projects panel, Shift+T targets the project's main checkout
+    /// From the Projects panel, `t` targets the project's main checkout
     /// (root), not whatever worktree row happens to be selected.
     #[test]
-    fn shift_t_from_projects_targets_the_root_checkout() {
+    fn t_from_projects_targets_the_root_checkout() {
         use nebula_core::{Entity, Worktree, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -17288,7 +17293,7 @@ diff --git a/src/c.rs b/src/c.rs
 
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
             &mut out,
         );
         assert!(matches!(
@@ -17310,7 +17315,7 @@ diff --git a/src/c.rs b/src/c.rs
 
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
             &mut out,
         );
         let Some(ClientRequest::CreateTerminal { req_id, .. }) = out.last() else {
