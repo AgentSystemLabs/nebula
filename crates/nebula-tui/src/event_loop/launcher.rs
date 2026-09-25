@@ -335,8 +335,16 @@ pub(super) fn land_on_grid(app: &mut App) {
 /// no card on it, which only **Show all worktrees** draws. What `d` and
 /// a right-click act on there: the worktree itself, as nothing else is.
 /// None with the grid down, or the cursor on a card or a band of them.
+///
+/// The checkout's link rows are no card: its detected pull request is a
+/// row the cursor rests on (`App::visible_session_rows`), but on the grid
+/// it is the `#42` on the band's rule, so a band holding it is still
+/// empty (#104) — callers ask this before they match the row.
 pub(super) fn empty_band(app: &App) -> Option<WorktreeId> {
-    if !app.launcher_active() || app.selected_session_row().is_some() {
+    let on_card = app
+        .selected_session_row()
+        .is_some_and(|row| row.sref().is_some());
+    if !app.launcher_active() || on_card {
         return None;
     }
     let bands = view::bands(app);
@@ -3529,6 +3537,90 @@ mod tests {
             assert!(is_worktree_confirm(&by_click), "{:?}", by_click.overlay);
             let id = |app: &App| app.selected_worktree().map(|w| w.id.clone());
             assert_eq!(id(&by_click), id(&by_key));
+        });
+    }
+
+    /// [`with_empty_band`] with `idle`'s branch on a pull request git
+    /// detected: still no cards on its band, but the checkout's rows now
+    /// hold the pull request's link row, and the cursor rests on it.
+    fn with_empty_band_on_a_pull_request() -> App {
+        let mut app = with_empty_band();
+        app.pull_requests
+            .insert(WorktreeId("w3".into()), Some(pull_request(7)));
+        app
+    }
+
+    /// An EMPTY BAND whose checkout has a detected pull request is still
+    /// an empty band (#104): `d` opens the worktree's confirm its hint
+    /// promises, not the flash that the pull request's link can't be
+    /// deleted, and a right-click — on the band, or on the `#7` on its
+    /// rule — opens the worktree's menu, not the link's.
+    #[test]
+    fn an_empty_band_on_a_pull_request_still_deletes_the_worktree() {
+        with_default_config(|| {
+            let is_worktree_confirm = |app: &App| {
+                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    if c.action == PendingAction::DeleteWorktree(WorktreeId("w3".into())))
+            };
+
+            let mut by_key = with_empty_band_on_a_pull_request();
+            let screen = screen_text(&draw_tall(&mut by_key));
+            assert!(screen.contains("d: delete worktree"), "{screen}");
+            keys(&mut by_key, &[KeyCode::Char('j'), KeyCode::Char('j')]);
+            assert_eq!(
+                by_key.selected_worktree().map(|w| w.id.clone()),
+                Some(WorktreeId("w3".into()))
+            );
+            assert!(
+                matches!(
+                    by_key.selected_session_row(),
+                    Some(crate::app::SessionRow::Link(_))
+                ),
+                "the pull request's link row is under the cursor: {:?}",
+                by_key.selected_session_row()
+            );
+            let sent = key(&mut by_key, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert!(
+                is_worktree_confirm(&by_key),
+                "{:?} / {:?}",
+                by_key.overlay,
+                by_key.flash
+            );
+            assert_eq!(by_key.flash, None);
+            assert!(sent.is_empty(), "asked first: {sent:?}");
+
+            let mut drawn = with_empty_band_on_a_pull_request();
+            draw_tall(&mut drawn);
+            let band = band_area(&drawn, 2);
+            let pr = drawn
+                .hits
+                .iter()
+                .find(|(_, hit)| *hit == HitTarget::LauncherBandPr(WorktreeId("w3".into())))
+                .map(|(rect, _)| *rect)
+                .expect("the pull request on the empty band's rule");
+            for (x, y) in [(band.x + 4, band.y + 1), (pr.x, pr.y)] {
+                let mut by_click = with_empty_band_on_a_pull_request();
+                draw_tall(&mut by_click);
+                mouse(
+                    &mut by_click,
+                    MouseEventKind::Down(MouseButton::Right),
+                    x,
+                    y,
+                );
+                let at = match &by_click.overlay {
+                    Some(Overlay::Menu(menu)) => menu
+                        .items
+                        .iter()
+                        .position(|i| i.label == "Delete worktree")
+                        .unwrap_or_else(|| panic!("no Delete worktree in {menu:?}")),
+                    other => panic!("expected the worktree's menu, got {other:?}"),
+                };
+                for _ in 0..at {
+                    key(&mut by_click, KeyCode::Down, KeyModifiers::NONE);
+                }
+                key(&mut by_click, KeyCode::Enter, KeyModifiers::NONE);
+                assert!(is_worktree_confirm(&by_click), "{:?}", by_click.overlay);
+            }
         });
     }
 
