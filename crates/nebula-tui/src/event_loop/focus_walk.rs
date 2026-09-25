@@ -95,8 +95,10 @@ pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut V
             HitTarget::LauncherCard(_)
             | HitTarget::LauncherBand(_)
             | HitTarget::LauncherBandPr(_)
+            | HitTarget::LauncherCardIssue(_)
             | HitTarget::LauncherStripLeft(_)
-            | HitTarget::LauncherStripRight(_),
+            | HitTarget::LauncherStripRight(_)
+            | HitTarget::LauncherBandMore(_),
         ) => app.focus = Focus::Sessions,
         Some(HitTarget::PanelBg(focus)) => app.focus = focus,
         Some(HitTarget::TerminalPane | HitTarget::CloudSessionLink) => {
@@ -115,6 +117,7 @@ pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut V
             | HitTarget::LauncherTabAdd
             | HitTarget::LauncherPaneClose
             | HitTarget::LauncherPaneSide
+            | HitTarget::LauncherPaneZoom
             | HitTarget::LauncherPullRequests
             | HitTarget::LauncherIssues
             | HitTarget::LauncherWelcomePrompt

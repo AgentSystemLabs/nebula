@@ -335,6 +335,19 @@ pub(super) fn land_on_grid(app: &mut App) {
     take_aim(app);
 }
 
+/// The checkout of the EMPTY BAND under the grid's cursor — a band with
+/// no card on it, which only **Show all worktrees** draws. What `d` and
+/// a right-click act on there: the worktree itself, as nothing else is.
+/// None with the grid down, or the cursor on a card or a band of them.
+pub(super) fn empty_band(app: &App) -> Option<WorktreeId> {
+    if !app.launcher_active() || app.selected_session_row().is_some() {
+        return None;
+    }
+    let bands = view::bands(app);
+    let band = &bands[view::band_cursor(app, &bands)?];
+    band.cards.is_empty().then(|| band.worktree.clone())
+}
+
 /// The cursor onto `worktree`'s BAND: the checkout under the panels'
 /// cursor through the jump the `/` PALETTE takes for a worktree, its
 /// remembered card — the session it was last left on, else its first
@@ -369,6 +382,9 @@ pub(super) fn select_card(app: &mut App, sref: SessionRef, out: &mut Vec<ClientR
         SessionRef::Terminal(id) => select_terminal(app, id, out),
     }
 }
+
+/// What Tab says on a LIST band that already lists every entry it has.
+const ALL_LISTED: &str = "every session in this worktree is already listed";
 
 /// What a terminal that left the tree between the draw and the key says.
 const TERMINAL_GONE: &str = "that terminal is gone";
@@ -441,12 +457,22 @@ pub(super) fn toggle_band_expand(app: &mut App, out: &mut Vec<ClientRequest>) {
             0
         }
     };
+    if bands[index].cards.is_empty() {
+        // An EMPTY BAND has no cards to open onto rows.
+        app.flash = Some(NO_SESSIONS.into());
+        take_aim(app);
+        return;
+    }
     let worktree = bands[index].worktree.clone();
-    app.launcher_expanded = if app.launcher_expanded.as_ref() == Some(&worktree) {
-        None
-    } else {
-        Some(worktree)
-    };
+    let open = app.launcher_expanded.as_ref() == Some(&worktree);
+    if app.launcher_list && !open && bands[index].cards.len() <= view::LIST_RECENT {
+        // The LIST already shows every entry of a band this short:
+        // opening it would change nothing on screen but the rule's word.
+        app.flash = Some(ALL_LISTED.into());
+        take_aim(app);
+        return;
+    }
+    app.launcher_expanded = if open { None } else { Some(worktree) };
     take_aim(app);
     app.dirty = true;
 }
@@ -658,6 +684,10 @@ pub(super) fn handle_action(
         Action::ToggleLauncherPane => {
             fold_key(app);
         }
+        // `^F` on a card: that session full-screen.
+        Action::ToggleFullScreen => {
+            toggle_full_screen(app, out);
+        }
         // The PROJECT TABS across the header.
         Action::NextProjectTab => step_tab(app, 1, out),
         Action::PrevProjectTab => step_tab(app, -1, out),
@@ -790,6 +820,35 @@ pub(super) fn open_issue(app: &mut App, out: &mut Vec<ClientRequest>) {
         Some(url) => super::open_link(app, &url, out),
         None => app.flash = Some(NO_ISSUE.into()),
     }
+}
+
+/// A click on the ISSUE NUMBER on a session's card — its `#15`
+/// (`HitTarget::LauncherCardIssue`): the cursor lands on that card, as
+/// the pointer landing on it puts it there ([`select_card`]), and the
+/// issue opens in the browser through the very [`open_issue`] `⇧I` runs.
+/// INPUT PARITY: the click and the key end in the same state. Like a
+/// click on a band's pull request ([`click_pull_request`]), it leaves a
+/// folded pane folded: the link leaves nebula for the browser.
+pub(super) fn click_issue(app: &mut App, id: &AgentId, out: &mut Vec<ClientRequest>) {
+    select_card(app, SessionRef::Agent(id.clone()), out);
+    take_aim(app);
+    open_issue(app, out);
+}
+
+/// A right-click's first half on a card's ISSUE NUMBER: the chip is the
+/// card to this button — the cursor onto it and the pane open on it, as
+/// on the rest of the card ([`select_card_row`]); the menu it opens
+/// carries **Open issue** already. False for a session no longer on the
+/// grid.
+pub(super) fn select_issue_card(app: &mut App, id: &AgentId, out: &mut Vec<ClientRequest>) -> bool {
+    let bands = view::bands(app);
+    let at = bands.iter().enumerate().find_map(|(band, b)| {
+        b.cards
+            .iter()
+            .position(|c| c.sref() == SessionRef::Agent(id.clone()))
+            .map(|card| CardRef { band, card })
+    });
+    at.is_some_and(|at| select_card_row(app, at, out))
 }
 
 /// What `⇧P` says with no card under the cursor to copy the settings of.
@@ -950,14 +1009,14 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
     }
     // The cursor itself, aimed or not: a step from a card let go of
     // (Esc, the fold) starts where the eye last saw it, and takes the aim
-    // back on landing.
-    if let Some(band) = app.cursor_in_open_band(&bands) {
-        let layout = view::expanded_layout(app.body_area, &bands[band]);
+    // back on landing. In the compact LIST every band is a column of
+    // entries, so the keys walk its lines wherever the cursor is.
+    if let Some((band, layout)) = app.walked_band(&bands) {
         let at = view::card_cursor(app, &bands[band]);
-        let Some(next) = layout.stepped(at, dx, dy) else {
-            return;
-        };
-        if Some(next) != at {
+        // An EMPTY BAND (**Show all worktrees**) has no card to step to:
+        // `j`/`k` go straight on to the band above or below it.
+        let next = layout.stepped(at, dx, dy);
+        if let Some(next) = next.filter(|&next| Some(next) != at) {
             let sref = bands[band].cards[next].sref();
             select_card(app, sref, out);
             return;
@@ -979,12 +1038,31 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
         None => last as usize,
         Some(b) => (b as i64 + dy).clamp(0, last) as usize,
     };
+    if app.launcher_list && Some(next) != at {
+        // The LIST reads as one column down every band: `j` off a band's
+        // last line lands on the next band's first, `k` off its first on
+        // the band above's last — not on whichever card that band last
+        // had, which may be lines away from where the eye is.
+        let entries = view::list_layout(app.body_area, &bands[next], false, None).rows;
+        let edge = if dy > 0 {
+            entries.first()
+        } else {
+            entries.last()
+        };
+        if let Some(&card) = edge.and_then(|row| row.first()) {
+            select_card(app, bands[next].cards[card].sref(), out);
+            return;
+        }
+    }
     if Some(next) == at {
         // On the band already, but on none of its cards — the selection
         // on a row the grid has no card for: its first card, as `h`/`l`
-        // take it.
+        // take it. An EMPTY BAND has none: the cursor is on all of it.
         if view::card_cursor(app, &bands[next]).is_none() {
-            select_card(app, bands[next].cards[0].sref(), out);
+            match bands[next].cards.first() {
+                Some(first) => select_card(app, first.sref(), out),
+                None => take_aim(app),
+            }
             return;
         }
         take_aim(app);
@@ -1008,11 +1086,9 @@ fn step_up(
     out: &mut Vec<ClientRequest>,
 ) {
     let bands = view::bands(app);
-    let top = match app.cursor_in_open_band(&bands) {
-        Some(band) => {
-            band == 0
-                && view::expanded_layout(app.body_area, &bands[band])
-                    .on_top_row(view::card_cursor(app, &bands[band]))
+    let top = match app.walked_band(&bands) {
+        Some((band, layout)) => {
+            band == 0 && layout.on_top_row(view::card_cursor(app, &bands[band]))
         }
         None => view::band_cursor(app, &bands).map_or(bands.is_empty(), |b| b == 0),
     };
@@ -1039,7 +1115,7 @@ pub(super) fn wheel_grid(app: &mut App, up: bool) {
     if bands.is_empty() {
         return;
     }
-    let panel = view::panel_layout(app.body_area, &bands, app.launcher_expanded.as_ref());
+    let panel = app.panel_layout(&bands);
     let max = panel.max_scroll();
     let delta = if up {
         -GRID_WHEEL_ROWS
@@ -1614,6 +1690,20 @@ pub(super) fn click_band(app: &mut App, index: usize, out: &mut Vec<ClientReques
     }
 }
 
+/// A click on the MORE HINT under a band's row (`HitTarget::LauncherBandMore`):
+/// the cursor onto the band, then the band opens as the ACCORDION.
+///
+/// INPUT PARITY: the open is [`toggle_band_expand`], the one Tab runs.
+pub(super) fn click_band_more(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) {
+    if !select_band_row(app, index, out) {
+        return;
+    }
+    let bands = view::bands(app);
+    if app.launcher_expanded.as_ref() != bands.get(index).map(|b| &b.worktree) {
+        toggle_band_expand(app, out);
+    }
+}
+
 /// A right-click's first half on a card, `select_clicked_row`'s arm: the
 /// cursor on the card at `at` and the pane open on it, as a left click
 /// leaves them. False off the grid.
@@ -1765,6 +1855,12 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
     if band.position(&sref).is_some() {
         return;
     }
+    if band.cards.is_empty() {
+        // Its last card gone, the band stayed as an EMPTY BAND (**Show
+        // all worktrees**): the cursor stays on it, on the checkout.
+        select_band(app, band.worktree.clone(), out);
+        return;
+    }
     let at = |s: &Option<SessionRef>| s.as_ref().and_then(|s| band.position(s));
     let next = at(&before.after)
         .or_else(|| at(&before.before))
@@ -1872,6 +1968,41 @@ pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
         }
     }
 }
+
+/// `^F`, and the FULL-SCREEN BUTTON in the pane's header: the session
+/// in the PANE takes the whole screen, the input lock on — or, from a
+/// full-screen session, comes back down to the pane beside the cards
+/// with the keys still in it, exactly where `^F` took it from. From the
+/// cards it full-screens the one under the cursor ([`open_session`]).
+/// A session full-screened for want of a pane (a body too short to draw
+/// one, the pane folded away) has nothing to come back down to, and
+/// lands on the grid the way the crumb always took it. Returns what it
+/// did, for the KEY COMBO DISPLAY.
+///
+/// INPUT PARITY: the one function behind the chord (from the grid, or let
+/// through a LOCKED PANE), `^q` and `^`` in a full-screen session, the
+/// `‹ sessions` crumb and the header's button.
+pub(super) fn toggle_full_screen(app: &mut App, out: &mut Vec<ClientRequest>) -> &'static str {
+    app.dirty = true;
+    if app.collapsed {
+        app.collapsed = false;
+        if app.launcher_pane_hidden || !has_pane(app) {
+            super::leave_terminal_lock(app);
+            return "Back to the grid";
+        }
+        return NORMAL_SIZE;
+    }
+    if app.focus == Focus::Terminal && app.term.is_some() {
+        super::zoom_pane(app, out);
+    } else {
+        open_session(app, out);
+    }
+    FULL_SCREEN
+}
+
+/// What [`toggle_full_screen`] says it did, for the KEY COMBO DISPLAY.
+pub(super) const FULL_SCREEN: &str = "Full screen";
+pub(super) const NORMAL_SIZE: &str = "Normal size";
 
 /// Is the PANE beside the cards on screen? False with the pane folded
 /// away (`^~`), on a body too short to hold the header, a row of cards
@@ -3264,6 +3395,197 @@ mod tests {
         });
     }
 
+    /// [`two_sessions`] with **Show all worktrees** on and a third
+    /// checkout of `demo` — `idle`, with nothing running in it — its
+    /// EMPTY BAND the grid's last, under `feat`'s.
+    fn with_empty_band() -> App {
+        let mut app = two_sessions();
+        app.show_all_worktrees = true;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w3".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: "/tmp/demo-idle".into(),
+                    branch: "idle".into(),
+                    is_main: false,
+                    sort_order: 2,
+                }),
+            },
+        );
+        app
+    }
+
+    /// Tall enough for all three of [`with_empty_band`]'s bands over
+    /// the pane.
+    fn draw_tall(app: &mut App) -> Terminal<TestBackend> {
+        draw_at(app, 130, 70)
+    }
+
+    fn screen_text(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .map(|c| c.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Where the EMPTY BAND `index` was drawn: the band's whole area.
+    fn band_area(app: &App, index: usize) -> ratatui::layout::Rect {
+        app.hits
+            .iter()
+            .find(|(_, hit)| *hit == HitTarget::LauncherBand(index))
+            .map(|(rect, _)| *rect)
+            .unwrap_or_else(|| panic!("band {index} was not drawn"))
+    }
+
+    /// With **Show all worktrees** on a checkout with nothing running is
+    /// on the grid as an EMPTY BAND — its branch on the rule, and under
+    /// it what can be done there — which `j` walks onto like any band.
+    /// Off, the same tree has no such band.
+    #[test]
+    fn an_empty_worktree_is_a_band_the_cursor_walks_onto() {
+        with_default_config(|| {
+            let mut off = with_empty_band();
+            off.show_all_worktrees = false;
+            let screen = screen_text(&draw_tall(&mut off));
+            assert!(!screen.contains("idle"), "{screen}");
+
+            let mut app = with_empty_band();
+            let screen = screen_text(&draw_tall(&mut app));
+            assert!(screen.contains("idle"), "{screen}");
+            assert!(
+                screen.contains(
+                    "nothing running · p: new session · t: terminal · d: delete worktree"
+                ),
+                "{screen}"
+            );
+            keys(&mut app, &[KeyCode::Char('j'), KeyCode::Char('j')]);
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.clone()),
+                Some(WorktreeId("w3".into()))
+            );
+            assert!(app.selected_session_row().is_none(), "no card to be on");
+            // Past the last band nothing moves, and back up is `feat`.
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.clone()),
+                Some(WorktreeId("w3".into()))
+            );
+            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.clone()),
+                Some(WorktreeId("w2".into()))
+            );
+            // Tab has no cards to open, and says so.
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(app.launcher_expanded, None);
+            assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+        });
+    }
+
+    /// INPUT PARITY: `d` on an EMPTY BAND and **Delete worktree** in its
+    /// right-click menu open the one confirm — the worktree's own, the
+    /// same `activate::delete_worktree` asks — and nothing is deleted
+    /// before it is answered.
+    #[test]
+    fn d_and_the_menu_on_an_empty_band_ask_to_delete_the_worktree() {
+        with_default_config(|| {
+            let is_worktree_confirm = |app: &App| {
+                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    if c.action == PendingAction::DeleteWorktree(WorktreeId("w3".into())))
+            };
+
+            let mut by_key = with_empty_band();
+            draw_tall(&mut by_key);
+            keys(&mut by_key, &[KeyCode::Char('j'), KeyCode::Char('j')]);
+            let sent = key(&mut by_key, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert!(is_worktree_confirm(&by_key), "{:?}", by_key.overlay);
+            assert!(sent.is_empty(), "asked first: {sent:?}");
+
+            let mut by_click = with_empty_band();
+            draw_tall(&mut by_click);
+            let area = band_area(&by_click, 2);
+            mouse(
+                &mut by_click,
+                MouseEventKind::Down(MouseButton::Right),
+                area.x + 4,
+                area.y + 1,
+            );
+            let at = match &by_click.overlay {
+                Some(Overlay::Menu(menu)) => menu
+                    .items
+                    .iter()
+                    .position(|i| i.label == "Delete worktree")
+                    .unwrap_or_else(|| panic!("no Delete worktree in {menu:?}")),
+                other => panic!("expected the worktree's menu, got {other:?}"),
+            };
+            for _ in 0..at {
+                key(&mut by_click, KeyCode::Down, KeyModifiers::NONE);
+            }
+            key(&mut by_click, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(is_worktree_confirm(&by_click), "{:?}", by_click.overlay);
+            let id = |app: &App| app.selected_worktree().map(|w| w.id.clone());
+            assert_eq!(id(&by_click), id(&by_key));
+        });
+    }
+
+    /// With **Show all worktrees** on, deleting a worktree's last card
+    /// never offers the worktree: the card's ordinary confirm, a delete
+    /// of the card alone, and its band stays on the grid — empty, the
+    /// cursor on it — for `d` to delete when that is wanted.
+    #[test]
+    fn deleting_the_last_card_keeps_the_worktree_with_show_all_worktrees() {
+        with_default_config(|| {
+            let mut app = with_empty_band();
+            draw_tall(&mut app);
+            to_feat(&mut app);
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            match &app.overlay {
+                Some(Overlay::Confirm(c)) => {
+                    assert!(
+                        matches!(c.action, PendingAction::DeleteAgent(_)),
+                        "{:?}",
+                        c.action
+                    );
+                    assert!(!c.message.contains("worktree"), "{}", c.message);
+                }
+                other => panic!("expected the card's confirm, got {other:?}"),
+            }
+            let sent = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                sent.iter()
+                    .any(|r| matches!(r, ClientRequest::DeleteAgent { .. })),
+                "{sent:?}"
+            );
+            assert!(
+                !sent
+                    .iter()
+                    .any(|r| matches!(r, ClientRequest::DeleteWorktree { .. })),
+                "{sent:?}"
+            );
+            let bands = crate::launcher::bands(&app);
+            let feat = bands
+                .iter()
+                .position(|b| b.worktree == WorktreeId("w2".into()))
+                .expect("feat's band stays");
+            assert!(bands[feat].cards.is_empty());
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.clone()),
+                Some(WorktreeId("w2".into())),
+                "the cursor stays on the emptied band"
+            );
+            draw_tall(&mut app);
+        });
+    }
+
     /// Space on a card opens the FOLLOW-UP MODAL over the grid, aimed at
     /// the card under the cursor — and touches nothing else: the PANE goes
     /// on reading what it was reading, at the size it was, with the keys
@@ -3846,7 +4168,7 @@ mod tests {
             }
             assert_eq!(at(&app), Some(0), "h stops at the first card");
             assert!(app.launcher_expanded.is_none(), "and never goes in");
-            draw(&mut app);
+            let term = draw(&mut app);
             assert!(
                 app.hit_rect(&HitTarget::LauncherStripLeft(0)).is_none(),
                 "nothing to the left: no ❮"
@@ -3854,6 +4176,15 @@ mod tests {
             let right = app
                 .hit_rect(&HitTarget::LauncherStripRight(0))
                 .expect("cards past the right edge: a ❯");
+            // Beside the cards, on their rows: the button their full
+            // height, the glyph on their middle line — on screen, not at
+            // the row's place counted from the top of the panel.
+            let card = app
+                .hit_rect(&HitTarget::LauncherCard(CardRef { band: 0, card: 0 }))
+                .expect("the first card");
+            assert_eq!((right.y, right.height), (card.y, card.height));
+            let mid = card.y + crate::launcher::CARD_H / 2;
+            assert_eq!(term.backend().buffer()[(right.x + 1, mid)].symbol(), "❯");
             assert_eq!(
                 app.hit_at(right.x + 1, right.y + 2),
                 Some(HitTarget::LauncherStripRight(0)),
@@ -3907,6 +4238,59 @@ mod tests {
                 .expect("❯ again, with the last card off the edge");
             click_at(&mut app, right.x, right.y + 2);
             assert_eq!(at(&app), Some(last), "and forward again");
+        });
+    }
+
+    /// A collapsed band hiding cards says so on the row of air under
+    /// them — `▾ 3 more · Tab: see all 5` — and a click on it opens the
+    /// band, the toggle Tab runs (INPUT PARITY). Open, it is gone: every
+    /// card is on screen.
+    #[test]
+    fn the_more_hint_under_a_band_says_what_is_hidden_and_opens_it() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            for (id, name) in [("a4", "second"), ("a5", "third"), ("a6", "fourth")] {
+                seed_running(&mut app, id, "w1", name);
+            }
+            seed_terminal(&mut app, "t1", "w1", "shell");
+            let term = draw(&mut app);
+            let bands = crate::launcher::bands(&app);
+            let hidden = bands[0].cards.len()
+                - app
+                    .hits
+                    .iter()
+                    .filter(|(_, h)| matches!(h, HitTarget::LauncherCard(c) if c.band == 0))
+                    .count();
+            assert!(hidden > 0, "the row leaves cards off");
+            let hint = app
+                .hit_rect(&HitTarget::LauncherBandMore(0))
+                .expect("a hint under the row");
+            let card = app
+                .hits
+                .iter()
+                .find_map(|(r, h)| {
+                    matches!(h, HitTarget::LauncherCard(c) if c.band == 0).then_some(*r)
+                })
+                .expect("a card on the row");
+            assert_eq!(hint.y, card.y + card.height, "right under the cards");
+            let buf = term.backend().buffer();
+            let text: String = (hint.x..hint.x + hint.width)
+                .map(|x| buf[(x, hint.y)].symbol().to_string())
+                .collect();
+            assert!(text.contains(&format!("▾ {hidden} more")), "{text:?}");
+            assert!(text.contains("see all 5"), "{text:?}");
+
+            click_at(&mut app, hint.x + 1, hint.y);
+            assert_eq!(
+                app.launcher_expanded.as_ref(),
+                Some(&bands[0].worktree),
+                "the click opens the band"
+            );
+            draw(&mut app);
+            assert!(
+                app.hit_rect(&HitTarget::LauncherBandMore(0)).is_none(),
+                "open, nothing is hidden"
+            );
         });
     }
 
@@ -5829,6 +6213,114 @@ mod tests {
             assert_eq!(by_click.collapsed, by_key.collapsed);
             assert_eq!(by_click.term_locked, by_key.term_locked);
             assert_eq!(selected(&by_click), selected(&by_key));
+        });
+    }
+
+    /// `^F` in the pane full-screens its session, keys still in it and
+    /// the chord never forwarded to the agent; pressed again it comes back
+    /// down to the pane beside the cards. In full-screen `^q` and `^``
+    /// bring it back down too — to the pane, not straight out to the grid.
+    #[test]
+    fn ctrl_f_full_screens_the_pane_and_brings_it_back_down() {
+        with_default_config(|| {
+            let ctrl_f = |app: &mut App| key(app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+            let in_pane = |app: &App| {
+                assert_eq!(app.focus, Focus::Terminal, "the keys stay in the session");
+                assert!(app.term_locked);
+                assert!(!app.collapsed, "back in the pane beside the cards");
+            };
+            let mut app = two_sessions();
+            draw(&mut app);
+            to_feat(&mut app);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            in_pane(&app);
+
+            for back_down in [
+                (KeyCode::Char('f'), KeyModifiers::CONTROL),
+                (KeyCode::Char('q'), KeyModifiers::CONTROL),
+                (KeyCode::Char('`'), KeyModifiers::CONTROL),
+            ] {
+                let out = ctrl_f(&mut app);
+                assert!(
+                    !out.iter().any(|r| matches!(r, ClientRequest::Input { .. })),
+                    "^F is nebula's, not the agent's: {out:?}"
+                );
+                assert!(app.collapsed, "full-screen");
+                assert_eq!(app.focus, Focus::Terminal);
+                assert!(app.term_locked);
+                let text = buffer_text(&draw(&mut app));
+                assert!(text.contains("‹ sessions"), "the crumb header: {text}");
+                assert!(tabs_drawn(&app).is_empty(), "no grid header: {text}");
+
+                let out = key(&mut app, back_down.0, back_down.1);
+                assert!(
+                    !out.iter().any(|r| matches!(r, ClientRequest::Input { .. })),
+                    "{back_down:?} is nebula's: {out:?}"
+                );
+                in_pane(&app);
+                draw(&mut app);
+                assert_eq!(tabs_drawn(&app), ["demo"], "the grid is back");
+                assert_eq!(pane(&app), Some(SessionRef::Agent(AgentId("a2".into()))));
+            }
+        });
+    }
+
+    /// `^F` from the cards full-screens the card under the cursor.
+    #[test]
+    fn ctrl_f_on_a_card_full_screens_it() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            to_feat(&mut app);
+            assert_eq!(app.focus, Focus::Sessions);
+            key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+            assert!(app.collapsed);
+            assert_eq!(app.focus, Focus::Terminal);
+            assert!(app.term_locked);
+            assert_eq!(pane(&app), Some(SessionRef::Agent(AgentId("a2".into()))));
+        });
+    }
+
+    /// INPUT PARITY: the pane header's `⤢` is `^F`, and a full-screen
+    /// session's `⤡` is `^F` pressed there — one toggle behind all four.
+    #[test]
+    fn the_full_screen_buttons_are_ctrl_f() {
+        with_default_config(|| {
+            let entered = || {
+                let mut app = two_sessions();
+                draw(&mut app);
+                to_feat(&mut app);
+                key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                draw(&mut app);
+                app
+            };
+            let click = |app: &mut App| {
+                let (x, y) = crumb_cell(app, HitTarget::LauncherPaneZoom);
+                mouse(app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+            };
+            let same = |a: &App, b: &App| {
+                assert_eq!(a.collapsed, b.collapsed);
+                assert_eq!(a.focus, b.focus);
+                assert_eq!(a.term_locked, b.term_locked);
+                assert_eq!(pane(a), pane(b));
+            };
+
+            let mut by_click = entered();
+            let head = buffer_text(&draw(&mut by_click));
+            assert!(head.contains('⤢'), "the pane has the button: {head}");
+            click(&mut by_click);
+            let mut by_key = entered();
+            key(&mut by_key, KeyCode::Char('f'), KeyModifiers::CONTROL);
+            assert!(by_click.collapsed);
+            same(&by_click, &by_key);
+
+            let head = buffer_text(&draw(&mut by_click));
+            assert!(head.contains('⤡'), "full-screen has its way back: {head}");
+            click(&mut by_click);
+            draw(&mut by_key);
+            key(&mut by_key, KeyCode::Char('f'), KeyModifiers::CONTROL);
+            assert!(!by_click.collapsed);
+            same(&by_click, &by_key);
         });
     }
 
@@ -7868,6 +8360,103 @@ mod tests {
         });
     }
 
+    /// With the CARD ISSUE NUMBER setting on, an ISSUE SESSION's card
+    /// shows its `#15` as a link: a click on it lands the cursor on the
+    /// card and opens the issue exactly as `⇧I` does — INPUT PARITY — and
+    /// the target is only as wide as its text: the rest of the card is
+    /// the card's.
+    #[test]
+    fn clicking_the_cards_issue_number_opens_it_as_shift_i_does() {
+        with_default_config(|| {
+            let mut by_key = card_from_an_issue();
+            let id = by_key.selected_session().expect("a card").id;
+            let sent_by_key = key(&mut by_key, KeyCode::Char('I'), KeyModifiers::SHIFT);
+
+            let mut by_click = card_from_an_issue();
+            by_click.card_issue_number = true;
+            // The aim let go of, so the click is what puts it back.
+            keys(&mut by_click, &[KeyCode::Esc, KeyCode::Esc]);
+            assert!(by_click.launcher_unaimed);
+            draw(&mut by_click);
+            let chip = by_click
+                .hit_rect(&HitTarget::LauncherCardIssue(id.clone()))
+                .expect("the issue number is drawn on the card");
+            assert_eq!(chip.width, 3, "the link is `#15`, not the card's width");
+            assert!(
+                matches!(
+                    by_click.hit_at(chip.x - 1, chip.y),
+                    Some(HitTarget::LauncherCard(_))
+                ),
+                "the card left of the number is the card's"
+            );
+
+            let sent = click_at(&mut by_click, chip.x, chip.y);
+            assert!(by_click.overlay.is_none(), "{:?}", by_click.overlay);
+            assert_eq!(by_click.flash, by_key.flash);
+            assert_eq!(
+                by_click.flash.as_deref(),
+                Some("opened github.com/o/demo/issues/15")
+            );
+            assert!(!by_click.launcher_unaimed, "the cursor is back on the card");
+            assert_eq!(by_click.selected_session().map(|a| a.id), Some(id));
+            assert_eq!(by_click.focus, Focus::Sessions, "the keys stay on the grid");
+            assert_eq!(
+                sent.iter()
+                    .filter(|r| format!("{r:?}").contains("issues/15"))
+                    .count(),
+                sent_by_key
+                    .iter()
+                    .filter(|r| format!("{r:?}").contains("issues/15"))
+                    .count(),
+            );
+        });
+    }
+
+    /// The setting is off by default: no issue number on the card, and
+    /// nothing on it to click but the card.
+    #[test]
+    fn the_cards_issue_number_is_off_by_default() {
+        with_default_config(|| {
+            let app = card_from_an_issue();
+            assert!(!app.card_issue_number);
+            assert!(
+                !app.hits
+                    .iter()
+                    .any(|(_, h)| matches!(h, HitTarget::LauncherCardIssue(_))),
+                "no issue link drawn"
+            );
+        });
+    }
+
+    /// A right-click on the issue number is a right-click on its card:
+    /// the card's menu, **Open issue** on it.
+    #[test]
+    fn right_clicking_the_cards_issue_number_opens_the_cards_menu() {
+        with_default_config(|| {
+            let mut app = card_from_an_issue();
+            app.card_issue_number = true;
+            draw(&mut app);
+            let id = app.selected_session().expect("a card").id;
+            let chip = app
+                .hit_rect(&HitTarget::LauncherCardIssue(id))
+                .expect("the issue number is drawn on the card");
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Right),
+                chip.x,
+                chip.y,
+            );
+            match &app.overlay {
+                Some(Overlay::Menu(menu)) => assert!(
+                    menu.items.iter().any(|i| i.label == "Open issue"),
+                    "{:?}",
+                    menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                ),
+                other => panic!("expected the card's menu, got {other:?}"),
+            }
+        });
+    }
+
     /// A card that was not started from an issue says so, and its menu
     /// carries no row for one.
     #[test]
@@ -8861,5 +9450,224 @@ mod tests {
             .iter()
             .position(|i| app.tree.projects[*i].id.0 == id)
             .expect("the project has a row")
+    }
+
+    // ---- the compact LIST ----
+
+    /// [`two_sessions`] in the compact LIST, with four more sessions in
+    /// `demo`'s root: its band holds five, the `feat` band one.
+    fn list_of_five() -> App {
+        let mut app = two_sessions();
+        app.launcher_list = true;
+        for (id, name) in [
+            ("a4", "second"),
+            ("a5", "third"),
+            ("a6", "fourth"),
+            ("a7", "fifth"),
+        ] {
+            seed_running(&mut app, id, "w1", name);
+        }
+        app
+    }
+
+    /// The cards of `band` the frame just drew, as one-line entries, by
+    /// their index in the band, top to bottom.
+    fn drawn_entries(app: &App, band: usize) -> Vec<(usize, ratatui::layout::Rect)> {
+        let mut out: Vec<(usize, ratatui::layout::Rect)> = app
+            .hits
+            .iter()
+            .filter_map(|(r, h)| match h {
+                HitTarget::LauncherCard(c) if c.band == band => Some((c.card, *r)),
+                _ => None,
+            })
+            .collect();
+        out.sort_by_key(|(_, r)| r.y);
+        out
+    }
+
+    fn cursor_card(app: &App) -> Option<crate::launcher::CardRef> {
+        crate::launcher::cursor(app, &crate::launcher::bands(app))
+    }
+
+    /// Settings → Appearance → **Worktree layout** reaches the app the way
+    /// every setting does (`apply_config`): `list` is the LIST, anything
+    /// else the cards.
+    #[test]
+    fn the_worktree_layout_setting_turns_the_list_on_and_off() {
+        with_config_json(r#"{"worktree_layout": "list"}"#, || {
+            let mut app = two_sessions();
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(app.launcher_list);
+        });
+        with_default_config(|| {
+            let mut app = two_sessions();
+            app.launcher_list = true;
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(!app.launcher_list, "the cards out of the box");
+        });
+    }
+
+    /// In the LIST a worktree stacks its sessions a line apiece, and
+    /// collapsed — as every band starts — shows only its three most
+    /// recent, the line under them counting the rest: `▾ 2 more · Tab:
+    /// see all 5`. Tab opens the band to every session, and again folds
+    /// it back to three. A band with nothing left off has no such line.
+    #[test]
+    fn the_list_shows_three_recent_sessions_until_tab_opens_the_rest() {
+        with_default_config(|| {
+            let mut app = list_of_five();
+            let bands = crate::launcher::bands(&app);
+            assert_eq!(bands[0].cards.len(), 5);
+            // The cursor on the newest: on the oldest, the band would list
+            // it too (`the_cursors_session_stays_listed_on_a_collapsed_band`).
+            super::select_card(&mut app, bands[0].cards[0].sref(), &mut Vec::new());
+            let term = draw(&mut app);
+            assert_eq!(app.launcher_expanded, None, "collapsed by default");
+            let entries = drawn_entries(&app, 0);
+            assert_eq!(
+                entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                vec![0, 1, 2],
+                "the three most recent, newest first"
+            );
+            for (_, r) in &entries {
+                assert_eq!(r.height, 1, "one line an entry");
+            }
+            assert!(
+                entries.windows(2).all(|w| w[1].1.y == w[0].1.y + 1),
+                "stacked one under the other: {entries:?}"
+            );
+            let hint = app
+                .hit_rect(&HitTarget::LauncherBandMore(0))
+                .expect("a line counting the rest");
+            assert_eq!(hint.y, entries[2].1.y + 1, "right under the last entry");
+            let buf = term.backend().buffer();
+            let text: String = (hint.x..hint.x + hint.width)
+                .map(|x| buf[(x, hint.y)].symbol().to_string())
+                .collect();
+            assert!(text.contains("▾ 2 more"), "{text:?}");
+            assert!(text.contains("see all 5"), "{text:?}");
+            assert_eq!(drawn_entries(&app, 1).len(), 1, "feat's one session");
+            assert!(app.hit_rect(&HitTarget::LauncherBandMore(1)).is_none());
+            let screen = buffer_text(&term);
+            for name in [
+                bands[0].cards[0].name(),
+                bands[0].cards[2].name(),
+                "polish-nav",
+            ] {
+                assert!(screen.contains(name), "{name} is listed:\n{screen}");
+            }
+            assert!(
+                !screen.contains(bands[0].cards[4].name()),
+                "the oldest waits behind Tab:\n{screen}"
+            );
+
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[0].worktree));
+            let screen = buffer_text(&draw(&mut app));
+            assert_eq!(drawn_entries(&app, 0).len(), 5, "every session");
+            assert!(screen.contains(bands[0].cards[4].name()), "{screen}");
+            assert!(app.hit_rect(&HitTarget::LauncherBandMore(0)).is_none());
+
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(app.launcher_expanded, None, "Tab folds it back");
+            draw(&mut app);
+            assert_eq!(drawn_entries(&app, 0).len(), 3);
+        });
+    }
+
+    /// `j` / `k` walk the LIST's lines as one column: down the band's
+    /// three, past the ones it leaves off, onto the next band's first
+    /// line — and `k` from there back onto the last line above it.
+    #[test]
+    fn j_and_k_walk_the_list_lines_across_worktrees() {
+        with_default_config(|| {
+            let mut app = list_of_five();
+            let bands = crate::launcher::bands(&app);
+            draw(&mut app);
+            super::select_card(&mut app, bands[0].cards[0].sref(), &mut Vec::new());
+            let at = |band, card| Some(crate::launcher::CardRef { band, card });
+            for want in [at(0, 1), at(0, 2), at(1, 0), at(1, 0)] {
+                key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+                draw(&mut app);
+                assert_eq!(cursor_card(&app), want);
+            }
+            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(cursor_card(&app), at(0, 2), "onto the last line above");
+        });
+    }
+
+    /// The card the pane reads is always a line on screen: with the
+    /// cursor on one the collapsed band leaves off — the palette jumped
+    /// there, or the list reordered under it — the band lists it after
+    /// its three, and counts one fewer left off.
+    #[test]
+    fn the_cursors_session_stays_listed_on_a_collapsed_band() {
+        with_default_config(|| {
+            let mut app = list_of_five();
+            let bands = crate::launcher::bands(&app);
+            super::select_card(&mut app, bands[0].cards[4].sref(), &mut Vec::new());
+            let term = draw(&mut app);
+            let entries = drawn_entries(&app, 0);
+            assert_eq!(
+                entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                vec![0, 1, 2, 4]
+            );
+            let hint = app.hit_rect(&HitTarget::LauncherBandMore(0)).unwrap();
+            let buf = term.backend().buffer();
+            let text: String = (hint.x..hint.x + hint.width)
+                .map(|x| buf[(x, hint.y)].symbol().to_string())
+                .collect();
+            assert!(text.contains("▾ 1 more"), "{text:?}");
+            let row: String = (0..130)
+                .map(|x| buf[(x, entries[3].1.y)].symbol().to_string())
+                .collect();
+            assert!(
+                row.contains("▌ "),
+                "the cursor's line wears the mark: {row:?}"
+            );
+        });
+    }
+
+    /// Tab on a LIST band that already lists every session opens nothing
+    /// — there is nothing more to see — and says so.
+    #[test]
+    fn tab_on_a_list_band_with_nothing_left_off_says_so() {
+        with_default_config(|| {
+            let mut app = list_of_five();
+            let bands = crate::launcher::bands(&app);
+            draw(&mut app);
+            super::select_card(&mut app, bands[1].cards[0].sref(), &mut Vec::new());
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(app.launcher_expanded, None);
+            assert_eq!(app.flash.as_deref(), Some(super::ALL_LISTED));
+        });
+    }
+
+    /// INPUT PARITY: a click on a LIST line lands the cursor on its card,
+    /// as `j` walking onto it does, and a click on the `▾ 2 more` line
+    /// opens the band as Tab does.
+    #[test]
+    fn a_click_on_a_list_line_is_the_walk_and_on_the_more_line_is_tab() {
+        with_default_config(|| {
+            let mut app = list_of_five();
+            let bands = crate::launcher::bands(&app);
+            draw(&mut app);
+            let (card, line) = drawn_entries(&app, 0)[1];
+            click_at(&mut app, line.x + 6, line.y);
+            assert_eq!(
+                cursor_card(&app),
+                Some(crate::launcher::CardRef { band: 0, card })
+            );
+            let mut by_key = list_of_five();
+            draw(&mut by_key);
+            super::select_card(&mut by_key, bands[0].cards[0].sref(), &mut Vec::new());
+            key(&mut by_key, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(cursor_card(&by_key), cursor_card(&app));
+
+            draw(&mut app);
+            let hint = app.hit_rect(&HitTarget::LauncherBandMore(0)).unwrap();
+            click_at(&mut app, hint.x + 1, hint.y);
+            assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[0].worktree));
+        });
     }
 }

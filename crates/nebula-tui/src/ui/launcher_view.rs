@@ -85,7 +85,9 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     // (`App::launcher_expanded`) — pushing the bands after it down, so
     // the whole panel, not just that band, may run taller than the
     // screen and scrolls as one list.
-    let panel = crate::launcher::panel_layout(body, &bands, app.launcher_expanded.as_ref());
+    // In the compact LIST every band is its entries stacked a line
+    // apiece instead (Settings → Appearance → **Worktree layout**).
+    let panel = app.panel_layout(&bands);
     let scroll = settle_panel_scroll(app, &panel, &bands, cursor);
     draw_head(f, app, body, count, panel.hidden(scroll));
     draw_bands(f, app, &g, &panel, &bands, cursor, scroll);
@@ -665,11 +667,19 @@ fn draw_bands(
                     index,
                     on,
                     lit: on && keys,
-                    more: strip.as_ref().map_or(0, crate::launcher::Strip::hidden),
-                    expanded: strip.is_none(),
+                    more: match &strip {
+                        Some(strip) => strip.hidden(),
+                        None => pb.content.as_ref().map_or(0, |c| c.more),
+                    },
+                    expanded: pb.open,
+                    list: app.launcher_list,
                 },
             );
             app.hits.extend(hits);
+        }
+        if band.cards.is_empty() {
+            draw_empty_band(f, app, g, pb, band, (window, scroll), on && keys);
+            continue;
         }
         // The cards under the rule: on the band the cursor is on, the
         // one it remembers — what the pane reads, and what the keys walk
@@ -678,6 +688,25 @@ fn draw_bands(
         // cursor on it (`HitTarget::LauncherCard`), and a card drawn cut
         // is clicked on the rows of it there are: the landing scrolls
         // the rest of it into view (`settle_panel_scroll`).
+        if app.launcher_list {
+            draw_list_band(
+                f,
+                app,
+                g,
+                pb,
+                ListBand {
+                    index,
+                    band,
+                    window,
+                    scroll,
+                    on,
+                    at,
+                    lit: on && keys,
+                },
+                &mut cfg,
+            );
+            continue;
+        }
         match &strip {
             None => {
                 // Open: every card, wrapped into rows, the terminals
@@ -719,6 +748,7 @@ fn draw_bands(
                         draw_any_card(buf, &*app, r, card, selected, false, th, &mut cfg)
                     });
                     note_tail_card(app, card);
+                    app.hits.extend(card_issue_hit(app, card, placed));
                     app.hits.push((
                         placed.rect,
                         HitTarget::LauncherCard(crate::launcher::CardRef {
@@ -761,13 +791,33 @@ fn draw_bands(
                         )
                     });
                     note_tail_card(app, card);
+                    app.hits.extend(card_issue_hit(app, card, placed));
                     app.hits
                         .push((placed.rect, HitTarget::LauncherCard(slot.at)));
                 }
                 // The arrows only on a row drawn whole: they stand beside
                 // the cards' full height.
                 if row_placed.whole() {
-                    draw_strip_arrows(f, app, strip, index, on && keys, th);
+                    draw_strip_arrows(f, app, strip, row_placed.rect.y, index, on && keys, th);
+                }
+                if strip.hidden() > 0 {
+                    // The band's own row under the cards
+                    // ([`crate::launcher::MORE_H`]), the gap to the next
+                    // band's rule under it.
+                    let row = Rect {
+                        y: pb.rule_y + crate::launcher::BAND_H,
+                        height: crate::launcher::MORE_H,
+                        ..g.area
+                    };
+                    if let Some(placed) = crate::launcher::place(window, scroll, row) {
+                        let more = StripMore {
+                            index,
+                            hidden: strip.hidden(),
+                            lit: on && keys,
+                            centered: true,
+                        };
+                        draw_strip_more(f, app, placed.rect, band, more);
+                    }
                 }
             }
         }
@@ -777,6 +827,48 @@ fn draw_bands(
     // Last, so the bands themselves win `hit_at`'s first-match scan and
     // only the air between them falls through to the grid.
     app.hits.push((g.area, HitTarget::PanelBg(Focus::Sessions)));
+}
+
+/// What an EMPTY BAND says under its rule, the root's without the delete
+/// it refuses.
+const EMPTY_BAND_HINT: &str = "nothing running · p: new session · t: terminal";
+const EMPTY_BAND_DELETE: &str = " · d: delete worktree";
+
+/// The line under an EMPTY BAND's rule — a checkout with nothing running
+/// in it, drawn only with **Show all worktrees** on — in place of the row
+/// of cards it has none of: what can be done there, dim, and in the
+/// accent while the cursor is on the band with the keys on the grid.
+/// A click on it is a click on the band (the band's whole area).
+fn draw_empty_band(
+    f: &mut Frame,
+    app: &App,
+    g: &crate::launcher::BandsLayout,
+    pb: &crate::launcher::PanelBand,
+    band: &crate::launcher::Band,
+    (window, scroll): (Rect, u16),
+    lit: bool,
+) {
+    let th = app.theme;
+    let row = Rect {
+        y: pb.rule_y + crate::launcher::BAND_RULE_H,
+        height: crate::launcher::EMPTY_BAND_ROW_H,
+        ..g.area
+    };
+    let Some(placed) = crate::launcher::place(window, scroll, row) else {
+        return;
+    };
+    let mut text = String::from(EMPTY_BAND_HINT);
+    if !band.is_main {
+        text.push_str(EMPTY_BAND_DELETE);
+    }
+    let fg = if lit { th.accent } else { th.dim };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {text}"),
+            Style::default().fg(fg),
+        ))),
+        placed.rect,
+    );
 }
 
 /// The EDGE MARKERS on a grid taller than its window: `↑ 2 more above`
@@ -854,6 +946,7 @@ fn draw_strip_arrows(
     f: &mut Frame,
     app: &mut App,
     strip: &crate::launcher::Strip,
+    top: u16,
     index: usize,
     lit: bool,
     th: Theme,
@@ -863,7 +956,8 @@ fn draw_strip_arrows(
         return;
     };
     let frame = f.area();
-    let top = first.rect.y;
+    // `top` is the row's line on screen: the slots' own `y` counts from
+    // the top of the whole panel, before the window and its scroll.
     let y = top + CARD_H / 2;
     let mut arrow = |hit: HitTarget, x: u16, glyph_x: u16, glyph: &str| {
         let hovered = app.hover_crumb.as_ref() == Some(&hit);
@@ -906,6 +1000,322 @@ fn draw_strip_arrows(
         let x = last.rect.x + last.rect.width;
         arrow(HitTarget::LauncherStripRight(index), x, x + 1, STRIP_RIGHT);
     }
+}
+
+/// The MORE HINT under a collapsed band's row that left cards off its
+/// edges: `▾ 6 more · Tab: see all 8`, centered on the band's own row
+/// under the cards ([`crate::launcher::MORE_H`]), so a band hiding sessions says so where the eye leaves the
+/// cards rather than only at the far end of its rule. Muted, its key in
+/// the accent while the band holds the keys or the pointer is on it. A
+/// button: a click opens the band as the ACCORDION, the very toggle Tab
+/// runs (`HitTarget::LauncherBandMore`).
+fn draw_strip_more(
+    f: &mut Frame,
+    app: &mut App,
+    r: Rect,
+    band: &crate::launcher::Band,
+    more: StripMore,
+) {
+    let StripMore {
+        index,
+        hidden,
+        lit,
+        centered,
+    } = more;
+    let th = app.theme;
+    let hit = HitTarget::LauncherBandMore(index);
+    let hovered = app.hover_crumb.as_ref() == Some(&hit);
+    let key = super::key_hint(app, crate::keymap::Action::FocusNext);
+    let (words, does) = (
+        format!("▾ {hidden} more · "),
+        format!(": see all {}", band.cards.len()),
+    );
+    let key_style = if lit || hovered {
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th.dim)
+    };
+    let text = Style::default().fg(if hovered { th.accent } else { th.muted });
+    let line = Line::from(vec![
+        Span::styled(words, text),
+        Span::styled(key, key_style),
+        Span::styled(does, text),
+    ]);
+    let w = (line.width() as u16).min(r.width);
+    // Centered under a row of cards; under a LIST, in the column its
+    // entries' names start in.
+    let x = if centered {
+        r.x + (r.width - w) / 2
+    } else {
+        r.x + LIST_LEAD.min(r.width - w)
+    };
+    let at = Rect { x, width: w, ..r };
+    f.render_widget(Paragraph::new(line), at);
+    app.hits.push((at, hit));
+}
+
+/// What [`draw_strip_more`] says, and where: the band it is under, how
+/// many it counts, whether the band holds the keys, and whether it
+/// centers under a row of cards or starts where a LIST's names do.
+#[derive(Debug, Clone, Copy)]
+struct StripMore {
+    index: usize,
+    hidden: usize,
+    lit: bool,
+    centered: bool,
+}
+
+/// What the cursor's LIST entry wears in front of it.
+const LIST_MARK: &str = "▌ ";
+/// Columns a LIST entry spends before its name: the cursor mark and the
+/// status dot (or a terminal's glyph), two apiece.
+const LIST_LEAD: u16 = 4;
+/// Longest a LIST's name column grows, and its runs-on column: past these
+/// the entries truncate rather than push the prompt off the line.
+const LIST_NAME_MAX: usize = 28;
+const LIST_RUNS_MAX: usize = 24;
+/// Air between a LIST entry's columns.
+const LIST_GAP: usize = 2;
+
+/// One band of the compact LIST as [`draw_list_band`] draws it.
+struct ListBand<'a> {
+    index: usize,
+    band: &'a crate::launcher::Band,
+    window: Rect,
+    scroll: u16,
+    /// The cursor is on the band, and `at` is its card.
+    on: bool,
+    at: Option<usize>,
+    /// The keys are on the band too.
+    lit: bool,
+}
+
+/// A band in the compact LIST: under its rule, one line per entry the
+/// layout shows — its most recent sessions, or every card once it is
+/// open (`launcher::list_layout`) — the names and what each runs on in
+/// columns shared down the band, then the MORE HINT on the line under
+/// them when it leaves any off. A click on a line lands the cursor on its
+/// card (`HitTarget::LauncherCard`), exactly as a click on a card does.
+fn draw_list_band(
+    f: &mut Frame,
+    app: &mut App,
+    g: &crate::launcher::BandsLayout,
+    pb: &crate::launcher::PanelBand,
+    list: ListBand<'_>,
+    cfg: &mut Option<crate::config::Config>,
+) {
+    let ListBand {
+        index,
+        band,
+        window,
+        scroll,
+        on,
+        at,
+        lit,
+    } = list;
+    let Some(content) = pb.content.as_ref() else {
+        return;
+    };
+    let shown: Vec<usize> = content
+        .rows
+        .iter()
+        .filter_map(|r| r.first().copied())
+        .collect();
+    let mut cols = (0, 0);
+    for &i in &shown {
+        let (name, runs) = match &band.cards[i] {
+            crate::launcher::Card::Session(row) => (
+                row.agent.name.chars().count(),
+                runs_on_line(&row.agent, cfg).chars().count(),
+            ),
+            crate::launcher::Card::Terminal(t) => (
+                t.name.chars().count(),
+                t.run_command.as_deref().unwrap_or("shell").chars().count(),
+            ),
+        };
+        cols = (cols.0.max(name), cols.1.max(runs));
+    }
+    let cols = (cols.0.min(LIST_NAME_MAX), cols.1.min(LIST_RUNS_MAX));
+    for &i in &shown {
+        let Some(placed) = pb
+            .cell(i)
+            .and_then(|cell| crate::launcher::place(window, scroll, cell))
+        else {
+            continue;
+        };
+        let card = &band.cards[i];
+        let selected = on && at == Some(i);
+        draw_list_row(
+            f.buffer_mut(),
+            app,
+            placed.rect,
+            card,
+            (selected, selected && lit),
+            cols,
+            cfg,
+        );
+        note_tail_card(app, card);
+        app.hits.push((
+            placed.rect,
+            HitTarget::LauncherCard(crate::launcher::CardRef {
+                band: index,
+                card: i,
+            }),
+        ));
+    }
+    if let Some(y) = content.more_y() {
+        let row = Rect {
+            y: pb.rule_y + y,
+            height: crate::launcher::MORE_H,
+            ..g.area
+        };
+        if let Some(placed) = crate::launcher::place(window, scroll, row) {
+            let more = StripMore {
+                index,
+                hidden: content.more,
+                lit,
+                centered: false,
+            };
+            draw_strip_more(f, app, placed.rect, band, more);
+        }
+    }
+}
+
+/// One entry of the compact LIST, on one line: the cursor mark, the
+/// status dot and name a card heads with, what it runs on, and the last
+/// thing it was asked — `›` as on the card — or, for a terminal, the last
+/// line its shell printed; how long since it moved (or `exited`) at the
+/// right. `cols` are the band's name and runs-on column widths, so the
+/// entries line up. `(selected, lit)`: the cursor's entry wears the mark,
+/// ([`LIST_MARK`]), and the FOCUSED PANEL TINT across the line while the
+/// grid holds the keys.
+fn draw_list_row(
+    buf: &mut Buffer,
+    app: &App,
+    r: Rect,
+    card: &crate::launcher::Card,
+    (selected, lit): (bool, bool),
+    (name_col, runs_col): (usize, usize),
+    cfg: &mut Option<crate::config::Config>,
+) {
+    let th = app.theme;
+    let width = usize::from(r.width);
+    // A bar rather than the rule's `❯`: a shell's own glyph is `❯`, one
+    // column over, and the two would read as one mark.
+    let mark = if selected {
+        Span::styled(LIST_MARK, Style::default().fg(th.accent))
+    } else {
+        Span::raw("  ")
+    };
+    struct Entry {
+        lead: Span<'static>,
+        name: String,
+        name_style: Style,
+        ramp: Option<[Color; 3]>,
+        runs: String,
+        runs_style: Style,
+        text_mark: &'static str,
+        text: String,
+        text_style: Style,
+        badge: String,
+        badge_style: Style,
+    }
+    let e = match card {
+        crate::launcher::Card::Session(row) => {
+            let a = &row.agent;
+            let look = session_look(app, a, selected, th);
+            let quiet_or = |live: Color| if a.archived { look.quiet } else { live };
+            Entry {
+                lead: look.dot,
+                name: a.name.clone(),
+                name_style: look.name_style,
+                ramp: look.ramp,
+                runs: runs_on_line(a, cfg),
+                runs_style: Style::default().fg(quiet_or(th.dim)),
+                text_mark: "› ",
+                text: crate::launcher::last_prompt(a)
+                    .unwrap_or_default()
+                    .to_string(),
+                text_style: Style::default().fg(quiet_or(th.muted)),
+                badge: look.ago,
+                badge_style: look.ago_style,
+            }
+        }
+        crate::launcher::Card::Terminal(t) => Entry {
+            lead: Span::styled(
+                if t.run_command.is_some() {
+                    "▶ "
+                } else {
+                    "❯ "
+                },
+                Style::default().fg(if t.alive { th.ok } else { th.dim }),
+            ),
+            name: t.name.clone(),
+            name_style: Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+            ramp: None,
+            runs: t.run_command.clone().unwrap_or_else(|| "shell".into()),
+            runs_style: Style::default().fg(th.dim),
+            text_mark: "",
+            text: terminal_tail_lines(app, t)
+                .into_iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or_default(),
+            text_style: Style::default().fg(th.muted),
+            badge: if t.alive {
+                String::new()
+            } else {
+                EXITED_BADGE.into()
+            },
+            badge_style: Style::default().fg(th.err),
+        },
+    };
+    let mut spans = vec![mark, e.lead];
+    let mut room = width.saturating_sub(usize::from(LIST_LEAD));
+    // The badge at the right end, while the name keeps a few letters.
+    let badge = e.badge.trim().to_string();
+    let badge_w = badge.chars().count();
+    let keep_badge = badge_w > 0 && room >= badge_w + 1 + 8;
+    if keep_badge {
+        room -= badge_w + 1;
+    }
+    let name_w = name_col.max(1).min(room);
+    let name = truncate(&e.name, name_w);
+    let mut used = name.chars().count();
+    spans.extend(status_name_spans(
+        name,
+        e.name_style,
+        e.ramp,
+        app.sweep_phase(),
+    ));
+    // What it runs on, in the band's column, and the prompt after it —
+    // each only where there is room for a few letters of it.
+    let runs_at = name_w + LIST_GAP;
+    if !e.runs.is_empty() && room >= runs_at + 6 {
+        let runs_w = runs_col.min(room - runs_at);
+        let runs = truncate(&e.runs, runs_w);
+        spans.push(Span::raw(" ".repeat(runs_at - used)));
+        used = runs_at + runs.chars().count();
+        spans.push(Span::styled(runs, e.runs_style));
+        let text_at = runs_at + runs_w + LIST_GAP;
+        let text_mark_w = e.text_mark.chars().count();
+        if !e.text.is_empty() && room >= text_at + text_mark_w + 6 {
+            let text = truncate(&e.text, room - text_at - text_mark_w);
+            spans.push(Span::raw(" ".repeat(text_at - used)));
+            spans.push(Span::styled(e.text_mark, Style::default().fg(th.dim)));
+            used = text_at + text_mark_w + text.chars().count();
+            spans.push(Span::styled(text, e.text_style));
+        }
+    }
+    if keep_badge {
+        spans.push(Span::raw(" ".repeat(room.saturating_sub(used) + 1)));
+        spans.push(Span::styled(badge, e.badge_style));
+    }
+    let mut line = Paragraph::new(Line::from(spans));
+    if lit {
+        line = line.style(Style::default().bg(th.focus_tint));
+    }
+    line.render(r, buf);
 }
 
 /// Draw something the window's edges may cut — a card half scrolled off
@@ -994,6 +1404,10 @@ struct BandRule {
     /// rows under this rule rather than the collapsed STRIP's one row,
     /// and the hint at the right end says Tab closes it.
     expanded: bool,
+    /// The grid is the compact LIST: a collapsed band that already lists
+    /// every entry has nothing for Tab to open, and its rule says nothing
+    /// about it.
+    list: bool,
 }
 
 /// A BAND's rule: the checkout — `⌂ main` or `↳ feat` in the SCOPE
@@ -1056,7 +1470,8 @@ fn draw_band_rule(
         // words drops them: the `❯` at the left still says which band is
         // selected. Tab is the panels' "next panel" key, which the grid
         // takes for itself (`event_loop::launcher::handle_action`).
-        if lit {
+        let nothing_to_open = rule.list && !expanded && more == 0;
+        if lit && !nothing_to_open {
             let key = super::key_hint(app, crate::keymap::Action::FocusNext);
             let does = if expanded {
                 ": collapse".to_string()
@@ -1232,16 +1647,20 @@ fn draw_chip(
     if width == 0 {
         return;
     }
-    let glyph = if t.run_command.is_some() {
+    // HIDE TERMINAL GLYPHS drops the glyph, and the name starts where it was.
+    let glyph = if app.hide_terminal_glyphs {
+        ""
+    } else if t.run_command.is_some() {
         "▶ "
     } else {
         "❯ "
     };
+    let glyph_w = glyph.chars().count();
     // `exited` sits where a session card keeps its ago badge, and the
     // name gives it the room, as a session's does.
     let badge = if t.alive { "" } else { EXITED_BADGE };
     let (badge, name_max) = fit_ago(badge.to_string(), width);
-    let name = truncate(&t.name, name_max.saturating_sub(2));
+    let name = truncate(&t.name, name_max.saturating_sub(glyph_w));
     let mut first = vec![
         Span::styled(
             glyph,
@@ -1254,7 +1673,7 @@ fn draw_chip(
     ];
     if !badge.is_empty() {
         let badge = badge.trim_start().to_string();
-        let pad = width.saturating_sub(name.chars().count() + 2 + badge.chars().count());
+        let pad = width.saturating_sub(name.chars().count() + glyph_w + badge.chars().count());
         first.push(Span::raw(" ".repeat(pad)));
         first.push(Span::styled(badge, Style::default().fg(th.err)));
     }
@@ -1355,33 +1774,16 @@ fn draw_card(
     let a = &row.agent;
     let pending = app.is_placeholder_agent(&a.id);
     let cold = !a.alive && a.cloud_session_id.is_none();
-    // An ARCHIVED card is the same card put away, and it is drawn as such:
-    // nothing on it is live, so nothing on it is colored. Every part of it
-    // takes `quiet` — dim on its own, lifted to muted on the card the
-    // cursor is on, so that card reads a step brighter than its
-    // neighbours — its name the plain `muted`, its STATUS DOT gives
-    // way to `ARCHIVED_MARK`, and its frame squares off (the `block`
-    // below). The colors say it at a glance and the two shapes say it
-    // again with the colors off, which is the whole grid's answer to
-    // "which of the two lists am I looking at" without a word repeated on
-    // every card - the header's `n archived sessions` says that once.
     let archived = a.archived;
-    let quiet = if selected { th.muted } else { th.dim };
+    let SessionLook {
+        dot,
+        quiet,
+        name_style,
+        ramp,
+        ago,
+        ago_style,
+    } = session_look(app, a, selected, th);
     let quiet_or = |live: Color| if archived { quiet } else { live };
-    // The dot and the sweep read the status the panels' session rows read,
-    // cold and pending alike (see `draw_session_row`).
-    let dot = if archived {
-        Span::styled(ARCHIVED_MARK, Style::default().fg(quiet))
-    } else if pending {
-        status_dot(None, false, th)
-    } else if cold {
-        Span {
-            style: Style::default().fg(th.dim),
-            ..status_dot(Some(a.status), false, th)
-        }
-    } else {
-        status_dot(Some(a.status), a.unseen, th)
-    };
     let border = if selected {
         th.accent
     } else if let Some(edge) = card_edge(a, archived || pending || cold, th) {
@@ -1419,6 +1821,204 @@ fn draw_card(
         return;
     }
 
+    let (ago, name_max) = fit_ago(ago, width);
+    let name = truncate(&a.name, name_max.saturating_sub(2));
+    let mut first = vec![dot];
+    let used = name.chars().count() + 2;
+    first.extend(status_name_spans(name, name_style, ramp, app.sweep_phase()));
+    if !ago.is_empty() {
+        let ago = ago.trim_start().to_string();
+        let pad = width.saturating_sub(used + ago.chars().count());
+        first.push(Span::raw(" ".repeat(pad)));
+        first.push(Span::styled(ago, ago_style));
+    }
+
+    // What it runs on: the harness, the model and the reasoning effort
+    // the session was launched with, dim. Where it runs — the checkout,
+    // its changes, its pull request — is the BAND's rule over the card,
+    // said once for every card in the checkout rather than on each. The
+    // project is not on the card either: the grid is one project's,
+    // named in the header.
+    let harness = runs_on_line(a, cfg);
+    let mut second = if harness.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(
+            truncate(&harness, width),
+            Style::default().fg(quiet_or(th.dim)),
+        )]
+    };
+    // The issue it was started from, at the row's right end — a link, and
+    // the only thing on the card under the pointer that is not the card
+    // (`HitTarget::LauncherCardIssue`, placed by `card_issue_rect`).
+    if let Some(label) = card_issue_label(app, a) {
+        let label_w = label.chars().count();
+        if card_issue_rect(area, label_w).is_some() {
+            let room = width - label_w - 1;
+            let harness = truncate(&harness, room);
+            let pad = width - label_w - harness.chars().count();
+            let mut style = Style::default().fg(quiet_or(th.accent));
+            if app.hover_crumb == Some(HitTarget::LauncherCardIssue(a.id.clone())) {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            second = vec![
+                Span::styled(harness, Style::default().fg(quiet_or(th.dim))),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(label, style),
+            ];
+        }
+    }
+
+    // The last thing it was asked to do, on the prompt's own `›`, over
+    // the card's last rows rather than clipped at the first — unless the
+    // `hide_card_prompt` setting leaves those rows blank.
+    let mut lines = vec![first, second];
+    lines.resize(crate::launcher::CARD_HEAD_H as usize, Vec::new());
+    if !app.hide_card_prompt {
+        lines.extend(prompt_lines(
+            crate::launcher::last_prompt(a).unwrap_or_default(),
+            width,
+            quiet_or(th.dim),
+            quiet_or(th.muted),
+        ));
+    }
+
+    for (i, spans) in lines.into_iter().enumerate() {
+        if spans.is_empty() {
+            continue;
+        }
+        let Some(r) = row_rect(inner, i) else { break };
+        Paragraph::new(Line::from(spans)).render(r, buf);
+    }
+}
+
+/// The `#15` an ISSUE SESSION's card shows for the GitHub issue it was
+/// started from, while the `card_issue_number` setting is on. None on
+/// every other card, and on every card with the setting off.
+fn card_issue_label(app: &App, a: &nebula_core::Agent) -> Option<String> {
+    if !app.card_issue_number {
+        return None;
+    }
+    a.issue_number().map(|n| format!("#{n}"))
+}
+
+/// Where a card drawn whole at `area` puts its issue number `label_w`
+/// cells wide: the right end of the row saying what it runs on, inside
+/// the border and its cell of air (`draw_card`). None on a card too
+/// small to hold it with a cell to spare.
+fn card_issue_rect(area: Rect, label_w: usize) -> Option<Rect> {
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+    let label_w = u16::try_from(label_w).ok()?;
+    if inner.height < 2 || inner.width <= label_w {
+        return None;
+    }
+    Some(Rect {
+        x: inner.x + inner.width - label_w,
+        y: inner.y + 1,
+        width: label_w,
+        height: 1,
+    })
+}
+
+/// The click target of the issue number on the session card `card`,
+/// placed at `placed` (cut or whole): the chip's cell when that row of
+/// the card is on screen, for [`draw_bands`] to register ahead of the
+/// card so the chip wins.
+fn card_issue_hit(
+    app: &App,
+    card: &crate::launcher::Card,
+    placed: crate::launcher::Placed,
+) -> Option<(Rect, HitTarget)> {
+    let crate::launcher::Card::Session(row) = card else {
+        return None;
+    };
+    let label = card_issue_label(app, &row.agent)?;
+    // The chip on the whole card laid out from row 0, then its row moved
+    // to the screen — kept only while the window shows that row.
+    let full = Rect {
+        y: 0,
+        height: placed.rect.height + placed.cut_top + placed.cut_bottom,
+        ..placed.rect
+    };
+    let chip = card_issue_rect(full, label.chars().count())?;
+    let row_on_screen = chip.y.checked_sub(placed.cut_top)?;
+    (row_on_screen < placed.rect.height).then(|| {
+        (
+            Rect {
+                y: placed.rect.y + row_on_screen,
+                ..chip
+            },
+            HitTarget::LauncherCardIssue(row.agent.id.clone()),
+        )
+    })
+}
+
+/// How a session shows its state wherever the grid draws it — a card's
+/// head, a LIST entry — so the two never disagree.
+struct SessionLook {
+    /// The STATUS DOT, or an archived card's square.
+    dot: Span<'static>,
+    /// What an archived session's every part is drawn in.
+    quiet: Color,
+    name_style: Style,
+    /// The status sweep across the name, while it animates.
+    ramp: Option<[Color; 3]>,
+    /// How long since it moved (`done`, `starting`, …), with its lead space.
+    ago: String,
+    ago_style: Style,
+}
+
+/// `a`'s [`SessionLook`], on the cursor's entry when `selected`.
+///
+/// An ARCHIVED session is the same session put away, and it is drawn as
+/// such: nothing on it is live, so nothing on it is colored. Every part of
+/// it takes `quiet` — dim on its own, lifted to muted on the one the
+/// cursor is on, so it reads a step brighter than its neighbours — its
+/// name the plain `muted`, its STATUS DOT gives way to `ARCHIVED_MARK`,
+/// and a card's frame squares off (`draw_card`). The colors say it at a
+/// glance and the shapes say it again with the colors off, which is the
+/// whole grid's answer to "which of the two lists am I looking at" without
+/// a word repeated on every card - the header's `n archived sessions` says
+/// that once.
+fn session_look(app: &App, a: &nebula_core::Agent, selected: bool, th: Theme) -> SessionLook {
+    let pending = app.is_placeholder_agent(&a.id);
+    let cold = !a.alive && a.cloud_session_id.is_none();
+    let archived = a.archived;
+    let quiet = if selected { th.muted } else { th.dim };
+    // The dot and the sweep read the status the panels' session rows read,
+    // cold and pending alike (see `draw_session_row`).
+    let dot = if archived {
+        Span::styled(ARCHIVED_MARK, Style::default().fg(quiet))
+    } else if pending {
+        status_dot(None, false, th)
+    } else if cold {
+        Span {
+            style: Style::default().fg(th.dim),
+            ..status_dot(Some(a.status), false, th)
+        }
+    } else {
+        status_dot(Some(a.status), a.unseen, th)
+    };
+    let ramp = if pending || cold || archived {
+        None
+    } else {
+        sweep_ramp(Some(a.status), app.agent_fresh_done(a), th, app.animations)
+    };
+    // An archived name is not the loud thing on the screen any more: it
+    // gives up the bold with the rest of the card's weight and sits one
+    // step above the quiet the rest of the card is in — muted over dim,
+    // and text over muted on the card the cursor is on, the same one-step
+    // lift `quiet` takes there.
+    let name_style = if archived {
+        Style::default().fg(if selected { th.text } else { th.muted })
+    } else {
+        Style::default().fg(th.text).add_modifier(Modifier::BOLD)
+    };
     // How long ago it was filed, on an archived card, rather than when its
     // turn last moved: the status behind it stopped being news the moment
     // it was put away. A row archived before the stamp existed carries 0
@@ -1432,75 +2032,20 @@ fn draw_card(
     } else {
         ago_badge(a.status_changed_at)
     };
-    let (ago, name_max) = fit_ago(ago, width);
-    let ramp = if pending || cold || archived {
-        None
+    let ago_style = if archived {
+        Style::default().fg(quiet)
+    } else if a.unseen && !pending {
+        Style::default().fg(th.done)
     } else {
-        sweep_ramp(Some(a.status), app.agent_fresh_done(a), th, app.animations)
+        Style::default().fg(th.dim)
     };
-    let name = truncate(&a.name, name_max.saturating_sub(2));
-    let mut first = vec![dot];
-    let used = name.chars().count() + 2;
-    // An archived name is not the loud thing on the screen any more: it
-    // gives up the bold with the rest of the card's weight and sits one
-    // step above the quiet the rest of the card is in — muted over dim,
-    // and text over muted on the card the cursor is on, the same one-step
-    // lift `quiet` takes there.
-    let name_style = if archived {
-        Style::default().fg(if selected { th.text } else { th.muted })
-    } else {
-        Style::default().fg(th.text).add_modifier(Modifier::BOLD)
-    };
-    first.extend(status_name_spans(name, name_style, ramp, app.sweep_phase()));
-    if !ago.is_empty() {
-        let ago = ago.trim_start().to_string();
-        let pad = width.saturating_sub(used + ago.chars().count());
-        first.push(Span::raw(" ".repeat(pad)));
-        first.push(Span::styled(
-            ago,
-            if archived {
-                Style::default().fg(quiet)
-            } else if a.unseen && !pending {
-                Style::default().fg(th.done)
-            } else {
-                Style::default().fg(th.dim)
-            },
-        ));
-    }
-
-    // What it runs on: the harness, the model and the reasoning effort
-    // the session was launched with, dim. Where it runs — the checkout,
-    // its changes, its pull request — is the BAND's rule over the card,
-    // said once for every card in the checkout rather than on each. The
-    // project is not on the card either: the grid is one project's,
-    // named in the header.
-    let harness = runs_on_line(a, cfg);
-    let second = if harness.is_empty() {
-        Vec::new()
-    } else {
-        vec![Span::styled(
-            truncate(&harness, width),
-            Style::default().fg(quiet_or(th.dim)),
-        )]
-    };
-
-    // The last thing it was asked to do, on the prompt's own `›`, over
-    // the card's last rows rather than clipped at the first.
-    let mut lines = vec![first, second];
-    lines.resize(crate::launcher::CARD_HEAD_H as usize, Vec::new());
-    lines.extend(prompt_lines(
-        crate::launcher::last_prompt(a).unwrap_or_default(),
-        width,
-        quiet_or(th.dim),
-        quiet_or(th.muted),
-    ));
-
-    for (i, spans) in lines.into_iter().enumerate() {
-        if spans.is_empty() {
-            continue;
-        }
-        let Some(r) = row_rect(inner, i) else { break };
-        Paragraph::new(Line::from(spans)).render(r, buf);
+    SessionLook {
+        dot,
+        quiet,
+        name_style,
+        ramp,
+        ago,
+        ago_style,
     }
 }
 
@@ -1756,11 +2301,38 @@ const PANE_CLOSE: &str = " × ";
 /// the move lasts. Aired like the close button.
 const PANE_TO_RIGHT: &str = " ◨ ";
 const PANE_TO_BOTTOM: &str = " ⬓ ";
+/// The PANE's FULL-SCREEN BUTTON, before the SIDE BUTTON: one click gives
+/// the session the whole screen, as `^F` does. A full-screen session's
+/// header ends in the NORMAL-SIZE BUTTON, which brings it back down.
+const PANE_FULL_SCREEN: &str = " ⤢ ";
+const PANE_NORMAL_SIZE: &str = " ⤡ ";
+
+/// A header button of `glyph` at `rect`, muted until the pointer is on
+/// it and lit in `lit` then, registered as `hit`.
+fn header_button(
+    f: &mut Frame,
+    app: &mut App,
+    rect: Rect,
+    glyph: &'static str,
+    hit: HitTarget,
+    lit: ratatui::style::Color,
+) {
+    let fg = if app.hover_crumb.as_ref() == Some(&hit) {
+        lit
+    } else {
+        app.theme.muted
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(glyph, Style::default().fg(fg))),
+        rect,
+    );
+    app.hits.push((rect, hit));
+}
 
 /// The PANE's own header in the LAUNCHER VIEW: what the pane is reading
 /// — the card under the cursor, session or terminal, and the checkout
 /// it runs in — then the state tag (`scroll 4`, `exited`) right-aligned
-/// before the SIDE and CLOSE BUTTONS. A rule under it, and the rect the
+/// before the FULL-SCREEN, SIDE and CLOSE BUTTONS. A rule under it, and the rect the
 /// PTY draws in returned, exactly as `ui::terminal_frame` does for the
 /// panels' pane. Opening a terminal is `t`'s alone: the grid offers no
 /// `+` for it.
@@ -1784,8 +2356,9 @@ pub(super) fn pane_frame(
             crate::launcher::PaneSide::Bottom => PANE_TO_BOTTOM,
         });
         let side_w = side_button.map_or(0, |b| b.chars().count() as u16);
+        let zoom_w = PANE_FULL_SCREEN.chars().count() as u16;
         let close_w = PANE_CLOSE.chars().count() as u16;
-        let buttons_w = side_w + close_w;
+        let buttons_w = zoom_w + side_w + close_w;
         let taken = usize::from(buttons_w)
             + right
                 .as_ref()
@@ -1823,6 +2396,20 @@ pub(super) fn pane_frame(
         }
         if r.width >= buttons_w {
             let mut x = tag_r.x + tag_r.width;
+            let zoom = Rect {
+                x,
+                width: zoom_w,
+                ..r
+            };
+            header_button(
+                f,
+                app,
+                zoom,
+                PANE_FULL_SCREEN,
+                HitTarget::LauncherPaneZoom,
+                th.accent,
+            );
+            x += zoom_w;
             if let Some(glyph) = side_button {
                 let side = Rect {
                     x,
@@ -1968,12 +2555,36 @@ fn attached_name(app: &App, sref: &nebula_core::SessionRef) -> Option<String> {
 /// The full-screen session's own header, in place of the pane's
 /// `TERMINAL · name`: a breadcrumb back to the grid — `‹ sessions` is a
 /// button, the session's name the crumb it leads out of — with the
-/// harness it runs on and where, right-aligned. Returns the rect the PTY
+/// harness it runs on and where, right-aligned before the NORMAL-SIZE
+/// BUTTON. Returns the rect the PTY
 /// draws in, as `terminal_frame` does.
 pub(super) fn crumb_frame(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
     let th = app.theme;
     if let Some(r) = row_rect(area, 1) {
         let r = pad_x(r);
+        // The NORMAL-SIZE BUTTON holds the right end of the row, where the
+        // pane's header keeps its buttons; the rest is laid out in what it
+        // leaves.
+        let size_w = PANE_NORMAL_SIZE.chars().count() as u16;
+        if r.width > size_w {
+            let size = Rect {
+                x: r.x + r.width - size_w,
+                width: size_w,
+                ..r
+            };
+            header_button(
+                f,
+                app,
+                size,
+                PANE_NORMAL_SIZE,
+                HitTarget::LauncherPaneZoom,
+                th.accent,
+            );
+        }
+        let r = Rect {
+            width: r.width.saturating_sub(size_w),
+            ..r
+        };
         let back = format!("‹ {CRUMB}");
         // The hatch out of a full-screen session is a button too, and
         // wears the same underline while the pointer is on it.
@@ -2995,6 +3606,53 @@ mod tests {
         );
     }
 
+    /// HIDE TERMINAL GLYPHS: off, a shell's card opens on `❯` and a RUN
+    /// TERMINAL's on `▶`; on, neither glyph is drawn and each name starts
+    /// in the column the glyph held.
+    #[test]
+    fn hide_terminal_glyphs_drops_the_glyph_before_the_name() {
+        use nebula_core::{TerminalId, TerminalTab, WorktreeId};
+        let mut app = a_tree();
+        select(&mut app, "api");
+        for (id, name, run) in [
+            ("t1", "shell-1", None),
+            ("t2", "dev-srv", Some("npm run dev")),
+        ] {
+            app.tree.terminals.push(TerminalTab {
+                id: TerminalId(id.into()),
+                worktree_id: WorktreeId("w0".into()),
+                name: name.into(),
+                sort_order: 0,
+                alive: true,
+                run_command: run.map(Into::into),
+            });
+        }
+        app.launcher_expanded = Some(WorktreeId("w0".into()));
+        let body = Rect::new(0, 0, 100, 40);
+        let row_of = |lines: &[String], name: &str| -> String {
+            lines
+                .iter()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("{name}'s card: {lines:?}"))
+                .clone()
+        };
+
+        let lines = drawn_lines(&mut app, body);
+        assert!(row_of(&lines, "shell-1").contains("❯ shell-1"));
+        assert!(row_of(&lines, "dev-srv").contains("▶ dev-srv"));
+        let shown_col = row_of(&lines, "shell-1").find("❯").unwrap();
+
+        app.hide_terminal_glyphs = true;
+        let lines = drawn_lines(&mut app, body);
+        let shell = row_of(&lines, "shell-1");
+        let run = row_of(&lines, "dev-srv");
+        assert!(
+            !shell.contains('❯') && !run.contains('▶'),
+            "{shell:?} {run:?}"
+        );
+        assert_eq!(shell.find("shell-1"), Some(shown_col), "{shell:?}");
+    }
+
     /// A session card's second row says what the session runs on — the
     /// harness, the model and the reasoning effort it was launched with,
     /// `claude opus high` — and a session on the CLI's own default effort
@@ -3028,6 +3686,85 @@ mod tests {
             "the CLI's default effort is unnamed: {:?}",
             lines[row + 1]
         );
+    }
+
+    /// The `hide_card_prompt` setting leaves the last prompt off the card:
+    /// shown by default under the name and harness, gone once it is on,
+    /// with the name and what it runs on still drawn.
+    #[test]
+    fn hide_card_prompt_leaves_the_last_prompt_off_the_card() {
+        let mut app = a_tree();
+        select(&mut app, "api");
+        app.tree.agents[0].recent_prompts = vec![nebula_core::PromptEntry {
+            text: "fix the login redirect".into(),
+            submitted_at: 0,
+        }];
+        let body = Rect::new(0, 0, 100, 30);
+        let shows = |lines: &[String]| lines.iter().any(|l| l.contains("fix the login redirect"));
+
+        let lines = drawn_lines(&mut app, body);
+        assert!(shows(&lines), "shown by default: {lines:#?}");
+
+        app.hide_card_prompt = true;
+        let lines = drawn_lines(&mut app, body);
+        assert!(!shows(&lines), "hidden: {lines:#?}");
+        let row = lines
+            .iter()
+            .position(|l| l.contains("s0"))
+            .expect("the session's card still drawn");
+        assert!(lines[row + 1].contains("claude"), "{:?}", lines[row + 1]);
+    }
+
+    /// The `card_issue_number` setting puts an ISSUE SESSION's `#15` at
+    /// the right end of the row saying what it runs on — only with the
+    /// setting on, only on a card started from an issue — and registers
+    /// it as a click target ahead of the card.
+    #[test]
+    fn card_issue_number_shows_the_issue_on_the_runs_on_row() {
+        let mut app = a_tree();
+        select(&mut app, "api");
+        app.tree.agents[0].issue_url = Some("https://github.com/o/r/issues/15".into());
+        let body = Rect::new(0, 0, 100, 30);
+        let runs_row = |lines: &[String]| {
+            let row = lines
+                .iter()
+                .position(|l| l.contains("s0"))
+                .expect("the session's card drawn");
+            lines[row + 1].clone()
+        };
+
+        let lines = drawn_lines(&mut app, body);
+        assert!(!runs_row(&lines).contains("#15"), "off by default");
+        assert!(!app
+            .hits
+            .iter()
+            .any(|(_, h)| matches!(h, HitTarget::LauncherCardIssue(_))));
+
+        app.card_issue_number = true;
+        app.hits.clear();
+        let lines = drawn_lines(&mut app, body);
+        let row = runs_row(&lines);
+        assert!(row.contains("claude"), "{row:?}");
+        assert!(row.contains("#15"), "{row:?}");
+        assert!(
+            row.find("claude") < row.find("#15"),
+            "after what it runs on: {row:?}"
+        );
+        let id = app.tree.agents[0].id.clone();
+        let chip = app
+            .hit_rect(&HitTarget::LauncherCardIssue(id.clone()))
+            .expect("the number is a click target");
+        assert_eq!(
+            app.hit_at(chip.x, chip.y),
+            Some(HitTarget::LauncherCardIssue(id)),
+            "registered ahead of the card, so it wins"
+        );
+        let drawn: String = lines[usize::from(chip.y)]
+            .chars()
+            .skip(usize::from(chip.x))
+            .take(usize::from(chip.width))
+            .collect();
+        assert_eq!(drawn, "#15", "the target is the text");
     }
 
     /// The runs-on line is the harness, then the model, then the effort,
@@ -3650,6 +4387,7 @@ mod tests {
                 lit: false,
                 more: 0,
                 expanded: false,
+                list: false,
             },
         )
     }
@@ -3756,6 +4494,7 @@ mod tests {
             lit: true,
             more,
             expanded: false,
+            list: false,
         };
 
         let buf = rule_row_as(&app, &band, 96, lit(6));
@@ -3792,6 +4531,7 @@ mod tests {
                 lit: false,
                 more: 6,
                 expanded: false,
+                list: false,
             },
         );
         let text = row_string(&buf, 0);
@@ -3818,6 +4558,7 @@ mod tests {
             lit: true,
             more: 2,
             expanded: false,
+            list: false,
         };
 
         let buf = rule_row_as(&app, &band, 40, rule);

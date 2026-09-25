@@ -36,6 +36,13 @@ pub const PANE_SIDES: &[&str] = &[
     crate::launcher::PaneSide::Bottom.as_str(),
 ];
 
+/// The **Worktree layout** choices (Settings → Appearance), in the order
+/// the row cycles them: the GRID's row of cards per worktree, the default,
+/// then the compact LIST — each worktree's sessions stacked one line apiece,
+/// the most recent few shown until Tab opens the rest
+/// ([`crate::launcher::LIST_RECENT`]).
+pub const WORKTREE_LAYOUTS: &[&str] = &["cards", "list"];
+
 /// The **Preset text** choices (Settings → Sessions), in the order the row
 /// cycles them: the [`PresetText`] sides by label.
 pub const PRESET_TEXTS: &[&str] = &[
@@ -375,10 +382,15 @@ pub enum SettingKind {
     FeedbackSound,
     PresetText,
     DeleteEmptyWorktree,
+    ShowAllWorktrees,
     Theme,
     Animations,
     BlackBackground,
+    HideTerminalGlyphs,
     SessionPane,
+    WorktreeLayout,
+    HideCardPrompt,
+    CardIssueNumber,
     HideDraftPrs,
     QuickPromptKind,
     QuickPromptFocus,
@@ -431,6 +443,86 @@ impl SettingKind {
     pub fn is_project(self) -> bool {
         matches!(self, SettingKind::RunCommand | SettingKind::OpenCommand)
     }
+
+    /// The day the row first shipped, `(year, month, day)`: the date of
+    /// the first release tag whose settings overlay lists it, or the day
+    /// it was written for a row no release carries yet. The overlay marks
+    /// a row `(new)` for [`NEW_SETTING_DAYS`] from here. The match is
+    /// exhaustive on purpose — a new row can't compile without its date.
+    pub fn added_on(self) -> (i32, u32, u32) {
+        match self {
+            // v0.1.0
+            SettingKind::PaletteEnterAttaches
+            | SettingKind::Editor
+            | SettingKind::SessionIdleTimeout
+            | SettingKind::Theme
+            | SettingKind::Animations => (2026, 8, 22),
+            // v0.16.0
+            SettingKind::DoneSound => (2026, 8, 28),
+            // v0.19.0 – v0.21.0
+            SettingKind::CloseFinderOnOpen
+            | SettingKind::QuickPromptKind
+            | SettingKind::QuickPromptFocus => (2026, 8, 29),
+            // v0.23.0 / v0.24.0
+            SettingKind::FeedbackSound
+            | SettingKind::WorktreeBaseBranch
+            | SettingKind::PrewarmAgents
+            | SettingKind::PrewarmSessions => (2026, 9, 9),
+            // v0.27.0 / v0.28.0
+            SettingKind::SshSyncConfig
+            | SettingKind::HideDraftPrs
+            | SettingKind::HideUninstalledHarnesses => (2026, 9, 15),
+            // v0.29.0 / v0.31.0
+            SettingKind::RunCommand | SettingKind::OpenCommand | SettingKind::RememberHarness => {
+                (2026, 9, 17)
+            }
+            // v0.33.0
+            SettingKind::PresetText => (2026, 9, 18),
+            // v0.34.0
+            SettingKind::BlackBackground
+            | SettingKind::SessionPane
+            | SettingKind::QuickPromptNewWorktree => (2026, 9, 22),
+            // v0.38.0, then rows not yet in a release
+            SettingKind::DeleteEmptyWorktree
+            | SettingKind::ShowAllWorktrees
+            | SettingKind::HideTerminalGlyphs
+            | SettingKind::WorktreeLayout
+            | SettingKind::HideCardPrompt
+            | SettingKind::CardIssueNumber => (2026, 9, 24),
+        }
+    }
+
+    /// The row shipped fewer than [`NEW_SETTING_DAYS`] days before
+    /// `today` (days since the Unix epoch, see [`today_days`]).
+    pub fn is_new(self, today: i64) -> bool {
+        let (y, m, d) = self.added_on();
+        (0..NEW_SETTING_DAYS).contains(&(today - days_from_civil(y, m, d)))
+    }
+}
+
+/// How many days a settings row wears its `(new)` prefix.
+pub const NEW_SETTING_DAYS: i64 = 7;
+
+/// What a newly shipped settings row is prefixed with.
+pub const NEW_SETTING_PREFIX: &str = "(new) ";
+
+/// Today as days since the Unix epoch, in UTC.
+pub fn today_days() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| (d.as_secs() / 86_400) as i64)
+}
+
+/// Days since the Unix epoch of a proleptic Gregorian date (Howard
+/// Hinnant's `days_from_civil`).
+pub fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = i64::from(y) - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let m = i64::from(m);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// The tab strip, left to right. Ordered by how often a setting gets
@@ -517,6 +609,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 hint: "Deleting a worktree's last session or terminal deletes the worktree with it, no question asked (off = that delete's confirm asks first)",
                 group: "",
             },
+            SettingSpec {
+                kind: SettingKind::ShowAllWorktrees,
+                label: "Show all worktrees",
+                hint: "Every worktree gets a band on the grid, even with nothing running in it; d on an empty one deletes it, and deleting a last card never takes the worktree",
+                group: "",
+            },
         ]),
     },
     SettingsTab {
@@ -544,6 +642,30 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::SessionPane,
                 label: "Session pane",
                 hint: "Where the session under the cursor is read: beside the cards on the right, or under them",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::WorktreeLayout,
+                label: "Worktree layout",
+                hint: "Each worktree's sessions as a row of cards, or as a compact list of the 3 most recent (Tab shows them all)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideCardPrompt,
+                label: "Card prompt",
+                hint: "Show or hide the last prompt at the foot of each session card",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::CardIssueNumber,
+                label: "Card issue number",
+                hint: "Show the #number of the GitHub issue a session was started from on its card; click it to open the issue",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideTerminalGlyphs,
+                label: "Terminal glyphs",
+                hint: "Show or hide the ▶ (run terminal) and ❯ (shell) before a terminal card's name",
                 group: "",
             },
             SettingSpec {
@@ -881,6 +1003,14 @@ pub struct Config {
     /// delete would take, so they always get the question. The ROOT
     /// WORKTREE is never offered, whatever this says.
     pub delete_empty_worktree: bool,
+    /// SHOW ALL WORKTREES: every checkout of the project gets a BAND on
+    /// the grid, one with nothing running in it too — an overview of the
+    /// checkouts, any of them a place to aim `p`/`n` at. Off (the
+    /// default), the grid is only what is running. On, deleting a
+    /// worktree's last card never offers the worktree (whatever
+    /// [`Config::delete_empty_worktree`] says): the emptied band stays,
+    /// and `d` on it — behind its own confirm — is the way to delete it.
+    pub show_all_worktrees: bool,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -894,6 +1024,10 @@ pub struct Config {
     /// Ghostty is a dark gray. On by default; off lets a transparency or
     /// image configured in the terminal show through.
     pub black_background: bool,
+    /// HIDE TERMINAL GLYPHS: leave the `▶` (a RUN TERMINAL) and the `❯`
+    /// (a plain shell) off the front of a terminal card's name, which then
+    /// starts where the glyph did. Off by default.
+    pub hide_terminal_glyphs: bool,
     /// Where the LAUNCHER VIEW's PANE — the session under the cursor, live
     /// — sits against the GRID of cards: `right` (down that side of them,
     /// the default) or `bottom` (under them). Also written by the SIDE
@@ -903,6 +1037,22 @@ pub struct Config {
     /// pane beside the cards lays it out along the bottom until there is
     /// room (`launcher::fitted_side`).
     pub session_pane: String,
+    /// How the LAUNCHER VIEW lays out each worktree's BAND: `cards` (a row
+    /// of cards, the default) or `list` (every session one line, stacked
+    /// under the band's rule, the [`crate::launcher::LIST_RECENT`] most
+    /// recent shown until Tab — the ACCORDION — opens the rest). Read
+    /// through [`Config::list_layout`], so a word off the list is the cards.
+    pub worktree_layout: String,
+    /// Leave the last prompt off every session card on the GRID: the name
+    /// and what it runs on stay, the rows under them go blank. The prompt
+    /// is still captured and still read everywhere else. Off by default:
+    /// a config predating the key keeps the prompt on the cards.
+    pub hide_card_prompt: bool,
+    /// Show the `#15` of the GitHub issue an ISSUE SESSION was started
+    /// from on its card on the GRID, a link a click opens in the browser
+    /// (the very `⇧I` the card runs). Off by default: a config predating
+    /// the key keeps the cards as they were.
+    pub card_issue_number: bool,
     /// Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE's pull-request rows, so browsing what's open shows only
     /// the rows asking for a reviewer. A view filter, not a fetch filter:
@@ -1213,10 +1363,15 @@ impl Default for Config {
             feedback_sound: "Sosumi".into(),
             preset_text: PresetText::DEFAULT.as_str().into(),
             delete_empty_worktree: false,
+            show_all_worktrees: false,
             theme: "default".into(),
             animations: true,
             black_background: true,
+            hide_terminal_glyphs: false,
             session_pane: crate::launcher::PaneSide::default().as_str().into(),
+            worktree_layout: WORKTREE_LAYOUTS[0].into(),
+            hide_card_prompt: false,
+            card_issue_number: false,
             hide_draft_prs: false,
             card_line_changes: false,
             skip_session_naming: false,
@@ -1367,6 +1522,11 @@ impl Config {
     /// out on.
     pub fn pane_side(&self) -> crate::launcher::PaneSide {
         crate::launcher::PaneSide::parse(&self.session_pane)
+    }
+
+    /// `worktree_layout` says the compact LIST rather than the cards.
+    pub fn list_layout(&self) -> bool {
+        self.worktree_layout.trim().eq_ignore_ascii_case("list")
     }
 
     /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
@@ -1992,10 +2152,15 @@ impl Config {
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::DeleteEmptyWorktree => on_off(self.delete_empty_worktree).into(),
+            SettingKind::ShowAllWorktrees => on_off(self.show_all_worktrees).into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::BlackBackground => on_off(self.black_background).into(),
+            SettingKind::HideTerminalGlyphs => shown_hidden(self.hide_terminal_glyphs).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
+            SettingKind::WorktreeLayout => WORKTREE_LAYOUTS[usize::from(self.list_layout())].into(),
+            SettingKind::HideCardPrompt => shown_hidden(self.hide_card_prompt).into(),
+            SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             // A project row with no project to speak of: what one without
             // an entry would show.
@@ -2075,6 +2240,9 @@ impl Config {
             SettingKind::DeleteEmptyWorktree => {
                 self.delete_empty_worktree = !self.delete_empty_worktree;
             }
+            SettingKind::ShowAllWorktrees => {
+                self.show_all_worktrees = !self.show_all_worktrees;
+            }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
             }
@@ -2084,11 +2252,24 @@ impl Config {
             SettingKind::BlackBackground => {
                 self.black_background = !self.black_background;
             }
+            SettingKind::HideTerminalGlyphs => {
+                self.hide_terminal_glyphs = !self.hide_terminal_glyphs;
+            }
             SettingKind::SessionPane => {
                 // Cycled from the resolved side, so a hand edit off the
                 // list steps on from the right it reads as.
                 self.session_pane =
                     cycle_choice(self.pane_side().as_str(), PANE_SIDES, step).into();
+            }
+            SettingKind::WorktreeLayout => {
+                let now = WORKTREE_LAYOUTS[usize::from(self.list_layout())];
+                self.worktree_layout = cycle_choice(now, WORKTREE_LAYOUTS, step).into();
+            }
+            SettingKind::HideCardPrompt => {
+                self.hide_card_prompt = !self.hide_card_prompt;
+            }
+            SettingKind::CardIssueNumber => {
+                self.card_issue_number = !self.card_issue_number;
             }
             SettingKind::HideDraftPrs => {
                 self.hide_draft_prs = !self.hide_draft_prs;
@@ -2388,6 +2569,37 @@ pub fn project_tab() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn days_from_civil_counts_from_the_epoch() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        assert_eq!(
+            days_from_civil(2026, 9, 24) - days_from_civil(2026, 8, 22),
+            33
+        );
+    }
+
+    #[test]
+    fn a_setting_is_new_for_a_week_from_its_release() {
+        let shipped = days_from_civil(2026, 9, 22);
+        let kind = SettingKind::BlackBackground;
+        assert!(!kind.is_new(shipped - 1), "not new before it shipped");
+        assert!(kind.is_new(shipped));
+        assert!(kind.is_new(shipped + NEW_SETTING_DAYS - 1));
+        assert!(!kind.is_new(shipped + NEW_SETTING_DAYS));
+    }
+
+    #[test]
+    fn no_setting_ships_in_the_future_of_its_own_code() {
+        // A date past today is a typo: the row would miss its `(new)` week.
+        for tab in 0..tab_count() {
+            for spec in tab_settings(tab) {
+                let (y, m, d) = spec.kind.added_on();
+                assert!(days_from_civil(y, m, d) <= today_days(), "{}", spec.label);
+            }
+        }
+    }
     use crate::keymap::Keymap;
 
     /// Config files earlier releases wrote, every value off its default.
@@ -3097,6 +3309,28 @@ mod tests {
         assert!(cfg.delete_empty_worktree);
     }
 
+    /// SHOW ALL WORKTREES starts off — the grid is what is running —
+    /// sits on the Sessions tab beside the delete it changes, toggles
+    /// like any bool, and a config predating the key reads as off.
+    #[test]
+    fn show_all_worktrees_is_off_by_default_and_toggles() {
+        let mut cfg = Config::default();
+        assert!(!cfg.show_all_worktrees);
+        let (tab, row) = locate(SettingKind::ShowAllWorktrees).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        assert_eq!(cfg.value_label(SettingKind::ShowAllWorktrees), "off");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.show_all_worktrees);
+        assert_eq!(cfg.value_label(SettingKind::ShowAllWorktrees), "on");
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.show_all_worktrees, "←/→ toggle it like Enter does");
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.show_all_worktrees, "a missing key reads as off");
+        let cfg: Config = serde_json::from_str(r#"{"show_all_worktrees": true}"#).unwrap();
+        assert!(cfg.show_all_worktrees);
+    }
+
     #[test]
     fn editor_defaults_cycles_and_persists() {
         let mut cfg = Config::default();
@@ -3211,6 +3445,61 @@ mod tests {
         assert!(!legacy.hide_draft_prs);
     }
 
+    /// CARD PROMPT: an Appearance row that reads `shown` / `hidden`, shown
+    /// by default so a config that predates the key keeps the last prompt
+    /// on every card, and persisted under `hide_card_prompt`.
+    #[test]
+    fn card_prompt_default_shown_toggle_on_the_appearance_tab_and_persist() {
+        let mut cfg = Config::default();
+        assert!(
+            !cfg.hide_card_prompt,
+            "the prompt stays on the cards until asked"
+        );
+        assert_eq!(cfg.value_label(SettingKind::HideCardPrompt), "shown");
+
+        let (tab, row) = locate(SettingKind::HideCardPrompt).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.hide_card_prompt);
+        assert_eq!(cfg.value_label(SettingKind::HideCardPrompt), "hidden");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""hide_card_prompt": true"#), "{raw}");
+        assert!(load_from(&path).hide_card_prompt);
+
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.hide_card_prompt);
+    }
+
+    /// CARD ISSUE NUMBER: an Appearance row that reads `on` / `off`, off
+    /// by default so a config that predates the key keeps the cards as
+    /// they were, and persisted under `card_issue_number`.
+    #[test]
+    fn card_issue_number_default_off_toggle_on_the_appearance_tab_and_persist() {
+        let mut cfg = Config::default();
+        assert!(!cfg.card_issue_number, "off until asked");
+        assert_eq!(cfg.value_label(SettingKind::CardIssueNumber), "off");
+
+        let (tab, row) = locate(SettingKind::CardIssueNumber).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.card_issue_number);
+        assert_eq!(cfg.value_label(SettingKind::CardIssueNumber), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""card_issue_number": true"#), "{raw}");
+        assert!(load_from(&path).card_issue_number);
+
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.card_issue_number);
+    }
+
     /// CARD LINE COUNTS: retired with every card counting its lines. The
     /// key an older build wrote (`card_line_changes`, off by default) still
     /// loads to what it wrote and is written back as stored, but no tab
@@ -3275,6 +3564,38 @@ mod tests {
         );
     }
 
+    /// HIDE TERMINAL GLYPHS: off out of the box, toggled on from its
+    /// Appearance row, persisted under `hide_terminal_glyphs`; a config
+    /// predating the key keeps the glyphs.
+    #[test]
+    fn hide_terminal_glyphs_default_off_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(!cfg.hide_terminal_glyphs);
+        let (tab, row) = locate(SettingKind::HideTerminalGlyphs).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        assert_eq!(cfg.value_label(SettingKind::HideTerminalGlyphs), "shown");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.hide_terminal_glyphs);
+        assert_eq!(cfg.value_label(SettingKind::HideTerminalGlyphs), "hidden");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).hide_terminal_glyphs);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw.get("hide_terminal_glyphs"),
+            Some(&serde_json::json!(true))
+        );
+
+        let older: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            !older.hide_terminal_glyphs,
+            "a config predating the key keeps the glyphs"
+        );
+    }
+
     /// The **Session pane**: down the right out of the box, cycled from
     /// its Appearance row to the bottom and back, persisted under
     /// `session_pane`. A config predating the key, or holding a word off
@@ -3312,6 +3633,39 @@ mod tests {
         assert_eq!(odd.pane_side(), PaneSide::Bottom, "steps on from the right");
         let left: Config = serde_json::from_str(r#"{"session_pane": "left"}"#).unwrap();
         assert_eq!(left.pane_side(), PaneSide::Right, "the retired left side");
+    }
+
+    /// The **Worktree layout**: the cards out of the box, cycled from its
+    /// Appearance row to the compact list and back, persisted under
+    /// `worktree_layout`. A config predating the key, or holding a word
+    /// off the list, reads as the cards.
+    #[test]
+    fn worktree_layout_defaults_to_cards_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.list_layout());
+        let (tab, row) = locate(SettingKind::WorktreeLayout).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        assert_eq!(cfg.value_label(SettingKind::WorktreeLayout), "cards");
+        cfg.cycle(tab, row, 1);
+        assert!(cfg.list_layout());
+        assert_eq!(cfg.value_label(SettingKind::WorktreeLayout), "list");
+        cfg.cycle(tab, row, -1);
+        assert!(!cfg.list_layout(), "and back");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.list_layout(), "Enter steps it on too");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).list_layout());
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.get("worktree_layout"), Some(&serde_json::json!("list")));
+
+        let older: Config = serde_json::from_str("{}").unwrap();
+        assert!(!older.list_layout(), "predating the key");
+        let odd: Config = serde_json::from_str(r#"{"worktree_layout": "grid"}"#).unwrap();
+        assert!(!odd.list_layout(), "a word off the list");
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,

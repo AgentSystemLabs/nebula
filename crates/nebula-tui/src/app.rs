@@ -93,6 +93,13 @@ pub enum HitTarget {
     /// runs. Only a checkout with a pull request has one, and it is only
     /// as wide as its text, so the rest of the rule is still the band's.
     LauncherBandPr(WorktreeId),
+    /// The ISSUE NUMBER on a session's card — its `#15`, drawn while the
+    /// `card_issue_number` setting is on — by the card's session,
+    /// registered ahead of the card, so it wins: a click lands the cursor
+    /// on the card and opens the issue in the browser, through the very
+    /// `launcher::open_issue` `⇧I` runs. Only as wide as its text, so the
+    /// rest of the card is still the card's.
+    LauncherCardIssue(AgentId),
     /// The `❮` / `❯` beside a BAND's row of cards on the grid, by the
     /// band's place in `launcher::bands` — drawn only while the row has
     /// cards off that edge: a click steps the cursor one card that way
@@ -100,6 +107,12 @@ pub enum HitTarget {
     /// (`event_loop::launcher::walk_band`).
     LauncherStripLeft(usize),
     LauncherStripRight(usize),
+    /// The `▾ 6 more · Tab: see all 8` under a collapsed BAND's row that
+    /// left cards off its edges, by the band's place in
+    /// `launcher::bands`: a click puts the cursor on the band and opens
+    /// it as the ACCORDION, the very toggle Tab runs
+    /// (`event_loop::launcher::click_band_more`).
+    LauncherBandMore(usize),
     /// The `‹ sessions` crumb in a full-screen session's header
     /// (LAUNCHER VIEW): a click leaves the session for the grid, as `^q`
     /// does.
@@ -131,6 +144,11 @@ pub enum HitTarget {
     /// under them — by writing Settings → Appearance → **Session pane**
     /// (`event_loop::launcher::move_pane`).
     LauncherPaneSide,
+    /// The FULL-SCREEN BUTTON before those in the pane's header, and the
+    /// NORMAL-SIZE BUTTON at the right end of a full-screen session's: a
+    /// click toggles between the two, the same
+    /// `event_loop::launcher::toggle_full_screen` `^F` runs.
+    LauncherPaneZoom,
     /// The PR COUNT on the right of the LAUNCHER VIEW's header (`2 prs`):
     /// a click opens the open pull requests of the project in front of
     /// you — the modal `v` opens.
@@ -3198,6 +3216,12 @@ pub struct App {
     /// is [`App::launcher_pane_side`], which falls back to the bottom on a
     /// window too narrow to stand the pane beside the cards.
     pub launcher_pane_at: crate::launcher::PaneSide,
+    /// Each BAND is the compact LIST — its sessions stacked a line apiece,
+    /// the most recent few until Tab opens the rest — rather than its row
+    /// of cards: Settings → Appearance → **Worktree layout**
+    /// (`event_loop::apply_config`). What a frame lays out is
+    /// [`App::panel_layout`].
+    pub launcher_list: bool,
     /// The LAUNCHER VIEW's PANE is folded away (`^~`): the GRID takes the
     /// whole body and no session is read under it. Hiding it also lets
     /// the card under the cursor go (`event_loop::launcher::toggle_pane`
@@ -3676,6 +3700,25 @@ pub struct App {
     /// applies it. Mirrors the config, refreshed at startup and when the
     /// settings overlay applies a change.
     pub black_background: bool,
+    /// The `hide_card_prompt` setting: leave the last prompt off every
+    /// session card on the GRID. Mirrors the config, refreshed at startup
+    /// and when the settings overlay applies a change.
+    pub hide_card_prompt: bool,
+    /// The `card_issue_number` setting: an ISSUE SESSION's card shows the
+    /// `#15` of the issue it was started from, a link a click opens
+    /// (`HitTarget::LauncherCardIssue`). Mirrors the config, refreshed at
+    /// startup and when the settings overlay applies a change.
+    pub card_issue_number: bool,
+    /// The `show_all_worktrees` setting: every checkout of the project
+    /// gets a BAND on the grid, one with nothing running in it too
+    /// (`launcher::bands`). Mirrors the config, refreshed at startup and
+    /// when the settings overlay applies a change.
+    pub show_all_worktrees: bool,
+    /// The `hide_terminal_glyphs` setting: a terminal card's name goes
+    /// without the `▶`/`❯` in front of it (`launcher_view::draw_chip`).
+    /// Mirrors the config, refreshed at startup and when the settings
+    /// overlay applies a change.
+    pub hide_terminal_glyphs: bool,
     /// The ROWS MEMO, armed by the frame and by [`App::reading_url`].
     pub rows_memo: RowsMemo,
 }
@@ -3725,6 +3768,7 @@ impl App {
             launcher_pane_h: None,
             launcher_pane_w: None,
             launcher_pane_at: crate::launcher::PaneSide::default(),
+            launcher_list: false,
             launcher_pane_hidden: false,
             launcher_expanded: None,
             launcher_scroll: 0,
@@ -3834,7 +3878,11 @@ impl App {
             splash_epoch: std::time::Instant::now(),
             welcome_on_screen: false,
             animations: true,
+            hide_card_prompt: false,
+            card_issue_number: false,
+            show_all_worktrees: false,
             black_background: false,
+            hide_terminal_glyphs: false,
             rows_memo: RowsMemo::default(),
         }
     }
@@ -4184,6 +4232,47 @@ impl App {
     pub fn cursor_in_open_band(&self, bands: &[crate::launcher::Band]) -> Option<usize> {
         let index = crate::launcher::band_cursor(self, bands)?;
         (self.open_band(bands) == Some(index)).then_some(index)
+    }
+
+    /// The whole GRID laid out the way this frame draws it: the bands'
+    /// rows of cards with the ACCORDION's one open
+    /// (`launcher::panel_layout`), or, in the compact LIST
+    /// ([`App::launcher_list`]), every band's entries stacked under its
+    /// rule, the cursor's card among them wherever it sits
+    /// (`launcher::list_panel_layout`). The draw, the wheel and the keys
+    /// all read this one, so what `j`/`k` walk is what is on screen.
+    pub fn panel_layout(&self, bands: &[crate::launcher::Band]) -> crate::launcher::PanelLayout {
+        if self.launcher_list {
+            crate::launcher::list_panel_layout(
+                self.body_area,
+                bands,
+                self.launcher_expanded.as_ref(),
+                crate::launcher::cursor(self, bands),
+            )
+        } else {
+            crate::launcher::panel_layout(self.body_area, bands, self.launcher_expanded.as_ref())
+        }
+    }
+
+    /// The band whose cards the keys walk as rows, and those rows: the
+    /// ACCORDION's open band while the cursor is on it — or, in the
+    /// compact LIST, whichever band the cursor is on, every band there
+    /// being a column of entries. None on a collapsed band of cards, where
+    /// `h`/`l` walk the STRIP and `j`/`k` the bands.
+    pub fn walked_band(
+        &self,
+        bands: &[crate::launcher::Band],
+    ) -> Option<(usize, crate::launcher::ExpandedLayout)> {
+        if self.launcher_list {
+            let index = crate::launcher::band_cursor(self, bands)?;
+            let layout = self.panel_layout(bands).bands.swap_remove(index).content?;
+            return Some((index, layout));
+        }
+        let index = self.cursor_in_open_band(bands)?;
+        Some((
+            index,
+            crate::launcher::expanded_layout(self.body_area, &bands[index]),
+        ))
     }
 
     /// `body` in two the way the LAUNCHER VIEW draws it: the grid's half

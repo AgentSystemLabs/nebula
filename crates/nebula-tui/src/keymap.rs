@@ -142,6 +142,10 @@ pub enum Action {
     /// whole body, or bring it back. Folding it also unselects the card
     /// under the cursor, so nothing is selected and nothing is read.
     ToggleLauncherPane,
+    /// `^F`: FULL-SCREEN the session in the PANE — the grid and its header
+    /// give way to the PTY — or bring it back down to the pane beside the
+    /// cards. From the cards it full-screens the one under the cursor.
+    ToggleFullScreen,
     /// `` ` ``: walk the LAUNCHER PANE's TAB STRIP — the session the
     /// cursor is on, then each TERMINAL open in that checkout, then back
     /// to the session. What the pane READS, where `^~` is whether it is
@@ -613,6 +617,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         // beside them — the shift of the `` ` `` that walks the pane's
         // tabs, which is the key everything else about the pane is on.
         defaults: &["ctrl+`", "ctrl+~", "~"],
+    },
+    ActionSpec {
+        action: Action::ToggleFullScreen,
+        id: "toggle_full_screen",
+        label: "Full-screen session",
+        hint: "Launcher view: give the session in the pane the whole screen, or bring it back down beside the cards — from inside the pane too, where it is never forwarded to the agent. From the cards it full-screens the one under the cursor. ^q and ^` also bring a full-screen session back down",
+        group: "GENERAL",
+        scope: Scope::Global,
+        defaults: &["ctrl+f"],
     },
     ActionSpec {
         action: Action::PaneTabs,

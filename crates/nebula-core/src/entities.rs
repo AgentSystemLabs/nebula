@@ -251,6 +251,15 @@ impl Agent {
     pub fn cloud_session_url(&self) -> Option<String> {
         self.cloud_session_id.as_deref().map(cloud_session_url)
     }
+
+    /// The number of the GitHub issue this ISSUE SESSION was started from,
+    /// read off `issue_url` (`…/issues/15`, with or without a trailing
+    /// path) — None for every other row.
+    pub fn issue_number(&self) -> Option<u64> {
+        let (_, tail) = self.issue_url.as_deref()?.split_once("/issues/")?;
+        let digits = tail.split(['/', '?', '#']).next().unwrap_or_default();
+        digits.parse::<u64>().ok().filter(|n| *n > 0)
+    }
 }
 
 /// The claude.ai page of a Claude Cloud session, from its `session_…` id.

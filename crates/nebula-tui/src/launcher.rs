@@ -259,9 +259,11 @@ impl Band {
 /// something running in it — a session on the list `rows` builds, or a
 /// terminal — the root first, then the rest most recently worked in
 /// first (`App::visible_worktrees`). A checkout with nothing running has
-/// no band: the grid is what is running, not what is checked out. The
+/// no band: the grid is what is running, not what is checked out — unless
+/// the **Show all worktrees** SETTING is on (`App::show_all_worktrees`),
+/// when every checkout gets one, an empty band with no cards on it. The
 /// ARCHIVED VIEW's bands hold the archived sessions alone; a terminal is
-/// never archived, so none is listed there.
+/// never archived, so none is listed there, and no empty band is either.
 pub fn bands(app: &App) -> Vec<Band> {
     let Some(project) = app.selected_project() else {
         return Vec::new();
@@ -285,7 +287,7 @@ pub fn bands(app: &App) -> Vec<Band> {
                     .map(Card::Terminal),
             );
         }
-        if cards.is_empty() {
+        if cards.is_empty() && (app.show_archived || !app.show_all_worktrees) {
             continue;
         }
         out.push(Band {
@@ -372,6 +374,25 @@ pub fn terminal_w(cols: usize, card_w: u16) -> u16 {
 pub const BAND_RULE_H: u16 = 1;
 /// A BAND on the grid: its rule and one row of cards under it.
 pub const BAND_H: u16 = BAND_RULE_H + CARD_H;
+/// The row under a collapsed BAND's cards that says how many its row
+/// left off (`▾ 2 more · Tab: see all 8`), on a band whose cards do not
+/// all fit across ([`BandsLayout::row_overflows`]). Part of the band, so
+/// the gap to the next band's rule stands under it rather than being
+/// painted over.
+pub const MORE_H: u16 = 1;
+/// The compact LIST layout (Settings → Appearance → **Worktree layout**):
+/// how many of a collapsed band's entries it shows — its most recent, since
+/// the sessions come newest first ([`rows`]) — before the `▾ N more` row;
+/// Tab (the ACCORDION) opens the rest.
+pub const LIST_RECENT: usize = 3;
+/// One entry of the LIST: a session or a terminal on a single line.
+pub const LIST_ROW_H: u16 = 1;
+/// The line under an EMPTY BAND's rule — a checkout with nothing running
+/// in it, on the grid only with **Show all worktrees** on — saying what
+/// can be done there, in place of a row of cards it has none of.
+pub const EMPTY_BAND_ROW_H: u16 = 1;
+/// An EMPTY BAND on the grid: its rule and the line under it.
+pub const EMPTY_BAND_H: u16 = BAND_RULE_H + EMPTY_BAND_ROW_H;
 /// Gaps between cards: a column of air either side, a blank row under.
 pub const GAP_X: u16 = 2;
 pub const GAP_Y: u16 = 1;
@@ -763,6 +784,19 @@ impl BandsLayout {
         }
     }
 
+    /// `band`'s cards are wider together, gaps included, than the row:
+    /// its STRIP leaves some off wherever the cursor is, and the band
+    /// takes the [`MORE_H`] row that says so.
+    pub fn row_overflows(&self, band: &Band) -> bool {
+        let cards: u32 = band
+            .cards
+            .iter()
+            .map(|c| u32::from(self.card_width(c)))
+            .sum();
+        let gaps = u32::from(GAP_X) * band.cards.len().saturating_sub(1) as u32;
+        cards + gaps > u32::from(self.area.width)
+    }
+
     /// The first card `band`'s row draws with the cursor on `cursor`: the
     /// stateless follow-window every list scrolls by
     /// (`app::window_start`) — the row slides only as far as it must to
@@ -870,10 +904,15 @@ impl Strip {
 pub struct PanelBand {
     pub rule_y: u16,
     /// The band's cards wrapped into rows under its rule, on the open
-    /// band; None collapsed, where the STRIP draws its one row.
+    /// band; None collapsed, where the STRIP draws its one row. In the
+    /// LIST layout every band has one — its entries stacked a line apiece
+    /// ([`list_layout`]) — and `open` says which is showing them all.
     pub content: Option<ExpandedLayout>,
-    /// Rows the band takes, rule included: [`BAND_H`] collapsed, or its
-    /// content's height open.
+    /// The band is the one open as the ACCORDION.
+    pub open: bool,
+    /// Rows the band takes, rule included: [`BAND_H`] collapsed — and
+    /// the [`MORE_H`] row under the cards when they do not all fit — or
+    /// its content's height open.
     pub height: u16,
 }
 
@@ -926,12 +965,54 @@ pub struct PanelLayout {
 pub fn panel_layout(body: Rect, bands: &[Band], expanded: Option<&WorktreeId>) -> PanelLayout {
     let mut y = 0u16;
     let mut out = Vec::with_capacity(bands.len());
+    let strips = bands_layout(body);
     for band in bands {
         let content = (expanded == Some(&band.worktree)).then(|| expanded_layout(body, band));
-        let height = content.as_ref().map_or(BAND_H, ExpandedLayout::height);
+        let collapsed = if band.cards.is_empty() {
+            EMPTY_BAND_H
+        } else if strips.row_overflows(band) {
+            BAND_H + MORE_H
+        } else {
+            BAND_H
+        };
+        let height = content.as_ref().map_or(collapsed, ExpandedLayout::height);
         out.push(PanelBand {
             rule_y: y,
+            open: content.is_some(),
             content,
+            height,
+        });
+        y += height + GAP_Y;
+    }
+    PanelLayout {
+        area: grid(body).area,
+        bands: out,
+        height: y.saturating_sub(GAP_Y),
+    }
+}
+
+/// [`panel_layout`] for the compact LIST: every band its rule over its
+/// entries stacked a line apiece ([`list_layout`]) — all of them on the
+/// band `expanded` names, the [`LIST_RECENT`] most recent on the rest, and
+/// on the band the cursor is on (`pin`) its card too wherever it sits, so
+/// the card the pane reads is always one of the lines on screen.
+pub fn list_panel_layout(
+    body: Rect,
+    bands: &[Band],
+    expanded: Option<&WorktreeId>,
+    pin: Option<CardRef>,
+) -> PanelLayout {
+    let mut y = 0u16;
+    let mut out = Vec::with_capacity(bands.len());
+    for (index, band) in bands.iter().enumerate() {
+        let open = expanded == Some(&band.worktree);
+        let pin = pin.filter(|p| p.band == index).map(|p| p.card);
+        let content = list_layout(body, band, open, pin);
+        let height = content.height();
+        out.push(PanelBand {
+            rule_y: y,
+            content: Some(content),
+            open,
             height,
         });
         y += height + GAP_Y;
@@ -946,7 +1027,7 @@ pub fn panel_layout(body: Rect, bands: &[Band], expanded: Option<&WorktreeId>) -
 impl PanelLayout {
     /// The band open as the ACCORDION, if one of these is.
     pub fn open(&self) -> Option<usize> {
-        self.bands.iter().position(|b| b.content.is_some())
+        self.bands.iter().position(|b| b.open)
     }
 
     /// The panel is taller than its area: it scrolls, and a marker row
@@ -1025,7 +1106,7 @@ impl PanelLayout {
             }
         };
         for band in &self.bands {
-            match &band.content {
+            match band.content.as_ref().filter(|_| band.open) {
                 None => count(band.rule_y, band.rule_y + band.height),
                 Some(content) => {
                     for cell in content.cells() {
@@ -1052,8 +1133,13 @@ impl PanelLayout {
 /// the grid is scrolled, is [`PanelLayout`]'s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedLayout {
-    /// Every card's cell, by its index in the band.
-    cells: Vec<Rect>,
+    /// Every card's cell, by its index in the band — None for one a
+    /// collapsed LIST leaves off ([`list_layout`]).
+    cells: Vec<Option<Rect>>,
+    /// Cards the collapsed LIST leaves off, counted on the `▾ N more` row
+    /// under its last entry ([`ExpandedLayout::more_y`]). Always 0 on the
+    /// open band and in the cards layout.
+    pub more: usize,
     /// The rules over each section: their row and what they say. The
     /// sessions' is the band's own rule, on row 0; the terminals' stands
     /// only with a terminal under it.
@@ -1072,7 +1158,7 @@ pub const TERMINALS_RULE: &str = "terminals";
 /// `band`'s cards laid out on the columns `body` gives the grid.
 pub fn expanded_layout(body: Rect, band: &Band) -> ExpandedLayout {
     let g = grid(body);
-    let mut cells = vec![Rect::default(); band.cards.len()];
+    let mut cells = vec![None; band.cards.len()];
     let mut rules = Vec::new();
     let mut rows: Vec<Vec<usize>> = Vec::new();
     let mut y = 0u16;
@@ -1110,12 +1196,12 @@ pub fn expanded_layout(body: Rect, band: &Band) -> ExpandedLayout {
         for chunk in slots.chunks(cols.max(1)) {
             let mut row = Vec::new();
             for (col, i) in chunk.iter().enumerate() {
-                cells[*i] = Rect {
+                cells[*i] = Some(Rect {
                     x: g.area.x + col as u16 * (w + GAP_X),
                     y,
                     width: w,
                     height: CARD_H,
-                };
+                });
                 row.push(*i);
             }
             rows.push(row);
@@ -1124,9 +1210,50 @@ pub fn expanded_layout(body: Rect, band: &Band) -> ExpandedLayout {
     }
     ExpandedLayout {
         cells,
+        more: 0,
         rules,
         rows,
         height: y.saturating_sub(GAP_Y),
+    }
+}
+
+/// `band` as the compact LIST lays it out under its rule: one line per
+/// card, the band's full width, in the band's own order — its sessions
+/// newest first, then its terminals — one column `j`/`k` walk. `open`
+/// lists every card; collapsed it lists the first [`LIST_RECENT`], then
+/// `pin` (the cursor's card) when that is further down, and says how
+/// many it left off on a row of its own under them (`more`).
+pub fn list_layout(body: Rect, band: &Band, open: bool, pin: Option<usize>) -> ExpandedLayout {
+    let area = grid(body).area;
+    let total = band.cards.len();
+    let mut shown: Vec<usize> = (0..if open { total } else { total.min(LIST_RECENT) }).collect();
+    if let Some(p) = pin.filter(|&p| p < total && !shown.contains(&p)) {
+        shown.push(p);
+    }
+    let mut cells = vec![None; total];
+    let mut y = BAND_RULE_H;
+    for &i in &shown {
+        cells[i] = Some(Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: LIST_ROW_H,
+        });
+        y += LIST_ROW_H;
+    }
+    let more = total - shown.len();
+    if more > 0 {
+        y += MORE_H;
+    }
+    if total == 0 {
+        y += EMPTY_BAND_ROW_H;
+    }
+    ExpandedLayout {
+        cells,
+        more,
+        rules: vec![(0, SESSIONS_RULE)],
+        rows: shown.into_iter().map(|i| vec![i]).collect(),
+        height: y,
     }
 }
 
@@ -1188,14 +1315,21 @@ impl ExpandedLayout {
         self.height
     }
 
-    /// `card`'s cell, `y` counted from the band's rule.
+    /// `card`'s cell, `y` counted from the band's rule. None for one a
+    /// collapsed LIST leaves off.
     pub fn cell(&self, card: usize) -> Option<Rect> {
-        self.cells.get(card).copied()
+        self.cells.get(card).copied().flatten()
     }
 
-    /// Every card's cell, in the band's own card order.
-    pub fn cells(&self) -> &[Rect] {
-        &self.cells
+    /// Every card's cell there is, in the band's own card order.
+    pub fn cells(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.cells.iter().flatten().copied()
+    }
+
+    /// The row of the collapsed LIST's `▾ N more` line, counted from the
+    /// band's rule: under its last entry. None with nothing left off.
+    pub fn more_y(&self) -> Option<u16> {
+        (self.more > 0).then(|| self.height - MORE_H)
     }
 
     /// The section rules: each one's row, counted from the band's rule,
@@ -1804,6 +1938,47 @@ mod tests {
 
     fn names(rows: &[LauncherRow]) -> Vec<&str> {
         rows.iter().map(|r| r.agent.name.as_str()).collect()
+    }
+
+    /// A checkout with nothing running in it has no band — until **Show
+    /// all worktrees** is on, when it gets an EMPTY BAND: no cards, and
+    /// only a rule and a line of height. The ARCHIVED VIEW never lists
+    /// one, whatever the setting says.
+    #[test]
+    fn an_empty_checkout_gets_a_band_only_with_show_all_worktrees() {
+        let mut app = app();
+        app.tree.worktrees.push(worktree("w5", "p1", "idle", false));
+        let branches = |app: &App| -> Vec<String> {
+            super::bands(app).into_iter().map(|b| b.branch).collect()
+        };
+        assert!(
+            !branches(&app).contains(&"idle".to_string()),
+            "off: what runs"
+        );
+
+        app.show_all_worktrees = true;
+        let bands = super::bands(&app);
+        let idle = bands
+            .iter()
+            .position(|b| b.branch == "idle")
+            .expect("on: every checkout");
+        assert!(bands[idle].cards.is_empty());
+        assert_eq!(branches(&app).len(), 3, "main, feat and idle");
+        let body = Rect::new(0, 0, 120, 60);
+        assert_eq!(
+            super::panel_layout(body, &bands, None).bands[idle].height,
+            EMPTY_BAND_H
+        );
+        assert_eq!(
+            super::list_panel_layout(body, &bands, None, None).bands[idle].height,
+            EMPTY_BAND_H
+        );
+
+        app.show_archived = true;
+        assert!(
+            !branches(&app).contains(&"idle".to_string()),
+            "archived view"
+        );
     }
 
     /// The list is the SELECTED PROJECT's sessions, each carrying the
@@ -2545,13 +2720,21 @@ mod tests {
         let body = Rect::new(0, 0, 80, 60);
         let collapsed = panel_layout(body, &all, None);
         assert_eq!(collapsed.open(), None);
-        assert_eq!(collapsed.bands[0].height, BAND_H);
+        assert_eq!(
+            collapsed.bands[0].height,
+            BAND_H + MORE_H,
+            "six cards on a two-card row: the row under them says so"
+        );
         assert_eq!(
             collapsed.bands[1].rule_y,
-            BAND_H + GAP_Y,
-            "one band's row, then the next"
+            BAND_H + MORE_H + GAP_Y,
+            "one band's row and its more row, then the next"
         );
-        assert_eq!(collapsed.height(), BAND_H * 2 + GAP_Y);
+        assert_eq!(
+            collapsed.bands[1].height, BAND_H,
+            "one card fits: no more row"
+        );
+        assert_eq!(collapsed.height(), BAND_H * 2 + MORE_H + GAP_Y);
         assert!(
             collapsed.bands[0].cell(0).is_none(),
             "a collapsed band's cards are the strip's"

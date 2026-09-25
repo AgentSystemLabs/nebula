@@ -2538,6 +2538,17 @@ fn folds_launcher_pane(app: &App, chord: &crate::keymap::KeyChord) -> bool {
             .contains(chord)
 }
 
+/// Is `chord` the full-screen toggle's (`^F`, whatever the Hotkeys tab
+/// binds to it) in a form a LOCKED PANE lets through rather than forwards
+/// — a chord with a command modifier, never one that types a character.
+fn toggles_full_screen(app: &App, chord: &crate::keymap::KeyChord) -> bool {
+    !crate::key_combo::is_text_key(chord)
+        && app
+            .keymap
+            .chords(crate::keymap::Action::ToggleFullScreen)
+            .contains(chord)
+}
+
 /// Is `chord` the PROJECT DROPDOWN's (`⌘P`, whatever the Hotkeys tab binds
 /// to it) in a form a LOCKED PANE or the dropdown's own TYPE-AHEAD lets
 /// through rather than takes as text — a chord with a command modifier,
@@ -2896,6 +2907,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         let is_hatch = chord == HARDWIRED_UNLOCK
             || app.keymap.lookup(crate::keymap::Scope::Terminal, &chord)
                 == Some(crate::keymap::Action::UnlockTerminal);
+        // `^F` full-screens the pane under the cards and brings it back
+        // down; in a full-screen session the hatches and the pane fold's
+        // `^`` bring it back down too, rather than straight out to the
+        // grid — the keys stay in the session, now in its pane.
+        let zooms = toggles_full_screen(app, &chord)
+            || (app.collapsed && (is_hatch || folds_launcher_pane(app, &chord)));
+        if app.launcher_active() && zooms {
+            let did = launcher::toggle_full_screen(app, out);
+            crate::key_combo::note(app, &[chord], Some(did));
+            return;
+        }
         if is_hatch {
             // The one key in a LOCKED PANE the KEY COMBO DISPLAY shows:
             // everything else typed here is the agent's, passwords
@@ -3116,6 +3138,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::ToggleLauncherPane if app.launcher_active() => launcher::toggle_pane(app),
         Action::ToggleLauncherPane => {
             app.flash = Some("no cards to fold a pane under — add a project first".into())
+        }
+        // Full-screen, and back down. The grid takes this key itself
+        // (`launcher::handle_action`), as does a LOCKED PANE; it reaches
+        // here from a full-screen session that is not typing — one that
+        // exited — and before the first project, with no session to show.
+        Action::ToggleFullScreen if app.launcher_active() => {
+            launcher::toggle_full_screen(app, out);
+        }
+        Action::ToggleFullScreen => {
+            app.flash = Some("no session to full-screen — add a project first".into())
         }
         // The strip across the LAUNCHER PANE's header. The grid takes this
         // key itself (`launcher::handle_action`); it reaches here over a
@@ -4644,7 +4676,12 @@ fn open_delete_confirm(app: &mut App) {
                 app.overlay = Some(Overlay::Confirm(confirm_close_terminal_in(app, &t)));
             }
             Some(SessionRow::Link(l)) => delete_link(app, &l),
-            None => {}
+            // An EMPTY BAND on the grid: the worktree is all there is.
+            None => {
+                if let Some(id) = launcher::empty_band(app) {
+                    activate::delete_worktree(app, &id);
+                }
+            }
         },
         Focus::Terminal => {}
     }
@@ -5221,11 +5258,18 @@ fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
                 None => app.selected_worktree().map(|w| worktree_menu_items(app, w)),
             },
         },
-        Focus::Sessions => app.selected_session_row().map(|row| match row {
-            SessionRow::Agent(a) => menu_items_for_session_in(app, &a),
-            SessionRow::Terminal(t) => menu_items_for_terminal(&t),
-            SessionRow::Link(l) => menu_items_for_link(&l),
-        }),
+        Focus::Sessions => match app.selected_session_row() {
+            Some(SessionRow::Agent(a)) => Some(menu_items_for_session_in(app, &a)),
+            Some(SessionRow::Terminal(t)) => Some(menu_items_for_terminal(&t)),
+            Some(SessionRow::Link(l)) => Some(menu_items_for_link(&l)),
+            // An EMPTY BAND on the grid: its checkout's own menu, the
+            // same **Delete worktree** its `d` opens.
+            None => {
+                let id = launcher::empty_band(app)?;
+                let w = app.tree.worktrees.iter().find(|w| w.id == id)?;
+                Some(worktree_menu_items(app, w))
+            }
+        },
         Focus::Terminal => None,
     }
 }
@@ -5292,8 +5336,11 @@ fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
 fn select_clicked_row(app: &mut App, target: &HitTarget, out: &mut Vec<ClientRequest>) -> bool {
     match *target {
         HitTarget::LauncherCard(at) => launcher::select_card_row(app, at, out),
-        HitTarget::LauncherBand(i) => launcher::select_band_row(app, i, out),
+        HitTarget::LauncherBand(i) | HitTarget::LauncherBandMore(i) => {
+            launcher::select_band_row(app, i, out)
+        }
         HitTarget::LauncherBandPr(ref wid) => launcher::select_band_of(app, wid, out),
+        HitTarget::LauncherCardIssue(ref id) => launcher::select_issue_card(app, id, out),
         _ => false,
     }
 }
@@ -6333,7 +6380,12 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.black_background = cfg.black_background;
+    app.hide_card_prompt = cfg.hide_card_prompt;
+    app.card_issue_number = cfg.card_issue_number;
+    app.show_all_worktrees = cfg.show_all_worktrees;
+    app.hide_terminal_glyphs = cfg.hide_terminal_glyphs;
     app.launcher_pane_at = cfg.pane_side();
+    app.launcher_list = cfg.list_layout();
     set_hide_draft_prs(app, cfg.hide_draft_prs);
 }
 
@@ -6882,8 +6934,10 @@ fn live_cards_in(app: &App, id: &WorktreeId) -> usize {
 /// counted in the question, since the delete takes their history. With
 /// the **Delete emptied worktree** SETTING on and nothing archived left
 /// the question is skipped: the dialog stays two-way, says the worktree
-/// goes with the card, and `Enter` does both. Anything else leaves the
-/// dialog as it came.
+/// goes with the card, and `Enter` does both. With **Show all worktrees**
+/// on the worktree is never offered: the emptied checkout keeps its band
+/// on the grid, and `d` on that band is the way to delete it. Anything
+/// else leaves the dialog as it came.
 fn with_worktree_offer(
     app: &App,
     mut dialog: ConfirmDialog,
@@ -6894,6 +6948,7 @@ fn with_worktree_offer(
         return dialog;
     };
     if w.is_main
+        || app.show_all_worktrees
         || app.is_placeholder_worktree(worktree)
         || live_cards_in(app, worktree) != live_taken
     {
@@ -8895,11 +8950,14 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
             h,
             HitTarget::LauncherTab(_)
                 | HitTarget::LauncherBandPr(_)
+                | HitTarget::LauncherCardIssue(_)
                 | HitTarget::LauncherStripLeft(_)
                 | HitTarget::LauncherStripRight(_)
+                | HitTarget::LauncherBandMore(_)
                 | HitTarget::LauncherTabClose(_)
                 | HitTarget::LauncherPaneClose
                 | HitTarget::LauncherPaneSide
+                | HitTarget::LauncherPaneZoom
                 | HitTarget::LauncherTabAdd
                 | HitTarget::LauncherCrumb
                 | HitTarget::LauncherPullRequests
@@ -9504,14 +9562,24 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::LauncherStripRight(i)) => {
                     launcher::click_strip_arrow(app, i, 1, out)
                 }
+                // `▾ 6 more · Tab: see all 8` under a band's row: the band
+                // opens, the very toggle Tab runs.
+                Some(HitTarget::LauncherBandMore(i)) => launcher::click_band_more(app, i, out),
                 // The PULL REQUEST on a band's rule: it opens in the
                 // browser, through the very `open_pull_request` `⇧V` runs.
                 Some(HitTarget::LauncherBandPr(wid)) => {
                     launcher::click_pull_request(app, &wid, out)
                 }
-                // `‹ sessions` in a full-screen session's header: back to
-                // the grid, the same way `^q` goes back.
-                Some(HitTarget::LauncherCrumb) => leave_terminal_lock(app),
+                // The ISSUE NUMBER on a session's card: the cursor onto
+                // the card, and the issue in the browser, through the very
+                // `open_issue` `⇧I` runs.
+                Some(HitTarget::LauncherCardIssue(id)) => launcher::click_issue(app, &id, out),
+                // `‹ sessions` in a full-screen session's header: back
+                // down to the pane beside the grid, the same way `^q`
+                // goes back.
+                Some(HitTarget::LauncherCrumb) => {
+                    launcher::toggle_full_screen(app, out);
+                }
                 // The GRID header's PROJECT TABS: a tab opens its
                 // project, through the `open_tab` that `[` and `]` walk
                 // with — or, with the header holding the keys, through
@@ -9542,6 +9610,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // side of the cards, written to Settings as the
                 // **Session pane** row's own cycling writes it.
                 Some(HitTarget::LauncherPaneSide) => launcher::move_pane(app),
+                // The FULL-SCREEN BUTTON before them, and the NORMAL-SIZE
+                // BUTTON in a full-screen session's header: the one
+                // toggle `^F` runs.
+                Some(HitTarget::LauncherPaneZoom) => {
+                    launcher::toggle_full_screen(app, out);
+                }
                 // Never in the hit map: the ISSUES and PULL REQUESTS MODALS route
                 // the click on their button themselves, before this is reached.
                 Some(HitTarget::ModalBrowser) => {}
@@ -9682,8 +9756,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         HitTarget::LauncherCard(_)
                             | HitTarget::LauncherBand(_)
                             | HitTarget::LauncherBandPr(_)
+                            | HitTarget::LauncherCardIssue(_)
                             | HitTarget::LauncherStripLeft(_)
                             | HitTarget::LauncherStripRight(_)
+                            | HitTarget::LauncherBandMore(_)
                             | HitTarget::PanelBg(Focus::Sessions)
                     )
                 )

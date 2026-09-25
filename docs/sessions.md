@@ -287,7 +287,14 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   counted at the edge they went past (`‹2`, `3›`), and the lit one is always drawn. A tab's name,
   its `×` and the `+` all mark themselves while the pointer rests on them. The cards are grouped
   into **BANDS**, one per checkout that has something running in it — the root first, then the
-  rest most recently worked in first; a checkout with nothing running has no band. Each band is a
+  rest most recently worked in first; a checkout with nothing running has no band — unless
+  **Show all worktrees** (Settings → Sessions, off by default) is on, when every checkout gets
+  one: an EMPTY BAND, its rule over a single line, `nothing running · p: new session · t:
+  terminal · d: delete worktree`. `j`/`k` walk onto it like any band, `p`/`n`/`t` start work in
+  that checkout, and `d` (or **Delete worktree** in its right-click menu) deletes it behind the
+  worktree's own confirm; the root's band says no `d`, since the root is never deleted. With the
+  setting on, deleting a worktree's last card never asks about the worktree: the band stays,
+  empty, until its own `d`. Each band is a
   titled rule over one row of cards: the rule names the checkout in its scope color (`↳ feat`,
   `⌂ main` for the root — the project is the grid's own scope, named once in the header), with
   that checkout's uncommitted changes right behind the branch in the warning color (`↳ feat +3
@@ -301,6 +308,9 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   showed them all, `Tab: collapse` on the one band open as an accordion, every card of it wrapped
   into rows under the rule — since a titled rule reads as a divider until something says a key
   acts on it.
+  A collapsed band whose row left cards off its edges says so again on the row of air under the
+  cards, centered — `▾ 2 more · Tab: see all 8` — where the eye leaves the row; a click on it
+  opens the band as Tab does.
   The cards under it are the checkout's sessions, then its terminals as cards two columns wide,
   gap included, so their output has room — a one-column grid gives them the one (`❯ shell-1`
   with what runs in it, then the last lines its shell printed, asked of the daemon
@@ -348,6 +358,16 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   next key that walks the cursor, or `j`/`k` against the grid's edge, scrolls just far enough to
   bring the cursor's card whole back on screen — with the checkout's rule when it is on the first
   row — and a click on a cut card does the same.
+- **The compact list.** Settings → Appearance → **Worktree layout** → `list` (`worktree_layout`)
+  swaps each band's row of cards for a list: every session one line under the band's rule —
+  its status dot and name, what it runs on, its last prompt — then its terminals, the shell's last
+  line where a session has its prompt, the names and harnesses in columns down the band. Each band
+  starts collapsed on its 3 most recent sessions (the one the cursor is on stays listed too,
+  wherever it sits), with `▾ 2 more · Tab: see all 5` on the line under them; `Tab`, or a click on
+  that line, opens the band to every entry and `Tab` or `Esc` folds it back — one band open at a
+  time, as with the cards. A band that already lists everything has nothing to open, and `Tab`
+  there says so. `j` and `k` walk the lines as one column, off a band's last line onto the next
+  band's first; `Enter` and a click work on a line as on a card.
 - **The pane** runs down the right side of the cards, full height and half the width — or along
   the bottom, under them, with the `⬓` button just before the `×` on its header (`◨` there moves
   it back) or Settings → Appearance → **Session pane** (`session_pane`, which the button writes; a
@@ -384,11 +404,15 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   into the pane beside the cards, where that session is already running, with its input locked and
   the grid still up over it — the same place a click into the pane lands. `` ^` `` hands the keys
   back to the cards, and a second `` ^` `` folds the pane away.
+- **Full-screen** is `^F` in the pane (or on a card), or the `⤢` in the pane's header: the grid and
+  its header give way to the session, the keys still in it. `^F` again, `^q`, `` ^` `` or the `⤡` at
+  the right end of the full-screen header brings it back down into the pane beside the cards, the
+  keys still in it.
 - **On a terminal too short to draw the pane**, stepping into a session gives it the whole screen
   instead — the grid gives way — with its input locked. Its header is a
   breadcrumb — `‹ sessions / ● Fix the login redirect loop`, with the harness, model and checkout
   right-aligned — and `^q`, or a click on `‹ sessions`, comes back to the grid with the cursor on
-  the card you came from. `p` (or `n`) opens the box again, on the project under the cursor.
+  the card you came from: there is no pane to come back down to. `p` (or `n`) opens the box again, on the project under the cursor.
 
 - **The project's own menu** — its verbs, which a session card has no room for — is a
   right-click on its PROJECT TAB: **New worktree**; **Run** / **Stop run** and **Open** for the

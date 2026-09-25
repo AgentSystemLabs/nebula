@@ -1048,6 +1048,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "GENERAL",
                     &[
                         (Act(&[ToggleLauncherPane]), "fold / unfold the pane"),
+                        (Act(&[ToggleFullScreen]), "full-screen / normal size"),
                         // The SHIFT PAIRS' rule (#93), once, for every
                         // letter above that has a shifted twin.
                         (Lit("⇧ + letter"), "bigger, or outside nebula"),
@@ -1195,6 +1196,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .position(|r| r.index() == Some(view.selected))
                 .unwrap_or(0);
             let first_row = (sel_row + 1).saturating_sub(body_h);
+            // A row shipped this past week wears a `(new)` prefix; the
+            // label column widens for the tab when one needs the room.
+            let today = crate::config::today_days();
+            let new_prefix = |kind: crate::config::SettingKind| {
+                if kind.is_new(today) {
+                    crate::config::NEW_SETTING_PREFIX
+                } else {
+                    ""
+                }
+            };
+            let label_w = crate::config::tab_settings(tab)
+                .iter()
+                .map(|spec| new_prefix(spec.kind).len() + spec.label.chars().count() + 1)
+                .fold(28, usize::max);
             for row in rows.iter().skip(first_row).take(body_h) {
                 match row {
                     crate::config::SettingsRow::Blank => lines.push(Line::from("")),
@@ -1226,14 +1241,18 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         // the registry; every other values tab reads its
                         // static spec, and a PROJECT TAB row reads the
                         // selected project's entry.
-                        let (label, value) = if tab == crate::config::agents_tab() {
+                        let (label, value, prefix) = if tab == crate::config::agents_tab() {
                             match crate::config::AGENTS_HEAD.get(*i) {
-                                Some(spec) => (spec.label.to_string(), cfg.value_label(spec.kind)),
+                                Some(spec) => (
+                                    spec.label.to_string(),
+                                    cfg.value_label(spec.kind),
+                                    new_prefix(spec.kind),
+                                ),
                                 None => {
                                     let (id, field) = cfg.agent_row(*i).expect(
                                         "settings_rows indexes the Agents tab's harness rows",
                                     );
-                                    (field.label().to_string(), cfg.agent_value(&id, field))
+                                    (field.label().to_string(), cfg.agent_value(&id, field), "")
                                 }
                             }
                         } else {
@@ -1247,7 +1266,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             } else {
                                 cfg.value_label(spec.kind)
                             };
-                            (spec.label.to_string(), value)
+                            (spec.label.to_string(), value, new_prefix(spec.kind))
                         };
                         let selected = *i == view.selected && !view.on_tabs;
                         let mut label_style = Style::default();
@@ -1258,9 +1277,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         }
                         // A typed command can outrun the column: clip it
                         // with an ellipsis rather than at the frame.
-                        let room = (inner.width as usize).saturating_sub(3 + 28 + 2);
+                        let room = (inner.width as usize).saturating_sub(3 + label_w + 2);
+                        let mut prefix_style = Style::default().fg(th.ok);
+                        if selected {
+                            prefix_style = prefix_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
+                        }
+                        let label_room = label_w - prefix.len();
                         lines.push(Line::from(vec![
-                            Span::styled(format!("   {:<28}", label), label_style),
+                            Span::styled("   ", label_style),
+                            Span::styled(prefix, prefix_style),
+                            Span::styled(format!("{label:<label_room$}"), label_style),
                             Span::styled(format!("[{}]", truncate(&value, room)), value_style),
                         ]));
                     }
@@ -4087,9 +4113,12 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 }
                 .or_else(|| app.keymap.first(Action::UnlockTerminal).map(|c| c.display()))
                 .unwrap_or_else(|| "^q".into()),
-                // The LAUNCHER VIEW has its grid of sessions to go back to.
+                // The LAUNCHER VIEW has its grid of sessions to go back to,
+                // and a full-screen session comes back down to its pane.
                 if app.launcher_grid() {
                     "back to the card"
+                } else if app.launcher_active() && app.collapsed {
+                    "normal size"
                 } else {
                     "sessions"
                 },
