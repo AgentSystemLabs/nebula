@@ -386,7 +386,7 @@ pub enum SettingKind {
     Theme,
     Animations,
     BlackBackground,
-    HideTerminalGlyphs,
+    HideCardMarks,
     SessionPane,
     WorktreeLayout,
     HideCardPrompt,
@@ -485,7 +485,7 @@ impl SettingKind {
             // v0.38.0, then rows not yet in a release
             SettingKind::DeleteEmptyWorktree
             | SettingKind::ShowAllWorktrees
-            | SettingKind::HideTerminalGlyphs
+            | SettingKind::HideCardMarks
             | SettingKind::WorktreeLayout
             | SettingKind::HideCardPrompt
             | SettingKind::CardIssueNumber => (2026, 9, 24),
@@ -663,9 +663,9 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 group: "",
             },
             SettingSpec {
-                kind: SettingKind::HideTerminalGlyphs,
-                label: "Terminal glyphs",
-                hint: "Show or hide the ▶ (run terminal) and ❯ (shell) before a terminal card's name",
+                kind: SettingKind::HideCardMarks,
+                label: "Card marks",
+                hint: "Show or hide the ▶ (run terminal) and ❯ (shell) before a terminal card's name and the › before a session card's prompt",
                 group: "",
             },
             SettingSpec {
@@ -1024,10 +1024,13 @@ pub struct Config {
     /// Ghostty is a dark gray. On by default; off lets a transparency or
     /// image configured in the terminal show through.
     pub black_background: bool,
-    /// HIDE TERMINAL GLYPHS: leave the `▶` (a RUN TERMINAL) and the `❯`
-    /// (a plain shell) off the front of a terminal card's name, which then
-    /// starts where the glyph did. Off by default.
-    pub hide_terminal_glyphs: bool,
+    /// HIDE CARD MARKS: leave the `▶` (a RUN TERMINAL) and the `❯` (a
+    /// plain shell) off the front of a terminal card's name, and the `›`
+    /// off the front of a session card's prompt, each of which then starts
+    /// where its mark did. Off by default. Read under the key it had
+    /// before, `hide_terminal_glyphs`, too.
+    #[serde(alias = "hide_terminal_glyphs")]
+    pub hide_card_marks: bool,
     /// Where the LAUNCHER VIEW's PANE — the session under the cursor, live
     /// — sits against the GRID of cards: `right` (down that side of them,
     /// the default) or `bottom` (under them). Also written by the SIDE
@@ -1367,7 +1370,7 @@ impl Default for Config {
             theme: "default".into(),
             animations: true,
             black_background: true,
-            hide_terminal_glyphs: false,
+            hide_card_marks: false,
             session_pane: crate::launcher::PaneSide::default().as_str().into(),
             worktree_layout: WORKTREE_LAYOUTS[0].into(),
             hide_card_prompt: false,
@@ -1417,6 +1420,12 @@ impl Default for Config {
         }
     }
 }
+
+/// Keys a field was renamed from, `(old, new)`: the field reads the old key
+/// through a `#[serde(alias)]`, and a save takes the old key out of both
+/// layers. Left in beside the new one, the pair is a `duplicate field` to
+/// serde — a file this build can only read key by key.
+const RENAMED_KEYS: &[(&str, &str)] = &[("hide_terminal_glyphs", "hide_card_marks")];
 
 impl Config {
     pub fn load() -> Self {
@@ -1488,6 +1497,17 @@ impl Config {
         };
         let defaults = serde_json::to_value(Self::default()).map_err(invalid_data)?;
         let mut local_changed = false;
+        for (old, new) in RENAMED_KEYS {
+            root.remove(*old);
+            // An old key the local layer holds stays local under its new
+            // name, so the loop below writes the value back there.
+            if let Some(held) = local_root.as_mut() {
+                if let Some(value) = held.remove(*old) {
+                    held.entry(new.to_string()).or_insert(value);
+                    local_changed = true;
+                }
+            }
+        }
         for (key, value) in known {
             // A stored value this build couldn't read loaded as its default.
             // Unless it has been changed since, leave the stored one alone.
@@ -2156,7 +2176,7 @@ impl Config {
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::BlackBackground => on_off(self.black_background).into(),
-            SettingKind::HideTerminalGlyphs => shown_hidden(self.hide_terminal_glyphs).into(),
+            SettingKind::HideCardMarks => shown_hidden(self.hide_card_marks).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::WorktreeLayout => WORKTREE_LAYOUTS[usize::from(self.list_layout())].into(),
             SettingKind::HideCardPrompt => shown_hidden(self.hide_card_prompt).into(),
@@ -2252,8 +2272,8 @@ impl Config {
             SettingKind::BlackBackground => {
                 self.black_background = !self.black_background;
             }
-            SettingKind::HideTerminalGlyphs => {
-                self.hide_terminal_glyphs = !self.hide_terminal_glyphs;
+            SettingKind::HideCardMarks => {
+                self.hide_card_marks = !self.hide_card_marks;
             }
             SettingKind::SessionPane => {
                 // Cycled from the resolved side, so a hand edit off the
@@ -2691,10 +2711,19 @@ mod tests {
     /// The first compatibility rule in docs/configuration.md: a key, once
     /// shipped, keeps its name, its type and its meaning. Every key a
     /// release wrote must still load to exactly the value it wrote — a
-    /// rename leaves the key unknown, a type change leaves it unreadable,
-    /// and either reads back as something else here.
+    /// rename off the `RENAMED_KEYS` table leaves the key unknown, a type
+    /// change leaves it unreadable, and either reads back as something
+    /// else here. A key on that table reads through its alias into the
+    /// field's new name, and a save writes it back under that name alone.
     #[test]
     fn config_files_from_earlier_releases_still_load_every_key() {
+        let current = |key: &str| {
+            RENAMED_KEYS
+                .iter()
+                .find(|(old, _)| *old == key)
+                .map_or(key, |(_, new)| *new)
+                .to_string()
+        };
         for (release, raw) in CONFIG_FIXTURES {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("config.json");
@@ -2709,20 +2738,25 @@ mod tests {
             let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
             for (key, value) in fixture.as_object().unwrap() {
                 assert_eq!(
-                    known.get(key),
+                    known.get(current(key)),
                     Some(value),
                     "{release}: `{key}` no longer loads as that release wrote it"
                 );
             }
-            // A save writes every one of them back unchanged.
+            // A save writes every one of them back unchanged — a renamed
+            // key under its new name, the old one gone.
             loaded.save_to(&path).unwrap();
             let saved = read_json_file(&path);
             for (key, value) in fixture.as_object().unwrap() {
+                let now = current(key);
                 assert_eq!(
-                    saved.get(key),
+                    saved.get(&now),
                     Some(value),
                     "{release}: `{key}` after a save"
                 );
+                if now != *key {
+                    assert_eq!(saved.get(key), None, "{release}: `{key}` after a save");
+                }
             }
         }
     }
@@ -3568,36 +3602,89 @@ mod tests {
         );
     }
 
-    /// HIDE TERMINAL GLYPHS: off out of the box, toggled on from its
-    /// Appearance row, persisted under `hide_terminal_glyphs`; a config
-    /// predating the key keeps the glyphs.
+    /// HIDE CARD MARKS: off out of the box, toggled on from its
+    /// Appearance row, persisted under `hide_card_marks`; a config
+    /// predating the key keeps the marks, and one written under the old
+    /// `hide_terminal_glyphs` key still reads.
     #[test]
-    fn hide_terminal_glyphs_default_off_toggle_and_persist() {
+    fn hide_card_marks_default_off_toggle_and_persist() {
         let mut cfg = Config::default();
-        assert!(!cfg.hide_terminal_glyphs);
-        let (tab, row) = locate(SettingKind::HideTerminalGlyphs).unwrap();
+        assert!(!cfg.hide_card_marks);
+        let (tab, row) = locate(SettingKind::HideCardMarks).unwrap();
         assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
-        assert_eq!(cfg.value_label(SettingKind::HideTerminalGlyphs), "shown");
+        assert_eq!(cfg.value_label(SettingKind::HideCardMarks), "shown");
         cfg.cycle(tab, row, 0);
-        assert!(cfg.hide_terminal_glyphs);
-        assert_eq!(cfg.value_label(SettingKind::HideTerminalGlyphs), "hidden");
+        assert!(cfg.hide_card_marks);
+        assert_eq!(cfg.value_label(SettingKind::HideCardMarks), "hidden");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).hide_terminal_glyphs);
+        assert!(load_from(&path).hide_card_marks);
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            raw.get("hide_terminal_glyphs"),
-            Some(&serde_json::json!(true))
-        );
+        assert_eq!(raw.get("hide_card_marks"), Some(&serde_json::json!(true)));
+        assert_eq!(raw.get("hide_terminal_glyphs"), None);
 
         let older: Config = serde_json::from_str("{}").unwrap();
         assert!(
-            !older.hide_terminal_glyphs,
-            "a config predating the key keeps the glyphs"
+            !older.hide_card_marks,
+            "a config predating the key keeps the marks"
         );
+        let renamed: Config = serde_json::from_str(r#"{"hide_terminal_glyphs":true}"#).unwrap();
+        assert!(renamed.hide_card_marks, "the old key still reads");
+    }
+
+    /// A v0.39.0 file says `hide_terminal_glyphs`; the first save of a
+    /// build that renamed it patched `hide_card_marks` in beside it. That
+    /// pair once loaded as every default, so the settings overlay (which
+    /// reads the file each frame) showed defaults whatever was chosen, and
+    /// each save wrote those defaults back. Every other value must survive
+    /// the pair, a toggle must read back, and the save must drop the old key.
+    #[test]
+    fn a_file_holding_both_card_marks_keys_keeps_its_settings_and_heals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"theme": "ocean", "worktree_layout": "list", "hide_card_marks": true, "hide_terminal_glyphs": false}"#,
+        )
+        .unwrap();
+
+        let mut cfg = load_from(&path);
+        assert_eq!(cfg.theme, "ocean", "the clash costs no other value");
+        assert!(cfg.list_layout());
+        assert!(cfg.hide_card_marks, "the new key wins over the old one");
+
+        let (tab, row) = locate(SettingKind::Animations).unwrap();
+        cfg.cycle(tab, row, 0);
+        cfg.save_to(&path).unwrap();
+        let reread = load_from(&path);
+        assert!(!reread.animations, "the toggle reads back");
+        assert_eq!(reread.theme, "ocean");
+        assert!(reread.hide_card_marks);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.get("hide_terminal_glyphs"), None, "{raw}");
+
+        // Upgrading straight from v0.39.0: the old key alone carries over
+        // under its new name.
+        std::fs::write(&path, r#"{"hide_terminal_glyphs": true}"#).unwrap();
+        load_from(&path).save_to(&path).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.get("hide_card_marks"), Some(&serde_json::json!(true)));
+        assert_eq!(raw.get("hide_terminal_glyphs"), None, "{raw}");
+
+        // An old key the local layer holds moves to its new name there.
+        let local = dir.path().join("config.local.json");
+        std::fs::write(&local, r#"{"hide_terminal_glyphs": true}"#).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        load_from(&path).save_to(&path).unwrap();
+        let held: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+        assert_eq!(held, serde_json::json!({"hide_card_marks": true}));
+        assert!(load_from(&path).hide_card_marks);
     }
 
     /// The **Session pane**: down the right out of the box, cycled from

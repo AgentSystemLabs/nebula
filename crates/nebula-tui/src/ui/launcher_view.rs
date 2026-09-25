@@ -1647,8 +1647,8 @@ fn draw_chip(
     if width == 0 {
         return;
     }
-    // HIDE TERMINAL GLYPHS drops the glyph, and the name starts where it was.
-    let glyph = if app.hide_terminal_glyphs {
+    // HIDE CARD MARKS drops the glyph, and the name starts where it was.
+    let glyph = if app.hide_card_marks {
         ""
     } else if t.run_command.is_some() {
         "▶ "
@@ -1869,16 +1869,17 @@ fn draw_card(
         }
     }
 
-    // The last thing it was asked to do, on the prompt's own `›`, over
-    // the card's last rows rather than clipped at the first — unless the
-    // `hide_card_prompt` setting leaves those rows blank.
+    // The last thing it was asked to do, on the prompt's own `›` (which
+    // `hide_card_marks` leaves off), over the card's last rows rather than
+    // clipped at the first — unless the `hide_card_prompt` setting leaves
+    // those rows blank.
     let mut lines = vec![first, second];
     lines.resize(crate::launcher::CARD_HEAD_H as usize, Vec::new());
     if !app.hide_card_prompt {
         lines.extend(prompt_lines(
             crate::launcher::last_prompt(a).unwrap_or_default(),
             width,
-            quiet_or(th.dim),
+            (!app.hide_card_marks).then(|| quiet_or(th.dim)),
             quiet_or(th.muted),
         ));
     }
@@ -2084,9 +2085,20 @@ fn draw_list_empty(f: &mut Frame, app: &mut App, area: Rect, what: &str) {
 /// most [`crate::launcher::PROMPT_LINES`] rows — so a card is a fixed
 /// height whatever it was asked to do. A prompt longer than that is cut
 /// on the last of them with an ellipsis; an empty one draws nothing.
-fn prompt_lines(prompt: &str, width: usize, mark: Color, text: Color) -> Vec<Vec<Span<'static>>> {
+/// `mark` is the `›`'s color, `None` (HIDE CARD MARKS) to leave it off
+/// and start every row in its column.
+fn prompt_lines(
+    prompt: &str,
+    width: usize,
+    mark: Option<Color>,
+    text: Color,
+) -> Vec<Vec<Span<'static>>> {
     const MARK: &str = "› ";
-    let indent = MARK.chars().count();
+    let indent = if mark.is_some() {
+        MARK.chars().count()
+    } else {
+        0
+    };
     let body = width.saturating_sub(indent);
     if prompt.is_empty() || body == 0 {
         return Vec::new();
@@ -2105,14 +2117,11 @@ fn prompt_lines(prompt: &str, width: usize, mark: Color, text: Color) -> Vec<Vec
             } else {
                 line
             };
-            vec![
-                if i == 0 {
-                    Span::styled(MARK, Style::default().fg(mark))
-                } else {
-                    Span::raw(" ".repeat(indent))
-                },
-                Span::styled(line_text, Style::default().fg(text)),
-            ]
+            let lead = match mark {
+                Some(mark) if i == 0 => Span::styled(MARK, Style::default().fg(mark)),
+                _ => Span::raw(" ".repeat(indent)),
+            };
+            vec![lead, Span::styled(line_text, Style::default().fg(text))]
         })
         .collect()
 }
@@ -3606,14 +3615,19 @@ mod tests {
         );
     }
 
-    /// HIDE TERMINAL GLYPHS: off, a shell's card opens on `❯` and a RUN
-    /// TERMINAL's on `▶`; on, neither glyph is drawn and each name starts
-    /// in the column the glyph held.
+    /// HIDE CARD MARKS: off, a shell's card opens on `❯`, a RUN
+    /// TERMINAL's on `▶` and a session card's prompt on `›`; on, none of
+    /// them is drawn and each name or prompt starts in the column its mark
+    /// held.
     #[test]
-    fn hide_terminal_glyphs_drops_the_glyph_before_the_name() {
+    fn hide_card_marks_drops_the_mark_before_the_name_and_the_prompt() {
         use nebula_core::{TerminalId, TerminalTab, WorktreeId};
         let mut app = a_tree();
         select(&mut app, "api");
+        app.tree.agents[0].recent_prompts = vec![nebula_core::PromptEntry {
+            text: "fix the login redirect".into(),
+            submitted_at: 0,
+        }];
         for (id, name, run) in [
             ("t1", "shell-1", None),
             ("t2", "dev-srv", Some("npm run dev")),
@@ -3641,8 +3655,11 @@ mod tests {
         assert!(row_of(&lines, "shell-1").contains("❯ shell-1"));
         assert!(row_of(&lines, "dev-srv").contains("▶ dev-srv"));
         let shown_col = row_of(&lines, "shell-1").find("❯").unwrap();
+        let prompt = row_of(&lines, "fix the login redirect");
+        assert!(prompt.contains("› fix the login redirect"), "{prompt:?}");
+        let mark_col = prompt.find('›').unwrap();
 
-        app.hide_terminal_glyphs = true;
+        app.hide_card_marks = true;
         let lines = drawn_lines(&mut app, body);
         let shell = row_of(&lines, "shell-1");
         let run = row_of(&lines, "dev-srv");
@@ -3651,6 +3668,13 @@ mod tests {
             "{shell:?} {run:?}"
         );
         assert_eq!(shell.find("shell-1"), Some(shown_col), "{shell:?}");
+        let prompt = row_of(&lines, "fix the login redirect");
+        assert!(!prompt.contains('›'), "{prompt:?}");
+        assert_eq!(
+            prompt.find("fix the login redirect"),
+            Some(mark_col),
+            "{prompt:?}"
+        );
     }
 
     /// A session card's second row says what the session runs on — the

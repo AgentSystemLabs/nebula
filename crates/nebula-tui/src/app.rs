@@ -3714,11 +3714,12 @@ pub struct App {
     /// (`launcher::bands`). Mirrors the config, refreshed at startup and
     /// when the settings overlay applies a change.
     pub show_all_worktrees: bool,
-    /// The `hide_terminal_glyphs` setting: a terminal card's name goes
-    /// without the `▶`/`❯` in front of it (`launcher_view::draw_chip`).
+    /// The `hide_card_marks` setting: a terminal card's name goes without
+    /// the `▶`/`❯` in front of it (`launcher_view::draw_chip`), a session
+    /// card's prompt without its `›` (`launcher_view::prompt_lines`).
     /// Mirrors the config, refreshed at startup and when the settings
     /// overlay applies a change.
-    pub hide_terminal_glyphs: bool,
+    pub hide_card_marks: bool,
     /// The ROWS MEMO, armed by the frame and by [`App::reading_url`].
     pub rows_memo: RowsMemo,
 }
@@ -3882,7 +3883,7 @@ impl App {
             card_issue_number: false,
             show_all_worktrees: false,
             black_background: false,
-            hide_terminal_glyphs: false,
+            hide_card_marks: false,
             rows_memo: RowsMemo::default(),
         }
     }

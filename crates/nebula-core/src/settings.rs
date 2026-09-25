@@ -69,7 +69,7 @@ pub fn parse_lenient<T: DeserializeOwned + Default>(obj: &Object) -> (T, BTreeSe
     if let Ok(value) = serde_json::from_value(Value::Object(obj.clone())) {
         return (value, BTreeSet::new());
     }
-    let skipped: BTreeSet<String> = obj
+    let mut skipped: BTreeSet<String> = obj
         .iter()
         .filter(|(key, value)| {
             let single = Object::from_iter([((*key).clone(), (*value).clone())]);
@@ -82,7 +82,23 @@ pub fn parse_lenient<T: DeserializeOwned + Default>(obj: &Object) -> (T, BTreeSe
         .filter(|(key, _)| !skipped.contains(*key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let value = serde_json::from_value(Value::Object(readable)).unwrap_or_default();
+    if let Ok(value) = serde_json::from_value(Value::Object(readable.clone())) {
+        return (value, skipped);
+    }
+    // Every key reads alone, yet not all together: two of them clash — a
+    // field under its name and under its `alias` both, the old key an
+    // older build wrote still beside the new one. Add the keys back one at
+    // a time and leave out each that breaks what already reads, so the
+    // clash costs the later key of the pair rather than every value.
+    let mut kept = Object::new();
+    for (key, value) in readable {
+        kept.insert(key.clone(), value);
+        if serde_json::from_value::<T>(Value::Object(kept.clone())).is_err() {
+            kept.remove(&key);
+            skipped.insert(key);
+        }
+    }
+    let value = serde_json::from_value(Value::Object(kept)).unwrap_or_default();
     (value, skipped)
 }
 
@@ -189,6 +205,8 @@ mod tests {
     struct Sample {
         on: bool,
         count: u32,
+        /// Renamed: a file an older build wrote says `old_name`.
+        #[serde(alias = "old_name")]
         name: String,
     }
 
@@ -228,6 +246,35 @@ mod tests {
 
         let (_, skipped) = parse_lenient::<Sample>(&object(json!({"on": false})));
         assert!(skipped.is_empty(), "a readable object skips nothing");
+    }
+
+    /// A file holding a field under both its name and its old alias —
+    /// the old key left behind by an older build, the new one patched in
+    /// beside it — is a `duplicate field` to serde as a whole, though each
+    /// key reads fine alone. That must cost the one key, not every value.
+    #[test]
+    fn a_renamed_key_beside_its_old_name_costs_only_the_old_name() {
+        let obj = object(json!({
+            "on": false,
+            "count": 7,
+            "name": "new",
+            "old_name": "stale",
+        }));
+        let (sample, skipped) = parse_lenient::<Sample>(&obj);
+        assert_eq!(
+            sample,
+            Sample {
+                on: false,
+                count: 7,
+                name: "new".into()
+            },
+            "the other values survive the clash"
+        );
+        assert_eq!(skipped, BTreeSet::from(["old_name".to_string()]));
+
+        let (sample, skipped) = parse_lenient::<Sample>(&object(json!({"old_name": "old"})));
+        assert_eq!(sample.name, "old", "the old name alone still reads");
+        assert!(skipped.is_empty());
     }
 
     #[test]

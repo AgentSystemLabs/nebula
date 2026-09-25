@@ -6383,7 +6383,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.hide_card_prompt = cfg.hide_card_prompt;
     app.card_issue_number = cfg.card_issue_number;
     app.show_all_worktrees = cfg.show_all_worktrees;
-    app.hide_terminal_glyphs = cfg.hide_terminal_glyphs;
+    app.hide_card_marks = cfg.hide_card_marks;
     app.launcher_pane_at = cfg.pane_side();
     app.launcher_list = cfg.list_layout();
     set_hide_draft_prs(app, cfg.hide_draft_prs);
