@@ -41,6 +41,11 @@ pub struct Loaded<T> {
 
 /// Read both layers and deserialize `T` from their merge, `local` over
 /// `config`. `T` must be `#[serde(default)]`: a missing key is its default.
+/// `session_idle_timeout`'s default, and the DAEMON's fallback when the
+/// value is malformed. The daemon and the TUI both default their configs
+/// to it.
+pub const DEFAULT_SESSION_IDLE_TIMEOUT: &str = "5m";
+
 pub fn load<T: DeserializeOwned + Default>(config: &Path, local: &Path) -> Loaded<T> {
     let mut problems = Vec::new();
     let mut merged = read_layer(config, &mut problems);

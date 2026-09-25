@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod codec;
 pub mod crashlog;
 pub mod entities;
@@ -10,6 +11,7 @@ pub mod paths;
 pub mod project_file;
 pub mod protocol;
 pub mod settings;
+pub mod shell;
 
 pub use entities::*;
 pub use harness::*;

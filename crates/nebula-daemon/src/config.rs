@@ -30,7 +30,7 @@ pub struct Config {
     /// their conversation). Malformed values fall back to the 5m default.
     pub session_idle_timeout: String,
     /// The branch every new WORKTREE nobody named a base for starts from
-    /// — `n` in the WORKTREES PANEL, a bare `nebula worktree`, the QUICK
+    /// — a project's **New worktree**, a bare `nebula worktree`, the QUICK
     /// PROMPT's auto-created one. Empty (the default) means origin's own
     /// default branch, `origin/HEAD` as freshly fetched; a name (`master`,
     /// `develop`) means origin's fetched copy of that branch when origin
@@ -62,8 +62,8 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ProjectConfig {
-    /// The RUN COMMAND `r` starts in this project's worktrees, typed into
-    /// Settings → Project. Empty means the checkout's `.nebula.json`
+    /// The RUN COMMAND a menu's **Run** starts in this project's
+    /// worktrees, typed into Settings → Project. Empty means the checkout's `.nebula.json`
     /// `run`, as before the row existed.
     pub run_command: String,
 }
@@ -82,8 +82,7 @@ impl Default for Config {
     }
 }
 
-/// Fallback for `session_idle_timeout` when the value is malformed.
-pub const DEFAULT_SESSION_IDLE_TIMEOUT: &str = "5m";
+pub use nebula_core::settings::DEFAULT_SESSION_IDLE_TIMEOUT;
 
 impl Config {
     pub fn load() -> Self {

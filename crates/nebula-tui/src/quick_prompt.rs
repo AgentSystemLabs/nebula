@@ -181,6 +181,18 @@ pub struct QuickReturn {
     pub from_box: bool,
 }
 
+impl QuickReturn {
+    /// `launch` with nothing typed, reached with no box up — so Esc closes
+    /// the picker rather than putting a box back.
+    pub fn fresh(launch: QuickLaunch) -> Self {
+        Self {
+            launch,
+            text: String::new(),
+            from_box: false,
+        }
+    }
+}
+
 /// A QUICK PROMPT box abandoned with something typed in it: the launch as
 /// it stood and the field itself — text, caret and scroll. Nothing typed
 /// into the box is lost to the press that closes it; the draft waits in
@@ -627,13 +639,7 @@ pub(crate) fn pr_launch_for(
     project: &ProjectId,
     pr: &OpenPr,
 ) -> Option<QuickLaunch> {
-    let root = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| &w.project_id == project && w.is_main)
-        .map(|w| w.id.clone());
-    let Some(root) = root else {
+    let Some(root) = app.root_worktree(project) else {
         app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
         return None;
     };
@@ -652,12 +658,7 @@ pub(crate) fn pr_launch_for(
 pub(crate) fn picker_context(app: &App, launch: &QuickLaunch) -> Option<WorktreeId> {
     match &launch.target {
         QuickTarget::Worktree(id) => Some(id.clone()),
-        QuickTarget::NewWorktree { project, .. } => app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| &w.project_id == project && w.is_main)
-            .map(|w| w.id.clone()),
+        QuickTarget::NewWorktree { project, .. } => app.root_worktree(project),
     }
 }
 
@@ -815,14 +816,7 @@ pub(crate) fn open_preset_picker_for_pr(app: &mut App) {
     let Some(launch) = pr_launch(app) else {
         return;
     };
-    open_preset_picker(
-        app,
-        QuickReturn {
-            launch,
-            text: String::new(),
-            from_box: false,
-        },
-    );
+    open_preset_picker(app, QuickReturn::fresh(launch));
 }
 
 #[cfg(test)]

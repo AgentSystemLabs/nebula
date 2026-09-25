@@ -1,6 +1,6 @@
 //! The pull request on a worktree's branch, discovered with the GitHub CLI
-//! (`gh pr view`). The row it feeds sits above the worktree's saved links
-//! and refreshes on its own, so a PR opened outside nebula shows up without
+//! (`gh pr view`). What it feeds — the pull request on the worktree's
+//! BAND — refreshes on its own, so a PR opened outside nebula shows up without
 //! anyone typing its URL, and one that has since been merged or closed
 //! stays on the row, badged, for as long as the checkout does: the worktree
 //! outlives its pull request, and the PR is what you check before archiving
@@ -12,7 +12,7 @@
 //!
 //! The same `gh` also answers the wider question this module's other half
 //! asks — every pull request still open on the *project's* repo, for the
-//! group at the bottom of the worktrees panel (see [`list`]).
+//! PULL REQUESTS MODAL and the header's counts (see [`list`]).
 //!
 //! `gh` may be missing, unauthenticated, or pointed at a repo with no
 //! remote; every one of those is an ordinary "couldn't ask", not an error
@@ -26,7 +26,7 @@ use std::path::Path;
 /// How long a lookup may run before we give up on it. `gh` retries and can
 /// hang on a stalled network; the row is a convenience, not worth a task
 /// that never ends.
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// `gh`'s state strings. Only [`STATE_OPEN`] still accepts work: it is the
 /// one state the PROJECT OPEN PRS GROUP lists, and the one the preview and
@@ -175,7 +175,11 @@ impl Trouble {
 /// Run `gh` with `args` (in `dir` when given) under `timeout`, yielding
 /// stdout on success. Every failure — no `gh`, bad exit, timeout — is
 /// `None`, since each is an ordinary "couldn't ask" to every caller.
-async fn gh(dir: Option<&Path>, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+pub(crate) async fn gh(
+    dir: Option<&Path>,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<String> {
     run_gh(dir, args, timeout).await.ok()
 }
 
@@ -204,7 +208,7 @@ async fn run_gh(
 }
 
 /// `v[key]` as a string, `""` when absent or not a string.
-fn str_at(v: &serde_json::Value, key: &str) -> String {
+pub(crate) fn str_at(v: &serde_json::Value, key: &str) -> String {
     v.get(key)
         .and_then(|x| x.as_str())
         .unwrap_or_default()
@@ -241,7 +245,7 @@ fn state_at(v: &serde_json::Value) -> String {
 /// `v["url"]`, but only when it is something a browser can open. Only
 /// http(s) reaches `open(1)`; gh has no business returning anything else,
 /// but the row leads straight to a browser so it's checked anyway.
-fn web_url(v: &serde_json::Value) -> Option<String> {
+pub(crate) fn web_url(v: &serde_json::Value) -> Option<String> {
     let url = v.get("url")?.as_str()?.to_string();
     (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
 }
@@ -506,14 +510,20 @@ pub struct OpenPr {
     pub head: String,
 }
 
+/// `#42 title`, or `#42` alone for an untitled one — how a pull request
+/// or an issue is named on a row.
+pub fn numbered_label(number: u64, title: &str) -> String {
+    if title.is_empty() {
+        format!("#{number}")
+    } else {
+        format!("#{number} {title}")
+    }
+}
+
 impl OpenPr {
-    /// Row text: `#42 title`, the same shape the worktree link rows use.
+    /// Row text: `#42 title`.
     pub fn label(&self) -> String {
-        if self.title.is_empty() {
-            format!("#{}", self.number)
-        } else {
-            format!("#{} {}", self.number, self.title)
-        }
+        numbered_label(self.number, &self.title)
     }
 
     /// Open or draft — every row here is open by construction (`list` asks
@@ -782,7 +792,8 @@ fn parse_detail(json: &str) -> Option<PrDetail> {
     })
 }
 
-fn login(author: Option<&serde_json::Value>) -> String {
+/// `author.login`, `""` when absent.
+pub(crate) fn login(author: Option<&serde_json::Value>) -> String {
     author
         .and_then(|a| a.get("login"))
         .and_then(|l| l.as_str())

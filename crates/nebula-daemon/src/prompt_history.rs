@@ -1,10 +1,11 @@
 //! RECENT PROMPTS — the last few prompts typed into a session, kept on
-//! its row so the SESSIONS PANEL can say what each session was last asked
-//! to do, not only what it was named after its first prompt.
+//! its row so its card can say what the session was last asked to do,
+//! not only what it was named after its first prompt.
 //!
 //! The `UserPromptSubmit` hook payload carries the prompt on every CLI
 //! nebula manages (Claude and Codex as `prompt`, Cursor's
-//! `beforeSubmitPrompt` the same, pi through its managed extension). The
+//! `beforeSubmitPrompt` the same, pi and OpenCode through their managed
+//! extension and plugin). The
 //! hook receiver condenses it here — one line, whitespace collapsed,
 //! clipped past [`MAX_PROMPT_CHARS`] — before it crosses the daemon's
 //! channel, so a pasted file never rides the wire whole. The store keeps
@@ -88,7 +89,7 @@ impl Daemon {
     pub fn record_prompt(self: &Arc<Self>, id: &AgentId, text: String) {
         let entry = PromptEntry {
             text,
-            submitted_at: crate::registry::epoch_ms(),
+            submitted_at: nebula_core::clock::now_ms(),
         };
         match self.store.push_prompt(id, &entry) {
             Ok(true) => self.try_broadcast_agent(id),

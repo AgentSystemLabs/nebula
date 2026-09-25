@@ -9,9 +9,10 @@
 //! ```
 //!
 //! Both values are shell command lines, and both run in the selected
-//! worktree's checkout. `run` is the RUN COMMAND: `r` on a worktree starts
-//! it in a RUN TERMINAL the DAEMON holds, and `r` again stops it. `open` is
-//! the OPEN COMMAND: `Shift+Enter` on a worktree fires it once, from the TUI.
+//! worktree's checkout. `run` is the RUN COMMAND: a menu's **Run** starts
+//! it in a RUN TERMINAL the DAEMON holds, and **Stop run** stops it. `open`
+//! is the OPEN COMMAND: `Shift+Enter` on a worktree fires it once, from the
+//! TUI.
 //!
 //! The file is read fresh at every press — from the worktree's own checkout
 //! first, so a branch can carry commands of its own, and otherwise from the

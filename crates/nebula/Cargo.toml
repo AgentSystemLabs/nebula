@@ -14,13 +14,11 @@ nebula-daemon = { workspace = true }
 nebula-tui = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive", "wrap_help"] }
-tokio = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
-portable-pty = "0.9"
-vt100 = "0.16"
+portable-pty = { workspace = true }
+vt100 = { workspace = true }

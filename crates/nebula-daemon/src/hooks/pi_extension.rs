@@ -17,7 +17,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use super::installer::write_text_atomic;
+use super::installer::install_unless_unchanged;
 
 /// pi's config dir under `$HOME`, and the agent dir inside it.
 const PI_DIR: &str = ".pi";
@@ -57,14 +57,12 @@ pub fn extension_path(agent_dir: &Path) -> PathBuf {
 /// told to reload, and an unchanged mtime keeps its extension cache warm.
 pub fn install(agent_dir: &Path) -> Result<()> {
     let dir = agent_dir.join(EXTENSIONS_DIR);
-    let path = dir.join(EXTENSION_FILE);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        if existing == EXTENSION_SOURCE {
-            return Ok(());
-        }
-    }
-    write_text_atomic(&dir, EXTENSION_FILE, EXTENSION_SOURCE)
-        .with_context(|| format!("install pi extension into {}", path.display()))
+    install_unless_unchanged(&dir, EXTENSION_FILE, EXTENSION_SOURCE).with_context(|| {
+        format!(
+            "install pi extension into {}",
+            dir.join(EXTENSION_FILE).display()
+        )
+    })
 }
 
 #[cfg(test)]

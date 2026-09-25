@@ -256,10 +256,16 @@ impl Agent {
     /// read off `issue_url` (`…/issues/15`, with or without a trailing
     /// path) — None for every other row.
     pub fn issue_number(&self) -> Option<u64> {
-        let (_, tail) = self.issue_url.as_deref()?.split_once("/issues/")?;
-        let digits = tail.split(['/', '?', '#']).next().unwrap_or_default();
-        digits.parse::<u64>().ok().filter(|n| *n > 0)
+        url_number_after(self.issue_url.as_deref()?, "/issues/")
     }
+}
+
+/// The positive number that follows `marker` in `url` (`/issues/`,
+/// `/pull/`), up to the next path or query separator.
+pub fn url_number_after(url: &str, marker: &str) -> Option<u64> {
+    let (_, tail) = url.split_once(marker)?;
+    let digits = tail.split(['/', '?', '#']).next().unwrap_or_default();
+    digits.parse::<u64>().ok().filter(|n| *n > 0)
 }
 
 /// The claude.ai page of a Claude Cloud session, from its `session_…` id.

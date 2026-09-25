@@ -581,8 +581,7 @@ impl AgentPresetEditor {
         if choices.is_empty() {
             return;
         }
-        let refs: Vec<&str> = choices.iter().map(String::as_str).collect();
-        let next = crate::config::cycle_choice(&self.row_value(), &refs, delta).to_string();
+        let next = crate::config::cycle_owned(&self.row_value(), &choices, delta);
         self.set_row_value(&next);
     }
 
@@ -726,10 +725,7 @@ pub(crate) fn open_agent_presets(app: &mut App) {
     let worktree = match (app.focus, app.selected_worktree()) {
         (Focus::Sessions | Focus::Worktrees, Some(w)) => w.id.clone(),
         _ => {
-            app.flash = Some(
-                "agent presets: select a worktree or an open PR in the Worktrees panel, or a worktree's Sessions panel"
-                    .into(),
-            );
+            app.flash = Some("agent presets: put the cursor on a checkout first".into());
             return;
         }
     };

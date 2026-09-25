@@ -1,8 +1,8 @@
-//! The shape a pull request row takes in either sidebar panel — the `↗`
+//! The shape a pull request takes wherever a row names one — the `↗`
 //! glyph, the `#42 title` label and a trailing badge — and how a draft, a
-//! merged and a closed pull request are told apart from an open one. The
-//! PROJECT OPEN PRS GROUP (WORKTREES PANEL) and the PR ROW (SESSIONS PANEL)
-//! both build their spans here, so the two lists read as one.
+//! merged and a closed pull request are told apart from an open one. A
+//! BAND's rule and the PULL REQUESTS MODAL's rows both take their colors
+//! here (`look`), so the two read as one.
 
 use crate::pull_request::{Standing, Trouble};
 use crate::theme::Theme;
@@ -23,8 +23,7 @@ pub struct Look {
 /// nebula", the rail says it wants a reviewer. A draft is dimmed the whole
 /// way down, arrow, title and rail alike: the role the PR PREVIEW paints its
 /// `draft` state in, so a row that isn't ready reads as such before its
-/// `draft` badge is even read. Selecting a draft row lifts it like any
-/// other (`render_pill` brightens `dim` to `muted`), so it stays legible.
+/// `draft` badge is even read.
 ///
 /// A merged pull request wears the theme's `merged` purple — the color the
 /// PR PREVIEW paints that state in — on its arrow, rail and badge, with the

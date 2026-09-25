@@ -117,7 +117,7 @@ const AGO_REFRESH: Duration = Duration::from_secs(30);
 /// pre-spawn that worktree's dead sessions — long enough that walking the
 /// list doesn't boot every CLI passed, short enough that the sessions are
 /// booting well before the user picks one.
-const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
+pub(crate) const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How long a selection-driven attach to a *reaped* session waits for the
 /// cursor to settle: attaching one makes the daemon fork an agent CLI, and a
 /// cursor merely passing through a row — walking a list, or the project
@@ -167,8 +167,8 @@ const PR_SWEEP_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// How often the selected *project's* open-pull-request list is re-asked
 /// once a repo has proved it has any, and how a repo that answers empty (or
 /// can't answer at all) backs off. One `gh pr list` is one GraphQL call —
-/// one point, however many pull requests come back — and only the selected
-/// project is ever asked.
+/// one point, however many pull requests come back. Every other project's
+/// list is on the slower `OPEN_PRS_SWEEP_REFRESH`.
 ///
 /// The budget (docs.github.com, "Rate limits and node limits for the
 /// GraphQL API", checked 2026-08-28): 5,000 points an hour per user token,
@@ -193,7 +193,7 @@ const PR_SWEEP_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// the floor: a deliberate keypress may spend the call.
 pub(crate) const OPEN_PRS_REFRESH: Duration = Duration::from_secs(15);
 pub(crate) const OPEN_PRS_RECHECK_MIN: Duration = Duration::from_secs(30);
-const OPEN_PRS_RECHECK_MAX: Duration = Duration::from_secs(10 * 60);
+pub(crate) const OPEN_PRS_RECHECK_MAX: Duration = Duration::from_secs(10 * 60);
 /// How often the open list of a project the cursor is *not* on is re-asked
 /// — the background pass that keeps every project's group warm, so
 /// switching to one shows a list minutes old at worst (and the cache the
@@ -203,14 +203,14 @@ const OPEN_PRS_RECHECK_MAX: Duration = Duration::from_secs(10 * 60);
 /// answers empty keeps its own backoff on top. Same reasoning and cadence
 /// as `PR_SWEEP_REFRESH`; the selected project's list stays on
 /// `OPEN_PRS_REFRESH`.
-const OPEN_PRS_SWEEP_REFRESH: Duration = Duration::from_secs(5 * 60);
+pub(crate) const OPEN_PRS_SWEEP_REFRESH: Duration = Duration::from_secs(5 * 60);
 
 /// How long the Worktrees cursor must rest on an open-PR row before its
 /// description and conversation are fetched. Long enough that arrowing
 /// through a hundred rows spends nothing, short enough that stopping to
 /// read one feels immediate. Answers are cached for the session, so this is
 /// paid at most once per pull request.
-const PR_DETAIL_DEBOUNCE: Duration = Duration::from_millis(300);
+pub(crate) const PR_DETAIL_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// While the metrics modal is open, how often a fresh memory reading is
 /// requested from the daemon.
@@ -418,9 +418,8 @@ async fn main_loop(
                 // The selected project's open issues, on the same beat, so
                 // `i` paints rows that are at most a couple of minutes old.
                 crate::issues::refresh_selected(&mut app);
-                // And, with PR & ISSUE COUNTS on, one other project's — the
-                // pass that keeps every row's count warm, `sweep_open_prs`
-                // for issues. Off, it asks nobody.
+                // And one other project's — the pass that keeps every
+                // row's count warm, `sweep_open_prs` for issues.
                 crate::issues::sweep_others(&mut app);
                 // Whatever the answers above changed since the last tick
                 // goes to disk, off the loop; the next launch paints from it.
@@ -1581,11 +1580,7 @@ fn open_pr_comment(app: &mut App) {
         None if app.launcher_grid() => {
             launcher::card_pull_request(app, launcher::NO_CARD_FOR_COMMENT).map(|pr| {
                 crate::app::PreviewedPr {
-                    label: if pr.title.is_empty() {
-                        format!("#{}", pr.number)
-                    } else {
-                        format!("#{} {}", pr.number, pr.title)
-                    },
+                    label: crate::pull_request::numbered_label(pr.number, &pr.title),
                     number: pr.number,
                     url: pr.url,
                 }
@@ -3909,7 +3904,7 @@ fn spawn_open_command(command: &str, cwd: &std::path::Path) -> std::io::Result<(
     }
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let shell = nebula_core::shell::user_shell();
     let mut child = Command::new(shell)
         .arg("-c")
         .arg(command)
@@ -4642,13 +4637,9 @@ fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequ
 /// project's main checkout (root) when the Projects panel has focus.
 fn worktree_in_context(app: &App) -> Option<WorktreeId> {
     match app.focus {
-        Focus::Projects => app.selected_project().and_then(|p| {
-            app.tree
-                .worktrees
-                .iter()
-                .find(|w| w.project_id == p.id && w.is_main)
-                .map(|w| w.id.clone())
-        }),
+        Focus::Projects => app
+            .selected_project()
+            .and_then(|p| app.root_worktree(&p.id)),
         _ => app.selected_worktree().map(|w| w.id.clone()),
     }
 }
@@ -5049,11 +5040,7 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
 /// fallback as PROJECT-scoped TERMINAL SESSION and LINK creation.
 fn selected_project_main_worktree(app: &App) -> Option<WorktreeId> {
     let project = app.selected_project()?;
-    app.tree
-        .worktrees
-        .iter()
-        .find(|worktree| worktree.project_id == project.id && worktree.is_main)
-        .map(|worktree| worktree.id.clone())
+    app.root_worktree(&project.id)
 }
 
 /// `n` on a PROJECT OPEN PRS GROUP row: the NEW SESSION PICKER's harness
@@ -5141,7 +5128,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
                 .or_else(|| cfg.default_effort(*kind)),
         ),
     };
-    let configured = configured.unwrap_or_else(|| "default".into());
+    let configured = configured.unwrap_or_else(|| crate::config::DEFAULT_CHOICE.into());
     let items: Vec<MenuItem> = choices
         .iter()
         .map(|choice| {
@@ -5197,8 +5184,7 @@ pub(crate) fn menu_quick_return(menu: &ContextMenu) -> Option<crate::quick_promp
     })
 }
 
-/// A checkout row's context menu in the Worktrees panel — the same rows
-/// from `m` as from a right-click.
+/// A checkout's context menu: what a right-click on an EMPTY BAND opens.
 fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
     let run = if app.worktree_running(&w.id) {
         "Stop run"
@@ -5753,7 +5739,9 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         Overlay::Diff(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            let half = (view.view_height / 2).max(1) as i32;
+            // Ctrl+d/u walk the file list half its height, as in vim —
+            // the flat list and the tree alike; the diff pages on PgUp/PgDn.
+            let half = (view.list_area.height / 2).max(1) as i64;
             let page = view.view_height.max(1) as i32;
             match key.code {
                 // Two-stage escape: an active filter is cleared before the
@@ -5763,10 +5751,14 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     activate::diff_filter_changed(view);
                 }
                 KeyCode::Esc => app.overlay = None,
-                KeyCode::Char('d') if ctrl => view.scroll_by(half),
+                KeyCode::Char('d') if ctrl => {
+                    activate::diff_file(view, view.cursor() as i64 + half)
+                }
                 // Ctrl+u is the line editor's kill-to-start while something
-                // is typed; only with an empty filter does it scroll.
-                KeyCode::Char('u') if ctrl && view.filter.is_empty() => view.scroll_by(-half),
+                // is typed; only with an empty filter does it move.
+                KeyCode::Char('u') if ctrl && view.filter.is_empty() => {
+                    activate::diff_file(view, view.cursor() as i64 - half)
+                }
                 // Ctrl+r toggles the reviewed ✓ on the selected file —
                 // nebula-side bookkeeping only, no git state is touched.
                 // Reviewed files sink to the bottom; marking advances to the
@@ -6139,7 +6131,7 @@ fn run_settings_cmd(app: &mut App, cmd: SettingsCmd) {
             app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                 title: "Reset settings".into(),
                 message: "Every setting goes back to its default: theme, editor, agent \
-                          defaults,\ntimeouts, panel visibility, every project's settings, \
+                          defaults,\ntimeouts, the grid's layout, every project's settings, \
                           and all hotkey\nbindings. Your config.json is rewritten and \
                           config.local.json removed;\nthis can't be undone."
                     .into(),
@@ -6380,7 +6372,6 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.black_background = cfg.black_background;
-    app.hide_card_prompt = cfg.hide_card_prompt;
     app.card_issue_number = cfg.card_issue_number;
     app.show_all_worktrees = cfg.show_all_worktrees;
     app.hide_card_marks = cfg.hide_card_marks;
@@ -6503,8 +6494,8 @@ fn set_hide_draft_prs(app: &mut App, hidden: bool) -> bool {
 
 /// **Hide draft PRs** / **Show draft PRs** on the Worktrees panel menu:
 /// flip the `hide_draft_prs` SETTING where the group is and write it to
-/// CONFIG.JSON, the way `Shift+P` writes the panel it hides — the file is
-/// where the choice persists, the app field is the live copy. A cursor
+/// CONFIG.JSON — the file is where the choice persists, the app field is
+/// the live copy. A cursor
 /// that was on a draft and landed on a checkout gets that checkout's
 /// session brought up, as a fold does (`toggle_open_prs`): the PTY
 /// underneath was deliberately left attached while the cursor was in the
@@ -7059,8 +7050,8 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     back.launch.target.clone(),
                     kind,
                     custom.clone(),
-                    model.filter(|m| m != "default"),
-                    effort.filter(|e| e != "default"),
+                    model.filter(|m| m != crate::config::DEFAULT_CHOICE),
+                    effort.filter(|e| e != crate::config::DEFAULT_CHOICE),
                     &crate::config::Config::load(),
                 )
                 .with_issue(back.launch.issue.clone())
@@ -7088,7 +7079,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             let picked = (model.clone(), effort.clone());
             let resolve = |choice: Option<String>, configured: Option<String>| match choice {
                 None => configured,
-                Some(c) if c == "default" => configured,
+                Some(c) if c == crate::config::DEFAULT_CHOICE => configured,
                 some => some,
             };
             let harness = cfg.effective_harness(kind, custom.as_deref());
@@ -7867,7 +7858,7 @@ fn cloud_session_url_of(app: &App, sref: &SessionRef) -> Option<String> {
 }
 
 /// Full-screen whatever the pane is showing, with the input lock on:
-/// the sidebars collapse away and the keys go to the PTY. Enter and a
+/// the grid gives way and the keys go to the PTY. Enter and a
 /// double-click on a card step into the pane under the cards
 /// (`launcher::enter_pane`); only a body too short to draw that pane
 /// comes here instead (`launcher::open_session`). [`leave_terminal_lock`]
@@ -7879,9 +7870,9 @@ pub(super) fn zoom_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
     fire_pending_attach(app, out);
 }
 
-/// Leave a locked pane for the Sessions panel. Also expands collapsed
-/// sidebars, so there is something on screen to land in — which is what
-/// takes a full-screen session back to the LAUNCHER VIEW's GRID.
+/// Leave a locked pane for the cards (`Focus::Sessions`). Also ends a
+/// full screen, so there is something on screen to land in — which is
+/// what takes a full-screen session back to the LAUNCHER VIEW's GRID.
 fn leave_terminal_lock(app: &mut App) {
     app.collapsed = false;
     app.term_locked = false;
@@ -8733,29 +8724,10 @@ fn copy_and_flash(app: &mut App, text: &str, label: &str) {
     app.flash = Some(via_terminal);
 }
 
-/// Base64 (RFC 4648, padded) for OSC 52 payloads — one call site does not
-/// justify a dependency.
+/// Base64 (RFC 4648, padded) for OSC 52 payloads.
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = u32::from(chunk[0]) << 16
-            | u32::from(chunk.get(1).copied().unwrap_or(0)) << 8
-            | u32::from(chunk.get(2).copied().unwrap_or(0));
-        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
-        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Copy to *this machine's* system clipboard.
@@ -9138,12 +9110,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         app.dirty = true;
         return;
     }
-    // Diff modal: the wheel scrolls the diff, a click on a file-list row
-    // selects that file (and folds or unfolds a tree directory's), a drag
-    // on the files/diff border resizes the file list; everything else is
-    // swallowed.
+    // Diff modal: the wheel over the file list walks its cursor a row a
+    // notch (↑/↓'s own step), anywhere else it scrolls the diff; a click on
+    // a file-list row selects that file (and folds or unfolds a tree
+    // directory's), a drag on the files/diff border resizes the file list;
+    // everything else is swallowed.
     if let Some(Overlay::Diff(view)) = &mut app.overlay {
+        let over_files = view.area.contains(mouse_pos) && mouse.column < view.splitter_x();
         match mouse.kind {
+            MouseEventKind::ScrollUp if over_files => {
+                activate::diff_file(view, view.cursor() as i64 - 1);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown if over_files => {
+                activate::diff_file(view, view.cursor() as i64 + 1);
+                app.dirty = true;
+            }
             MouseEventKind::ScrollUp => {
                 view.scroll_by(-MODAL_WHEEL_LINES);
                 app.dirty = true;
@@ -9154,7 +9136,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 // Border grab zone: the two touching border cells at the
-                // files/diff boundary (the panel `Splitter` pattern).
+                // files/diff boundary.
                 let bx = view.splitter_x();
                 if on_vsplit(bx, view.area, mouse.column, mouse.row) {
                     view.files_drag = Some(bx as i32 - mouse.column as i32);
@@ -9289,7 +9271,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 // Border grab zone: the two touching border cells at the
-                // tree/preview boundary (the panel `Splitter` pattern).
+                // tree/preview boundary.
                 let bx = view.splitter_x();
                 if on_vsplit(bx, view.area, mouse.column, mouse.row) {
                     view.files_drag = Some(bx as i32 - mouse.column as i32);
@@ -9830,9 +9812,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
         }
         MouseEventKind::Down(MouseButton::Right) => {
-            // The right button is two keys: the cursor moves onto the row
-            // as a left click moves it (`select_clicked_row`), then `m` —
-            // the row's own CONTEXT MENU, from the one builder. A panel's
+            // The right button is two steps: the cursor moves onto the row
+            // as a left click moves it (`select_clicked_row`), then the
+            // row's own CONTEXT MENU opens, from the one builder
+            // (`context_menu_items`). A panel's
             // background has no row and no cursor, so its menu is the
             // mouse's alone.
             let at = (mouse.column, mouse.row);
@@ -21240,13 +21223,6 @@ diff --git a/src/c.rs b/src/c.rs
         press(&mut app, KeyCode::Up, KeyModifiers::SHIFT, &mut out);
         press(&mut app, KeyCode::Up, KeyModifiers::SHIFT, &mut out);
         assert_eq!(scroll(&app), (0, 0), "Shift+Up clamps at the top");
-        press(
-            &mut app,
-            KeyCode::Char('d'),
-            KeyModifiers::CONTROL,
-            &mut out,
-        );
-        assert_eq!(scroll(&app), (0, 10), "Ctrl+d scrolls half a page");
         press(&mut app, KeyCode::End, KeyModifiers::NONE, &mut out);
         assert_eq!(scroll(&app), (0, 80), "End jumps to max scroll");
         press(&mut app, KeyCode::PageDown, KeyModifiers::NONE, &mut out);
@@ -21264,9 +21240,120 @@ diff --git a/src/c.rs b/src/c.rs
         assert_eq!(scroll(&app).0, 1, "selection clamps at the last file");
         press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
         assert_eq!(scroll(&app).0, 0, "Up selects the previous file");
+        press(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(scroll(&app).0, 1, "Ctrl+d walks the file list");
+        press(
+            &mut app,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(scroll(&app).0, 0, "Ctrl+u walks it back");
 
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "Esc closes the modal");
+        assert!(out.is_empty());
+    }
+
+    /// INPUT PARITY: the wheel over the file list walks the file cursor the
+    /// way ↑/↓ do; over the diff pane it still scrolls the diff.
+    #[test]
+    fn diff_modal_wheel_over_file_list_walks_files() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut view = fake_diff_view(100);
+        view.area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        view.files_width = 30;
+        view.list_area = ratatui::layout::Rect::new(1, 2, 28, 26);
+        app.overlay = Some(Overlay::Diff(view));
+        let mut out = Vec::new();
+        let state = |app: &App| match &app.overlay {
+            Some(Overlay::Diff(v)) => (v.selected, v.scroll),
+            _ => panic!("diff overlay gone"),
+        };
+
+        // The diff pane first: a file switch reloads the fake view's diff.
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, 60, 5), &mut out);
+        assert_eq!(
+            state(&app),
+            (0, MODAL_WHEEL_LINES as u16),
+            "the diff pane's wheel scrolls the diff, not the files"
+        );
+
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, 10, 5), &mut out);
+        assert_eq!(
+            state(&app),
+            (1, 0),
+            "wheel down over the files selects the next"
+        );
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, 10, 5), &mut out);
+        assert_eq!(state(&app).0, 1, "clamps at the last file");
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 10, 1), &mut out);
+        assert_eq!(
+            state(&app).0,
+            0,
+            "wheel up (filter row too) selects the previous"
+        );
+        assert!(out.is_empty());
+    }
+
+    /// Ctrl+d / Ctrl+u move the file cursor half the list's height, vim
+    /// style, in the flat list and in the tree alike, and leave the diff's
+    /// scroll to PgUp/PgDn.
+    #[test]
+    fn diff_modal_ctrl_d_u_half_the_file_list() {
+        use crate::git_diff::DiffFile;
+        let files = (0..30)
+            .map(|i| DiffFile {
+                path: format!("src/f{i:02}.rs"),
+                orig_path: None,
+                xy: ['M', ' '],
+            })
+            .collect();
+        let mut view = DiffView::new(
+            "/nonexistent-nebula-diff-test".into(),
+            "main".into(),
+            files,
+            true,
+        );
+        view.list_area = ratatui::layout::Rect::new(1, 2, 28, 10);
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.overlay = Some(Overlay::Diff(view));
+        let mut out = Vec::new();
+        let cursor = |app: &App| match &app.overlay {
+            Some(Overlay::Diff(v)) => v.cursor(),
+            _ => panic!("diff overlay gone"),
+        };
+        let ctrl = |app: &mut App, c: char, out: &mut Vec<ClientRequest>| {
+            press(app, KeyCode::Char(c), KeyModifiers::CONTROL, out)
+        };
+
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(cursor(&app), 5, "flat: Ctrl+d is half the list's 10 rows");
+        ctrl(&mut app, 'd', &mut out);
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(cursor(&app), 5, "flat: Ctrl+u comes back up half");
+        for _ in 0..10 {
+            ctrl(&mut app, 'd', &mut out);
+        }
+        assert_eq!(cursor(&app), 29, "clamps on the last file");
+
+        ctrl(&mut app, 't', &mut out);
+        let Some(Overlay::Diff(v)) = &mut app.overlay else {
+            panic!("diff overlay gone")
+        };
+        assert!(v.tree.is_some(), "Ctrl+t showed the tree");
+        v.select(0);
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(cursor(&app), 5, "tree: Ctrl+d is half the list too");
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(cursor(&app), 0, "tree: Ctrl+u back to the top");
         assert!(out.is_empty());
     }
 
@@ -21460,7 +21547,7 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     #[test]
-    fn diff_modal_ctrl_u_clears_filter_before_scrolling() {
+    fn diff_modal_ctrl_u_clears_filter_before_moving() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.overlay = Some(Overlay::Diff(fake_diff_view(100)));
@@ -21470,21 +21557,21 @@ diff --git a/src/c.rs b/src/c.rs
             _ => panic!("diff overlay gone"),
         };
 
-        // With nothing typed, Ctrl+u keeps its half-page-up scroll role.
+        // With nothing typed, Ctrl+u keeps its half-list-up role.
         press(
             &mut app,
             KeyCode::Char('d'),
             KeyModifiers::CONTROL,
             &mut out,
         );
-        assert_eq!(view(&app).scroll, 10, "Ctrl+d scrolls half a page down");
+        assert_eq!(view(&app).selected, 1, "Ctrl+d moves down the files");
         press(
             &mut app,
             KeyCode::Char('u'),
             KeyModifiers::CONTROL,
             &mut out,
         );
-        assert_eq!(view(&app).scroll, 0, "empty filter: Ctrl+u scrolls up");
+        assert_eq!(view(&app).selected, 0, "empty filter: Ctrl+u moves up");
 
         // With a filter typed, Ctrl+u clears it instead of scrolling.
         press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
@@ -28694,8 +28781,7 @@ diff --git a/src/c.rs b/src/c.rs
     /// launch. On the WORKTREES PANEL the checkout is cut on the way, so
     /// only a PROJECT is needed — and an empty tree has none of those
     /// either. (A cursor parked on an OPEN PRS row is not this case: the
-    /// pull request's own checkout is where that box launches —
-    /// `p_on_an_open_pr_row_launches_a_pr_session_with_its_checkout_up_at_once`.)
+    /// pull request's own checkout is where that box launches.)
     #[test]
     fn the_quick_prompt_needs_a_worktree() {
         with_default_config(|| {

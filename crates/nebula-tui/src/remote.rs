@@ -101,10 +101,7 @@ pub fn web_url(remote: &str) -> Option<String> {
 /// the port for schemes a browser speaks — `git.lan:3000` is where the
 /// forge answers, while `:22` on an ssh remote is not.
 fn assemble(scheme: &str, rest: &str, port_is_web: bool) -> Option<String> {
-    let (authority, path) = match rest.split_once('/') {
-        Some((authority, path)) => (authority, path),
-        None => return None,
-    };
+    let (authority, path) = rest.split_once('/')?;
     // Credentials belong to the transport — never to the address bar.
     let host = authority.rsplit('@').next()?;
     // `ssh://git@host:22/o/r` — strip the port, but not an IPv6 literal

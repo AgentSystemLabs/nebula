@@ -159,7 +159,8 @@ pub struct TreeBrowser {
     /// Outer width of the tree panel; drag the panel border to resize.
     pub files_width: u16,
     /// In-progress drag of the tree/preview border: `boundary_x - grab
-    /// column` at mouse-down (the `SplitterDrag::grab_offset` pattern).
+    /// column` at mouse-down, so the border tracks the pointer instead of
+    /// jumping to it.
     pub files_drag: Option<i32>,
     /// BACKGROUND READS: with it, a file's preview is read and highlighted
     /// off the loop and lands in [`TreeBrowser::land_preview`]; without (a

@@ -18,10 +18,11 @@
 //! `CLAUDE_MODELS` — by leaking each installed catalogue once; a refresh happens
 //! at most once per TUI process.
 
+use nebula_core::clock::now_secs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{OnceLock, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -442,12 +443,6 @@ struct Cache {
 
 fn cache_path() -> PathBuf {
     nebula_core::paths::data_dir().join(CACHE_FILE)
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 fn read_cache(path: &std::path::Path) -> Option<Cache> {

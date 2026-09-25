@@ -162,7 +162,7 @@ fn upgrade_with(url: &str, staging_dir: &Path, force: bool) -> Result<()> {
     // running" note — finish_daemon_handoff owns that messaging here.
     let result = Command::new("sh")
         .arg(&script)
-        .env("NEBULA_UPGRADE_HANDOFF", "1")
+        .env(nebula_core::env::UPGRADE_HANDOFF, "1")
         .status()
         .with_context(|| format!("run {}", script.display()));
     let _ = std::fs::remove_file(&script);

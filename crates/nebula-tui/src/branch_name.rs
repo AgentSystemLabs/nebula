@@ -60,12 +60,12 @@ pub fn issue_name(number: u64, title: &str, taken: &[String]) -> String {
     } else {
         format!("issue-{number}-{slug}")
     };
-    if !taken.iter().any(|t| t == &base) {
+    if !taken.contains(&base) {
         return base;
     }
     (2..)
         .map(|n| format!("{base}-{n}"))
-        .find(|candidate| !taken.iter().any(|t| t == candidate))
+        .find(|candidate| !taken.contains(candidate))
         .expect("an unbounded range always finds a free suffix")
 }
 
@@ -134,14 +134,14 @@ pub fn name_from_seed(seed: u64) -> String {
 pub fn random_name(taken: &[String]) -> String {
     for _ in 0..64 {
         let candidate = name_from_seed(next_seed());
-        if !taken.iter().any(|t| t == &candidate) {
+        if !taken.contains(&candidate) {
             return candidate;
         }
     }
     let base = name_from_seed(next_seed());
     (2..)
         .map(|n| format!("{base}-{n}"))
-        .find(|c| !taken.iter().any(|t| t == c))
+        .find(|c| !taken.contains(c))
         .expect("infinite range yields an untaken name")
 }
 

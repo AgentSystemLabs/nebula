@@ -81,9 +81,7 @@ pub const SOUNDS: &[&str] = &[
 /// Where the macOS system sounds live; `<name>.aiff` inside it.
 const MACOS_SOUNDS_DIR: &str = "/System/Library/Sounds";
 
-/// The model/effort sentinel meaning "don't pass the flag — let the CLI
-/// pick"; it heads every choice list and is what the daemon sees as None.
-pub const DEFAULT_CHOICE: &str = "default";
+pub use nebula_core::harness::DEFAULT_CHOICE;
 
 /// What the overlay shows for an empty `worktree_base_branch`: the daemon
 /// picks origin's default branch itself. Display only — the file holds
@@ -93,13 +91,13 @@ pub const AUTO_CHOICE: &str = "auto";
 /// the checkout's `.nebula.json` is what `r` reads then.
 pub const PROJECT_FILE_CHOICE: &str = nebula_core::project_file::FILE_NAME;
 
-/// The static model/effort lists live in the core registry table now
-/// ([`nebula_core::harness::builtin`]); what the pickers show is built
-/// below from the effective descriptor, so a `harnesses` override renames
-/// the rows everywhere at once. Claude's models still come from
-/// `claude_catalogue.rs` at runtime — CONFIG.JSON's `claude_models`, else
-/// Claude Code's own `availableModels`, else the aliases — and Cursor's
-/// from its catalogue (a seed plus a cached `cursor-agent --list-models`).
+// The static model/effort lists live in the core registry table now
+// ([`nebula_core::harness::builtin`]); what the pickers show is built
+// below from the effective descriptor, so a `harnesses` override renames
+// the rows everywhere at once. Claude's models still come from
+// `claude_catalogue.rs` at runtime — CONFIG.JSON's `claude_models`, else
+// Claude Code's own `availableModels`, else the aliases — and Cursor's
+// from its catalogue (a seed plus a cached `cursor-agent --list-models`).
 
 /// The `quick_prompt_kind` choices: every built-in harness id, by the name
 /// the config file stores. Derived from the registry table rather than
@@ -195,12 +193,19 @@ pub(crate) fn cycle_owned(current: &str, choices: &[String], delta: i32) -> Stri
     if choices.is_empty() {
         return current.to_string();
     }
+    choices[cycled_index(current, choices, delta)].clone()
+}
+
+/// Where `current` lands in `choices` after `delta` steps, wrapping; a
+/// value off the list (matched ignoring case) counts as the first.
+/// Panics on an empty list.
+fn cycled_index<S: AsRef<str>>(current: &str, choices: &[S], delta: i32) -> usize {
     let n = choices.len() as i32;
     let pos = choices
         .iter()
-        .position(|c| c.eq_ignore_ascii_case(current.trim()))
+        .position(|c| c.as_ref().eq_ignore_ascii_case(current.trim()))
         .unwrap_or(0) as i32;
-    choices[(pos + delta).rem_euclid(n) as usize].clone()
+    (pos + delta).rem_euclid(n) as usize
 }
 
 /// The effort to launch with, given the harness, its model and the picked
@@ -294,7 +299,7 @@ fn describe(kind: AgentKind, custom: Option<&str>) -> nebula_core::harness::Harn
         label: String::new(),
         program: id.to_string(),
         enabled: true,
-        model: "default".into(),
+        model: DEFAULT_CHOICE.into(),
         model_flag: "--model".into(),
         hooks: None,
     }
@@ -389,7 +394,6 @@ pub enum SettingKind {
     HideCardMarks,
     SessionPane,
     WorktreeLayout,
-    HideCardPrompt,
     CardIssueNumber,
     HideDraftPrs,
     QuickPromptKind,
@@ -487,7 +491,6 @@ impl SettingKind {
             | SettingKind::ShowAllWorktrees
             | SettingKind::HideCardMarks
             | SettingKind::WorktreeLayout
-            | SettingKind::HideCardPrompt
             | SettingKind::CardIssueNumber => (2026, 9, 24),
         }
     }
@@ -623,7 +626,7 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::Theme,
                 label: "Color theme",
-                hint: "Accent colors used across the panels and overlays",
+                hint: "Accent colors used across the grid and overlays",
                 group: "",
             },
             SettingSpec {
@@ -651,12 +654,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 group: "",
             },
             SettingSpec {
-                kind: SettingKind::HideCardPrompt,
-                label: "Card prompt",
-                hint: "Show or hide the last prompt at the foot of each session card",
-                group: "",
-            },
-            SettingSpec {
                 kind: SettingKind::CardIssueNumber,
                 label: "Card issue number",
                 hint: "Show the #number of the GitHub issue a session was started from on its card; click it to open the issue",
@@ -671,7 +668,7 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::HideDraftPrs,
                 label: "Draft pull requests",
-                hint: "Show or hide drafts in the OPEN PRS group and / search; checkouts always stay",
+                hint: "Show or hide draft pull requests in / search; checkouts always stay",
                 group: "",
             },
         ]),
@@ -694,7 +691,7 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::RunCommand,
                 label: "Run command",
-                hint: "Shell line r runs in this project's worktrees (empty = its .nebula.json \"run\")",
+                hint: "Shell line a menu's Run starts in this project's worktrees (empty = its .nebula.json \"run\")",
                 group: "",
             },
             SettingSpec {
@@ -925,7 +922,7 @@ pub struct Config {
     /// user made.
     pub git_init_on_create: bool,
     /// The branch every new WORKTREE nobody named a base for starts from
-    /// (`n` in the WORKTREES PANEL, a bare `nebula worktree`, the QUICK
+    /// (a project's **New worktree**, a bare `nebula worktree`, the QUICK
     /// PROMPT's auto-created one). Empty — the default, shown as `auto` —
     /// is origin's own default branch, `origin/HEAD` freshly fetched; a
     /// name (`master`, `develop`) is origin's fetched copy of that branch
@@ -1005,8 +1002,8 @@ pub struct Config {
     pub delete_empty_worktree: bool,
     /// SHOW ALL WORKTREES: every checkout of the project gets a BAND on
     /// the grid, one with nothing running in it too — an overview of the
-    /// checkouts, any of them a place to aim `p`/`n` at. Off (the
-    /// default), the grid is only what is running. On, deleting a
+    /// checkouts, any of them a place to aim `p`/`n` at. On by default.
+    /// Off, the grid is only what is running. On, deleting a
     /// worktree's last card never offers the worktree (whatever
     /// [`Config::delete_empty_worktree`] says): the emptied band stays,
     /// and `d` on it — behind its own confirm — is the way to delete it.
@@ -1046,15 +1043,17 @@ pub struct Config {
     /// recent shown until Tab — the ACCORDION — opens the rest). Read
     /// through [`Config::list_layout`], so a word off the list is the cards.
     pub worktree_layout: String,
-    /// Leave the last prompt off every session card on the GRID: the name
-    /// and what it runs on stay, the rows under them go blank. The prompt
-    /// is still captured and still read everywhere else. Off by default:
-    /// a config predating the key keeps the prompt on the cards.
+    /// RETIRED with every card carrying its last prompt. Through 0.40 the
+    /// **Card prompt** SETTING (Settings → Appearance, `shown` by default)
+    /// could leave the last prompt off every session card on the GRID.
+    /// Every card shows it now, whatever this says, so no tab shows the
+    /// row and nothing reads it. Still loaded and written back as stored,
+    /// so an older build sharing the file keeps the choice its user made.
     pub hide_card_prompt: bool,
     /// Show the `#15` of the GitHub issue an ISSUE SESSION was started
     /// from on its card on the GRID, a link a click opens in the browser
-    /// (the very `⇧I` the card runs). Off by default: a config predating
-    /// the key keeps the cards as they were.
+    /// (the very `⇧I` the card runs). On by default, a config predating
+    /// the key too.
     pub card_issue_number: bool,
     /// Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE's pull-request rows, so browsing what's open shows only
@@ -1081,7 +1080,7 @@ pub struct Config {
     /// it any more. Still loaded and written back as stored, so an older
     /// build sharing the file keeps the behavior its user chose.
     pub skip_session_naming: bool,
-    /// RETIRED with the archive confirm made unconditional. Through 0.33,
+    /// RETIRED with the archive confirm made unconditional. Through 0.34,
     /// on, it put a CONFIRM DIALOG in front of archiving a session — the
     /// `a` key and the row menu's Archive alike — and off (the default)
     /// archived at once. Every archive asks now, so no tab shows the row
@@ -1089,7 +1088,7 @@ pub struct Config {
     /// an older build sharing the file keeps the behavior its user chose.
     pub confirm_on_archive: bool,
     /// The key of the **Focused panel tint** SETTING (Settings →
-    /// Appearance, through 0.33): whether the faint accent wash behind
+    /// Appearance, through 0.34): whether the faint accent wash behind
     /// whatever keys land in — the card under the cursor, or the session
     /// pane — was painted at all. It always is now: the wash is the one
     /// cue that says which surface keys land in, so this build never
@@ -1104,20 +1103,20 @@ pub struct Config {
     /// edits it. Still loaded and written back as stored, so an older
     /// build sharing the file keeps the bar its user chose.
     pub show_workspaces: bool,
-    /// RETIRED with the three-panel layout. Through 0.36 the **Projects panel**
+    /// RETIRED with the three-panel layout. Through 0.37 the **Projects panel**
     /// SETTING (Settings → Appearance) collapsed that panel to a rail; the
     /// GRID has no panels, so no tab shows the row and nothing reads it.
     /// Still loaded and written back as stored, so an older build sharing
     /// the file keeps the layout its user chose.
     pub hide_projects: bool,
     /// RETIRED with the three-panel layout, as `hide_projects` is: the
-    /// **Worktrees panel** SETTING through 0.36.
+    /// **Worktrees panel** SETTING through 0.37.
     pub hide_worktrees: bool,
     /// RETIRED with the three-panel layout, as `hide_projects` is: the
-    /// **Sessions panel** SETTING through 0.36.
+    /// **Sessions panel** SETTING through 0.37.
     pub hide_sessions: bool,
     /// RETIRED with the root always listed. Through 0.27 one switch for
-    /// every project (Settings → Experimental), then through 0.33 the
+    /// every project (Settings → Experimental), then through 0.35 the
     /// fallback for a project whose `projects` entry had no **Hide root
     /// worktree** row of its own: on, a project's ROOT WORKTREE was left
     /// out of everything the grid launched into. Nothing hides the root
@@ -1129,7 +1128,7 @@ pub struct Config {
     /// user made.
     pub hide_root_worktree: bool,
     /// RETIRED with every card carrying its session's last prompt. Through
-    /// 0.36 the **Recent prompts** SETTING (Settings → Experimental) listed a
+    /// 0.37 the **Recent prompts** SETTING (Settings → Experimental) listed a
     /// session's last prompts under its row; the card shows the newest one
     /// whatever this says, so no tab shows the row and nothing reads it.
     /// Still loaded and written back as stored, so an older build sharing
@@ -1252,10 +1251,10 @@ pub struct Config {
     /// still enters the pane.
     pub quick_prompt_focus: bool,
     /// Whether each new QUICK PROMPT starts aimed at a fresh worktree
-    /// rather than the project's ROOT BRANCH — never the checkout of the
-    /// card under the cursor, whose session takes more work as a
-    /// FOLLOW-UP. `^N` flips the one box that is up; the next box starts
-    /// from this again. Off by default.
+    /// rather than the checkout under the grid's cursor (the project's
+    /// ROOT BRANCH when nothing is aimed at — `launcher::target_for`).
+    /// `^N` flips the one box that is up; the next box starts from this
+    /// again. Off by default.
     pub quick_prompt_new_worktree: bool,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
@@ -1278,8 +1277,8 @@ pub struct Config {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProjectSettings {
-    /// The RUN COMMAND `r` starts in this project's worktrees, typed on
-    /// the Project tab. Empty — the default, shown as `.nebula.json` — is
+    /// The RUN COMMAND a menu's **Run** starts in this project's
+    /// worktrees, typed on the Project tab. Empty — the default, shown as `.nebula.json` — is
     /// the checkout's PROJECT FILE `run`, where the command lived before
     /// the row existed; set, it wins over the file. The DAEMON reads it
     /// (`nebula-daemon/src/config.rs`); the TUI only edits it. Left out
@@ -1359,14 +1358,14 @@ impl Default for Config {
             editor: "vim".into(),
             close_finder_on_open: true,
             ssh_sync_config: true,
-            session_idle_timeout: "5m".into(),
+            session_idle_timeout: nebula_core::settings::DEFAULT_SESSION_IDLE_TIMEOUT.into(),
             prewarm_agents: true,
             prewarm_sessions: true,
             done_sound: "Glass".into(),
             feedback_sound: "Sosumi".into(),
             preset_text: PresetText::DEFAULT.as_str().into(),
             delete_empty_worktree: false,
-            show_all_worktrees: false,
+            show_all_worktrees: true,
             theme: "default".into(),
             animations: true,
             black_background: true,
@@ -1374,7 +1373,7 @@ impl Default for Config {
             session_pane: crate::launcher::PaneSide::default().as_str().into(),
             worktree_layout: WORKTREE_LAYOUTS[0].into(),
             hide_card_prompt: false,
-            card_issue_number: false,
+            card_issue_number: true,
             hide_draft_prs: false,
             card_line_changes: false,
             skip_session_naming: false,
@@ -1661,7 +1660,7 @@ impl Config {
             label: String::new(),
             program: id.to_string(),
             enabled: true,
-            model: "default".into(),
+            model: DEFAULT_CHOICE.into(),
             model_flag: "--model".into(),
             hooks: None,
         }
@@ -1775,7 +1774,7 @@ impl Config {
             label: String::new(),
             program: id.to_string(),
             enabled: true,
-            model: "default".into(),
+            model: DEFAULT_CHOICE.into(),
             model_flag: "--model".into(),
             hooks: None,
         }
@@ -2179,7 +2178,6 @@ impl Config {
             SettingKind::HideCardMarks => shown_hidden(self.hide_card_marks).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::WorktreeLayout => WORKTREE_LAYOUTS[usize::from(self.list_layout())].into(),
-            SettingKind::HideCardPrompt => shown_hidden(self.hide_card_prompt).into(),
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             // A project row with no project to speak of: what one without
@@ -2284,9 +2282,6 @@ impl Config {
             SettingKind::WorktreeLayout => {
                 let now = WORKTREE_LAYOUTS[usize::from(self.list_layout())];
                 self.worktree_layout = cycle_choice(now, WORKTREE_LAYOUTS, step).into();
-            }
-            SettingKind::HideCardPrompt => {
-                self.hide_card_prompt = !self.hide_card_prompt;
             }
             SettingKind::CardIssueNumber => {
                 self.card_issue_number = !self.card_issue_number;
@@ -2455,12 +2450,7 @@ fn shown_hidden(hidden: bool) -> &'static str {
 }
 
 pub(crate) fn cycle_choice<'a>(current: &str, choices: &[&'a str], delta: i32) -> &'a str {
-    let n = choices.len() as i32;
-    let pos = choices
-        .iter()
-        .position(|c| c.eq_ignore_ascii_case(current.trim()))
-        .unwrap_or(0) as i32;
-    choices[(pos + delta).rem_euclid(n) as usize]
+    choices[cycled_index(current, choices, delta)]
 }
 
 /// The two settings layers merged, `local` over `path`. What this build
@@ -3351,26 +3341,26 @@ mod tests {
         assert!(cfg.delete_empty_worktree);
     }
 
-    /// SHOW ALL WORKTREES starts off — the grid is what is running —
-    /// sits on the Sessions tab beside the delete it changes, toggles
-    /// like any bool, and a config predating the key reads as off.
+    /// SHOW ALL WORKTREES starts on — every checkout gets a band — sits
+    /// on the Sessions tab beside the delete it changes, toggles like any
+    /// bool, and a config predating the key reads as on.
     #[test]
-    fn show_all_worktrees_is_off_by_default_and_toggles() {
+    fn show_all_worktrees_is_on_by_default_and_toggles() {
         let mut cfg = Config::default();
-        assert!(!cfg.show_all_worktrees);
+        assert!(cfg.show_all_worktrees);
         let (tab, row) = locate(SettingKind::ShowAllWorktrees).unwrap();
         assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
-        assert_eq!(cfg.value_label(SettingKind::ShowAllWorktrees), "off");
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.show_all_worktrees);
         assert_eq!(cfg.value_label(SettingKind::ShowAllWorktrees), "on");
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.show_all_worktrees);
+        assert_eq!(cfg.value_label(SettingKind::ShowAllWorktrees), "off");
         cfg.cycle(tab, row, 1);
-        assert!(!cfg.show_all_worktrees, "←/→ toggle it like Enter does");
+        assert!(cfg.show_all_worktrees, "←/→ toggle it like Enter does");
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(!cfg.show_all_worktrees, "a missing key reads as off");
-        let cfg: Config = serde_json::from_str(r#"{"show_all_worktrees": true}"#).unwrap();
-        assert!(cfg.show_all_worktrees);
+        assert!(cfg.show_all_worktrees, "a missing key reads as on");
+        let cfg: Config = serde_json::from_str(r#"{"show_all_worktrees": false}"#).unwrap();
+        assert!(!cfg.show_all_worktrees);
     }
 
     #[test]
@@ -3487,49 +3477,49 @@ mod tests {
         assert!(!legacy.hide_draft_prs);
     }
 
-    /// CARD PROMPT: an Appearance row that reads `shown` / `hidden`, shown
-    /// by default so a config that predates the key keeps the last prompt
-    /// on every card, and persisted under `hide_card_prompt`.
+    /// CARD PROMPT: retired with every card carrying its last prompt. The
+    /// key an older build wrote (`hide_card_prompt`, off by default) still
+    /// loads to what it wrote and is written back as stored, but no tab
+    /// shows it any more.
     #[test]
-    fn card_prompt_default_shown_toggle_on_the_appearance_tab_and_persist() {
-        let mut cfg = Config::default();
+    fn card_prompt_is_retired_but_still_round_trips() {
         assert!(
-            !cfg.hide_card_prompt,
-            "the prompt stays on the cards until asked"
+            !Config::default().hide_card_prompt,
+            "the default an older build reads"
         );
-        assert_eq!(cfg.value_label(SettingKind::HideCardPrompt), "shown");
-
-        let (tab, row) = locate(SettingKind::HideCardPrompt).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.hide_card_prompt);
-        assert_eq!(cfg.value_label(SettingKind::HideCardPrompt), "hidden");
+        let cfg: Config = serde_json::from_str(r#"{"hide_card_prompt": true}"#).unwrap();
+        assert!(cfg.hide_card_prompt, "loaded to what an older build wrote");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains(r#""hide_card_prompt": true"#), "{raw}");
-        assert!(load_from(&path).hide_card_prompt);
+        assert!(load_from(&path).hide_card_prompt, "written back as stored");
 
-        let legacy: Config = serde_json::from_str("{}").unwrap();
-        assert!(!legacy.hide_card_prompt);
+        assert!(
+            SETTINGS_TABS.iter().all(|t| match t.body {
+                TabBody::Values(rows) => rows.iter().all(|r| r.label != "Card prompt"),
+                _ => true,
+            }),
+            "no tab shows the row"
+        );
     }
 
-    /// CARD ISSUE NUMBER: an Appearance row that reads `on` / `off`, off
-    /// by default so a config that predates the key keeps the cards as
-    /// they were, and persisted under `card_issue_number`.
+    /// CARD ISSUE NUMBER: an Appearance row that reads `on` / `off`, on
+    /// by default (a config that predates the key too), and persisted
+    /// under `card_issue_number`.
     #[test]
-    fn card_issue_number_default_off_toggle_on_the_appearance_tab_and_persist() {
+    fn card_issue_number_default_on_toggle_on_the_appearance_tab_and_persist() {
         let mut cfg = Config::default();
-        assert!(!cfg.card_issue_number, "off until asked");
-        assert_eq!(cfg.value_label(SettingKind::CardIssueNumber), "off");
+        assert!(cfg.card_issue_number, "on by default");
+        assert_eq!(cfg.value_label(SettingKind::CardIssueNumber), "on");
 
         let (tab, row) = locate(SettingKind::CardIssueNumber).unwrap();
         assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
         cfg.cycle(tab, row, 0);
+        assert!(!cfg.card_issue_number);
+        assert_eq!(cfg.value_label(SettingKind::CardIssueNumber), "off");
+        cfg.cycle(tab, row, 0);
         assert!(cfg.card_issue_number);
-        assert_eq!(cfg.value_label(SettingKind::CardIssueNumber), "on");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -3539,7 +3529,7 @@ mod tests {
         assert!(load_from(&path).card_issue_number);
 
         let legacy: Config = serde_json::from_str("{}").unwrap();
-        assert!(!legacy.card_issue_number);
+        assert!(legacy.card_issue_number);
     }
 
     /// CARD LINE COUNTS: retired with every card counting its lines. The

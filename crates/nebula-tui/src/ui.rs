@@ -32,9 +32,8 @@ const FILES_SIZE: (u16, u16) = (72, 20);
 /// border.
 const TASK_PROMPT_SIZE: (u16, u16) = (80, 14);
 /// The FOLLOW-UP MODAL's size — the LAUNCHER VIEW's next-turn box. Short
-/// and wide: four rows of typing, the same a card's own composer holds
-/// ([`FOLLOW_UP_MAX_LINES`]), since both are a turn's worth of instruction
-/// to a session already running.
+/// and wide: four rows of typing, a turn's worth of instruction to a
+/// session already running.
 const FOLLOW_UP_PROMPT_SIZE: (u16, u16) = (76, 9);
 
 /// The key hints on a task box's bottom border, widest that fits inside
@@ -2211,7 +2210,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             } else {
                 view.window_start(inner.height as usize)
             };
-            let now = crate::hosts::now_ms();
+            let now = nebula_core::clock::now_ms();
             for (i, entry) in view.hosts.iter().enumerate().skip(start) {
                 let Some(row_area) = row_rect(inner, i - start) else {
                     break;
@@ -2694,9 +2693,9 @@ pub(crate) fn centered_rect_pct(frame: Rect, pct_w: u16, pct_h: u16) -> Rect {
 
 /// A modal's inner rect minus its first row — the list under an always-on
 /// filter input, which every fuzzy overlay lays out the same way.
-fn below_first_row(inner: Rect) -> Rect {
+pub(crate) fn below_first_row(inner: Rect) -> Rect {
     Rect {
-        y: inner.y + 1,
+        y: inner.y.saturating_add(1),
         height: inner.height.saturating_sub(1),
         ..inner
     }
@@ -2942,7 +2941,8 @@ pub(crate) fn browser_button_under(app: &App, pos: Position) -> Option<HitTarget
 /// button it is, if it is one.
 pub(crate) type BadgePart = (String, Style, Option<HitTarget>);
 
-/// The PR & ISSUE COUNTS badge (Settings → Experimental):
+/// The PR & ISSUE COUNTS badge (always on; through 0.37 an Experimental
+/// switch, `pr_issue_counts`):
 /// ` 3 prs · 2 issues` — the pull requests in the accent the OPEN PRS rows
 /// wear (`pr_row::look`), the issues in the green the ISSUES MODAL paints
 /// `open` in, a dim `·` between — as spans, with the columns they take
@@ -3433,7 +3433,7 @@ fn draw_cloud_session(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 
 /// Borderless terminal frame: a header row (`TERMINAL · session` plus a
 /// right-aligned state tag), a thin rule, then the content area. The
-/// header carries the focus signal like the sidebar columns do.
+/// header carries the focus signal.
 fn terminal_frame(
     f: &mut Frame,
     area: Rect,
@@ -3462,8 +3462,7 @@ fn titled_frame(
     } else {
         Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
     };
-    // Row 0 is a blank spacer so the header sits on the same screen row
-    // as the sidebar column titles (`draw_column` does the same).
+    // Row 0 is a blank spacer above the header.
     if let Some(r) = row_rect(area, 1) {
         let mut spans = vec![Span::styled(format!("  {title}"), header_style)];
         spans.extend(left);
@@ -3868,9 +3867,9 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
     } else if let Some(Overlay::Diff(view)) = &app.overlay {
         Span::styled(
             if view.tree.is_some() {
-                "type: filter  ↑/↓: move  ←/→: fold  ⇧↑/↓: scroll  Ctrl+d/u: page  Ctrl+t: flat list  Ctrl+u: clear filter  Esc: clear/close"
+                "type: filter  ↑/↓: move  ←/→: fold  ⇧↑/↓: scroll  Ctrl+d/u: half list  Ctrl+t: flat list  Ctrl+u: clear filter  Esc: clear/close"
             } else {
-                "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Ctrl+t: tree  Ctrl+u: clear filter  Esc: clear/close"
+                "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: half list  Ctrl+t: tree  Ctrl+u: clear filter  Esc: clear/close"
             },
             Style::default().fg(th.dim),
         )

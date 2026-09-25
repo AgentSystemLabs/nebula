@@ -4,6 +4,7 @@
 
 use crate::session_title::TitleState;
 use anyhow::{Context, Result};
+use nebula_core::clock::now_ms;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, PromptEntry,
     TerminalId, TerminalTab, Worktree, WorktreeId, RECENT_PROMPTS_KEPT,
@@ -334,13 +335,6 @@ pub struct Store {
 }
 
 pub type TreeRows = (Vec<Project>, Vec<Worktree>, Vec<Agent>, Vec<TerminalTab>);
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {

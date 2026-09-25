@@ -261,12 +261,7 @@ fn detached(root: &Path, args: &[&str]) -> Command {
         .env("GIT_TERMINAL_PROMPT", "0");
     // SAFETY: setsid is async-signal-safe and touches nothing but the child.
     unsafe {
-        cmd.pre_exec(|| {
-            if crate::ipc::libc_setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        cmd.pre_exec(crate::ipc::own_session);
     }
     cmd
 }
@@ -1137,12 +1132,7 @@ pub(crate) fn open_branch_switch(app: &mut App) {
             return;
         }
         Some(w) => Some(w.id.clone()),
-        None => app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.project_id == project && w.is_main)
-            .map(|w| w.id.clone()),
+        None => app.root_worktree(&project),
     };
     match target {
         Some(id) => open_for(app, &id),
@@ -2021,11 +2011,7 @@ fn draw_list(f: &mut Frame, view: &BranchSwitchView, body: Rect, th: Theme) -> (
         );
         f.render_widget(Paragraph::new(line), query_area);
     }
-    let list = Rect {
-        y: body.y + 1,
-        height: body.height.saturating_sub(1),
-        ..body
-    };
+    let list = crate::ui::below_first_row(body);
     if view.matches.is_empty() {
         let query = view.query.as_str().trim();
         let text = match (&view.list_error, view.listed) {
@@ -2182,7 +2168,6 @@ fn draw_dirty(
 
 /// The COMMIT prompt: what is about to happen, the message field, the
 /// files.
-#[allow(clippy::too_many_arguments)]
 fn draw_commit(
     f: &mut Frame,
     view: &BranchSwitchView,

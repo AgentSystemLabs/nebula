@@ -72,23 +72,23 @@ fn spawn_daemon() -> Result<()> {
     // can reach a tty via /dev/tty grabs its foreground process group —
     // SIGTTIN-stopping the TUI running on this terminal mid-frame.
     unsafe {
-        cmd.pre_exec(|| {
-            if libc_setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        cmd.pre_exec(own_session);
     }
     cmd.spawn().context("spawn nebula daemon")?;
     Ok(())
 }
 
-// Avoid a libc dependency for one call (same pattern as nebula-core's geteuid).
-pub(crate) fn libc_setsid() -> i32 {
+/// `pre_exec` hook putting the child in a session of its own (`setsid`).
+/// Avoids a libc dependency for one call (same pattern as nebula-core's
+/// geteuid).
+pub(crate) fn own_session() -> std::io::Result<()> {
     extern "C" {
         fn setsid() -> i32;
     }
-    unsafe { setsid() }
+    if unsafe { setsid() } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 async fn handshake(mut stream: UnixStream) -> Result<Connection> {

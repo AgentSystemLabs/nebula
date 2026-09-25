@@ -22,6 +22,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
+use nebula_core::paths::{
+    CONFIG_FILE_NAME, CONFIG_LOCAL_FILE_NAME, PRESETS_FILE_NAME, SSH_HOSTS_FILE_NAME,
+};
 use nebula_core::settings::{self, Object};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -50,9 +53,9 @@ const EXEC_KEYS: [&str; 2] = ["harnesses", "custom_harnesses"];
 
 /// Each section, with the name its file has in a data dir.
 const SECTIONS: [(&str, &str); 3] = [
-    (CONFIG, "config.json"),
-    (PRESETS, "agent_presets.json"),
-    (HOSTS, "ssh_hosts.json"),
+    (CONFIG, CONFIG_FILE_NAME),
+    (PRESETS, PRESETS_FILE_NAME),
+    (HOSTS, SSH_HOSTS_FILE_NAME),
 ];
 
 /// The files a bundle is read from and merged into.
@@ -443,8 +446,8 @@ fn classify(value: Value, file_name: Option<&str>) -> Result<Value> {
     let section = match (&value, file_name) {
         (Value::Object(obj), _) if obj.contains_key(MARKER) => return Ok(value),
         (Value::Object(_), _) => CONFIG,
-        (Value::Array(_), Some("agent_presets.json")) => PRESETS,
-        (Value::Array(_), Some("ssh_hosts.json")) => HOSTS,
+        (Value::Array(_), Some(PRESETS_FILE_NAME)) => PRESETS,
+        (Value::Array(_), Some(SSH_HOSTS_FILE_NAME)) => HOSTS,
         (Value::Array(_), _) => bail!(
             "a JSON list could be presets or ssh hosts — name the file agent_presets.json or \
              ssh_hosts.json, or import the folder holding it"
@@ -539,10 +542,10 @@ pub fn run(op: ConfigOp) -> Result<()> {
     match op {
         ConfigOp::Path => {
             for (label, path) in [
-                ("config.json", &paths.config),
-                ("config.local.json", &paths.local),
-                ("agent_presets.json", &paths.presets),
-                ("ssh_hosts.json", &paths.hosts),
+                (CONFIG_FILE_NAME, &paths.config),
+                (CONFIG_LOCAL_FILE_NAME, &paths.local),
+                (PRESETS_FILE_NAME, &paths.presets),
+                (SSH_HOSTS_FILE_NAME, &paths.hosts),
             ] {
                 println!("{label:<20}{}", path.display());
             }

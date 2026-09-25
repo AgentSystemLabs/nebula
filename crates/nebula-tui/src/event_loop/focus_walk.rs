@@ -1,7 +1,8 @@
-//! The panel walk: focus moving across the columns — Tab / ⇧Tab and
-//! ^⇧L / ^⇧H one panel at a time, `h`/`l` (←/→) as their vim twins —
-//! and the double tap that jumps a walk edge: `l`,`l` at Sessions into the
-//! pane. `event_loop.rs` dispatches the keys; this module decides where
+//! The panel walk: focus moving across the old panel columns one at a
+//! time, `h`/`l` (←/→) — the path the keys take when the grid does not
+//! handle them itself — and the double tap that jumps a walk edge into
+//! the pane ([`double_tapped`], which the grid's `k`,`k` and `j`,`j` use
+//! too). `event_loop.rs` dispatches the keys; this module decides where
 //! focus lands. The state it drives is `App::focus`, `App::edge_tap` and
 //! the pane's input lock.
 

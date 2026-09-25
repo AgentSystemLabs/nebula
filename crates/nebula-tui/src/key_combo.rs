@@ -1,8 +1,8 @@
 //! The KEY COMBO DISPLAY, always on (through 0.37 an Experimental
 //! switch, `show_key_combos` — retired, and never read now):
-//! each key pressed in the panels, spelled at the bottom left of the
-//! screen with what it did — `j - Move down`, `^d - Half page down`,
-//! `l l - Enter pane` — so someone watching over a shoulder or a screen
+//! each key pressed on the grid, spelled at the bottom left of the
+//! screen with what it did — `j - Move down`, `^d - Half page down` —
+//! so someone watching over a shoulder or a screen
 //! share can pick the shortcuts up as they are used. Modelled on vim's
 //! `showcmd`: the keys show as they land and clear on their own a moment
 //! later ([`LINGER`]), with nothing to dismiss.

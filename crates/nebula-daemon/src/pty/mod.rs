@@ -1,6 +1,7 @@
 pub mod cloud;
 pub mod cursor;
 pub mod kitty;
+mod osc;
 pub mod progress;
 pub mod ring;
 pub mod title;

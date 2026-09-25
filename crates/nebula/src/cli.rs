@@ -144,14 +144,15 @@ pub(crate) enum Command {
     ///
     /// Run from inside a nebula agent session; agents run it when you ask for
     /// a new nebula session. The new session starts in the same worktree, on
-    /// the task you name as its first prompt, and shows up in the sessions
-    /// list on its own — this session carries on untouched.
+    /// the task you name as its first prompt, and shows up on the grid on
+    /// its own — this session carries on untouched.
     #[command(after_help = SPAWN_EXAMPLES)]
     Spawn {
         /// The task the new session starts on; multiple words need no quotes.
         #[arg(required = true, num_args = 1..)]
         task: Vec<String>,
-        /// Harness for the new session: claude, codex or cursor.
+        /// Harness for the new session: claude, codex, cursor, pi, muse,
+        /// grok or opencode.
         ///
         /// Defaults to the harness this session is running.
         #[arg(long, value_name = "KIND", value_parser = parse_agent_kind)]

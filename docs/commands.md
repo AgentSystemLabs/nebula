@@ -56,9 +56,9 @@ nebula worktree [name] [--base <ref>]  # move the current session into a worktre
                           # a branch name meaning origin's fetched copy — main is origin/main;
                           # without it the worktree_base_branch setting, else origin's default)
 nebula spawn <task> [--kind <claude|codex|cursor|pi|muse|grok|opencode>]  # start a new agent session beside the current
-                          # (custom harnesses launch from the TUI picker and presets, not --kind)
                           # one, in the same worktree, opening on <task> (agents run this when you
-                          # ask for a new nebula session; --kind defaults to this session's harness)
+                          # ask for a new nebula session; --kind defaults to this session's harness;
+                          # custom harnesses launch from the TUI picker and presets, not --kind)
 nebula open <file>…       # show the files in this nebula's FILE TABS — a modal with one tab per
                           # file, the focused one previewed, Enter editing it (agents run this only
                           # when you ask to see a file; text files only — an image or any other

@@ -1,8 +1,7 @@
 //! The one AGENT KIND picker behind every launch surface — the NEW SESSION
 //! PICKER (`n` on the grid, which opens the QUICK PROMPT on the pick; from
 //! a menu's "New agent" row it launches outright), the PR SESSION picker
-//! (`n` on a PROJECT OPEN PRS GROUP row) and the QUICK PROMPT's `Tab` —
-//! plus the per-harness rows a CONTEXT MENU on a PR row offers. Each is one
+//! (`Tab` in the PULL REQUESTS MODAL) and the QUICK PROMPT's `Tab`. Each is one
 //! `ContextMenu` with a row per harness still enabled on the AGENTS TAB (a
 //! disabled one is absent, not greyed), every row a
 //! `MenuAction::NewAgentOfKind` carrying the surface's launch context, so

@@ -1,8 +1,9 @@
 //! Managed-hook installation into the agent CLI's config:
 //! `<worktree>/.claude/settings.local.json` (Claude Code),
 //! `~/.codex/hooks.json` (Codex CLI), or `<worktree>/.cursor/hooks.json`
-//! (Cursor CLI). Pi has no hook file — its managed TypeScript extension is
-//! `pi_extension.rs`, which shares this module's atomic writer.
+//! (Cursor CLI). Pi and OpenCode have no hook file — their managed
+//! TypeScript extension and plugin are `pi_extension.rs` and
+//! `opencode_plugin.rs`, which share this module's atomic writer.
 //!
 //! Claude and Codex share one hooks dialect (PascalCase event names, groups
 //! of `{"hooks": [{"type": "command", ...}]}`). Cursor speaks its own
@@ -267,7 +268,7 @@ fn array_mut<'a>(v: &'a mut Value, what: &str, path: &Path) -> Result<&'a mut Ve
 /// Codex's home (`$CODEX_HOME`, else `~/.codex`) — where its hooks live so
 /// one trust approval covers every worktree. See the module header.
 pub fn codex_home() -> PathBuf {
-    nebula_core::env::non_empty("CODEX_HOME")
+    nebula_core::env::non_empty(nebula_core::env::CODEX_HOME)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             nebula_core::env::home_dir()
@@ -377,6 +378,19 @@ fn load_hooks_root(path: &Path) -> Result<Value> {
 
 fn write_hooks_root(dir: &Path, file_name: &str, root: &Value) -> Result<()> {
     write_text_atomic(dir, file_name, &serde_json::to_string_pretty(root)?)
+}
+
+/// Write the managed file `name` holding `source` into `dir`, unless it
+/// already holds exactly that — an unchanged mtime keeps the CLI's own
+/// bookkeeping of the directory (pi's extension cache, OpenCode's plugin
+/// scan) quiet.
+pub(super) fn install_unless_unchanged(dir: &Path, name: &str, source: &str) -> Result<()> {
+    if let Ok(existing) = std::fs::read_to_string(dir.join(name)) {
+        if existing == source {
+            return Ok(());
+        }
+    }
+    write_text_atomic(dir, name, source)
 }
 
 pub(super) fn write_text_atomic(dir: &Path, file_name: &str, text: &str) -> Result<()> {

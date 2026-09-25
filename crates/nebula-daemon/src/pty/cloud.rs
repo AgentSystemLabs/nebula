@@ -1,4 +1,4 @@
-//! Claude Cloud scanner — the one thing a `claude --cloud <task>` child
+//! Claude Cloud scanner — the one thing a `claude --cloud=<task>` child
 //! says on its output that nebula must act on, read straight off the PTY
 //! stream.
 //!

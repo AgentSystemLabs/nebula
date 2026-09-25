@@ -1,6 +1,6 @@
 //! Rebindable application hotkeys.
 //!
-//! Every key the panels react to is an [`Action`] here, with a default
+//! Every key the grid reacts to is an [`Action`] here, with a default
 //! chord list. The Hotkeys tab of the settings overlay writes overrides
 //! into the shared config JSON (`keybindings: { "<action id>": "j, down" }`),
 //! and the event loop dispatches through [`Keymap::lookup`] instead of
@@ -118,7 +118,8 @@ pub enum Action {
     ToggleArchived,
     Delete,
     DeleteAll,
-    /// The AGENT PRESETS list: saved launch definitions for the SESSIONS PANEL.
+    /// The AGENT PRESETS list: saved launch definitions for the checkout
+    /// under the cursor.
     AgentPresets,
     /// The QUICK PROMPT: type a task, launch an agent on it.
     QuickPrompt,
@@ -146,10 +147,9 @@ pub enum Action {
     /// give way to the PTY — or bring it back down to the pane beside the
     /// cards. From the cards it full-screens the one under the cursor.
     ToggleFullScreen,
-    /// `` ` ``: walk the LAUNCHER PANE's TAB STRIP — the session the
-    /// cursor is on, then each TERMINAL open in that checkout, then back
-    /// to the session. What the pane READS, where `^~` is whether it is
-    /// drawn at all.
+    /// `` ` ``: walk the TERMINAL cards of the cursor's checkout, one after
+    /// another and back round to the first. What the pane READS, where
+    /// `^~` is whether it is drawn at all.
     PaneTabs,
     /// Open the Nth PROJECT TAB (1-based) in the LAUNCHER VIEW's header.
     SelectProjectTab(u8),
@@ -184,7 +184,7 @@ macro_rules! project_tab_slot {
             action: Action::SelectProjectTab($n),
             id: $id,
             label: $label,
-            hint: "Launcher view: open the project on that tab of the header, counting from the left (⌘N only in emulators that send ⌘)",
+            hint: "Open the project on that tab of the header, counting from the left (⌘N only in emulators that send ⌘)",
             group: "NAVIGATE",
             scope: Scope::Global,
             // The digit first: it arrives everywhere, and ⌘N is a silent
@@ -299,7 +299,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::NextProjectTab,
         id: "next_project_tab",
         label: "Next project tab",
-        hint: "Launcher view: open the project on the tab to the right of this one in the header, stopping at the last",
+        hint: "Open the project on the tab to the right of this one in the header, stopping at the last",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["]"],
@@ -308,7 +308,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::PrevProjectTab,
         id: "prev_project_tab",
         label: "Prev project tab",
-        hint: "Launcher view: open the project on the tab to the left, stopping at the first",
+        hint: "Open the project on the tab to the left, stopping at the first",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["["],
@@ -326,7 +326,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::CloseProjectTab,
         id: "close_project_tab",
         label: "Close project tab",
-        hint: "Launcher view: drop this project's tab from the header and open the tab beside it. Nothing is deleted — + opens it again",
+        hint: "Drop this project's tab from the header and open the tab beside it. Nothing is deleted — + opens it again",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["x"],
@@ -335,7 +335,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::ProjectDropdown,
         id: "project_dropdown",
         label: "Switch project",
-        hint: "Launcher view: drop the list of every project under the + in the header — type to narrow it, Enter or a click opens one. + is the header's own button and arrives in every terminal and in nebula browser; ⌘P does the same from inside the pane, where the terminal sends ⌘ at all (Ghostty/kitty do, Terminal.app and the browser never do)",
+        hint: "Drop the list of every project under the + in the header — type to narrow it, Enter or a click opens one. + is the header's own button and arrives in every terminal and in nebula browser; ⌘P does the same from inside the pane, where the terminal sends ⌘ at all (Ghostty/kitty do, Terminal.app and the browser never do)",
         group: "NAVIGATE",
         scope: Scope::Global,
         // `+`, the header button's own glyph, is the key the app shows —
@@ -421,7 +421,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Issues,
         id: "issues",
         label: "GitHub issues",
-        hint: "List the project's open issues; Enter prompts an agent on one, e launches a preset on it",
+        hint: "List the project's open issues; Enter prompts an agent on one, ⇧Tab launches a preset on it",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["i"],
@@ -430,7 +430,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::PullRequests,
         id: "pull_requests",
         label: "GitHub pull requests",
-        hint: "List the project's open pull requests; Enter prompts a PR session on one, e launches a preset on it, n picks a harness",
+        hint: "List the project's open pull requests; Enter prompts a PR session on one, ⇧Tab launches a preset on it, Tab picks a harness",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["v"],
@@ -504,7 +504,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::ToggleArchived,
         id: "toggle_archived",
         label: "Show / hide archived",
-        hint: "Show or hide archived sessions among the cards",
+        hint: "Swap the grid between the live sessions and the archived ones",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["shift+a"],
@@ -606,7 +606,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::ToggleLauncherPane,
         id: "toggle_launcher_pane",
         label: "Launcher session pane",
-        hint: "Launcher view: fold the pane under the cards away — which also unselects the card it was reading — or bring it back. From inside the pane the ctrl chords take two presses: the first hands the keys back to the card, the second folds the pane. ^` and ^~ need the kitty protocol; ~ is bound alongside them, the shift of the ` that walks the pane's tabs",
+        hint: "Fold the pane under the cards away — which also unselects the card it was reading — or bring it back. From inside the pane the ctrl chords take two presses: the first hands the keys back to the card, the second folds the pane. ^` and ^~ need the kitty protocol; ~ is bound alongside them, the shift of the ` that walks the pane's tabs",
         group: "GENERAL",
         scope: Scope::Global,
         // `^`` is the chord to reach for — out of the pane, then the pane
@@ -622,7 +622,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::ToggleFullScreen,
         id: "toggle_full_screen",
         label: "Full-screen session",
-        hint: "Launcher view: give the session in the pane the whole screen, or bring it back down beside the cards — from inside the pane too, where it is never forwarded to the agent. From the cards it full-screens the one under the cursor. ^q and ^` also bring a full-screen session back down",
+        hint: "Give the session in the pane the whole screen, or bring it back down beside the cards — from inside the pane too, where it is never forwarded to the agent. From the cards it full-screens the one under the cursor. ^q and ^` also bring a full-screen session back down",
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["ctrl+f"],
@@ -631,7 +631,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::PaneTabs,
         id: "pane_tabs",
         label: "Terminals in the pane",
-        hint: "Launcher view: swap the pane under the cards between the session the cursor is on and the terminals open in that checkout — the tabs across the pane's header, which a click walks too",
+        hint: "Walk the cursor through the terminal cards of its checkout, one after another and back round to the first — the pane reads each",
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["`"],

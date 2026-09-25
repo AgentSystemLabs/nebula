@@ -197,7 +197,7 @@ impl TuiHarness {
     fn try_wait_for_text(&self, needle: &str, window: Duration) -> bool {
         let deadline = Instant::now() + window;
         loop {
-            if screen_to_text(&self.parser.lock().unwrap().screen()).contains(needle) {
+            if screen_to_text(self.parser.lock().unwrap().screen()).contains(needle) {
                 return true;
             }
             if Instant::now() > deadline {

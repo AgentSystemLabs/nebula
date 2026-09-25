@@ -40,7 +40,7 @@ pub fn load() -> Vec<HostEntry> {
 /// Move `host` (+ start dir) to the front of the list, stamped now.
 /// Best-effort: a failed write only costs the picker an entry.
 pub fn record(host: &str, path: Option<&str>) {
-    if let Err(err) = record_at(&store_path(), host, path, now_ms()) {
+    if let Err(err) = record_at(&store_path(), host, path, nebula_core::clock::now_ms()) {
         tracing::warn!(?err, "failed to record ssh host");
     }
 }
@@ -70,13 +70,6 @@ pub fn parse_destination(input: &str) -> Option<HostEntry> {
     })
 }
 
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// "just now" / "5m ago" / "3h ago" / "12d ago"; empty when the entry
 /// predates timestamps (or a clock went backwards).
 pub fn ago_label(delta_ms: i64) -> String {
@@ -98,7 +91,7 @@ pub(crate) fn store_path() -> PathBuf {
             return path;
         }
     }
-    nebula_core::paths::data_dir().join("ssh_hosts.json")
+    nebula_core::paths::data_dir().join(nebula_core::paths::SSH_HOSTS_FILE_NAME)
 }
 
 /// Entry by entry, so one unreadable entry costs only itself.

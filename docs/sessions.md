@@ -12,7 +12,7 @@ switched off on the settings overlay's Agents tab and drops out of the menu enti
 on the Agents tab and the menu lists only enabled harnesses whose CLI is found on PATH (the daemon still
 checks through the login shell at launch). Your own CLIs join the menu too: add them to config.json
 `custom_harnesses` (see [Configuration](configuration.md)) and they appear after the built-ins under their
-own labels, toggled per entry on the Agents tab's Custom harnesses row, with the session row wearing the
+own labels, each toggled in its own section on the Agents tab, with the session card wearing the
 entry's label as its badge. A custom entry launches with its program and model flag, boots fresh every
 time (no resume mapping), and — unless it names a built-in hook dialect — stays process-based: yellow
 while the PTY is live, green when it ends, never red. `→` on any row drills
@@ -42,15 +42,17 @@ switches branch, and **Attach** and **Restart** are not offered: there is no loc
 row, and the daemon refuses to boot a bare `claude` in its name. To steer the cloud agent without a
 browser, pick **Send to cloud session** from the card's right-click menu — the same wrapped editor — and nebula
 runs `claude -p <message> --cloud=<id>`; the reply lands on the session's page, the CLI never returns
-one. Otherwise `Enter` on a row is the launch: nothing asks for a name or a task first — nebula spawns
-the CLI in that worktree and drops you straight into it, and you type the agent's first prompt there.
-The session titles itself from that first prompt (AUTO-TITLE); `r` renames it whenever you like. To
-start an agent on a task you type up front instead, use `p` (the QUICK PROMPT — see [Keys](keys.md)).
+one. Otherwise `Enter` on a row opens the QUICK PROMPT set to that harness, model and effort, aimed
+at the checkout under the cursor: type the task and `Enter` launches it, or send the box empty and
+the CLI starts bare, and you type the agent's first prompt there. Nothing asks for a name — the
+session titles itself from that first prompt (AUTO-TITLE); `r` renames it whenever you like. `p`
+opens the same box straight away, on the Agents tab's harness (see [Keys](keys.md)).
 
-The picker opens on its first row every time, whatever you picked last — unless **Remember harness**
+The picker opens on the Agents tab's **Quick prompt › Agent** harness — the one `p` launches — so
+`Enter` at once is `p`, whatever you picked last, unless **Remember harness**
 is on (Settings → Experimental, `remember_harness` in CONFIG.JSON). Then every launch you walk
 through this picker, the PR SESSION picker or the QUICK PROMPT's `Tab` picker writes its harness into
-the Agents tab's **Quick prompt › Agent** row, and a model or effort you drilled into through the
+that row, and a model or effort you drilled into through the
 submenus into that harness's own **Model** / **Effort** rows: the next `n` opens on that harness with
 its ✓ on that model, the box `Enter` opens is set to it, and `p` launches it too. The rows are the ordinary settings,
 so the Agents tab always shows what the next launch will be, and you can still change them there. An
@@ -112,7 +114,7 @@ as its very first prompt, so the agent is already working when the pane opens. T
 send the box empty and the prefix and postfix go on their own (a preset with neither starts the CLI
 with no first prompt). Set **Task** to `skip` for a preset that never needs one — a "commit and push" —
 and `Enter` launches it at once, no box at all; the list marks those rows `no task`. A `skip` preset
-picked with `Shift+Tab` in a quick prompt, or with `e` in the issues modal, launches the same way when
+picked with `Shift+Tab` in a quick prompt or in the issues modal launches the same way when
 the box is still empty, while text you already typed stays yours to send. The row it creates is an
 ordinary session: it names itself on that first turn, resumes, and shows status like any other. Presets
 live in `agent_presets.json` beside `config.json`. The form's Harness row lists custom registry entries
@@ -149,18 +151,16 @@ The next turn for a session already running. Put the cursor on an agent's card a
 pick **Follow-up prompt** from its right-click menu — and a small MODAL opens over the grid, titled
 `Follow-up · <session>`, four rows of typing.
 
-`Enter` sends what you typed to the agent as its next turn and folds the card back up, with
+`Enter` sends what you typed to the agent as its next turn and closes the box, with
 `sent to <session>` in the footer; `Shift+Enter`, `Option+Enter` and `Ctrl+J` break a line, as in Claude
-Code's own prompt, and `Esc` folds the card without sending. The text goes straight down the session's
-PTY — the same path your keystrokes take in the pane — so the CLI sees it as a prompt typed at it, and
-the pane swaps to that session so you can watch the turn land. A prompt with line breaks in it crosses
-as one bracketed paste rather than as typing, so nothing auto-indents it to mush.
+Code's own prompt, and `Esc` closes the box without sending. The text goes straight down the session's
+PTY — the same path your keystrokes take in the pane — so the CLI sees it as a prompt typed at it. A
+prompt with line breaks in it crosses as one bracketed paste rather than as typing, so nothing
+auto-indents it to mush.
 
 While the box is open it owns the keyboard: the grid's own verbs are bare letters, so `a`, `d` and `r`
 are letters in your prompt and not archive, delete and rename aimed at the session you are prompting.
-`Tab` still walks to the next panel and leaves the card expanded behind it, and clicking another card
-folds the box. The toggle on each card says which state it is in — `▸` folded, `▾` expanded — and a
-click on it does either.
+A click outside the box closes it, as it closes any modal.
 
 Nothing about the PANE moves when you use it. It is not unfolded, not swapped onto the card, not
 attached to and not focused, and the turn goes down the session's PTY where it stands: prompting a
@@ -168,7 +168,7 @@ card is not opening it. So the loop is click a card, `Space`, type a line, `Ente
 card — over a folded pane (`^~`) if you walk the cards with the keys, since a click on a card always
 brings the pane back — never once stepping into a session or waiting for one to attach. A pane already open is left on whatever card it was reading, a terminal's chip included.
 
-Only a live local agent has a card to expand. An archived session's turn is over, a Claude Cloud row's
+Only a live local agent takes one. An archived session's turn is over, a Claude Cloud row's
 agent runs in a sandbox with a message queue of its own (**Send to cloud session** in its menu), a shell
 terminal takes typing in the pane, and a pull request row is not a conversation — each says so if you
 ask. A session whose CLI is not up — reaped by the IDLE REAPER, or cold since the daemon started — is
@@ -235,7 +235,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   Enter sends your text as the cloud task — not offered in a box for an issue or a pull request. `⇧Tab` takes a preset, and `^N` flips between a fresh
   worktree and the project's own checkout — the choice sticks for the next box. None of the four
   needs the chord: the details row is a row of buttons, and a click on `project …`, `worktree …`,
-  `agent …` or `model …` — or on the `[ ] new worktree` toggle across from the question — opens
+  `harness …` or `model …` — or on the `[ ] new worktree` toggle across from the question — opens
   exactly what the chord printed beside it opens, box and task still in front of you. Enter
   launches; Esc leaves the box for the grid, keeping what you typed — `p` opens on it again.
 - **The grid** takes the top of the body: every unarchived session of
@@ -258,8 +258,8 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   reading, a session or a terminal, runs on in the project you left and is never shown here.
   `` ^` `` brings the pane up empty — one press, since there was nothing on screen to fold — with
   nothing on its header to click — `t` opens a terminal on the project's root; the terminal comes
-  up as a card inside its checkout's band with the keys in it, and `t` (or a card menu's **New
-  terminal**) is the only way to open one: the grid has no `+` for it. From the keyboard the header can also be
+  up as a card inside its checkout's band with the keys in it, and `t` (or an EMPTY BAND's
+  right-click **New terminal**) is the only way to open one: the grid has no `+` for it. From the keyboard the header can also be
   walked: `k`,`k` (`↑`,`↑`) on the top row of cards hands the keys up to the tabs, with a cursor of
   their own on the lit tab; `h`/`l` (`←`/`→`) move it and the grid switches with it, each project
   shown on its last-focused card as the cursor passes, and `Enter` — or `j`,`j` (`↓`,`↓`) back
@@ -373,15 +373,15 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   it back) or Settings → Appearance → **Session pane** (`session_pane`, which the button writes; a
   window too narrow for it beside a column of cards lays it along the bottom until there is
   room) — and reads whichever card the cursor is on — on a collapsed band, its remembered
-  card: `● polish-nav  ↳ feat` on its header, the card's name and its checkout, with a `+` after
-  them that opens a terminal there, and that session live under it, swapping as you walk the
+  card: `● polish-nav  ↳ feat` on its header, the card's name and its checkout, and that session
+  live under it, swapping as you walk the
   grid, so stepping across the bands reads each checkout's progress in turn. A terminal's chip
   puts its shell there the same way. It is the selected session, so
   it comes and goes with the selection: clicking a card opens the pane on it — reading only, the keys
   stay on the cards, so a clicked card stays a
   preview under its rule — and letting the card go (`Esc`, or `^~`) collapses
   the pane and gives the grid the whole body back. A click on the air between the cards does not: a
-  miss with the pointer leaves the pane exactly where it is. It takes a second click, or Enter, to type into it. It is the same pane the
+  miss with the pointer leaves the pane exactly where it is. It takes a second click, or Enter, to type into it. It is the same pane
   a full-screen session has — the same attach, the same scrollback and wheel, and the card it shows is marked read
   the moment it lands there, so a `done` badge comes down as you arrive rather than when you open it.
   A click into the pane types into that session where it stands, with the grid still up over it, and
@@ -541,9 +541,9 @@ down the left of a modal — newest first with the drafts sunk below the
 finished ones, and drafts listed even while `hide_draft_prs` keeps them out of the `/` palette — and the one
 under the cursor read on the right, as the pane reads a pull request: state, checks and mergeability,
 author, branches and size, the description rendered as markdown, then the conversation. A row reads
-the way its group row does — a draft dimmed with a `draft` badge, one GitHub says cannot merge red
-end to end with `conflicts` or `failing` — and the modal opens on the pull request the Worktrees
-cursor rests on, when it rests on one.
+the way the pull request on a band's rule does — a draft dimmed with a `draft` badge, one GitHub says
+cannot merge red end to end with `conflicts` or `failing` — and the modal opens on the pull request
+the pane is reading (after a `/` jump onto one), when it reads one.
 
 Nothing new is asked of GitHub to paint it. The rows are the project's open list the OPEN PRS beat
 already keeps warm (and remembers across launches), so the modal opens on them at once; a list older
@@ -555,9 +555,9 @@ view`) the same way. `Ctrl+r` asks for the list and the row's body again now.
 The keys are the ISSUES MODAL's, and the QUICK PROMPT box's: the list filters as you type, narrowing
 the rows to the fuzzy matches of `#42 title`, `Esc` clears the filter before a second `Esc` closes,
 and the verbs are chords. `Enter` opens the QUICK PROMPT for a
-PR SESSION on the pull request — the box `p` opens on its group row, titled `Quick prompt · PR #42 …`
+PR SESSION on the pull request — the box `p` opens, titled `Quick prompt · PR #42 …`
 — `Shift+Tab` launches one of your AGENT PRESETS on it, and `Tab` picks a harness and starts the session bare,
-`→` drilling into the MODEL / EFFORT submenus. Every one of them is the group row's launch: a
+`→` drilling into the MODEL / EFFORT submenus. Every one of them is the same launch: a
 `CreatePrAgent` that runs in the project's checkout of the pull request's head branch, reused when
 one is there and cut by the DAEMON otherwise, its stand-in rows up under the pull request from the
 moment you launch, and the PR's URL and work rule in the harness's context. The QUICK PROMPT stands

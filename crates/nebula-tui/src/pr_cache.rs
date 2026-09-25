@@ -35,9 +35,9 @@
 //! the main loop installs one at startup, the unit tests never do, so no
 //! test can read or clobber the real user's cache.
 
+use nebula_core::clock::now_secs;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
 
 use nebula_core::{ProjectId, WorktreeId};
 use serde::{Deserialize, Serialize};
@@ -123,18 +123,7 @@ impl PrCache {
     /// rename — so a crash mid-write leaves the previous document, not
     /// half of the new one.
     pub fn save_store(&self, store: &Store) -> std::io::Result<()> {
-        let path = self.store_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut bytes = serde_json::to_vec_pretty(store)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-        if !bytes.ends_with(b"\n") {
-            bytes.push(b'\n');
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)
+        write_json_atomic(&self.store_path(), store)
     }
 
     fn diff_path(&self, url: &str) -> PathBuf {
@@ -196,10 +185,21 @@ pub fn diff_file_name(url: &str) -> String {
     format!("{stem}.diff")
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// Write `value` to `path` as pretty JSON with a trailing newline, creating
+/// the parent dir. Atomic — a temp file beside it, then a rename — so a
+/// crash mid-write leaves the previous document, not half of the new one.
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Startup: read the document and paint the app from it. Every hydrated

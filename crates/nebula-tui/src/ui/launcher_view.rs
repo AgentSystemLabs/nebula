@@ -1,8 +1,8 @@
 //! The LAUNCHER VIEW's drawing (`crate::launcher` is its model,
 //! `event_loop::launcher` its keys): the GRID of session cards — each card
-//! the session's name and status, the worktree it runs in under it, its
-//! pull request under that — over the PANE along the bottom that reads the
-//! card under the cursor (`ui::draw` splits the body and fills that pane);
+//! the session's name and status, gathered into a BAND per worktree whose
+//! rule wears the branch and its pull request — beside the PANE that reads
+//! the card under the cursor (`ui::draw` splits the body and fills that pane);
 //! plus the view's own pieces of the QUICK PROMPT (the project on its
 //! target row, its key hints) and the PROJECT PICKER.
 
@@ -1562,11 +1562,7 @@ fn draw_band_rule(
         let spare = room.saturating_sub(used + 2 - 3);
         if spare >= 6 {
             let look = crate::pr_row::look(pr.standing, pr.trouble, th);
-            let label = if pr.title.is_empty() {
-                format!("#{}", pr.number)
-            } else {
-                format!("#{} {}", pr.number, pr.title)
-            };
+            let label = crate::pull_request::numbered_label(pr.number, &pr.title);
             let mut spans = crate::pr_row::spans(
                 look,
                 &label,
@@ -1871,18 +1867,15 @@ fn draw_card(
 
     // The last thing it was asked to do, on the prompt's own `›` (which
     // `hide_card_marks` leaves off), over the card's last rows rather than
-    // clipped at the first — unless the `hide_card_prompt` setting leaves
-    // those rows blank.
+    // clipped at the first.
     let mut lines = vec![first, second];
     lines.resize(crate::launcher::CARD_HEAD_H as usize, Vec::new());
-    if !app.hide_card_prompt {
-        lines.extend(prompt_lines(
-            crate::launcher::last_prompt(a).unwrap_or_default(),
-            width,
-            (!app.hide_card_marks).then(|| quiet_or(th.dim)),
-            quiet_or(th.muted),
-        ));
-    }
+    lines.extend(prompt_lines(
+        crate::launcher::last_prompt(a).unwrap_or_default(),
+        width,
+        (!app.hide_card_marks).then(|| quiet_or(th.dim)),
+        quiet_or(th.muted),
+    ));
 
     for (i, spans) in lines.into_iter().enumerate() {
         if spans.is_empty() {
@@ -1991,8 +1984,8 @@ fn session_look(app: &App, a: &nebula_core::Agent, selected: bool, th: Theme) ->
     let cold = !a.alive && a.cloud_session_id.is_none();
     let archived = a.archived;
     let quiet = if selected { th.muted } else { th.dim };
-    // The dot and the sweep read the status the panels' session rows read,
-    // cold and pending alike (see `draw_session_row`).
+    // The dot and the sweep read the session's status, cold and pending
+    // alike.
     let dot = if archived {
         Span::styled(ARCHIVED_MARK, Style::default().fg(quiet))
     } else if pending {
@@ -2775,7 +2768,10 @@ impl Details {
         if launch.cloud {
             harness.push_str(" · cloud");
         }
-        let mut model = launch.model.clone().unwrap_or_else(|| "default".into());
+        let mut model = launch
+            .model
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_CHOICE.into());
         if let Some(effort) = launch.effort.as_deref().filter(|e| !e.is_empty()) {
             model.push(' ');
             model.push_str(effort);
@@ -3712,11 +3708,10 @@ mod tests {
         );
     }
 
-    /// The `hide_card_prompt` setting leaves the last prompt off the card:
-    /// shown by default under the name and harness, gone once it is on,
-    /// with the name and what it runs on still drawn.
+    /// Every card carries its session's last prompt under the name and
+    /// harness — there is no setting to leave it off any more.
     #[test]
-    fn hide_card_prompt_leaves_the_last_prompt_off_the_card() {
+    fn every_card_shows_its_last_prompt() {
         let mut app = a_tree();
         select(&mut app, "api");
         app.tree.agents[0].recent_prompts = vec![nebula_core::PromptEntry {
@@ -3727,15 +3722,11 @@ mod tests {
         let shows = |lines: &[String]| lines.iter().any(|l| l.contains("fix the login redirect"));
 
         let lines = drawn_lines(&mut app, body);
-        assert!(shows(&lines), "shown by default: {lines:#?}");
-
-        app.hide_card_prompt = true;
-        let lines = drawn_lines(&mut app, body);
-        assert!(!shows(&lines), "hidden: {lines:#?}");
+        assert!(shows(&lines), "{lines:#?}");
         let row = lines
             .iter()
             .position(|l| l.contains("s0"))
-            .expect("the session's card still drawn");
+            .expect("the session's card");
         assert!(lines[row + 1].contains("claude"), "{:?}", lines[row + 1]);
     }
 

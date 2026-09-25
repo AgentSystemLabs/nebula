@@ -1,5 +1,6 @@
 //! The pull-request reading pane: what the terminal pane shows while the
-//! Worktrees cursor rests on an open-PR row.
+//! cursor rests on an open pull request (a `/` jump to one), and the
+//! PULL REQUESTS MODAL's right half.
 //!
 //! The whole preview is laid out as a flat `Vec<Line>` — every wrap decided
 //! up front against the pane width — so scrolling is a slice and the line
@@ -22,10 +23,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 /// Left inset of the body text, so prose doesn't hug the pane rule.
-const INDENT: &str = " ";
+pub(crate) const INDENT: &str = " ";
 /// Narrowest the body wraps to: below this, wrapping yields a word per line
 /// and overflowing the pane reads better than that.
-const MIN_BODY_W: usize = 20;
+pub(crate) const MIN_BODY_W: usize = 20;
 
 /// Wrap `text` to `width` columns on word boundaries, honoring the hard
 /// line breaks already in it. A word longer than the whole width (a URL, a

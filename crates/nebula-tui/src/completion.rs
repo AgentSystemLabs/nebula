@@ -49,7 +49,7 @@ pub fn list_dirs(input: &str, home: Option<&Path>) -> Vec<DirEntry> {
     let show_hidden = partial.starts_with('.');
     let mut dirs: Vec<DirEntry> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| name.starts_with(partial))
         .filter(|name| show_hidden || !name.starts_with('.'))
@@ -82,7 +82,7 @@ pub fn complete_path(input: &str, home: Option<&Path>) -> PathCompletion {
     let show_hidden = partial.starts_with('.');
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| name.starts_with(partial))
         .filter(|name| show_hidden || !name.starts_with('.'))

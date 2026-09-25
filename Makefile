@@ -220,9 +220,10 @@ check: ## Typecheck the workspace (fastest feedback)
 fmt: ## Format the workspace
 	cargo fmt --all
 
-# Not `-D warnings` by default: the workspace does not currently clear that
-# bar (pre-existing lints in config.rs, ui.rs, and hooks/mod.rs), and CI runs
-# no clippy at all. `make lint STRICT=1` opts into the stricter gate.
+# Not `-D warnings` by default, so a lint a new toolchain adds doesn't fail
+# the gate on its own; the workspace does clear that bar today, so keep it
+# that way. CI runs no clippy at all. `make lint STRICT=1` opts into the
+# stricter gate.
 lint: ## Clippy over the workspace (STRICT=1 to fail on warnings)
 	cargo clippy --workspace --all-targets $(if $(STRICT),-- -D warnings)
 

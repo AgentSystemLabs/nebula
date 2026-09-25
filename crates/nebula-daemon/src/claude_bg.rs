@@ -119,10 +119,7 @@ fn run_captured(program: &str, args: &[String], timeout: Duration) -> Option<Str
     // reach the daemon's controlling terminal. It also makes the shell a
     // group leader, so a timeout can sweep whatever it started.
     unsafe {
-        command.pre_exec(|| match nix::unistd::setsid() {
-            Ok(_) => Ok(()),
-            Err(errno) => Err(std::io::Error::from_raw_os_error(errno as i32)),
-        });
+        command.pre_exec(crate::registry::own_session);
     }
     let mut child = command.spawn().ok()?;
     let mut stdout = child.stdout.take()?;

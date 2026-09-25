@@ -11,6 +11,7 @@
 //! POSIX-single-quoted. csh/tcsh login shells are the one unsupported case.
 
 use anyhow::{bail, Context, Result};
+use nebula_core::shell::single_quote;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -88,23 +89,18 @@ fn remote_command(install_url: &str, path: Option<&str>, bundle: Option<&str>) -
     let mut cmd = format!(
         "sh -c '{}' nebula-ssh {}",
         REMOTE_SCRIPT,
-        shell_single_quote(install_url)
+        single_quote(install_url)
     );
     // A bundle is `$3`, so an absent start dir still takes its place, empty.
     if path.is_some() || bundle.is_some() {
         cmd.push(' ');
-        cmd.push_str(&shell_single_quote(path.unwrap_or("")));
+        cmd.push_str(&single_quote(path.unwrap_or("")));
     }
     if let Some(bundle) = bundle {
         cmd.push(' ');
-        cmd.push_str(&shell_single_quote(bundle));
+        cmd.push_str(&single_quote(bundle));
     }
     cmd
-}
-
-/// POSIX-quote for a remote shell: `it's` -> `'it'\''s'`.
-pub(crate) fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -194,12 +190,5 @@ mod tests {
                 bundle.unwrap_or("unset")
             );
         }
-    }
-
-    #[test]
-    fn single_quote_edge_cases() {
-        assert_eq!(shell_single_quote(""), "''");
-        assert_eq!(shell_single_quote("plain"), "'plain'");
-        assert_eq!(shell_single_quote("'''"), "''\\'''\\'''\\'''");
     }
 }

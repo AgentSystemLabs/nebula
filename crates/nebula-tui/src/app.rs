@@ -54,13 +54,7 @@ pub fn launch_repo() -> Option<PathBuf> {
         .map(std::path::Path::to_path_buf)
 }
 
-/// Wall-clock epoch ms, comparable to the daemon's `status_changed_at`.
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+pub use nebula_core::clock::now_ms;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -982,7 +976,8 @@ pub struct DiffView {
     /// Outer width of the file-list panel; drag the panel border to resize.
     pub files_width: u16,
     /// In-progress drag of the files/diff border: `boundary_x - grab column`
-    /// at mouse-down (the `SplitterDrag::grab_offset` pattern).
+    /// at mouse-down, so the border tracks the pointer instead of jumping
+    /// to it.
     pub files_drag: Option<i32>,
     /// Whether the repo has a commit; picks the diff command.
     pub head_ok: bool,
@@ -1991,8 +1986,8 @@ pub enum PendingIntent {
         text: String,
         note: String,
     },
-    /// `r` on a worktree (`StartRun` / `StopRun`): once the DAEMON has done
-    /// it, flash what happened in `branch`.
+    /// A menu's **Run** / **Stop run** (`StartRun` / `StopRun`): once the
+    /// DAEMON has done it, flash what happened in `branch`.
     RunToggled {
         branch: String,
         started: bool,
@@ -2168,8 +2163,7 @@ impl LinkRow {
     /// URL with the noise (scheme, `www.`, trailing slash) stripped.
     pub fn label(&self) -> String {
         match self.pull_request() {
-            Some(pr) if !pr.title.is_empty() => format!("#{} {}", pr.number, pr.title),
-            Some(pr) => format!("#{}", pr.number),
+            Some(pr) => crate::pull_request::numbered_label(pr.number, &pr.title),
             None => pretty_url(self.url()),
         }
     }
@@ -2618,11 +2612,19 @@ pub struct AttachedTerm {
     pub pending_scroll: Option<usize>,
 }
 
+/// Lines of scrollback the attached pane's parser keeps.
+const SCROLLBACK_LINES: usize = 10_000;
+
 impl AttachedTerm {
     pub fn new(sref: SessionRef, cols: u16, rows: u16) -> Self {
         Self {
             sref,
-            parser: vt100::Parser::new_with_callbacks(rows, cols, 10_000, TermCallbacks::default()),
+            parser: vt100::Parser::new_with_callbacks(
+                rows,
+                cols,
+                SCROLLBACK_LINES,
+                TermCallbacks::default(),
+            ),
             exited: false,
             cols,
             rows,
@@ -2640,7 +2642,7 @@ impl AttachedTerm {
         self.parser = vt100::Parser::new_with_callbacks(
             self.rows,
             self.cols,
-            10_000,
+            SCROLLBACK_LINES,
             TermCallbacks::default(),
         );
         self.exited = false;
@@ -3103,9 +3105,9 @@ pub struct App {
     pub sel_project: usize,
     pub sel_worktree: usize,
     pub sel_session: usize,
-    /// How many pill rows the Worktrees column had room for as of the
-    /// last draw — the page Ctrl+d / Ctrl+u jump by half of. Zero before
-    /// the first frame, when a half page is a single row.
+    /// How many pill rows the Worktrees column had room for — the page
+    /// Ctrl+d / Ctrl+u jump by half of. No draw sets it since the panels
+    /// went (only tests do), so a half page is a single row.
     pub worktrees_view_rows: usize,
     /// The same for the Sessions column: pill rows it had room for as of
     /// the last draw, the page its Ctrl+d / Ctrl+u halve. A worktree
@@ -3182,7 +3184,8 @@ pub struct App {
     pub open_prs_collapsed: bool,
     /// The ISSUES group under it, folded and remembered the same way.
     pub issues_collapsed: bool,
-    /// Sidebars collapsed (z) — terminal takes the full width.
+    /// The session in the pane is FULL-SCREEN (`^F`, `zoom_pane`) — the
+    /// grid and its header give way to the PTY.
     pub collapsed: bool,
     /// Draft pull requests left out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE; mirrors CONFIG.JSON's `hide_draft_prs` (Settings →
@@ -3271,8 +3274,7 @@ pub struct App {
     pub launcher_reveal: bool,
     /// In-progress drag of that edge: `boundary row - grab row` at
     /// mouse-down, so the edge tracks the pointer instead of jumping by
-    /// one depending on which of the two grab rows was caught (the
-    /// [`SplitterDrag::grab_offset`] pattern).
+    /// one depending on which of the two grab rows was caught.
     pub launcher_pane_drag: Option<i32>,
     /// That edge is under the mouse, or being dragged: its grip lights up.
     /// Only ever set in terminals that report plain mouse motion;
@@ -3700,10 +3702,6 @@ pub struct App {
     /// applies it. Mirrors the config, refreshed at startup and when the
     /// settings overlay applies a change.
     pub black_background: bool,
-    /// The `hide_card_prompt` setting: leave the last prompt off every
-    /// session card on the GRID. Mirrors the config, refreshed at startup
-    /// and when the settings overlay applies a change.
-    pub hide_card_prompt: bool,
     /// The `card_issue_number` setting: an ISSUE SESSION's card shows the
     /// `#15` of the issue it was started from, a link a click opens
     /// (`HitTarget::LauncherCardIssue`). Mirrors the config, refreshed at
@@ -3879,7 +3877,6 @@ impl App {
             splash_epoch: std::time::Instant::now(),
             welcome_on_screen: false,
             animations: true,
-            hide_card_prompt: false,
             card_issue_number: false,
             show_all_worktrees: false,
             black_background: false,
@@ -3972,8 +3969,8 @@ impl App {
     /// already open keeps its place: switching to a tab only looks, and
     /// only working in it moves it ([`App::bring_tab_forward`]). Run by
     /// the view's draw, as
-    /// [`App::settle_pane_tab`] is, and by the tab keys before they read
-    /// the list.
+    /// [`App::settle_launcher_focus`] is, and by the tab keys before they
+    /// read the list.
     pub fn settle_project_tabs(&mut self) {
         let projects = &self.tree.projects;
         self.launcher_tabs
@@ -4083,7 +4080,7 @@ impl App {
     /// into that session where it stands, and the hatch (`^q`) comes back
     /// out to the cards. Every other focus — a restored UI state parked on
     /// a panel this view doesn't draw — lands on the cards. Run by the
-    /// view's draw, as `settle_focus` is by the panels'.
+    /// view's draw.
     pub fn settle_launcher_focus(&mut self) {
         // Only the SESSIONS level draws a pane (`launcher::split`), only
         // while it is unfolded (`^~`) and only with a card wearing the
@@ -4116,9 +4113,9 @@ impl App {
     }
 
     /// The animated splash is on screen and should be ticking: nothing in
-    /// the tree yet (first run) or summoned with N, panels not collapsed,
-    /// no editor modal covering the body, animations enabled (off, the
-    /// splash still draws — as a still frame).
+    /// the tree yet (first run), no session full-screen, no editor modal
+    /// covering the body, animations enabled (off, the splash still draws
+    /// — as a still frame).
     pub fn splash_active(&self) -> bool {
         self.animations && self.splash_showing() && self.vim.is_none()
     }
@@ -4532,6 +4529,17 @@ impl App {
     /// The project giving the current selection its context.
     pub fn selected_project(&self) -> Option<&Project> {
         self.tree.projects.get(self.selected_project_index()?)
+    }
+
+    /// `project`'s ROOT WORKTREE — its main checkout — when the tree has
+    /// one. Stand-ins count; `launcher::root_checkout` is the one that
+    /// steps over a checkout still being cut.
+    pub fn root_worktree(&self, project: &ProjectId) -> Option<WorktreeId> {
+        self.tree
+            .worktrees
+            .iter()
+            .find(|w| &w.project_id == project && w.is_main)
+            .map(|w| w.id.clone())
     }
 
     /// The checkout under the Worktrees cursor — a plain row or one nested

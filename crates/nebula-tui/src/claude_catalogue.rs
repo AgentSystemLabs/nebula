@@ -163,13 +163,6 @@ pub fn install_available(available: Vec<String>) {
 
 // --- Claude Code's settings ------------------------------------------------
 
-/// Claude Code's config dir: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn claude_config_dir() -> Option<PathBuf> {
-    nebula_core::env::non_empty("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| nebula_core::env::home_dir().map(|home| home.join(".claude")))
-}
-
 /// The system directory managed settings files live in.
 fn managed_dir() -> PathBuf {
     if cfg!(target_os = "macos") {
@@ -289,7 +282,7 @@ pub fn bootstrap(claude_enabled: bool) {
     if !claude_enabled || nebula_core::env::non_empty(nebula_core::env::AGENT_CMD).is_some() {
         return;
     }
-    let Some(cfg_dir) = claude_config_dir() else {
+    let Some(cfg_dir) = nebula_core::paths::claude_config_dir() else {
         return;
     };
     if let Some(list) = available_models_from(&cfg_dir, &managed_dir()) {

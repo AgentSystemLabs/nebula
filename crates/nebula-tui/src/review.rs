@@ -79,7 +79,7 @@ pub fn store_marks(worktree: &Path, head: &str, files: &HashMap<String, u64>) {
             },
         );
     }
-    if let Err(err) = write_store(&path, &store) {
+    if let Err(err) = crate::pr_cache::write_json_atomic(&path, &store) {
         tracing::warn!("failed to save {}: {err}", path.display());
     }
 }
@@ -92,21 +92,6 @@ fn read_store(path: &Path) -> StoreFile {
         tracing::warn!("ignoring malformed {}: {err}", path.display());
         StoreFile::default()
     })
-}
-
-fn write_store(path: &Path, store: &StoreFile) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut bytes = serde_json::to_vec_pretty(store)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    if !bytes.ends_with(b"\n") {
-        bytes.push(b'\n');
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 fn store_path() -> PathBuf {

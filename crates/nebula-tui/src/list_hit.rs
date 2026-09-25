@@ -1,7 +1,7 @@
 //! Which row of a list the pointer is on.
 //!
 //! Every list in the app — the modals' result lists, the pickers, the
-//! panels — answers a click with the same arithmetic: the list's box, the
+//! menus — answers a click with the same arithmetic: the list's box, the
 //! index of the first row showing in it, how many rows there are. It was
 //! written out in each mouse handler, and a copy that forgot the bounds
 //! check or the window offset was a click that landed on the wrong row.

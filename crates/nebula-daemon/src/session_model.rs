@@ -140,7 +140,7 @@ fn alias(model: &str) -> Option<String> {
         .models
         .into_iter()
         .map(|entry| entry.id)
-        .filter(|id| id != "default")
+        .filter(|id| id != nebula_core::harness::DEFAULT_CHOICE)
         .filter_map(|id| Some((lower.find(&id)?, id)))
         .min_by_key(|(at, _)| *at)?
         .1;

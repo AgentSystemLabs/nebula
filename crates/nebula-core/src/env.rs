@@ -43,6 +43,26 @@ pub const EDITOR: &str = "NEBULA_EDITOR";
 /// (the footer's `⇡ vX.Y.Z` update indicator); `0` turns it off, as the
 /// e2e tests do so their footers never depend on what GitHub has published.
 pub const UPDATE_CHECK_SECS: &str = "NEBULA_UPDATE_CHECK_SECS";
+/// A file the TUI writes its INPUT LATENCY PROBE's timeline to
+/// (`make perf`); unset, there is no probe.
+pub const PERF_LOG: &str = "NEBULA_PERF_LOG";
+/// Set by `nebula upgrade` on the install script it runs, so the script
+/// leaves the "daemon still running" note to the upgrade. `install.sh`
+/// reads it by this name.
+pub const UPGRADE_HANDOFF: &str = "NEBULA_UPGRADE_HANDOFF";
+/// Set on a WORKTREE HOOK script: which hook it is running as
+/// (`worktree-create` / `worktree-delete`), so one script can serve both.
+pub const HOOK: &str = "NEBULA_HOOK";
+/// Set on a WORKTREE HOOK script: the worktree's branch.
+pub const WORKTREE_BRANCH: &str = "NEBULA_WORKTREE_BRANCH";
+/// Set on a WORKTREE HOOK script: the worktree's id.
+pub const WORKTREE_ID: &str = "NEBULA_WORKTREE_ID";
+/// Claude Code's own override of its config dir (`~/.claude`), honoured
+/// wherever nebula reads Claude's settings or transcripts.
+pub const CLAUDE_CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
+/// Codex's own override of its home (`~/.codex`), where nebula installs
+/// its hooks.
+pub const CODEX_HOME: &str = "CODEX_HOME";
 
 /// Env vars that identify an agent session to the daemon. They are set on
 /// every agent PTY and must never leak into plain terminals.

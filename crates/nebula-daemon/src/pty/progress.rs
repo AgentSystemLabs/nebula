@@ -29,33 +29,17 @@
 //! progress bar, 1/2/3/4 are normal/error/indeterminate/paused. Anything
 //! that isn't 0 counts as busy.
 
-use super::{BEL, ESC};
+use super::osc::OscFramer;
 
 /// Longest OSC payload we will buffer. `9;4;<state>;<pct>` is far shorter;
 /// anything longer (a title, a hyperlink, a base64 image) is poisoned and
 /// skipped without allocating.
 const MAX_OSC: usize = 24;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum State {
-    Ground,
-    Esc,
-    /// Inside an OSC payload. `poisoned` sequences are consumed to their
-    /// terminator and discarded.
-    Osc {
-        poisoned: bool,
-    },
-    /// Saw ESC inside an OSC: `ESC \` terminates (ST), anything else aborts.
-    OscEsc {
-        poisoned: bool,
-    },
-}
-
 /// Tracks the child's advertised progress state across chunk boundaries.
 #[derive(Debug)]
 pub struct ProgressScanner {
-    state: State,
-    buf: Vec<u8>,
+    osc: OscFramer,
     /// Last state the child advertised; `None` until it advertises one.
     busy: Option<bool>,
 }
@@ -69,8 +53,7 @@ impl Default for ProgressScanner {
 impl ProgressScanner {
     pub fn new() -> Self {
         Self {
-            state: State::Ground,
-            buf: Vec::new(),
+            osc: OscFramer::new(MAX_OSC, prefix_possible),
             busy: None,
         }
     }
@@ -91,7 +74,9 @@ impl ProgressScanner {
     pub fn feed(&mut self, data: &[u8]) -> Option<bool> {
         let before = self.busy;
         for &b in data {
-            self.step(b);
+            if let Some(payload) = self.osc.step(b) {
+                self.dispatch(payload);
+            }
         }
         match self.busy {
             after if after != before => after,
@@ -99,60 +84,7 @@ impl ProgressScanner {
         }
     }
 
-    fn step(&mut self, b: u8) {
-        match self.state {
-            State::Ground => {
-                if b == ESC {
-                    self.state = State::Esc;
-                }
-            }
-            State::Esc => {
-                if b == b']' {
-                    self.buf.clear();
-                    self.state = State::Osc { poisoned: false };
-                } else {
-                    self.state = if b == ESC { State::Esc } else { State::Ground };
-                }
-            }
-            State::Osc { poisoned } => match b {
-                BEL => {
-                    if !poisoned {
-                        self.dispatch();
-                    }
-                    self.buf.clear();
-                    self.state = State::Ground;
-                }
-                ESC => self.state = State::OscEsc { poisoned },
-                _ => {
-                    if !poisoned {
-                        self.buf.push(b);
-                        // Bail as soon as the payload can't be ours: only the
-                        // `9;4;` prefix is worth carrying.
-                        if self.buf.len() > MAX_OSC || !prefix_possible(&self.buf) {
-                            self.buf.clear();
-                            self.state = State::Osc { poisoned: true };
-                        }
-                    }
-                }
-            },
-            State::OscEsc { poisoned } => {
-                if b == b'\\' {
-                    if !poisoned {
-                        self.dispatch();
-                    }
-                    self.buf.clear();
-                    self.state = State::Ground;
-                } else {
-                    // Aborted mid-OSC; ESC ESC restarts the escape.
-                    self.buf.clear();
-                    self.state = if b == ESC { State::Esc } else { State::Ground };
-                }
-            }
-        }
-    }
-
-    fn dispatch(&mut self) {
-        let payload = std::mem::take(&mut self.buf);
+    fn dispatch(&mut self, payload: Vec<u8>) {
         let Some(rest) = payload.strip_prefix(b"9;4;") else {
             return;
         };
@@ -249,7 +181,7 @@ mod tests {
         let mut s = ProgressScanner::new();
         let title = format!("\x1b]0;{}\x07", "x".repeat(4096));
         assert_eq!(s.feed(title.as_bytes()), None);
-        assert!(s.buf.len() <= MAX_OSC);
+        assert!(s.osc.buffered() <= MAX_OSC);
         // …and the scanner still works afterwards.
         assert_eq!(s.feed(b"\x1b]9;4;3;\x07"), Some(true));
     }

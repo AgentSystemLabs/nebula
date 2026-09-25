@@ -1,18 +1,16 @@
-//! The LAUNCHER VIEW (Settings → Experimental, `launcher_view`): nebula
-//! built around the prompt instead of the tree. It opens on the QUICK
-//! PROMPT, already focused, on the launch the AGENTS TAB defaults describe
-//! — `^P` picks the PROJECT with type-ahead over every one this machine
-//! knows, `^O` the MODEL, `Tab` the harness, `^N` flips between a fresh
-//! worktree and the project's checkout — and once something has been sent
-//! the three panels are gone: a GRID of cards, one per session in the
-//! project on screen, most recent first, each card the session's name with the
-//! worktree under it and its pull request under that, and the session
-//! under the cursor live in the PANE along the BOTTOM ([`split`]). Walking
-//! the cards walks the pane, so stepping through the grid reads each
-//! session's progress in turn.
+//! The LAUNCHER VIEW: nebula's one screen. PROJECT TABS across the
+//! header, and under them a GRID of cards — one per session in the
+//! project on screen, most recent first, gathered into a BAND per
+//! worktree that wears the checkout's branch and its pull request on its
+//! rule — with the session under the cursor live in the PANE beside them
+//! ([`split`]). Walking the cards walks the pane, so stepping through the
+//! grid reads each session's progress in turn. The QUICK PROMPT launches
+//! from here: `^P` picks the PROJECT with type-ahead over every one this
+//! machine knows, `^O` the MODEL, `Tab` the harness, `^N` flips between a
+//! fresh worktree and the checkout under the cursor.
 //!
 //! Nothing here is a second copy of the tree: the list's cursor IS the
-//! panels' selection (`App::selected_session`), moved through the same
+//! app's selection (`App::selected_session`), moved through the same
 //! jump the `/` PALETTE uses, so every verb that reads the selection —
 //! archive, delete, rename, the diff, the context menu — keeps working on
 //! the row under the cursor. What lives here is what the view adds: the
@@ -33,15 +31,15 @@ pub struct LauncherRow {
     pub agent: Agent,
     /// The PROJECT's display name.
     pub project: String,
-    /// The checkout's branch — what the panels call the worktree.
+    /// The checkout's branch — how the grid names the worktree.
     pub branch: String,
     /// The pull request on that branch, when one is known.
     pub pr: Option<RowPr>,
 }
 
 /// What a row says about its pull request: the number and title, and the
-/// standing and trouble that color it the way the PR rows in the panels
-/// are colored (`pr_row::look`).
+/// standing and trouble that color it the way every pull request row is
+/// colored (`pr_row::look`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowPr {
     pub number: u64,

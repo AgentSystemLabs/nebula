@@ -2,7 +2,7 @@
 //! machine's nebula in a browser tab here, with nothing exposed on the
 //! remote's network.
 //!
-//! One `ssh -t -L local:127.0.0.1:remote HOST` does all of it. The remote
+//! One `ssh -tt -L local:127.0.0.1:remote HOST` does all of it. The remote
 //! command is [`crate::ssh`]'s self-installing prelude with a different tail:
 //! `nebula browser --no-open --port <remote>`, which stays on the remote's
 //! loopback — the ssh channel is the only way in, so there is no port on the
@@ -27,7 +27,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::browser;
-use crate::ssh::{export_settings_bundle, install_prelude, shell_single_quote};
+use crate::ssh::{export_settings_bundle, install_prelude};
+use nebula_core::shell::single_quote;
 
 /// Both ends of the tunnel are loopback: the local listener ssh binds, and
 /// the address on the remote that ssh connects the other end to.
@@ -231,17 +232,17 @@ fn remote_command(
     let mut cmd = format!(
         "sh -c '{}' nebula-tunnel {} {}",
         REMOTE_SCRIPT,
-        shell_single_quote(install_url),
+        single_quote(install_url),
         port
     );
     // A bundle is `$4`, so an absent start dir still takes its place, empty.
     if path.is_some() || bundle.is_some() {
         cmd.push(' ');
-        cmd.push_str(&shell_single_quote(path.unwrap_or("")));
+        cmd.push_str(&single_quote(path.unwrap_or("")));
     }
     if let Some(bundle) = bundle {
         cmd.push(' ');
-        cmd.push_str(&shell_single_quote(bundle));
+        cmd.push_str(&single_quote(bundle));
     }
     cmd
 }

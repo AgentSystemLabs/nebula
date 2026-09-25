@@ -5,8 +5,9 @@
 //! keys for them. Either launch carries the issue as
 //! an [`IssueRef`], and the create that ends it sends the issue URL to the
 //! DAEMON (`ClientRequest::CreateAgent::issue_url`), which folds it into the
-//! harness's context on every spawn — Claude's appended system prompt, a
-//! Codex / Cursor cold spawn's first prompt — so the agent knows which
+//! harness's context on every spawn — the system prompt of a harness with
+//! a flag for it (Claude, pi, Grok), a cold spawn's first prompt for the
+//! rest — so the agent knows which
 //! issue the session is for before it reads the first word of the task.
 //!
 //! `Ctrl+c` (or `Ctrl+y`, the grid's reply key as a chord) leaves a
@@ -68,6 +69,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::{clamp_selection, window_start, App, HitTarget, Overlay};
 use crate::markdown::{self, Breaks};
 use crate::pr_preview::fit;
+use crate::pull_request::{gh, login, str_at, web_url};
 use crate::quick_prompt::{ModalUnder, QuickLaunch, QuickReturn, QuickTarget};
 use crate::text_input::{TextInput, TextView};
 use crate::theme::Theme;
@@ -79,49 +81,48 @@ use crate::ui::{
 
 /// How long a lookup may run before we give up on it — the PR lookups'
 /// budget, for the same reason: `gh` retries on a stalled network.
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const TIMEOUT: std::time::Duration = crate::pull_request::TIMEOUT;
 /// The most issues one list asks for. `gh` pages past its own 30-row
 /// default; a repo with hundreds of open issues would spend several API
 /// calls filling rows nobody scrolls to.
 pub const LIST_LIMIT: usize = 100;
-/// How long the cursor rests on a row before its comments are fetched, so
-/// walking the list with `j` fetches only the rows actually paused on.
-const DETAIL_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+/// How long the cursor rests on a row before its comments are fetched — the
+/// PULL REQUESTS MODAL's debounce — so walking the list with `j` fetches
+/// only the rows actually paused on.
+const DETAIL_DEBOUNCE: std::time::Duration = crate::pr_modal::DETAIL_DEBOUNCE;
 /// How long the cursor rests on a project before its open issues are asked
 /// for in the background — the session prewarm's debounce, for the same
 /// reason: walking the project list with j/k must not spawn a `gh` per row
 /// passed, only one for the row the cursor settles on.
-const PREFETCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+const PREFETCH_DEBOUNCE: std::time::Duration = crate::event_loop::PREWARM_DEBOUNCE;
 /// The beat a selected project's list is re-asked on once it has proved it
 /// has open issues, so the rows `i` paints are never older than this while
 /// the project stays selected.
 pub(crate) const REFRESH: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 /// The backoff after an empty or failed answer: doubling from the floor to
 /// the ceiling, so a repo with nothing open (or a machine with no `gh`)
-/// settles at the ceiling instead of being asked every beat.
-pub(crate) const RECHECK_MIN: std::time::Duration = std::time::Duration::from_secs(30);
-pub(crate) const RECHECK_MAX: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// settles at the ceiling instead of being asked every beat — the open
+/// pull requests' backoff.
+pub(crate) const RECHECK_MIN: std::time::Duration = crate::event_loop::OPEN_PRS_RECHECK_MIN;
+pub(crate) const RECHECK_MAX: std::time::Duration = crate::event_loop::OPEN_PRS_RECHECK_MAX;
 /// How often the open issues of a project the cursor is *not* on are
-/// re-asked while PR & ISSUE COUNTS is on (Settings → Experimental) — the
-/// open pull requests' sweep beat, for the same budget: one `gh issue list`
-/// per project per beat, one project per tick ([`sweep_others`]), twelve
-/// calls an hour per project. With the switch off no project but the
-/// selected one is ever asked.
-pub(crate) const SWEEP_REFRESH: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// re-asked — the open pull requests' sweep beat, for the same budget:
+/// one `gh issue list` per project per beat, one project per tick
+/// ([`sweep_others`]), twelve calls an hour per project.
+pub(crate) const SWEEP_REFRESH: std::time::Duration = crate::event_loop::OPEN_PRS_SWEEP_REFRESH;
 /// A list younger than this is what opening the modal shows, with no second
 /// ask: the prefetch that landed as the cursor settled *is* the answer `i`
 /// was waiting for. `r` asks regardless.
 pub(crate) const FRESH: std::time::Duration = std::time::Duration::from_secs(30);
-/// Left inset of the reading pane's text.
-const INDENT: &str = " ";
-/// Narrowest the body wraps to; below this a word per line reads worse
-/// than overflowing.
-const MIN_BODY_W: usize = 20;
-/// The list column's share of the modal, and its floor.
-const LIST_PCT: u16 = 38;
-const MIN_LIST_W: u16 = 24;
-/// Lines one wheel notch scrolls the reading pane.
-const WHEEL_LINES: i32 = 3;
+/// Left inset of the reading pane's text, and the narrowest the body wraps
+/// to — the PR PREVIEW's, so the two reading panes read alike.
+const INDENT: &str = crate::pr_preview::INDENT;
+const MIN_BODY_W: usize = crate::pr_preview::MIN_BODY_W;
+/// The list column's share of the modal, its floor, and the reading
+/// pane's wheel step — the PULL REQUESTS MODAL's, so the two modals match.
+const LIST_PCT: u16 = crate::pr_modal::LIST_PCT;
+const MIN_LIST_W: u16 = crate::pr_modal::MIN_LIST_W;
+const WHEEL_LINES: i32 = crate::pr_modal::WHEEL_LINES;
 
 /// One open issue, as `gh issue list` reports it. The body rides the list
 /// — one call paints the whole reading pane — and only the comments are a
@@ -145,11 +146,7 @@ pub struct Issue {
 impl Issue {
     /// Row text: `#15 title`, the shape the OPEN PRS rows use.
     pub fn label(&self) -> String {
-        if self.title.is_empty() {
-            format!("#{}", self.number)
-        } else {
-            format!("#{} {}", self.number, self.title)
-        }
+        crate::pull_request::numbered_label(self.number, &self.title)
     }
 
     /// What a launch carries from the row to the DAEMON.
@@ -442,20 +439,6 @@ impl IssueEditor {
 
 // ---- gh ----
 
-async fn gh(dir: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(args)
-        .stdin(std::process::Stdio::null())
-        .current_dir(dir);
-    let out = match tokio::time::timeout(TIMEOUT, cmd.output()).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(_)) | Err(_) => return None,
-    };
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// Ask `gh` for every open issue on `dir`'s repo, newest first. `None` is
 /// "couldn't ask" and is kept apart from `Some(vec![])`, the real answer
 /// "nothing is open": the caller keeps the last good list over a failed
@@ -463,7 +446,7 @@ async fn gh(dir: &Path, args: &[&str]) -> Option<String> {
 pub async fn list(dir: &Path) -> Option<Vec<Issue>> {
     let limit = LIST_LIMIT.to_string();
     let out = gh(
-        dir,
+        Some(dir),
         &[
             "issue",
             "list",
@@ -474,6 +457,7 @@ pub async fn list(dir: &Path) -> Option<Vec<Issue>> {
             "--json",
             "number,url,title,author,createdAt,updatedAt,labels,body",
         ],
+        TIMEOUT,
     )
     .await?;
     parse_list(&out)
@@ -483,7 +467,12 @@ pub async fn list(dir: &Path) -> Option<Vec<Issue>> {
 /// checkout of the repo will do.
 pub async fn detail(dir: &Path, number: u64) -> Option<IssueDetail> {
     let number = number.to_string();
-    let out = gh(dir, &["issue", "view", &number, "--json", "url,comments"]).await?;
+    let out = gh(
+        Some(dir),
+        &["issue", "view", &number, "--json", "url,comments"],
+        TIMEOUT,
+    )
+    .await?;
     parse_detail(&out)
 }
 
@@ -531,7 +520,7 @@ async fn comment_via(
     // would otherwise leave the write blocked on a closed pipe.
     let run = async {
         let (_, status) = tokio::join!(feed, child.wait());
-        status.map(|s| s.success()).unwrap_or(false)
+        status.is_ok_and(|s| s.success())
     };
     tokio::time::timeout(TIMEOUT, run).await.unwrap_or(false)
 }
@@ -598,28 +587,6 @@ fn complaint(stderr: &[u8]) -> String {
         .map(str::trim)
         .find(|l| !l.is_empty())
         .map_or_else(|| "gh refused the edit".to_string(), str::to_string)
-}
-
-fn str_at(v: &serde_json::Value, key: &str) -> String {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn login(author: Option<&serde_json::Value>) -> String {
-    author
-        .and_then(|a| a.get("login"))
-        .and_then(|l| l.as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// `v["url"]`, only when a browser could open it — the row leads straight
-/// to one, and the text originates outside nebula.
-fn web_url(v: &serde_json::Value) -> Option<String> {
-    let url = v.get("url")?.as_str()?.to_string();
-    (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
 }
 
 /// Parse `gh issue list --json …` — a bare array. A row with no number or
@@ -1473,11 +1440,7 @@ fn launch_target(app: &App, project: &ProjectId, issue: &IssueRef) -> Option<Qui
             branch: crate::branch_name::issue_name(issue.number, &issue.title, &taken),
         });
     }
-    app.tree
-        .worktrees
-        .iter()
-        .find(|w| &w.project_id == project && w.is_main)
-        .map(|w| QuickTarget::Worktree(w.id.clone()))
+    app.root_worktree(project).map(QuickTarget::Worktree)
 }
 
 /// The launch a row describes: the `quick_prompt_kind` SETTING's harness
@@ -1517,14 +1480,7 @@ fn open_prompt_for_selected(app: &mut App) {
 fn open_preset_for_selected(app: &mut App) {
     let under = ModalUnder::of(app.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
-        crate::quick_prompt::open_preset_picker(
-            app,
-            QuickReturn {
-                launch: launch.with_under(under),
-                text: String::new(),
-                from_box: false,
-            },
-        );
+        crate::quick_prompt::open_preset_picker(app, QuickReturn::fresh(launch.with_under(under)));
     }
 }
 
@@ -1552,14 +1508,7 @@ pub(crate) fn open_prompt_for_row(app: &mut App) {
 /// `e` on a PROJECT ISSUES GROUP row: an AGENT PRESET on that issue.
 pub(crate) fn open_preset_for_row(app: &mut App) {
     if let Some(launch) = launch_for_row(app) {
-        crate::quick_prompt::open_preset_picker(
-            app,
-            QuickReturn {
-                launch,
-                text: String::new(),
-                from_box: false,
-            },
-        );
+        crate::quick_prompt::open_preset_picker(app, QuickReturn::fresh(launch));
     }
 }
 
@@ -1890,11 +1839,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         let line = search_line(&view.query, "type to filter…", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
-    let rows_area = Rect {
-        y: list_inner.y.saturating_add(1),
-        height: list_inner.height.saturating_sub(1),
-        ..list_inner
-    };
+    let rows_area = crate::ui::below_first_row(list_inner);
     if rows.is_empty() {
         let text = if failed {
             "couldn't list issues — is gh installed and logged in?"

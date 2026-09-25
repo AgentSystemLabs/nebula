@@ -34,7 +34,7 @@ pub struct Perf {
 impl Perf {
     /// The probe, when `NEBULA_PERF_LOG` names a file that can be created.
     pub fn from_env() -> Option<Self> {
-        let path = std::env::var_os("NEBULA_PERF_LOG")?;
+        let path = std::env::var_os(nebula_core::env::PERF_LOG)?;
         let file = std::fs::File::create(path).ok()?;
         let mut out = std::io::BufWriter::new(file);
         // The wall clock `t: 0` stands for, so a driver's own timeline (when

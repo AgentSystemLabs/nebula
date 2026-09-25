@@ -13,32 +13,16 @@
 //! Verified against Claude Code 2.1.261: `ESC ] 0 ; ✳ <name> BEL` on start
 //! (`--name`), on `/rename`, and on a hook reply's `sessionTitle`.
 
-use super::{BEL, ESC};
+use super::osc::OscFramer;
 
 /// Longest title payload buffered; anything longer (a hyperlink, a base64
 /// image) is poisoned and skipped without allocating further.
 const MAX_TITLE: usize = 512;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum State {
-    Ground,
-    Esc,
-    /// Inside an OSC payload. `poisoned` sequences are consumed to their
-    /// terminator and discarded.
-    Osc {
-        poisoned: bool,
-    },
-    /// Saw ESC inside an OSC: `ESC \` terminates (ST), anything else aborts.
-    OscEsc {
-        poisoned: bool,
-    },
-}
-
 /// Tracks the child's window title across chunk boundaries.
 #[derive(Debug)]
 pub struct TitleScanner {
-    state: State,
-    buf: Vec<u8>,
+    osc: OscFramer,
     /// Last title the child set; `None` until it sets one.
     title: Option<String>,
     /// Bumped on every title change, so `feed` can report one without
@@ -55,8 +39,7 @@ impl Default for TitleScanner {
 impl TitleScanner {
     pub fn new() -> Self {
         Self {
-            state: State::Ground,
-            buf: Vec::new(),
+            osc: OscFramer::new(MAX_TITLE, prefix_possible),
             title: None,
             generation: 0,
         }
@@ -74,7 +57,9 @@ impl TitleScanner {
     pub fn feed(&mut self, data: &[u8]) -> Option<String> {
         let before = self.generation;
         for &b in data {
-            self.step(b);
+            if let Some(payload) = self.osc.step(b) {
+                self.dispatch(payload);
+            }
         }
         if self.generation != before {
             self.title.clone()
@@ -83,60 +68,7 @@ impl TitleScanner {
         }
     }
 
-    fn step(&mut self, b: u8) {
-        match self.state {
-            State::Ground => {
-                if b == ESC {
-                    self.state = State::Esc;
-                }
-            }
-            State::Esc => {
-                if b == b']' {
-                    self.buf.clear();
-                    self.state = State::Osc { poisoned: false };
-                } else {
-                    self.state = if b == ESC { State::Esc } else { State::Ground };
-                }
-            }
-            State::Osc { poisoned } => match b {
-                BEL => {
-                    if !poisoned {
-                        self.dispatch();
-                    }
-                    self.buf.clear();
-                    self.state = State::Ground;
-                }
-                ESC => self.state = State::OscEsc { poisoned },
-                _ => {
-                    if !poisoned {
-                        self.buf.push(b);
-                        // Bail as soon as the payload can't be a title: only
-                        // `0;` (icon + window) and `2;` (window) are ours.
-                        if self.buf.len() > MAX_TITLE || !prefix_possible(&self.buf) {
-                            self.buf.clear();
-                            self.state = State::Osc { poisoned: true };
-                        }
-                    }
-                }
-            },
-            State::OscEsc { poisoned } => {
-                if b == b'\\' {
-                    if !poisoned {
-                        self.dispatch();
-                    }
-                    self.buf.clear();
-                    self.state = State::Ground;
-                } else {
-                    // Aborted mid-OSC; ESC ESC restarts the escape.
-                    self.buf.clear();
-                    self.state = if b == ESC { State::Esc } else { State::Ground };
-                }
-            }
-        }
-    }
-
-    fn dispatch(&mut self) {
-        let payload = std::mem::take(&mut self.buf);
+    fn dispatch(&mut self, payload: Vec<u8>) {
         let Some(text) = payload
             .strip_prefix(b"0;")
             .or_else(|| payload.strip_prefix(b"2;"))
@@ -210,7 +142,7 @@ mod tests {
         let mut s = TitleScanner::new();
         let long = format!("\x1b]0;{}\x07", "x".repeat(4096));
         assert_eq!(s.feed(long.as_bytes()), None);
-        assert!(s.buf.len() <= MAX_TITLE + 1);
+        assert!(s.osc.buffered() <= MAX_TITLE + 1);
         // …and the scanner resyncs for the next title.
         assert_eq!(s.feed(b"\x1b]0;ok\x07"), Some("ok".into()));
     }

@@ -109,11 +109,7 @@ pub(super) fn open_new_session(app: &mut App) {
         app.flash = Some("project no longer exists".into());
         return;
     };
-    let back = QuickReturn {
-        launch,
-        text: String::new(),
-        from_box: false,
-    };
+    let back = QuickReturn::fresh(launch);
     crate::agent_picker::open_kind_picker(
         app,
         crate::agent_picker::KindPicker::new_session_box(context, back),
@@ -477,7 +473,7 @@ pub(super) fn toggle_band_expand(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.dirty = true;
 }
 
-/// A terminal just opened — `t`, a card menu's **New terminal** —
+/// A terminal just opened — `t`, an EMPTY BAND's **New terminal** —
 /// comes up as its card on the grid with the PANE on it: unfolded and
 /// aimed, so the shell that was asked for is on screen rather than
 /// behind a fold. Run by the create's Ack (`event_loop::attach_created`),
@@ -493,8 +489,8 @@ pub(super) fn show_created_terminal(app: &mut App) {
 /// band aimed at (Esc let it go), the project's ROOT checkout, the footer
 /// saying so. The Ack lands on the new chip inside its worktree with the
 /// keys in the pane ([`show_created_terminal`]). The grid offers no `+`
-/// for a terminal: the key, and a card menu's **New terminal**, are how
-/// one opens.
+/// for a terminal: the key, and an EMPTY BAND's **New terminal**, are
+/// how one opens.
 pub(super) fn new_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
     if !app.launcher_unaimed && app.selected_worktree().is_some() {
         super::create_terminal_for_context(app, out);
@@ -1420,9 +1416,8 @@ fn close_active_tab(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// run on, and the `+` dropdown opens it again, back at the far left.
 ///
 /// Closing the tab the grid is on moves the grid to the tab that slides
-/// into its place — the one to its right, else the one to its left — as
-/// closing a TERMINAL tab moves the pane ([`tab_after`]). Closing any
-/// other tab moves nothing. Closing the last tab leaves nebula where it
+/// into its place — the one to its right, else the one to its left.
+/// Closing any other tab moves nothing. Closing the last tab leaves nebula where it
 /// starts before there is any project: the SPLASH, the pane let go
 /// ([`App::projects_closed`]). Enter, `+` or `o` there opens one again.
 pub(super) fn close_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
@@ -1674,7 +1669,7 @@ pub(super) fn click_card(app: &mut App, at: CardRef, out: &mut Vec<ClientRequest
 /// A click on a BAND's rule: the cursor onto that band, the pane on its
 /// remembered card — what `j`/`k` walking onto it do — unfolding the pane
 /// as a click on a card does. A second click on the same rule opens the
-/// ACCORDION on it, or closes it — what `z` does. INPUT PARITY:
+/// ACCORDION on it, or closes it — what Tab does. INPUT PARITY:
 /// [`select_band`] and [`toggle_band_expand`].
 pub(super) fn click_band(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) {
     let bands = view::bands(app);

@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use super::installer::write_text_atomic;
+use super::installer::install_unless_unchanged;
 
 /// The XDG base every OpenCode config path hangs off, and its default.
 pub const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
@@ -58,14 +58,12 @@ pub fn plugin_path(config_dir: &Path) -> PathBuf {
 /// keeps OpenCode's own bookkeeping of the directory quiet.
 pub fn install(config_dir: &Path) -> Result<()> {
     let dir = config_dir.join(PLUGINS_DIR);
-    let path = dir.join(PLUGIN_FILE);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        if existing == PLUGIN_SOURCE {
-            return Ok(());
-        }
-    }
-    write_text_atomic(&dir, PLUGIN_FILE, PLUGIN_SOURCE)
-        .with_context(|| format!("install opencode plugin into {}", path.display()))
+    install_unless_unchanged(&dir, PLUGIN_FILE, PLUGIN_SOURCE).with_context(|| {
+        format!(
+            "install opencode plugin into {}",
+            dir.join(PLUGIN_FILE).display()
+        )
+    })
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
-//! The PR SESSION: an AGENT created from an OPEN PRS row. This module owns
+//! The PR SESSION: an AGENT created from the PULL REQUESTS MODAL. This
+//! module owns
 //! its launch — the worktree it runs in and the scope rule it carries —
 //! and the shape that rule takes for each AGENT KIND's CLI.
 //!
@@ -9,10 +10,10 @@
 //!
 //! The rule is regenerated from the persisted URL and the row's current
 //! worktree for every fresh process, so a RESUME cannot silently lose the
-//! scope the user chose at creation time. Claude and pi take it as an
-//! appended system prompt on every spawn. Codex and Cursor have no
-//! system-prompt flag, so on their cold spawn it becomes the positional
-//! first prompt — their transcripts keep it, so a resume of either needs
+//! scope the user chose at creation time. Claude, pi and Grok take it
+//! through their system-prompt flag on every spawn. Codex, Cursor, Muse
+//! and OpenCode have none, so on their cold spawn it becomes the
+//! positional first prompt — their transcripts keep it, so a resume needs
 //! nothing added.
 //!
 //! The ISSUE SESSION — an AGENT launched from the ISSUES MODAL — rides the
@@ -198,7 +199,8 @@ pub(crate) fn validate_pr_url(raw: &str) -> Result<String> {
 /// The pull request's number, read off its validated URL (`…/pull/42`,
 /// with or without a trailing path).
 pub(crate) fn pr_number(url: &str) -> Result<u64> {
-    number_after(url, "/pull/").with_context(|| format!("no pull request number in {url}"))
+    nebula_core::url_number_after(url, "/pull/")
+        .with_context(|| format!("no pull request number in {url}"))
 }
 
 /// Validate an ISSUE SESSION's URL the way [`validate_pr_url`] validates a
@@ -221,15 +223,7 @@ pub(crate) fn validate_issue_url(raw: &str) -> Result<String> {
 /// The issue's number, read off its URL (`…/issues/15`, with or without a
 /// trailing path).
 pub(crate) fn issue_number(url: &str) -> Option<u64> {
-    number_after(url, "/issues/")
-}
-
-/// The positive number that follows `marker` in `url`, up to the next path
-/// or query separator.
-fn number_after(url: &str, marker: &str) -> Option<u64> {
-    let (_, tail) = url.split_once(marker)?;
-    let digits = tail.split(['/', '?', '#']).next().unwrap_or_default();
-    digits.parse::<u64>().ok().filter(|n| *n > 0)
+    nebula_core::url_number_after(url, "/issues/")
 }
 
 /// The PR's head branch as `gh` reports it, checked before it becomes a

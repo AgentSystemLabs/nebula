@@ -32,7 +32,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use nebula_core::{ClientRequest, ProjectId, WorktreeId};
+use nebula_core::{ClientRequest, ProjectId};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -56,18 +56,19 @@ use crate::ui::{
 /// second ask — the ISSUES MODAL's window, for the same reason: the list
 /// the OPEN PRS beat landed moments ago *is* the answer. `r` asks
 /// regardless.
-pub(crate) const FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const FRESH: std::time::Duration = crate::issues::FRESH;
 /// How long the cursor rests on a row before its body and conversation
 /// are fetched — the pane's own debounce, so walking the list with `j`
 /// fetches only the rows actually paused on.
-const DETAIL_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
-/// Left inset of the reading pane's own lines.
-const INDENT: &str = " ";
-/// The list column's share of the modal, and its floor.
-const LIST_PCT: u16 = 38;
-const MIN_LIST_W: u16 = 24;
+pub(crate) const DETAIL_DEBOUNCE: std::time::Duration = crate::event_loop::PR_DETAIL_DEBOUNCE;
+/// Left inset of the reading pane's own lines — the PR PREVIEW's.
+const INDENT: &str = crate::pr_preview::INDENT;
+/// The list column's share of the modal, and its floor. The ISSUES MODAL
+/// is laid out the same.
+pub(crate) const LIST_PCT: u16 = 38;
+pub(crate) const MIN_LIST_W: u16 = 24;
 /// Lines one wheel notch scrolls the reading pane.
-const WHEEL_LINES: i32 = 3;
+pub(crate) const WHEEL_LINES: i32 = 3;
 
 /// The modal's own state. The rows live on the [`App`] (`open_prs`, keyed
 /// by project), where the panels read them too; this holds only the
@@ -453,15 +454,6 @@ fn refresh(app: &mut App) {
 
 // ---- launching ----
 
-/// The PROJECT's ROOT WORKTREE: what a PR SESSION create is addressed to.
-fn root_worktree(app: &App, project: &ProjectId) -> Option<WorktreeId> {
-    app.tree
-        .worktrees
-        .iter()
-        .find(|w| &w.project_id == project && w.is_main)
-        .map(|w| w.id.clone())
-}
-
 /// The launch the row under the cursor describes — the group row's, for
 /// this pull request: the `quick_prompt_kind` SETTING's harness, the pull
 /// request carried as `QuickLaunch::pr`, addressed to the project's root.
@@ -495,14 +487,7 @@ fn open_prompt_for_selected(app: &mut App) {
 fn open_preset_for_selected(app: &mut App) {
     let under = ModalUnder::of(app.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
-        crate::quick_prompt::open_preset_picker(
-            app,
-            QuickReturn {
-                launch: launch.with_under(under),
-                text: String::new(),
-                from_box: false,
-            },
-        );
+        crate::quick_prompt::open_preset_picker(app, QuickReturn::fresh(launch.with_under(under)));
     }
 }
 
@@ -518,7 +503,8 @@ fn open_harness_picker_for_selected(app: &mut App) {
         app.flash = Some("no pull request selected".into());
         return;
     };
-    let Some(root) = root_worktree(app, &project) else {
+    // The PROJECT's ROOT WORKTREE: what a PR SESSION create is addressed to.
+    let Some(root) = app.root_worktree(&project) else {
         app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
         return;
     };
@@ -850,11 +836,7 @@ pub(crate) fn draw(
         let line = search_line(&view.query, "type to filter…", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
-    let rows_area = Rect {
-        y: list_inner.y.saturating_add(1),
-        height: list_inner.height.saturating_sub(1),
-        ..list_inner
-    };
+    let rows_area = crate::ui::below_first_row(list_inner);
     if rows.is_empty() {
         let text = if inflight || !asked {
             "asking GitHub…"
@@ -955,6 +937,7 @@ mod tests {
     use super::*;
     use crate::pull_request::{Checks, Health, PrLaunch};
     use crate::quick_prompt::QuickTarget;
+    use nebula_core::WorktreeId;
 
     const DIR: &str = "/nonexistent/nebula-pr-modal";
 

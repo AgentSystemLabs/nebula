@@ -1,6 +1,13 @@
 use crate::env;
 use std::path::{Path, PathBuf};
 
+/// The settings files' names in the data dir. Their loaders, the SETTINGS
+/// BUNDLE and `nebula config path` all spell them from here.
+pub const CONFIG_FILE_NAME: &str = "config.json";
+pub const CONFIG_LOCAL_FILE_NAME: &str = "config.local.json";
+pub const PRESETS_FILE_NAME: &str = "agent_presets.json";
+pub const SSH_HOSTS_FILE_NAME: &str = "ssh_hosts.json";
+
 /// Where the runtime dir lands when neither override nor `XDG_RUNTIME_DIR`
 /// is set. World-writable, so the per-uid subdir is what carries mode 0700.
 const FALLBACK_RUNTIME_ROOT: &str = "/tmp";
@@ -71,7 +78,7 @@ pub fn config_path() -> PathBuf {
             Some(rest) => env::home_dir().unwrap_or_default().join(rest),
             None => PathBuf::from(file),
         },
-        None => data_dir().join("config.json"),
+        None => data_dir().join(CONFIG_FILE_NAME),
     }
 }
 
@@ -79,7 +86,14 @@ pub fn config_path() -> PathBuf {
 /// exported, forwarded or overwritten by an import. Stays in the data dir
 /// when `NEBULA_CONFIG_FILE` moves the portable file.
 pub fn config_local_path() -> PathBuf {
-    data_dir().join("config.local.json")
+    data_dir().join(CONFIG_LOCAL_FILE_NAME)
+}
+
+/// Claude Code's config dir: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+pub fn claude_config_dir() -> Option<PathBuf> {
+    env::non_empty(env::CLAUDE_CONFIG_DIR)
+        .map(PathBuf::from)
+        .or_else(|| env::home_dir().map(|home| home.join(".claude")))
 }
 
 pub fn log_dir() -> PathBuf {

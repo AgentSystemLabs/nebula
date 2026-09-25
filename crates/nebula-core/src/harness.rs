@@ -1,6 +1,6 @@
 //! The harness registry: one behavior descriptor per agent CLI.
 //!
-//! The six known harnesses ship as a compiled-in table ([`builtin`]);
+//! The seven known harnesses ship as a compiled-in table ([`builtin`]);
 //! the user's config adds a `harnesses` map of [`HarnessOverride`]s over
 //! it — disable one, repoint a program, rename a flag, or define a whole
 //! new CLI — and [`registry`] merges the two (plus the legacy
@@ -63,6 +63,10 @@ impl HarnessCatalog {
     }
 }
 
+/// The model/effort sentinel meaning "don't pass the flag — let the CLI
+/// pick"; it heads every choice list and is what the daemon sees as None.
+pub const DEFAULT_CHOICE: &str = "default";
+
 /// How a harness takes its model: the flag carrying it, the default the
 /// Agents tab edits, and the static list the pickers offer (before the
 /// `default` sentinel, which always means "don't pass the flag").
@@ -115,7 +119,7 @@ pub struct EffortSpec {
 /// How a harness resumes a stored CLI session id: a flag (`--resume`,
 /// `--session-id`), Codex's positional subcommand (`resume <id>`, with
 /// `--cd`), or nothing (the CLI boots fresh and the id is ignored).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeSpec {
     /// Resume flag. Mutually exclusive with `subcommand`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,7 +136,7 @@ pub struct ResumeSpec {
 /// How nebula's guidance (worktree rules, PR scope) reaches the CLI:
 /// appended to the system prompt through a flag, prepended to the first
 /// prompt, or dropped.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemSpec {
     /// System-prompt flag (`--append-system-prompt`). Mutually exclusive
     /// with `prepend_to_first_prompt`.
@@ -206,7 +210,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_model_choice() -> String {
-    "default".into()
+    DEFAULT_CHOICE.into()
 }
 
 impl Default for ModelSpec {
@@ -233,25 +237,6 @@ impl Default for EffortSpec {
     }
 }
 
-impl Default for ResumeSpec {
-    fn default() -> Self {
-        Self {
-            flag: None,
-            subcommand: None,
-            cd: false,
-        }
-    }
-}
-
-impl Default for SystemSpec {
-    fn default() -> Self {
-        Self {
-            append_flag: None,
-            prepend_to_first_prompt: false,
-        }
-    }
-}
-
 impl HarnessDescriptor {
     /// The label the picker and session rows show.
     pub fn display_label(&self) -> &str {
@@ -266,14 +251,14 @@ impl HarnessDescriptor {
     /// the flag) — the same sentinel the model settings use.
     pub fn default_model(&self) -> Option<&str> {
         let value = self.model.default.trim();
-        (!value.is_empty() && !value.eq_ignore_ascii_case("default")).then_some(value)
+        (!value.is_empty() && !value.eq_ignore_ascii_case(DEFAULT_CHOICE)).then_some(value)
     }
 
     /// The configured default effort, or None for `"default"`. Callers
     /// composing Cursor ids fit it against the family first.
     pub fn default_effort(&self) -> Option<&str> {
         let value = self.effort.default.trim();
-        (!value.is_empty() && !value.eq_ignore_ascii_case("default")).then_some(value)
+        (!value.is_empty() && !value.eq_ignore_ascii_case(DEFAULT_CHOICE)).then_some(value)
     }
 
     /// Whether this harness resumes `sid` in place (as opposed to booting
@@ -590,11 +575,8 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
 pub fn builtins() -> Vec<HarnessDescriptor> {
     AgentKind::ALL
         .into_iter()
-        .filter_map(|kind| {
-            (kind != AgentKind::Custom).then(|| {
-                builtin(kind.as_str()).expect("every built-in AgentKind has a descriptor row")
-            })
-        })
+        .filter(|&kind| kind != AgentKind::Custom)
+        .map(|kind| builtin(kind.as_str()).expect("every built-in AgentKind has a descriptor row"))
         .collect()
 }
 

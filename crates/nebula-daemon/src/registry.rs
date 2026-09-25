@@ -114,14 +114,6 @@ struct PrewarmEntry {
     buffered_hooks: Vec<(HookEvent, Option<String>)>,
 }
 
-/// Wall-clock epoch ms, matching the store's `status_changed_at` stamps.
-pub(crate) fn epoch_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 pub struct Daemon {
     sessions: Mutex<HashMap<SessionRef, Arc<PtySession>>>,
     status_machines: Mutex<HashMap<AgentId, AgentStatusMachine>>,
@@ -311,7 +303,7 @@ impl Daemon {
                         Ok(stamped) => stamped,
                         Err(e) => {
                             tracing::warn!(error = %e, "persist status failed");
-                            (epoch_ms(), false)
+                            (nebula_core::clock::now_ms(), false)
                         }
                     };
                     self.broadcast(ServerEvent::StatusChanged {
@@ -1108,7 +1100,7 @@ impl Daemon {
             session_id: None,
             cloud_session_id: None,
             sort_order: 0,
-            status_changed_at: epoch_ms(),
+            status_changed_at: nebula_core::clock::now_ms(),
             alive: false,
             issue_url: issue_url.clone(),
             recent_prompts: Vec::new(),
@@ -1129,7 +1121,7 @@ impl Daemon {
             if let Some(text) = crate::prompt_history::condense(task) {
                 let entry = nebula_core::PromptEntry {
                     text,
-                    submitted_at: epoch_ms(),
+                    submitted_at: nebula_core::clock::now_ms(),
                 };
                 self.store.push_prompt(&agent.id, &entry)?;
                 agent.recent_prompts.push(entry);
@@ -1461,7 +1453,7 @@ impl Daemon {
     /// Uncached `command -v` through the user's login shell; caches the answer.
     async fn probe_cli(&self, program: &str) -> bool {
         let check = cli_probe_line(program);
-        let mut probe = tokio::process::Command::new(user_shell());
+        let mut probe = tokio::process::Command::new(nebula_core::shell::user_shell());
         probe
             .args(LOGIN_SHELL_ARGS)
             .arg(&check)
@@ -1475,10 +1467,7 @@ impl Daemon {
         // init opens /dev/tty and makes itself the foreground process group,
         // SIGTTIN-stopping whatever TUI owns that terminal.
         unsafe {
-            probe.pre_exec(|| match nix::unistd::setsid() {
-                Ok(_) => Ok(()),
-                Err(errno) => Err(std::io::Error::from_raw_os_error(errno as i32)),
-            });
+            probe.pre_exec(own_session);
         }
         let status = tokio::time::timeout(CLI_PROBE_TIMEOUT, probe.status()).await;
         match status {
@@ -1570,8 +1559,8 @@ impl Daemon {
             return Ok((target, EnterOutcome::AlreadyThere));
         }
         let alive = self.session(&SessionRef::Agent(id.clone())).is_some();
-        // Same invalidation as `move_agent`: every cwd this process reports
-        // until it respawns is the old checkout's.
+        // Same invalidation as `relocate_into`: every cwd this process
+        // reports until it respawns is the old checkout's.
         self.last_cwd.lock().unwrap().remove(id);
         if alive {
             self.pending_moves
@@ -1932,7 +1921,7 @@ impl Daemon {
         let (program, args) = match cmd_override.as_deref() {
             Some(over) => (over.to_string(), Vec::new()),
             None => login_shell_wrap(
-                &user_shell(),
+                &nebula_core::shell::user_shell(),
                 "claude",
                 &[
                     "-p".to_string(),
@@ -2521,7 +2510,7 @@ impl Daemon {
         let (program, args) = if cmd_override.is_some() {
             (program, args)
         } else {
-            login_shell_wrap(&user_shell(), &program, &args)
+            login_shell_wrap(&nebula_core::shell::user_shell(), &program, &args)
         };
 
         let spec = SpawnSpec {
@@ -2674,7 +2663,11 @@ impl Daemon {
     fn claude_background_id(&self, agent: &Agent) -> Option<String> {
         let sid = claude_resumable_session(agent)?;
         let listing = ["agents".to_string(), "--json".to_string()];
-        let (program, args) = login_shell_wrap(&user_shell(), agent.kind.cli_program(), &listing);
+        let (program, args) = login_shell_wrap(
+            &nebula_core::shell::user_shell(),
+            agent.kind.cli_program(),
+            &listing,
+        );
         let id = claude_bg::probe(&program, &args, sid)?;
         tracing::info!(agent = %agent.id, session = %sid, attach = %id, "Claude session runs in the background");
         Some(id)
@@ -2691,7 +2684,7 @@ impl Daemon {
             .values()
             .filter_map(|t| Some(t.transcript_path.parent()?.parent()?.to_path_buf()))
             .collect();
-        dirs.extend(claude_config_dir().map(|dir| dir.join("projects")));
+        dirs.extend(nebula_core::paths::claude_config_dir().map(|dir| dir.join("projects")));
         dirs.sort();
         dirs.dedup();
         dirs
@@ -2709,10 +2702,10 @@ impl Daemon {
             // interactive shell an agent launch uses, so `npm` or `bun`
             // resolve the way they do typed. The PTY lives exactly as long
             // as the command, which is what makes it the RUNNING state.
-            Some(command) => login_shell_line(&user_shell(), command),
+            Some(command) => login_shell_line(&nebula_core::shell::user_shell(), command),
             // `-l` makes it a login shell, matching Terminal.app: zsh then
             // sources /etc/zprofile (path_helper), ~/.zprofile, and ~/.zshrc.
-            None => (user_shell(), vec!["-l".into()]),
+            None => (nebula_core::shell::user_shell(), vec!["-l".into()]),
         };
         let spec = SpawnSpec {
             program,
@@ -2902,13 +2895,6 @@ impl Daemon {
             }
         });
     }
-}
-
-/// Claude Code's config dir: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn claude_config_dir() -> Option<PathBuf> {
-    env::non_empty("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env::home_dir().map(|home| home.join(".claude")))
 }
 
 /// The session id a spawn of `agent` would hand `claude --resume` — the
@@ -3366,8 +3352,13 @@ pub(crate) fn normalize_url(url: &str) -> Result<String> {
     Ok(normalized)
 }
 
-fn user_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+/// `pre_exec` hook putting the child in a session of its own (`setsid`):
+/// an interactive shell there cannot reach the daemon's controlling
+/// terminal, and the child leads a group a timeout can sweep.
+pub(crate) fn own_session() -> std::io::Result<()> {
+    nix::unistd::setsid()
+        .map(drop)
+        .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))
 }
 
 /// Why a create was refused when the agent CLI isn't installed. One line —
@@ -3421,7 +3412,7 @@ fn resolve_harness_in(
         bail!("custom harness launch is missing its registry id");
     }
     nebula_core::harness::resolve(all, kind, id)
-        .map(|descriptor| descriptor.clone())
+        .cloned()
         .map_err(anyhow::Error::msg)
 }
 
@@ -3455,7 +3446,7 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
     let mut line = command_word(program);
     for arg in args {
         line.push(' ');
-        line.push_str(&shell_quote(arg));
+        line.push_str(&nebula_core::shell::single_quote(arg));
     }
     login_shell_line(shell, &line)
 }
@@ -3494,23 +3485,22 @@ fn command_word(program: &str) -> String {
     if plain {
         program.to_string()
     } else {
-        shell_quote(program)
+        nebula_core::shell::single_quote(program)
     }
 }
 
-/// Single-quote `arg` for a POSIX shell; the only escape needed is `'`.
-fn shell_quote(arg: &str) -> String {
-    format!("'{}'", arg.replace('\'', "'\\''"))
-}
-
 /// The login-shell line [`Daemon::probe_cli`] runs to ask whether
-/// `program` resolves. The word is single-quoted through [`shell_quote`]:
+/// `program` resolves. The word is single-quoted
+/// ([`nebula_core::shell::single_quote`]):
 /// a `harnesses` entry in config.json can name any string, and pasted in
 /// bare a quote would close the word and run the rest as a command — at
 /// daemon boot, since [`Daemon::warm_cli_probes`] asks for every entry.
 /// Built-in names come out exactly as they always did (`'claude'`).
 fn cli_probe_line(program: &str) -> String {
-    format!("command -v {} >/dev/null 2>&1", shell_quote(program))
+    format!(
+        "command -v {} >/dev/null 2>&1",
+        nebula_core::shell::single_quote(program)
+    )
 }
 
 #[cfg(test)]
@@ -3835,7 +3825,10 @@ mod tests {
             model_flag: "--model".into(),
             hooks: None,
         };
-        let all = harness_registry_in(&std::collections::BTreeMap::new(), &[agy.clone()]);
+        let all = harness_registry_in(
+            &std::collections::BTreeMap::new(),
+            std::slice::from_ref(&agy),
+        );
         let harness = test_custom_harness(&all, "agy");
         let (program, args, resumed) = agent_spawn_command_with(
             &harness,
@@ -4000,7 +3993,10 @@ mod tests {
             model_flag: "--model".into(),
             hooks: None,
         };
-        let all = harness_registry_in(&std::collections::BTreeMap::new(), &[agy.clone()]);
+        let all = harness_registry_in(
+            &std::collections::BTreeMap::new(),
+            std::slice::from_ref(&agy),
+        );
         // Built-ins resolve by kind, whatever the id says.
         assert_eq!(
             resolve_harness_in(AgentKind::Claude, None, &all)
@@ -4587,10 +4583,7 @@ mod tests {
         // must not make itself the foreground of the terminal running the
         // tests.
         unsafe {
-            cmd.pre_exec(|| match nix::unistd::setsid() {
-                Ok(_) => Ok(()),
-                Err(errno) => Err(std::io::Error::from_raw_os_error(errno as i32)),
-            });
+            cmd.pre_exec(own_session);
         }
         let out = cmd.output().unwrap();
         assert_eq!(
