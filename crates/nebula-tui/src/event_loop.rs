@@ -4659,20 +4659,20 @@ fn open_delete_confirm(app: &mut App) {
                 activate::delete_worktree(app, &id);
             }
         }
-        Focus::Sessions => match app.selected_session_row() {
-            Some(SessionRow::Agent(a)) => {
-                app.overlay = Some(Overlay::Confirm(confirm_delete_agent_in(app, &a)));
-            }
-            Some(SessionRow::Terminal(t)) => {
-                app.overlay = Some(Overlay::Confirm(confirm_close_terminal_in(app, &t)));
-            }
-            Some(SessionRow::Link(l)) => delete_link(app, &l),
-            // An EMPTY BAND on the grid: the worktree is all there is.
-            None => {
-                if let Some(id) = launcher::empty_band(app) {
-                    activate::delete_worktree(app, &id);
+        // An EMPTY BAND on the grid: the worktree is all there is — even
+        // with its pull request's link row under the cursor (#104).
+        Focus::Sessions => match launcher::empty_band(app) {
+            Some(id) => activate::delete_worktree(app, &id),
+            None => match app.selected_session_row() {
+                Some(SessionRow::Agent(a)) => {
+                    app.overlay = Some(Overlay::Confirm(confirm_delete_agent_in(app, &a)));
                 }
-            }
+                Some(SessionRow::Terminal(t)) => {
+                    app.overlay = Some(Overlay::Confirm(confirm_close_terminal_in(app, &t)));
+                }
+                Some(SessionRow::Link(l)) => delete_link(app, &l),
+                None => {}
+            },
         },
         Focus::Terminal => {}
     }
@@ -5244,17 +5244,19 @@ fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
                 None => app.selected_worktree().map(|w| worktree_menu_items(app, w)),
             },
         },
-        Focus::Sessions => match app.selected_session_row() {
-            Some(SessionRow::Agent(a)) => Some(menu_items_for_session_in(app, &a)),
-            Some(SessionRow::Terminal(t)) => Some(menu_items_for_terminal(&t)),
-            Some(SessionRow::Link(l)) => Some(menu_items_for_link(&l)),
-            // An EMPTY BAND on the grid: its checkout's own menu, the
-            // same **Delete worktree** its `d` opens.
-            None => {
-                let id = launcher::empty_band(app)?;
+        // An EMPTY BAND on the grid: its checkout's own menu, the same
+        // **Delete worktree** its `d` opens — its pull request's link row
+        // under the cursor or not (#104).
+        Focus::Sessions => match launcher::empty_band(app) {
+            Some(id) => {
                 let w = app.tree.worktrees.iter().find(|w| w.id == id)?;
                 Some(worktree_menu_items(app, w))
             }
+            None => match app.selected_session_row()? {
+                SessionRow::Agent(a) => Some(menu_items_for_session_in(app, &a)),
+                SessionRow::Terminal(t) => Some(menu_items_for_terminal(&t)),
+                SessionRow::Link(l) => Some(menu_items_for_link(&l)),
+            },
         },
         Focus::Terminal => None,
     }
