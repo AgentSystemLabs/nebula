@@ -1,0 +1,64 @@
+# launcher-tabs-narrow with two more projects whose names are long: five tabs, so at COLS=76 the
+# header has more tabs than room and the MORE CHIP counts the ones it left off.
++
+demo
+Enter
+F12
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+p
+Sort the changelog entries by date, newest first
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+Escape
+Escape
++
+api
+Enter
+F12
++
+web
+Enter
+F12
++
+agentsys
+Enter
+F12
++
+marketing
+Enter
+F12
++
+demo
+Enter
+F12
+F12

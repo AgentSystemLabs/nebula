@@ -1,0 +1,15 @@
+# Terminal cards as small terminals: two shells opened with `t`, one runs a cargo test, the other a
+# git log, each in its tools' colours, then Ctrl+q hands the keys back to the grid — the first card
+# read from the daemon's tail, the second from the pane's live screen, both in colour with the
+# prompt's cursor.
+t
+./cargo-test
+Enter
+C-q
+t
+./git-log
+Enter
+C-q
+F12
+F12
+F12

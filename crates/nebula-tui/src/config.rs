@@ -351,6 +351,12 @@ pub const AGENTS_HEAD: &[SettingSpec] = &[
         group: "Quick prompt",
     },
     SettingSpec {
+        kind: SettingKind::FollowNewSession,
+        label: "Follow new",
+        hint: "Move the cursor onto the new session's card, the grid scrolled to it, without entering it (off = stay on the card you're on)",
+        group: "Quick prompt",
+    },
+    SettingSpec {
         kind: SettingKind::QuickPromptNewWorktree,
         label: "New worktree",
         hint: "Each new session's box starts on a fresh worktree (off = the project's root branch; ^N flips one box)",
@@ -394,10 +400,12 @@ pub enum SettingKind {
     HideCardMarks,
     SessionPane,
     WorktreeLayout,
+    ExpandAllWorktrees,
     CardIssueNumber,
     HideDraftPrs,
     QuickPromptKind,
     QuickPromptFocus,
+    FollowNewSession,
     QuickPromptNewWorktree,
     RunCommand,
     OpenCommand,
@@ -492,6 +500,7 @@ impl SettingKind {
             | SettingKind::HideCardMarks
             | SettingKind::WorktreeLayout
             | SettingKind::CardIssueNumber => (2026, 9, 24),
+            SettingKind::ExpandAllWorktrees | SettingKind::FollowNewSession => (2026, 9, 26),
         }
     }
 
@@ -651,6 +660,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::WorktreeLayout,
                 label: "Worktree layout",
                 hint: "Each worktree's sessions as a row of cards, or as a compact list of the 3 most recent (Tab shows them all)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::ExpandAllWorktrees,
+                label: "Expand all worktrees",
+                hint: "Show every worktree's sessions and terminals at once, with no Tab to open one (off = one worktree opens at a time, with Tab)",
                 group: "",
             },
             SettingSpec {
@@ -1043,6 +1058,13 @@ pub struct Config {
     /// recent shown until Tab — the ACCORDION — opens the rest). Read
     /// through [`Config::list_layout`], so a word off the list is the cards.
     pub worktree_layout: String,
+    /// EXPAND ALL WORKTREES: every BAND on the GRID laid out open at once
+    /// — each worktree's sessions and terminals wrapped into rows under
+    /// its rule, every entry of the compact LIST listed — so there is no
+    /// ACCORDION for Tab to open, and `j`/`k` walk down every card of
+    /// every worktree as one column of rows. Off by default, a config
+    /// predating the key too: one band opens at a time, with Tab.
+    pub expand_all_worktrees: bool,
     /// RETIRED with every card carrying its last prompt. Through 0.40 the
     /// **Card prompt** SETTING (Settings → Appearance, `shown` by default)
     /// could leave the last prompt off every session card on the GRID.
@@ -1243,13 +1265,27 @@ pub struct Config {
     /// since been switched off.
     pub quick_prompt_kind: String,
     /// Whether a QUICK PROMPT launch takes FOCUS into the TERMINAL PANE and
-    /// locks it. Off by default: the new SESSION's row is selected (so the
-    /// pane previews it and it is marked seen) but FOCUS stays on the panel
-    /// the prompt was fired from, so firing one off does not interrupt what
-    /// you were doing. Only the QUICK PROMPT reads this — every other launch
+    /// locks it. Off by default: FOCUS stays on the panel the prompt was
+    /// fired from, so firing one off does not interrupt what you were
+    /// doing — and where the cursor goes is [`Config::follow_new_session`]'s
+    /// to say. Only the QUICK PROMPT reads this — every other launch
     /// (the NEW SESSION PICKER, an AGENT PRESET, a PR SESSION, a Cloud task)
     /// still enters the pane.
     pub quick_prompt_focus: bool,
+    /// FOLLOW NEW SESSION: a QUICK PROMPT launch lands the cursor on the
+    /// new session's card — the grid scrolled to it, the pane showing it,
+    /// the keys still on the cards — so a run of launches can be watched
+    /// going up. It selects the card and no more: entering its terminal
+    /// is [`Config::quick_prompt_focus`]'s to say. On by default, a
+    /// config predating the key too. Off, the cursor, the pane and FOCUS
+    /// stay on the session the user was on while the new card goes up in
+    /// its band, as a BACKGROUND LAUNCH already does for another project.
+    /// Only a launch fired from a session card holds still: with no card
+    /// under the cursor there is nothing to keep, and the cursor lands on
+    /// the new session either way. [`Config::quick_prompt_focus`] on
+    /// outranks it — a launch that enters the new session's pane has to
+    /// go there.
+    pub follow_new_session: bool,
     /// Whether each new QUICK PROMPT starts aimed at a fresh worktree
     /// rather than the checkout under the grid's cursor (the project's
     /// ROOT BRANCH when nothing is aimed at — `launcher::target_for`).
@@ -1372,6 +1408,7 @@ impl Default for Config {
             hide_card_marks: false,
             session_pane: crate::launcher::PaneSide::default().as_str().into(),
             worktree_layout: WORKTREE_LAYOUTS[0].into(),
+            expand_all_worktrees: false,
             hide_card_prompt: false,
             card_issue_number: true,
             hide_draft_prs: false,
@@ -1413,6 +1450,7 @@ impl Default for Config {
             harnesses: BTreeMap::new(),
             quick_prompt_kind: AgentKind::Claude.as_str().into(),
             quick_prompt_focus: false,
+            follow_new_session: true,
             quick_prompt_new_worktree: false,
             keybindings: BTreeMap::new(),
             skipped: BTreeSet::new(),
@@ -2178,6 +2216,7 @@ impl Config {
             SettingKind::HideCardMarks => shown_hidden(self.hide_card_marks).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::WorktreeLayout => WORKTREE_LAYOUTS[usize::from(self.list_layout())].into(),
+            SettingKind::ExpandAllWorktrees => on_off(self.expand_all_worktrees).into(),
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             // A project row with no project to speak of: what one without
@@ -2189,6 +2228,7 @@ impl Config {
             SettingKind::HideUninstalledHarnesses => on_off(self.hide_uninstalled_harnesses).into(),
             SettingKind::QuickPromptKind => self.quick_prompt_kind.clone(),
             SettingKind::QuickPromptFocus => on_off(self.quick_prompt_focus).into(),
+            SettingKind::FollowNewSession => on_off(self.follow_new_session).into(),
             SettingKind::QuickPromptNewWorktree => on_off(self.quick_prompt_new_worktree).into(),
         }
     }
@@ -2283,6 +2323,9 @@ impl Config {
                 let now = WORKTREE_LAYOUTS[usize::from(self.list_layout())];
                 self.worktree_layout = cycle_choice(now, WORKTREE_LAYOUTS, step).into();
             }
+            SettingKind::ExpandAllWorktrees => {
+                self.expand_all_worktrees = !self.expand_all_worktrees;
+            }
             SettingKind::CardIssueNumber => {
                 self.card_issue_number = !self.card_issue_number;
             }
@@ -2303,6 +2346,9 @@ impl Config {
             }
             SettingKind::QuickPromptFocus => {
                 self.quick_prompt_focus = !self.quick_prompt_focus;
+            }
+            SettingKind::FollowNewSession => {
+                self.follow_new_session = !self.follow_new_session;
             }
             SettingKind::QuickPromptNewWorktree => {
                 self.quick_prompt_new_worktree = !self.quick_prompt_new_worktree;
@@ -3540,6 +3586,40 @@ mod tests {
         assert!(legacy.card_issue_number);
     }
 
+    /// EXPAND ALL WORKTREES: an Appearance row under **Worktree layout**
+    /// that reads `on` / `off`, off by default (a config that predates the
+    /// key too), and persisted under `expand_all_worktrees`.
+    #[test]
+    fn expand_all_worktrees_is_off_by_default_toggles_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.expand_all_worktrees, "off by default");
+        assert_eq!(cfg.value_label(SettingKind::ExpandAllWorktrees), "off");
+
+        let (tab, row) = locate(SettingKind::ExpandAllWorktrees).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        assert_eq!(
+            locate(SettingKind::WorktreeLayout),
+            Some((tab, row - 1)),
+            "under the layout it opens"
+        );
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.expand_all_worktrees);
+        assert_eq!(cfg.value_label(SettingKind::ExpandAllWorktrees), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""expand_all_worktrees": true"#), "{raw}");
+        assert!(load_from(&path).expand_all_worktrees);
+
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.expand_all_worktrees);
+
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.expand_all_worktrees, "a missing key reads as off");
+    }
+
     /// CARD LINE COUNTS: retired with every card counting its lines. The
     /// key an older build wrote (`card_line_changes`, off by default) still
     /// loads to what it wrote and is written back as stored, but no tab
@@ -3786,6 +3866,37 @@ mod tests {
         // A config predating the key reads as off.
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.quick_prompt_focus);
+    }
+
+    /// FOLLOW NEW SESSION starts on, sits under the QUICK PROMPT's Focus
+    /// row on the Agents tab, toggles like any bool and persists under its
+    /// own key; a config predating the key reads as on.
+    #[test]
+    fn follow_new_session_is_on_by_default_and_persists() {
+        let mut cfg = Config::default();
+        assert!(cfg.follow_new_session, "a launch lands on its new card");
+        assert_eq!(cfg.value_label(SettingKind::FollowNewSession), "on");
+        let (tab, row) = locate(SettingKind::FollowNewSession).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Agents");
+        assert_eq!(
+            locate(SettingKind::QuickPromptFocus),
+            Some((tab, row - 1)),
+            "beside the Focus row that outranks it"
+        );
+
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.follow_new_session);
+        assert_eq!(cfg.value_label(SettingKind::FollowNewSession), "off");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""follow_new_session": false"#), "{raw}");
+        assert!(!load_from(&path).follow_new_session, "off survives a save");
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.follow_new_session, "a missing key reads as on");
     }
 
     /// **Run command** on the Project tab: a typed row (Enter prompts,
@@ -4830,6 +4941,7 @@ mod tests {
                         vec![
                             "Agent".to_string(),
                             "Focus".to_string(),
+                            "Follow new".to_string(),
                             "New worktree".to_string(),
                             "Hide missing CLIs".to_string()
                         ]

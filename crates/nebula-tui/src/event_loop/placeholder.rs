@@ -34,8 +34,9 @@
 //! lands (`resolve_worktree`).
 
 use super::{
-    create_agent, pane_size, reconcile_selection, release_attachment, remove_worktree_rows,
-    restore_context, select_worktree_by_id, selection_snapshot, WORKTREE_STILL_CREATING,
+    create_agent, pane_size, reconcile_selection, reconcile_selection_inner, release_attachment,
+    remove_worktree_rows, restore_context, select_worktree_by_id, selection_snapshot,
+    WORKTREE_STILL_CREATING,
 };
 use crate::app::{
     now_ms, AgentLaunchDraft, App, AttachedTerm, ConfirmDialog, Overlay, PendingAction,
@@ -59,6 +60,18 @@ pub(super) fn stage_worktree(
     branch: String,
     out: &mut Vec<ClientRequest>,
 ) -> WorktreeId {
+    let worktree = push_worktree(app, project, branch);
+    // False when the checkout's project is not the selected one (a
+    // project menu's "New worktree" on another row): the row waits in the
+    // tree for that project to be selected, as the real one would.
+    select_worktree_by_id(app, &worktree, out);
+    app.dirty = true;
+    worktree
+}
+
+/// The checkout row alone, under an id this client made, selecting
+/// nothing.
+fn push_worktree(app: &mut App, project: ProjectId, branch: String) -> WorktreeId {
     let worktree = WorktreeId::generate();
     app.tree.worktrees.push(Worktree {
         id: worktree.clone(),
@@ -71,11 +84,6 @@ pub(super) fn stage_worktree(
         is_main: false,
         sort_order: 0,
     });
-    // False when the checkout's project is not the selected one (a
-    // project menu's "New worktree" on another row): the row waits in the
-    // tree for that project to be selected, as the real one would.
-    select_worktree_by_id(app, &worktree, out);
-    app.dirty = true;
     worktree
 }
 
@@ -84,6 +92,10 @@ pub(super) fn stage_worktree(
 /// PROMPT launch keeps it), its one session row — a `kind` CLI at
 /// `model` / `effort`, named as the create will name it — selected, the
 /// pane showing "starting…" for it. Returns the ids the intents carry.
+///
+/// Without `follow` — a launch that stays put (FOLLOW NEW SESSION off),
+/// a BACKGROUND LAUNCH — the rows go up and that is all: every cursor,
+/// the pane and FOCUS stay on the session the user was on (`stage_agent`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn stage(
     app: &mut App,
@@ -94,10 +106,18 @@ pub(super) fn stage(
     model: Option<String>,
     effort: Option<String>,
     first_prompt: bool,
+    follow: bool,
     out: &mut Vec<ClientRequest>,
 ) -> PlaceholderRows {
     let focus = app.focus;
-    let worktree = stage_worktree(app, project, branch, out);
+    // Where the user is, by id, ahead of the checkout row that could
+    // slide in above it.
+    let before = selection_snapshot(app);
+    let worktree = if follow {
+        stage_worktree(app, project, branch, out)
+    } else {
+        push_worktree(app, project, branch)
+    };
     let agent = stage_agent(
         app,
         &worktree,
@@ -106,8 +126,12 @@ pub(super) fn stage(
         model,
         effort,
         first_prompt,
+        follow,
         out,
     );
+    if !follow {
+        reconcile_selection_inner(app, before, out);
+    }
     app.focus = focus;
     PlaceholderRows { worktree, agent }
 }
@@ -120,7 +144,9 @@ pub(super) fn stage(
 ///
 /// A BACKGROUND LAUNCH puts the row up and stops there: nothing is
 /// selected and the pane is not taken, because the launch landed in a
-/// project the user is not looking at.
+/// project the user is not looking at. So does a launch that stays put
+/// (`follow` false — FOLLOW NEW SESSION off) in the project on screen: its row
+/// sorts in among the ones the cursors are on, which are held by id.
 ///
 /// `first_prompt` is a launch carrying a task (a QUICK PROMPT's, an AGENT
 /// PRESET's): the CLI submits it the moment it boots, so the row is staged
@@ -135,6 +161,7 @@ pub(super) fn stage_agent(
     model: Option<String>,
     effort: Option<String>,
     first_prompt: bool,
+    follow: bool,
     out: &mut Vec<ClientRequest>,
 ) -> AgentId {
     // The name the DAEMON will give the real row: `default_session_name`
@@ -162,6 +189,7 @@ pub(super) fn stage_agent(
         .find(|w| &w.id == worktree)
         .map(|w| w.project_id.clone())
         .is_some_and(|landed| crate::launcher::is_background(app, &landed));
+    let before = selection_snapshot(app);
     app.tree.agents.push(Agent {
         id: agent.clone(),
         worktree_id: worktree.clone(),
@@ -203,6 +231,14 @@ pub(super) fn stage_agent(
     // of the user. The create's Ack is left behind for the same reason
     // (`quick_launch::submit`).
     if background {
+        app.dirty = true;
+        return agent;
+    }
+    // A launch into this very project that leaves the user put: the
+    // stamp re-sorted the checkouts and the new row leads its own, so
+    // the cursors go back onto the rows they were on.
+    if !follow {
+        reconcile_selection_inner(app, before, out);
         app.dirty = true;
         return agent;
     }
@@ -467,6 +503,7 @@ pub(super) fn defer_launch(
         draft.model.clone(),
         draft.effort.clone(),
         draft.starting_prompt.is_some(),
+        draft.follow,
         out,
     );
     draft.placeholder = Some(agent);
@@ -539,8 +576,8 @@ fn forget_worktree(app: &mut App, id: &WorktreeId) {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        buffer_text, hse, press, seed_feat_worktree, seed_open_prs, seed_tree, with_default_config,
-        with_seeded_presets, worktree_branches,
+        buffer_text, hse, press, seed_feat_worktree, seed_open_prs, seed_tree, with_config_json,
+        with_default_config, with_seeded_presets, worktree_branches,
     };
     use super::super::{
         fire_pending_prewarm, handle_server_event, handle_terminal_event, paste_into_overlay,
@@ -2145,7 +2182,7 @@ mod tests {
     /// through the upsert, the Ack and the first status change.
     #[test]
     fn a_launch_into_the_bottom_projects_checkout_keeps_the_cursor_on_it() {
-        with_default_config(|| {
+        with_config_json(r#"{"follow_new_session": true}"#, || {
             let mut app = App::new();
             let mut out = Vec::new();
             seed_project_that_ran_first(&mut app);

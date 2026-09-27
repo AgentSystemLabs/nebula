@@ -2176,10 +2176,35 @@ fn ui_state_json(app: &App) -> String {
         launcher_pane_w: app.launcher_pane_w,
         launcher_pane_hidden: app.launcher_pane_hidden,
         launcher_expanded: app.launcher_expanded.as_ref().map(|w| w.to_string()),
+        launcher_open_bands: saved_open_bands(app),
         launcher_tabs: app.launcher_tabs.iter().map(|id| id.to_string()).collect(),
         projects_closed: app.projects_closed,
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
+}
+
+/// The band every project was left with open, for the blob: the other
+/// projects' ([`App::launcher_open_bands`]) with the one on screen filed
+/// under its own project, less any project or checkout the tree no
+/// longer has.
+fn saved_open_bands(app: &App) -> std::collections::HashMap<String, String> {
+    let mut bands = app.launcher_open_bands.clone();
+    if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
+        match &app.launcher_expanded {
+            Some(open) => bands.insert(pid, open.clone()),
+            None => bands.remove(&pid),
+        };
+    }
+    bands
+        .into_iter()
+        .filter(|(pid, wid)| {
+            app.tree
+                .worktrees
+                .iter()
+                .any(|w| &w.id == wid && &w.project_id == pid)
+        })
+        .map(|(pid, wid)| (pid.to_string(), wid.to_string()))
+        .collect()
 }
 
 /// Re-seat the cursor from the persisted blob. Returns whether the
@@ -2212,6 +2237,14 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
     // lands on the cards either way.
     app.launcher_pane_hidden = state.launcher_pane_hidden;
     app.launcher_expanded = state.launcher_expanded.map(nebula_core::WorktreeId::from);
+    // Every other project's open band too; the restored project's own is
+    // `launcher_expanded` above, which the next switch away files here.
+    app.launcher_open_bands = state
+        .launcher_open_bands
+        .into_iter()
+        .filter(|(pid, _)| state.project.as_ref() != Some(pid))
+        .map(|(pid, wid)| (ProjectId(pid), WorktreeId(wid)))
+        .collect();
     // The PROJECT TABS come back in the order they were left, less any
     // project the tree no longer has; the draw's settle gives the
     // restored project its tab if it had none.
@@ -6379,6 +6412,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.hide_card_marks = cfg.hide_card_marks;
     app.launcher_pane_at = cfg.pane_side();
     app.launcher_list = cfg.list_layout();
+    app.launcher_all_open = cfg.expand_all_worktrees;
     set_hide_draft_prs(app, cfg.hide_draft_prs);
 }
 
@@ -6717,9 +6751,10 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             create_agent(app, draft, out);
         }
         // A box opened over the ISSUES MODAL or the PULL REQUESTS MODAL
-        // takes the modal with it when it launches: the new session's card
-        // is what the user wants to see, and the Ack puts the grid's cursor
-        // on it (`attach_created`). Only a box that goes without launching
+        // takes the modal with it when it launches: the grid is where the
+        // new session's card goes up — and where the Ack puts the cursor on
+        // it (`attach_created`) with FOLLOW NEW SESSION on, or else leaves
+        // it on the card it was on. Only a box that goes without launching
         // hands the modal back.
         PromptKind::QuickPrompt(launch) => quick_launch::submit(app, launch, value, out),
         PromptKind::PrComment {
@@ -7419,9 +7454,32 @@ fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool 
     };
     app.select_worktree_when_seen = None;
     remember_context(app);
+    let left = app.selected_project().map(|p| p.id.clone());
     app.sel_project = row;
     app.reopen_projects();
+    carry_open_band(app, left);
     true
+}
+
+/// After the cursor moved from project `left` to whichever is selected
+/// now: the ACCORDION's open band is one per project, so the band open on
+/// the grid being left is filed away under `left`
+/// ([`App::launcher_open_bands`]) and the one the new project was left
+/// with comes back open — switching away and back finds it as it was,
+/// whatever was opened in between. Nothing moves when the project did
+/// not change.
+fn carry_open_band(app: &mut App, left: Option<ProjectId>) {
+    let now = app.selected_project().map(|p| p.id.clone());
+    if now == left {
+        return;
+    }
+    if let Some(pid) = left {
+        match app.launcher_expanded.take() {
+            Some(open) => app.launcher_open_bands.insert(pid, open),
+            None => app.launcher_open_bands.remove(&pid),
+        };
+    }
+    app.launcher_expanded = now.and_then(|pid| app.launcher_open_bands.get(&pid).cloned());
 }
 
 /// Land the panel selections on a `/` palette pick. A project or worktree
@@ -7775,6 +7833,7 @@ fn select_project_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
     let owner_before = app.selected_project().map(|p| p.id.clone());
     app.sel_project = i;
     app.reopen_projects();
+    carry_open_band(app, owner_before.clone());
     if app.selected_project().map(|p| p.id.clone()) != owner_before {
         restore_context(app, out);
     }
@@ -8256,6 +8315,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
                     model.clone(),
                     effort.clone(),
                     starting_prompt.is_some(),
+                    follow,
                     out,
                 )),
             };
@@ -8933,6 +8993,7 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
                 | HitTarget::LauncherPaneSide
                 | HitTarget::LauncherPaneZoom
                 | HitTarget::LauncherTabAdd
+                | HitTarget::LauncherTabMore
                 | HitTarget::LauncherCrumb
                 | HitTarget::LauncherPullRequests
                 | HitTarget::LauncherIssues
@@ -9570,10 +9631,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // the `choose_tab` Enter on it runs; its `×` closes it;
                 // the `+` after them drops the PROJECT DROPDOWN — every
                 // project, narrowed by whatever you type, and a row that
-                // opens a folder — whose pick opens a tab.
+                // opens a folder — whose pick opens a tab; the MORE CHIP
+                // drops the tabs the row had no room for.
                 Some(HitTarget::LauncherTab(id)) => launcher::click_tab(app, &id, out),
                 Some(HitTarget::LauncherTabClose(id)) => launcher::close_tab(app, &id, out),
                 Some(HitTarget::LauncherTabAdd) => launcher::open_project_menu(app),
+                Some(HitTarget::LauncherTabMore) => launcher::open_more_tabs_menu(app),
                 // The key cap in the empty grid's welcome: the QUICK
                 // PROMPT, through the `open_box` its key runs.
                 Some(HitTarget::LauncherWelcomePrompt) => launcher::open_box(app),
@@ -9826,6 +9889,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // project's own handle: the right button opens it, with
                 // the project's menu hung under the tab.
                 Some(HitTarget::LauncherTab(id)) => launcher::tab_menu(app, &id, out),
+                // The MORE CHIP has no menu but its list: either button
+                // drops it.
+                Some(HitTarget::LauncherTabMore) => launcher::open_more_tabs_menu(app),
                 Some(HitTarget::PanelBg(focus)) => {
                     app.focus = focus;
                     let items = panel_menu_items(app, focus);
@@ -10401,6 +10467,9 @@ fn attach_created(
     if let (Some(stand_in), EntityId::Agent(real)) = (&placeholder, &id) {
         placeholder::resolve_agent(app, stand_in, real);
     }
+    // Where the user is, by id: the lead taken below re-sorts the band
+    // the card landed in, and the cursor there is a row index.
+    let before = selection_snapshot(app);
     // The card leads the sessions lists until its first turn starts, with
     // or without `follow`: where the cursor goes is one question, and
     // where the newest session sorts is another.
@@ -10416,6 +10485,7 @@ fn attach_created(
         return;
     };
     if !follow {
+        reconcile_selection_inner(app, before, out);
         let stand_in_shown = placeholder.is_some_and(|stand_in| {
             app.term
                 .as_ref()
@@ -10707,7 +10777,11 @@ fn reconcile_selection_inner(
     if let Some(pid) = &before.project {
         if !app.tree.projects.iter().any(|p| &p.id == pid) {
             // The selected row's project is gone; the cursor landed on a
-            // neighbor — bring up its remembered worktree + session.
+            // neighbor — bring up its remembered worktree + session, and
+            // the band it was left with open.
+            app.launcher_open_bands.remove(pid);
+            app.launcher_expanded = None;
+            carry_open_band(app, None);
             restore_context(app, out);
             return;
         }
@@ -11307,8 +11381,9 @@ mod tests {
     /// The grid's beat asks the daemon after every terminal the last
     /// frame drew but the one the pane is on and the dead — each ask
     /// carrying the ring end its card last heard — and the answer lands
-    /// as the card's lines, laid out at the PTY's width. An answer with
-    /// no bytes, or none at all once the shell is gone, leaves them.
+    /// as the card's lines, laid out at the PTY's width in the colours
+    /// they were printed in. An answer with no bytes, or none at all once
+    /// the shell is gone, leaves them.
     #[test]
     fn terminal_tails_are_asked_after_the_drawn_cards_and_land_as_lines() {
         use crate::app::TerminalTail;
@@ -11390,7 +11465,16 @@ mod tests {
             "the slot is cleared by hand"
         );
         let tail = &app.terminal_tails[&TerminalId("t1".into())];
-        assert_eq!(tail.lines, ["$ npm test", "ok 12", "$"]);
+        let texts: Vec<String> = tail.lines.iter().map(|r| r.text()).collect();
+        assert_eq!(texts, ["$ npm test", "ok 12", "$"]);
+        assert_eq!(
+            tail.lines[1].runs[0],
+            (
+                "ok".to_string(),
+                ratatui::style::Style::default().fg(ratatui::style::Color::Indexed(2))
+            ),
+            "the lines keep the colours they were printed in"
+        );
         assert_eq!(tail.end_seq, 70);
         assert!(app.dirty, "the card changed");
 
@@ -23110,6 +23194,7 @@ diff --git a/src/c.rs b/src/c.rs
             "Quick prompt",
             "Agent",
             "Focus",
+            "Follow new",
             "New worktree",
             "Hide missing CLIs",
             "Claude",
@@ -23135,8 +23220,9 @@ diff --git a/src/c.rs b/src/c.rs
             "the old flat labels are gone:\n{text}"
         );
 
-        // Headers and blanks are not rows the cursor can land on: four ↓
+        // Headers and blanks are not rows the cursor can land on: five ↓
         // from the first row reach Claude's Enabled row, not a header.
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
@@ -26336,7 +26422,7 @@ diff --git a/src/c.rs b/src/c.rs
     /// the grid's cursor on the new session's card, the keys still there.
     #[test]
     fn the_issue_quick_prompt_stands_on_the_modal() {
-        with_default_config(|| {
+        with_config_json(r#"{"follow_new_session": true}"#, || {
             let mut app = App::new();
             seed_tree(&mut app);
             let focus = app.focus;
@@ -27688,7 +27774,8 @@ diff --git a/src/c.rs b/src/c.rs
     fn p_on_the_worktrees_panel_cuts_a_fresh_worktree_first() {
         use crate::quick_prompt::QuickTarget;
         use nebula_core::{EntityId, ProjectId, WorktreeId};
-        with_config_json(r#"{"quick_prompt_new_worktree": true}"#, || {
+        let json = r#"{"quick_prompt_new_worktree": true, "follow_new_session": true}"#;
+        with_config_json(json, || {
             let mut app = App::new();
             let mut out = Vec::new();
             seed_tree(&mut app);
@@ -27887,22 +27974,25 @@ diff --git a/src/c.rs b/src/c.rs
             );
         }
 
-        with_config_json(r#"{"quick_prompt_kind": "codex"}"#, || {
-            let mut app = App::new();
-            launch(&mut app);
-            assert_eq!(
-                app.term.as_ref().map(|t| t.sref.clone()),
-                Some(SessionRef::Agent(AgentId("a2".into()))),
-                "the pane still previews what was just launched"
-            );
-            assert_eq!(
-                app.selected_session().map(|a| a.id),
-                Some(AgentId("a2".into())),
-                "and the cursor lands on its row"
-            );
-            assert_eq!(app.focus, Focus::Sessions, "but focus stays put");
-            assert!(!app.term_locked, "and the pane is not locked");
-        });
+        with_config_json(
+            r#"{"quick_prompt_kind": "codex", "follow_new_session": true}"#,
+            || {
+                let mut app = App::new();
+                launch(&mut app);
+                assert_eq!(
+                    app.term.as_ref().map(|t| t.sref.clone()),
+                    Some(SessionRef::Agent(AgentId("a2".into()))),
+                    "the pane still previews what was just launched"
+                );
+                assert_eq!(
+                    app.selected_session().map(|a| a.id),
+                    Some(AgentId("a2".into())),
+                    "and the cursor lands on its row"
+                );
+                assert_eq!(app.focus, Focus::Sessions, "but focus stays put");
+                assert!(!app.term_locked, "and the pane is not locked");
+            },
+        );
 
         with_config_json(
             r#"{"quick_prompt_kind": "codex", "quick_prompt_focus": true}"#,
@@ -28574,7 +28664,7 @@ diff --git a/src/c.rs b/src/c.rs
     fn ctrl_n_in_the_quick_prompt_flips_the_launch_into_a_fresh_worktree() {
         use crate::quick_prompt::QuickTarget;
         use nebula_core::{EntityId, ProjectId, WorktreeId};
-        with_default_config(|| {
+        with_config_json(r#"{"follow_new_session": true}"#, || {
             let mut app = App::new();
             let mut out = Vec::new();
             seed_tree(&mut app);
