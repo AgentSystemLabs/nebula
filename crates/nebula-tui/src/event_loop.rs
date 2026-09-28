@@ -6410,6 +6410,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.card_issue_number = cfg.card_issue_number;
     app.show_all_worktrees = cfg.show_all_worktrees;
     app.hide_card_marks = cfg.hide_card_marks;
+    app.highlight_current_card = cfg.highlight_current_card;
     app.launcher_pane_at = cfg.pane_side();
     app.launcher_list = cfg.list_layout();
     app.launcher_all_open = cfg.expand_all_worktrees;
