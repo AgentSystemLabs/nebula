@@ -43,8 +43,8 @@ use focus_walk::{
 };
 pub use host_terminal::restore_terminal;
 use host_terminal::{
-    on_host_resize, reassert_modes, repaint, setup_terminal, take_worker_panic, watch_held_key,
-    MODE_REASSERT,
+    on_host_resize, reassert_modes, repaint, report_working_directory, setup_terminal,
+    take_worker_panic, watch_held_key, MODE_REASSERT,
 };
 pub use release_watch::ReleaseWatch;
 
@@ -292,6 +292,7 @@ async fn main_loop(
     // Pointer shape last sent to the terminal (OSC 22), so hover over a
     // splitter swaps the cursor once instead of on every motion event.
     let mut pointer_sent = PointerShape::default();
+    let mut directory_sent = None;
     let mut next_draw = tokio::time::Instant::now();
     // When the loop may paint again (FRAME PACING): back to back for a key
     // and its answer, 60 fps under sustained output.
@@ -710,6 +711,8 @@ async fn main_loop(
             app.flash = Some("a background task crashed — logged to tui.log".into());
             app.dirty = true;
         }
+
+        report_working_directory(&app, &mut directory_sent, terminal.backend_mut())?;
 
         // Mouse handlers only record the pointer shape they want; emit the
         // OSC 22 request when it changes. Terminals without pointer-shape
@@ -4452,22 +4455,27 @@ fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
     spawn_editor_modal(app, &editor, &root, &file, line.unwrap_or(1), size);
 }
 
-/// Worktree root of the attached session; falls back to the selected
-/// worktree when the attachment isn't an agent (or isn't in the tree yet).
+/// Worktree root of the attached agent or shell; falls back to the
+/// selected worktree when nothing is attached (or it isn't in the tree yet).
 fn attached_worktree_root(app: &App) -> Option<std::path::PathBuf> {
-    if let Some(SessionRef::Agent(id)) = app.term.as_ref().map(|t| &t.sref) {
-        let root = app
+    let worktree_id = app.term.as_ref().and_then(|t| match &t.sref {
+        SessionRef::Agent(id) => app
             .tree
             .agents
             .iter()
             .find(|a| &a.id == id)
-            .and_then(|a| app.tree.worktrees.iter().find(|w| w.id == a.worktree_id))
-            .map(|w| w.path.clone());
-        if root.is_some() {
-            return root;
-        }
-    }
-    app.selected_worktree().map(|w| w.path.clone())
+            .map(|a| &a.worktree_id),
+        SessionRef::Terminal(id) => app
+            .tree
+            .terminals
+            .iter()
+            .find(|t| &t.id == id)
+            .map(|t| &t.worktree_id),
+    });
+    worktree_id
+        .and_then(|id| app.tree.worktrees.iter().find(|w| &w.id == id))
+        .or_else(|| app.selected_worktree())
+        .map(|w| w.path.clone())
 }
 
 /// Resolve a clicked path against the worktree: expand `~/`, try it as
