@@ -1,0 +1,58 @@
+# The PROJECT TABS header on a narrow window: three launches into the demo (running with a pull
+# request, finished, stopped on a question), then api-server and web-app opened from the `+`
+# dropdown, then back to the demo — three tabs, the lit one with STATUS DOTS. Run it at COLS=76 to
+# see what the row gives up first.
++
+demo
+Enter
+F12
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+p
+Sort the changelog entries by date, newest first
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+Escape
+Escape
++
+api
+Enter
+F12
++
+web
+Enter
+F12
++
+demo
+Enter
+F12
+F12

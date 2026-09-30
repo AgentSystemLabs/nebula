@@ -39,6 +39,7 @@ const FOOTER_TERMINAL_LOCKED: &str = "^q: sessions";
 struct TuiHarness {
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
+    output: Arc<Mutex<Vec<u8>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     runtime_dir: PathBuf,
     data_dir: PathBuf,
@@ -101,14 +102,17 @@ impl TuiHarness {
         std::mem::forget(pty.master);
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+        let output = Arc::new(Mutex::new(Vec::new()));
         {
             let parser = parser.clone();
+            let output = output.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 while let Ok(n) = reader.read(&mut buf) {
                     if n == 0 {
                         break;
                     }
+                    output.lock().unwrap().extend_from_slice(&buf[..n]);
                     parser.lock().unwrap().process(&buf[..n]);
                 }
             });
@@ -117,6 +121,7 @@ impl TuiHarness {
         Self {
             writer,
             parser,
+            output,
             child,
             runtime_dir,
             data_dir,
@@ -183,6 +188,18 @@ impl TuiHarness {
             }
             std::thread::sleep(POLL_STEP);
         }
+    }
+
+    fn wait_for_working_directory(&self, path: &Path) {
+        let sequence = format!("\x1b]7;file://localhost{}\x1b\\", path.display());
+        self.wait_for(&format!("working directory {path:?}"), |_| {
+            self.output
+                .lock()
+                .unwrap()
+                .windows(sequence.len())
+                .any(|bytes| bytes == sequence.as_bytes())
+        });
+        self.output.lock().unwrap().clear();
     }
 
     fn wait_for_text(&self, needle: &str) {
@@ -380,6 +397,28 @@ fn repo_git(repo: &std::path::Path, args: &[&str]) {
         .unwrap()
         .success();
     assert!(ok, "git {args:?} failed in {}", repo.display());
+}
+
+/// Host-terminal links follow the visible checkout, not the directory where
+/// nebula was launched. On exit, the shell gets its original directory back.
+#[test]
+fn host_working_directory_follows_project_switches_and_restores_on_exit() {
+    let mut tui = TuiHarness::spawn_with_env(&[
+        ("SSH_CONNECTION", String::new()),
+        ("SSH_TTY", String::new()),
+    ]);
+    let first = tui.make_repo("cwd-first").canonicalize().unwrap();
+    let second = tui.make_repo("cwd-second").canonicalize().unwrap();
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &first, "cwd-first");
+    tui.wait_for_working_directory(&first);
+    add_project(&mut tui, &second, "cwd-second");
+    tui.wait_for_working_directory(&second);
+
+    tui.send(b"q");
+    tui.wait_for_text("Quit nebula");
+    tui.send(ENTER);
+    tui.wait_for_working_directory(&tui._repos.path().canonicalize().unwrap());
 }
 
 #[test]

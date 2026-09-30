@@ -961,11 +961,26 @@ pub struct PanelLayout {
 /// `bands` laid out in `body`, with `expanded`'s cards open under its
 /// rule when it names one of them.
 pub fn panel_layout(body: Rect, bands: &[Band], expanded: Option<&WorktreeId>) -> PanelLayout {
+    lay_out_panel(body, bands, |band| expanded == Some(&band.worktree))
+}
+
+/// [`panel_layout`] with every band open at once — Settings → Appearance
+/// → **Expand all worktrees**: each band's cards wrapped into rows under
+/// its rule, as the ACCORDION's one open band has them, and no STRIP
+/// anywhere. An EMPTY BAND has no cards to open onto rows, and keeps its
+/// one row saying so.
+pub fn open_panel_layout(body: Rect, bands: &[Band]) -> PanelLayout {
+    lay_out_panel(body, bands, |band| !band.cards.is_empty())
+}
+
+/// `bands` laid out top to bottom in `body`, the ones `open` picks with
+/// their cards wrapped into rows, the rest on their collapsed row.
+fn lay_out_panel(body: Rect, bands: &[Band], open: impl Fn(&Band) -> bool) -> PanelLayout {
     let mut y = 0u16;
     let mut out = Vec::with_capacity(bands.len());
     let strips = bands_layout(body);
     for band in bands {
-        let content = (expanded == Some(&band.worktree)).then(|| expanded_layout(body, band));
+        let content = open(band).then(|| expanded_layout(body, band));
         let collapsed = if band.cards.is_empty() {
             EMPTY_BAND_H
         } else if strips.row_overflows(band) {
@@ -991,19 +1006,21 @@ pub fn panel_layout(body: Rect, bands: &[Band], expanded: Option<&WorktreeId>) -
 
 /// [`panel_layout`] for the compact LIST: every band its rule over its
 /// entries stacked a line apiece ([`list_layout`]) — all of them on the
-/// band `expanded` names, the [`LIST_RECENT`] most recent on the rest, and
-/// on the band the cursor is on (`pin`) its card too wherever it sits, so
-/// the card the pane reads is always one of the lines on screen.
+/// band `expanded` names, or on every band with `all_open` (**Expand all
+/// worktrees**), the [`LIST_RECENT`] most recent on the rest, and on the
+/// band the cursor is on (`pin`) its card too wherever it sits, so the
+/// card the pane reads is always one of the lines on screen.
 pub fn list_panel_layout(
     body: Rect,
     bands: &[Band],
     expanded: Option<&WorktreeId>,
+    all_open: bool,
     pin: Option<CardRef>,
 ) -> PanelLayout {
     let mut y = 0u16;
     let mut out = Vec::with_capacity(bands.len());
     for (index, band) in bands.iter().enumerate() {
-        let open = expanded == Some(&band.worktree);
+        let open = all_open || expanded == Some(&band.worktree);
         let pin = pin.filter(|p| p.band == index).map(|p| p.card);
         let content = list_layout(body, band, open, pin);
         let height = content.height();
@@ -1968,7 +1985,7 @@ mod tests {
             EMPTY_BAND_H
         );
         assert_eq!(
-            super::list_panel_layout(body, &bands, None, None).bands[idle].height,
+            super::list_panel_layout(body, &bands, None, false, None).bands[idle].height,
             EMPTY_BAND_H
         );
 
@@ -2789,6 +2806,45 @@ mod tests {
         )
         .unwrap()
         .whole());
+    }
+
+    /// **Expand all worktrees**: every band with cards is laid out as the
+    /// ACCORDION's open one is — its cards wrapped into rows under its
+    /// rule, no strip, no more row — one after another down the panel.
+    #[test]
+    fn every_band_opens_at_once_with_expand_all_worktrees() {
+        let mut app = app();
+        app.tree
+            .agents
+            .extend((0..5).map(|i| agent(&format!("s{i}"), "w1", &format!("session-{i}"))));
+        app.tree.agents.push(agent("f1", "w2", "feat-1"));
+        let all = super::bands(&app);
+        assert_eq!(all.len(), 2, "the root band and feat's");
+        let body = Rect::new(0, 0, 80, 60);
+        let panel = open_panel_layout(body, &all);
+        for (index, band) in all.iter().enumerate() {
+            let pb = &panel.bands[index];
+            assert!(pb.open, "band {index} is open");
+            assert_eq!(
+                pb.content.as_ref(),
+                Some(&expanded_layout(body, band)),
+                "band {index} is laid out as the accordion lays it out"
+            );
+            assert!(
+                (0..band.cards.len()).all(|card| pb.cell(card).is_some()),
+                "every card of band {index} has its cell"
+            );
+        }
+        assert_eq!(
+            panel.bands[1].rule_y,
+            panel.bands[0].height + GAP_Y,
+            "feat's band right under the root band's rows"
+        );
+        assert_eq!(
+            panel.bands[0].height,
+            BAND_RULE_H + CARD_H * 3 + GAP_Y * 2,
+            "six sessions over two columns: three rows, no more row"
+        );
     }
 
     /// The screenshot's grid: nine sessions in two columns and three

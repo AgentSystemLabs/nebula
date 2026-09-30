@@ -390,6 +390,10 @@ pub(super) fn select_card(app: &mut App, sref: SessionRef, out: &mut Vec<ClientR
 /// What Tab says on a LIST band that already lists every entry it has.
 const ALL_LISTED: &str = "every session in this worktree is already listed";
 
+/// What Tab says with every band open at once: there is no ACCORDION.
+const ALL_OPEN: &str =
+    "every worktree is already open (Settings → Appearance → Expand all worktrees)";
+
 /// What a terminal that left the tree between the draw and the key says.
 const TERMINAL_GONE: &str = "that terminal is gone";
 
@@ -444,11 +448,17 @@ fn select_terminal(app: &mut App, id: nebula_core::TerminalId, out: &mut Vec<Cli
 /// opened.
 ///
 /// Never what Enter does: Enter always opens the card itself
-/// ([`enter_pane`]), expanded or not.
+/// ([`enter_pane`]), expanded or not. With every band open at once
+/// (Settings → Appearance → **Expand all worktrees**) there is nothing to
+/// open or fold, and the footer says so.
 ///
 /// INPUT PARITY: the one function behind the key and a second click on
 /// a band's rule ([`click_band`]).
 pub(super) fn toggle_band_expand(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app.launcher_all_open {
+        app.flash = Some(ALL_OPEN.into());
+        return;
+    }
     let bands = view::bands(app);
     if bands.is_empty() {
         app.flash = Some(nothing_here(app).into());
@@ -1014,9 +1024,13 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
     // The cursor itself, aimed or not: a step from a card let go of
     // (Esc, the fold) starts where the eye last saw it, and takes the aim
     // back on landing. In the compact LIST every band is a column of
-    // entries, so the keys walk its lines wherever the cursor is.
+    // entries, so the keys walk its lines wherever the cursor is — and
+    // with every band open (**Expand all worktrees**) its rows of cards.
+    // The column it walks in goes with it onto the next band.
+    let mut col = 0;
     if let Some((band, layout)) = app.walked_band(&bands) {
         let at = view::card_cursor(app, &bands[band]);
+        col = at.and_then(|i| layout.row_of(i)).map_or(0, |(_, c)| c);
         // An EMPTY BAND (**Show all worktrees**) has no card to step to:
         // `j`/`k` go straight on to the band above or below it.
         let next = layout.stepped(at, dx, dy);
@@ -1042,18 +1056,24 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
         None => last as usize,
         Some(b) => (b as i64 + dy).clamp(0, last) as usize,
     };
-    if app.launcher_list && Some(next) != at {
+    if (app.launcher_list || app.launcher_all_open) && Some(next) != at {
         // The LIST reads as one column down every band: `j` off a band's
         // last line lands on the next band's first, `k` off its first on
         // the band above's last — not on whichever card that band last
-        // had, which may be lines away from where the eye is.
-        let entries = view::list_layout(app.body_area, &bands[next], false, None).rows;
+        // had, which may be lines away from where the eye is. Every band
+        // open reads the same way, row by row, in the column the cursor
+        // was in (or the row's last card, on a shorter row).
+        let entries = if app.launcher_list {
+            view::list_layout(app.body_area, &bands[next], app.launcher_all_open, None).rows
+        } else {
+            view::expanded_layout(app.body_area, &bands[next]).rows
+        };
         let edge = if dy > 0 {
             entries.first()
         } else {
             entries.last()
         };
-        if let Some(&card) = edge.and_then(|row| row.first()) {
+        if let Some(&card) = edge.and_then(|row| row.get(col).or(row.last())) {
             select_card(app, bands[next].cards[card].sref(), out);
             return;
         }
@@ -1547,6 +1567,32 @@ pub(super) fn open_project_menu(app: &mut App) {
         area: ratatui::layout::Rect::default(),
         parent: None,
     }));
+    app.dirty = true;
+}
+
+/// A click on the header's MORE CHIP (`2 more ▾`): the PROJECT TABS the
+/// row had no room for ([`App::launcher_tabs_more`]), listed under the
+/// chip in tab order the way the PROJECT DROPDOWN lists a project — its
+/// name and how many sessions it holds — and the pick opens it through
+/// the one [`open_project`] every way into a project ends in.
+/// INPUT IS NOT ACTION: `[` / `]`, the digits and the header's cursor
+/// reach the same tabs by walking onto them, which draws each in the lit
+/// tab's place.
+pub(super) fn open_more_tabs_menu(app: &mut App) {
+    let cards = view::project_cards(app);
+    let items: Vec<MenuItem> = app
+        .launcher_tabs_more
+        .iter()
+        .filter_map(|id| cards.iter().find(|card| &card.id == id))
+        .map(|card| {
+            MenuItem::new(
+                format!("{}  ({})", card.name, card.sessions.len()),
+                MenuAction::OpenProject(card.id.clone()),
+            )
+        })
+        .collect();
+    let at = crumb_anchor(app, &HitTarget::LauncherTabMore);
+    super::open_menu(app, items, at);
     app.dirty = true;
 }
 
@@ -4714,6 +4760,51 @@ mod tests {
         });
     }
 
+    /// The MORE CHIP is a button: either mouse button on it drops the
+    /// tabs the row had no room for, hung under the chip, and a pick opens
+    /// that project through the `open_project` the tabs and the `+`
+    /// dropdown end in.
+    #[test]
+    fn the_more_chip_lists_the_tabs_the_row_left_off() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            let (demo, web) = (ProjectId("p1".into()), ProjectId("p2".into()));
+            app.launcher_tabs = vec![demo, web.clone()];
+            for p in &mut app.tree.projects {
+                if p.id == web {
+                    p.name = "web-storefront-admin".into();
+                }
+            }
+            let width = (30..130u16)
+                .rev()
+                .find(|&w| {
+                    draw_at(&mut app, w, 34);
+                    !app.launcher_tabs_more.is_empty()
+                })
+                .expect("some width puts web in the chip");
+            assert_eq!(app.launcher_tabs_more, vec![web.clone()], "at {width}");
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTabMore);
+            let listed = |app: &App| -> Vec<String> {
+                let Some(Overlay::Menu(menu)) = &app.overlay else {
+                    panic!("the chip drops a list: {:?}", app.overlay);
+                };
+                assert_eq!(menu.at, Some((x, y + 1)), "it hangs off the chip");
+                menu.items.iter().map(|i| i.label.clone()).collect()
+            };
+
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y);
+            assert_eq!(listed(&app), ["web-storefront-admin  (1)"]);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(listed(&app), ["web-storefront-admin  (1)"]);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "the list closes: {:?}", app.overlay);
+            assert_eq!(app.selected_project().map(|p| p.id.clone()), Some(web));
+        });
+    }
+
     /// TYPE-AHEAD in the PROJECT DROPDOWN: letters narrow the rows to what
     /// they fuzzy-match rather than jumping the cursor, so a project is
     /// found by name instead of by scrolling. Backspace widens, Esc clears
@@ -5441,6 +5532,60 @@ mod tests {
             type_text(&mut app, "fix the css");
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(tab_state(&app).2, ["p2", "p1"]);
+        });
+    }
+
+    /// The ACCORDION is remembered per project: a band opened in `demo`
+    /// is still open after a trip to `web`, though a band was opened
+    /// there in between, and `web`'s is still open on the way back to it
+    /// — by the key or a click on the tab alike. One closed stays closed
+    /// in its own project only, and a relaunch brings back every
+    /// project's: the one on screen and the one a tab away.
+    #[test]
+    fn each_project_keeps_its_open_band_across_a_switch() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            let demo = app.launcher_expanded.clone();
+            assert!(demo.is_some(), "Tab opened demo's band");
+
+            key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+            assert_eq!(tab_state(&app).0.as_deref(), Some("web"));
+            assert_eq!(app.launcher_expanded, None, "web's bands start collapsed");
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            let web = Some(WorktreeId("w2root".into()));
+            assert_eq!(app.launcher_expanded, web, "Tab opened web's band");
+
+            key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+            assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
+            assert_eq!(app.launcher_expanded, demo, "demo's band is open again");
+
+            draw(&mut app);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTab(ProjectId("p2".into())));
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(tab_state(&app).0.as_deref(), Some("web"));
+            assert_eq!(
+                app.launcher_expanded, web,
+                "web's too, by a click on its tab"
+            );
+
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.launcher_expanded, None, "Esc closed web's band");
+            key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+            assert_eq!(app.launcher_expanded, demo, "demo's stayed open");
+            key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+            assert_eq!(app.launcher_expanded, None, "web's stayed closed");
+
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            let json = super::super::ui_state_json(&app);
+            let mut next = two_sessions();
+            super::super::restore_ui_state(&mut next, &json);
+            assert_eq!(tab_state(&next).0.as_deref(), Some("web"));
+            assert_eq!(next.launcher_expanded, web, "the relaunch opens web's band");
+            draw(&mut next);
+            key(&mut next, KeyCode::Char(']'), KeyModifiers::NONE);
+            assert_eq!(tab_state(&next).0.as_deref(), Some("demo"));
+            assert_eq!(next.launcher_expanded, demo, "and demo's, a tab away");
         });
     }
 
@@ -8729,30 +8874,40 @@ mod tests {
     }
 
     /// However narrow the terminal, the tabs and the count keep off each
-    /// other: a tab is cut, then counted rather than drawn — never drawn
-    /// over the count (the two are separate right/left-aligned paragraphs
-    /// on one row, so an overlong tab would overprint it) — and the `+`
-    /// is never pushed off.
+    /// other: the tabs are laid out first, and the count gives way whole
+    /// rather than being drawn over (the two are separate
+    /// right/left-aligned paragraphs on one row, so an overlong tab would
+    /// overprint it) — the lit tab's name is never the thing cut to make
+    /// room for it, and the `+` is never pushed off.
     #[test]
     fn the_header_never_overprints_its_count() {
         with_default_config(|| {
             let mut app = two_sessions();
             app.launcher_expanded = None;
-            // Below this the count itself no longer fits the row, and
-            // nothing that could be drawn there would be readable.
-            for width in 24..=130u16 {
+            let mut counted = 0;
+            // Below this the lit tab and its `×` are wider than the row.
+            for width in 20..=130u16 {
                 let text = buffer_text(&draw_at(&mut app, width, 50));
                 let head = text.lines().nth(1).unwrap_or_default().to_string();
-                assert!(head.contains("2 sessions"), "{width}: {head:?}");
-                // The tabs end before the count begins: the gap between
-                // the two is real air, not a letter eaten by one of them.
-                let tabs = head.split("2 sessions").next().unwrap_or_default();
+                assert!(head.contains('+'), "{width}: {head:?}");
                 assert!(
-                    tabs.ends_with("  "),
-                    "{width}: tabs run into the count: {head:?}"
+                    head.contains(" demo"),
+                    "{width}: the lit tab, whole: {head:?}"
                 );
-                assert!(tabs.contains('+'), "{width}: {head:?}");
+                if let Some((tabs, _)) = head.split_once("2 sessions") {
+                    // The tabs end before the count begins: the gap
+                    // between the two is real air, not a letter eaten by
+                    // one of them.
+                    assert!(
+                        tabs.ends_with("  "),
+                        "{width}: tabs run into the count: {head:?}"
+                    );
+                    counted += 1;
+                } else {
+                    assert!(!head.contains("session"), "{width}: half a count: {head:?}");
+                }
             }
+            assert!(counted > 0, "some width has room for the count");
             // Wide enough for the tab whole.
             draw_at(&mut app, 130, 34);
             assert_eq!(tabs_drawn(&app), ["demo"]);
@@ -9680,6 +9835,123 @@ mod tests {
             }
             key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
             assert_eq!(cursor_card(&app), at(0, 2), "onto the last line above");
+        });
+    }
+
+    // ---- EXPAND ALL WORKTREES ----
+
+    /// [`list_of_five`] as cards, with **Expand all worktrees** on:
+    /// `demo`'s root band holds five sessions, the `feat` band one.
+    fn all_open_of_five() -> App {
+        let mut app = list_of_five();
+        app.launcher_list = false;
+        app.launcher_all_open = true;
+        app
+    }
+
+    /// Settings → Appearance → **Expand all worktrees** reaches the app
+    /// the way every setting does (`apply_config`), off out of the box.
+    #[test]
+    fn the_expand_all_worktrees_setting_reaches_the_app() {
+        with_config_json(r#"{"expand_all_worktrees": true}"#, || {
+            let mut app = two_sessions();
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(app.launcher_all_open);
+        });
+        with_default_config(|| {
+            let mut app = two_sessions();
+            app.launcher_all_open = true;
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(!app.launcher_all_open, "off out of the box");
+        });
+    }
+
+    /// With **Expand all worktrees** on every band shows every card at
+    /// once, wrapped into rows under its rule — no strip, no `▸ N more`,
+    /// no `Tab:` verb on the rule — and Tab, or a second click on a rule,
+    /// opens and folds nothing: the footer says why, the one function
+    /// behind both (INPUT PARITY). Esc has no band to close, so the first
+    /// press lets the card go.
+    #[test]
+    fn expand_all_worktrees_shows_every_card_and_tab_opens_nothing() {
+        with_default_config(|| {
+            let mut app = all_open_of_five();
+            let bands = crate::launcher::bands(&app);
+            assert_eq!(bands[0].cards.len(), 5);
+            super::select_card(&mut app, bands[0].cards[0].sref(), &mut Vec::new());
+            let term = draw_tall(&mut app);
+            let root = drawn_entries(&app, 0);
+            assert_eq!(root.len(), 5, "every card of the root band");
+            let rows: std::collections::BTreeSet<u16> = root.iter().map(|(_, r)| r.y).collect();
+            assert!(rows.len() > 1, "wrapped into rows: {root:?}");
+            assert_eq!(drawn_entries(&app, 1).len(), 1, "and feat's one");
+            for index in 0..bands.len() {
+                assert!(app.hit_rect(&HitTarget::LauncherBandMore(index)).is_none());
+                assert!(app.hit_rect(&HitTarget::LauncherStripLeft(index)).is_none());
+                assert!(app
+                    .hit_rect(&HitTarget::LauncherStripRight(index))
+                    .is_none());
+            }
+            let screen = buffer_text(&term);
+            for verb in [": collapse", ": expand", ": see all"] {
+                assert!(!screen.contains(verb), "no {verb:?} on a rule:\n{screen}");
+            }
+
+            // A band the accordion remembered stays remembered, unread.
+            app.launcher_expanded = Some(bands[1].worktree.clone());
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(app.flash.as_deref(), Some(super::ALL_OPEN));
+            assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[1].worktree));
+            draw_tall(&mut app);
+            assert_eq!(drawn_entries(&app, 0).len(), 5, "still every card");
+
+            let rule = app
+                .hit_rect(&HitTarget::LauncherBand(1))
+                .expect("feat's rule");
+            let (x, y) = (rule.x + rule.width - 2, rule.y);
+            app.flash = None;
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            draw_tall(&mut app);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(app.flash.as_deref(), Some(super::ALL_OPEN), "as Tab says");
+            assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[1].worktree));
+
+            app.flash = None;
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.launcher_unaimed, "the first Esc lets the card go");
+            assert_eq!(app.flash.as_deref(), Some(super::UNAIMED));
+        });
+    }
+
+    /// With every band open `h`/`j`/`k`/`l` walk the rows of cards as the
+    /// open band's are walked, and `j` off a band's last row lands on the
+    /// next band's first row in the column the cursor was in — the row's
+    /// last card on a shorter row — and `k` back onto the last row above.
+    #[test]
+    fn expand_all_worktrees_walks_the_rows_across_worktrees() {
+        with_default_config(|| {
+            let mut app = all_open_of_five();
+            let bands = crate::launcher::bands(&app);
+            draw_tall(&mut app);
+            assert_eq!(
+                crate::launcher::expanded_layout(app.body_area, &bands[0]).rows,
+                vec![vec![0, 1, 2], vec![3, 4]],
+                "three cards to a row at 130 columns"
+            );
+            super::select_card(&mut app, bands[0].cards[0].sref(), &mut Vec::new());
+            let at = |band, card| Some(crate::launcher::CardRef { band, card });
+            for (code, want) in [
+                (KeyCode::Char('l'), at(0, 1)),
+                (KeyCode::Char('j'), at(0, 4)),
+                (KeyCode::Char('j'), at(1, 0)),
+                (KeyCode::Char('j'), at(1, 0)),
+                (KeyCode::Char('k'), at(0, 3)),
+                (KeyCode::Char('k'), at(0, 0)),
+            ] {
+                key(&mut app, code, KeyModifiers::NONE);
+                draw_tall(&mut app);
+                assert_eq!(cursor_card(&app), want, "after {code:?}");
+            }
         });
     }
 

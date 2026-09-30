@@ -20,6 +20,8 @@ use crossterm::event::KeyboardEnhancementFlags;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{BufWriter, Stdout, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::thread::ThreadId;
 use std::time::Duration;
@@ -116,7 +118,57 @@ pub fn restore_terminal() {
         crossterm::event::DisableMouseCapture,
         LeaveAlternateScreen,
     );
+    // Nebula never changes its own cwd. Hand that directory back to the
+    // shell instead of leaving the last previewed checkout on the host.
+    if !nebula_core::host::is_remote_session() {
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut stdout = std::io::stdout().lock();
+            let _ = write_working_directory(&mut stdout, &cwd);
+            let _ = stdout.flush();
+        }
+    }
     let _ = disable_raw_mode();
+}
+
+/// Publish the visible session's checkout through OSC 7, so the outer
+/// terminal can resolve relative links even though child OSCs are consumed
+/// by vt100. An unchanged directory produces no output.
+pub(super) fn report_working_directory(
+    app: &crate::app::App,
+    sent: &mut Option<PathBuf>,
+    w: &mut impl Write,
+) -> std::io::Result<()> {
+    // ponytail: local checkout roots only; child-shell cd and remote host
+    // identity need separate tracking, never advertise SSH paths as local.
+    if app.is_remote {
+        return Ok(());
+    }
+    let cwd = super::attached_worktree_root(app).or_else(|| std::env::current_dir().ok());
+    if cwd != *sent {
+        if let Some(path) = &cwd {
+            write_working_directory(w, path)?;
+            w.flush()?;
+        }
+        *sent = cwd;
+    }
+    Ok(())
+}
+
+fn write_working_directory(w: &mut impl Write, path: &Path) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Ok(());
+    }
+    w.write_all(b"\x1b]7;file://localhost")?;
+    // Encode raw path bytes: spaces, URL delimiters and terminal controls
+    // must stay filename data, and non-UTF-8 names must round-trip too.
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            w.write_all(&[byte])?;
+        } else {
+            write!(w, "%{byte:02X}")?;
+        }
+    }
+    w.write_all(b"\x1b\\")
 }
 
 /// Wrap whatever panic hook is installed (the crash log's, which chains to
@@ -221,6 +273,111 @@ pub(super) fn watch_held_key(w: &mut impl Write, on: bool) -> std::io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{App, AttachedTerm};
+    use crate::event_loop::tests::{seed_feat_worktree, seed_tree};
+    use nebula_core::{AgentId, SessionRef, TerminalId, TerminalTab, WorktreeId};
+
+    #[test]
+    fn working_directory_follows_the_attached_agent_not_the_sidebar() {
+        let mut app = App::new();
+        app.is_remote = false;
+        seed_tree(&mut app);
+        seed_feat_worktree(&mut app, "w2", "links");
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        let mut sent = None;
+        let mut out = Vec::new();
+        report_working_directory(&app, &mut sent, &mut out).unwrap();
+        assert_eq!(text(&out), "\x1b]7;file://localhost/tmp/demo\x1b\\");
+        out.clear();
+        report_working_directory(&app, &mut sent, &mut out).unwrap();
+        assert!(out.is_empty(), "unchanged cwd is not repeated");
+
+        // An agent moved checkout while the sidebar still selects main.
+        app.tree.agents[0].worktree_id = WorktreeId("w2".into());
+        assert_eq!(
+            app.selected_worktree().unwrap().path,
+            Path::new("/tmp/demo")
+        );
+        report_working_directory(&app, &mut sent, &mut out).unwrap();
+        assert_eq!(
+            text(&out),
+            "\x1b]7;file://localhost/tmp/demo-worktrees/links\x1b\\"
+        );
+
+        out.clear();
+        app.term = None;
+        report_working_directory(&app, &mut sent, &mut out).unwrap();
+        assert_eq!(text(&out), "\x1b]7;file://localhost/tmp/demo\x1b\\");
+    }
+
+    #[test]
+    fn working_directory_follows_an_attached_shell_and_leaves_ssh_alone() {
+        let mut app = App::new();
+        app.is_remote = false;
+        seed_tree(&mut app);
+        seed_feat_worktree(&mut app, "w2", "shell");
+        let id = TerminalId("t1".into());
+        app.tree.terminals.push(TerminalTab {
+            id: id.clone(),
+            worktree_id: WorktreeId("w2".into()),
+            name: "shell".into(),
+            sort_order: 0,
+            alive: true,
+            run_command: None,
+        });
+        app.term = Some(AttachedTerm::new(SessionRef::Terminal(id), 80, 24));
+        let mut sent = None;
+        let mut out = Vec::new();
+        report_working_directory(&app, &mut sent, &mut out).unwrap();
+        assert_eq!(
+            text(&out),
+            "\x1b]7;file://localhost/tmp/demo-worktrees/shell\x1b\\"
+        );
+
+        app.is_remote = true;
+        sent = None;
+        out.clear();
+        report_working_directory(&app, &mut sent, &mut out).unwrap();
+        assert!(
+            out.is_empty(),
+            "remote paths must not become local file URLs"
+        );
+        assert!(sent.is_none());
+    }
+
+    #[test]
+    fn working_directory_encodes_url_delimiters_controls_and_non_utf8_bytes() {
+        let path = Path::new(std::ffi::OsStr::from_bytes(
+            b"/tmp/a b#?%/caf\xc3\xa9/\xff\x07\x1b\\",
+        ));
+        let mut out = Vec::new();
+        write_working_directory(&mut out, path).unwrap();
+        assert_eq!(
+            text(&out),
+            "\x1b]7;file://localhost/tmp/a%20b%23%3F%25/caf%C3%A9/%FF%07%1B%5C\x1b\\"
+        );
+        out.clear();
+        write_working_directory(&mut out, Path::new("relative/path")).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn working_directory_retries_a_failed_write() {
+        let mut app = App::new();
+        app.is_remote = false;
+        seed_tree(&mut app);
+        let mut sent = None;
+        let mut full = &mut [][..];
+        assert!(report_working_directory(&app, &mut sent, &mut full).is_err());
+        assert!(sent.is_none(), "only a successful write counts as reported");
+        let mut out = Vec::new();
+        report_working_directory(&app, &mut sent, &mut out).unwrap();
+        assert_eq!(text(&out), "\x1b]7;file://localhost/tmp/demo\x1b\\");
+    }
 
     #[test]
     fn a_worker_thread_panic_is_counted_and_leaves_the_terminal_alone() {

@@ -125,6 +125,11 @@ pub enum HitTarget {
     /// by type-ahead, with a row for opening a folder that is not one yet
     /// — and the pick opens a tab.
     LauncherTabAdd,
+    /// The MORE CHIP after the last tab drawn — `2 more ▾` — standing
+    /// in for the tabs the row had no room for: a click, or a
+    /// right-click, drops the list of just those under it
+    /// ([`App::launcher_tabs_more`]), and the pick opens that project.
+    LauncherTabMore,
     /// Draggable top edge of the LAUNCHER VIEW's PANE: the blank row the
     /// pane opens with, plus the grid row above it. Registered ahead of
     /// the cards so a card ending on that row never swallows the grab.
@@ -2557,12 +2562,13 @@ pub struct TermCallbacks {
 /// The last lines a TERMINAL printed, as its card on the grid shows them
 /// (`launcher_view::draw_chip`): the end of its ring, asked of the daemon on
 /// the grid's beat (`event_loop::request_terminal_tails`) and laid out
-/// through a throwaway screen (`terminal_tail::parse_tail`). `end_seq` is
-/// the ring end the lines came from, sent back with the next ask so an
-/// idle terminal answers with nothing.
+/// through a throwaway screen (`terminal_tail::parse_tail`), each row in
+/// the colours it was printed in. `end_seq` is the ring end the lines
+/// came from, sent back with the next ask so an idle terminal answers
+/// with nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TerminalTail {
-    pub lines: Vec<String>,
+    pub lines: Vec<crate::terminal_tail::TailRow>,
     pub end_seq: u64,
 }
 
@@ -2804,6 +2810,12 @@ pub struct UiState {
     /// collapsed.
     #[serde(default)]
     pub launcher_expanded: Option<String>,
+    /// The band every project was left with open
+    /// ([`App::launcher_open_bands`]), project id to worktree id, the one
+    /// on screen included; absent in older blobs, which remember only
+    /// the one in `launcher_expanded`.
+    #[serde(default)]
+    pub launcher_open_bands: HashMap<String, String>,
     /// The LAUNCHER VIEW's PROJECT TABS, by project id, far left first;
     /// absent in older blobs, which open with the one project restored.
     #[serde(default)]
@@ -3226,6 +3238,13 @@ pub struct App {
     /// (`event_loop::apply_config`). What a frame lays out is
     /// [`App::panel_layout`].
     pub launcher_list: bool,
+    /// Every BAND is laid out open at once — its cards wrapped into rows,
+    /// or every entry of the LIST listed — and there is no ACCORDION:
+    /// Settings → Appearance → **Expand all worktrees**
+    /// (`event_loop::apply_config`). [`App::launcher_expanded`] is kept
+    /// as it was but read by nothing while this is on, so switching it
+    /// off brings back the band that was open.
+    pub launcher_all_open: bool,
     /// The LAUNCHER VIEW's PANE is folded away (`^~`): the GRID takes the
     /// whole body and no session is read under it. Hiding it also lets
     /// the card under the cursor go (`event_loop::launcher::toggle_pane`
@@ -3241,6 +3260,13 @@ pub struct App {
     /// across restarts, so a project reopens with the checkout it was
     /// left looking into still open.
     pub launcher_expanded: Option<WorktreeId>,
+    /// The band each OTHER project was left with open, by project: a
+    /// switch files [`App::launcher_expanded`] away under the project
+    /// being left and brings back the one the new project had
+    /// (`event_loop::carry_open_band`), so switching away and back finds
+    /// the band still open, whatever was opened elsewhere in between.
+    /// Remembered across restarts with the one on screen.
+    pub launcher_open_bands: HashMap<ProjectId, WorktreeId>,
     /// How far the whole GRID is scrolled: rows of its panel layout
     /// (`launcher::panel_layout`) above the window's top edge, the way a
     /// terminal's screen scrolls through its history. Collapsed bands
@@ -3314,6 +3340,11 @@ pub struct App {
     /// cards, which is every other moment: Esc, a click anywhere, and any
     /// other key hand them back. Never remembered across a restart.
     pub launcher_tab_cursor: Option<ProjectId>,
+    /// The PROJECT TABS the header last had no room for, in tab order —
+    /// the ones its MORE CHIP stands in for and lists when clicked.
+    /// Written by the draw, as the hit rects are, so the list a click
+    /// drops is the one the chip on screen counts.
+    pub launcher_tabs_more: Vec<ProjectId>,
     /// The git repository this instance was started in
     /// ([`launch_repo`]), read once at launch: the folder the first run's
     /// SPLASH opens on Enter and the open-project prompt starts on.
@@ -3725,6 +3756,11 @@ pub struct App {
     /// Mirrors the config, refreshed at startup and when the settings
     /// overlay applies a change.
     pub hide_card_marks: bool,
+    /// The `highlight_current_card` setting: the cursor's card is washed
+    /// faintly in its status color instead of the gray fill
+    /// (`launcher_view::card_tint`). Mirrors the config, refreshed at
+    /// startup and when the settings overlay applies a change.
+    pub highlight_current_card: bool,
     /// The ROWS MEMO, armed by the frame and by [`App::reading_url`].
     pub rows_memo: RowsMemo,
 }
@@ -3775,8 +3811,10 @@ impl App {
             launcher_pane_w: None,
             launcher_pane_at: crate::launcher::PaneSide::default(),
             launcher_list: false,
+            launcher_all_open: false,
             launcher_pane_hidden: false,
             launcher_expanded: None,
+            launcher_open_bands: HashMap::new(),
             launcher_scroll: 0,
             launcher_scroll_held: false,
             launcher_scroll_on: None,
@@ -3788,6 +3826,7 @@ impl App {
             launcher_tabs: Vec::new(),
             projects_closed: false,
             launcher_tab_cursor: None,
+            launcher_tabs_more: Vec::new(),
             launch_repo: None,
             launcher_body: Rect::default(),
             key_combo: None,
@@ -3889,6 +3928,7 @@ impl App {
             show_all_worktrees: false,
             black_background: false,
             hide_card_marks: false,
+            highlight_current_card: false,
             rows_memo: RowsMemo::default(),
         }
     }
@@ -4224,8 +4264,13 @@ impl App {
     /// The band OPEN as the ACCORDION ([`App::launcher_expanded`]), while
     /// the checkout it names still has a band on this grid. None with
     /// every band collapsed, and none while the open checkout is another
-    /// project's, or has nothing running in it any more.
+    /// project's, or has nothing running in it any more. None too with
+    /// every band open ([`App::launcher_all_open`]): there is no
+    /// accordion then, so nothing for Esc to close.
     pub fn open_band(&self, bands: &[crate::launcher::Band]) -> Option<usize> {
+        if self.launcher_all_open {
+            return None;
+        }
         let open = self.launcher_expanded.as_ref()?;
         bands.iter().position(|b| &b.worktree == open)
     }
@@ -4245,16 +4290,23 @@ impl App {
     /// (`launcher::panel_layout`), or, in the compact LIST
     /// ([`App::launcher_list`]), every band's entries stacked under its
     /// rule, the cursor's card among them wherever it sits
-    /// (`launcher::list_panel_layout`). The draw, the wheel and the keys
+    /// (`launcher::list_panel_layout`). With every band open
+    /// ([`App::launcher_all_open`]) each is laid out as the open one is
+    /// (`launcher::open_panel_layout`). The draw, the wheel and the keys
     /// all read this one, so what `j`/`k` walk is what is on screen.
     pub fn panel_layout(&self, bands: &[crate::launcher::Band]) -> crate::launcher::PanelLayout {
         if self.launcher_list {
             crate::launcher::list_panel_layout(
                 self.body_area,
                 bands,
-                self.launcher_expanded.as_ref(),
+                self.launcher_expanded
+                    .as_ref()
+                    .filter(|_| !self.launcher_all_open),
+                self.launcher_all_open,
                 crate::launcher::cursor(self, bands),
             )
+        } else if self.launcher_all_open {
+            crate::launcher::open_panel_layout(self.body_area, bands)
         } else {
             crate::launcher::panel_layout(self.body_area, bands, self.launcher_expanded.as_ref())
         }
@@ -4263,13 +4315,15 @@ impl App {
     /// The band whose cards the keys walk as rows, and those rows: the
     /// ACCORDION's open band while the cursor is on it — or, in the
     /// compact LIST, whichever band the cursor is on, every band there
-    /// being a column of entries. None on a collapsed band of cards, where
-    /// `h`/`l` walk the STRIP and `j`/`k` the bands.
+    /// being a column of entries — and, with every band open
+    /// ([`App::launcher_all_open`]), whichever band the cursor is on too.
+    /// None on a collapsed band of cards, where `h`/`l` walk the STRIP
+    /// and `j`/`k` the bands.
     pub fn walked_band(
         &self,
         bands: &[crate::launcher::Band],
     ) -> Option<(usize, crate::launcher::ExpandedLayout)> {
-        if self.launcher_list {
+        if self.launcher_list || self.launcher_all_open {
             let index = crate::launcher::band_cursor(self, bands)?;
             let layout = self.panel_layout(bands).bands.swap_remove(index).content?;
             return Some((index, layout));

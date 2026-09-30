@@ -5,7 +5,11 @@
 //! a `CreateWorktree` first, the launch riding its PENDING INTENT, and
 //! the same `CreateAgent` once the Ack names the checkout: retargeted at
 //! it, the cursor moved onto its row, FOCUS left on the panel `p` was
-//! pressed in. Both rows are on screen from the moment Enter is pressed —
+//! pressed in. With FOLLOW NEW SESSION (`Config::follow_new_session`,
+//! on by default) turned off, either launch fired from a session card holds
+//! still: the rows go up and the Acks are born left behind, as a
+//! BACKGROUND LAUNCH's are, so the cursor and the pane stay on that
+//! card. Both rows are on screen from the moment Enter is pressed —
 //! stand-ins (`placeholder`) that the Acks turn into the real rows. A
 //! launch for a pull request (`QuickLaunch::pr` — `e` on an OPEN PRS
 //! row, through the preset picker) is a `CreatePrAgent` instead: the
@@ -50,23 +54,31 @@ pub(super) fn submit(
     // going up (`placeholder::stage_agent`).
     let background = crate::launcher::project_of(app, &launch.target)
         .is_some_and(|project| crate::launcher::is_background(app, &project));
+    let cfg = crate::config::Config::load();
+    // Unless FOLLOW NEW SESSION is on, a launch into the project on screen
+    // holds just as still: the new card goes up in its band and the one
+    // the user was on stays under the cursor and in the pane.
+    let stay = background || stays_put(app, &cfg);
     // The launch lands on a card, so the GRID has an aim again whether or
     // not it had one when the box went up (`launcher::clear_aim`).
     super::launcher::take_aim(app);
     if background {
         announce_background(app, &launch.target);
+    } else if stay {
+        announce_kept(app, &launch);
     } else {
         reveal_pane(app);
     }
     // The box is the one launch that stays out of the way by default:
-    // `p`, type, Enter, keep working, the new session in the pane but the
-    // keys still on the cards — unless the `quick_prompt_focus` SETTING
-    // says to take the pane, as a picker-walked launch (`n`) does.
-    let focus_pane = !background && crate::config::Config::load().quick_prompt_focus;
+    // `p`, type, Enter, keep working — on the card you were on, or, with
+    // FOLLOW NEW SESSION on, with the new session in the pane, the keys
+    // still on the cards — unless the `quick_prompt_focus` SETTING says to take
+    // the pane, as a picker-walked launch (`n`) does.
+    let focus_pane = !stay && cfg.quick_prompt_focus;
     match launch.target.clone() {
         QuickTarget::Worktree(worktree) => {
             let draft = AgentLaunchDraft {
-                follow: !background,
+                follow: !stay,
                 ..draft(launch, worktree, text, focus_pane, None)
             };
             create_agent(app, draft, out)
@@ -89,6 +101,7 @@ pub(super) fn submit(
                 launch.model.clone(),
                 launch.effort.clone(),
                 first_prompt,
+                !stay,
                 out,
             );
 
@@ -104,7 +117,7 @@ pub(super) fn submit(
                     placeholder,
                     focus: focus_pane,
                 },
-                !background,
+                !stay,
                 |req_id| ClientRequest::CreateWorktree {
                     req_id,
                     project,
@@ -124,6 +137,37 @@ pub(super) fn submit(
 fn reveal_pane(app: &mut App) {
     app.launcher_pane_hidden = false;
     app.dirty = true;
+}
+
+/// Does this launch leave the user where they are? It does unless FOLLOW
+/// NEW SESSION (`Config::follow_new_session`) is on, and only when there
+/// is a session in front of the user to keep there: a launch fired from
+/// a session card — one under the grid's cursor, read in the pane. With
+/// no card aimed at, or on an empty band, there is nothing to lose and
+/// the cursor lands on the new session as it always has. A box that
+/// enters the new session's pane (`quick_prompt_focus`) has to go there,
+/// so that SETTING on outranks this.
+fn stays_put(app: &App, cfg: &crate::config::Config) -> bool {
+    !cfg.follow_new_session
+        && !cfg.quick_prompt_focus
+        && !app.launcher_unaimed
+        && app
+            .selected_session_row()
+            .is_some_and(|row| row.sref().is_some())
+}
+
+/// What a launch that stayed put says: the card it put up can land
+/// in a band scrolled out of sight, and the box closing on its own would
+/// otherwise look like Enter did nothing.
+fn announce_kept(app: &mut App, launch: &QuickLaunch) {
+    let branch = match &launch.pr {
+        Some(pr) => Some(pr.head.clone()),
+        None => crate::quick_prompt::target_branch(app, launch),
+    };
+    app.flash = Some(match branch {
+        Some(branch) => format!("started a session in {branch}"),
+        None => "started a session".into(),
+    });
 }
 
 /// The only trace a BACKGROUND LAUNCH leaves on screen: the footer names
@@ -233,7 +277,7 @@ mod tests {
     //! The box's send in the LAUNCHER VIEW, through the loop's own entry
     //! points: Enter puts the new session in the pane and leaves the keys
     //! on the cards.
-    use super::super::tests::{buffer_text, hse, seed_tree, with_default_config};
+    use super::super::tests::{buffer_text, hse, seed_tree, with_config_json, with_default_config};
     use super::super::{handle_server_event, handle_terminal_event};
     use crate::app::{App, Focus};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -243,6 +287,13 @@ mod tests {
     };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    /// The setting that lands the cursor and the pane on the new session,
+    /// for the tests about where it lands.
+    const FOLLOW_ON: &str = r#"{"follow_new_session": true}"#;
+
+    /// The setting turned off, for the tests about a launch that stays put.
+    const FOLLOW_OFF: &str = r#"{"follow_new_session": false}"#;
 
     fn draw(app: &mut App) {
         let mut terminal = Terminal::new(TestBackend::new(130, 34)).unwrap();
@@ -353,6 +404,180 @@ mod tests {
         });
     }
 
+    /// The card the cursor starts on, read in the pane — where a launch
+    /// is fired from.
+    fn on_card(app: &mut App) -> Option<SessionRef> {
+        draw(app);
+        super::super::preview_selected_now(app, &mut Vec::new());
+        let card = Some(SessionRef::Agent(AgentId("a1".into())));
+        assert_eq!(pane(app), card, "the pane reads the card");
+        card
+    }
+
+    fn cursor(app: &App) -> Option<AgentId> {
+        app.selected_session().map(|a| a.id)
+    }
+
+    /// FOLLOW NEW SESSION off: Enter from a card leaves that card
+    /// under the cursor and in the pane, the keys where they were, while
+    /// the new session's card goes up at the head of the band — through
+    /// its upsert, its Ack and its first turn, each of which re-sorts the
+    /// band under a cursor that is a row index. The card the user is on
+    /// is mid-turn, which counts as *now*: the fresh new card sorts under
+    /// it until the Ack puts it first (`App::just_launched`).
+    #[test]
+    fn enter_from_a_card_keeps_it_under_the_cursor_and_in_the_pane() {
+        with_config_json(FOLLOW_OFF, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            hse(
+                &mut app,
+                ServerEvent::StatusChanged {
+                    agent: AgentId("a1".into()),
+                    status: AgentStatus::Running,
+                    changed_at: 1,
+                    unseen: false,
+                },
+            );
+            let card = on_card(&mut app);
+            let focus = app.focus;
+
+            let (req_id, worktree) = launch(&mut app, KeyModifiers::NONE);
+            assert!(
+                app.left_behind.contains(&req_id),
+                "the Ack is born left behind"
+            );
+            assert_eq!(app.flash.as_deref(), Some("started a session in main"));
+            acked(&mut app, req_id, &worktree);
+
+            assert_eq!(
+                app.visible_sessions().first().map(|a| a.id.0.clone()),
+                Some("a9".into()),
+                "the new card leads the band"
+            );
+            assert_eq!(
+                cursor(&app),
+                Some(AgentId("a1".into())),
+                "the cursor stayed"
+            );
+            assert_eq!(pane(&app), card, "and so did the pane");
+            assert_eq!(app.focus, focus);
+            assert!(!app.term_locked);
+
+            hse(
+                &mut app,
+                ServerEvent::StatusChanged {
+                    agent: AgentId("a9".into()),
+                    status: AgentStatus::Running,
+                    changed_at: crate::app::now_ms(),
+                    unseen: false,
+                },
+            );
+            assert_eq!(cursor(&app), Some(AgentId("a1".into())), "its first turn");
+            assert_eq!(pane(&app), card);
+        });
+    }
+
+    /// The same for a box `^N` flipped onto a fresh worktree: the two
+    /// stand-in rows go up in a band of their own without the cursor,
+    /// and neither Ack — the checkout's, then the session's — takes it
+    /// there.
+    #[test]
+    fn a_launch_into_a_fresh_worktree_keeps_the_card_too() {
+        with_config_json(FOLLOW_OFF, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let card = on_card(&mut app);
+            let focus = app.focus;
+
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            type_text(&mut app, "tidy the nav");
+            key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let (req_id, branch) = match out.as_slice() {
+                [ClientRequest::CreateWorktree { req_id, branch, .. }] => (*req_id, branch.clone()),
+                other => panic!("one CreateWorktree: {other:?}"),
+            };
+            assert!(app.left_behind.contains(&req_id));
+            assert_eq!(
+                app.flash.as_deref(),
+                Some(format!("started a session in {branch}").as_str())
+            );
+            assert!(
+                app.tree.worktrees.iter().any(|w| w.branch == branch),
+                "the stand-in checkout is up"
+            );
+            assert_eq!(app.tree.agents.len(), 2, "and its session");
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+            assert_eq!(cursor(&app), Some(AgentId("a1".into())));
+            assert_eq!(pane(&app), card);
+
+            let real = WorktreeId("w3".into());
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: real.clone(),
+                        project_id: ProjectId("p1".into()),
+                        path: "/tmp/demo-w3".into(),
+                        branch,
+                        is_main: false,
+                        sort_order: 0,
+                    }),
+                },
+            );
+            let mut out = Vec::new();
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Worktree(real.clone())),
+                },
+                &mut out,
+            );
+            let create = match out.as_slice() {
+                [ClientRequest::CreateAgent {
+                    req_id, worktree, ..
+                }] if *worktree == real => *req_id,
+                other => panic!("the create goes into the new checkout: {other:?}"),
+            };
+            assert!(app.left_behind.contains(&create), "born left behind too");
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+            assert_eq!(cursor(&app), Some(AgentId("a1".into())));
+
+            acked(&mut app, create, &real);
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+            assert_eq!(cursor(&app), Some(AgentId("a1".into())));
+            assert_eq!(pane(&app), card);
+            assert_eq!(app.focus, focus);
+        });
+    }
+
+    /// FOLLOW NEW SESSION on, the default: the cursor and the pane land on
+    /// the new card and the grid scrolls to keep it on screen — selected,
+    /// not entered: the keys stay on the cards and the pane is not locked.
+    #[test]
+    fn follow_new_session_lands_on_the_new_card() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            on_card(&mut app);
+            let focus = app.focus;
+            let (req_id, worktree) = launch(&mut app, KeyModifiers::NONE);
+            assert!(!app.left_behind.contains(&req_id));
+            acked(&mut app, req_id, &worktree);
+            assert_eq!(cursor(&app), Some(AgentId("a9".into())));
+            assert_eq!(pane(&app), new_session());
+            assert_eq!(
+                app.launcher_scroll_on,
+                new_session(),
+                "the grid scrolled to it"
+            );
+            assert_eq!(app.focus, focus, "the keys stay on the cards");
+            assert!(!app.term_locked);
+        });
+    }
+
     /// The box's border no longer offers a launch that takes the pane.
     #[test]
     fn the_box_border_names_no_cmd_enter() {
@@ -374,7 +599,7 @@ mod tests {
     /// in front of it.
     #[test]
     fn enter_takes_the_pane_off_a_terminal_chip() {
-        with_default_config(|| {
+        with_config_json(FOLLOW_ON, || {
             let mut app = App::new();
             seed_tree(&mut app);
             hse(
@@ -410,7 +635,7 @@ mod tests {
     #[test]
     fn cmd_enter_is_the_plain_launch() {
         for mods in [KeyModifiers::SUPER, KeyModifiers::CONTROL] {
-            with_default_config(|| {
+            with_config_json(FOLLOW_ON, || {
                 let mut app = App::new();
                 seed_tree(&mut app);
                 draw(&mut app);

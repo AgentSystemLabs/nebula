@@ -126,7 +126,8 @@ project on the machine, and `x` closes a tab without touching its sessions.
 
 **3. Start the agent.** `p` opens the QUICK PROMPT, focused, so the first thing you type is the task.
 `Enter` launches it — with the harness, model and effort the Agents tab defaults name, in the checkout
-under the cursor — and the new card shows up in the grid with its terminal in the pane. For one launch
+under the cursor — and the cursor and the pane land on the new card as it shows up in the grid
+(turn off **Follow new** in Settings → Agents to stay on the card you were on). For one launch
 only, `Tab` picks another harness (**Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build** or **OpenCode**, `→`
 for MODEL and EFFORT), `Ctrl+O` a model, `Ctrl+T` any checkout of the project, `Ctrl+P` any project on the
 machine (a launch aimed elsewhere runs in the background and the footer says where it went). Send the

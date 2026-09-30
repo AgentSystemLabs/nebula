@@ -2,6 +2,11 @@
 
 <sub>[← README](../README.md) · [Keys](keys.md) · [Commands](commands.md) · [Sessions](sessions.md) · [Configuration](configuration.md) · [How it works](how-it-works.md)</sub>
 
+- **Relative links in the host terminal.** On local sessions, nebula reports the displayed
+  agent or shell's checkout root through OSC 7, so the host terminal can resolve relative
+  file links. With no attached session it reports the selected checkout; on exit it restores
+  nebula's launch directory. This follows checkout changes, not `cd` inside a child shell.
+  SSH sessions leave the host's directory unchanged rather than label remote paths as local.
 - **Detached daemon (tmux-style).** A background `nebula` daemon owns every PTY, so agents keep running
   when the TUI closes. The TUI is a client that attaches over a unix socket (`$XDG_RUNTIME_DIR/nebula/`
   or `/tmp/nebula-<uid>/`, mode 0700). Quit the TUI, relaunch later, and your sessions are still alive

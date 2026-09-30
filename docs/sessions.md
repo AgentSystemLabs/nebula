@@ -237,7 +237,12 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   needs the chord: the details row is a row of buttons, and a click on `project …`, `worktree …`,
   `harness …` or `model …` — or on the `[ ] new worktree` toggle across from the question — opens
   exactly what the chord printed beside it opens, box and task still in front of you. Enter
-  launches; Esc leaves the box for the grid, keeping what you typed — `p` opens on it again.
+  launches, and the cursor and the pane land on the new card as it goes up in its band, the grid
+  scrolling to it and the keys still on the grid. Turn off **Follow new** under **Quick prompt** in
+  Settings → Agents and nothing you were looking at moves instead: the cursor and the pane stay on
+  the card you were on, and the footer names the branch the new session went to (`started a session
+  in feat`). Esc leaves the box for the grid, keeping what you typed — `p`
+  opens on it again.
 - **The grid** takes the top of the body: every unarchived session of
   the **selected project**, most recently touched first, as a wall
   of cards — up to four a row, fewer as the terminal narrows,
@@ -283,9 +288,15 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   row, `+ open a folder…`, for a folder that is not a project yet (the prompt `o` opens). It takes
   **type-ahead** — letters narrow the rows to what they fuzzy-match, best first, `↑`/`↓` move,
   Backspace widens, Esc clears the query before it closes the list — so opening a project is its
-  name and Enter. Tabs that do not fit the row are
-  counted at the edge they went past (`‹2`, `3›`), and the lit one is always drawn. A tab's name,
-  its `×` and the `+` all mark themselves while the pointer rests on them. The cards are grouped
+  name and Enter. The row is the tabs' first: the counts right of them get only what the tabs
+  leave. Squeezed, the tabs give way in steps — first the `×` on every tab but the lit one (a tab
+  without one closes once it is lit), then whole tabs, from the right, into the MORE CHIP after the
+  last one drawn: `2 more ▾`, carrying their STATUS DOTS between them and sweeping as a tab's name
+  does, so a project the row had no room for still says it wants you. A click on the chip (either
+  button) lists just those projects under it, and the pick opens one; `[` / `]`, the digits and the
+  header's cursor reach them too, each drawn in the lit tab's place. The lit tab is always drawn,
+  its name whole wherever there is room for it. A tab's name, its `×`, the chip and the `+` all mark
+  themselves while the pointer rests on them. The cards are grouped
   into **BANDS**, one per checkout that has something running in it — the root first, then the
   rest most recently worked in first; a checkout with nothing running has no band — unless
   **Show all worktrees** (Settings → Sessions, off by default) is on, when every checkout gets
@@ -330,16 +341,18 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   `↑↓ 5 hidden` for both. The count beside it still says how many sessions the project has, so a
   card that is not on screen reads as something taking its room rather than as a session gone, and
   the arrow says whether the way back to it is `j` down through the grid or the pane's edge dragged
-  back down. It holds the right edge on a narrow terminal: the pr and issue counts give way first.
+  back down. On a row the tabs leave little of, the counts give way whole, least needed first: the
+  session count (each band's rule says its own), then the pr and issue counts, and this one last.
   An open band's edges say it again where the eye looks for the rest: `↑ 2 more
   above` on the row of air under the PROJECT TABS once the top has scrolled off, `↓ 3 more below`
   on a row kept under the cards while there is more past the bottom — the row stays as air once the
   grid is scrolled to its end, and neither appears on a grid that fits.
 - **Walking it.** `j` and `k` walk the bands — the rule of the band under the cursor takes the
   accent and its branch goes bold, its remembered card (the session it was last left on, else its
-  first) wears the cursor's outline and the pane reads it; the accent goes with the keys, so with
-  them up on the PROJECT TABS or down in the pane the rule is gray like the others and only the
-  bold branch still says which checkout the pane reads. `h` and `l` walk the cards along the band's
+  first) is raised out of the row — a heavy accent frame (`┏━┓`, a weight no status frame takes) over
+  a gray fill — and the pane reads it; the accent goes with the keys, so with them up on the
+  PROJECT TABS or down in the pane the rule is gray like the others, the card's fill drops a shade,
+  and only the bold branch still says which checkout the pane reads. `h` and `l` walk the cards along the band's
   row, which scrolls under the cursor. `Tab` opens the band in place, like an accordion: every one
   of its cards wrapped into rows under its own rule — the sessions first, the terminals under a
   `terminals` rule — pushing the bands under it down, one band open at a time. On the open band
@@ -349,7 +362,8 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   with more cards than its row can hold counts the rest on its rule rather than wrapping, so a step
   down is always a step onto the next checkout; open, there is room to wrap, and the whole grid
   scrolls by rows to keep the cursor's card on screen. `Enter` opens the card under the cursor in
-  the pane, open band or collapsed. Which band is open is remembered across restarts, and a jump that
+  the pane, open band or collapsed. Which band is open is remembered per project — a trip to another
+  project's tab and back finds it still open — and across restarts, and a jump that
   names a session — `/`, the attention walk, a terminal just opened — lands inside its checkout.
   The wheel never walks the cursor, so a trackpad cannot swap the pane out from under the card you
   are reading: the grid scrolls the way a terminal's screen does — the wheel moves the bands three
@@ -368,6 +382,13 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   time, as with the cards. A band that already lists everything has nothing to open, and `Tab`
   there says so. `j` and `k` walk the lines as one column, off a band's last line onto the next
   band's first; `Enter` and a click work on a line as on a card.
+- **Every worktree open.** Settings → Appearance → **Expand all worktrees** (`expand_all_worktrees`,
+  off by default) lays every band out open at once — each worktree's sessions and terminals wrapped
+  into rows under its rule, or every line of the compact list — so there is no accordion: `Tab`, and
+  a second click on a rule, open and fold nothing (the footer says so), no rule offers a `Tab:` verb,
+  and `Esc` has no band to close. `h`/`l` walk a row, `j`/`k` walk down every worktree's rows as one
+  column — off a band's last row onto the next band's first, in the column the cursor was in. Which
+  band `Tab` last opened is kept, and comes back open when the setting is switched off.
 - **The pane** runs down the right side of the cards, full height and half the width — or along
   the bottom, under them, with the `⬓` button just before the `×` on its header (`◨` there moves
   it back) or Settings → Appearance → **Session pane** (`session_pane`, which the button writes; a
@@ -459,7 +480,7 @@ drops its bold, and the harness row goes with it. The ARCHIVED VIEW's bands are 
 filed sessions were in, with no terminals under them — a terminal is never archived. The badge on the right counts from when the session was archived (`2h ago`), not
 from its last turn — a session archived before nebula kept that stamp simply has no badge. Under the
 cursor the whole card lifts a step, so the one you are about to unarchive stays legible on the
-focus tint, and with color off entirely the two shapes still tell the grids apart. No card says
+selection fill, and with color off entirely the two shapes still tell the grids apart. No card says
 the word `archived`: the header says it once, for all of them.
 
 ## The ISSUES MODAL and ISSUE SESSIONS
@@ -521,8 +542,8 @@ first and the title slugified, rather than a random name — and the issue survi
 round trips. Send the box empty and the task is `Fix GitHub issue #15: <title> (<url>)`. The box
 goes up over the modal rather than in its place — the list and the issue you were reading stay on
 screen under it. `Esc`, or a click outside the box, puts you back in the modal on the same row; the
-launch closes the modal as well, so the new session's card is in front of you with the grid's cursor
-on it.
+launch closes the modal as well, back onto the grid with the new session's card up in its band —
+the cursor on the new card, or still on the card you were on with **Follow new** off.
 
 Either way the launch is an ISSUE SESSION. The create carries the issue's URL
 (`CreateAgent::issue_url`); the DAEMON validates it, keeps it with the AGENT row beside a PR
@@ -562,8 +583,8 @@ PR SESSION on the pull request — the box `p` opens, titled `Quick prompt · PR
 one is there and cut by the DAEMON otherwise, its stand-in rows up under the pull request from the
 moment you launch, and the PR's URL and work rule in the harness's context. The QUICK PROMPT stands
 on the modal as the ISSUES MODAL's does: the list stays under the box, `Esc` or a click outside puts
-you back on the pull request you opened it on, and the launch closes the modal onto the new
-session's card, the grid's cursor on it. `Ctrl+c` (or `Ctrl+y`) opens the
+you back on the pull request you opened it on, and the launch closes the modal onto the grid, the
+new session's card up in its band as the ISSUES MODAL's launch leaves it. `Ctrl+c` (or `Ctrl+y`) opens the
 COMMENT BOX on the pull request and comes back to the modal on the row — after `Enter` posts, after
 `Esc`, and after a post `gh` refused, with your text back in the box — `Ctrl+g` opens the pull request's
 whole diff, `Ctrl+o` — or a click on the `↗ open in browser` button pinned right on the reading pane's

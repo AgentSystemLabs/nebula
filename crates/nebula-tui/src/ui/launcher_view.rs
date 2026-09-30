@@ -37,13 +37,11 @@ const CRUMB: &str = "sessions";
 /// Longest a project's name is drawn on its PROJECT TAB before it is
 /// clipped, so one long name cannot push every other tab off the row.
 const PROJECT_TAB_MAX: usize = 20;
-/// A name the row has to cut is never cut under this: at that point the
-/// tab gives way whole, and the count at the edge of the row says so.
+/// The lit tab's name is never cut under this: at that point it gives
+/// way whole, and the MORE CHIP counts it with the rest.
 const TAB_NAME_MIN: usize = 3;
-/// Room a row of tabs keeps back for the `3›` that counts the tabs past
-/// its right edge, so the last tab that fits is never the one that
-/// leaves no room to say there are more.
-const MORE_ROOM: usize = 5;
+/// The air between the PROJECT TABS and the counts right of them.
+const HEAD_GAP: usize = 2;
 /// The button before the first PROJECT TAB, and what it says with no tab
 /// beside it — the one time the header has room to say what it does.
 /// A column of air either side is part of the button, so the pointer has
@@ -86,7 +84,8 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     // the whole panel, not just that band, may run taller than the
     // screen and scrolls as one list.
     // In the compact LIST every band is its entries stacked a line
-    // apiece instead (Settings → Appearance → **Worktree layout**).
+    // apiece instead (Settings → Appearance → **Worktree layout**), and
+    // with **Expand all worktrees** on every band is open at once.
     let panel = app.panel_layout(&bands);
     let scroll = settle_panel_scroll(app, &panel, &bands, cursor);
     draw_head(f, app, body, count, panel.hidden(scroll));
@@ -155,13 +154,22 @@ const NO_ARCHIVED: &str = "nothing archived in this project — ⇧A back to the
 /// status dots, how many cards the grid holds on the right — and how many
 /// of them it could not fit — a rule under both: the same three-row head
 /// the panels' columns sit on.
+///
+/// The row is the project bar first: the tabs are laid out before
+/// anything else and take what they need of it, and the counts on the
+/// right get what they leave ([`head_count`]), giving way a piece at a
+/// time — so a narrow window, or the PANE down the right of the cards,
+/// costs the counts before it costs a project's name.
 fn draw_head(f: &mut Frame, app: &mut App, body: Rect, count: HeadCount, hidden: Hidden) {
     let th = app.theme;
     if let Some(r) = row_rect(body, 1) {
         let r = pad_x(r);
-        let right = head_count(app, count, hidden, r.width as usize, th);
+        let tabs = head_tabs(app, r);
+        let taken: usize = tabs.iter().map(|s| s.width()).sum();
+        f.render_widget(Paragraph::new(Line::from(tabs)), r);
+        let room = (r.width as usize).saturating_sub(taken + HEAD_GAP);
+        let right = head_count(app, count, hidden, room, th);
         let used: usize = right.iter().map(|(s, _)| s.width()).sum();
-        f.render_widget(Paragraph::new(Line::from(head_tabs(app, r, used))), r);
         // The PR & ISSUE COUNTS are buttons, laid down where the
         // right-aligned row puts each word: a click opens that list for
         // the project in front of you, as `v` and `i` do.
@@ -213,70 +221,48 @@ fn draw_head(f: &mut Frame, app: &mut App, body: Rect, count: HeadCount, hidden:
 /// tab it is on wears the accent as a solid block, the way a focused
 /// title chip does, whichever tab is lit.
 ///
-/// `taken` is what the count on the right of the same row has already
-/// spent: the tabs get the rest, less a column of air. Tabs that will not
-/// fit are counted at the edge they went past (`‹2`, `3›`) rather than
-/// drawn half, and the window always holds the header's cursor, or with
-/// none the lit tab.
-fn head_tabs(app: &mut App, r: Rect, taken: usize) -> Vec<Span<'static>> {
+/// The tabs get the whole row ([`draw_head`]) and give way in steps, the
+/// lit tab last of all ([`fit_tabs`]): first the `×` on every tab but the
+/// lit one — the browser's own answer to a crowded tab strip, the lit tab
+/// being the one a close is aimed at — then whole tabs, from the right,
+/// into the MORE CHIP after the last one drawn (`2 more ▾`, [`more_chip`]),
+/// which carries their STATUS DOTS and sweeps as a tab would, so a project
+/// off the row that wants you still says so from the header. Its click
+/// lists them (`event_loop::launcher::open_more_tabs_menu`). The lit tab
+/// is always drawn, whole wherever there is room for it, so the header
+/// always says which project the grid is on.
+fn head_tabs(app: &mut App, r: Rect) -> Vec<Span<'static>> {
     let th = app.theme;
     let hover = app.hover_crumb.clone();
     let sweep = app.animations.then(|| app.sweep_phase());
     let tabs = crate::launcher::project_tabs(app);
-    let room = (r.width as usize).saturating_sub(taken + 2);
+    let room = r.width as usize;
     let add = if tabs.is_empty() { ADD_EMPTY } else { ADD };
     let add_w = add.chars().count() + 2;
     // The `+` is laid out first: it is the only way to a project with no
     // tab, so the tabs shrink around it rather than push it off the row.
     let budget = room.saturating_sub(add_w + 1);
-    let mut chips: Vec<[PaneTab; 2]> = tabs
+    let chip =
+        |tab: &ProjectTab, name_max: usize| project_chip(tab, name_max, hover.as_ref(), sweep, th);
+    let sizes: Vec<TabSize> = tabs
         .iter()
-        .map(|t| project_chip(t, PROJECT_TAB_MAX, hover.as_ref(), sweep, th))
-        .collect();
-    let width = |chip: &[PaneTab; 2]| chip.iter().map(PaneTab::width).sum::<usize>();
-    // The tabs that fit from `start` in `budget` columns: the index one
-    // past the last. Room is kept for the count of those left over on the
-    // right, except behind the very last tab, which leaves nothing over.
-    let fit = |chips: &[[PaneTab; 2]], start: usize, budget: usize| -> usize {
-        let mut left = budget;
-        let mut end = start;
-        for (i, chip) in chips.iter().enumerate().skip(start) {
-            let gap = usize::from(i > start);
-            let spare = if i + 1 == chips.len() { 0 } else { MORE_ROOM };
-            if gap + width(chip) + spare > left {
-                break;
+        .map(|tab| {
+            let [label, cross] = chip(tab, PROJECT_TAB_MAX);
+            TabSize {
+                label: label.width(),
+                cross: cross.width(),
+                name: tab.name.chars().count().min(PROJECT_TAB_MAX),
             }
-            left -= gap + width(chip);
-            end = i + 1;
-        }
-        end
-    };
+        })
+        .collect();
     let lit = tabs
         .iter()
         .position(|t| t.focused)
         .or_else(|| tabs.iter().position(|t| t.active));
-    let mut start = 0;
-    let mut end = fit(&chips, 0, budget);
-    if let Some(lit) = lit.filter(|lit| *lit >= end) {
-        start = lit;
-        end = fit(&chips, start, budget.saturating_sub(MORE_ROOM));
-    }
-    // Not even one tab whole: the one the window starts on is cut to what
-    // is left, down to TAB_NAME_MIN, before it gives way altogether.
-    if end == start && start < chips.len() {
-        let markers = MORE_ROOM * (usize::from(start > 0) + usize::from(start + 1 < chips.len()));
-        let overhead = width(&chips[start]) - tabs[start].name.chars().count().min(PROJECT_TAB_MAX);
-        let name_room = budget.saturating_sub(markers + overhead);
-        if name_room >= TAB_NAME_MIN {
-            chips[start] = project_chip(&tabs[start], name_room, hover.as_ref(), sweep, th);
-            end = start + 1;
-        }
-    }
-    // And with no room even for that, the count of them all stands in for
-    // the tabs — if there is room for the count.
-    if end == start {
-        (start, end) = (0, 0);
-    }
+    let fit = fit_tabs(&sizes, lit, budget, |more| {
+        more_chip(more.len(), tally_of(&tabs, more), false, None, th).width()
+    });
+    app.launcher_tabs_more = fit.more.iter().map(|&i| tabs[i].id.clone()).collect();
 
     // The `+` leads the row, on the side a project it opens lands on: a
     // button after the last tab would read as appending one there.
@@ -294,26 +280,34 @@ fn head_tabs(app: &mut App, r: Rect, taken: usize) -> Vec<Span<'static>> {
         });
     }
     let mut tabs_row: Vec<PaneTab> = Vec::new();
-    if start > 0 {
-        tabs_row.push(PaneTab::plain(vec![Span::styled(
-            format!("‹{start} "),
-            Style::default().fg(th.dim),
-        )]));
-    }
-    let len = chips.len();
-    for (i, chip) in chips.into_iter().enumerate().take(end).skip(start) {
-        if i > start {
+    for (n, &i) in fit.shown.iter().enumerate() {
+        if n > 0 {
             tabs_row.push(PaneTab::plain(vec![Span::raw(" ")]));
         }
-        tabs_row.extend(chip);
+        let is_lit = Some(i) == lit;
+        let name_max = if is_lit {
+            fit.lit_name
+        } else {
+            PROJECT_TAB_MAX
+        };
+        let [label, cross] = chip(&tabs[i], name_max);
+        tabs_row.push(label);
+        if fit.crosses || is_lit {
+            tabs_row.push(cross);
+        }
     }
-    let used: usize = tabs_row.iter().map(PaneTab::width).sum();
-    let right = PaneTab::plain(vec![Span::styled(
-        format!(" {}›", len - end),
-        Style::default().fg(th.dim),
-    )]);
-    if end < len && used + right.width() <= budget {
-        tabs_row.push(right);
+    if !fit.more.is_empty() {
+        if !tabs_row.is_empty() {
+            tabs_row.push(PaneTab::plain(vec![Span::raw(" ")]));
+        }
+        let hovered = hover.as_ref() == Some(&HitTarget::LauncherTabMore);
+        tabs_row.push(more_chip(
+            fit.more.len(),
+            tally_of(&tabs, &fit.more),
+            hovered,
+            sweep,
+            th,
+        ));
     }
     if !row.is_empty() && !tabs_row.is_empty() {
         row.push(PaneTab::plain(vec![Span::raw(" ")]));
@@ -339,6 +333,158 @@ fn head_tabs(app: &mut App, r: Rect, taken: usize) -> Vec<Span<'static>> {
         spans.extend(tab.spans);
     }
     spans
+}
+
+/// The columns a PROJECT TAB takes, measured whole: its name and STATUS
+/// DOTS (`label`), the `×` beside them (`cross`), and how much of the
+/// label is the name itself (`name`) — what the lit tab can give up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabSize {
+    label: usize,
+    cross: usize,
+    name: usize,
+}
+
+/// How the PROJECT TABS share their row ([`fit_tabs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TabFit {
+    /// The tabs drawn, by index, in tab order.
+    shown: Vec<usize>,
+    /// Every tab drawn keeps its `×`, not just the lit one.
+    crosses: bool,
+    /// How much of the lit tab's name is drawn.
+    lit_name: usize,
+    /// The tabs the MORE CHIP stands in for, by index, in tab order.
+    more: Vec<usize>,
+}
+
+/// Which PROJECT TABS the header draws in `budget` columns, each step
+/// giving up less than the next: every tab with its `×`; every tab, the
+/// `×` on the lit one only; the lit tab and as many of the rest as fit,
+/// in tab order, with the MORE CHIP (`more_w` columns for the tabs it
+/// holds) standing in for the others; the lit tab's name cut, down to
+/// [`TAB_NAME_MIN`]; the chip alone, holding them all; and nothing. The
+/// tabs keep their own order, so the lit tab drawn out of its place
+/// sits where it falls among the ones kept, and the ones kept are the
+/// first ones — the projects last worked in.
+fn fit_tabs(
+    sizes: &[TabSize],
+    lit: Option<usize>,
+    budget: usize,
+    more_w: impl Fn(&[usize]) -> usize,
+) -> TabFit {
+    let all: Vec<usize> = (0..sizes.len()).collect();
+    let lit_name = lit.map_or(0, |i| sizes[i].name);
+    let row = |shown: &[usize], crosses: bool| -> usize {
+        let tabs: usize = shown
+            .iter()
+            .map(|&i| {
+                let cross = crosses || Some(i) == lit;
+                sizes[i].label + if cross { sizes[i].cross } else { 0 }
+            })
+            .sum();
+        tabs + shown.len().saturating_sub(1)
+    };
+    // The chip and the column of air before it; nothing with no chip.
+    let chip = |more: &[usize]| {
+        if more.is_empty() {
+            0
+        } else {
+            1 + more_w(more)
+        }
+    };
+    for crosses in [true, false] {
+        if row(&all, crosses) <= budget {
+            return TabFit {
+                shown: all,
+                crosses,
+                lit_name,
+                more: Vec::new(),
+            };
+        }
+    }
+    let others: Vec<usize> = all.iter().copied().filter(|&i| Some(i) != lit).collect();
+    for kept in (0..others.len()).rev() {
+        let mut shown = others[..kept].to_vec();
+        shown.extend(lit);
+        shown.sort_unstable();
+        let more = others[kept..].to_vec();
+        if row(&shown, false) + chip(&more) <= budget {
+            return TabFit {
+                shown,
+                crosses: false,
+                lit_name,
+                more,
+            };
+        }
+    }
+    if let Some(i) = lit {
+        let over = (row(&[i], false) + chip(&others)).saturating_sub(budget);
+        if lit_name >= TAB_NAME_MIN + over {
+            return TabFit {
+                shown: vec![i],
+                crosses: false,
+                lit_name: lit_name - over,
+                more: others,
+            };
+        }
+    }
+    let more = if !all.is_empty() && more_w(&all) <= budget {
+        all
+    } else {
+        Vec::new()
+    };
+    TabFit {
+        shown: Vec::new(),
+        crosses: false,
+        lit_name,
+        more,
+    }
+}
+
+/// The STATUS DOTS the tabs at `ids` would carry between them.
+fn tally_of(tabs: &[ProjectTab], ids: &[usize]) -> Tally {
+    ids.iter().fold(Tally::default(), |sum, &i| Tally {
+        needs_you: sum.needs_you + tabs[i].tally.needs_you,
+        done: sum.done + tabs[i].tally.done,
+        running: sum.running + tabs[i].tally.running,
+    })
+}
+
+/// What the MORE CHIP says it drops, after the count.
+const MORE_CARET: &str = " ▾ ";
+
+/// The MORE CHIP: ` 2 more ●1 ▾ ` — how many PROJECT TABS the row had no
+/// room for, the STATUS DOTS they carry between them, and the caret that
+/// says a click lists them. Its words sweep on the loudest of those dots
+/// ([`tab_ramp`]) as a tab's name does, so a project off the row that is
+/// waiting on you is still seen moving in the header. Underlined under
+/// the pointer, as the tabs are.
+fn more_chip(
+    count: usize,
+    tally: Tally,
+    hovered: bool,
+    sweep: Option<usize>,
+    th: Theme,
+) -> PaneTab {
+    let mut words = Style::default().fg(th.muted);
+    if hovered {
+        words = words.add_modifier(Modifier::UNDERLINED);
+    }
+    let ramp = sweep.and_then(|_| tab_ramp(tally, th));
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(status_name_spans(
+        format!("{count} more"),
+        words,
+        ramp,
+        sweep.unwrap_or(0),
+    ));
+    spans.extend(tab_dots(tally, th));
+    spans.push(Span::styled(MORE_CARET, Style::default().fg(th.dim)));
+    PaneTab {
+        spans,
+        hit: Some(HitTarget::LauncherTabMore),
+    }
 }
 
 /// One PROJECT TAB, as two hits side by side: the tab — its name and its
@@ -460,12 +606,13 @@ fn tab_ramp(tally: Tally, th: Theme) -> Option<[Color; 3]> {
 /// DOTS' business on the PROJECT TABS, told in dots rather than in a
 /// second sentence.
 ///
-/// The HIDDEN MARKER holds the right edge whatever else has to go: a
+/// It gets what the tabs leave of the row ([`draw_head`]), and what does
+/// not fit in `width` gives way whole, least needed first: the count of
+/// the cards (each band's rule says its own), then the PR & ISSUE COUNTS
+/// (`v` and `i` say them again), and the HIDDEN MARKER last — a
 /// screenful of cards with more behind it looks exactly like a project
 /// with that many sessions in it, and the PANE dragged up over the grid
-/// is the usual way of getting there — so the one thing on this row that
-/// says cards are missing outranks the PR & ISSUE COUNTS beside it, which
-/// `v` and `i` say again anyway.
+/// is the usual way of getting there. The row never runs past `width`.
 ///
 /// Each span comes with the button it is, if any: only the two counts are,
 /// and [`draw_head`] lays their hit rects where the row lands them.
@@ -476,7 +623,8 @@ fn head_count(
     width: usize,
     th: Theme,
 ) -> Vec<(Span<'static>, Option<HitTarget>)> {
-    let mut spans = vec![(
+    type Part = Vec<(Span<'static>, Option<HitTarget>)>;
+    let words: Part = vec![(
         Span::styled(count_words(app, count), Style::default().fg(th.dim)),
         None,
     )];
@@ -484,28 +632,50 @@ fn head_count(
     // many open pull requests and issues the project in front of you has,
     // so the number is read without opening `v` or `i` to find it — and a
     // click on either count opens that list, the pointer's way to the
-    // same modal.
-    let mark = hidden_mark(hidden, th);
-    let mark_w: usize = mark.iter().map(|s| s.width()).sum();
-    if let Some(project) = app.selected_project() {
-        let counts = app.project_open_counts(&project.id);
-        if let Some(badge) = crate::ui::open_counts_badge(counts, th) {
-            let used: usize = spans.iter().map(|(s, _)| s.width()).sum();
-            if used + badge.1 + mark_w <= width {
-                spans.extend(badge.0.into_iter().map(|(text, mut style, hit)| {
-                    // Nothing about a word says it is a button, so the one
-                    // under the pointer is underlined, as the header's
-                    // tabs are.
-                    if hit.is_some() && app.hover_crumb == hit {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                    }
-                    (Span::styled(text, style), hit)
-                }));
+    // same modal. A second column of air sets them off from the count.
+    let badge: Part = app
+        .selected_project()
+        .and_then(|project| crate::ui::open_counts_badge(app.project_open_counts(&project.id), th))
+        .map(|(parts, _)| {
+            let parts = parts.into_iter().map(|(text, mut style, hit)| {
+                // Nothing about a word says it is a button, so the one
+                // under the pointer is underlined, as the header's tabs
+                // are.
+                if hit.is_some() && app.hover_crumb == hit {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                (Span::styled(text, style), hit)
+            });
+            std::iter::once((Span::raw(" "), None))
+                .chain(parts)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mark: Part = hidden_mark(hidden, th)
+        .into_iter()
+        .map(|s| (s, None))
+        .collect();
+    // Once a piece has not fitted, nothing after it is tried: a narrower
+    // piece slipping into the room a wider one left would swap what the
+    // row says as the window narrows, rather than only take it away.
+    let mut left = Some(width);
+    let mut keep = |part: Part| -> Part {
+        let w: usize = part.iter().map(|(s, _)| s.width()).sum();
+        match left {
+            Some(room) if w <= room => {
+                left = Some(room - w);
+                part
+            }
+            _ => {
+                left = None;
+                Vec::new()
             }
         }
-    }
-    spans.extend(mark.into_iter().map(|s| (s, None)));
-    spans
+    };
+    let mark = keep(mark);
+    let badge = keep(badge);
+    let words = keep(words);
+    words.into_iter().chain(badge).chain(mark).collect()
 }
 
 /// The header's count of what the grid holds: `3 sessions · 2 terminals`
@@ -683,8 +853,8 @@ fn draw_bands(
         }
         // The cards under the rule: on the band the cursor is on, the
         // one it remembers — what the pane reads, and what the keys walk
-        // — wears the cursor's accent outline, the tint staying with the
-        // lit rule; the rest are a preview. A click on any lands the
+        // — is raised out of the row ([`selected_card_block`]), its fill
+        // brighter while the keys are on the grid; the rest are a preview. A click on any lands the
         // cursor on it (`HitTarget::LauncherCard`), and a card drawn cut
         // is clicked on the rows of it there are: the landing scrolls
         // the rest of it into view (`settle_panel_scroll`).
@@ -745,7 +915,7 @@ fn draw_bands(
                     };
                     let selected = on && at == Some(i);
                     draw_cut(f, placed, |buf, r| {
-                        draw_any_card(buf, &*app, r, card, selected, false, th, &mut cfg)
+                        draw_any_card(buf, &*app, r, card, selected, keys, th, &mut cfg)
                     });
                     note_tail_card(app, card);
                     app.hits.extend(card_issue_hit(app, card, placed));
@@ -785,7 +955,7 @@ fn draw_bands(
                             r,
                             card,
                             on && at == Some(slot.at.card),
-                            false,
+                            keys,
                             th,
                             &mut cfg,
                         )
@@ -1257,7 +1427,8 @@ fn draw_list_row(
             runs_style: Style::default().fg(th.dim),
             text_mark: "",
             text: terminal_tail_lines(app, t)
-                .into_iter()
+                .iter()
+                .map(crate::terminal_tail::TailRow::text)
                 .rev()
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or_default(),
@@ -1469,8 +1640,10 @@ fn draw_band_rule(
         // open. A rule too narrow to keep the branch legible beside the
         // words drops them: the `❯` at the left still says which band is
         // selected. Tab is the panels' "next panel" key, which the grid
-        // takes for itself (`event_loop::launcher::handle_action`).
-        let nothing_to_open = rule.list && !expanded && more == 0;
+        // takes for itself (`event_loop::launcher::handle_action`). With
+        // every band open at once (**Expand all worktrees**) Tab has
+        // nothing to open or fold, and no band says it does.
+        let nothing_to_open = app.launcher_all_open || (rule.list && !expanded && more == 0);
         if lit && !nothing_to_open {
             let key = super::key_hint(app, crate::keymap::Action::FocusNext);
             let does = if expanded {
@@ -1613,8 +1786,10 @@ fn draw_band_rule(
 /// gone), what runs in it, then the last lines it printed where a
 /// session's card has its prompt ([`terminal_tail_lines`]) — so a glance
 /// down the grid says what each shell is up to, and an exited one what it
-/// was doing when it went. Framed as a card is, the cursor's in the
-/// accent.
+/// was doing when it went. Those lines are a small terminal
+/// ([`draw_tail_row`]): the shell's own colours, clipped at the card's
+/// edge, and a live shell's cursor. Framed and filled as a session's card
+/// is when the cursor is on it ([`selected_card_block`]).
 fn draw_chip(
     buf: &mut Buffer,
     app: &App,
@@ -1624,14 +1799,15 @@ fn draw_chip(
     focused: bool,
     th: Theme,
 ) {
-    let border = if selected { th.accent } else { th.edge };
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border));
-    if selected && focused {
-        block = block.style(Style::default().bg(th.focus_tint));
-    }
+    let block = if selected {
+        selected_card_block(app, focused, None, th)
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(th.edge))
+    };
+    let dim = if selected { th.muted } else { th.dim };
     let inner = block.inner(area);
     block.render(area, buf);
     let inner = Rect {
@@ -1660,7 +1836,7 @@ fn draw_chip(
     let mut first = vec![
         Span::styled(
             glyph,
-            Style::default().fg(if t.alive { th.ok } else { th.dim }),
+            Style::default().fg(if t.alive { th.ok } else { dim }),
         ),
         Span::styled(
             name.clone(),
@@ -1676,27 +1852,56 @@ fn draw_chip(
     let runs = t.run_command.as_deref().unwrap_or("shell");
     let second = vec![Span::styled(
         truncate(runs, width),
-        Style::default().fg(th.dim),
+        Style::default().fg(dim),
     )];
-    let mut lines = vec![first, second];
-    lines.resize(crate::launcher::CARD_HEAD_H as usize, Vec::new());
-    lines.extend(
-        terminal_tail_lines(app, t)
-            .iter()
-            .take(crate::launcher::PROMPT_LINES)
-            .map(|line| {
-                vec![Span::styled(
-                    truncate(line, width),
-                    Style::default().fg(th.muted),
-                )]
-            }),
-    );
-    for (i, spans) in lines.into_iter().enumerate() {
-        if spans.is_empty() {
-            continue;
-        }
+    for (i, spans) in [first, second].into_iter().enumerate() {
         let Some(r) = row_rect(inner, i) else { break };
         Paragraph::new(Line::from(spans)).render(r, buf);
+    }
+    let head = usize::from(crate::launcher::CARD_HEAD_H);
+    for (i, row) in terminal_tail_lines(app, t)
+        .iter()
+        .take(crate::launcher::PROMPT_LINES)
+        .enumerate()
+    {
+        let Some(r) = row_rect(inner, head + i) else {
+            break;
+        };
+        draw_tail_row(buf, r, row, t.alive, th);
+    }
+}
+
+/// One row of a terminal card's tail, painted as the pane would paint
+/// it: each run in the look the shell printed it in over the card's own
+/// text colour and background — which is what a terminal's default is
+/// on a card — cut at the card's right edge the way a narrower terminal
+/// cuts, no `…`, and the shell's cursor a reversed cell while it lives:
+/// over a character it reverses that character's own colours, past the
+/// text it is a block in the card's text colour.
+fn draw_tail_row(
+    buf: &mut Buffer,
+    r: Rect,
+    row: &crate::terminal_tail::TailRow,
+    alive: bool,
+    th: Theme,
+) {
+    let base = Style::default().fg(th.text);
+    let (mut x, right) = (r.x, r.right());
+    for (text, look) in &row.runs {
+        if x >= right {
+            break;
+        }
+        x = buf
+            .set_stringn(x, r.y, text, usize::from(right - x), base.patch(*look))
+            .0;
+    }
+    let Some(col) = row.cursor.filter(|&c| alive && c < r.width) else {
+        return;
+    };
+    let at = r.x + col;
+    let look = if at < x { Style::default() } else { base };
+    if let Some(cell) = buf.cell_mut((at, r.y)) {
+        cell.set_style(look.add_modifier(Modifier::REVERSED));
     }
 }
 
@@ -1707,7 +1912,10 @@ const EXITED_BADGE: &str = " exited";
 /// pane is on this terminal — live, on the frame it changes — and
 /// otherwise the tail the daemon last answered with
 /// ([`App::terminal_tails`]), which a card keeps once its shell is gone.
-fn terminal_tail_lines(app: &App, t: &nebula_core::TerminalTab) -> Vec<String> {
+fn terminal_tail_lines(
+    app: &App,
+    t: &nebula_core::TerminalTab,
+) -> Vec<crate::terminal_tail::TailRow> {
     let sref = nebula_core::SessionRef::Terminal(t.id.clone());
     if let Some(term) = app
         .term
@@ -1730,7 +1938,8 @@ fn terminal_tail_lines(app: &App, t: &nebula_core::TerminalTab) -> Vec<String> {
 /// — the three the PROJECT TABS count, each in the color its STATUS DOT
 /// wears, and no other. A read finish, a fresh or terminated session and a
 /// `quiet` card (cold, pending or archived: nothing on it is live) keep
-/// the plain edge. The focused card's accent outranks all three.
+/// the plain edge. The cursor's card outranks all three
+/// ([`selected_card_block`]).
 fn card_edge(a: &nebula_core::Agent, quiet: bool, th: Theme) -> Option<Color> {
     use nebula_core::AgentStatus;
     if quiet {
@@ -1744,6 +1953,144 @@ fn card_edge(a: &nebula_core::Agent, quiet: bool, th: Theme) -> Option<Color> {
     }
 }
 
+/// The frame of the card under the cursor, session or terminal: a heavy
+/// accent border — a weight no status frame ([`card_edge`]) ever takes,
+/// so a blue unread finish or a red question beside it can't be read as
+/// the selection, color or no color — over the raised fill every selected
+/// row in nebula wears, frame and all: `sel_bg` while the grid has the
+/// keys, `sel_bg_dim` while the pane or the PROJECT TABS do, so the card
+/// stays picked out as the one the pane reads.
+///
+/// HIGHLIGHT CURRENT CARD trades the gray fill for a faint wash of the
+/// card's own light ([`card_tint`]), kept while the pane has the keys.
+/// `status` is the color its frame would wear were it not selected
+/// ([`card_edge`]); none for a quiet card or a terminal's.
+fn selected_card_block(
+    app: &App,
+    focused: bool,
+    status: Option<Color>,
+    th: Theme,
+) -> Block<'static> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(th.accent));
+    let fill = if app.highlight_current_card {
+        card_tint(app, status, th)
+    } else if focused {
+        th.sel_bg
+    } else {
+        th.sel_bg_dim
+    };
+    block.style(Style::default().bg(fill))
+}
+
+/// HIGHLIGHT CURRENT CARD's fill: the card's status color taken nearly to
+/// black, so the card is only just washed in it. A card with something
+/// going on — running, asking, finished and unread — breathes, the wash
+/// rising and falling on the sweep's clock ([`tint_level`]); a quiet
+/// card or a terminal's holds a still wash of the accent, as every card
+/// does with the ANIMATIONS off. Fainter still while the PROJECT TABS
+/// hold the keys.
+fn card_tint(app: &App, status: Option<Color>, th: Theme) -> Color {
+    let (color, level) = match status {
+        Some(c) if app.animations => (c, tint_level(app.sweep_phase())),
+        Some(c) => (c, TINT_PEAK),
+        None => (th.accent, TINT_STILL),
+    };
+    let away = if app.launcher_tab_cursor.is_none() {
+        1.0
+    } else {
+        0.6
+    };
+    dim_toward_black(color, level * away)
+}
+
+/// How much of its status color a breathing card's fill keeps at its
+/// brightest, and how much a still one keeps of the accent.
+const TINT_PEAK: f32 = 0.20;
+const TINT_STILL: f32 = 0.13;
+/// Its dimmest: all but the grid's own black.
+const TINT_FLOOR: f32 = 0.07;
+/// Sweep frames ([`crate::app::SWEEP_FRAME`]) in one breath, ~1.6 s.
+const TINT_BREATH: usize = 16;
+
+/// Where a breathing fill is at sweep `phase`: a cosine from
+/// [`TINT_FLOOR`] up to [`TINT_PEAK`] and back.
+fn tint_level(phase: usize) -> f32 {
+    let t = (phase % TINT_BREATH) as f32 / TINT_BREATH as f32;
+    let wave = (1.0 - (t * std::f32::consts::TAU).cos()) / 2.0;
+    TINT_FLOOR + (TINT_PEAK - TINT_FLOOR) * wave
+}
+
+/// `c` at `level` of its brightness, the rest black — truecolor, as
+/// `focus_tint` already is, since the 256 palette has no dim shade of
+/// most hues. A color with no fixed value (`Reset`) is returned as is.
+fn dim_toward_black(c: Color, level: f32) -> Color {
+    let Some((r, g, b)) = color_rgb(c) else {
+        return c;
+    };
+    let f = |v: u8| (f32::from(v) * level).round().clamp(0.0, 255.0) as u8;
+    Color::Rgb(f(r), f(g), f(b))
+}
+
+/// The RGB a terminal most likely shows for `c`: xterm's defaults for the
+/// sixteen named colors, the 6×6×6 cube and the gray ramp for the rest of
+/// the 256.
+fn color_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    let index = match c {
+        Color::Rgb(r, g, b) => return Some((r, g, b)),
+        Color::Indexed(i) => i,
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        Color::Reset => return None,
+    };
+    Some(match index {
+        0..=15 => ANSI[usize::from(index)],
+        16..=231 => {
+            let i = index - 16;
+            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            (level(i / 36), level(i / 6 % 6), level(i % 6))
+        }
+        _ => {
+            let v = 8 + (index - 232) * 10;
+            (v, v, v)
+        }
+    })
+}
+
 /// What an ARCHIVED card wears where a live one wears its STATUS DOT: the
 /// round dot squared off. Two columns wide like the dot it stands in for,
 /// so the name behind it starts in the same column on both grids.
@@ -1752,10 +2099,9 @@ const ARCHIVED_MARK: &str = "▪ ";
 /// One session's card: its name and how long since it last moved, what
 /// it runs on, and the last thing it was asked to do. Where it runs —
 /// the checkout, its changes, its pull request — is on its BAND's rule,
-/// said once for every card in the checkout. The cursor's card takes an
-/// accent border wherever the keys are, and — while the grid has them —
-/// the FOCUSED PANEL TINT behind it; every other card's frame answers to
-/// its status ([`card_edge`]).
+/// said once for every card in the checkout. The cursor's card is raised
+/// out of the grid wherever the keys are ([`selected_card_block`]); every
+/// other card's frame answers to its status ([`card_edge`]).
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
     buf: &mut Buffer,
@@ -1780,30 +2126,29 @@ fn draw_card(
         ago_style,
     } = session_look(app, a, selected, th);
     let quiet_or = |live: Color| if archived { quiet } else { live };
-    let border = if selected {
-        th.accent
-    } else if let Some(edge) = card_edge(a, archived || pending || cold, th) {
-        edge
+    // On the raised fill the dim parts step up to muted and the prompt to
+    // text, so nothing on the cursor's card sinks into its background.
+    let (dim, prompt) = if selected {
+        (th.muted, th.text)
     } else {
-        th.edge
+        (th.dim, th.muted)
     };
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        // Square corners on an archived card, round on a live one: the one
-        // difference between the two grids that survives a terminal with
-        // no color at all.
-        .border_type(if archived {
-            BorderType::Plain
-        } else {
-            BorderType::Rounded
-        })
-        .border_style(Style::default().fg(border));
-    // The card keys land in wears the same wash the session pane wears
-    // when it has them, so one surface on screen is lit and it follows the
-    // focus between the grid and the pane.
-    if selected && focused {
-        block = block.style(Style::default().bg(th.focus_tint));
-    }
+    let edge = card_edge(a, archived || pending || cold, th);
+    let block = if selected {
+        selected_card_block(app, focused, edge, th)
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            // Square corners on an archived card, round on a live one: the
+            // one difference between the two grids that survives a
+            // terminal with no color at all.
+            .border_type(if archived {
+                BorderType::Plain
+            } else {
+                BorderType::Rounded
+            })
+            .border_style(Style::default().fg(edge.unwrap_or(th.edge)))
+    };
     let inner = block.inner(area);
     block.render(area, buf);
     // One cell of air inside the border, so the text never touches it.
@@ -1841,7 +2186,7 @@ fn draw_card(
     } else {
         vec![Span::styled(
             truncate(&harness, width),
-            Style::default().fg(quiet_or(th.dim)),
+            Style::default().fg(quiet_or(dim)),
         )]
     };
     // The issue it was started from, at the row's right end — a link, and
@@ -1858,7 +2203,7 @@ fn draw_card(
                 style = style.add_modifier(Modifier::UNDERLINED);
             }
             second = vec![
-                Span::styled(harness, Style::default().fg(quiet_or(th.dim))),
+                Span::styled(harness, Style::default().fg(quiet_or(dim))),
                 Span::raw(" ".repeat(pad)),
                 Span::styled(label, style),
             ];
@@ -1873,8 +2218,8 @@ fn draw_card(
     lines.extend(prompt_lines(
         crate::launcher::last_prompt(a).unwrap_or_default(),
         width,
-        (!app.hide_card_marks).then(|| quiet_or(th.dim)),
-        quiet_or(th.muted),
+        (!app.hide_card_marks).then(|| quiet_or(dim)),
+        quiet_or(prompt),
     ));
 
     for (i, spans) in lines.into_iter().enumerate() {
@@ -1957,7 +2302,8 @@ fn card_issue_hit(
 struct SessionLook {
     /// The STATUS DOT, or an archived card's square.
     dot: Span<'static>,
-    /// What an archived session's every part is drawn in.
+    /// What an archived session's every part is drawn in, and a live
+    /// one's age: dim, a step up on the cursor's entry.
     quiet: Color,
     name_style: Style,
     /// The status sweep across the name, while it animates.
@@ -2026,12 +2372,10 @@ fn session_look(app: &App, a: &nebula_core::Agent, selected: bool, th: Theme) ->
     } else {
         ago_badge(a.status_changed_at)
     };
-    let ago_style = if archived {
-        Style::default().fg(quiet)
-    } else if a.unseen && !pending {
+    let ago_style = if a.unseen && !pending && !archived {
         Style::default().fg(th.done)
     } else {
-        Style::default().fg(th.dim)
+        Style::default().fg(quiet)
     };
     SessionLook {
         dot,
@@ -3505,10 +3849,10 @@ mod tests {
         assert!(!top.contains('╭'), "its top border is off screen: {top:?}");
         let last = lines.last().unwrap();
         assert!(last.contains("↓ 2 more below"), "{last:?}");
-        // The cursor's card is whole: its bottom border on the window's
-        // last row, just over the marker.
+        // The cursor's card is whole: its heavy bottom border on the
+        // window's last row, just over the marker.
         let bottom = &lines[lines.len() - 2];
-        assert!(bottom.contains('╰'), "{bottom:?}");
+        assert!(bottom.contains('┗'), "{bottom:?}");
         assert!(lines.iter().any(|l| l.contains("term-1")), "{lines:#?}");
     }
 
@@ -3608,6 +3952,62 @@ mod tests {
             lines[row + 2].contains("$ npm test"),
             "the lines stay: {:?}",
             lines[row + 2]
+        );
+    }
+
+    /// A terminal card's tail is a small terminal: the shell's colours
+    /// and weights per run, its defaults in the card's text colour over
+    /// the card's own background (the focus tint shows through), a row
+    /// cut at the card's edge with no `…`, and the cursor a reversed
+    /// cell — a block past the text, the character's own colours
+    /// flipped over one — only while the shell lives.
+    #[test]
+    fn a_terminal_cards_tail_paints_like_a_small_terminal() {
+        use crate::terminal_tail::parse_tail;
+        let th = App::new().theme;
+        let r = Rect::new(0, 0, 12, 1);
+        let paint = |data: &[u8], alive: bool| {
+            let mut buf = Buffer::empty(r);
+            buf.set_style(r, Style::default().bg(th.focus_tint));
+            let rows = parse_tail(data, 80, 24, 4);
+            draw_tail_row(&mut buf, r, rows.last().unwrap(), alive, th);
+            buf
+        };
+        let text = |buf: &Buffer| -> String {
+            (0..r.width)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect()
+        };
+
+        let buf = paint(b"\x1b[1;32mok\x1b[0m done \x1b[33mwith a long tail", true);
+        assert_eq!(text(&buf), "ok done with", "cut at the edge, no ellipsis");
+        assert_eq!(buf[(0, 0)].fg, Color::Indexed(2));
+        assert!(buf[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(3, 0)].fg, th.text, "the default is the card's text");
+        assert_eq!(buf[(3, 0)].bg, th.focus_tint, "the tint shows through");
+        assert_eq!(buf[(8, 0)].fg, Color::Indexed(3));
+        assert!(
+            !buf[(11, 0)].modifier.contains(Modifier::REVERSED),
+            "the cursor is past the edge"
+        );
+
+        let buf = paint(b"\x1b[31m$\x1b[0m ", true);
+        assert_eq!(buf[(2, 0)].fg, th.text, "past the text: a block");
+        assert!(buf[(2, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+
+        let buf = paint(b"\x1b[31mabc\x1b[2D", true);
+        assert_eq!(
+            buf[(1, 0)].fg,
+            Color::Indexed(1),
+            "over a character: its own colour"
+        );
+        assert!(buf[(1, 0)].modifier.contains(Modifier::REVERSED));
+
+        let buf = paint(b"$ ", false);
+        assert!(
+            !buf[(2, 0)].modifier.contains(Modifier::REVERSED),
+            "an exited shell has no cursor"
         );
     }
 
@@ -3953,25 +4353,50 @@ mod tests {
         );
     }
 
-    /// The marker holds the right edge however narrow the row: the PR &
-    /// ISSUE COUNTS beside it give way first, and the row never overruns.
+    /// The counts get what the tabs leave them and give way whole, least
+    /// needed first — the count of the cards, then the PR & ISSUE COUNTS
+    /// — with the HIDDEN MARKER last, and never run past their room.
     #[test]
-    fn the_hidden_marker_outlasts_the_counts_beside_it() {
+    fn the_counts_give_way_a_piece_at_a_time() {
         let mut app = a_tree();
         select(&mut app, "api");
+        let id = app.selected_project().expect("api").id.clone();
+        app.issues.insert(
+            id,
+            crate::issues::IssueList {
+                list: vec![crate::issues::Issue {
+                    number: 7,
+                    url: "https://github.com/o/r/issues/7".into(),
+                    title: "Tabs vanish on a narrow window".into(),
+                    author: "webdevcody".into(),
+                    created_at: "2026-09-10T12:00:00Z".into(),
+                    updated_at: "2026-09-11T12:00:00Z".into(),
+                    labels: Vec::new(),
+                    body: String::new(),
+                }],
+                at: std::time::Instant::now(),
+            },
+        );
         let th = app.theme;
         let hidden = Hidden { above: 0, below: 5 };
-        for width in 10..=120usize {
+        let mark_w = "  ↓ 5 hidden".chars().count();
+        for width in 0..=120usize {
             let spans = count_spans(&app, 9, hidden, width, th);
             let text = row_text(&spans);
-            assert!(text.contains("5 hidden"), "{width}: {text:?}");
             let used: usize = spans.iter().map(|s| s.width()).sum();
-            if used > width {
-                // Only the count itself and the marker are left; nothing
-                // else was there to drop.
-                assert_eq!(text, "9 sessions  ↓ 5 hidden", "{width}: {text:?}");
-            }
+            assert!(used <= width, "{width}: {text:?} overruns");
+            let words = text.contains("9 sessions");
+            let badge = text.contains("1 issue");
+            let mark = text.contains("5 hidden");
+            assert_eq!(mark, width >= mark_w, "{width}: {text:?}");
+            assert!(!badge || mark, "{width}: the marker went first: {text:?}");
+            assert!(!words || badge, "{width}: the counts went first: {text:?}");
         }
+        assert_eq!(
+            row_text(&count_spans(&app, 9, hidden, 120, th)),
+            "9 sessions  1 issue  ↓ 5 hidden",
+            "a column of air more between the count and the badge"
+        );
     }
 
     /// [`head_count`]'s spans without the buttons they carry.
@@ -4023,7 +4448,7 @@ mod tests {
         let mut app = a_tabbed_tree();
         let th = app.theme;
         app.hits.clear();
-        let spans = head_tabs(&mut app, r, 0);
+        let spans = head_tabs(&mut app, r);
         let text = row_text(&spans);
         assert_eq!(text, " +   web ×   api × ");
         let (web, api) = (ProjectId("p1".into()), ProjectId("p0".into()));
@@ -4059,7 +4484,7 @@ mod tests {
         // With nothing open, the `+` says what it does.
         app.launcher_tabs.clear();
         app.hits.clear();
-        let spans = head_tabs(&mut app, r, 0);
+        let spans = head_tabs(&mut app, r);
         assert_eq!(row_text(&spans), " + open a project ");
         assert_eq!(head_hits(&app), vec![HitTarget::LauncherTabAdd]);
     }
@@ -4083,7 +4508,7 @@ mod tests {
         app.tree.agents[1].unseen = true;
         select(&mut app, "api");
         app.hits.clear();
-        let spans = head_tabs(&mut app, r, 0);
+        let spans = head_tabs(&mut app, r);
         assert_eq!(row_text(&spans), " +   web ●1 ×   api ●1 ●1 × ");
         let dots: Vec<(String, Option<Color>)> = spans
             .iter()
@@ -4107,7 +4532,7 @@ mod tests {
         let r = Rect::new(0, 0, 80, 1);
         let mut app = a_tabbed_tree();
         app.launcher_tabs = vec![ProjectId("p0".into())];
-        let spans = head_tabs(&mut app, r, 0);
+        let spans = head_tabs(&mut app, r);
         assert_eq!(row_text(&spans), " +   api × ");
         assert!(head_hits(&app)
             .iter()
@@ -4115,7 +4540,7 @@ mod tests {
 
         let mut app = a_tabbed_tree();
         app.hits.clear();
-        let spans = head_tabs(&mut app, r, 0);
+        let spans = head_tabs(&mut app, r);
         assert_eq!(row_text(&spans), " +   web ×   api × ");
     }
 
@@ -4128,13 +4553,13 @@ mod tests {
         let r = Rect::new(0, 0, 80, 1);
         let mut app = a_tabbed_tree();
         app.hits.clear();
-        head_tabs(&mut app, r, 0);
+        head_tabs(&mut app, r);
         let quiet = std::mem::take(&mut app.hits);
         for a in &mut app.tree.agents {
             a.status = AgentStatus::Running;
         }
         select(&mut app, "api");
-        let busy = head_tabs(&mut app, r, 0);
+        let busy = head_tabs(&mut app, r);
         assert!(row_text(&busy).contains(" web"), "{:?}", row_text(&busy));
         assert!(
             !busy.iter().any(|s| s.content == "web"),
@@ -4184,16 +4609,16 @@ mod tests {
                 .map(|s| s.content.to_string())
                 .collect()
         };
-        assert!(underlined(&head_tabs(&mut app, r, 0)).is_empty());
+        assert!(underlined(&head_tabs(&mut app, r)).is_empty());
 
         app.hover_crumb = Some(HitTarget::LauncherTab(web.clone()));
-        assert_eq!(underlined(&head_tabs(&mut app, r, 0)), ["web"]);
+        assert_eq!(underlined(&head_tabs(&mut app, r)), ["web"]);
 
         app.hover_crumb = Some(HitTarget::LauncherTabAdd);
-        assert_eq!(underlined(&head_tabs(&mut app, r, 0)), ["+"]);
+        assert_eq!(underlined(&head_tabs(&mut app, r)), ["+"]);
 
         app.hover_crumb = Some(HitTarget::LauncherTabClose(web));
-        let spans = head_tabs(&mut app, r, 0);
+        let spans = head_tabs(&mut app, r);
         assert!(underlined(&spans).is_empty());
         let crosses: Vec<Option<Color>> = spans
             .iter()
@@ -4203,12 +4628,13 @@ mod tests {
         assert_eq!(crosses, [Some(th.err), Some(th.muted)], "web's is red");
     }
 
-    /// More tabs than the row holds: the ones past the edge are counted
-    /// there rather than drawn half, the lit tab is always in the window,
-    /// the `+` is never pushed off, and nothing overruns the row at any
-    /// width.
+    /// More tabs than the row holds: the ones it has no room for go into
+    /// the MORE CHIP, which counts them, rather than being drawn half;
+    /// every tab is either drawn or in the chip, the lit tab is always
+    /// drawn — whole wherever there is room — the `+` is never pushed
+    /// off, and nothing overruns the row at any width.
     #[test]
-    fn tabs_that_do_not_fit_are_counted_at_the_edge() {
+    fn tabs_that_do_not_fit_go_into_the_more_chip() {
         use nebula_core::Project;
         let mut app = a_tree();
         for i in 2..9 {
@@ -4225,20 +4651,121 @@ mod tests {
         for width in 5..=160u16 {
             let r = Rect::new(0, 0, width, 1);
             app.hits.clear();
-            let spans = head_tabs(&mut app, r, 0);
+            let spans = head_tabs(&mut app, r);
             let text = row_text(&spans);
             let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-            assert!(used + 2 <= width as usize, "{width}: {text:?} overruns");
+            assert!(used <= width as usize, "{width}: {text:?} overruns");
             assert!(text.contains('+'), "{width}: the + went: {text:?}");
+            let drawn = head_hits(&app)
+                .iter()
+                .filter(|h| matches!(h, HitTarget::LauncherTab(_)))
+                .count();
+            let more = app.launcher_tabs_more.len();
+            if drawn + more > 0 {
+                assert_eq!(drawn + more, 9, "{width}: a tab went missing: {text:?}");
+            }
+            if more > 0 {
+                assert!(
+                    text.contains(&format!("{more} more ▾")),
+                    "{width}: {text:?}"
+                );
+                assert!(head_hits(&app).contains(&HitTarget::LauncherTabMore));
+            }
             if width >= 24 {
-                assert!(text.contains("api"), "{width}: the lit tab went: {text:?}");
-                assert!(text.contains('‹'), "{width}: {text:?}");
+                assert!(
+                    text.contains(" api × "),
+                    "{width}: the lit tab went: {text:?}"
+                );
             }
         }
-        // Wide enough for all of them, nothing is counted.
+        // Wide enough for all of them, no chip.
         let r = Rect::new(0, 0, 400, 1);
-        let text = row_text(&head_tabs(&mut app, r, 0));
-        assert!(!text.contains('‹') && !text.contains('›'), "{text:?}");
+        let text = row_text(&head_tabs(&mut app, r));
+        assert!(!text.contains("more"), "{text:?}");
+        assert!(app.launcher_tabs_more.is_empty());
+    }
+
+    /// The tabs give way in steps, each giving up less than the next: the
+    /// `×` off every tab but the lit one, then tabs from the right into the
+    /// MORE CHIP, then the lit tab's name, down to [`TAB_NAME_MIN`]; then
+    /// the chip alone, holding every tab, and at last nothing. The lit tab
+    /// keeps its place among the tabs kept.
+    #[test]
+    fn the_tabs_give_way_in_steps() {
+        let size = |name: usize| TabSize {
+            label: 1 + name,
+            cross: 3,
+            name,
+        };
+        // Four tabs, the third lit; a chip is ten columns, whatever it holds.
+        let sizes = [size(5), size(5), size(10), size(5)];
+        let fit = |budget| fit_tabs(&sizes, Some(2), budget, |_| 10);
+        let tabs = |shown: &[usize], crosses, lit_name, more: &[usize]| TabFit {
+            shown: shown.to_vec(),
+            crosses,
+            lit_name,
+            more: more.to_vec(),
+        };
+        // 29 of labels, 12 of crosses, 3 of air.
+        assert_eq!(fit(44), tabs(&[0, 1, 2, 3], true, 10, &[]));
+        assert_eq!(fit(43), tabs(&[0, 1, 2, 3], false, 10, &[]));
+        assert_eq!(fit(35), tabs(&[0, 1, 2, 3], false, 10, &[]));
+        assert_eq!(fit(34), tabs(&[0, 2], false, 10, &[1, 3]));
+        assert_eq!(fit(25), tabs(&[2], false, 10, &[0, 1, 3]));
+        assert_eq!(fit(24), tabs(&[2], false, 9, &[0, 1, 3]));
+        assert_eq!(fit(18), tabs(&[2], false, 3, &[0, 1, 3]));
+        assert_eq!(fit(17), tabs(&[], false, 10, &[0, 1, 2, 3]));
+        assert_eq!(fit(9), tabs(&[], false, 10, &[]));
+        // With no tab lit, the first ones are the ones kept.
+        let unlit = fit_tabs(&sizes, None, 31, |_| 10);
+        assert_eq!(unlit, tabs(&[0, 1], false, 0, &[2, 3]));
+    }
+
+    /// The MORE CHIP carries the STATUS DOTS of the tabs it stands in for,
+    /// so a project the row had no room for still says it wants you — and
+    /// the header remembers which projects those are, for the chip's list.
+    #[test]
+    fn the_more_chip_carries_the_dots_of_the_tabs_it_holds() {
+        use nebula_core::AgentStatus;
+        let mut app = a_tabbed_tree();
+        let th = app.theme;
+        let web = ProjectId("p1".into());
+        for p in &mut app.tree.projects {
+            if p.id == web {
+                p.name = "website-frontend".into();
+            }
+        }
+        // web: one waiting on you.
+        app.tree.agents[1].status = AgentStatus::NeedsFeedback;
+        select(&mut app, "api");
+        app.hits.clear();
+        let spans = head_tabs(&mut app, Rect::new(0, 0, 30, 1));
+        let text = row_text(&spans);
+        assert!(!text.contains("website"), "{text:?}");
+        assert!(text.contains(" api × "), "the lit tab, whole: {text:?}");
+        assert!(text.contains("1 more ●1 ▾"), "{text:?}");
+        let dot = spans.iter().find(|s| s.content == " ●1").expect("a dot");
+        assert_eq!(dot.style.fg, Some(th.err), "web's red, on the chip");
+        assert_eq!(app.launcher_tabs_more, vec![web]);
+        assert!(head_hits(&app).contains(&HitTarget::LauncherTabMore));
+    }
+
+    /// Squeezed, the tabs that are not lit give up their `×` before any
+    /// tab gives way: the lit one keeps its own.
+    #[test]
+    fn a_crowded_row_keeps_only_the_lit_tabs_cross() {
+        let mut app = a_tabbed_tree();
+        let web = ProjectId("p1".into());
+        for p in &mut app.tree.projects {
+            if p.id == web {
+                p.name = "website-frontend".into();
+            }
+        }
+        app.hits.clear();
+        let text = row_text(&head_tabs(&mut app, Rect::new(0, 0, 30, 1)));
+        assert_eq!(text, " +   website-frontend  api × ");
+        assert!(!head_hits(&app).contains(&HitTarget::LauncherTabClose(web)));
+        assert!(app.launcher_tabs_more.is_empty());
     }
 
     /// The prompt header keeps the toggle whatever else it has to drop,
@@ -4696,11 +5223,13 @@ mod tests {
         assert_ne!(th.warn, th.accent);
     }
 
-    /// The card keys land in is filled with the FOCUSED PANEL TINT, frame
-    /// and all; the cursor's card off the grid (outlined, the wash gone to
-    /// the pane) and any other card stay on the terminal's background.
+    /// The cursor's card is raised out of the grid, frame and all: a heavy
+    /// accent border no status frame takes, over the selection fill —
+    /// `sel_bg` while the grid has the keys, `sel_bg_dim` while they are
+    /// elsewhere. Every other card keeps its round, thin frame on the
+    /// terminal's background.
     #[test]
-    fn only_the_focused_card_wears_the_focus_tint() {
+    fn the_cursor_s_card_is_raised_with_a_heavy_frame_and_a_fill() {
         use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
         let row = LauncherRow {
             agent: Agent {
@@ -4739,14 +5268,114 @@ mod tests {
                 .draw(|f| draw_one(f, app, area, &row, selected, focused, th))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
-            let corner = buf.cell((0, 0)).unwrap().bg;
+            let corner = buf.cell((0, 0)).unwrap();
             let inside = buf.cell((20, area.height - 2)).unwrap().bg;
-            assert_eq!(corner, inside, "one fill, frame and all");
-            inside
+            assert_eq!(corner.bg, inside, "one fill, frame and all");
+            (corner.symbol().to_string(), inside)
         };
-        assert_eq!(fill(&app, true, true), th.focus_tint);
-        assert_eq!(fill(&app, true, false), Color::Reset);
-        assert_eq!(fill(&app, false, true), Color::Reset);
+        assert_eq!(fill(&app, true, true), ("┏".into(), th.sel_bg));
+        assert_eq!(fill(&app, true, false), ("┏".into(), th.sel_bg_dim));
+        assert_eq!(fill(&app, false, true), ("╭".into(), Color::Reset));
+        assert_eq!(fill(&app, false, false), ("╭".into(), Color::Reset));
+    }
+
+    /// HIGHLIGHT CURRENT CARD: the cursor's card is washed, very faintly,
+    /// in its status color — breathing while it runs, still in the accent
+    /// once nothing is going on — and keeps the wash while the pane has
+    /// the keys.
+    #[test]
+    fn highlight_current_card_washes_the_card_faintly_in_its_status_color() {
+        use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
+        let row = LauncherRow {
+            agent: Agent {
+                id: AgentId("a1".into()),
+                worktree_id: WorktreeId("w1".into()),
+                name: "fix login".into(),
+                status: AgentStatus::Running,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: 0,
+                alive: true,
+                issue_url: None,
+                recent_prompts: Vec::new(),
+            },
+            project: "nebula".into(),
+            branch: "feat-x".into(),
+            pr: None,
+        };
+        let th = Theme::by_name("coral");
+        let mut app = App::new();
+        app.theme = th;
+        let draw = |app: &App, focused: bool| {
+            let area = Rect::new(0, 0, 40, crate::launcher::CARD_H);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .unwrap();
+            terminal
+                .draw(|f| draw_one(f, app, area, &row, true, focused, th))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+
+        // Off: the plain gray fill, dimmed off the grid.
+        app.focus = Focus::Terminal;
+        let buf = draw(&app, false);
+        assert_eq!(buf.cell((20, 1)).unwrap().bg, th.sel_bg_dim);
+
+        // On: a faint wash of the running yellow, frame and all, while
+        // the pane has the keys.
+        app.highlight_current_card = true;
+        let buf = draw(&app, false);
+        let fill = buf.cell((20, 2)).unwrap().bg;
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, fill);
+        let Color::Rgb(r, g, b) = fill else {
+            panic!("{fill:?}")
+        };
+        assert!(r.max(g).max(b) <= 45, "faint: {fill:?}");
+        assert!(r > b && g > b, "yellowish: {fill:?}");
+
+        // It breathes between the floor and the peak.
+        let levels: Vec<f32> = (0..TINT_BREATH).map(tint_level).collect();
+        assert!(levels
+            .iter()
+            .all(|l| *l >= TINT_FLOOR - 1e-4 && *l <= TINT_PEAK + 1e-4));
+        assert!(levels[TINT_BREATH / 2] > levels[0] + 0.1);
+        assert_eq!(
+            dim_toward_black(Color::Indexed(209), 0.5),
+            Color::Rgb(128, 68, 48)
+        );
+
+        // A quiet card holds a still wash of the accent; the animations
+        // off hold a live one still at its peak.
+        let mut idle = row.clone();
+        idle.agent.status = AgentStatus::Fresh;
+        let idle_card = |app: &App| {
+            let area = Rect::new(0, 0, 40, crate::launcher::CARD_H);
+            let mut buf = Buffer::empty(area);
+            draw_card(&mut buf, app, area, &idle, true, false, th, &mut None);
+            buf.cell((20, 2)).unwrap().bg
+        };
+        assert_eq!(idle_card(&app), dim_toward_black(th.accent, TINT_STILL));
+        app.animations = false;
+        assert_eq!(
+            draw(&app, false).cell((20, 2)).unwrap().bg,
+            dim_toward_black(th.warn, TINT_PEAK)
+        );
+
+        // The PROJECT TABS holding the keys fade it further.
+        app.launcher_tab_cursor = Some(nebula_core::ProjectId("p1".into()));
+        assert_eq!(
+            draw(&app, false).cell((20, 2)).unwrap().bg,
+            dim_toward_black(th.warn, TINT_PEAK * 0.6)
+        );
     }
 
     /// CARD LINE COUNTS: the lines behind the file count always follow it
