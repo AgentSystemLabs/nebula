@@ -434,13 +434,34 @@ fn activity(v: &serde_json::Value, viewer: Option<&str>) -> Vec<String> {
     stamps
 }
 
-/// The pull request's [`Health`] as a `gh pr view` / `gh pr list` payload
-/// carries it: `mergeable` and `statusCheckRollup`, either missing when the
-/// caller did not ask for it, which reads as healthy.
+/// The pull request's [`Health`] as a payload carries it: `mergeable`, and
+/// the checks in one of two shapes. `gh pr view` hands back every check on
+/// the head commit (`statusCheckRollup`, folded by [`checks`]); a [`list`]
+/// node carries only GitHub's own verdict on them, the rollup's `state`
+/// on its last commit ([`rollup_state`]). Either missing — the caller did
+/// not ask — reads as healthy.
 fn health(v: &serde_json::Value) -> Health {
+    let checks = match v.pointer("/commits/nodes/0/commit/statusCheckRollup") {
+        Some(rollup) => rollup_state(rollup),
+        None => checks(arr_at(v, "statusCheckRollup")),
+    };
     Health {
         conflicts: str_at(v, "mergeable") == "CONFLICTING",
-        checks: checks(arr_at(v, "statusCheckRollup")),
+        checks,
+    }
+}
+
+/// GitHub's one word for every check on a commit (`StatusCheckRollup`'s
+/// `state`): the verdict the pull request page's ✓ / ✗ shows, worked out
+/// server side, so asking for it costs nothing per check. `EXPECTED` is a
+/// required status that has not reported yet — still pending. A commit
+/// with no checks at all has no rollup (`null`): nothing to say.
+fn rollup_state(rollup: &serde_json::Value) -> Checks {
+    match str_at(rollup, "state").as_str() {
+        "SUCCESS" => Checks::Passing,
+        "FAILURE" | "ERROR" => Checks::Failing,
+        "PENDING" | "EXPECTED" => Checks::Pending,
+        _ => Checks::Absent,
     }
 }
 
@@ -477,16 +498,30 @@ fn checks(rollup: &[serde_json::Value]) -> Checks {
 /// Every open pull request on a project's repo, and what it costs to ask.
 ///
 /// A worktree's own PR ([`lookup`]) is one `gh pr view` per checkout; this
-/// is one `gh pr list` per *project*, answering "what's still open here?"
+/// is one GraphQL query per *project*, answering "what's still open here?"
 /// for the group at the bottom of the worktrees panel. It deliberately
 /// carries no conversation: reading comment counts for a hundred rows would
 /// be a request each, so the unread badge stays a per-worktree affair.
 /// One page, one call, however many PRs the repo has.
 ///
-/// `gh` pages past its own 30-row default, so the cap is ours to set: a
-/// repo with hundreds of open pull requests would spend several API calls
-/// per refresh filling rows nobody scrolls to.
+/// The cap is ours to set, and a page is all GraphQL gives in one request:
+/// a repo with hundreds of open pull requests would spend several API
+/// calls per refresh filling rows nobody scrolls to.
 pub const LIST_LIMIT: usize = 100;
+
+/// The one GraphQL query [`list`] runs — `gh pr list`'s own fields, in its
+/// own newest-first order, save the checks. `gh pr list --json
+/// statusCheckRollup` asks for every check context on every pull
+/// request's head commit, and on a busy repo (80 open pull requests, 30
+/// to 60 checks each) GitHub gives up on that with a 504 every time, so
+/// the list never refreshed again (#106). All the row needs is one word
+/// per pull request, and GitHub computes it: the rollup's `state`.
+const LIST_QUERY: &str = "query($owner: String!, $repo: String!, $limit: Int!) { \
+    repository(owner: $owner, name: $repo) { \
+    pullRequests(states: OPEN, first: $limit, orderBy: {field: CREATED_AT, direction: DESC}) { \
+    nodes { number url title isDraft headRefName isCrossRepository \
+    headRepositoryOwner { login } mergeable \
+    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } } } }";
 
 /// One row of a project's open-pull-request list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -591,20 +626,27 @@ impl PrLaunch {
 ///   simply stops coming back, so re-asking on a beat *is* the periodic
 ///   "should this row still be here?" check. Nothing has to track closures
 ///   separately.
+///
+/// Asked as [`LIST_QUERY`] through `gh api graphql` rather than `gh pr
+/// list`, whose checks field times out on a busy repo; `gh` still fills
+/// in `{owner}` and `{repo}` from the checkout, the way `gh pr list`
+/// resolves its repo.
 pub async fn list(dir: &Path) -> Option<Vec<OpenPr>> {
-    let limit = LIST_LIMIT.to_string();
+    let limit = format!("limit={LIST_LIMIT}");
+    let query = format!("query={LIST_QUERY}");
     let out = gh(
         Some(dir),
         &[
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
+            "api",
+            "graphql",
+            "-F",
+            "owner={owner}",
+            "-F",
+            "repo={repo}",
+            "-F",
             &limit,
-            "--json",
-            "number,url,title,isDraft,headRefName,isCrossRepository,headRepositoryOwner,\
-             mergeable,statusCheckRollup",
+            "-f",
+            &query,
         ],
         TIMEOUT,
     )
@@ -642,13 +684,16 @@ fn checkout_branch(v: &serde_json::Value) -> String {
     }
 }
 
-/// Parse `gh pr list --json …` output — a bare array. Kept separate from
-/// the process call so the shape it expects is testable without a GitHub
-/// account. A row whose url could never be opened is dropped rather than
-/// failing the whole list; a payload that isn't an array at all is a miss.
+/// Parse [`LIST_QUERY`]'s answer — the rows under
+/// `data.repository.pullRequests.nodes`. Kept separate from the process
+/// call so the shape it expects is testable without a GitHub account. A
+/// row whose url could never be opened is dropped rather than failing the
+/// whole list; a payload with no list of rows at all is a miss.
 pub(crate) fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
-    let rows = serde_json::from_str::<serde_json::Value>(json).ok()?;
-    let rows = rows.as_array()?;
+    let answer = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    let rows = answer
+        .pointer("/data/repository/pullRequests/nodes")?
+        .as_array()?;
     Some(
         rows.iter()
             .filter_map(|v| {
@@ -664,6 +709,13 @@ pub(crate) fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
             })
             .collect(),
     )
+}
+
+/// A [`LIST_QUERY`] answer as `gh api graphql` prints it, around `nodes`
+/// — a JSON array of rows.
+#[cfg(test)]
+pub(crate) fn list_answer(nodes: &str) -> String {
+    format!(r#"{{"data":{{"repository":{{"pullRequests":{{"nodes":{nodes}}}}}}}}}"#)
 }
 
 /// Sink the drafts below everything else, keeping `gh`'s newest-first
@@ -1007,7 +1059,8 @@ mod tests {
     }
 
     /// GitHub's word on whether the branch still merges (`mergeable`) and
-    /// how its checks stand (`statusCheckRollup`) rides every payload —
+    /// how its checks stand (`statusCheckRollup`, the list's as its rollup
+    /// `state`) rides every payload —
     /// branch row, list row and detail alike — into the same `Health`, so
     /// the three surfaces go red together. `UNKNOWN` mergeability, what
     /// GitHub says while it is still computing, is not a conflict.
@@ -1019,8 +1072,10 @@ mod tests {
         assert_eq!(pr.health.checks, Checks::Passing);
         assert_eq!(pr.trouble(), Some(Trouble::Conflicts));
 
-        let list = r#"[{"number":8,"url":"https://github.com/o/r/pull/8","title":"t","isDraft":false,"headRefName":"h","mergeable":"UNKNOWN","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}]}]"#;
-        let rows = parse_list(list).expect("parsed");
+        let list = list_answer(
+            r#"[{"number":8,"url":"https://github.com/o/r/pull/8","title":"t","isDraft":false,"headRefName":"h","mergeable":"UNKNOWN","commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]}}]"#,
+        );
+        let rows = parse_list(&list).expect("parsed");
         assert!(!rows[0].health.conflicts, "UNKNOWN is not a conflict");
         assert_eq!(rows[0].health.checks, Checks::Failing);
         assert_eq!(rows[0].trouble(), Some(Trouble::FailingChecks));
@@ -1079,6 +1134,38 @@ mod tests {
         assert_eq!(checks(&[ctx("SUCCESS")]), Checks::Passing);
         assert_eq!(checks(&[ctx("PENDING")]), Checks::Pending);
         assert_eq!(checks(&[ctx("ERROR")]), Checks::Failing);
+    }
+
+    /// A list row's checks are GitHub's own rollup `state` on its last
+    /// commit, read into the same four words the fold gives; a commit
+    /// with no checks has a `null` rollup, which says nothing.
+    #[test]
+    fn a_list_rows_checks_are_the_rollup_state() {
+        let row = |rollup: &str| {
+            let nodes = format!(
+                r#"[{{"number":1,"url":"https://github.com/o/r/pull/1","commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{rollup}}}}}]}}}}]"#
+            );
+            parse_list(&list_answer(&nodes)).expect("parsed")[0]
+                .health
+                .checks
+        };
+        assert_eq!(row(r#"{"state":"SUCCESS"}"#), Checks::Passing);
+        assert_eq!(row(r#"{"state":"FAILURE"}"#), Checks::Failing);
+        assert_eq!(row(r#"{"state":"ERROR"}"#), Checks::Failing);
+        assert_eq!(row(r#"{"state":"PENDING"}"#), Checks::Pending);
+        assert_eq!(row(r#"{"state":"EXPECTED"}"#), Checks::Pending);
+        assert_eq!(row("null"), Checks::Absent);
+    }
+
+    /// The list asks for GitHub's one word per pull request, never every
+    /// check on it: asking for the contexts is what timed out on a busy
+    /// repo and froze the list on its last good answer (#106).
+    #[test]
+    fn the_list_query_asks_for_the_rollup_state_alone() {
+        assert!(LIST_QUERY.contains("statusCheckRollup { state }"));
+        assert!(!LIST_QUERY.contains("contexts"));
+        assert!(LIST_QUERY.contains("states: OPEN"));
+        assert!(LIST_QUERY.contains("orderBy: {field: CREATED_AT, direction: DESC}"));
     }
 
     /// Trouble is an open pull request's: a merged or closed one is past
@@ -1260,13 +1347,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_gh_pr_list_payload() {
-        let prs = parse_list(
+    fn parses_the_open_list_answer() {
+        let prs = parse_list(&list_answer(
             r#"[
               {"number":42,"title":"Attach links","url":"https://github.com/o/r/pull/42","isDraft":false,"headRefName":"attach-links"},
               {"number":7,"title":"WIP","url":"https://github.com/o/r/pull/7","isDraft":true}
             ]"#,
-        )
+        ))
         .expect("parsed");
         assert_eq!(prs.len(), 2);
         assert_eq!(prs[0].label(), "#42 Attach links");
@@ -1289,7 +1376,7 @@ mod tests {
     /// fork since deleted is named for the pull request.
     #[test]
     fn a_forks_checkout_branch_carries_its_owner() {
-        let prs = parse_list(
+        let prs = parse_list(&list_answer(
             r#"[
               {"number":129,"title":"Prefer PowerShell 7","url":"https://github.com/o/r/pull/129","isDraft":false,
                "headRefName":"main","isCrossRepository":true,"headRepositoryOwner":{"login":"givemeurhats"}},
@@ -1300,7 +1387,7 @@ mod tests {
               {"number":140,"title":"Orphan","url":"https://github.com/o/r/pull/140","isDraft":false,
                "headRefName":"main","isCrossRepository":true,"headRepositoryOwner":null}
             ]"#,
-        )
+        ))
         .expect("parsed");
         let heads: Vec<&str> = prs.iter().map(|pr| pr.head.as_str()).collect();
         assert_eq!(
@@ -1320,20 +1407,20 @@ mod tests {
     /// pretending it never asked.
     #[test]
     fn an_empty_list_is_an_answer_not_a_miss() {
-        assert_eq!(parse_list("[]"), Some(vec![]));
+        assert_eq!(parse_list(&list_answer("[]")), Some(vec![]));
     }
 
     /// One unusable row must not cost the whole list; a payload that isn't
     /// a list at all is a miss.
     #[test]
     fn list_rows_that_could_never_be_opened_drop_out() {
-        let prs = parse_list(
+        let prs = parse_list(&list_answer(
             r#"[
               {"number":1,"url":"file:///etc/passwd"},
               {"url":"https://github.com/o/r/pull/2"},
               {"number":3,"url":"https://github.com/o/r/pull/3"}
             ]"#,
-        )
+        ))
         .expect("parsed");
         assert_eq!(
             prs.len(),
@@ -1343,6 +1430,10 @@ mod tests {
         assert_eq!(prs[0].label(), "#3", "a missing title still names the PR");
         assert!(parse_list("").is_none());
         assert!(parse_list("{}").is_none());
+        assert!(parse_list("[]").is_none(), "a bare array is not the answer");
+        assert!(parse_list(&list_answer("{}")).is_none());
+        // What `gh api graphql` prints for a repo it could not resolve.
+        assert!(parse_list(r#"{"data":{"repository":null}}"#).is_none());
     }
 
     /// The preview payload: description, stats, and one merged oldest-first

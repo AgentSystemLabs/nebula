@@ -1093,7 +1093,7 @@ pub struct Config {
     /// Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE's pull-request rows, so browsing what's open shows only
     /// the rows asking for a reviewer. A view filter, not a fetch filter:
-    /// `gh pr list` still returns the drafts and the cache still holds
+    /// the open list's query still returns the drafts and the cache holds
     /// them, so switching this off shows them again at once, and a draft
     /// marked ready on GitHub joins the rows on the next refresh. Never
     /// touches a checkout, its sessions, or the checkout's own PR ROW in

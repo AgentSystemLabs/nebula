@@ -2899,10 +2899,11 @@ impl PointerShape {
     }
 }
 
-/// What `gh pr list` last said about one project's open pull requests, and
-/// the timer deciding when to ask again. Held per project rather than
-/// refetched per repaint because every answer is a `gh` process and a
-/// GitHub API call, and the list changes on the order of minutes.
+/// What `pull_request::list` last said about one project's open pull
+/// requests, and the timer deciding when to ask again. Held per project
+/// rather than refetched per repaint because every answer is a `gh`
+/// process and a GitHub API call, and the list changes on the order of
+/// minutes.
 #[derive(Debug, Clone)]
 pub struct OpenPrs {
     /// Open pull requests: newest first, with the drafts sunk below every
@@ -3578,7 +3579,7 @@ pub struct App {
     /// entry, so arriving somewhere always asks again promptly; so does its
     /// pull request leaving the project's open list.
     pub pr_recheck: HashMap<WorktreeId, (std::time::Instant, std::time::Duration)>,
-    /// What `gh pr list` last said about each project's open pull requests
+    /// What `pull_request::list` last said about each project's open pull requests
     /// — the group at the bottom of the Worktrees panel. A missing key
     /// means "never asked"; only the selected project is ever asked, so a
     /// machine with thirty projects still costs one call per refresh.
@@ -3586,6 +3587,12 @@ pub struct App {
     /// Projects with a list lookup in flight, so a repaint can't stack a
     /// second `gh` on the first.
     pub open_prs_inflight: std::collections::HashSet<ProjectId>,
+    /// Projects whose last list lookup came back with no answer — `gh`
+    /// failed, timed out, or the checkout is gone. The list kept on screen
+    /// is then the last one that worked, so the PULL REQUESTS MODAL says
+    /// `couldn't refresh` rather than pass it off as current; the next
+    /// answer that lands clears it.
+    pub open_prs_failed: std::collections::HashSet<ProjectId>,
     /// Bodies and conversations of the pull requests the cursor has rested
     /// on, keyed by URL. A second API call on top of the list, so it is
     /// fetched only for the row actually being read and kept for the whole
@@ -3878,6 +3885,7 @@ impl App {
             pr_recheck: HashMap::new(),
             open_prs: HashMap::new(),
             open_prs_inflight: std::collections::HashSet::new(),
+            open_prs_failed: std::collections::HashSet::new(),
             pr_detail: HashMap::new(),
             pr_detail_inflight: std::collections::HashSet::new(),
             pr_detail_failed: std::collections::HashSet::new(),
@@ -4926,7 +4934,7 @@ impl App {
             .collect()
     }
 
-    /// The selected project's open pull requests, every one `gh pr list`
+    /// The selected project's open pull requests, every one the list query
     /// answered with — drafts included whatever `hide_draft_prs` says, and
     /// whether or not the group under the checkouts is showing them. The
     /// list the fetch cap (`pull_request::LIST_LIMIT`) is measured
@@ -5279,7 +5287,7 @@ impl App {
         }
     }
 
-    /// Whether `gh pr list` should be run for this project now: not while
+    /// Whether the open list should be asked for this project now: not while
     /// an answer is in flight, and not before the timer the last answer
     /// armed. A project nebula has never asked about is always due.
     pub fn open_prs_lookup_due(&self, project: &ProjectId) -> bool {
