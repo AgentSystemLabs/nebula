@@ -434,8 +434,21 @@ impl PtySession {
     }
 
     /// Ring snapshot for attach replay: (base_seq, bytes).
+    ///
+    /// A replay that rebuilds the client's screen from a ring that has
+    /// wrapped opens with the modes whose set may have fallen off its head
+    /// — bracketed paste, which claude turns on once at startup and the
+    /// client reads to paste the way a terminal would (#107) — and
+    /// `base_seq` backs up by their length, so the client's byte count
+    /// still ends where the ring does.
     pub fn snapshot(&self, from_seq: Option<u64>) -> (u64, Vec<u8>) {
-        self.ring.lock().unwrap().snapshot_from(from_seq)
+        let (base_seq, data) = self.ring.lock().unwrap().snapshot_from(from_seq);
+        let modes: &[u8] = if self.kitty.lock().unwrap().bracketed_paste() {
+            b"\x1b[?2004h"
+        } else {
+            b""
+        };
+        with_modes(from_seq, base_seq, data, modes)
     }
 
     /// The end of the ring for a grid card's preview (`TailOutput`): the
@@ -552,6 +565,23 @@ fn spawn_reader_thread(
             let _ = tx.blocking_send(ReaderMsg::Eof { exit_code });
         })
         .expect("spawn pty reader thread");
+}
+
+/// The ring's replay `data` from `base_seq`, opened with `modes` when it
+/// rebuilds a screen that lost the ring's head. The whole history
+/// (`base_seq` 0) and a continuation of a screen the client kept (its
+/// `from_seq`) lost nothing and go as they are. So does a replay whose
+/// backed-up start would be exactly where the client asked to resume:
+/// it would take `modes` for the bytes it missed and keep its screen.
+fn with_modes(from_seq: Option<u64>, base_seq: u64, data: Vec<u8>, modes: &[u8]) -> (u64, Vec<u8>) {
+    let start = base_seq.saturating_sub(modes.len() as u64);
+    if modes.is_empty() || start == 0 || from_seq == Some(base_seq) || from_seq == Some(start) {
+        return (base_seq, data);
+    }
+    let mut replay = Vec::with_capacity(modes.len() + data.len());
+    replay.extend_from_slice(modes);
+    replay.extend_from_slice(&data);
+    (start, replay)
 }
 
 /// When output that arrived at `now` has to be on its way to the clients.
@@ -689,6 +719,89 @@ mod tests {
             flush_deadline(now, Some(just_flushed)),
             just_flushed + COALESCE_HOLD
         );
+    }
+
+    /// Only a replay that rebuilds a screen from past the ring's head opens
+    /// with the modes, and the client's byte count still lands on the end.
+    #[test]
+    fn modes_open_only_a_replay_that_lost_the_ring_head() {
+        let modes = b"\x1b[?2004h";
+        let (start, replay) = with_modes(None, 100, b"tail".to_vec(), modes);
+        assert_eq!(replay, b"\x1b[?2004htail");
+        assert_eq!(start + replay.len() as u64, 104, "ends where the ring does");
+        // A resume point that fell off the ring rebuilds the screen too.
+        assert_eq!(with_modes(Some(50), 100, b"tail".to_vec(), modes).0, 92);
+
+        let untouched = (100, b"tail".to_vec());
+        assert_eq!(with_modes(None, 100, b"tail".to_vec(), b""), untouched);
+        // A continuation of a screen the client kept.
+        assert_eq!(
+            with_modes(Some(100), 100, b"tail".to_vec(), modes),
+            untouched
+        );
+        // A start that would read as that continuation.
+        assert_eq!(
+            with_modes(Some(92), 100, b"tail".to_vec(), modes),
+            untouched
+        );
+        // The whole history, or too little lost to back up over.
+        assert_eq!(
+            with_modes(None, 0, b"all".to_vec(), modes),
+            (0, b"all".to_vec())
+        );
+        assert_eq!(
+            with_modes(None, 8, b"tail".to_vec(), modes),
+            (8, b"tail".to_vec())
+        );
+    }
+
+    /// A child that turned bracketed paste on and has since printed more
+    /// than the ring holds — claude, a long session later — still has it on
+    /// a screen rebuilt from the replay, and the replay ends on the ring's
+    /// last byte (#107).
+    #[tokio::test]
+    async fn a_wrapped_replay_keeps_bracketed_paste() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!(
+                        "printf '\\033[?2004h'; head -c {} /dev/zero | tr '\\000' x",
+                        RING_CAPACITY + 4096
+                    ),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        let mut rx = session.events.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Exited { .. }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("child exits within 10s");
+
+        let (head, raw) = session.ring.lock().unwrap().snapshot_from(None);
+        assert!(head > 0, "the ring wrapped");
+        let (start, replay) = session.snapshot(None);
+        assert_eq!(start + replay.len() as u64, head + raw.len() as u64);
+        let mut screen = vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0);
+        screen.process(&replay);
+        assert!(screen.screen().bracketed_paste());
+        // A client that kept its screen gets the ring as it is.
+        assert_eq!(session.snapshot(Some(head)), (head, raw));
     }
 
     /// A window title set by the child reaches subscribers as its own

@@ -2488,13 +2488,11 @@ fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
             if app.focus == Focus::Terminal && app.term_locked && !app.pane_shows_placeholder() {
-                if let Some(session) = app.term.as_ref().map(|t| t.sref.clone()) {
+                if let Some(term) = &app.term {
+                    let session = term.sref.clone();
+                    let data = pasted(term.parser.screen(), &text);
                     typed_into(app, &session);
-                    // Bracketed paste so the child (claude, vim…) knows.
-                    out.push(ClientRequest::Input {
-                        session,
-                        data: bracketed(&text),
-                    });
+                    out.push(ClientRequest::Input { session, data });
                 }
             }
         }
@@ -2574,6 +2572,21 @@ fn bracketed(text: &str) -> Vec<u8> {
     data.extend_from_slice(text.as_bytes());
     data.extend_from_slice(PASTE_END);
     data
+}
+
+/// `text` as a terminal pastes it into the program on `screen`: bracketed
+/// when the program turned bracketed paste on (a shell's line editor,
+/// claude, vim), so it takes the text as one block; otherwise as though
+/// typed, each line break an Enter. A program that never asked — a
+/// password prompt, `read` — would take the markers for part of what was
+/// pasted: a token pasted into `hf auth login` came out wrapped in them
+/// (#107).
+fn pasted(screen: &vt100::Screen, text: &str) -> Vec<u8> {
+    if screen.bracketed_paste() {
+        bracketed(text)
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
 }
 
 /// Route a bracketed paste into whatever text field the open overlay has
@@ -17767,16 +17780,19 @@ diff --git a/src/c.rs b/src/c.rs
         ));
     }
 
-    /// A paste into a locked pane reaches the PTY wrapped in the
-    /// bracketed-paste markers, so the child (claude, vim…) takes it as one
-    /// block instead of keystrokes to auto-indent. Unlocked, it goes nowhere.
+    /// A paste into a locked pane whose child turned bracketed paste on
+    /// reaches the PTY wrapped in the markers, so the child (claude, vim…)
+    /// takes it as one block instead of keystrokes to auto-indent.
+    /// Unlocked, it goes nowhere.
     #[test]
     fn paste_into_a_locked_pane_is_bracketed() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
         let sref = SessionRef::Agent(AgentId("a1".into()));
-        app.term = Some(AttachedTerm::new(sref.clone(), 80, 24));
+        let mut term = AttachedTerm::new(sref.clone(), 80, 24);
+        term.apply_output(0, b"\x1b[?2004h");
+        app.term = Some(term);
         app.focus = Focus::Terminal;
         app.term_locked = true;
 
@@ -17793,6 +17809,37 @@ diff --git a/src/c.rs b/src/c.rs
         app.term_locked = false;
         handle_terminal_event(&mut app, Event::Paste("x".into()), &mut out);
         assert!(out.is_empty(), "an unlocked pane takes no paste: {out:?}");
+    }
+
+    /// A program that never turned bracketed paste on gets a paste as a
+    /// terminal sends it, as though typed: a token pasted at a password
+    /// prompt the shell ran (`hf auth login`) arrives as the token alone,
+    /// not wrapped in markers that make it a bad one (#107).
+    #[test]
+    fn paste_into_a_program_that_never_asked_is_not_bracketed() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        let sref = SessionRef::Terminal(TerminalId("t1".into()));
+        let mut term = AttachedTerm::new(sref.clone(), 80, 24);
+        // The shell's prompt asks for bracketed paste and gives it up again
+        // when it runs the command; the command's prompt never asks.
+        let screen = b"$ \x1b[?2004huv run hf auth login\r\n\x1b[?2004lEnter your token: ";
+        term.apply_output(0, screen);
+        app.term = Some(term);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+
+        handle_terminal_event(&mut app, Event::Paste("hf_token".into()), &mut out);
+        handle_terminal_event(&mut app, Event::Paste("one\ntwo\r\n".into()), &mut out);
+        let sent: Vec<&[u8]> = out
+            .iter()
+            .map(|r| match r {
+                ClientRequest::Input { session, data } if *session == sref => data.as_slice(),
+                other => panic!("expected Input to the pane, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(sent, [&b"hf_token"[..], b"one\rtwo\r"]);
     }
 
     #[test]

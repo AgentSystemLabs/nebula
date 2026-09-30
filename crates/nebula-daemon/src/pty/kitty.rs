@@ -12,6 +12,11 @@
 //! cursor position report (`CSI 6 n`) needs a screen, so the scanner only
 //! marks where in the chunk it was asked and the pump answers it from
 //! `pty::cursor`. Replies stay in query order either way.
+//!
+//! And bracketed paste (`CSI ? 2004 h` / `l`): a client reads the mode off
+//! its own parser to paste the way a terminal would, but a child sets it
+//! once — claude at startup — and a ring that has wrapped since no longer
+//! holds the set, so the replay has to restore it (`PtySession::snapshot`).
 
 use super::ESC;
 
@@ -64,6 +69,7 @@ pub struct KittyScanner {
     state: State,
     params: Vec<u8>,
     stack: Vec<u8>,
+    bracketed_paste: bool,
 }
 
 impl Default for KittyScanner {
@@ -78,12 +84,18 @@ impl KittyScanner {
             state: State::Ground,
             params: Vec::new(),
             stack: Vec::new(),
+            bracketed_paste: false,
         }
     }
 
     /// Effective flags: top of the stack, or 0 (legacy) when empty.
     pub fn flags(&self) -> u8 {
         self.stack.last().copied().unwrap_or(0)
+    }
+
+    /// Has the child turned bracketed paste on (`CSI ? 2004 h`)?
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
     }
 
     /// Scan a chunk of child output. Sequences split across chunks are fine —
@@ -114,6 +126,10 @@ impl KittyScanner {
                     self.params.clear();
                     self.state = State::Csi { poisoned: false };
                 } else {
+                    // RIS (`ESC c`) puts every mode back to its default.
+                    if b == b'c' {
+                        self.bracketed_paste = false;
+                    }
                     // Includes ESC ESC; any other escape kind is not a CSI.
                     self.state = if b == ESC { State::Esc } else { State::Ground };
                 }
@@ -186,6 +202,15 @@ impl KittyScanner {
                 // Bare CSI u = SCO restore-cursor; not ours.
                 _ => {}
             },
+            // DECSET / DECRST, any number of modes at once
+            // (`CSI ? 1004 ; 2004 h`): only bracketed paste is tracked.
+            b'h' | b'l' => {
+                if let Some((b'?', modes)) = params.split_first() {
+                    if modes.split(|&b| b == b';').any(|m| m == b"2004") {
+                        self.bracketed_paste = final_byte == b'h';
+                    }
+                }
+            }
             // DA1 (CSI c / CSI 0 c): claim VT102 so detection loops terminate.
             b'c' if params.is_empty() || params == [b'0'] => {
                 actions.reply_bytes(b"\x1b[?6c");
@@ -266,6 +291,26 @@ mod tests {
         let a = s.feed(b"\x1b[31mred\x1b[H\x1b[u\x1b[12345678901234567890u");
         assert_eq!(a, ScanActions::default());
         assert_eq!(s.flags(), 0);
+    }
+
+    #[test]
+    fn bracketed_paste_follows_decset_2004() {
+        let mut s = KittyScanner::new();
+        assert!(!s.bracketed_paste(), "off until the child asks");
+        // Split across chunks, alongside other modes, as claude sets it.
+        s.feed(b"\x1b[?25l\x1b[?10");
+        s.feed(b"04;2004h prompt");
+        assert!(s.bracketed_paste());
+        // A mode that is not 2004, or the ANSI (non-`?`) form, changes nothing.
+        s.feed(b"\x1b[?1004l\x1b[2004l\x1b[?20045l");
+        assert!(s.bracketed_paste());
+        // A shell running a command turns it off before the command reads.
+        s.feed(b"\x1b[?2004l");
+        assert!(!s.bracketed_paste());
+        s.feed(b"\x1b[?2004h");
+        // RIS (`reset`) drops it with every other mode.
+        s.feed(b"\x1bc");
+        assert!(!s.bracketed_paste());
     }
 
     #[test]
