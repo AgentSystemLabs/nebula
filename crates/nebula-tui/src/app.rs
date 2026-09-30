@@ -3749,6 +3749,11 @@ pub struct App {
     /// Mirrors the config, refreshed at startup and when the settings
     /// overlay applies a change.
     pub hide_card_marks: bool,
+    /// The `highlight_current_card` setting: the cursor's card is washed
+    /// faintly in its status color instead of the gray fill
+    /// (`launcher_view::card_tint`). Mirrors the config, refreshed at
+    /// startup and when the settings overlay applies a change.
+    pub highlight_current_card: bool,
     /// The ROWS MEMO, armed by the frame and by [`App::reading_url`].
     pub rows_memo: RowsMemo,
 }
@@ -3915,6 +3920,7 @@ impl App {
             show_all_worktrees: false,
             black_background: false,
             hide_card_marks: false,
+            highlight_current_card: false,
             rows_memo: RowsMemo::default(),
         }
     }

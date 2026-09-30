@@ -1800,7 +1800,7 @@ fn draw_chip(
     th: Theme,
 ) {
     let block = if selected {
-        selected_card_block(focused, th)
+        selected_card_block(app, focused, None, th)
     } else {
         Block::default()
             .borders(Borders::ALL)
@@ -1960,12 +1960,135 @@ fn card_edge(a: &nebula_core::Agent, quiet: bool, th: Theme) -> Option<Color> {
 /// row in nebula wears, frame and all: `sel_bg` while the grid has the
 /// keys, `sel_bg_dim` while the pane or the PROJECT TABS do, so the card
 /// stays picked out as the one the pane reads.
-fn selected_card_block(focused: bool, th: Theme) -> Block<'static> {
-    Block::default()
+///
+/// HIGHLIGHT CURRENT CARD trades the gray fill for a faint wash of the
+/// card's own light ([`card_tint`]), kept while the pane has the keys.
+/// `status` is the color its frame would wear were it not selected
+/// ([`card_edge`]); none for a quiet card or a terminal's.
+fn selected_card_block(
+    app: &App,
+    focused: bool,
+    status: Option<Color>,
+    th: Theme,
+) -> Block<'static> {
+    let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(th.accent))
-        .style(Style::default().bg(if focused { th.sel_bg } else { th.sel_bg_dim }))
+        .border_style(Style::default().fg(th.accent));
+    let fill = if app.highlight_current_card {
+        card_tint(app, status, th)
+    } else if focused {
+        th.sel_bg
+    } else {
+        th.sel_bg_dim
+    };
+    block.style(Style::default().bg(fill))
+}
+
+/// HIGHLIGHT CURRENT CARD's fill: the card's status color taken nearly to
+/// black, so the card is only just washed in it. A card with something
+/// going on — running, asking, finished and unread — breathes, the wash
+/// rising and falling on the sweep's clock ([`tint_level`]); a quiet
+/// card or a terminal's holds a still wash of the accent, as every card
+/// does with the ANIMATIONS off. Fainter still while the PROJECT TABS
+/// hold the keys.
+fn card_tint(app: &App, status: Option<Color>, th: Theme) -> Color {
+    let (color, level) = match status {
+        Some(c) if app.animations => (c, tint_level(app.sweep_phase())),
+        Some(c) => (c, TINT_PEAK),
+        None => (th.accent, TINT_STILL),
+    };
+    let away = if app.launcher_tab_cursor.is_none() {
+        1.0
+    } else {
+        0.6
+    };
+    dim_toward_black(color, level * away)
+}
+
+/// How much of its status color a breathing card's fill keeps at its
+/// brightest, and how much a still one keeps of the accent.
+const TINT_PEAK: f32 = 0.20;
+const TINT_STILL: f32 = 0.13;
+/// Its dimmest: all but the grid's own black.
+const TINT_FLOOR: f32 = 0.07;
+/// Sweep frames ([`crate::app::SWEEP_FRAME`]) in one breath, ~1.6 s.
+const TINT_BREATH: usize = 16;
+
+/// Where a breathing fill is at sweep `phase`: a cosine from
+/// [`TINT_FLOOR`] up to [`TINT_PEAK`] and back.
+fn tint_level(phase: usize) -> f32 {
+    let t = (phase % TINT_BREATH) as f32 / TINT_BREATH as f32;
+    let wave = (1.0 - (t * std::f32::consts::TAU).cos()) / 2.0;
+    TINT_FLOOR + (TINT_PEAK - TINT_FLOOR) * wave
+}
+
+/// `c` at `level` of its brightness, the rest black — truecolor, as
+/// `focus_tint` already is, since the 256 palette has no dim shade of
+/// most hues. A color with no fixed value (`Reset`) is returned as is.
+fn dim_toward_black(c: Color, level: f32) -> Color {
+    let Some((r, g, b)) = color_rgb(c) else {
+        return c;
+    };
+    let f = |v: u8| (f32::from(v) * level).round().clamp(0.0, 255.0) as u8;
+    Color::Rgb(f(r), f(g), f(b))
+}
+
+/// The RGB a terminal most likely shows for `c`: xterm's defaults for the
+/// sixteen named colors, the 6×6×6 cube and the gray ramp for the rest of
+/// the 256.
+fn color_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    let index = match c {
+        Color::Rgb(r, g, b) => return Some((r, g, b)),
+        Color::Indexed(i) => i,
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        Color::Reset => return None,
+    };
+    Some(match index {
+        0..=15 => ANSI[usize::from(index)],
+        16..=231 => {
+            let i = index - 16;
+            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            (level(i / 36), level(i / 6 % 6), level(i % 6))
+        }
+        _ => {
+            let v = 8 + (index - 232) * 10;
+            (v, v, v)
+        }
+    })
 }
 
 /// What an ARCHIVED card wears where a live one wears its STATUS DOT: the
@@ -2010,8 +2133,9 @@ fn draw_card(
     } else {
         (th.dim, th.muted)
     };
+    let edge = card_edge(a, archived || pending || cold, th);
     let block = if selected {
-        selected_card_block(focused, th)
+        selected_card_block(app, focused, edge, th)
     } else {
         Block::default()
             .borders(Borders::ALL)
@@ -2023,10 +2147,7 @@ fn draw_card(
             } else {
                 BorderType::Rounded
             })
-            .border_style(
-                Style::default()
-                    .fg(card_edge(a, archived || pending || cold, th).unwrap_or(th.edge)),
-            )
+            .border_style(Style::default().fg(edge.unwrap_or(th.edge)))
     };
     let inner = block.inner(area);
     block.render(area, buf);
@@ -5156,6 +5277,105 @@ mod tests {
         assert_eq!(fill(&app, true, false), ("┏".into(), th.sel_bg_dim));
         assert_eq!(fill(&app, false, true), ("╭".into(), Color::Reset));
         assert_eq!(fill(&app, false, false), ("╭".into(), Color::Reset));
+    }
+
+    /// HIGHLIGHT CURRENT CARD: the cursor's card is washed, very faintly,
+    /// in its status color — breathing while it runs, still in the accent
+    /// once nothing is going on — and keeps the wash while the pane has
+    /// the keys.
+    #[test]
+    fn highlight_current_card_washes_the_card_faintly_in_its_status_color() {
+        use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
+        let row = LauncherRow {
+            agent: Agent {
+                id: AgentId("a1".into()),
+                worktree_id: WorktreeId("w1".into()),
+                name: "fix login".into(),
+                status: AgentStatus::Running,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: 0,
+                alive: true,
+                issue_url: None,
+                recent_prompts: Vec::new(),
+            },
+            project: "nebula".into(),
+            branch: "feat-x".into(),
+            pr: None,
+        };
+        let th = Theme::by_name("coral");
+        let mut app = App::new();
+        app.theme = th;
+        let draw = |app: &App, focused: bool| {
+            let area = Rect::new(0, 0, 40, crate::launcher::CARD_H);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .unwrap();
+            terminal
+                .draw(|f| draw_one(f, app, area, &row, true, focused, th))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+
+        // Off: the plain gray fill, dimmed off the grid.
+        app.focus = Focus::Terminal;
+        let buf = draw(&app, false);
+        assert_eq!(buf.cell((20, 1)).unwrap().bg, th.sel_bg_dim);
+
+        // On: a faint wash of the running yellow, frame and all, while
+        // the pane has the keys.
+        app.highlight_current_card = true;
+        let buf = draw(&app, false);
+        let fill = buf.cell((20, 2)).unwrap().bg;
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, fill);
+        let Color::Rgb(r, g, b) = fill else {
+            panic!("{fill:?}")
+        };
+        assert!(r.max(g).max(b) <= 45, "faint: {fill:?}");
+        assert!(r > b && g > b, "yellowish: {fill:?}");
+
+        // It breathes between the floor and the peak.
+        let levels: Vec<f32> = (0..TINT_BREATH).map(tint_level).collect();
+        assert!(levels
+            .iter()
+            .all(|l| *l >= TINT_FLOOR - 1e-4 && *l <= TINT_PEAK + 1e-4));
+        assert!(levels[TINT_BREATH / 2] > levels[0] + 0.1);
+        assert_eq!(
+            dim_toward_black(Color::Indexed(209), 0.5),
+            Color::Rgb(128, 68, 48)
+        );
+
+        // A quiet card holds a still wash of the accent; the animations
+        // off hold a live one still at its peak.
+        let mut idle = row.clone();
+        idle.agent.status = AgentStatus::Fresh;
+        let idle_card = |app: &App| {
+            let area = Rect::new(0, 0, 40, crate::launcher::CARD_H);
+            let mut buf = Buffer::empty(area);
+            draw_card(&mut buf, app, area, &idle, true, false, th, &mut None);
+            buf.cell((20, 2)).unwrap().bg
+        };
+        assert_eq!(idle_card(&app), dim_toward_black(th.accent, TINT_STILL));
+        app.animations = false;
+        assert_eq!(
+            draw(&app, false).cell((20, 2)).unwrap().bg,
+            dim_toward_black(th.warn, TINT_PEAK)
+        );
+
+        // The PROJECT TABS holding the keys fade it further.
+        app.launcher_tab_cursor = Some(nebula_core::ProjectId("p1".into()));
+        assert_eq!(
+            draw(&app, false).cell((20, 2)).unwrap().bg,
+            dim_toward_black(th.warn, TINT_PEAK * 0.6)
+        );
     }
 
     /// CARD LINE COUNTS: the lines behind the file count always follow it
