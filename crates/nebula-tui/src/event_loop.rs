@@ -166,7 +166,7 @@ const PR_SWEEP_REFRESH: Duration = Duration::from_secs(5 * 60);
 
 /// How often the selected *project's* open-pull-request list is re-asked
 /// once a repo has proved it has any, and how a repo that answers empty (or
-/// can't answer at all) backs off. One `gh pr list` is one GraphQL call —
+/// can't answer at all) backs off. One list lookup is one GraphQL call —
 /// one point, however many pull requests come back. Every other project's
 /// list is on the slower `OPEN_PRS_SWEEP_REFRESH`.
 ///
@@ -197,7 +197,7 @@ pub(crate) const OPEN_PRS_RECHECK_MAX: Duration = Duration::from_secs(10 * 60);
 /// How often the open list of a project the cursor is *not* on is re-asked
 /// — the background pass that keeps every project's group warm, so
 /// switching to one shows a list minutes old at worst (and the cache the
-/// next launch hydrates from is as fresh as that). One `gh pr list` per
+/// next launch hydrates from is as fresh as that). One list lookup per
 /// project per beat, one project per tick (`sweep_open_prs`): twelve
 /// calls an hour per project against the budget above, and a project that
 /// answers empty keeps its own backoff on top. Same reasoning and cadence
@@ -1216,7 +1216,9 @@ fn open_prs_sweep_target(app: &App) -> Option<(ProjectId, std::path::PathBuf)> {
 /// attempt a backoff step further out, so a repo with no PRs (or a machine
 /// with no `gh`) settles at `OPEN_PRS_RECHECK_MAX` instead of asking all
 /// day. A failed call keeps whatever list was already on screen: one flaky
-/// network round trip is no reason to blank the group.
+/// network round trip is no reason to blank the group. It is noted,
+/// though (`App::open_prs_failed`), so a call that keeps failing shows as
+/// a list that `couldn't refresh` rather than a current one.
 fn note_open_prs_answer(
     app: &mut App,
     project: nebula_core::ProjectId,
@@ -1232,6 +1234,15 @@ fn note_open_prs_answer(
     // the cursor goes with it — a checkout is never lost to a re-list.
     let checkout = app.selected_worktree().map(|w| w.id.clone());
     app.open_prs_inflight.remove(&project);
+    let failed = list.is_none();
+    if failed != app.open_prs_failed.contains(&project) {
+        app.dirty = true;
+        if failed {
+            app.open_prs_failed.insert(project.clone());
+        } else {
+            app.open_prs_failed.remove(&project);
+        }
+    }
     let previous = app.open_prs.get(&project);
     let found = list.as_ref().is_some_and(|l| !l.is_empty());
     let step = if found {
@@ -1415,7 +1426,7 @@ fn adopt_pr_state(app: &mut App, detail: &crate::pull_request::PrDetail) {
 }
 
 /// Retire one pull request from every project's list ahead of the next
-/// `gh pr list`, because GitHub has just told us — in the detail fetched
+/// list lookup, because GitHub has just told us — in the detail fetched
 /// for the row the cursor is resting on — that it is merged or closed.
 /// The list refresh would catch it within the minute anyway; this is for
 /// the case where the user is looking straight at it.
@@ -1450,6 +1461,7 @@ fn prune_pull_requests_to_tree(app: &mut App) {
     app.pull_requests.retain(|w, _| worktrees.contains(w));
     app.pr_recheck.retain(|w, _| worktrees.contains(w));
     app.open_prs.retain(|p, _| projects.contains(p));
+    app.open_prs_failed.retain(|p| projects.contains(p));
     app.pr_cache_dirty |= before != (app.pull_requests.len(), app.open_prs.len());
     forget_retired_prs(app);
 }
@@ -4584,7 +4596,7 @@ fn toggle_issues(app: &mut App, out: &mut Vec<ClientRequest>) {
 }
 
 /// Re-seat the Worktrees cursor on checkout `id` after the rows regrouped
-/// under it — a fold, a draft toggle, a fresh `gh pr list` answer — each
+/// under it — a fold, a draft toggle, a fresh open-list answer — each
 /// of which can move a checkout under its pull request's row or back out
 /// among the plain ones (`App::worktree_rows`). The pane needs nothing:
 /// the worktree under the cursor is the one it was showing. A cursor
@@ -10550,6 +10562,7 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.pull_requests.retain(|w, _| !wt_ids.contains(w));
             app.pr_recheck.retain(|w, _| !wt_ids.contains(w));
             app.open_prs.remove(id);
+            app.open_prs_failed.remove(id);
             app.pr_cache_dirty = true;
             app.tree.worktrees.retain(|w| &w.project_id != id);
             app.tree.projects.retain(|p| &p.id != id);
@@ -12691,12 +12704,23 @@ mod tests {
         );
         assert_eq!(app.visible_open_prs().len(), 1);
 
+        assert!(!app.open_prs_failed.contains(&pid));
         note_open_prs_answer(&mut app, pid.clone(), None, &mut Vec::new());
         assert_eq!(
             app.open_prs[&pid].list, found,
             "a failed call keeps the last good list"
         );
         assert!(app.open_prs[&pid].step > OPEN_PRS_REFRESH, "but backs off");
+        assert!(
+            app.open_prs_failed.contains(&pid),
+            "and marks it as one that couldn't be refreshed (#106)"
+        );
+
+        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]), &mut Vec::new());
+        assert!(
+            !app.open_prs_failed.contains(&pid),
+            "the next real answer clears the mark"
+        );
     }
 
     /// Arriving at a project asks again promptly — but never more often than
@@ -25740,12 +25764,12 @@ diff --git a/src/c.rs b/src/c.rs
                 "the ROOT WORKTREE is on our main: {:?}",
                 app.tree.worktrees
             );
-            let list = crate::pull_request::parse_list(
+            let list = crate::pull_request::parse_list(&crate::pull_request::list_answer(
                 r#"[{"number":129,"title":"Prefer PowerShell 7",
                      "url":"https://github.com/o/r/pull/129","isDraft":false,
                      "headRefName":"main","isCrossRepository":true,
                      "headRepositoryOwner":{"login":"givemeurhats"}}]"#,
-            )
+            ))
             .expect("parsed");
             let project = app.selected_project().expect("a project").id.clone();
             let now = std::time::Instant::now();

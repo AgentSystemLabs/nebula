@@ -801,6 +801,9 @@ pub(crate) fn draw(
     let rows: Vec<OpenPr> = rows(app, &view.project).to_vec();
     let inflight = app.open_prs_inflight.contains(&view.project);
     let asked = app.open_prs.contains_key(&view.project);
+    // The last ask came back with nothing — these rows are the last
+    // answer that worked, however old — and no second ask is running yet.
+    let stale = app.open_prs_failed.contains(&view.project) && !inflight;
     // The rows the filter leaves, and where the cursor sits among them.
     let visible = visible_rows(&view.query, &rows);
     let cursor = cursor_index(view, &rows);
@@ -836,14 +839,28 @@ pub(crate) fn draw(
         let line = search_line(&view.query, "type to filter…", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
-    let rows_area = crate::ui::below_first_row(list_inner);
-    if rows.is_empty() {
-        let text = if inflight || !asked {
-            "asking GitHub…"
+    let mut rows_area = crate::ui::below_first_row(list_inner);
+    // A list GitHub could not be asked for says so on a row of its own
+    // under the filter, never only in a title a narrow list would cut:
+    // rows that stopped refreshing look exactly like current ones (#106).
+    if stale {
+        let note = if rows.is_empty() {
+            "couldn't ask GitHub (^r retries)"
         } else {
-            "no open pull requests"
+            "couldn't refresh (^r retries)"
         };
-        empty_list_row(f, rows_area, text, th);
+        if let Some(note_area) = row_rect(rows_area, 0) {
+            let note = Span::styled(note, Style::default().fg(th.warn));
+            f.render_widget(Paragraph::new(note), note_area);
+        }
+        rows_area = crate::ui::below_first_row(rows_area);
+    }
+    if rows.is_empty() {
+        if inflight || !asked {
+            empty_list_row(f, rows_area, "asking GitHub…", th);
+        } else if !stale {
+            empty_list_row(f, rows_area, "no open pull requests", th);
+        }
     } else if visible.is_empty() {
         empty_list_row(f, rows_area, "no pull requests match", th);
     }
@@ -1436,6 +1453,47 @@ mod tests {
         assert!(screen(&mut app, 100, 20).contains("no open pull requests"));
         app.open_prs.remove(&project);
         assert!(screen(&mut app, 100, 20).contains("asking GitHub…"));
+    }
+
+    /// A list GitHub could not be asked for says so, on a row of its own
+    /// under the filter where a narrow modal cannot cut it off — rows that
+    /// stopped refreshing must not pass for current ones (#106). The rows
+    /// stay, and stay clickable under the note; a retry in flight says
+    /// `refreshing…` instead, and an answer clears it.
+    #[test]
+    fn a_list_that_could_not_be_refreshed_says_so() {
+        let (mut app, project) = app_with(vec![pr(42, "Fix login", false)], true);
+        open(&mut app);
+        let fine = screen(&mut app, 100, 20);
+        assert!(!fine.contains("couldn't refresh"), "{fine}");
+        let first_row = view(&app).list_area.y;
+
+        app.open_prs_failed.insert(project.clone());
+        let stale = screen(&mut app, 100, 20);
+        assert!(stale.contains("couldn't refresh (^r retries)"), "{stale}");
+        assert!(stale.contains("#42 Fix login"), "{stale}");
+        assert_eq!(
+            view(&app).list_area.y,
+            first_row + 1,
+            "the rows' hit area starts under the note"
+        );
+
+        app.open_prs_inflight.insert(project.clone());
+        // Wide enough for the title to say it in full.
+        let retrying = screen(&mut app, 160, 20);
+        assert!(!retrying.contains("couldn't refresh"), "{retrying}");
+        assert!(retrying.contains("refreshing…"), "{retrying}");
+        app.open_prs_inflight.remove(&project);
+
+        app.open_prs.get_mut(&project).unwrap().list = vec![];
+        let never = screen(&mut app, 100, 20);
+        assert!(never.contains("couldn't ask GitHub"), "{never}");
+        assert!(!never.contains("no open pull requests"), "{never}");
+
+        app.open_prs_failed.remove(&project);
+        let answered = screen(&mut app, 100, 20);
+        assert!(!answered.contains("couldn't"), "{answered}");
+        assert!(answered.contains("no open pull requests"), "{answered}");
     }
 
     /// `Ctrl+o` and a click on the reading pane's `↗ open in browser` button run

@@ -333,7 +333,7 @@ attachment is gone; links an earlier version saved stay in the database, so no d
 though the grid draws none of them.
 
 This is the one part of nebula the TUI asks for itself rather than the DAEMON: every `gh pr view`,
-`gh pr list` and `gh pr diff` — and the ISSUES MODAL's `gh issue list`, `gh issue view` and `gh issue comment` — is spawned by the client, which is why the lookups stop the moment you
+open-list query (`gh api graphql`) and `gh pr diff` — and the ISSUES MODAL's `gh issue list`, `gh issue view` and `gh issue comment` — is spawned by the client, which is why the lookups stop the moment you
 quit, and why a machine with no `gh` — or one that is unauthenticated, or pointed at a checkout with no
 remote — just shows no rows instead of an error. The selected project is asked about most: its
 selected worktree's pull request and its open list on every tick, one process each, and its other
@@ -349,6 +349,12 @@ backs off by doubling — out to 3 min for a branch that never grows a PR, 10 mi
 open — so a machine with thirty repos does not cost thirty API calls a beat. Focusing the
 terminal window pulls the next lookup forward, floored at a few seconds; `Shift+R` is the one
 gesture that asks straight away, every checkout of the project and its open issues included.
+
+The open list is one GraphQL query per project rather than `gh pr list`, because a row's checks need
+only GitHub's own verdict on them — the pass / fail / pending the pull request page shows — and `gh pr
+list` asks for every check on every pull request instead, which on a busy repo times out every time. A
+lookup that fails keeps the last list that worked on screen, and the PULL REQUESTS MODAL says
+`couldn't refresh` under its filter until an answer lands.
 
 Settings and hotkeys live in [Configuration](configuration.md). The process model, the IPC CODEC and
 the crate layout are covered in more depth in [ARCHITECTURE.md](../ARCHITECTURE.md).
