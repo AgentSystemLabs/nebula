@@ -1,0 +1,5 @@
+# Open the PULL REQUESTS MODAL on the list the boot answer landed, then Ctrl+r: the stand-in gh fails
+# that ask, and the modal says `couldn't refresh (^r retries)` under its filter, over the rows it
+# kept — #42 `conflicts` and #37 `failing` from the rollup state, the draft #39 last.
+v
+C-r
