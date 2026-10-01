@@ -502,9 +502,11 @@ impl ContextMenu {
             .any(|i| matches!(i.action, MenuAction::PickLaunchWorktree { .. }))
     }
 
-    /// Cloud mode is a root-picker modifier, not another agent kind.
-    /// Returning Some only while the Claude row itself is highlighted
-    /// keeps Tab free everywhere else (including model/effort submenus).
+    /// Cloud mode is a launch modifier, not another agent kind. Returning
+    /// Some only while a Claude row is highlighted keeps Tab free
+    /// everywhere else: the picker's Claude row, and every row of the
+    /// Claude MODEL / EFFORT lists under it — reached with `→`, or opened
+    /// straight onto by the box's `^O`.
     /// Two pickers offer it: the NEW SESSION PICKER (its `"New session"`
     /// title is the gate — the PR SESSION picker and a PR row's menu share
     /// these rows but never launch cloud, the daemon refusing a PR launch
@@ -512,8 +514,9 @@ impl ContextMenu {
     /// makes the box a cloud one — unless the box is for an issue or a PR
     /// (`QuickLaunch::takes_cloud`).
     pub fn hovered_claude_cloud(&self) -> Option<bool> {
-        if self.parent.is_some() {
-            return None;
+        let mut root = self;
+        while let Some(parent) = &root.parent {
+            root = parent;
         }
         match &self.items.get(self.hover)?.action {
             MenuAction::NewAgentOfKind {
@@ -526,7 +529,7 @@ impl ContextMenu {
             } => {
                 let offered = match quick {
                     Some(back) => back.launch.takes_cloud(),
-                    None => self.title.as_deref() == Some("New session"),
+                    None => root.title.as_deref() == Some("New session"),
                 };
                 offered.then_some(*cloud)
             }
@@ -545,25 +548,70 @@ impl ContextMenu {
         }
     }
 
-    /// Toggle the highlighted Claude row and keep the state visible in the
-    /// label. False means Tab did not belong to this menu/row.
+    /// Toggle cloud for the launch the highlighted Claude row belongs to
+    /// and keep the state visible. False means Tab did not belong to this
+    /// menu/row.
     pub fn toggle_hovered_claude_cloud(&mut self) -> bool {
-        if self.hovered_claude_cloud().is_none() {
+        let Some(on) = self.hovered_claude_cloud() else {
             return false;
-        }
-        let item = &mut self.items[self.hover];
-        let MenuAction::NewAgentOfKind { cloud, .. } = &mut item.action else {
-            unreachable!("hovered_claude_cloud checked the action")
         };
-        *cloud = !*cloud;
-        item.label = if *cloud {
-            "Claude · cloud".into()
-        } else {
-            "Claude".into()
-        };
+        self.set_claude_cloud(!on);
         true
     }
+
+    /// Cloud is the whole launch's, not one row's: every Claude row of
+    /// this menu takes `on` — the rows a filter has narrowed away too, so
+    /// typing never undoes it — and so do the menus `←` backs out to, so
+    /// the picker's Claude row agrees with the list drilled from it. The
+    /// picker's row says so in its label (`Claude · cloud`); a model or
+    /// effort row keeps its own name, and the list's title carries it
+    /// instead ([`ContextMenu::lists_claude_cloud`]).
+    fn set_claude_cloud(&mut self, on: bool) {
+        let narrowed = self.filter.iter_mut().flat_map(|f| f.all.iter_mut());
+        for item in self.items.iter_mut().chain(narrowed) {
+            let MenuAction::NewAgentOfKind {
+                kind: AgentKind::Claude,
+                custom: None,
+                model,
+                cloud,
+                ..
+            } = &mut item.action
+            else {
+                continue;
+            };
+            *cloud = on;
+            if model.is_none() {
+                let name = item.label.strip_suffix(CLOUD_LABEL).unwrap_or(&item.label);
+                item.label = if on {
+                    format!("{name}{CLOUD_LABEL}")
+                } else {
+                    name.to_string()
+                };
+            }
+        }
+        if let Some(parent) = &mut self.parent {
+            parent.set_claude_cloud(on);
+        }
+    }
+
+    /// Is this a MODEL / EFFORT list whose pick launches in the cloud? Its
+    /// rows are model and effort names, so the title is where it shows.
+    pub fn lists_claude_cloud(&self) -> bool {
+        self.items.iter().any(|item| {
+            matches!(
+                &item.action,
+                MenuAction::NewAgentOfKind {
+                    model: Some(_),
+                    cloud: true,
+                    ..
+                }
+            )
+        })
+    }
 }
+
+/// What a row or a title wears while its launch is a CLAUDE CLOUD one.
+pub(crate) const CLOUD_LABEL: &str = " · cloud";
 
 /// Destructive action waiting behind a confirmation.
 #[derive(Debug, Clone, PartialEq)]

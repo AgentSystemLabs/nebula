@@ -1622,6 +1622,10 @@ fn select_project(app: &mut App, id: &ProjectId) {
 /// the key that starts a session — no BOX. Opening one here would put a
 /// modal over a screen the user only asked to look at: switching to a
 /// project is not asking to start a session in it.
+///
+/// Either way the PANE never goes on reading the project that was left:
+/// it swaps onto the card the cursor lands on, and with no card to land
+/// on it folds away ([`fold_empty_grid`]).
 pub(super) fn open_project(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
     let Some(card) = view::project_cards(app).into_iter().find(|c| &c.id == id) else {
         app.flash = Some("project no longer exists".into());
@@ -1629,14 +1633,28 @@ pub(super) fn open_project(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRe
     };
     let land = last_focused(app, &card).or_else(|| card.sessions.first().map(|a| a.id.clone()));
     select_project(app, id);
-    match land {
-        Some(id) => select(app, id, out),
-        // No session, but a terminal keeps a band on the grid: the
-        // cursor lands on it rather than on nothing.
-        None => match view::bands(app).first().map(|b| b.worktree.clone()) {
-            Some(worktree) => select_band(app, worktree, out),
-            None => fold_empty_grid(app, out),
-        },
+    if let Some(id) = land {
+        select(app, id, out);
+        return;
+    }
+    // No session, but a terminal is a card too: the cursor lands on the
+    // first checkout that holds one. An EMPTY BAND (**Show all
+    // worktrees**) is no card — a grid of nothing but those has nothing
+    // for the pane to read, and folds as a grid with no band at all does.
+    let holds_a_card = view::bands(app)
+        .into_iter()
+        .find(|band| !band.cards.is_empty())
+        .map(|band| band.worktree);
+    match holds_a_card {
+        Some(worktree) => {
+            select_band(app, worktree, out);
+            // `select_band` leaves a checkout the cursor already rests on
+            // as it is, and `select_project` has just rested it on one —
+            // the root, on a first visit — without touching the pane. So
+            // the checkout's card is brought up here, whichever it was.
+            super::restore_session(app, out);
+        }
+        None => fold_empty_grid(app, out),
     }
 }
 
@@ -3670,10 +3688,11 @@ mod tests {
         });
     }
 
-    /// With **Show all worktrees** on, deleting a worktree's last card
-    /// never offers the worktree: the card's ordinary confirm, a delete
-    /// of the card alone, and its band stays on the grid — empty, the
-    /// cursor on it — for `d` to delete when that is wanted.
+    /// With **Show all worktrees** on (and **Delete emptied worktree**
+    /// off), deleting a worktree's last card never asks about the
+    /// worktree: the card's ordinary confirm, a delete of the card alone,
+    /// and its band stays on the grid — empty, the cursor on it — for `d`
+    /// to delete when that is wanted.
     #[test]
     fn deleting_the_last_card_keeps_the_worktree_with_show_all_worktrees() {
         with_default_config(|| {
@@ -3714,6 +3733,50 @@ mod tests {
                 app.selected_worktree().map(|w| w.id.clone()),
                 Some(WorktreeId("w2".into())),
                 "the cursor stays on the emptied band"
+            );
+            draw_tall(&mut app);
+        });
+    }
+
+    /// **Delete emptied worktree** on, with **Show all worktrees** on too:
+    /// `d` on a worktree's last card takes the worktree with it — no
+    /// empty band is left on the grid for a second `d`.
+    #[test]
+    fn deleting_the_last_card_takes_the_worktree_when_the_setting_says_so() {
+        with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+            let mut app = with_empty_band();
+            draw_tall(&mut app);
+            to_feat(&mut app);
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            match &app.overlay {
+                Some(Overlay::Confirm(c)) => assert!(
+                    matches!(
+                        c.action,
+                        PendingAction::ThenDeleteWorktree { offered: false, .. }
+                    ) && c.message.contains("goes with it"),
+                    "{:?}: {}",
+                    c.action,
+                    c.message
+                ),
+                other => panic!("expected the card's confirm, got {other:?}"),
+            }
+            let sent = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                sent.iter()
+                    .any(|r| matches!(r, ClientRequest::DeleteAgent { .. })),
+                "{sent:?}"
+            );
+            assert!(
+                sent.iter()
+                    .any(|r| matches!(r, ClientRequest::DeleteWorktree { id, .. }
+                    if id == &WorktreeId("w2".into()))),
+                "{sent:?}"
+            );
+            assert!(
+                !crate::launcher::bands(&app)
+                    .iter()
+                    .any(|b| b.worktree == WorktreeId("w2".into())),
+                "feat's band is gone with its last card"
             );
             draw_tall(&mut app);
         });
@@ -5075,6 +5138,138 @@ mod tests {
             );
             assert!(!super::has_pane(&app), "the pane folded away");
             assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+        });
+    }
+
+    /// **Show all worktrees** keeps a band on the grid for a checkout with
+    /// nothing running, so a project with no session still has one — its
+    /// root's. Switching to it folds the PANE away all the same: an EMPTY
+    /// BAND is no card, and the pane never goes on reading the session of
+    /// the project that was left. INPUT PARITY: the `+` dropdown's pick,
+    /// the `/` PALETTE's and [`open_project`] itself end in the same state.
+    #[test]
+    fn an_empty_project_folds_the_pane_with_its_empty_band_on_the_grid() {
+        type Way = fn(&mut App);
+        let by_dropdown: Way = |app| {
+            key(app, KeyCode::Char('+'), KeyModifiers::NONE);
+            type_text(app, "docs");
+            key(app, KeyCode::Enter, KeyModifiers::NONE);
+        };
+        let by_palette: Way = |app| {
+            super::super::jump_to_target(
+                app,
+                crate::palette::PaletteTarget::Project(ProjectId("p3".into())),
+                super::super::Landing::FocusOnly,
+                &mut Vec::new(),
+            );
+        };
+        let by_call: Way = |app| {
+            super::open_project(app, &ProjectId("p3".into()), &mut Vec::new());
+        };
+        let ways = [
+            ("the + dropdown", by_dropdown),
+            ("the palette", by_palette),
+            ("open_project", by_call),
+        ];
+        with_default_config(|| {
+            for (way, open) in ways {
+                let mut app = two_sessions();
+                app.show_all_worktrees = true;
+                seed_empty_project(&mut app);
+                draw(&mut app);
+                let mut out = Vec::new();
+                super::select_card_row(&mut app, CardRef { band: 0, card: 0 }, &mut out);
+                let polish_nav = SessionRef::Agent(AgentId("a2".into()));
+                super::super::attach_now(&mut app, polish_nav.clone(), &mut out);
+                draw(&mut app);
+                assert!(super::has_pane(&app) && reading(&app) == Some(polish_nav));
+
+                open(&mut app);
+                let text = buffer_text(&draw(&mut app));
+
+                assert_eq!(
+                    app.selected_project().map(|p| p.name.clone()),
+                    Some("docs".into()),
+                    "{way}"
+                );
+                assert_eq!(reading(&app), None, "{way}: nothing of demo's left");
+                assert!(!super::has_pane(&app), "{way}: the pane folded: {text}");
+                assert!(!text.contains("polish-nav"), "{way}: {text}");
+                assert!(
+                    text.contains("nothing running"),
+                    "{way}: docs' empty band is the grid: {text}"
+                );
+                assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS), "{way}");
+
+                // `j` takes the aim back, onto the band: the pane it
+                // brings up is docs', and docs has nothing to read.
+                key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+                let text = buffer_text(&draw(&mut app));
+                assert!(super::has_pane(&app), "{way}: aimed at the band: {text}");
+                assert_eq!(reading(&app), None, "{way}: and it reads nothing");
+                assert!(!text.contains("polish-nav"), "{way}: {text}");
+            }
+        });
+    }
+
+    /// A project whose only card is a TERMINAL opens on it: the cursor on
+    /// its chip, the pane reading it rather than the session of the
+    /// project that was left — in the root, where the cursor already
+    /// rests on a first visit, and in another checkout under an EMPTY
+    /// BAND (**Show all worktrees**), which the cursor steps past.
+    #[test]
+    fn a_project_with_only_a_terminal_opens_on_it() {
+        with_default_config(|| {
+            for (show_all, checkout) in [(false, "w3root"), (true, "w3root"), (true, "w3feat")] {
+                let mut app = two_sessions();
+                app.show_all_worktrees = show_all;
+                seed_empty_project(&mut app);
+                hse(
+                    &mut app,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Worktree(Worktree {
+                            id: WorktreeId("w3feat".into()),
+                            project_id: ProjectId("p3".into()),
+                            path: "/tmp/docs-feat".into(),
+                            branch: "feat".into(),
+                            is_main: false,
+                            sort_order: 1,
+                        }),
+                    },
+                );
+                seed_terminal(&mut app, "t7", checkout, "docs-shell");
+                draw(&mut app);
+                let mut out = Vec::new();
+                super::select_card_row(&mut app, CardRef { band: 0, card: 0 }, &mut out);
+                let polish_nav = SessionRef::Agent(AgentId("a2".into()));
+                super::super::attach_now(&mut app, polish_nav.clone(), &mut out);
+                draw(&mut app);
+                assert!(super::has_pane(&app) && reading(&app) == Some(polish_nav));
+
+                super::open_project(&mut app, &ProjectId("p3".into()), &mut out);
+                let text = buffer_text(&draw(&mut app));
+                let case = format!("show_all={show_all} in {checkout}");
+
+                assert_eq!(
+                    reading(&app),
+                    Some(SessionRef::Terminal(TerminalId("t7".into()))),
+                    "{case}: {text}"
+                );
+                assert!(super::has_pane(&app), "{case}: {text}");
+                assert_eq!(
+                    app.selected_worktree().map(|w| w.id.clone()),
+                    Some(WorktreeId(checkout.into())),
+                    "{case}"
+                );
+                let bands = crate::launcher::bands(&app);
+                let at = crate::launcher::cursor(&app, &bands).expect("on the chip");
+                assert_eq!(
+                    crate::launcher::card_at(&bands, at).map(|c| c.name().to_string()),
+                    Some("docs-shell".into()),
+                    "{case}"
+                );
+                assert!(!text.contains("polish-nav"), "{case}: {text}");
+            }
         });
     }
 
@@ -7614,6 +7809,59 @@ mod tests {
             assert_eq!(text, "hi");
             let expected = Some(want).filter(|m| m != "default");
             assert_eq!(launch.model, expected);
+        });
+    }
+
+    /// `Tab` in the `^O` model list is the pickers' Claude Cloud toggle,
+    /// and the footer names it there as it does on the picker's Claude
+    /// row. It is the launch's, not one row's: the rows keep their model
+    /// names (the title says cloud), a typed filter does not undo it, and
+    /// whichever model is picked hands back a cloud box.
+    #[test]
+    fn tab_in_the_model_list_toggles_cloud_and_the_footer_names_it() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            type_text(&mut app, "hi");
+            key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            let labels = |app: &App| -> Vec<String> {
+                match &app.overlay {
+                    Some(Overlay::Menu(menu)) => {
+                        menu.items.iter().map(|i| i.label.clone()).collect()
+                    }
+                    other => panic!("expected the model list, got {other:?}"),
+                }
+            };
+            let models = labels(&app);
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("Tab: cloud off"), "the footer:\n{text}");
+            assert!(text.contains("Claude model ⌕"), "{text}");
+
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(labels(&app), models, "the rows are still the models");
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("Tab: cloud on"), "the footer:\n{text}");
+            assert!(text.contains("Claude model · cloud ⌕"), "{text}");
+
+            // Narrowing rebuilds the rows; the toggle rides along.
+            type_text(&mut app, "opus");
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("Tab: cloud on"), "still on:\n{text}");
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let (launch, text) = launch(&app);
+            assert_eq!(text, "hi");
+            assert!(launch.cloud, "the box came back a cloud one");
+            assert_eq!(launch.model.as_deref(), Some("opus"));
+
+            // The list opens as the box stands, and Tab takes it back.
+            key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            let text = buffer_text(&draw(&mut app));
+            assert!(text.contains("Tab: cloud on"), "opens as left:\n{text}");
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let (launch, _) = self::launch(&app);
+            assert!(!launch.cloud, "and Tab again is a local launch");
         });
     }
 

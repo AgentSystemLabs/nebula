@@ -138,7 +138,7 @@ pub(crate) fn kind_rows(
             let label = label(row.kind, row.custom.as_deref());
             MenuItem::new(
                 if cloud {
-                    format!("{label} · cloud")
+                    format!("{label}{}", crate::app::CLOUD_LABEL)
                 } else {
                     label
                 },

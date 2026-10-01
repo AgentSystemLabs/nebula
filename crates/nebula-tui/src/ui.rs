@@ -387,22 +387,13 @@ pub(crate) fn over_box_rect(frame: Rect, over: Option<Rect>, width: u16, height:
 /// of their own beyond Enter and Esc: the session pickers (the `?` jump
 /// to the hovered harness's Agents section, and `Tab` on a Claude row
 /// that can go to the cloud, with the state it would flip) and their
-/// type-ahead MODEL / EFFORT submenus. None for a plain context menu,
-/// which keeps the generic `Esc: close  Enter: confirm`. The keys live
-/// down here, not in the modal's bottom border, so the modal stays as
-/// narrow as its rows.
+/// type-ahead MODEL / EFFORT submenus — the Claude ones name `Tab` too,
+/// first, where a narrow terminal cuts it last. None for a plain context
+/// menu, which keeps the generic `Esc: close  Enter: confirm`. The keys
+/// live down here, not in the modal's bottom border, so the modal stays
+/// as narrow as its rows.
 pub(crate) fn menu_footer_hint(menu: &crate::app::ContextMenu) -> Option<String> {
     let agent_jump = menu.hovered_agent_kind().is_some();
-    if menu.filter.is_some() {
-        return Some(
-            if agent_jump {
-                "type to filter  ↑/↓: move  Backspace: widen  ?: settings  Enter: pick  Esc: back"
-            } else {
-                "type to filter  ↑/↓: move  Backspace: widen  Enter: pick  Esc: back"
-            }
-            .to_string(),
-        );
-    }
     let cloud = menu.hovered_claude_cloud().map(|on| {
         if on {
             "Tab: cloud on  "
@@ -410,6 +401,13 @@ pub(crate) fn menu_footer_hint(menu: &crate::app::ContextMenu) -> Option<String>
             "Tab: cloud off  "
         }
     });
+    if menu.filter.is_some() {
+        return Some(format!(
+            "{}type to filter  ↑/↓: move  Backspace: widen  {}Enter: pick  Esc: back",
+            cloud.unwrap_or(""),
+            if agent_jump { "?: settings  " } else { "" }
+        ));
+    }
     if cloud.is_none() && !agent_jump {
         return None;
     }
@@ -666,11 +664,18 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (branch.width > 0).then(|| (branch.x.saturating_sub(2), branch.y + 1))
             });
             // A type-ahead submenu shows its query in the title: `Cursor
-            // model ⌕ opus`, the bare ⌕ while nothing is typed yet.
+            // model ⌕ opus`, the bare ⌕ while nothing is typed yet. A
+            // Claude list `Tab` sent to the cloud says so there as well —
+            // `Claude model · cloud ⌕` — its rows being model names.
+            let cloud = if menu.lists_claude_cloud() {
+                crate::app::CLOUD_LABEL
+            } else {
+                ""
+            };
             let title_text = menu.title.as_deref().map(|t| match &menu.filter {
-                Some(f) if !f.query.is_empty() => format!("{t} ⌕ {}", f.query),
-                Some(_) => format!("{t} ⌕"),
-                None => t.to_string(),
+                Some(f) if !f.query.is_empty() => format!("{t}{cloud} ⌕ {}", f.query),
+                Some(_) => format!("{t}{cloud} ⌕"),
+                None => format!("{t}{cloud}"),
             });
             let title_width = title_text
                 .as_deref()

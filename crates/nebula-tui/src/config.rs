@@ -626,7 +626,7 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::ShowAllWorktrees,
                 label: "Show all worktrees",
-                hint: "Every worktree gets a band on the grid, even with nothing running in it; d on an empty one deletes it, and deleting a last card never takes the worktree",
+                hint: "Every worktree gets a band on the grid, even an empty one (d deletes it); deleting a last card keeps the worktree unless Delete emptied worktree is on",
                 group: "",
             },
         ]),
@@ -1021,15 +1021,18 @@ pub struct Config {
     /// card's ordinary confirm deletes both — as long as no archived
     /// session is still filed under the checkout: those hold history the
     /// delete would take, so they always get the question. The ROOT
-    /// WORKTREE is never offered, whatever this says.
+    /// WORKTREE is never offered, whatever this says. On holds with
+    /// [`Config::show_all_worktrees`] on too: only the question is that
+    /// setting's to drop.
     pub delete_empty_worktree: bool,
     /// SHOW ALL WORKTREES: every checkout of the project gets a BAND on
     /// the grid, one with nothing running in it too — an overview of the
     /// checkouts, any of them a place to aim `p`/`n` at. On by default.
     /// Off, the grid is only what is running. On, deleting a
-    /// worktree's last card never offers the worktree (whatever
-    /// [`Config::delete_empty_worktree`] says): the emptied band stays,
-    /// and `d` on it — behind its own confirm — is the way to delete it.
+    /// worktree's last card never asks about the worktree: the emptied
+    /// band stays, and `d` on it — behind its own confirm — is the way to
+    /// delete it. [`Config::delete_empty_worktree`] on still takes the
+    /// worktree with its last card.
     pub show_all_worktrees: bool,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.

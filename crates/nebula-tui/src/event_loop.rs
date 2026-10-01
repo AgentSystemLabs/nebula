@@ -5579,8 +5579,9 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             }
             // The NEW SESSION PICKER's Claude row — and the QUICK PROMPT
             // `Tab` picker's, for a box that can go to the cloud — owns
-            // Tab as a launch-mode toggle. Submenus and every other menu
-            // leave it untouched.
+            // Tab as a launch-mode toggle, and so do the rows of the
+            // Claude MODEL / EFFORT lists behind it (`→`, or the box's
+            // `^O`). Every other menu leaves it untouched.
             KeyCode::Tab if menu.toggle_hovered_claude_cloud() => {}
             KeyCode::Enter => {
                 let hover = menu.hover;
@@ -6997,9 +6998,11 @@ fn live_cards_in(app: &App, id: &WorktreeId) -> usize {
 /// the **Delete emptied worktree** SETTING on and nothing archived left
 /// the question is skipped: the dialog stays two-way, says the worktree
 /// goes with the card, and `Enter` does both. With **Show all worktrees**
-/// on the worktree is never offered: the emptied checkout keeps its band
-/// on the grid, and `d` on that band is the way to delete it. Anything
-/// else leaves the dialog as it came.
+/// on the question is never asked — the emptied checkout keeps its band
+/// on the grid, and `d` on that band is the way to delete it — but
+/// **Delete emptied worktree** still deletes: that setting is the user
+/// saying an emptied worktree goes, whether or not the grid would have
+/// kept a band for it. Anything else leaves the dialog as it came.
 fn with_worktree_offer(
     app: &App,
     mut dialog: ConfirmDialog,
@@ -7010,10 +7013,13 @@ fn with_worktree_offer(
         return dialog;
     };
     if w.is_main
-        || app.show_all_worktrees
         || app.is_placeholder_worktree(worktree)
         || live_cards_in(app, worktree) != live_taken
     {
+        return dialog;
+    }
+    let force = crate::config::Config::load().delete_empty_worktree;
+    if app.show_all_worktrees && !force {
         return dialog;
     }
     let archived = app
@@ -7022,7 +7028,6 @@ fn with_worktree_offer(
         .iter()
         .filter(|a| &a.worktree_id == worktree && a.archived)
         .count();
-    let force = crate::config::Config::load().delete_empty_worktree;
     let offered = !(force && archived == 0);
     let branch = &w.branch;
     dialog.message.push('\n');
@@ -16539,6 +16544,85 @@ diff --git a/src/c.rs b/src/c.rs
                     if prompt.is_multiline()
                         && prompt.input.as_str() == "Fix auth\nRun the tests\nShip it"
             ));
+        })
+    }
+
+    /// `Tab` is the cloud toggle in the Claude MODEL / EFFORT lists too,
+    /// not only on the picker's Claude row: one launch, one switch. `←`
+    /// backs out to a picker whose Claude row agrees, and the pick asks
+    /// for the cloud task on the model and effort drilled to. Another
+    /// harness's list leaves Tab alone.
+    #[test]
+    fn tab_in_a_claude_submenu_toggles_cloud_for_the_whole_launch() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+            fn menu(app: &App) -> &crate::app::ContextMenu {
+                match &app.overlay {
+                    Some(Overlay::Menu(menu)) => menu,
+                    other => panic!("expected a menu, got {other:?}"),
+                }
+            }
+
+            open_picker(&mut app);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            assert_eq!(menu(&app).hovered_claude_cloud(), Some(false));
+            assert_eq!(
+                ui::menu_footer_hint(menu(&app)).as_deref(),
+                Some("Tab: cloud off  type to filter  ↑/↓: move  Backspace: widen  ?: settings  Enter: pick  Esc: back")
+            );
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            assert_eq!(menu(&app).items[2].label, "opus", "a model row stays one");
+            assert!(menu(&app).lists_claude_cloud());
+            assert!(
+                ui::menu_footer_hint(menu(&app))
+                    .is_some_and(|hint| hint.starts_with("Tab: cloud on  ")),
+                "{:?}",
+                ui::menu_footer_hint(menu(&app))
+            );
+
+            // ← to the picker: its Claude row took the toggle with it.
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
+            assert_eq!(menu(&app).items[0].label, "Claude · cloud");
+            assert_eq!(menu(&app).hovered_claude_cloud(), Some(true));
+
+            // → again, down to opus, → to its efforts: still cloud.
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            assert_eq!(menu(&app).title.as_deref(), Some("Claude effort"));
+            assert_eq!(menu(&app).hovered_claude_cloud(), Some(true));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(out.is_empty(), "the cloud task comes first: {out:?}");
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(p)) if matches!(
+                        &p.kind,
+                        PromptKind::ClaudeCloudTask { model: Some(m), .. } if m == "opus"
+                    )
+                ),
+                "{:?}",
+                app.overlay
+            );
+
+            // Codex's model list: Tab is nobody's, and the footer is the
+            // plain type-ahead one.
+            open_picker(&mut app);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            assert_eq!(menu(&app).title.as_deref(), Some("Codex model"));
+            assert_eq!(menu(&app).hovered_claude_cloud(), None);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            assert!(!menu(&app).lists_claude_cloud());
+            assert!(
+                ui::menu_footer_hint(menu(&app)).is_some_and(|hint| !hint.contains("cloud")),
+                "{:?}",
+                ui::menu_footer_hint(menu(&app))
+            );
         })
     }
 
@@ -31682,6 +31766,88 @@ diff --git a/src/c.rs b/src/c.rs
                 c.message.contains("1 archived session"),
                 "names the history at stake: {}",
                 c.message
+            );
+        });
+    }
+
+    /// **Show all worktrees** drops the question, not the setting: with
+    /// both on, the last session's delete and the last terminal's close
+    /// each take the worktree with them, the way they do with it off.
+    #[test]
+    fn delete_empty_worktree_setting_holds_with_show_all_worktrees_on() {
+        with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            app.show_all_worktrees = true;
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            let c = menu_delete(&mut app, "a2");
+            assert_eq!(
+                c.action,
+                PendingAction::ThenDeleteWorktree {
+                    first: Box::new(PendingAction::DeleteAgent(AgentId("a2".into()))),
+                    worktree: WorktreeId("w2".into()),
+                    offered: false,
+                }
+            );
+            assert!(c.message.contains("goes with it"), "{}", c.message);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                out.iter()
+                    .any(|r| matches!(r, ClientRequest::DeleteAgent { id, .. } if id.0 == "a2")),
+                "{out:?}"
+            );
+            assert_eq!(delete_worktree_requests(&out), ["w2"]);
+            assert!(
+                !app.tree.worktrees.iter().any(|w| w.id.0 == "w2"),
+                "no empty band is left behind"
+            );
+        });
+        with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            app.show_all_worktrees = true;
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: terminal_entity("t1", "w2", "shell-1"),
+                },
+            );
+            let mut out = Vec::new();
+            run_menu_action(
+                &mut app,
+                MenuAction::CloseTerminal(TerminalId("t1".into())),
+                &mut out,
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                out.iter()
+                    .any(|r| matches!(r, ClientRequest::CloseTerminal { .. })),
+                "{out:?}"
+            );
+            assert_eq!(delete_worktree_requests(&out), ["w2"]);
+            assert!(!app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
+        });
+    }
+
+    /// Both settings on, and archived sessions still filed under the
+    /// worktree: their history is at stake, so the question comes back.
+    #[test]
+    fn archived_sessions_keep_the_question_with_show_all_worktrees_on() {
+        with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            app.show_all_worktrees = true;
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+            upsert_agent(&mut app, "a3", "w2", "agent-3", true);
+            let c = menu_delete(&mut app, "a2");
+            assert!(
+                matches!(
+                    c.action,
+                    PendingAction::ThenDeleteWorktree { offered: true, .. }
+                ),
+                "{:?}",
+                c.action
             );
         });
     }

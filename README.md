@@ -32,6 +32,16 @@ curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install
 
 ---
 
+## Watch the walkthrough
+
+<div align="center">
+
+<a href="https://youtu.be/ZBPqH36BPgI"><img src="https://i.ytimg.com/vi/ZBPqH36BPgI/maxresdefault.jpg" alt="Video: A Complete Walkthrough of Nebula — click to watch on YouTube" width="80%"></a>
+
+**[▶ A Complete Walkthrough of Nebula](https://youtu.be/ZBPqH36BPgI)** — what nebula is, why it exists, and a full tour of it running.
+
+</div>
+
 ## Three agents, three tabs, and no idea which one needs you
 
 You start three agents in three terminal tabs. Five minutes later you don't know which one is waiting on

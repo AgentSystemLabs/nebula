@@ -24,7 +24,9 @@ Pi's model is a fuzzy `--model` pattern — `opus`, `sonnet`, or a `provider/id`
 and its effort is the `--thinking` level, `off` through `max`).
 In those submenus you type to filter — `opus` narrows the rows to the Opus families, `↑`/`↓` move, `Backspace` widens, `Esc` clears — and the preset editor's Harness / Model / Effort rows take the same type-ahead.
 `Enter` anywhere takes your configured defaults. On the
-Claude row, `Tab` toggles Cloud mode: enter the task in the wrapped editor
+Claude row — and on any row of the Claude model and effort lists under it, whose title then reads
+`Claude model · cloud` — `Tab` toggles Cloud mode, the footer naming the key and the state it is in
+(`Tab: cloud off`): enter the task in the wrapped editor
 (`Shift+Enter`, `Option+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud=<task>` — the value binds
 with `=` and never a space, because `--cloud` takes an *optional* value, so a separate argv item starting
 with `--` would be read as another Claude flag instead. The CLI creates the session, prints its URL and
@@ -230,7 +232,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   checkout the project has, the one the box is aimed at ticked — and picks where this one launch
   runs, never switching a checkout's branch. `^O` opens the harness's model list straight away
   (`→` on a model reaches its efforts) and `Tab` the harness picker — all three over the box, as
-  the project picker is, so the task stays in front of you while you pick what will run it. `Tab` again on the picker's Claude row is the new-session
+  the project picker is, so the task stays in front of you while you pick what will run it. `Tab` again on the picker's Claude row — or in the Claude model list `^O` opens — is the new-session
   picker's Claude Cloud toggle: the box comes back as a cloud one (`harness claude · cloud`) and
   Enter sends your text as the cloud task — not offered in a box for an issue or a pull request. `⇧Tab` takes a preset, and `^N` flips between a fresh
   worktree and the project's own checkout — the choice sticks for the next box. None of the four
@@ -259,8 +261,10 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   the Nth from the left opens that project's sessions, on the card you last left it on — its session
   back in the pane — or its first card on a first visit. A project with no sessions yet — a folder
   just opened, or any other — opens on the empty grid with the pane folded away, however it was
-  opened (a tab, the `+`, a `/` jump), so the nebula has the whole body; whatever the pane was
-  reading, a session or a terminal, runs on in the project you left and is never shown here.
+  opened (a tab, the `+`, a `/` jump), so the nebula has the whole body — or, with **Show all
+  worktrees** on, the project's EMPTY BANDS do, the pane folded all the same; whatever the pane was
+  reading, a session or a terminal, runs on in the project you left and is never shown here. A
+  project with only a terminal in it opens on that terminal's card, the pane reading it.
   `` ^` `` brings the pane up empty — one press, since there was nothing on screen to fold — with
   nothing on its header to click — `t` opens a terminal on the project's root; the terminal comes
   up as a card inside its checkout's band with the keys in it, and `t` (or an EMPTY BAND's
@@ -299,13 +303,14 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   themselves while the pointer rests on them. The cards are grouped
   into **BANDS**, one per checkout that has something running in it — the root first, then the
   rest most recently worked in first; a checkout with nothing running has no band — unless
-  **Show all worktrees** (Settings → Sessions, off by default) is on, when every checkout gets
+  **Show all worktrees** (Settings → Sessions, on by default) is on, when every checkout gets
   one: an EMPTY BAND, its rule over a single line, `nothing running · p: new session · t:
   terminal · d: delete worktree`. `j`/`k` walk onto it like any band, `p`/`n`/`t` start work in
   that checkout, and `d` (or **Delete worktree** in its right-click menu) deletes it behind the
   worktree's own confirm; the root's band says no `d`, since the root is never deleted. With the
   setting on, deleting a worktree's last card never asks about the worktree: the band stays,
-  empty, until its own `d`. Each band is a
+  empty, until its own `d` — unless **Delete emptied worktree** is on, which still deletes the
+  worktree with its last card. Each band is a
   titled rule over one row of cards: the rule names the checkout in its scope color (`↳ feat`,
   `⌂ main` for the root — the project is the grid's own scope, named once in the header), with
   that checkout's uncommitted changes right behind the branch in the warning color (`↳ feat +3
@@ -460,7 +465,8 @@ checkout, so the dialog on a worktree that still holds archived sessions counts 
 delete takes their history with it. **Delete emptied worktree** (Settings → Sessions, off by
 default) skips the question: the card's ordinary confirm says the worktree goes with it and `Enter`
 deletes both — except when archived sessions are still filed under it, which always get the
-three-way question. A held `a` opens one dialog and
+three-way question. **Show all worktrees** takes the question away, not the setting: with both on,
+the worktree still goes with its last card. A held `a` opens one dialog and
 archives nothing by itself; a held `u` in the ARCHIVED VIEW unarchives one card, and the next needs
 the key let go and pressed again (on a terminal with the kitty keyboard protocol, which is what
 tells a held key's repeats from a fresh press; without it a long hold still walks the row).
