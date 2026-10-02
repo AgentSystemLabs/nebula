@@ -301,6 +301,15 @@ pub enum MenuAction {
     /// settings — `launcher::duplicate_agent`, what `⇧P` runs on the card
     /// under the cursor. Carries the id, as the row's other verbs do.
     DuplicateAgent(AgentId),
+    /// A card menu's **Move to…**: the MOVE PICKER of the checkouts
+    /// session `id` can move to, what `m` on the card opens.
+    MoveAgentPicker(AgentId),
+    /// A MOVE PICKER row, or a card dropped on another band: move the
+    /// session into `worktree` (`ClientRequest::MoveAgent`).
+    MoveAgent {
+        id: AgentId,
+        worktree: WorktreeId,
+    },
     EditLink(LinkId),
     DeleteLink(LinkId),
     DeleteWorktree(WorktreeId),
@@ -406,6 +415,22 @@ impl MenuItem {
             destructive: true,
         }
     }
+}
+
+/// A session card held under the pressed mouse button ([`App::card_drag`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardDrag {
+    pub agent: AgentId,
+    /// The cell the press landed on: the drag starts once the pointer
+    /// leaves it, so a plain click never becomes one.
+    pub from: (u16, u16),
+    pub active: bool,
+    /// The band under the pointer, when it is another checkout the card
+    /// can move to: where the release drops it.
+    pub over: Option<WorktreeId>,
+    /// The PROJECT TAB under the pointer instead: `over` is then that
+    /// project's first checkout, its root unless the card is already there.
+    pub over_tab: Option<ProjectId>,
 }
 
 #[derive(Debug, Clone)]
@@ -627,6 +652,13 @@ pub enum PendingAction {
     /// is answered.
     ArchiveAgent(AgentId),
     DeleteAgent(AgentId),
+    /// A session card dropped on another band or PROJECT TAB, with the
+    /// **Confirm drag move** SETTING on: move it once the dialog is
+    /// answered.
+    MoveAgent {
+        id: AgentId,
+        worktree: WorktreeId,
+    },
     CloseTerminal(TerminalId),
     DeleteWorktree(WorktreeId),
     /// A row delete that empties a linked worktree — the last card of the
@@ -3351,6 +3383,9 @@ pub struct App {
     /// mouse-down, so the edge tracks the pointer instead of jumping by
     /// one depending on which of the two grab rows was caught.
     pub launcher_pane_drag: Option<i32>,
+    /// A session card pressed on the grid, which a drag carries onto
+    /// another band to move the session there (`MoveAgent`).
+    pub card_drag: Option<CardDrag>,
     /// That edge is under the mouse, or being dragged: its grip lights up.
     /// Only ever set in terminals that report plain mouse motion;
     /// elsewhere the grip rests until a drag takes hold.
@@ -3869,6 +3904,7 @@ impl App {
             launcher_scroll_in: None,
             launcher_reveal: false,
             launcher_pane_drag: None,
+            card_drag: None,
             hover_launcher_pane: false,
             hover_crumb: None,
             launcher_tabs: Vec::new(),
@@ -4499,6 +4535,7 @@ impl App {
     /// with no button named is still the drag.
     pub fn mouse_held(&self) -> bool {
         let splitter = self.launcher_pane_drag.is_some()
+            || self.card_drag.is_some()
             || match &self.overlay {
                 Some(Overlay::Diff(view)) => view.files_drag.is_some(),
                 Some(Overlay::Tree(view)) => view.files_drag.is_some(),

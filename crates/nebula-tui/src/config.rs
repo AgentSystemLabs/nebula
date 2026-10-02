@@ -412,6 +412,7 @@ pub enum SettingKind {
     OpenCommand,
     RememberHarness,
     HideUninstalledHarnesses,
+    ConfirmDragMove,
 }
 
 /// One harness field row in the Agents tab. The tab renders one section
@@ -503,6 +504,7 @@ impl SettingKind {
             | SettingKind::CardIssueNumber => (2026, 9, 24),
             SettingKind::ExpandAllWorktrees | SettingKind::FollowNewSession => (2026, 9, 26),
             SettingKind::HighlightCurrentCard => (2026, 9, 28),
+            SettingKind::ConfirmDragMove => (2026, 10, 2),
         }
     }
 
@@ -627,6 +629,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::ShowAllWorktrees,
                 label: "Show all worktrees",
                 hint: "Every worktree gets a band on the grid, even an empty one (d deletes it); deleting a last card keeps the worktree unless Delete emptied worktree is on",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::ConfirmDragMove,
+                label: "Confirm drag move",
+                hint: "A session card dropped on another worktree or project tab asks before it moves (off = the drop moves it at once; m's picker never asks)",
                 group: "",
             },
         ]),
@@ -1302,6 +1310,12 @@ pub struct Config {
     /// outranks it — a launch that enters the new session's pane has to
     /// go there.
     pub follow_new_session: bool,
+    /// CONFIRM DRAG MOVE: a session card dragged onto another band or
+    /// PROJECT TAB asks before the session moves, since a drop is easy to
+    /// make by accident and the move restarts the CLI. On by default, a
+    /// config predating the key too. The MOVE PICKER (`m`) never asks: a
+    /// pick and Enter are already deliberate.
+    pub confirm_drag_move: bool,
     /// Whether each new QUICK PROMPT starts aimed at a fresh worktree
     /// rather than the checkout under the grid's cursor (the project's
     /// ROOT BRANCH when nothing is aimed at — `launcher::target_for`).
@@ -1468,6 +1482,7 @@ impl Default for Config {
             quick_prompt_kind: AgentKind::Claude.as_str().into(),
             quick_prompt_focus: false,
             follow_new_session: true,
+            confirm_drag_move: true,
             quick_prompt_new_worktree: false,
             keybindings: BTreeMap::new(),
             skipped: BTreeSet::new(),
@@ -2247,6 +2262,7 @@ impl Config {
             SettingKind::QuickPromptKind => self.quick_prompt_kind.clone(),
             SettingKind::QuickPromptFocus => on_off(self.quick_prompt_focus).into(),
             SettingKind::FollowNewSession => on_off(self.follow_new_session).into(),
+            SettingKind::ConfirmDragMove => on_off(self.confirm_drag_move).into(),
             SettingKind::QuickPromptNewWorktree => on_off(self.quick_prompt_new_worktree).into(),
         }
     }
@@ -2370,6 +2386,9 @@ impl Config {
             }
             SettingKind::FollowNewSession => {
                 self.follow_new_session = !self.follow_new_session;
+            }
+            SettingKind::ConfirmDragMove => {
+                self.confirm_drag_move = !self.confirm_drag_move;
             }
             SettingKind::QuickPromptNewWorktree => {
                 self.quick_prompt_new_worktree = !self.quick_prompt_new_worktree;
@@ -3926,6 +3945,23 @@ mod tests {
     /// FOLLOW NEW SESSION starts on, sits under the QUICK PROMPT's Focus
     /// row on the Agents tab, toggles like any bool and persists under its
     /// own key; a config predating the key reads as on.
+    #[test]
+    fn confirm_drag_move_is_on_by_default_and_persists() {
+        let mut cfg = Config::default();
+        assert!(cfg.confirm_drag_move, "a drop asks before it moves");
+        let (tab, row) = locate(SettingKind::ConfirmDragMove).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        cfg.cycle(tab, row, 0);
+        assert_eq!(cfg.value_label(SettingKind::ConfirmDragMove), "off");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).confirm_drag_move, "off survives a save");
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.confirm_drag_move, "a missing key reads as on");
+    }
+
     #[test]
     fn follow_new_session_is_on_by_default_and_persists() {
         let mut cfg = Config::default();
