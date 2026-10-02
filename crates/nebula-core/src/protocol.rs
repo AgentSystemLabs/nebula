@@ -267,6 +267,17 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
     },
+    /// The user moved a session's card onto another checkout, of its own
+    /// project or another one: the card menu's **Move to…**, or a drag
+    /// onto another band or project tab.
+    /// The row moves at once and a live session follows, resumed there:
+    /// straight away when idle, at its turn's end when mid-turn. Answered
+    /// with `Ack`.
+    MoveAgent {
+        req_id: u64,
+        id: AgentId,
+        worktree: WorktreeId,
+    },
     /// Queue a message on the Claude Cloud session a row launched
     /// (`claude -p <message> --cloud <id>`). Fire-and-forget by nature: the
     /// CLI acknowledges the send and returns, and the reply only ever

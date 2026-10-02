@@ -1,0 +1,32 @@
+# Two launches: the first into a fresh worktree (^N; it keeps running), the second into the root (it
+# finishes). Then m on the card under the cursor: the MOVE PICKER lists the project's other checkouts.
+p
+Fix the login redirect loop when the session cookie has expired
+C-n
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+p
+Sort the changelog entries by date, newest first
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+m
+F12
+F12

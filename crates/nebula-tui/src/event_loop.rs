@@ -3414,6 +3414,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::OpenPullRequest => launcher::open_pull_request(app, out),
         Action::OpenIssue => launcher::open_issue(app, out),
         Action::DuplicateSession => launcher::duplicate_session(app),
+        Action::MoveSession => launcher::move_session(app),
         Action::OpenGhosttyTab => open_ghostty_tab(app),
         // Shift+Enter / Shift+O: the selected worktree's OPEN COMMAND, from
         // any panel — the cursor's worktree is the context wherever the
@@ -4985,6 +4986,7 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
             MenuItem::new("Follow-up prompt", MenuAction::FollowUp),
             MenuItem::new("Restart", MenuAction::RestartAgent(a.id.clone())),
             MenuItem::new("Duplicate", MenuAction::DuplicateAgent(a.id.clone())),
+            MenuItem::new("Move to…", MenuAction::MoveAgentPicker(a.id.clone())),
             MenuItem::new("Rename", MenuAction::RenameAgent(a.id.clone())),
             MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
@@ -6879,6 +6881,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
         }
         PendingAction::ArchiveAgent(id) => archive_agent_now(app, id, out),
         PendingAction::DeleteAgent(id) => delete_agent(app, id, out),
+        PendingAction::MoveAgent { id, worktree } => launcher::move_agent(app, id, worktree, out),
         PendingAction::CloseTerminal(id) => close_terminal(app, id, out),
         PendingAction::DeleteLink(id) => {
             send(app, out, |req_id| ClientRequest::DeleteLink { req_id, id });
@@ -7088,6 +7091,8 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::SendCloudMessage(id) => open_prompt(app, PromptKind::CloudMessage { id }),
         MenuAction::DuplicateAgent(id) => launcher::duplicate_agent(app, id),
+        MenuAction::MoveAgentPicker(id) => launcher::open_move_picker(app, id),
+        MenuAction::MoveAgent { id, worktree } => launcher::move_agent(app, id, worktree, out),
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
         MenuAction::ArchiveAgent(id) => archive_agent(app, id),
         MenuAction::UnarchiveAgent(id) => activate::unarchive(app, id, out),
@@ -7390,8 +7395,9 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
 }
 
-/// Land the selection on `select_when_seen` — a session just created, or
-/// moved into another worktree of this project: directly when its row is
+/// Land the selection on `select_when_seen`: a session just created, or
+/// one moved into another worktree (of another project too, whose grid
+/// it then opens). Directly when its row is
 /// visible under the selected worktree, else by switching to the worktree it
 /// landed under first. Clears the pending follow once it lands; a no-op
 /// until the session's upsert has arrived.
@@ -7426,6 +7432,19 @@ fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>) {
             .map(|t| t.worktree_id.clone()),
     };
     if let Some(wt_id) = landed_worktree {
+        // Moved into another project (the MOVE PICKER, a drop on a
+        // PROJECT TAB): the grid goes there with it.
+        let project = app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.id == wt_id)
+            .map(|w| w.project_id.clone());
+        if let Some(project) = project {
+            if app.selected_project().map(|p| &p.id) != Some(&project) {
+                select_project_row_by_id(app, &project);
+            }
+        }
         if select_worktree_by_id(app, &wt_id, out) {
             if let Some(index) = app
                 .visible_session_rows()
@@ -9609,6 +9628,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             app.term_selection = None;
             app.next_drag_autoscroll = None;
             app.term_mouse_grab = None;
+            app.card_drag = None;
             match app.hit_at(mouse.column, mouse.row) {
                 Some(HitTarget::LauncherPaneSplitter) => {
                     // A second press on the edge within the double-click
@@ -9634,7 +9654,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // worktree; a second click is Enter, down into the PANE
                 // beside the cards — which comes back first if it was
                 // folded away.
-                Some(HitTarget::LauncherCard(at)) => launcher::click_card(app, at, out),
+                // The press also arms a drag of the card onto another
+                // band, which moves its session there. Armed first: the
+                // card is found by the grid as drawn, before the click.
+                Some(HitTarget::LauncherCard(at)) => {
+                    launcher::press_card(app, at, (mouse.column, mouse.row));
+                    launcher::click_card(app, at, out);
+                }
                 // A BAND's rule: the cursor lands on the band, as `j`/`k`
                 // walking onto it do.
                 Some(HitTarget::LauncherBand(i)) => launcher::click_band(app, i, out),
@@ -9773,7 +9799,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             app.dirty = true;
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(grab) = app.launcher_pane_drag {
+            if app.card_drag.is_some() {
+                launcher::drag_card(app, (mouse.column, mouse.row));
+            } else if let Some(grab) = app.launcher_pane_drag {
                 let at = app.launcher_pane_side().along(mouse.column, mouse.row);
                 app.set_launcher_pane(at + grab);
                 // A press that became a drag is not the first half of a
@@ -9806,6 +9834,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             let pane_ended = app.launcher_pane_drag.take().is_some();
             if pane_ended {
                 app.dirty = true;
+            } else if app.card_drag.is_some() {
+                launcher::drop_card(app, out);
             } else if let Some(sref) = app.term_mouse_grab.take() {
                 // The release closes the program's button — except under
                 // press-only tracking (`?9h`), which has no release report.
@@ -10314,8 +10344,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // moved elsewhere) hands the cursor — and the terminal pane —
             // to its neighbor.
             reconcile_selection(app, before, out);
-            // Fix the selection onto a session we just created — or follow
-            // one we just moved into another worktree of this project.
+            // Fix the selection onto a session we just created, or follow
+            // one we just moved into another worktree or project.
             land_pending_selection(app, out);
             // ...and onto a project we just added.
             if let Some(pid) = app.select_project_when_seen.clone() {
