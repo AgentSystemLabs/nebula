@@ -58,6 +58,8 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
 
     // Per-connection attach state: forward-task handles keyed by session.
     let mut attached: HashMap<SessionRef, tokio::task::JoinHandle<()>> = HashMap::new();
+    // The task forwarding broadcasts to a subscribed client.
+    let mut subscription: Option<tokio::task::JoinHandle<()>> = None;
     let mut handshaken = false;
 
     let result: Result<()> = async {
@@ -91,6 +93,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     break;
                 }
                 ClientRequest::Subscribe => {
+                    // Subscribed before the snapshot is taken, so a change
+                    // made between the two is not lost: it arrives after the
+                    // Snapshot, where a client folds it in by id.
+                    let mut rx = daemon.events.subscribe();
                     let snapshot = daemon.snapshot().unwrap_or(ServerEvent::Snapshot {
                         projects: vec![],
                         worktrees: vec![],
@@ -101,9 +107,8 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         ui_state: None,
                     });
                     let _ = out_tx.send(snapshot).await;
-                    let mut rx = daemon.events.subscribe();
                     let tx = out_tx.clone();
-                    tokio::spawn(async move {
+                    let forward = tokio::spawn(async move {
                         loop {
                             match rx.recv().await {
                                 Ok(ev) => {
@@ -118,6 +123,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             }
                         }
                     });
+                    if let Some(old) = subscription.replace(forward) {
+                        old.abort();
+                    }
                 }
                 ClientRequest::Attach {
                     session: sref,
@@ -591,6 +599,12 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     for (sref, h) in attached.drain() {
         h.abort();
         daemon.note_detached(&sref);
+    }
+    // The forwarder holds a sender and waits on the next broadcast: left
+    // running, it keeps the writer, and this client's socket, open until
+    // the daemon next has something to say.
+    if let Some(forward) = subscription {
+        forward.abort();
     }
     drop(out_tx);
     let _ = writer_task.await;
