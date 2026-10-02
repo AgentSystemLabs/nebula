@@ -122,6 +122,17 @@ struct PrewarmEntry {
     buffered_hooks: Vec<(HookEvent, Option<String>)>,
 }
 
+/// A relocation waiting on its agent's turn end (`Daemon::pending_moves`).
+#[derive(Debug, Clone)]
+struct PendingMove {
+    target: Worktree,
+    /// Respawn on the relocation notice, so the turn carries on in the
+    /// target: `nebula worktree`, which the agent ran mid-task. A move the
+    /// user made resumes silent, since the turn it waited out never asked
+    /// to move.
+    notice: bool,
+}
+
 pub struct Daemon {
     sessions: Mutex<HashMap<SessionRef, Arc<PtySession>>>,
     status_machines: Mutex<HashMap<AgentId, AgentStatusMachine>>,
@@ -169,7 +180,8 @@ pub struct Daemon {
     /// on the turn-end hook (kill + respawn resumed in the target), cleared
     /// by any other spawn of the agent, and consulted by the cwd reparent so
     /// the old checkout's cwd can't drag the row back in the meantime.
-    pending_moves: Mutex<HashMap<AgentId, Worktree>>,
+    /// A user's mid-turn `move_agent` waits here too.
+    pending_moves: Mutex<HashMap<AgentId, PendingMove>>,
     /// Serializes the check-and-spawn inside [`Daemon::ensure_session`].
     /// Attach (the request loop) and the worktree prewarm sweep (its own
     /// task) can both reach for the same dead session; without this they
@@ -496,19 +508,25 @@ impl Daemon {
         adopted
     }
 
-    /// Relocations still waiting on their turn to end (`nebula worktree`),
-    /// for an IN-PLACE RESTART to carry.
-    pub fn pending_moves(&self) -> Vec<(AgentId, Worktree)> {
+    /// Relocations still waiting on their turn to end, for an IN-PLACE
+    /// RESTART to carry. The boolean is whether the resumed session should
+    /// open on the relocation notice (`nebula worktree`) or silently (a
+    /// user-initiated card move).
+    pub fn pending_moves(&self) -> Vec<(AgentId, Worktree, bool)> {
         self.pending_moves
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, wt)| (id.clone(), wt.clone()))
+            .map(|(id, pending)| (id.clone(), pending.target.clone(), pending.notice))
             .collect()
     }
 
-    pub fn restore_pending_moves(&self, moves: Vec<(AgentId, Worktree)>) {
-        self.pending_moves.lock().unwrap().extend(moves);
+    pub fn restore_pending_moves(&self, moves: Vec<(AgentId, Worktree, bool)>) {
+        self.pending_moves.lock().unwrap().extend(
+            moves
+                .into_iter()
+                .map(|(id, target, notice)| (id, PendingMove { target, notice })),
+        );
     }
 
     // ---- attach tracking & idle reaping ----
@@ -1784,10 +1802,13 @@ impl Daemon {
         // reports until it respawns is the old checkout's.
         self.last_cwd.lock().unwrap().remove(id);
         if alive {
-            self.pending_moves
-                .lock()
-                .unwrap()
-                .insert(id.clone(), target.clone());
+            self.pending_moves.lock().unwrap().insert(
+                id.clone(),
+                PendingMove {
+                    target: target.clone(),
+                    notice: true,
+                },
+            );
         }
         self.store.set_agent_worktree(id, &target.id)?;
         self.broadcast_agent(id)?;
@@ -1797,6 +1818,50 @@ impl Daemon {
             EnterOutcome::NextLaunch
         };
         Ok((target, outcome))
+    }
+
+    /// The user moved this session's card onto another checkout, of its
+    /// own project or another one (the card menu's **Move to…**, or a drag
+    /// onto another band or project tab). The row moves now. A live session mid-turn follows at that turn's
+    /// end, as `nebula worktree` does but resumed silent: that turn never
+    /// asked to move. An idle one is killed and resumed in the target at
+    /// once, since no turn end is coming to wait for. A dead one boots
+    /// there on its next launch.
+    pub fn move_agent(self: &Arc<Self>, id: &AgentId, worktree: &WorktreeId) -> Result<()> {
+        let agent = self.store.get_agent(id)?.context("agent not found")?;
+        if agent.archived {
+            bail!("agent is archived");
+        }
+        let target = self
+            .store
+            .get_worktree(worktree)?
+            .context("worktree not found")?;
+        if target.id == agent.worktree_id {
+            return Ok(());
+        }
+        let alive = self.session(&SessionRef::Agent(id.clone())).is_some();
+        let mid_turn = matches!(
+            agent.status,
+            AgentStatus::Running | AgentStatus::NeedsFeedback
+        );
+        // Same invalidation as `enter_worktree`: every cwd this process
+        // reports until it respawns is the old checkout's.
+        self.last_cwd.lock().unwrap().remove(id);
+        if alive && mid_turn {
+            self.pending_moves.lock().unwrap().insert(
+                id.clone(),
+                PendingMove {
+                    target: target.clone(),
+                    notice: false,
+                },
+            );
+        }
+        self.store.set_agent_worktree(id, &target.id)?;
+        self.broadcast_agent(id)?;
+        if alive && !mid_turn {
+            self.relocate_into(id, &target, false);
+        }
+        Ok(())
     }
 
     /// The turn an agent ran `nebula worktree` in has ended: make the
@@ -1828,10 +1893,11 @@ impl Daemon {
         if !turn_over {
             return;
         }
-        let Some(target) = self.pending_moves.lock().unwrap().remove(id) else {
+        let Some(PendingMove { target, notice }) = self.pending_moves.lock().unwrap().remove(id)
+        else {
             return;
         };
-        if self.relocate_into(id, &target) {
+        if self.relocate_into(id, &target, notice) {
             // Working from the moment it boots, on the notice: seeded with
             // the launch reprieve so its startup progress-clear cannot
             // green it out before that turn begins (see `create_agent`).
@@ -1844,10 +1910,11 @@ impl Daemon {
         }
     }
 
-    /// The kill-and-respawn of [`Self::complete_pending_move`]. True when
-    /// the respawn opened on the relocation notice — the one outcome that
-    /// carries on the turn the status machine held.
-    fn relocate_into(self: &Arc<Self>, id: &AgentId, target: &Worktree) -> bool {
+    /// The kill-and-respawn of [`Self::complete_pending_move`] and of an
+    /// idle [`Self::move_agent`]. `notice` asks for the relocation notice.
+    /// True when the respawn opened on it: the one outcome that carries on
+    /// the turn the status machine held.
+    fn relocate_into(self: &Arc<Self>, id: &AgentId, target: &Worktree, notice: bool) -> bool {
         let agent = match self.store.get_agent(id) {
             Ok(Some(agent)) if !agent.archived && agent.worktree_id == target.id => agent,
             // Archived, deleted, or moved elsewhere by hand since: the
@@ -1873,7 +1940,7 @@ impl Daemon {
         // itself refuses with the entry's reason, so the notice degrades
         // to none rather than failing the move.
         let prompt = resolve_harness(agent.kind, agent.custom_harness.as_deref())
-            .map(|harness| relocation_prompt(harness.relocation_prompt, target))
+            .map(|harness| relocation_prompt(notice && harness.relocation_prompt, target))
             .unwrap_or(None);
         let spawned = self.spawn_agent_session_with(
             &agent,
@@ -5842,7 +5909,13 @@ mod tests {
             .pending_moves
             .lock()
             .unwrap()
-            .insert(a1.clone(), feat);
+            .insert(
+                a1.clone(),
+                PendingMove {
+                    target: feat,
+                    notice: true,
+                },
+            );
 
         daemon.reparent_agent_by_cwd(&a1, "/nebula-test/p", Some("s1"), false);
         assert_eq!(
@@ -5980,7 +6053,13 @@ mod tests {
             .pending_moves
             .lock()
             .unwrap()
-            .insert(a1.clone(), feat);
+            .insert(
+                a1.clone(),
+                PendingMove {
+                    target: feat,
+                    notice: true,
+                },
+            );
         let status = |id: &AgentId| daemon.store.get_agent(id).unwrap().unwrap().status;
 
         daemon.apply_hook_event(&a1, HookEvent::Stop, Some("s1".into()));
@@ -5989,6 +6068,95 @@ mod tests {
         daemon.complete_pending_move(&a1, &HookEvent::Stop);
         assert!(!daemon.relocation_pending(&a1));
         assert_eq!(status(&a1), AgentStatus::Finished);
+    }
+
+    /// A dead session's move is the row alone, into its own project's
+    /// checkouts or another project's; the one it is already in is a no-op.
+    #[test]
+    fn move_agent_rehomes_a_dead_row_across_checkouts_and_projects() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p", "q"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_worktree(&daemon, "q", "other", "/nebula-test/q", true);
+        seed_agent(&daemon, "a1", "root", Some("s1"));
+        let a1 = AgentId("a1".into());
+
+        daemon.move_agent(&a1, &WorktreeId("feat".into())).unwrap();
+        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+        assert!(!daemon.relocation_pending(&a1), "nothing runs to follow");
+
+        daemon.move_agent(&a1, &WorktreeId("feat".into())).unwrap();
+        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+
+        daemon.move_agent(&a1, &WorktreeId("other".into())).unwrap();
+        assert_eq!(agent_worktree(&daemon, "a1"), "other");
+    }
+
+    /// A live session: idle, it is respawned in the target at once; mid
+    /// turn, it waits for the turn end and then resumes silent, so the
+    /// held Stop finishes the row instead of a notice carrying it on.
+    #[tokio::test]
+    async fn move_agent_relocates_an_idle_session_now_and_a_busy_one_at_turn_end() {
+        let daemon = test_daemon();
+        let (dir, main) = run_worktree(&daemon);
+        let feat_dir = tempfile::tempdir().unwrap();
+        let feat = Worktree {
+            id: WorktreeId::generate(),
+            project_id: main.project_id.clone(),
+            path: feat_dir.path().to_path_buf(),
+            branch: "feat".into(),
+            is_main: false,
+            sort_order: 1,
+        };
+        daemon.store.insert_worktree(&feat).unwrap();
+        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
+        let EntityId::Agent(id) = daemon
+            .create_agent(CreateAgentSpec {
+                worktree: main.id.clone(),
+                name: "a".into(),
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                auto_title: false,
+                cloud_prompt: None,
+                starting_prompt: None,
+                pr_url: None,
+                issue_url: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("a create makes an agent");
+        };
+        let sref = SessionRef::Agent(id.clone());
+        let status = |id: &AgentId| daemon.store.get_agent(id).unwrap().unwrap().status;
+
+        // Mid-turn: the row moves, the PTY waits for the turn's end.
+        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("s1".into()));
+        daemon.move_agent(&id, &feat.id).unwrap();
+        assert_eq!(agent_worktree(&daemon, &id.to_string()), feat.id.to_string());
+        assert!(daemon.relocation_pending(&id));
+        let first = daemon.session(&sref).expect("still the first PTY");
+        daemon.apply_hook_event(&id, HookEvent::Stop, Some("s1".into()));
+        daemon.complete_pending_move(&id, &HookEvent::Stop);
+        assert!(!daemon.relocation_pending(&id));
+        let second = daemon.session(&sref).expect("respawned in the target");
+        assert!(!Arc::ptr_eq(&first, &second), "a new PTY");
+        assert_eq!(
+            status(&id),
+            AgentStatus::Finished,
+            "no notice carries the turn on"
+        );
+
+        // Idle: back to the root checkout straight away.
+        daemon.move_agent(&id, &main.id).unwrap();
+        assert!(!daemon.relocation_pending(&id));
+        assert_eq!(agent_worktree(&daemon, &id.to_string()), main.id.to_string());
+        let third = daemon.session(&sref).expect("respawned in the root");
+        assert!(!Arc::ptr_eq(&second, &third), "a new PTY");
+        drop(dir);
     }
 
     #[tokio::test]

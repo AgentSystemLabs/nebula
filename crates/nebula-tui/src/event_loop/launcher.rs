@@ -11,8 +11,8 @@ use super::{
     open_prompt, restore_project_cursors, select_project_row_by_id, Landing,
 };
 use crate::app::{
-    App, ConfirmDialog, ContextMenu, Focus, HitTarget, MenuAction, MenuFilter, MenuItem, Overlay,
-    PendingAction, PromptKind, SessionRow,
+    App, CardDrag, ConfirmDialog, ContextMenu, Focus, HitTarget, MenuAction, MenuFilter, MenuItem,
+    Overlay, PendingAction, PromptKind, SessionRow,
 };
 use crate::keymap::{Action, KeyChord};
 use crate::launcher::{self as view, BoxField, CardRef, ProjectPicker};
@@ -856,6 +856,8 @@ pub(super) fn handle_action(
         Action::OpenIssue => open_issue(app, out),
         // `⇧P` on a card: another session with its settings, nothing typed.
         Action::DuplicateSession => duplicate_session(app),
+        // `m` on a card: the checkouts it can move to.
+        Action::MoveSession => move_session(app),
         // The fold is a preference the view keeps, and its key is the way
         // out of the pane first ([`fold_key`]).
         Action::ToggleLauncherPane => {
@@ -2014,6 +2016,152 @@ pub(super) fn click_card(app: &mut App, at: CardRef, out: &mut Vec<ClientRequest
     }
 }
 
+/// A press at `from` on the card at `at` arms a drag of its session:
+/// carried onto another band and let go there, it moves the session
+/// ([`drop_card`]). A terminal card stays put: only sessions move.
+pub(super) fn press_card(app: &mut App, at: CardRef, from: (u16, u16)) {
+    let bands = view::bands(app);
+    app.card_drag = match view::card_at(&bands, at) {
+        Some(view::Card::Session(row)) => Some(CardDrag {
+            agent: row.agent.id.clone(),
+            from,
+            active: false,
+            over: None,
+            over_tab: None,
+        }),
+        _ => None,
+    };
+}
+
+/// The held card moved to `pos`: the band under the pointer becomes the
+/// drop target, unless it is the card's own checkout or a stand-in. A
+/// PROJECT TAB under it aims at that project's first checkout, its root.
+pub(super) fn drag_card(app: &mut App, pos: (u16, u16)) {
+    let Some(drag) = &app.card_drag else {
+        return;
+    };
+    if !drag.active && pos == drag.from {
+        return;
+    }
+    let band = |i: usize| view::bands(app).get(i).map(|b| b.worktree.clone());
+    let mut over_tab = None;
+    let over = match app.hit_at(pos.0, pos.1) {
+        Some(HitTarget::LauncherCard(at)) => band(at.band),
+        Some(
+            HitTarget::LauncherBand(i)
+            | HitTarget::LauncherBandMore(i)
+            | HitTarget::LauncherStripLeft(i)
+            | HitTarget::LauncherStripRight(i),
+        ) => band(i),
+        Some(HitTarget::LauncherBandPr(w)) => Some(w),
+        // The air under a band, down to the next one or the grid's foot:
+        // the band above it, so an empty band is a target past its rule.
+        Some(HitTarget::PanelBg(Focus::Sessions)) => app
+            .hits
+            .iter()
+            .filter_map(|(r, hit)| match hit {
+                HitTarget::LauncherBand(i)
+                    if r.y <= pos.1 && (r.x..r.x + r.width).contains(&pos.0) =>
+                {
+                    Some((r.y, *i))
+                }
+                _ => None,
+            })
+            .max()
+            .and_then(|(_, i)| band(i)),
+        Some(HitTarget::LauncherTab(project)) => {
+            let first = picker_checkouts(app, &project)
+                .first()
+                .map(|w| w.id.clone());
+            over_tab = Some(project);
+            first
+        }
+        _ => None,
+    };
+    let home = app
+        .tree
+        .agents
+        .iter()
+        .find(|a| a.id == drag.agent)
+        .map(|a| a.worktree_id.clone());
+    let over = over.filter(|w| Some(w) != home.as_ref() && !app.is_placeholder_worktree(w));
+    if let Some(drag) = &mut app.card_drag {
+        drag.active = true;
+        drag.over = over;
+        drag.over_tab = over_tab;
+    }
+    app.dirty = true;
+}
+
+/// The button let go: a drag that ended over another band moves the
+/// session there ([`move_agent`]), asking first while the **Confirm drag
+/// move** SETTING is on ([`confirm_move`]). A press that never left its
+/// card was the click it already ran as.
+pub(super) fn drop_card(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some(drag) = app.card_drag.take() else {
+        return;
+    };
+    if !drag.active {
+        return;
+    }
+    // A drag is not the first half of a double-click on the card.
+    app.last_session_click = None;
+    app.dirty = true;
+    if let Some(worktree) = drag.over {
+        if crate::config::Config::load().confirm_drag_move {
+            confirm_move(app, drag.agent, worktree);
+        } else {
+            move_agent(app, drag.agent, worktree, out);
+        }
+    }
+}
+
+/// The dialog a drop opens before [`move_agent`] runs, saying where the
+/// session goes and that its CLI restarts there.
+fn confirm_move(app: &mut App, id: AgentId, worktree: WorktreeId) {
+    let Some((name, dest, mid_turn)) = move_plan(app, &id, &worktree) else {
+        return;
+    };
+    let when = if mid_turn {
+        " once its current turn ends"
+    } else {
+        ""
+    };
+    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+        title: "Move session".into(),
+        message: format!(
+            "Move '{name}' to {dest}? It restarts there{when}, on the same conversation."
+        ),
+        action: PendingAction::MoveAgent { id, worktree },
+        area: ratatui::layout::Rect::default(),
+    }));
+}
+
+/// Moving session `id` into `worktree` as the flash and the confirm name
+/// it: the session's name, where it goes (`project ▸ branch` when the
+/// project changes) and whether it waits for its turn to end first. None
+/// when there is nothing to move.
+fn move_plan(app: &App, id: &AgentId, worktree: &WorktreeId) -> Option<(String, String, bool)> {
+    let agent = app.tree.agents.iter().find(|a| &a.id == id)?;
+    if &agent.worktree_id == worktree {
+        return None;
+    }
+    let target = app.tree.worktrees.iter().find(|w| &w.id == worktree)?;
+    let home = app.tree.worktrees.iter().find(|w| w.id == agent.worktree_id);
+    let dest = match app.tree.projects.iter().find(|p| p.id == target.project_id) {
+        Some(p) if home.is_none_or(|h| h.project_id != p.id) => {
+            format!("{} ▸ {}", p.name, target.branch)
+        }
+        _ => target.branch.clone(),
+    };
+    let mid_turn = agent.alive
+        && matches!(
+            agent.status,
+            nebula_core::AgentStatus::Running | nebula_core::AgentStatus::NeedsFeedback
+        );
+    Some((agent.name.clone(), dest, mid_turn))
+}
+
 /// A click on a BAND's rule: the cursor onto that band, the pane on its
 /// remembered card — what `j`/`k` walking onto it do — unfolding the pane
 /// as a click on a card does. A second click on the same rule opens the
@@ -2581,6 +2729,125 @@ fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
     }
 }
 
+/// `project`'s checkouts as the pickers list them: the ROOT WORKTREE
+/// first and the rest most recently worked in first, as the WORKTREES
+/// PANEL lists them, never a stand-in git is still cutting.
+fn picker_checkouts<'a>(app: &'a App, project: &ProjectId) -> Vec<&'a nebula_core::Worktree> {
+    use std::cmp::Reverse;
+    let mut checkouts: Vec<_> = app
+        .tree
+        .worktrees
+        .iter()
+        .filter(|w| &w.project_id == project && !app.is_placeholder_worktree(&w.id))
+        .collect();
+    let now = crate::app::now_ms();
+    checkouts.sort_by_key(|w| {
+        let r = crate::app::worktree_recency(&app.tree, &w.id, now);
+        (
+            Reverse(w.is_main),
+            Reverse(r.interacted),
+            Reverse(r.stamped),
+        )
+    });
+    checkouts
+}
+
+/// `m` on a card: the MOVE PICKER for the session under the cursor.
+///
+/// INPUT PARITY: the card menu's **Move to…** opens the same
+/// [`open_move_picker`].
+pub(super) fn move_session(app: &mut App) {
+    let aimed = !(app.launcher_grid() && app.launcher_unaimed);
+    let Some(agent) = app.selected_session().filter(|_| aimed) else {
+        app.flash = Some("no session card to move".into());
+        return;
+    };
+    open_move_picker(app, agent.id);
+}
+
+/// The MOVE PICKER: every other checkout of session `id`'s project, then
+/// every other project's as `project ▸ branch`, each in [`picker_checkouts`]
+/// order. Letters narrow the list; a pick moves the session there
+/// ([`move_agent`]).
+pub(super) fn open_move_picker(app: &mut App, id: AgentId) {
+    let Some(agent) = app.tree.agents.iter().find(|a| a.id == id) else {
+        return;
+    };
+    if agent.archived {
+        app.flash = Some("an archived session stays where it is: unarchive it first".into());
+        return;
+    }
+    let Some(project) = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.id == agent.worktree_id)
+        .map(|w| w.project_id.clone())
+    else {
+        app.flash = Some("worktree no longer exists".into());
+        return;
+    };
+    let others = app.tree.projects.iter().filter(|p| p.id != project);
+    let mut items = Vec::new();
+    for (name, p) in std::iter::once((None, &project)).chain(others.map(|p| (Some(&p.name), &p.id)))
+    {
+        for w in picker_checkouts(app, p) {
+            if w.id == agent.worktree_id {
+                continue;
+            }
+            let root = if w.is_main { "  (root)" } else { "" };
+            let at = name.map(|n| format!("{n} ▸ ")).unwrap_or_default();
+            items.push(MenuItem::new(
+                format!("{at}{}{root}", w.branch),
+                MenuAction::MoveAgent {
+                    id: id.clone(),
+                    worktree: w.id.clone(),
+                },
+            ));
+        }
+    }
+    if items.is_empty() {
+        app.flash = Some("no other worktree to move to".into());
+        return;
+    }
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("Move to".into()),
+        items: items.clone(),
+        at: None,
+        hover: 0,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+        filter: Some(MenuFilter {
+            query: String::new(),
+            all: items,
+        }),
+    }));
+}
+
+/// Move session `id` into checkout `worktree`: a MOVE PICKER row, or the
+/// card dropped on another band. The DAEMON moves the row and the grid's
+/// cursor follows it; the flash says when the session itself follows.
+pub(super) fn move_agent(
+    app: &mut App,
+    id: AgentId,
+    worktree: WorktreeId,
+    out: &mut Vec<ClientRequest>,
+) {
+    let Some((name, dest, mid_turn)) = move_plan(app, &id, &worktree) else {
+        return;
+    };
+    app.flash = Some(if mid_turn {
+        format!("{name} moves to {dest} when its turn ends")
+    } else {
+        format!("moved {name} to {dest}")
+    });
+    super::send(app, out, |req_id| ClientRequest::MoveAgent {
+        req_id,
+        id,
+        worktree,
+    });
+}
+
 /// The WORKTREE PICKER for the box `back` owes — `^T`, or a click on the
 /// branch in the box's details row (`worktree main ^T`), dropped down
 /// from that branch over the box, which stays on screen under it as it
@@ -2598,7 +2865,6 @@ fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
 /// at the row ([`pick_launch_worktree`]). A PR SESSION has nothing to
 /// pick: the DAEMON runs it in the pull request's own checkout.
 fn open_worktree_picker(app: &mut App, back: QuickReturn) {
-    use std::cmp::Reverse;
     if back.launch.pr.is_some() {
         app.flash =
             Some("quick prompt: a PR session runs in the pull request's own checkout".into());
@@ -2608,21 +2874,7 @@ fn open_worktree_picker(app: &mut App, back: QuickReturn) {
         app.flash = Some("project no longer exists".into());
         return;
     };
-    let mut checkouts: Vec<_> = app
-        .tree
-        .worktrees
-        .iter()
-        .filter(|w| w.project_id == project && !app.is_placeholder_worktree(&w.id))
-        .collect();
-    let now = crate::app::now_ms();
-    checkouts.sort_by_key(|w| {
-        let r = crate::app::worktree_recency(&app.tree, &w.id, now);
-        (
-            Reverse(w.is_main),
-            Reverse(r.interacted),
-            Reverse(r.stamped),
-        )
-    });
+    let checkouts = picker_checkouts(app, &project);
 
     let tick = |on: bool| if on { " ✓" } else { "" };
     let row = |label: String, target: QuickTarget| {
@@ -5938,15 +6190,22 @@ mod tests {
         });
     }
 
-    /// `m` opens no menu — not a card's, and with no card selected not
-    /// the project's either. The menus are the right button's alone.
+    /// `m` opens no context menu: on a card it is the MOVE PICKER, and with
+    /// no card selected it opens nothing, not the project's menu either.
+    /// The menus are the right button's alone.
     #[test]
     fn m_opens_no_menu() {
         with_default_config(|| {
             let mut app = two_sessions();
             draw(&mut app);
             key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "on a card: {:?}", app.overlay);
+            let title = match &app.overlay {
+                Some(Overlay::Menu(m)) => m.title.as_deref(),
+                _ => None,
+            };
+            assert_eq!(title, Some("Move to"), "on a card: {:?}", app.overlay);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.overlay.is_none());
 
             keys(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
             assert!(app.launcher_unaimed);
@@ -11855,5 +12114,236 @@ mod tests {
     fn drawn_after(app: &mut App, band: usize) -> Vec<(usize, ratatui::layout::Rect)> {
         draw_tall(app);
         drawn_entries(app, band)
+    }
+
+    /// A cell on the rule of `worktree`'s band, as drawn.
+    fn band_rule_cell(app: &App, worktree: &str) -> (u16, u16) {
+        let bands = crate::launcher::bands(app);
+        app.hits
+            .iter()
+            .find_map(|(rect, hit)| match hit {
+                HitTarget::LauncherBand(i) if bands[*i].worktree.0 == worktree => {
+                    Some((rect.x + 1, rect.y))
+                }
+                _ => None,
+            })
+            .expect("the band's rule was drawn")
+    }
+
+    fn sent_move(out: &[ClientRequest]) -> Option<(String, String)> {
+        out.iter().find_map(|r| match r {
+            ClientRequest::MoveAgent { id, worktree, .. } => {
+                Some((id.0.clone(), worktree.0.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    /// `m` on a card lists the project's other checkouts, then the other
+    /// projects', and a pick moves the session there; a mid-turn one is
+    /// told it follows when its turn ends.
+    #[test]
+    fn m_on_a_card_picks_a_checkout_to_move_the_session_to() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw_at(&mut app, 130, 50);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            draw_at(&mut app, 130, 50);
+            let (x, y) = row_cell(&app, 0);
+            click_at(&mut app, x, y);
+            assert_eq!(app.selected_session().unwrap().id.0, "a2");
+
+            key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("m opens the move picker");
+            };
+            assert_eq!(menu.title.as_deref(), Some("Move to"));
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                ["main  (root)", "web ▸ main  (root)"],
+                "every checkout but its own, its own project's first"
+            );
+
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(sent_move(&out), Some(("a2".into(), "w1".into())));
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("polish-nav moves to main when its turn ends")
+            );
+
+            // Another project's checkout, picked by typing its name.
+            key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+            for c in "web".chars() {
+                key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+            }
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(sent_move(&out), Some(("a2".into(), "w2root".into())));
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("polish-nav moves to web ▸ main when its turn ends")
+            );
+        });
+    }
+
+    /// A card dragged onto another project's tab lights the tab and, let
+    /// go there and confirmed, moves its session into that project's root;
+    /// the daemon's upsert takes the grid into that project with it.
+    #[test]
+    fn dragging_a_card_onto_a_project_tab_moves_it_into_that_project() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            draw_at(&mut app, 130, 50);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            draw_at(&mut app, 130, 50);
+            let (x, y) = row_cell(&app, 0);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            draw_at(&mut app, 130, 50);
+            let (tx, ty) = app
+                .hits
+                .iter()
+                .find_map(|(rect, hit)| match hit {
+                    HitTarget::LauncherTab(p) if p.0 == "p2" => Some((rect.x + 1, rect.y)),
+                    _ => None,
+                })
+                .expect("web's tab was drawn");
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), tx, ty);
+            assert_eq!(
+                app.card_drag.as_ref().and_then(|d| d.over.clone()),
+                Some(WorktreeId("w2root".into()))
+            );
+            assert!(crate::launcher::project_tabs(&app)
+                .iter()
+                .any(|t| t.drop && t.id.0 == "p2"));
+
+            let mut out = Vec::new();
+            let up = MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: tx,
+                row: ty,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_terminal_event(&mut app, crossterm::event::Event::Mouse(up), &mut out);
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(sent_move(&out), Some(("a2".into(), "w2root".into())));
+
+            let mut moved = app
+                .tree
+                .agents
+                .iter()
+                .find(|a| a.id.0 == "a2")
+                .unwrap()
+                .clone();
+            moved.worktree_id = WorktreeId("w2root".into());
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(moved),
+                },
+            );
+            assert_eq!(app.selected_project().map(|p| p.id.0.as_str()), Some("p2"));
+            assert_eq!(app.selected_session().map(|a| a.id.0), Some("a2".into()));
+        });
+    }
+
+    /// A card dragged onto another band lights that band's rule and, let
+    /// go there, asks, then moves its session; a plain click moves nothing.
+    #[test]
+    fn dragging_a_card_onto_another_band_moves_its_session() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw_at(&mut app, 130, 50);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            draw_at(&mut app, 130, 50);
+            let (x, y) = row_cell(&app, 0);
+            assert!(sent_move(&click_at(&mut app, x, y)).is_none());
+            assert!(app.card_drag.is_none(), "the release ends the press");
+
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            draw_at(&mut app, 130, 50);
+            let (bx, by) = band_rule_cell(&app, "w1");
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), bx, by);
+            assert_eq!(
+                app.card_drag.as_ref().and_then(|d| d.over.clone()),
+                Some(WorktreeId("w1".into()))
+            );
+            let term = draw_at(&mut app, 130, 50);
+            let screen: String = term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(screen.contains("release to move here"));
+
+            let mut out = Vec::new();
+            let up = MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: bx,
+                row: by,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_terminal_event(&mut app, crossterm::event::Event::Mouse(up), &mut out);
+            assert!(sent_move(&out).is_none(), "the drop asks first");
+            assert!(app.card_drag.is_none());
+            let Some(Overlay::Confirm(c)) = &app.overlay else {
+                panic!("the drop's confirm: {:?}", app.overlay);
+            };
+            assert_eq!(
+                c.message,
+                "Move 'polish-nav' to main? It restarts there once its current turn ends, \
+                 on the same conversation."
+            );
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(sent_move(&out), Some(("a2".into(), "w1".into())));
+        });
+    }
+
+    /// With **Confirm drag move** off the drop moves at once, and the air
+    /// under the last band is that band's: an empty band is a target past
+    /// its rule.
+    #[test]
+    fn a_drop_under_the_last_band_moves_there_without_asking_when_confirm_is_off() {
+        with_config_json(r#"{"confirm_drag_move": false}"#, || {
+            let mut app = two_sessions();
+            draw_at(&mut app, 130, 50);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            draw_at(&mut app, 130, 50);
+            let (x, y) = row_cell(&app, 1);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            draw_at(&mut app, 130, 50);
+            let bands = crate::launcher::bands(&app);
+            let (last, foot) = app
+                .hits
+                .iter()
+                .filter_map(|(r, hit)| match hit {
+                    HitTarget::LauncherBand(i) => Some((*i, r.y + r.height)),
+                    _ => None,
+                })
+                .max_by_key(|(_, foot)| *foot)
+                .expect("bands were drawn");
+            assert_eq!(bands[last].worktree.0, "w2", "feat's band is last");
+            assert!(matches!(
+                app.hit_at(x, foot + 1),
+                Some(HitTarget::PanelBg(Focus::Sessions))
+            ));
+
+            let mut out = Vec::new();
+            for kind in [
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                let event = MouseEvent {
+                    kind,
+                    column: x,
+                    row: foot + 1,
+                    modifiers: KeyModifiers::NONE,
+                };
+                handle_terminal_event(&mut app, crossterm::event::Event::Mouse(event), &mut out);
+            }
+            assert!(app.overlay.is_none(), "no confirm");
+            assert_eq!(sent_move(&out), Some(("a1".into(), "w2".into())));
+        });
     }
 }

@@ -1715,6 +1715,9 @@ pub struct ProjectTab {
     /// The header's own cursor is on it: the PROJECT TABS have the keys
     /// ([`App::launcher_tab_cursor`]) and the grid is showing this one.
     pub focused: bool,
+    /// A session card is dragged over it: the release moves the session
+    /// into this project.
+    pub drop: bool,
 }
 
 /// The PROJECT TABS across the LAUNCHER VIEW's header: every project
@@ -1740,6 +1743,9 @@ pub fn project_tabs(app: &App) -> Vec<ProjectTab> {
                 tally: project_tally(app, id),
                 active: active.as_ref() == Some(id),
                 focused: app.launcher_tab_cursor.as_ref() == Some(id),
+                drop: app.card_drag.as_ref().is_some_and(|d| {
+                    d.active && d.over.is_some() && d.over_tab.as_ref() == Some(id)
+                }),
             })
         })
         .collect()

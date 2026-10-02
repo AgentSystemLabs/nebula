@@ -545,6 +545,13 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::RestartAgent { req_id, id } => {
                     reply_done(&out_tx, req_id, daemon.restart_agent(&id).await).await;
                 }
+                ClientRequest::MoveAgent {
+                    req_id,
+                    id,
+                    worktree,
+                } => {
+                    reply_done(&out_tx, req_id, daemon.move_agent(&id, &worktree)).await;
+                }
                 ClientRequest::SendCloudMessage {
                     req_id,
                     id,
