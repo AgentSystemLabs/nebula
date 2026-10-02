@@ -358,14 +358,17 @@ async fn full_crud_attach_and_restart_persistence() {
         &mut c,
         &ClientRequest::Input {
             session: sref.clone(),
-            data: format!("echo {marker}; pwd\n").into_bytes(),
+            data: format!("pwd; echo {marker}\n").into_bytes(),
         },
     )
     .await
     .unwrap();
     let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         let text = String::from_utf8_lossy(&collected_output(evs)).into_owned();
-        text.matches(marker).count() >= 2
+        // The typed line is echoed, and echoed again when the shell's line
+        // editor redraws what was typed before its prompt. Only a marker at
+        // the start of a line is the command's own, printed after `pwd`'s.
+        text.contains(&format!("\n{marker}"))
     })
     .await;
     // The shell runs in the worktree directory.
@@ -4049,7 +4052,13 @@ async fn nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree() {
     )
     .unwrap();
     make_executable(&script);
-    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+    // A Codex sibling installs Codex's managed hooks into Codex's home:
+    // this test's own, never the developer's `~/.codex`.
+    let codex_home = env.tmp.path().join("codex-home");
+    let mut daemon = env.spawn_daemon_with(
+        script.to_str().unwrap(),
+        &[(env::CODEX_HOME, codex_home.to_str().unwrap())],
+    );
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
