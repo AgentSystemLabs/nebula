@@ -3994,6 +3994,37 @@ async fn subscribe(c: &mut UnixStream) -> Vec<ServerEvent> {
     .await
 }
 
+/// A subscribed client that hangs up is let go at once, with nothing
+/// broadcast in between: the daemon closes its side of the connection as
+/// soon as it reads the hang-up. It used to keep the socket open until the
+/// next broadcast, so an idle daemon collected one per one-shot client.
+#[tokio::test]
+async fn a_subscribed_client_that_hangs_up_is_let_go_by_an_idle_daemon() {
+    use tokio::io::AsyncWriteExt;
+    let env = TestEnv::new();
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+
+    // Hang up the writing half only: the daemon reads the end of the
+    // requests, and this half stays open to see the daemon close its own.
+    c.shutdown().await.unwrap();
+    let closed = tokio::time::timeout(EVENT_TIMEOUT, async {
+        while let Ok(Some(_)) = read_frame::<ServerEvent, _>(&mut c).await {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the daemon kept a hung-up subscriber's connection open"
+    );
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// `nebula spawn "<task>"` from inside a session, end to end over real
 /// processes: the CLI (what the model runs) makes the daemon start a second
 /// agent in the caller's worktree — booted at once, on the default name so
