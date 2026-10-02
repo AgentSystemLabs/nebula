@@ -132,6 +132,10 @@ pub enum Action {
     /// the box on the Agents tab defaults; the shifted key opens it on
     /// the card.
     DuplicateSession,
+    /// `m`: move the card under the cursor onto another checkout, of its
+    /// project or another one, picked from a list. Dragging the card onto
+    /// another band or project tab does the same.
+    MoveSession,
     // files
     FindFile,
     Grep,
@@ -562,6 +566,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["shift+p"],
+    },
+    ActionSpec {
+        action: Action::MoveSession,
+        id: "move_session",
+        label: "Move session",
+        hint: "Pick another worktree, of this project or another, for the selected session; it resumes there, after its current turn when it is mid-turn. Dragging the card onto another band or project tab does the same",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["m"],
     },
     // ---- FILES ----
     ActionSpec {

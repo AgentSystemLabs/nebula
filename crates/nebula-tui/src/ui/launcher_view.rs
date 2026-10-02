@@ -577,7 +577,7 @@ fn project_chip(
     }
     // The header's own cursor: the pad and the name as one accent block,
     // so where Enter would go reads apart from which tab is lit.
-    let (pad, name) = if tab.focused {
+    let (pad, name) = if tab.focused || tab.drop {
         let cursor = Style::default().bg(th.accent).fg(th.on_accent);
         (cursor, cursor.add_modifier(Modifier::BOLD))
     } else {
@@ -1665,7 +1665,15 @@ fn draw_band_rule(
         expanded,
         ..
     } = rule;
-    let edge = if lit { th.accent } else { th.edge };
+    // A session card dragged over this band: the rule lights and says
+    // the release moves the card here.
+    let drop = app
+        .card_drag
+        .as_ref()
+        .is_some_and(|d| {
+            d.active && d.over_tab.is_none() && d.over.as_ref() == Some(&band.worktree)
+        });
+    let edge = if lit || drop { th.accent } else { th.edge };
     let dash = |n: usize| Span::styled("─".repeat(n), Style::default().fg(edge));
 
     // The right end first, since the left gives way to it.
@@ -1716,6 +1724,14 @@ fn draw_band_rule(
             }
         }
         spans
+    };
+    let right = if drop {
+        vec![Span::styled(
+            "release to move here",
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        )]
+    } else {
+        right
     };
     let right_w: usize = right.iter().map(|s| s.width()).sum();
 

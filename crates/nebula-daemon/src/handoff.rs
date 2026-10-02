@@ -31,7 +31,7 @@ use std::time::Duration;
 /// The state-file format this build writes, and the newest it reads. A
 /// daemon only restarts onto a binary whose `_restart-version` is at least
 /// its own, so a change that an older reader could misread bumps this.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// A request older than this is a leftover, not a client still waiting.
 const REQUEST_MAX_AGE_MS: i64 = 60_000;
@@ -70,6 +70,30 @@ pub struct CarriedSession {
     pub launching: bool,
 }
 
+/// A relocation held across an in-place restart. v1 restart state wrote
+/// only `(agent, target)` and every held move was a `nebula worktree`
+/// relocation, so reading an old state defaults to showing the relocation
+/// notice. v2 adds `notice`, preserving silent user-initiated session moves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum CarriedPendingMove {
+    V2(AgentId, Worktree, bool),
+    V1(AgentId, Worktree),
+}
+
+impl CarriedPendingMove {
+    fn new(agent: AgentId, target: Worktree, notice: bool) -> Self {
+        Self::V2(agent, target, notice)
+    }
+
+    fn into_parts(self) -> (AgentId, Worktree, bool) {
+        match self {
+            Self::V2(agent, target, notice) => (agent, target, notice),
+            Self::V1(agent, target) => (agent, target, true),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct State {
     version: u32,
@@ -81,7 +105,7 @@ struct State {
     #[serde(default)]
     sessions: Vec<CarriedSession>,
     #[serde(default)]
-    pending_moves: Vec<(AgentId, Worktree)>,
+    pending_moves: Vec<CarriedPendingMove>,
 }
 
 /// The running image's handles a restart passes on.
@@ -105,7 +129,7 @@ pub struct Inherited {
 pub struct Carry {
     pub nonce: String,
     pub sessions: Vec<CarriedSession>,
-    pub pending_moves: Vec<(AgentId, Worktree)>,
+    pub pending_moves: Vec<(AgentId, Worktree, bool)>,
 }
 
 impl Carry {
@@ -177,7 +201,11 @@ pub fn restart(daemon: &Arc<Daemon>, handles: &Handles, request: &Request) -> Re
         hook_fd: handles.hook_fd,
         hook_token: daemon.hook_env.token.clone(),
         sessions,
-        pending_moves: daemon.pending_moves(),
+        pending_moves: daemon
+            .pending_moves()
+            .into_iter()
+            .map(|(agent, target, notice)| CarriedPendingMove::new(agent, target, notice))
+            .collect(),
     };
     let state_path = paths::restart_state_path();
     let kept = [state.pidfile_fd, state.socket_fd, state.hook_fd];
@@ -265,7 +293,11 @@ pub fn inherit(state_path: &Path) -> Result<Inherited> {
         carry: Carry {
             nonce: state.nonce,
             sessions: state.sessions,
-            pending_moves: state.pending_moves,
+            pending_moves: state
+                .pending_moves
+                .into_iter()
+                .map(CarriedPendingMove::into_parts)
+                .collect(),
         },
     })
 }
