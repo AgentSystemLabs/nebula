@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 mod launcher_view;
+mod panels_view;
 
 /// Outer size of the editor modal, as (width, height) percent of the frame.
 /// Shared with the event loop's pre-draw PTY size guess.
@@ -239,6 +240,17 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
     //
     // Any project on the machine puts it up; with none, the splash below
     // is the first run's "open a project".
+    //
+    // Settings → Appearance → **Layout** `panels` draws the PANELS in its
+    // place: PROJECTS | WORKTREES | SESSIONS beside the pane, on the same
+    // selection and the same attached session.
+    if app.panels_active() {
+        panels_view::draw(f, app, body);
+        draw_footer(f, app, footer);
+        draw_overlay(f, app);
+        draw_vim(f, app);
+        return;
+    }
     if app.launcher_active() {
         // `launcher_view::draw` takes `body_area` for the grid's half, so
         // the whole body is kept here for the pane drag to measure against.
@@ -3519,6 +3531,9 @@ fn pty_cursor_cell(screen: &vt100::Screen, area: Rect) -> Option<Position> {
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Terminal;
+    // The LAUNCHER VIEW's pane chrome; the PANELS' pane is the plain
+    // `TERMINAL · name` frame it always was.
+    let grid = app.launcher_active() && !app.panels_active();
     // A cursor is resting on an open pull request — the Worktrees cursor
     // on a PROJECT OPEN PRS GROUP row, or the focused Sessions cursor on
     // the PR ROW: the pane reads it. The attachment underneath stays live —
@@ -3570,7 +3585,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         // The LAUNCHER VIEW's pane says nothing of the lock: its header's
         // right end is the CLOSE BUTTON, and the accent rule under the
         // strip already says the keys are in there.
-        Some(_) if app.term_locked && !app.launcher_active() => Some(Span::styled(
+        Some(_) if app.term_locked && !grid => Some(Span::styled(
             "INPUT".to_string(),
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         )),
@@ -3584,9 +3599,9 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     // cursor itself, so the panels' ` · <attached>` is not added beside
     // it: with the pane on a terminal the attachment IS that terminal,
     // and the SESSION tab has to go on saying what it would come back to.
-    let inner = if app.launcher_active() && app.collapsed {
+    let inner = if grid && app.collapsed {
         launcher_view::crumb_frame(f, app, area)
-    } else if app.launcher_active() {
+    } else if grid {
         launcher_view::pane_frame(f, app, area, right, focused)
     } else {
         terminal_frame(f, area, left, right, focused, th)
@@ -3664,7 +3679,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         // The LAUNCHER VIEW's pane with nothing in it — a project with no
         // session yet — is an empty panel: the strip over it already says
         // which key opens a terminal here, and is a button for it.
-        None if app.launcher_active() => (Vec::new(), Vec::new()),
+        None if grid => (Vec::new(), Vec::new()),
         None => {
             // Empty-pane hero: vertically centered wordmark + a compact
             // key cheat-sheet, so the big blank pane earns its keep.

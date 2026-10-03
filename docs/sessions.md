@@ -489,6 +489,28 @@ cursor the whole card lifts a step, so the one you are about to unarchive stays 
 selection fill, and with color off entirely the two shapes still tell the grids apart. No card says
 the word `archived`: the header says it once, for all of them.
 
+## The PANELS
+
+Settings → Appearance → **Layout** `panels` puts the three-column layout back in place of the GRID:
+PROJECTS, WORKTREES and SESSIONS side by side, and the TERMINAL PANE beside them. Every launch path
+above works from it, on the selection the columns show.
+
+- **PROJECTS** lists every project on the machine, the one last worked in first, each with the
+  rolled-up status dot of its sessions, how long since anything in it moved and its unread finishes.
+- **WORKTREES** lists the selected project's checkouts — the root first, `⌂ root` — then the
+  project's open pull requests under `OPEN PRS` (a checkout on a pull request's branch nested under
+  it with a `└`) and its open issues under `ISSUES`. A click on either header folds the group. Resting
+  on a pull request or an issue reads it in the pane.
+- **SESSIONS** lists the selected checkout's sessions under `RECENT`, most recently touched first,
+  then its `TERMINALS`, its `PULL REQUESTS` and the `ARCHIVED` group, folded to its count until
+  `Shift+A` or a click opens it. Walking the list shows each session in the pane; `Enter` steps
+  into it.
+- `n` in SESSIONS is the NEW SESSION PICKER for the selected checkout, `p` the QUICK PROMPT, `Space`
+  the FOLLOW-UP MODAL. The breadcrumb in the footer reads `project ▸ worktree ▸ session`.
+
+The cards' own extras — the last prompt and line counts on a card, the header's PR and issue
+counts, the pane's terminal strip — are the grid's and have no column here.
+
 ## The ISSUES MODAL and ISSUE SESSIONS
 
 `i` lists the selected PROJECT's open GitHub issues — `gh issue list`, newest first,

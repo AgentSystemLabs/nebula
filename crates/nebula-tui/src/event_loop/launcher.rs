@@ -344,7 +344,7 @@ pub(super) fn empty_band(app: &App) -> Option<WorktreeId> {
     let on_card = app
         .selected_session_row()
         .is_some_and(|row| row.sref().is_some());
-    if !app.launcher_active() || on_card {
+    if !app.launcher_active() || app.panels || on_card {
         return None;
     }
     let bands = view::bands(app);
@@ -2053,7 +2053,8 @@ pub(super) fn toggle_full_screen(app: &mut App, out: &mut Vec<ClientRequest>) ->
     app.dirty = true;
     if app.collapsed {
         app.collapsed = false;
-        if app.launcher_pane_hidden || !has_pane(app) {
+        // The PANELS always have their pane beside the columns.
+        if !app.panels_active() && (app.launcher_pane_hidden || !has_pane(app)) {
             super::leave_terminal_lock(app);
             return "Back to the grid";
         }

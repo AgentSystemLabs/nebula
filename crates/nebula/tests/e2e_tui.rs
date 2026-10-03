@@ -55,6 +55,16 @@ impl TuiHarness {
     /// a stub `gh` on PATH so the pull-request row can be driven without a
     /// GitHub account.
     fn spawn_with_env(extra_env: &[(&str, String)]) -> Self {
+        Self::spawn_with(extra_env, None)
+    }
+
+    /// `spawn`, with `config` written to CONFIG.JSON before the TUI starts
+    /// — a setting the run needs from its first frame.
+    fn spawn_with_config(config: &str) -> Self {
+        Self::spawn_with(&[], Some(config))
+    }
+
+    fn spawn_with(extra_env: &[(&str, String)], config: Option<&str>) -> Self {
         // Socket paths must stay under SUN_LEN (~104 bytes) — keep the
         // runtime dir short. Tests share one process, so a per-harness
         // sequence keeps each test on its own daemon.
@@ -65,6 +75,10 @@ impl TuiHarness {
         let data_dir = PathBuf::from(format!("/tmp/nebtui-data-{pid}-{seq}"));
         let _ = std::fs::remove_dir_all(&runtime_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
+        if let Some(config) = config {
+            std::fs::create_dir_all(&data_dir).unwrap();
+            std::fs::write(data_dir.join("config.json"), config).unwrap();
+        }
         let repos = tempfile::tempdir().unwrap();
 
         let pty = native_pty_system()
@@ -954,4 +968,175 @@ fn tui_drag_past_the_pane_top_autoscrolls_and_copies_the_run() {
     for (i, row) in rows.iter().enumerate() {
         assert_eq!(*row, format!("row {}", first + i), "{text}");
     }
+}
+
+// ---- the PANELS (Settings › Appearance › Layout `panels`) ----
+
+/// The PANELS' footer while each column has the keys — the first words of
+/// each column's own hints.
+const FOOTER_PROJECTS: &str = "n/o: add";
+const FOOTER_WORKTREES: &str = "n: new worktree";
+const FOOTER_SESSIONS: &str = "Enter: focus  n: agent";
+const LEFT: &[u8] = b"\x1b[D";
+
+/// Does the SESSIONS column — the third, at the PANELS' default widths —
+/// show `needle`? The pane beside it names the attached session too, so a
+/// whole-screen search can't tell a row from the pane's header.
+fn sessions_column_contains(screen: &vt100::Screen, needle: &str) -> bool {
+    const SESSIONS_X: u16 = 20 + 22;
+    const SESSIONS_W: u16 = 32;
+    let (rows, cols) = screen.size();
+    let right = SESSIONS_X.saturating_add(SESSIONS_W).min(cols);
+    (0..rows).any(|row| {
+        let line: String = (SESSIONS_X..right)
+            .map(|col| {
+                let c = screen
+                    .cell(row, col)
+                    .map(|c| c.contents())
+                    .unwrap_or_default();
+                if c.is_empty() {
+                    " ".to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        line.contains(needle)
+    })
+}
+
+/// The PANELS walked the way the three-column layout always was: `h`/`l`
+/// across PROJECTS | WORKTREES | SESSIONS, `j`/`k` down each, Enter
+/// drilling in, a project scoping the worktrees and a worktree the
+/// sessions, a session started from SESSIONS taking the pane and `^q`
+/// handing the keys back.
+#[test]
+fn tui_panels_walk_projects_worktrees_and_sessions() {
+    let mut tui = TuiHarness::spawn_with_config(r#"{"layout": "panels"}"#);
+    let alpha = tui.make_repo("alpha-proj");
+    let beta = tui.make_repo("beta-proj");
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &alpha, "alpha-proj");
+    add_project(&mut tui, &beta, "beta-proj");
+    for column in ["PROJECTS", "WORKTREES", "SESSIONS", "TERMINAL"] {
+        tui.wait_for_text(column);
+    }
+
+    // ---- h walks left to PROJECTS and stops there; j/k walk projects ----
+    for _ in 0..3 {
+        tui.send(b"h");
+    }
+    tui.wait_for_text(FOOTER_PROJECTS);
+    // Neither project has run anything, so they list in the order added.
+    tui.send(b"k");
+    tui.wait_for_selected("alpha-proj");
+    tui.send(b"j");
+    tui.wait_for_selected("beta-proj");
+    tui.send(b"k");
+    tui.wait_for_selected("alpha-proj");
+
+    // ---- Enter drills in: PROJECTS → WORKTREES; a new worktree there ----
+    tui.send(ENTER);
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.wait_for_text("main ⌂ root");
+    tui.send(b"n");
+    tui.wait_for_text("New worktree");
+    tui.type_str("feat-a");
+    tui.send(ENTER);
+    tui.wait_for_gone("New worktree");
+    tui.wait_for_text("feat-a");
+    tui.wait_for_selected("feat-a");
+
+    // ---- SESSIONS: n picks a harness, the launch takes the pane ----
+    tui.send(b"l");
+    tui.wait_for_text(FOOTER_SESSIONS);
+    tui.send(b"n");
+    tui.wait_for_text("New session");
+    tui.send(ENTER);
+    tui.wait_for_gone("New session");
+    tui.wait_for("agent-1 in the SESSIONS column", |s| {
+        sessions_column_contains(s, "agent-1")
+    });
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+    tui.send(CTRL_Q);
+    tui.wait_for_text(FOOTER_SESSIONS);
+    // Tab walks onto the live pane and takes its input in one step.
+    tui.send(TAB);
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+    tui.send(CTRL_Q);
+    tui.wait_for_text(FOOTER_SESSIONS);
+
+    // ---- sessions are per-worktree: the root has no agent-1 ----
+    tui.send(LEFT);
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(b"k");
+    tui.wait_for_selected("main ⌂ root");
+    tui.wait_for("agent-1 gone from the SESSIONS column", |s| {
+        !sessions_column_contains(s, "agent-1")
+    });
+    tui.send(b"j");
+    tui.wait_for_selected("feat-a");
+    tui.wait_for("agent-1 back in the SESSIONS column", |s| {
+        sessions_column_contains(s, "agent-1")
+    });
+
+    // ---- another project swaps the WORKTREES column ----
+    tui.send(b"h");
+    tui.wait_for_text(FOOTER_PROJECTS);
+    tui.send(b"j");
+    tui.wait_for_selected("beta-proj");
+    tui.wait_for_gone("feat-a");
+
+    // ---- a click on a row selects it and its column takes the keys ----
+    let (row, col) =
+        find_text(tui.parser.lock().unwrap().screen(), "alpha-proj").expect("alpha-proj on screen");
+    tui.send(&sgr_mouse(0, col, row, false));
+    tui.send(&sgr_mouse(0, col, row, true));
+    tui.wait_for_selected("alpha-proj");
+    tui.wait_for_text("feat-a");
+}
+
+/// Settings › Appearance › Layout flips between the GRID and the PANELS
+/// live, with no restart, and back.
+#[test]
+fn tui_layout_setting_switches_grid_and_panels_live() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("layout-proj");
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "layout-proj");
+    assert!(!tui.screen_text().contains("WORKTREES"), "the grid first");
+
+    let flip = |tui: &mut TuiHarness| {
+        tui.send(b"s");
+        tui.wait_for_text("Appearance");
+        // Along the tab strip to Appearance, then down its rows to Layout.
+        for _ in 0..12 {
+            if tui.try_wait_for_text("Color theme", Duration::from_millis(300)) {
+                break;
+            }
+            tui.send(TAB);
+        }
+        for _ in 0..12 {
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < deadline {
+                if row_is_selected(tui.parser.lock().unwrap().screen(), "Layout") {
+                    tui.send(ENTER);
+                    tui.send(ESC);
+                    tui.wait_for_gone("Color theme");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            tui.send(b"j");
+        }
+        panic!(
+            "the Layout row never came under the cursor:\n{}",
+            tui.screen_text()
+        );
+    };
+    flip(&mut tui);
+    tui.wait_for_text("WORKTREES");
+    tui.wait_for_text("main ⌂ root");
+    flip(&mut tui);
+    tui.wait_for_gone("WORKTREES");
 }

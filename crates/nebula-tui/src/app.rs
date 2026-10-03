@@ -67,8 +67,14 @@ pub enum Focus {
 /// What a screen cell maps to; rebuilt on every draw for hit-testing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HitTarget {
-    /// The GRID's background (registered after the cards, so they win).
+    /// The GRID's background (registered after the cards, so they win),
+    /// or a PANELS column's.
     PanelBg(Focus),
+    /// A row of the PANELS — a project, a checkout (or pull request, or
+    /// issue), a session — or a group header there that folds
+    /// (`crate::panels::Row`). Registered ahead of its column's
+    /// `PanelBg`, so it wins.
+    PanelsRow(crate::panels::Row),
     TerminalPane,
     /// The session URL on the CLOUD SESSION PANEL; a click opens it in the
     /// browser. Registered ahead of the pane it sits on, so it wins.
@@ -3286,6 +3292,14 @@ pub struct App {
     /// (`event_loop::apply_config`). What a frame lays out is
     /// [`App::panel_layout`].
     pub launcher_list: bool,
+    /// The body is the PANELS — PROJECTS | WORKTREES | SESSIONS beside the
+    /// pane — rather than the PROJECT TABS over the GRID: Settings →
+    /// Appearance → **Layout** (`event_loop::apply_config`). Only a
+    /// switch: both draw the one selection (`sel_project`, `sel_worktree`,
+    /// `sel_session`) and the one pane, so flipping it mid-session lands
+    /// on the same rows with the same session attached. What a frame
+    /// draws is [`App::panels_active`].
+    pub panels: bool,
     /// Every BAND is laid out open at once — its cards wrapped into rows,
     /// or every entry of the LIST listed — and there is no ACCORDION:
     /// Settings → Appearance → **Expand all worktrees**
@@ -3859,6 +3873,7 @@ impl App {
             launcher_pane_w: None,
             launcher_pane_at: crate::launcher::PaneSide::default(),
             launcher_list: false,
+            panels: false,
             launcher_all_open: false,
             launcher_pane_hidden: false,
             launcher_expanded: None,
@@ -4142,7 +4157,17 @@ impl App {
     /// no session has been opened full-screen over it (`collapsed`, which
     /// `ui::draw` hands to the pane before it ever reaches the view).
     pub fn launcher_grid(&self) -> bool {
-        self.launcher_active() && !self.collapsed
+        self.launcher_active() && !self.collapsed && !self.panels
+    }
+
+    /// The PANELS are what the body draws in place of the GRID: the
+    /// **Layout** setting says so ([`App::panels`]) and there is a project
+    /// open to draw them for — the same gate as the LAUNCHER VIEW's, so
+    /// the first run and the all-tabs-closed SPLASH come first either way.
+    /// True under a full-screen session too, as [`App::launcher_active`]
+    /// is: the panels are what `^q` comes back down to.
+    pub fn panels_active(&self) -> bool {
+        self.panels && self.launcher_active()
     }
 
     /// Take the keyboard back from the session in the PANE, and say so
@@ -5471,9 +5496,10 @@ impl App {
 
     /// The two places FOCUS can rest: the LAUNCHER VIEW's GRID of cards
     /// and the PANE under them. The three columns the other variants name
-    /// are no longer drawn.
+    /// are drawn only by the PANELS ([`App::panels_active`]), where all
+    /// four are places to rest.
     pub fn focus_visible(&self, focus: Focus) -> bool {
-        matches!(focus, Focus::Sessions | Focus::Terminal)
+        matches!(focus, Focus::Sessions | Focus::Terminal) || self.panels_active()
     }
 
     fn focus_rank(focus: Focus) -> u8 {

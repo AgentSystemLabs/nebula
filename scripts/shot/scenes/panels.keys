@@ -1,0 +1,22 @@
+# The PANELS: three launches from the box into the selected checkout — one keeps running and opens a
+# pull request, one finishes, one stops on a question — then PROJECTS | WORKTREES | SESSIONS beside
+# the pane, the SESSIONS cursor on the newest launch, live in the pane.
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+p
+Sort the changelog entries by date, newest first
+Enter
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12

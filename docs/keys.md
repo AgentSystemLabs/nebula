@@ -118,6 +118,28 @@ the pane reads (`a`, `d`, `g`, `/`, `s`, `?`, `q`). `^P` in the box is the way t
 box at any project on the machine without taking you there, so Enter starts that session in the
 background and leaves the screen on the work in front of you.
 
+## The panels
+
+With **Layout** set to `panels` (Settings → Appearance, `layout` in [Configuration](configuration.md)) the
+body is the three-column layout from before the grid: PROJECTS | WORKTREES | SESSIONS down the left and
+the TERMINAL PANE beside them, reading the session under the SESSIONS cursor. The columns are the
+grid's own selection, so switching layouts lands on the same project, checkout and session. The
+PROJECTS column lists every project and stands in for the PROJECT TABS.
+
+| Key | Action |
+|---|---|
+| `h`/`l` or `←`/`→`, `Tab` | move FOCUS across the columns; `h` stops at PROJECTS, a double `l` at SESSIONS (or `Tab`) crosses into the pane and takes its input |
+| `j`/`k` or `↓`/`↑`, `Ctrl+d`/`Ctrl+u` | move the focused column's cursor: a project scopes the WORKTREES, a checkout the SESSIONS, and a session comes up in the pane |
+| `Enter` | drill in: PROJECTS → WORKTREES → SESSIONS; on a session, attach it and type into it; on a pull request or an issue, open it in the browser |
+| `n` | per column: add a project, cut a worktree, or pick a harness for a new session |
+| `p`, `t`, `r`, `a`, `u`, `d`, `/`, `.`/`,`, `g`, `f`, `?` … | as everywhere else, on the selected project, checkout or session |
+| `Space` | on a session: its FOLLOW-UP MODAL |
+| `^F` | the session under the cursor full-screen; `^F` or `^q` comes back down to the panels' pane |
+| `Shift+A` | open or fold the SESSIONS column's ARCHIVED group |
+| `]` / `[` | the attention walk, as `.` / `,` |
+| `x`, `1`–`9`, `+`, `` ` ``, `` ^` `` | grid-only — the PROJECT TABS, the pane's terminal strip and its fold have nothing to act on here, and the footer says so |
+| click | a row selects it and its column takes the keys, a second click is `Enter` on it; a click on a group header (`OPEN PRS`, `ISSUES`, `ARCHIVED`) folds it; a click on the pane steps into it |
+
 ## Chips and readouts
 
 Two strips report state without being asked. The TERMINAL PANE's header shows one chip at a

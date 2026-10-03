@@ -27,6 +27,7 @@ pub(crate) mod list_hit;
 pub mod markdown;
 pub mod overlay_close;
 pub mod palette;
+pub mod panels;
 pub mod perf;
 pub mod pr_cache;
 pub mod pr_modal;

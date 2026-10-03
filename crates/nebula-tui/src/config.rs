@@ -43,6 +43,13 @@ pub const PANE_SIDES: &[&str] = &[
 /// ([`crate::launcher::LIST_RECENT`]).
 pub const WORKTREE_LAYOUTS: &[&str] = &["cards", "list"];
 
+/// The **Layout** choices (Settings → Appearance), in the order the row
+/// cycles them: the GRID — PROJECT TABS over the lit project's session
+/// cards, the default — then the PANELS, the three columns nebula drew
+/// before the grid (PROJECTS | WORKTREES | SESSIONS beside the pane,
+/// `crate::panels`).
+pub const LAYOUTS: &[&str] = &["grid", "panels"];
+
 /// The **Preset text** choices (Settings → Sessions), in the order the row
 /// cycles them: the [`PresetText`] sides by label.
 pub const PRESET_TEXTS: &[&str] = &[
@@ -397,6 +404,7 @@ pub enum SettingKind {
     Theme,
     Animations,
     BlackBackground,
+    Layout,
     HideCardMarks,
     HighlightCurrentCard,
     SessionPane,
@@ -503,6 +511,7 @@ impl SettingKind {
             | SettingKind::CardIssueNumber => (2026, 9, 24),
             SettingKind::ExpandAllWorktrees | SettingKind::FollowNewSession => (2026, 9, 26),
             SettingKind::HighlightCurrentCard => (2026, 9, 28),
+            SettingKind::Layout => (2026, 10, 3),
         }
     }
 
@@ -650,6 +659,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::BlackBackground,
                 label: "Black background",
                 hint: "Paint the window pure black instead of the terminal's own background (off keeps the terminal's, transparency included)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::Layout,
+                label: "Layout",
+                hint: "The grid of session cards under project tabs, or the three panels — projects, worktrees, sessions — beside the session pane",
                 group: "",
             },
             SettingSpec {
@@ -1074,6 +1089,12 @@ pub struct Config {
     /// recent shown until Tab — the ACCORDION — opens the rest). Read
     /// through [`Config::list_layout`], so a word off the list is the cards.
     pub worktree_layout: String,
+    /// What the body draws: `grid` (the LAUNCHER VIEW — PROJECT TABS over
+    /// the GRID of cards, the default) or `panels` (the PROJECTS,
+    /// WORKTREES and SESSIONS columns beside the pane, `crate::panels`).
+    /// Read through [`Config::panels_layout`], so a word off the list is
+    /// the grid.
+    pub layout: String,
     /// EXPAND ALL WORKTREES: every BAND on the GRID laid out open at once
     /// — each worktree's sessions and terminals wrapped into rows under
     /// its rule, every entry of the compact LIST listed — so there is no
@@ -1425,6 +1446,7 @@ impl Default for Config {
             highlight_current_card: true,
             session_pane: crate::launcher::PaneSide::default().as_str().into(),
             worktree_layout: WORKTREE_LAYOUTS[0].into(),
+            layout: LAYOUTS[0].into(),
             expand_all_worktrees: false,
             hide_card_prompt: false,
             card_issue_number: true,
@@ -1601,6 +1623,11 @@ impl Config {
     /// `worktree_layout` says the compact LIST rather than the cards.
     pub fn list_layout(&self) -> bool {
         self.worktree_layout.trim().eq_ignore_ascii_case("list")
+    }
+
+    /// `layout` says the PANELS rather than the grid.
+    pub fn panels_layout(&self) -> bool {
+        self.layout.trim().eq_ignore_ascii_case("panels")
     }
 
     /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
@@ -2234,6 +2261,7 @@ impl Config {
             SettingKind::HighlightCurrentCard => on_off(self.highlight_current_card).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::WorktreeLayout => WORKTREE_LAYOUTS[usize::from(self.list_layout())].into(),
+            SettingKind::Layout => LAYOUTS[usize::from(self.panels_layout())].into(),
             SettingKind::ExpandAllWorktrees => on_off(self.expand_all_worktrees).into(),
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
@@ -2343,6 +2371,10 @@ impl Config {
             SettingKind::WorktreeLayout => {
                 let now = WORKTREE_LAYOUTS[usize::from(self.list_layout())];
                 self.worktree_layout = cycle_choice(now, WORKTREE_LAYOUTS, step).into();
+            }
+            SettingKind::Layout => {
+                let now = LAYOUTS[usize::from(self.panels_layout())];
+                self.layout = cycle_choice(now, LAYOUTS, step).into();
             }
             SettingKind::ExpandAllWorktrees => {
                 self.expand_all_worktrees = !self.expand_all_worktrees;
@@ -3894,6 +3926,39 @@ mod tests {
         assert!(!older.list_layout(), "predating the key");
         let odd: Config = serde_json::from_str(r#"{"worktree_layout": "grid"}"#).unwrap();
         assert!(!odd.list_layout(), "a word off the list");
+    }
+
+    /// The **Layout**: the grid out of the box, cycled from its Appearance
+    /// row to the PANELS and back, persisted under `layout`. A config
+    /// predating the key, or holding a word off the list, reads as the
+    /// grid.
+    #[test]
+    fn layout_defaults_to_the_grid_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.panels_layout());
+        let (tab, row) = locate(SettingKind::Layout).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        assert_eq!(cfg.value_label(SettingKind::Layout), "grid");
+        cfg.cycle(tab, row, 1);
+        assert!(cfg.panels_layout());
+        assert_eq!(cfg.value_label(SettingKind::Layout), "panels");
+        cfg.cycle(tab, row, -1);
+        assert!(!cfg.panels_layout(), "and back");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.panels_layout(), "Enter steps it on too");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).panels_layout());
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.get("layout"), Some(&serde_json::json!("panels")));
+
+        let older: Config = serde_json::from_str("{}").unwrap();
+        assert!(!older.panels_layout(), "predating the key");
+        let odd: Config = serde_json::from_str(r#"{"layout": "cards"}"#).unwrap();
+        assert!(!odd.panels_layout(), "a word off the list");
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,
