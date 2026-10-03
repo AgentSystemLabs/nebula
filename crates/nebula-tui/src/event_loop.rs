@@ -8,7 +8,7 @@ use crate::app::{
     PointerShape, PromptDialog, PromptKind, SessionRow, SettingsView, SubmenuKind, TermSelection,
     WorktreeRollback,
 };
-use crate::app::{PrCommentAnswer, PrDiffAnswer};
+use crate::app::{Place, PrCommentAnswer, PrDiffAnswer};
 use crate::pull_request::Lookup;
 use crate::text_input::TextInput;
 use crate::tree_browser::TreeBrowser;
@@ -1916,6 +1916,7 @@ fn open_pr_diff_view(app: &mut App, number: u64, url: &str, title: String, diff:
     view.prefetched = Some(chunks.into_iter().collect());
     view.pr_url = Some(url.to_string());
     view.files_width = app.diff_files_width;
+    view.split = app.diff_split;
     if app.diff_tree {
         view.toggle_tree();
     }
@@ -2185,8 +2186,9 @@ fn ui_state_json(app: &App) -> String {
         collapsed: app.collapsed,
         open_prs_collapsed: app.open_prs_collapsed,
         issues_collapsed: app.issues_collapsed,
-        diff_files_width: Some(app.diff_files_width),
+        diff_sidebar_width: Some(app.diff_files_width),
         diff_tree: app.diff_tree,
+        diff_unified: !app.diff_split,
         launcher_pane_h: app.launcher_pane_h,
         launcher_pane_w: app.launcher_pane_w,
         launcher_pane_hidden: app.launcher_pane_hidden,
@@ -2233,11 +2235,12 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
     app.show_archived = state.show_archived;
     app.open_prs_collapsed = state.open_prs_collapsed;
     app.issues_collapsed = state.issues_collapsed;
-    if let Some(w) = state.diff_files_width {
-        // The draw re-caps it to the actual modal width.
+    // The draw re-caps it to the actual modal width; 0 was never dragged.
+    if let Some(w) = state.diff_sidebar_width.filter(|w| *w > 0) {
         app.diff_files_width = w.clamp(crate::app::MIN_DIFF_FILES_W, MAX_RESTORED_WIDTH);
     }
     app.diff_tree = state.diff_tree;
+    app.diff_split = !state.diff_unified;
     // The next draw re-fits it to the body actually on screen
     // (`launcher::pane_height`); the cap here only keeps a nonsense blob
     // from carrying a wild number around.
@@ -4039,76 +4042,39 @@ fn load_worktree_files(
 /// the pruned set is written back. Restored marks sink to the bottom, so
 /// the modal opens on the first unreviewed file.
 ///
-/// A checkout the changed-files badge already knows to be clean is told so
-/// on the spot instead of being shown a modal that closes again; the badge
-/// can be two seconds behind an agent, so git is still asked, and the
-/// modal opens after all if it disagrees (`App::diff_probe`).
+/// The CHANGES share the sidebar with the GRAPH (`git_log`), read beside
+/// them; a checkout with nothing changed opens on HEAD's commit.
 fn open_diff_view(app: &mut App) {
     let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
-    let Some(jobs) = app.view_jobs.clone() else {
-        // No loop to land an answer on (unit tests): read inline.
-        match crate::git_diff::read_listing(&path) {
-            Ok(listing) => show_diff_listing(app, path, branch, listing),
-            Err(msg) => app.flash = Some(msg),
-        }
-        return;
-    };
-    let ticket = crate::view_jobs::ticket();
-    let selected = app.selected_worktree().map(|w| w.id.clone());
-    let known_clean =
-        matches!(&app.git_changes, Some((id, Some(0))) if Some(id) == selected.as_ref());
-    if known_clean {
-        app.flash = Some(format!("no changes in {branch}"));
-        app.diff_probe = Some((ticket, path.clone(), branch));
-    } else {
-        let mut view = DiffView::opening(path.clone(), branch, jobs.clone(), ticket);
-        view.files_width = app.diff_files_width;
-        if app.diff_tree {
-            view.toggle_tree();
-        }
-        // The badge's last `git status` — two seconds old at most — is the
-        // list to open on: the files are up on this keypress and the first
-        // diff is being read while the `git status` below checks them, not
-        // after it. `fill_view` reconciles the two when that lands.
-        let polled = app
-            .changed_files
-            .as_ref()
-            .filter(|(id, files)| Some(id) == selected.as_ref() && !files.is_empty());
-        if let Some((_, files)) = polled {
-            view.replace_files(files.clone());
-            crate::git_diff::load_selected_diff(&mut view);
-        }
-        app.overlay = Some(Overlay::Diff(view));
-    }
-    jobs.run(move || {
-        Some(crate::view_jobs::Answer::DiffListing {
-            ticket,
-            result: crate::git_diff::read_listing(&path),
-        })
-    });
-}
-
-/// Open the DIFF VIEWER on a listing already in hand — or say there is
-/// nothing to show.
-fn show_diff_listing(
-    app: &mut App,
-    path: std::path::PathBuf,
-    branch: String,
-    listing: crate::view_jobs::DiffListing,
-) {
-    if listing.files.is_empty() {
-        app.flash = Some(format!("no changes in {branch}"));
-        return;
-    }
     let mut view = DiffView::new(path, branch, Vec::new(), true);
     view.jobs = app.view_jobs.clone();
     view.files_width = app.diff_files_width;
-    crate::git_diff::fill_view(&mut view, listing);
-    // After the marks: the tree opens on the first unreviewed file too.
-    if app.diff_tree && view.toggle_tree() {
+    view.split = app.diff_split;
+    view.place = Place::ChangesHeader;
+    if app.diff_tree {
+        view.toggle_tree();
+    }
+    let selected = app.selected_worktree().map(|w| w.id.clone());
+    // The badge's last `git status` — two seconds old at most — is the list
+    // to open on: the files are up on this keypress and the first diff is
+    // being read while the `git status` below checks them, not after it.
+    // `fill_view` reconciles the two when that lands.
+    let polled = app
+        .changed_files
+        .as_ref()
+        .filter(|(id, files)| Some(id) == selected.as_ref() && !files.is_empty());
+    if let Some((_, files)) = polled.filter(|_| view.jobs.is_some()) {
+        view.replace_files(files.clone());
+        view.place = Place::Changes;
         crate::git_diff::load_selected_diff(&mut view);
+    }
+    crate::git_log::request_log(&mut view);
+    // With no loop to land on (unit tests) the listing is read inline.
+    if let Err(msg) = crate::git_diff::request_listing(&mut view) {
+        app.flash = Some(msg);
+        return;
     }
     app.overlay = Some(Overlay::Diff(view));
 }
@@ -4218,6 +4184,20 @@ fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) {
                 crate::git_diff::land_diff(view, id, ticket, &path, diff, prefetch);
             }
         }
+        Answer::Log { ticket, result } => {
+            if let Some(Overlay::Diff(view)) = &mut app.overlay {
+                crate::git_log::land_log(view, ticket, result);
+            }
+        }
+        Answer::CommitFiles {
+            view: id,
+            sha,
+            result,
+        } => {
+            if let Some(Overlay::Diff(view)) = &mut app.overlay {
+                crate::git_log::land_files(view, id, &sha, result);
+            }
+        }
         Answer::Preview { ticket, preview } => match &mut app.overlay {
             Some(Overlay::Tree(view)) => view.land_preview(ticket, *preview),
             Some(Overlay::FileTabs(view)) => view.land_preview(ticket, *preview),
@@ -4269,46 +4249,23 @@ fn land_worktree_files(app: &mut App, ticket: u64, result: Result<Vec<String>, S
     }
 }
 
-/// `git status` came back for a `g`: fill the DIFF VIEWER that opened ahead
-/// of it — or close it, saying why, when there is nothing to show — or, for
-/// the checkout that was told "no changes" off the badge, open it after all
-/// when git found some and nothing else has taken the screen since.
+/// A file list came back for the DIFF VIEWER that asked for it: the
+/// checkout's changes (a clean checkout puts its HISTORY up instead), or a
+/// commit's files. One git could not read closes the modal with the reason.
 fn land_diff_listing(
     app: &mut App,
     ticket: u64,
     result: Result<crate::view_jobs::DiffListing, String>,
 ) {
-    let probe = match &app.diff_probe {
-        Some((probed, ..)) if *probed == ticket => app.diff_probe.take(),
-        _ => None,
+    let Some(Overlay::Diff(view)) = &mut app.overlay else {
+        return;
     };
-    if let Some((_, path, branch)) = probe {
-        if let Ok(listing) = result {
-            if !listing.files.is_empty() && app.overlay.is_none() && app.vim.is_none() {
-                app.flash = None;
-                show_diff_listing(app, path, branch, listing);
-            }
-        }
+    if view.listing != Some(ticket) {
         return;
     }
-    let branch = match &app.overlay {
-        Some(Overlay::Diff(view)) if view.listing == Some(ticket) => view.branch.clone(),
-        _ => return,
-    };
-    match result {
-        Ok(listing) if !listing.files.is_empty() => {
-            if let Some(Overlay::Diff(view)) = &mut app.overlay {
-                crate::git_diff::fill_view(view, listing);
-            }
-        }
-        Ok(_) => {
-            app.overlay = None;
-            app.flash = Some(format!("no changes in {branch}"));
-        }
-        Err(msg) => {
-            app.overlay = None;
-            app.flash = Some(msg);
-        }
+    if let Err(msg) = crate::git_diff::take_listing(view, result) {
+        app.overlay = None;
+        app.flash = Some(msg);
     }
 }
 
@@ -5808,10 +5765,11 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         Overlay::Diff(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            // Ctrl+d/u walk the file list half its height, as in vim —
-            // the flat list and the tree alike; the diff pages on PgUp/PgDn.
+            // Ctrl+d/u walk the sidebar half its height, as in vim; the
+            // diff pages on PgUp/PgDn.
             let half = (view.list_area.height / 2).max(1) as i64;
             let page = view.view_height.max(1) as i32;
+            let at = view.side_cursor() as i64;
             match key.code {
                 // Two-stage escape: an active filter is cleared before the
                 // second Esc closes the modal.
@@ -5820,13 +5778,11 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     activate::diff_filter_changed(view);
                 }
                 KeyCode::Esc => app.overlay = None,
-                KeyCode::Char('d') if ctrl => {
-                    activate::diff_file(view, view.cursor() as i64 + half)
-                }
+                KeyCode::Char('d') if ctrl => activate::diff_file(view, at + half),
                 // Ctrl+u is the line editor's kill-to-start while something
                 // is typed; only with an empty filter does it move.
                 KeyCode::Char('u') if ctrl && view.filter.is_empty() => {
-                    activate::diff_file(view, view.cursor() as i64 - half)
+                    activate::diff_file(view, at - half)
                 }
                 // Ctrl+r toggles the reviewed ✓ on the selected file —
                 // nebula-side bookkeeping only, no git state is touched.
@@ -5849,19 +5805,22 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     activate::diff_tree_toggled(view);
                     app.diff_tree = view.tree.is_some();
                 }
+                // Ctrl+s: the diff side by side, or unified; remembered too.
+                KeyCode::Char('s') if ctrl => {
+                    view.toggle_split();
+                    app.diff_split = view.split;
+                }
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
-                KeyCode::Down => activate::diff_file(view, view.cursor() as i64 + 1),
-                KeyCode::Up => activate::diff_file(view, view.cursor() as i64 - 1),
-                // The tree folds on the TREE BROWSER's keys: →/← open and
-                // fold a directory (or step in / out to the parent), Enter
-                // flips the one under the cursor. In the flat list all
-                // three stay the filter's.
-                KeyCode::Right if view.tree.is_some() => activate::diff_tree_step(view, true),
-                KeyCode::Left if view.tree.is_some() => activate::diff_tree_step(view, false),
-                KeyCode::Enter if view.tree.is_some() => {
-                    activate::diff_row(view, view.cursor() as i64)
-                }
+                KeyCode::Down => activate::diff_file(view, at + 1),
+                KeyCode::Up => activate::diff_file(view, at - 1),
+                // →/← unfold and fold what the cursor is on (a section, a
+                // commit, a tree directory) or step in / out to the
+                // parent, as in the TREE BROWSER; Enter flips it. On the
+                // flat list's files all three stay the filter's.
+                KeyCode::Right if view.folds_on_arrows() => activate::diff_fold(view, true),
+                KeyCode::Left if view.folds_on_arrows() => activate::diff_fold(view, false),
+                KeyCode::Enter if view.folds_on_arrows() => activate::diff_row(view, at),
                 KeyCode::PageDown => view.scroll_by(page),
                 KeyCode::PageUp => view.scroll_by(-page),
                 KeyCode::Home => view.scroll = 0,
@@ -9212,20 +9171,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         app.dirty = true;
         return;
     }
-    // Diff modal: the wheel over the file list walks its cursor a row a
-    // notch (↑/↓'s own step), anywhere else it scrolls the diff; a click on
-    // a file-list row selects that file (and folds or unfolds a tree
-    // directory's), a drag on the files/diff border resizes the file list;
-    // everything else is swallowed.
+    // Diff modal: the wheel over the sidebar walks its cursor a row a notch
+    // (↑/↓'s own step), anywhere else it scrolls the diff; a click on a
+    // sidebar row selects it (and folds or unfolds a section header, a
+    // commit or a tree directory), a drag on the sidebar/diff border
+    // resizes the sidebar; everything else is swallowed.
     if let Some(Overlay::Diff(view)) = &mut app.overlay {
         let over_files = view.area.contains(mouse_pos) && mouse.column < view.splitter_x();
         match mouse.kind {
             MouseEventKind::ScrollUp if over_files => {
-                activate::diff_file(view, view.cursor() as i64 - 1);
+                activate::diff_file(view, view.side_cursor() as i64 - 1);
                 app.dirty = true;
             }
             MouseEventKind::ScrollDown if over_files => {
-                activate::diff_file(view, view.cursor() as i64 + 1);
+                activate::diff_file(view, view.side_cursor() as i64 + 1);
                 app.dirty = true;
             }
             MouseEventKind::ScrollUp => {
@@ -9247,7 +9206,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 let area = view.list_area;
                 let first = view.window_start(area.height as usize);
                 if let Some(index) =
-                    crate::list_hit::row_at(area, first, view.row_count(), mouse_pos)
+                    crate::list_hit::row_at(area, first, view.side_len(), mouse_pos)
                 {
                     activate::diff_row(view, index as i64);
                     app.dirty = true;
@@ -14023,7 +13982,7 @@ diff --git a/docs/keys.md b/docs/keys.md
         let text = buffer_text(&terminal);
         assert!(text.contains("▾ crates/tui/src"), "{text}");
         assert!(text.contains("^t: flat list"), "{text}");
-        assert!(text.contains("←/→: fold"), "{text}");
+        assert!(text.contains("→/←: unfold/fold"), "{text}");
 
         // Up onto the directory's row: the pane lists what is under it.
         press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
@@ -14091,9 +14050,10 @@ diff --git a/docs/keys.md b/docs/keys.md
             );
         };
 
+        // Row 0 is the FILES header.
         press(&mut keyed, KeyCode::Up, KeyModifiers::NONE, &mut out);
         press(&mut keyed, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        click(&mut clicked, 0, &mut out);
+        click(&mut clicked, 1, &mut out);
         assert_eq!(
             diff_tree_rows(&keyed),
             ["*crates/tui/src", "docs", "keys.md"]
@@ -14105,7 +14065,7 @@ diff --git a/docs/keys.md b/docs/keys.md
         press(&mut keyed, KeyCode::Down, KeyModifiers::NONE, &mut out);
         press(&mut keyed, KeyCode::Down, KeyModifiers::NONE, &mut out);
         press(&mut keyed, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        click(&mut clicked, 2, &mut out);
+        click(&mut clicked, 3, &mut out);
         assert_eq!(
             diff_tree_rows(&keyed),
             ["crates/tui/src", "docs", "*keys.md"]
@@ -21225,23 +21185,95 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(out.is_empty(), "the diff modal never talks to the daemon");
     }
 
+    /// `g` on a clean checkout opens on HEAD's commit in the GRAPH, the
+    /// pane reading it. `Enter` unfolds it into its files right under it,
+    /// `↓` reads the first one against the commit's parent, and `←` / `Enter`
+    /// fold it back.
     #[test]
-    fn g_with_clean_repo_flashes_no_changes() {
+    fn g_with_clean_repo_opens_on_heads_commit() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo(&dir);
+        std::fs::write(repo.join("a.txt"), "second\n").unwrap();
+        run_git(&repo, &["commit", "-am", "second"]);
         let mut app = App::new();
         seed_repo_tree(&mut app, &repo);
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
-        assert!(app.overlay.is_none(), "clean tree opens no modal");
-        assert!(
-            app.flash
-                .as_deref()
-                .unwrap_or("")
-                .contains("no changes in main"),
-            "{:?}",
-            app.flash
-        );
+        let Some(Overlay::Diff(v)) = &app.overlay else {
+            panic!("expected the modal, got {:?}", app.overlay);
+        };
+        assert_eq!(v.place, Place::Graph);
+        let log = v.log.as_ref().unwrap();
+        assert_eq!(log.commits.len(), 2);
+        assert_eq!(log.selected_commit().unwrap().subject, "second");
+        assert!(v.diff.contains("second"), "{}", v.diff);
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Diff(v)) = &app.overlay else {
+            panic!("closed");
+        };
+        let log = v.log.as_ref().unwrap();
+        assert!(matches!(
+            log.selected_entry(),
+            Some(crate::git_log::Entry::File(..))
+        ));
+        assert!(v.diff.contains("-orig"), "{}", v.diff);
+        assert!(v.diff.contains("+second"), "{}", v.diff);
+
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Diff(v)) = &app.overlay else {
+            panic!("closed");
+        };
+        let log = v.log.as_ref().unwrap();
+        assert!(log.unfolded.is_empty(), "folded back");
+        assert_eq!(log.selected_commit().unwrap().subject, "second");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+    }
+
+    /// The CHANGES sit over the GRAPH in one list: `↓` off the last changed
+    /// file crosses the GRAPH's header onto its first commit, and typing
+    /// narrows both.
+    #[test]
+    fn the_cursor_walks_from_the_changes_into_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Diff(v)) = &app.overlay else {
+            panic!("closed");
+        };
+        assert_eq!(v.place, Place::Changes);
+        assert_eq!(v.selected_path(), Some("a.txt"));
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Diff(v)) = &app.overlay else {
+            panic!("closed");
+        };
+        assert_eq!(v.place, Place::GraphHeader);
+        assert!(v.diff.contains("a.txt"), "git status: {}", v.diff);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Diff(v)) = &app.overlay else {
+            panic!("closed");
+        };
+        assert_eq!(v.place, Place::Graph);
+        assert!(v.diff.contains("init"), "the commit: {}", v.diff);
+
+        // A filter only the commit matches keeps the cursor in the GRAPH.
+        for c in "init".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let Some(Overlay::Diff(v)) = &app.overlay else {
+            panic!("closed");
+        };
+        assert_eq!(v.row_count(), 0, "no changed file matches");
+        assert_eq!(v.place, Place::Graph);
+        assert_eq!(v.log.as_ref().unwrap().rows.len(), 1);
     }
 
     /// `G` turns the checkout's remote into a page and hands it to the
@@ -21876,7 +21908,7 @@ diff --git a/src/c.rs b/src/c.rs
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Files (2)"), "file pane title:\n{text}");
+        assert!(text.contains("CHANGES (2)"), "the changes' header:\n{text}");
         assert!(text.contains("alpha.rs"), "file row:\n{text}");
         assert!(text.contains("type to filter"), "filter row:\n{text}");
         assert!(text.contains("+new line"), "diff body:\n{text}");
@@ -21943,14 +21975,15 @@ diff --git a/src/c.rs b/src/c.rs
         );
 
         let mut out = Vec::new();
-        // Click the second row: beta.rs becomes the selection and its diff
-        // loads (the fake root makes that an error string, still a reload).
+        // Click the second file, under the CHANGES header: beta.rs becomes
+        // the selection and its diff loads (the fake root makes that an
+        // error string, still a reload).
         handle_mouse(
             &mut app,
             mev(
                 MouseEventKind::Down(MouseButton::Left),
                 area.x + 2,
-                area.y + 1,
+                area.y + 2,
             ),
             &mut out,
         );

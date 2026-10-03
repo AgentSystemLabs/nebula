@@ -25,7 +25,7 @@ use super::{
     WORKTREE_STILL_CREATING,
 };
 use crate::app::{
-    App, ConfirmDialog, DiffView, Focus, FollowUp, Overlay, PendingAction, SessionRow,
+    App, ConfirmDialog, DiffView, Focus, FollowUp, Overlay, PendingAction, Place, SessionRow,
 };
 use nebula_core::{AgentId, ClientRequest, SessionRef, WorktreeId};
 
@@ -85,36 +85,43 @@ pub(super) fn metrics_row(app: &mut App, out: &mut Vec<ClientRequest>) {
     open_session(app, sref, out);
 }
 
-/// Move the DIFF modal's file cursor to `index` (clamped) and read that
-/// file's diff when the cursor actually moved — ↑/↓ and a click on a file
-/// row alike.
+/// Move the DIFF modal's sidebar cursor to row `index` (clamped), across
+/// its CHANGES and GRAPH, and read what it lands on when it actually
+/// moved: ↑/↓, the wheel and `Ctrl+d`/`Ctrl+u` alike.
 pub(super) fn diff_file(view: &mut DiffView, index: i64) {
-    if view.select(index) {
+    if view.side_select(index) {
         crate::git_diff::load_selected_diff(view);
     }
 }
 
-/// A row of the DIFF modal's list chosen — a click on it, or Enter on the
-/// cursor's own: the cursor lands there, and a tree directory's row folds
-/// or unfolds as well. On a file's row that is all there is to choose, so
-/// in the flat list this is `diff_file`.
+/// A row of the DIFF modal's sidebar chosen (a click on it, or Enter on
+/// the cursor's own): the cursor lands there, and a section header, a tree
+/// directory or a GRAPH commit folds or unfolds as well. On a file's row
+/// that is all there is to choose, so in the flat list this is `diff_file`.
 pub(super) fn diff_row(view: &mut DiffView, index: i64) {
-    let moved = view.select(index);
-    if view.toggle_dir(view.cursor()) || moved {
+    let moved = view.side_select(index);
+    let folded = match view.place {
+        Place::ChangesHeader | Place::GraphHeader => view.fold_section(None),
+        Place::Changes => view.toggle_dir(view.cursor()),
+        Place::Graph => crate::git_log::fold(view, None),
+    };
+    if moved || folded {
         crate::git_diff::load_selected_diff(view);
     }
 }
 
-/// `→` / `←` in the DIFF modal's tree: open or fold the directory under the
-/// cursor, stepping into an open one or out to the parent's row, and read
-/// whatever the cursor came to rest on.
-pub(super) fn diff_tree_step(view: &mut DiffView, inward: bool) {
-    let moved = if inward {
-        view.expand_selected()
-    } else {
-        view.collapse_selected()
+/// `→` / `←` in the DIFF modal: unfold or fold what the cursor is on (a
+/// section, a GRAPH commit, a tree directory), stepping into an open one
+/// or out to its parent's row, and read whatever the cursor came to rest
+/// on.
+pub(super) fn diff_fold(view: &mut DiffView, open: bool) {
+    let changed = match view.place {
+        Place::ChangesHeader | Place::GraphHeader => view.fold_section(Some(open)),
+        Place::Changes if open => view.expand_selected(),
+        Place::Changes => view.collapse_selected(),
+        Place::Graph => crate::git_log::fold(view, Some(open)),
     };
-    if moved {
+    if changed {
         crate::git_diff::load_selected_diff(view);
     }
 }
@@ -124,16 +131,33 @@ pub(super) fn diff_tree_step(view: &mut DiffView, inward: bool) {
 /// had to move — off a directory's row, which the flat list has none of —
 /// reads a diff.
 pub(super) fn diff_tree_toggled(view: &mut DiffView) {
-    if view.toggle_tree() {
+    if view.toggle_tree() && view.place == Place::Changes {
         crate::git_diff::load_selected_diff(view);
     }
 }
 
 /// The DIFF modal's filter text changed — typed, pasted, or cleared by
-/// Esc: the file list narrows, and when that moved the cursor onto another
-/// file its diff is read.
+/// Esc: both sections narrow, and when that moved the cursor onto another
+/// row its diff is read. A cursor whose section has nothing left goes to
+/// the other's first row.
 pub(super) fn diff_filter_changed(view: &mut DiffView) {
-    if view.apply_filter() {
+    let before = view.selected_key();
+    let moved = view.apply_filter();
+    let query = view.filter.to_string();
+    if let Some(log) = &mut view.log {
+        log.apply_filter(&query);
+    }
+    let graph_rows = view.log.as_ref().map_or(0, |l| l.rows.len());
+    match view.place {
+        Place::Changes if view.row_count() == 0 && graph_rows > 0 => {
+            view.place = Place::Graph;
+        }
+        Place::Graph if graph_rows == 0 && view.row_count() > 0 => {
+            view.place = Place::Changes;
+        }
+        _ => {}
+    }
+    if view.selected_key() != before || (moved && view.place == Place::Changes) {
         crate::git_diff::load_selected_diff(view);
     }
 }
