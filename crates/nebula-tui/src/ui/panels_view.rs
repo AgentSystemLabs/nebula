@@ -175,7 +175,7 @@ pub(super) fn help_sections() -> (&'static [HelpSection], &'static [HelpSection]
                     "project tabs: none here",
                 ),
                 (Lit("click"), "select; again: Enter"),
-                (Lit("wheel"), "walk the column under it"),
+                (Lit("wheel"), "scroll the column under it"),
             ],
         ),
         (
