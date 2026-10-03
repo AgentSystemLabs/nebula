@@ -189,7 +189,11 @@ impl GitLog {
     fn key_of(&self, entry: Entry) -> Option<String> {
         match entry {
             Entry::Commit(c) => Some(self.commits.get(c)?.sha.clone()),
-            Entry::File(c, f) => Some(format!("{}:{}", self.commits.get(c)?.sha, self.file_at(c, f)?.path)),
+            Entry::File(c, f) => Some(format!(
+                "{}:{}",
+                self.commits.get(c)?.sha,
+                self.file_at(c, f)?.path
+            )),
             _ => None,
         }
     }
@@ -258,7 +262,8 @@ impl GitLog {
     }
 
     fn select_key(&mut self, key: &str) -> bool {
-        let row = (0..self.rows.len()).find(|&i| self.key_of(self.rows[i].entry).as_deref() == Some(key));
+        let row =
+            (0..self.rows.len()).find(|&i| self.key_of(self.rows[i].entry).as_deref() == Some(key));
         if let Some(row) = row {
             self.selected = row;
         }
@@ -272,7 +277,10 @@ impl GitLog {
     /// Where the cursor starts: HEAD's commit.
     pub fn go_home(&mut self) {
         let head = self.rows.iter().position(|r| match r.entry {
-            Entry::Commit(c) => self.commits[c].refs.iter().any(|rf| rf.kind == RefKind::Head),
+            Entry::Commit(c) => self.commits[c]
+                .refs
+                .iter()
+                .any(|rf| rf.kind == RefKind::Head),
             _ => false,
         });
         self.selected = 0;
@@ -336,7 +344,13 @@ impl GitLog {
         self.rows = rows;
     }
 
-    fn push_commit(&self, rows: &mut Vec<LogRow>, c: usize, line: Option<usize>, positions: Vec<usize>) {
+    fn push_commit(
+        &self,
+        rows: &mut Vec<LogRow>,
+        c: usize,
+        line: Option<usize>,
+        positions: Vec<usize>,
+    ) {
         rows.push(LogRow {
             entry: Entry::Commit(c),
             line,
@@ -439,20 +453,21 @@ pub fn parse_refs(decorations: &str) -> Vec<Ref> {
         .split(", ")
         .filter_map(|d| {
             let (kind, name) = if let Some(branch) = d.strip_prefix("HEAD -> ") {
-                (RefKind::Head, branch.strip_prefix("refs/heads/").unwrap_or(branch))
+                (
+                    RefKind::Head,
+                    branch.strip_prefix("refs/heads/").unwrap_or(branch),
+                )
             } else if d == "HEAD" {
                 (RefKind::Head, "")
             } else if let Some(tag) = d.strip_prefix("tag: ") {
                 (RefKind::Tag, tag.strip_prefix("refs/tags/").unwrap_or(tag))
             } else if let Some(branch) = d.strip_prefix("refs/heads/") {
                 (RefKind::Local, branch)
-            } else if let Some(remote) = d.strip_prefix("refs/remotes/") {
-                if remote.ends_with("/HEAD") {
-                    return None;
-                }
-                (RefKind::Remote, remote)
             } else {
-                return None;
+                let remote = d
+                    .strip_prefix("refs/remotes/")
+                    .filter(|r| !r.ends_with("/HEAD"))?;
+                (RefKind::Remote, remote)
             };
             Some(Ref {
                 kind,
@@ -767,11 +782,23 @@ pub fn read_ahead(view: &DiffView) {
         .map(|c| c.sha.clone())
         .filter(|sha| view.cached(sha).is_none());
     if let (Some(sha), Some(jobs)) = (next, view.jobs.clone()) {
-        request(view, &jobs, Read::Summary(sha), crate::view_jobs::ticket(), true);
+        request(
+            view,
+            &jobs,
+            Read::Summary(sha),
+            crate::view_jobs::ticket(),
+            true,
+        );
     }
 }
 
-fn request(view: &DiffView, jobs: &crate::view_jobs::Jobs, read: Read, ticket: u64, prefetch: bool) {
+fn request(
+    view: &DiffView,
+    jobs: &crate::view_jobs::Jobs,
+    read: Read,
+    ticket: u64,
+    prefetch: bool,
+) {
     let (root, id) = (view.root.clone(), view.id);
     let work = move || {
         Some(crate::view_jobs::Answer::DiffText {
@@ -817,7 +844,11 @@ mod tests {
     /// side, the lines joining them, HEAD on the third.
     fn log() -> GitLog {
         let read = LogRead {
-            commits: vec![commit("c0", Vec::new()), commit("c1", Vec::new()), commit("c2", head())],
+            commits: vec![
+                commit("c0", Vec::new()),
+                commit("c1", Vec::new()),
+                commit("c2", head()),
+            ],
             lines: vec![
                 ("*".into(), Some(0)),
                 ("|\\".into(), None),
@@ -846,7 +877,10 @@ mod tests {
                     | * \x1fbbbb\x1fbb\x1f\x1fBob\x1f90\x1fadd b\n";
         let (commits, lines) = parse_log(text);
         assert_eq!(commits.len(), 2);
-        assert_eq!(commits[0].subject, "fix: a\x1fb", "the subject keeps a stray separator");
+        assert_eq!(
+            commits[0].subject, "fix: a\x1fb",
+            "the subject keeps a stray separator"
+        );
         assert_eq!(commits[0].time, 100);
         assert_eq!(commits[0].refs_label(), "(HEAD → main, origin/main)");
         assert!(commits[1].refs.is_empty());
@@ -904,7 +938,10 @@ mod tests {
         assert!(!log.select(-5), "clamped at the top");
         assert!(log.select(1));
         assert_eq!(log.selected_key().as_deref(), Some("c1"), "down over |\\");
-        assert_eq!(log.commit_after_cursor().map(|c| c.sha.as_str()), Some("c2"));
+        assert_eq!(
+            log.commit_after_cursor().map(|c| c.sha.as_str()),
+            Some("c2")
+        );
     }
 
     /// Typing narrows the list to matching commits, best first and with no
@@ -948,7 +985,11 @@ mod tests {
 
         *log.unfolded.get_mut("c1").unwrap() = Some(Ok(vec![modified("a.rs"), modified("b.rs")]));
         log.refresh();
-        assert_eq!(log.selected_key().as_deref(), Some("c1"), "the cursor kept its row");
+        assert_eq!(
+            log.selected_key().as_deref(),
+            Some("c1"),
+            "the cursor kept its row"
+        );
         assert!(log.select(log.selected as i64 + 1));
         assert_eq!(log.selected_key().as_deref(), Some("c1:a.rs"));
         assert_eq!(log.selected_commit().map(|c| c.sha.as_str()), Some("c1"));

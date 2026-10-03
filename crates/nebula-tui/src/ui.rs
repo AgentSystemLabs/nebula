@@ -1707,14 +1707,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // each under a header that folds it; a stateless follow-window
             // keeps the cursor's row visible.
             // The hint names the list `Ctrl+t` leads to, not the one up.
-            let block = panel_block("Source control", true, th).title_bottom(Line::from(Span::styled(
-                if view.tree.is_some() {
-                    " ^t: flat list "
-                } else {
-                    " ^t: tree "
-                },
-                Style::default().fg(th.dim),
-            )));
+            let block =
+                panel_block("Source control", true, th).title_bottom(Line::from(Span::styled(
+                    if view.tree.is_some() {
+                        " ^t: flat list "
+                    } else {
+                        " ^t: tree "
+                    },
+                    Style::default().fg(th.dim),
+                )));
             let files_inner = block.inner(files_a);
             f.render_widget(block, files_a);
 
@@ -1773,9 +1774,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         log.commits[c].short,
                         log.file_at(c, file).map_or("", |f| f.path.as_str())
                     ),
-                    _ => log
-                        .selected_commit()
-                        .map_or(view.branch.clone(), |c| format!("{} {}", c.short, c.subject)),
+                    _ => log.selected_commit().map_or(view.branch.clone(), |c| {
+                        format!("{} {}", c.short, c.subject)
+                    }),
                 },
                 _ => format!("{}: status", view.branch),
             };
@@ -2835,9 +2836,11 @@ fn draw_split_diff(
     let widest = rows
         .iter()
         .filter_map(|row| match row {
-            SplitRow::Pair { left, right, .. } => {
-                Some(left.as_ref().map_or(0, |l| l.0).max(right.as_ref().map_or(0, |r| r.0)))
-            }
+            SplitRow::Pair { left, right, .. } => Some(
+                left.as_ref()
+                    .map_or(0, |l| l.0)
+                    .max(right.as_ref().map_or(0, |r| r.0)),
+            ),
             SplitRow::Note(..) => None,
         })
         .max()
@@ -2893,8 +2896,14 @@ fn draw_split_diff(
 /// A section header's fold marker and name, bold.
 fn header_spans(open: bool, name: &str, th: Theme) -> Vec<Span<'static>> {
     vec![
-        Span::styled(if open { "▾ " } else { "▸ " }, Style::default().fg(th.accent)),
-        Span::styled(name.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            if open { "▾ " } else { "▸ " },
+            Style::default().fg(th.accent),
+        ),
+        Span::styled(
+            name.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
     ]
 }
 
@@ -2931,7 +2940,10 @@ fn graph_header_spans(view: &crate::app::DiffView, th: Theme) -> Vec<Span<'stati
     let Some(log) = &view.log else {
         return spans;
     };
-    let commits = log.rows.iter().filter(|r| matches!(r.entry, crate::git_log::Entry::Commit(_)));
+    let commits = log
+        .rows
+        .iter()
+        .filter(|r| matches!(r.entry, crate::git_log::Entry::Commit(_)));
     let count = if log.reading.is_some() && log.commits.is_empty() {
         " (…)".to_string()
     } else if view.filter.is_empty() {
@@ -2942,17 +2954,27 @@ fn graph_header_spans(view: &crate::app::DiffView, th: Theme) -> Vec<Span<'stati
     spans.push(Span::styled(count, Style::default().fg(th.dim)));
     let (ahead, behind) = log.sides();
     if ahead > 0 {
-        spans.push(Span::styled(format!("  ↑{ahead}"), Style::default().fg(th.ok)));
+        spans.push(Span::styled(
+            format!("  ↑{ahead}"),
+            Style::default().fg(th.ok),
+        ));
     }
     if behind > 0 {
-        spans.push(Span::styled(format!("  ↓{behind}"), Style::default().fg(th.warn)));
+        spans.push(Span::styled(
+            format!("  ↓{behind}"),
+            Style::default().fg(th.warn),
+        ));
     }
     spans
 }
 
 /// A changed file's status code and reviewed ✓, the two columns both
 /// lists of the CHANGES open a row with.
-fn change_gutter(file: Option<&crate::git_diff::DiffFile>, reviewed: bool, th: Theme) -> Vec<Span<'static>> {
+fn change_gutter(
+    file: Option<&crate::git_diff::DiffFile>,
+    reviewed: bool,
+    th: Theme,
+) -> Vec<Span<'static>> {
     let status = match file {
         Some(file) => Span::styled(
             format!("{} ", file.status_str()),
@@ -3050,7 +3072,10 @@ fn graph_spans(graph: &str, under: bool, th: Theme) -> Vec<Span<'static>> {
                 '-' | '_' => '─',
                 other => other,
             };
-            Span::styled(glyph.to_string(), Style::default().fg(lanes[col / 2 % lanes.len()]))
+            Span::styled(
+                glyph.to_string(),
+                Style::default().fg(lanes[col / 2 % lanes.len()]),
+            )
         })
         .collect()
 }
@@ -3059,7 +3084,12 @@ fn graph_spans(graph: &str, under: bool, th: Theme) -> Vec<Span<'static>> {
 /// upstream (`↑` to push, `↓` to pull), its hash, refs and subject (the
 /// filter's matches lit, while it narrows the list) and who and when,
 /// dimmed; or under an unfolded commit, one of its files.
-fn log_row_spans(log: &crate::git_log::GitLog, i: usize, now: i64, th: Theme) -> Vec<Span<'static>> {
+fn log_row_spans(
+    log: &crate::git_log::GitLog,
+    i: usize,
+    now: i64,
+    th: Theme,
+) -> Vec<Span<'static>> {
     use crate::git_log::{Entry, RefKind, Side};
     let Some(r) = log.rows.get(i) else {
         return Vec::new();

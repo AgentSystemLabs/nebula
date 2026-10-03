@@ -647,7 +647,8 @@ pub fn split_rows(diff: &str) -> Option<Vec<SplitRow>> {
     }
     let mut rows = Vec::new();
     let (mut old, mut new) = (0u32, 0u32);
-    let (mut removed, mut added): (Vec<(u32, String)>, Vec<(u32, String)>) = (Vec::new(), Vec::new());
+    let mut removed: Vec<(u32, String)> = Vec::new();
+    let mut added: Vec<(u32, String)> = Vec::new();
     let flush = |rows: &mut Vec<SplitRow>, removed: &mut Vec<_>, added: &mut Vec<_>| {
         let n = removed.len().max(added.len());
         let mut left = removed.drain(..);
@@ -740,7 +741,11 @@ mod tests {
                 pair(Some((13, "tail")), Some((14, "tail")), false),
             ]
         );
-        assert_eq!(split_rows("commit abc\n\n    subject"), None, "no hunk: shown as it is");
+        assert_eq!(
+            split_rows("commit abc\n\n    subject"),
+            None,
+            "no hunk: shown as it is"
+        );
     }
 
     fn modified(path: &str) -> DiffFile {

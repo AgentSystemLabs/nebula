@@ -4189,7 +4189,11 @@ fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) {
                 crate::git_log::land_log(view, ticket, result);
             }
         }
-        Answer::CommitFiles { view: id, sha, result } => {
+        Answer::CommitFiles {
+            view: id,
+            sha,
+            result,
+        } => {
             if let Some(Overlay::Diff(view)) = &mut app.overlay {
                 crate::git_log::land_files(view, id, &sha, result);
             }
@@ -21210,7 +21214,10 @@ diff --git a/src/c.rs b/src/c.rs
             panic!("closed");
         };
         let log = v.log.as_ref().unwrap();
-        assert!(matches!(log.selected_entry(), Some(crate::git_log::Entry::File(..))));
+        assert!(matches!(
+            log.selected_entry(),
+            Some(crate::git_log::Entry::File(..))
+        ));
         assert!(v.diff.contains("-orig"), "{}", v.diff);
         assert!(v.diff.contains("+second"), "{}", v.diff);
 

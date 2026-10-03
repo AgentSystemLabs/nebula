@@ -1216,7 +1216,10 @@ impl DiffView {
         }
         let before = (self.place, self.side_cursor());
         let changes = self.row_count();
-        let graph = self.log.as_mut().filter(|l| l.rows.iter().any(|r| r.entry.selectable()));
+        let graph = self
+            .log
+            .as_mut()
+            .filter(|l| l.rows.iter().any(|r| r.entry.selectable()));
         if changes > 0 {
             self.place = Place::Changes;
         } else if let Some(log) = graph {
