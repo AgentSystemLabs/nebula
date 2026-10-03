@@ -14,7 +14,8 @@
 
 use super::{
     ago_badge, draw_focus_tint, draw_terminal, fit_ago, key_hint, render_button, row_rect,
-    status_color, status_dot, status_name_spans, sweep_ramp, truncate, PENDING_SESSION_BADGE,
+    status_color, status_dot, status_name_spans, sweep_ramp, truncate, HelpSection,
+    PENDING_SESSION_BADGE,
 };
 use crate::app::{App, Focus, HitTarget, SessionRow, WorktreeRow};
 use crate::keymap::Action;
@@ -95,8 +96,9 @@ fn column(f: &mut Frame, area: Rect, title: &str, count: usize, focused: bool, t
     }
 }
 
-/// A column's list: the `lines` from the one that keeps the `cursor`'s row
-/// on screen (`panels::scroll_to`), each row drawn by `row` as its spans
+/// A column's list: the `lines` from where the column is scrolled to
+/// (`panels::ColumnScroll`, which brings the `cursor`'s row back on screen
+/// when it moves), each row drawn by `row` as its spans
 /// and the color its selection rail takes. Registers each row, and each
 /// header that folds, as a `PanelsRow`, then the whole column as its
 /// `PanelBg`.
@@ -114,7 +116,7 @@ fn draw_list(
     let th = app.theme;
     let focused = app.focus == focus;
     let height = usize::from(list.height);
-    let top = crate::panels::scroll_to(lines, cursor, height);
+    let top = app.panels_scroll[crate::panels::scroll_slot(focus)].settle(lines, cursor, height);
     for (y, line) in lines.iter().skip(top).take(height).enumerate() {
         let Some(r) = row_rect(list, y) else {
             break;
@@ -142,6 +144,95 @@ fn draw_list(
         }
     }
     app.hits.push((area, HitTarget::PanelBg(focus)));
+}
+
+/// The `?` overlay's two columns while the PANELS are up: the keys the
+/// columns answer to, in place of the grid's cards and PROJECT TABS. Every
+/// chord is the live keymap's, as the grid's help is; the rows that read
+/// the selection — checkouts, GitHub, sessions — are the grid's own.
+pub(super) fn help_sections() -> (&'static [HelpSection], &'static [HelpSection]) {
+    use super::HelpKeys::{Act, Lit};
+    use Action::*;
+    const LEFT: &[HelpSection] = &[
+        (
+            "THE COLUMNS",
+            &[
+                (Act(&[FocusLeft, FocusRight]), "walk the three columns"),
+                (Act(&[FocusNext]), "next column, then the pane"),
+                (Act(&[MoveDown, MoveUp]), "walk the column's rows"),
+                (Act(&[HalfPageDown, HalfPageUp]), "half a page of rows"),
+                (Act(&[Activate]), "drill in; session: attach"),
+                (Act(&[FollowUp]), "session: follow-up modal"),
+                (Act(&[ToggleFullScreen]), "session full-screen / back"),
+                (Act(&[ToggleArchived]), "fold the ARCHIVED group"),
+                (Act(&[Palette]), "fuzzy jump to anything"),
+                (
+                    Act(&[NextAttention, PrevAttention, NextProjectTab, PrevProjectTab]),
+                    "next/prev session needing you",
+                ),
+                (
+                    Act(&[CloseProjectTab, ProjectDropdown]),
+                    "project tabs: none here",
+                ),
+                (Lit("click"), "select; again: Enter"),
+                (Lit("wheel"), "walk the column under it"),
+            ],
+        ),
+        (
+            "CHECKOUTS & GITHUB",
+            &[
+                (Act(&[OpenWorktree]), "open in editor (open command)"),
+                (Act(&[GitDiff]), "diff (^r reviewed, ^t tree)"),
+                (Act(&[OpenRepo]), "the repo on GitHub"),
+                (Act(&[OpenPullRequest, OpenIssue]), "PR / issue on GitHub"),
+                (Act(&[RefreshPullRequests]), "reload PRs + issues (GitHub)"),
+                (Act(&[Issues]), "issues: prompt, preset, edit"),
+                (Act(&[PullRequests]), "pull requests: read / launch"),
+                (Act(&[SwitchBranch]), "switch the ⌂ root's branch"),
+            ],
+        ),
+    ];
+    const RIGHT: &[HelpSection] = &[
+        (
+            "SESSIONS",
+            &[
+                (Act(&[QuickPrompt]), "quick prompt: Enter launches"),
+                (Act(&[New]), "new, per column"),
+                (Act(&[DuplicateSession]), "quick prompt as this session"),
+                (Act(&[AgentPresets]), "agent presets: saved launches"),
+                (
+                    Act(&[NewTerminal, OpenGhosttyTab]),
+                    "terminal: here / in Ghostty",
+                ),
+                (Act(&[Rename]), "rename the session"),
+                (Act(&[Archive, Unarchive]), "archive / unarchive"),
+                (Act(&[Delete, DeleteAll]), "delete one / delete all"),
+            ],
+        ),
+        (
+            "TERMINAL & MOUSE",
+            &[
+                (Act(&[Activate]), "lock input"),
+                (Act(&[UnlockTerminal]), "unlock, back to the column"),
+                (Lit("drag"), "select + copy (2×click: word)"),
+                (Lit("⌥click"), "open URL / file under cursor"),
+                (Lit("⇧drag"), "select via your terminal"),
+                (Lit("right-click"), "row menu: run, restart"),
+                (Lit("click outside"), "dismiss any modal (= Esc)"),
+            ],
+        ),
+        (
+            "GENERAL",
+            &[
+                (Lit("⇧ + letter"), "bigger, or outside nebula"),
+                (Act(&[Hosts]), "ssh hosts (a: new, d: del)"),
+                (Act(&[Settings]), "settings; Hotkeys tab rebinds"),
+                (Act(&[Metrics]), "memory: nebula + agents"),
+                (Act(&[Quit, Help]), "quit / toggle this help"),
+            ],
+        ),
+    ];
+    (LEFT, RIGHT)
 }
 
 /// PROJECTS: every project on the machine, the one last worked in first —

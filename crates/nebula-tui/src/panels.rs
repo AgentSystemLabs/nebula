@@ -18,7 +18,8 @@
 //! What lives here is what the layout adds: the columns' widths
 //! ([`columns`]), the lines each column lays out ([`project_lines`],
 //! [`worktree_lines`], [`session_lines`]) and the scroll that keeps the
-//! cursor's line on screen ([`scroll_to`]). The keys are
+//! cursor's line on screen ([`scroll_to`]) until the wheel moves it
+//! ([`ColumnScroll`]). The keys are
 //! `event_loop::panels`'s and the drawing `ui::panels_view`'s.
 
 use crate::app::{App, Focus, SessionRow, WorktreeRow};
@@ -302,6 +303,71 @@ pub fn scroll_to(lines: &[Line], cursor: Option<Row>, height: usize) -> usize {
     cursor
         .and_then(|c| lines.iter().position(|l| *l == Line::Row(c)))
         .map_or(0, |at| crate::app::window_start(at, height.max(1)))
+}
+
+/// Where the column FOCUS names keeps its scroll in `App::panels_scroll`.
+/// The pane has none and is never asked: it reads as the last column.
+pub fn scroll_slot(focus: Focus) -> usize {
+    match focus {
+        Focus::Projects => 0,
+        Focus::Worktrees => 1,
+        Focus::Sessions | Focus::Terminal => 2,
+    }
+}
+
+/// One column's scroll: the first line drawn, which the wheel moves under
+/// a cursor that stays put and the cursor's own moves bring back on
+/// screen. The columns lay out and clamp it each frame ([`settle`]); the
+/// wheel (`event_loop::panels::wheel`) reads what that left in `max`.
+///
+/// [`settle`]: ColumnScroll::settle
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ColumnScroll {
+    /// The first line drawn.
+    pub top: usize,
+    /// Furthest `top` goes: the last line on the bottom row, zero for a
+    /// column that fits.
+    pub max: usize,
+    /// The cursor and line count the last frame drew; a frame that finds
+    /// either changed reveals the cursor again. `None` is "reveal it".
+    seen: Option<(Option<Row>, usize)>,
+}
+
+impl ColumnScroll {
+    /// The first line to draw for `lines` in a column `height` rows tall:
+    /// `top` held within the column, and slid only as far as the cursor's
+    /// line needs ([`scroll_to`]) when the cursor — or what the column
+    /// lists — is not what the last frame drew, so a wheeled-away cursor
+    /// stays away until it moves.
+    pub fn settle(&mut self, lines: &[Line], cursor: Option<Row>, height: usize) -> usize {
+        let height = height.max(1);
+        self.max = lines.len().saturating_sub(height);
+        if self.seen != Some((cursor, lines.len())) {
+            self.seen = Some((cursor, lines.len()));
+            let at = cursor.and_then(|c| lines.iter().position(|l| *l == Line::Row(c)));
+            match at {
+                Some(at) if at < self.top => self.top = at,
+                Some(at) if at >= self.top + height => self.top = scroll_to(lines, cursor, height),
+                _ => {}
+            }
+        }
+        self.top = self.top.min(self.max);
+        self.top
+    }
+
+    /// A notch of the wheel: `delta` lines, held at the column's ends. False
+    /// when the column fits, or is already at that end, and nothing moved.
+    pub fn wheel(&mut self, delta: isize) -> bool {
+        let next = self.top.saturating_add_signed(delta).min(self.max);
+        std::mem::replace(&mut self.top, next) != next
+    }
+
+    /// The next frame reveals the cursor, whether or not it moved: what a
+    /// key that walks the column asks for, so one pressed at the column's
+    /// end still brings a wheeled-away cursor back.
+    pub fn reveal_next(&mut self) {
+        self.seen = None;
+    }
 }
 
 /// The newest finish under `worktree` is still a ONE-SHOT SWEEP's worth

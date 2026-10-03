@@ -3300,6 +3300,11 @@ pub struct App {
     /// on the same rows with the same session attached. What a frame
     /// draws is [`App::panels_active`].
     pub panels: bool,
+    /// The PANELS' columns' scroll — PROJECTS, WORKTREES, SESSIONS, in
+    /// that order ([`crate::panels::ColumnScroll`]): the wheel moves a
+    /// column under its cursor, which stays put, and a move of the
+    /// cursor brings it back on screen. Drawn by `ui::panels_view`.
+    pub panels_scroll: [crate::panels::ColumnScroll; 3],
     /// Every BAND is laid out open at once — its cards wrapped into rows,
     /// or every entry of the LIST listed — and there is no ACCORDION:
     /// Settings → Appearance → **Expand all worktrees**
@@ -3874,6 +3879,7 @@ impl App {
             launcher_pane_at: crate::launcher::PaneSide::default(),
             launcher_list: false,
             panels: false,
+            panels_scroll: Default::default(),
             launcher_all_open: false,
             launcher_pane_hidden: false,
             launcher_expanded: None,

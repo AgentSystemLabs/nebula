@@ -9870,6 +9870,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 launcher::wheel_grid(app, up);
                 return;
             }
+            // The PANELS' columns: a notch scrolls the column under it.
+            if app.panels_active() && !app.collapsed && panels::wheel(app, over.as_ref(), up) {
+                return;
+            }
             let in_term = matches!(over, Some(HitTarget::TerminalPane)) || app.collapsed;
             if in_term && app.reading_url().is_some() {
                 // The pane is showing a pull request or an issue, not a

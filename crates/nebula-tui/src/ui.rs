@@ -182,6 +182,12 @@ const CONFIRM_MIN_W: u16 = 52;
 const HELP_W: u16 = 92;
 /// The help overlay's key column: chords past it are dropped whole.
 const HELP_KEY_W: usize = 14;
+/// What a help entry shows in the key column, and one titled group of them.
+enum HelpKeys {
+    Lit(&'static str),
+    Act(&'static [crate::keymap::Action]),
+}
+type HelpSection = (&'static str, &'static [(HelpKeys, &'static str)]);
 const SETTINGS_W: u16 = 84;
 const MEMORY_W: u16 = 74;
 const HOSTS_W: u16 = 64;
@@ -961,12 +967,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // are for keys that belong to an overlay rather than the
             // grid, which is why they aren't rebindable.
             use crate::keymap::Action::*;
-            enum HelpKeys {
-                Lit(&'static str),
-                Act(&'static [crate::keymap::Action]),
-            }
             use HelpKeys::{Act, Lit};
-            type HelpSection = (&'static str, &'static [(HelpKeys, &'static str)]);
             const LEFT: &[HelpSection] = &[
                 (
                     "NAVIGATE & SEARCH",
@@ -1075,6 +1076,13 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     ],
                 ),
             ];
+            // The PANELS have their own keys to teach: the grid's cards,
+            // project tabs and pane fold are not drawn there.
+            let (left, right) = if app.panels_active() {
+                panels_view::help_sections()
+            } else {
+                (LEFT, RIGHT)
+            };
             // What to print in the key column: a literal, or every chord
             // each action currently answers to but the ⌘ aliases
             // (`Keymap::shown_chords`).
@@ -1117,7 +1125,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     .sum::<u16>()
                     + sections.len().saturating_sub(1) as u16
             };
-            let height = rows(LEFT).max(rows(RIGHT)) + 2;
+            let height = rows(left).max(rows(right)) + 2;
             let area = centered_rect(f.area(), HELP_W, height);
             f.render_widget(Clear, area);
             let block = Block::default()
@@ -1160,8 +1168,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 }
                 lines
             };
-            f.render_widget(Paragraph::new(column(LEFT, left_a.width)), left_a);
-            f.render_widget(Paragraph::new(column(RIGHT, right_a.width)), right_a);
+            f.render_widget(Paragraph::new(column(left, left_a.width)), left_a);
+            f.render_widget(Paragraph::new(column(right, right_a.width)), right_a);
             // Record the drawn area for click hit-testing.
             if let Some(Overlay::Help(h)) = &mut app.overlay {
                 h.area = area;

@@ -139,6 +139,7 @@ PROJECTS column lists every project and stands in for the PROJECT TABS.
 | `]` / `[` | the attention walk, as `.` / `,` |
 | `x`, `1`–`9`, `+`, `` ` ``, `` ^` `` | grid-only — the PROJECT TABS, the pane's terminal strip and its fold have nothing to act on here, and the footer says so |
 | click | a row selects it and its column takes the keys, a second click is `Enter` on it; a click on a group header (`OPEN PRS`, `ISSUES`, `ARCHIVED`) folds it; a click on the pane steps into it |
+| wheel | over a column longer than the screen: scroll it under the cursor, which stays put; the next key that moves the cursor brings it back on screen. `?` lists the panels' keys while they are up |
 
 ## Chips and readouts
 

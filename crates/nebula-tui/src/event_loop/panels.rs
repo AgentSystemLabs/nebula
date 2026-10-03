@@ -5,13 +5,14 @@
 //! (`move_selection`), Enter into the pane, and every verb that reads the
 //! selection — so this module only takes the keys the GRID owns and gives
 //! them their panel meaning, or a word saying they have none here
-//! ([`handle_action`]), and translates a click on a row ([`click_row`]).
+//! ([`handle_action`]), and translates a click on a row ([`click_row`]) or
+//! a notch of the wheel over a column ([`wheel`]).
 
 use super::{
     activate, attach_selected, is_double_click, jump_attention, launcher, select_project_row,
     select_session_row, select_worktree_row, toggle_issues, toggle_open_prs, zoom_pane,
 };
-use crate::app::{App, Focus, RowKey};
+use crate::app::{App, Focus, HitTarget, RowKey};
 use crate::keymap::Action;
 use crate::panels::Row;
 use nebula_core::ClientRequest;
@@ -47,6 +48,12 @@ const NOTHING_TO_FULL_SCREEN: &str = "no session in the pane — j/k onto one, t
 /// * The PROJECT TAB keys, the pane fold and the pane's terminal strip
 ///   have nothing to act on here, and say so.
 pub(super) fn handle_action(app: &mut App, action: Action, out: &mut Vec<ClientRequest>) -> bool {
+    // Whatever the key does, the focused column reveals its cursor again:
+    // the walk that follows a wheel brings the cursor back on screen even
+    // from the column's end, where it has nowhere to move to.
+    if app.focus != Focus::Terminal {
+        app.panels_scroll[crate::panels::scroll_slot(app.focus)].reveal_next();
+    }
     match action {
         Action::FollowUp => {
             if app.focus == Focus::Sessions {
@@ -176,6 +183,32 @@ pub(super) fn click_row(app: &mut App, row: Row, out: &mut Vec<ClientRequest>) {
             }
         }
     }
+}
+
+/// Lines a notch of the wheel scrolls a PANELS column: a third of the
+/// GRID's card, as `launcher::GRID_WHEEL_ROWS`.
+const WHEEL_LINES: isize = 3;
+
+/// A notch of the wheel over a PANELS column — a row, a group header or
+/// the air under them — scrolls that column a few lines under a cursor
+/// that stays put (`ColumnScroll::wheel`): the pane keeps reading the
+/// session it was on, so a trackpad never swaps it out from under you,
+/// and nothing here moves a cursor, FOCUS or sends a request. The scroll
+/// is held at the column's ends, and a column that fits moves nothing.
+/// The next key that walks the column brings its cursor back on screen
+/// (`handle_action`). True when the pointer was over a column; over the
+/// pane it is not, and falls through to the pane's own.
+pub(super) fn wheel(app: &mut App, over: Option<&HitTarget>, up: bool) -> bool {
+    let focus = match over {
+        Some(HitTarget::PanelsRow(row)) => row.focus(),
+        Some(HitTarget::PanelBg(focus)) => *focus,
+        _ => return false,
+    };
+    let delta = if up { -WHEEL_LINES } else { WHEEL_LINES };
+    if app.panels_scroll[crate::panels::scroll_slot(focus)].wheel(delta) {
+        app.dirty = true;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -504,5 +537,243 @@ mod tests {
             "{text}"
         );
         assert_eq!(app.selected_worktree().map(|w| w.id.clone()), worktree);
+    }
+
+    /// One wheel notch with the pointer on the middle of `target`'s rect.
+    fn wheel_at(
+        app: &mut App,
+        target: HitTarget,
+        kind: MouseEventKind,
+        out: &mut Vec<ClientRequest>,
+    ) {
+        let rect = app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == target)
+            .map(|(r, _)| *r)
+            .unwrap_or_else(|| panic!("{target:?} is not on screen"));
+        handle_mouse(
+            app,
+            MouseEvent {
+                kind,
+                column: rect.x + 2,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            out,
+        );
+    }
+
+    /// `demo`'s root with `n` more sessions, so SESSIONS outgrows its
+    /// column; the cursor on the first row.
+    fn long_sessions(app: &mut App, n: usize) {
+        let root = app.selected_worktree().map(|w| w.id.clone()).unwrap();
+        for i in 0..n {
+            let more = Agent {
+                id: AgentId(format!("long{i}")),
+                name: format!("long-{i}"),
+                worktree_id: root.clone(),
+                ..app.tree.agents[0].clone()
+            };
+            hse(
+                app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(more),
+                },
+            );
+        }
+        app.sel_project = 0;
+        app.sel_worktree = 0;
+        app.sel_session = 0;
+    }
+
+    fn on_screen(app: &App, row: Row) -> bool {
+        app.hits
+            .iter()
+            .any(|(_, h)| *h == HitTarget::PanelsRow(row))
+    }
+
+    /// A notch over a column taller than its height scrolls it under the
+    /// cursor: no cursor, FOCUS or request moves.
+    #[test]
+    fn the_wheel_scrolls_a_long_column_under_its_cursor() {
+        let mut app = panels_app();
+        let mut out = Vec::new();
+        long_sessions(&mut app, 40);
+        app.focus = Focus::Terminal;
+        draw(&mut app);
+        assert!(on_screen(&app, Row::Session(0)));
+        let cursors = (app.sel_project, app.sel_worktree, app.sel_session);
+        wheel_at(
+            &mut app,
+            HitTarget::PanelsRow(Row::Session(0)),
+            MouseEventKind::ScrollDown,
+            &mut out,
+        );
+        assert_eq!(app.panels_scroll[2].top, 3, "three lines a notch");
+        assert_eq!(
+            cursors,
+            (app.sel_project, app.sel_worktree, app.sel_session)
+        );
+        assert_eq!(app.focus, Focus::Terminal, "FOCUS stays");
+        assert!(out.is_empty(), "no attach: {out:?}");
+        draw(&mut app);
+        assert!(!on_screen(&app, Row::Session(0)), "the window moved");
+        assert!(on_screen(&app, Row::Session(5)));
+        wheel_at(
+            &mut app,
+            HitTarget::PanelBg(Focus::Sessions),
+            MouseEventKind::ScrollUp,
+            &mut out,
+        );
+        assert_eq!(app.panels_scroll[2].top, 0, "a notch up scrolls back");
+        assert_eq!(app.panels_scroll[0].top + app.panels_scroll[1].top, 0);
+    }
+
+    /// A column that fits its height moves nothing.
+    #[test]
+    fn the_wheel_moves_nothing_in_a_column_that_fits() {
+        let mut app = panels_app();
+        let mut out = Vec::new();
+        draw(&mut app);
+        let before = app.panels_scroll;
+        for focus in [Focus::Projects, Focus::Worktrees, Focus::Sessions] {
+            wheel_at(
+                &mut app,
+                HitTarget::PanelBg(focus),
+                MouseEventKind::ScrollDown,
+                &mut out,
+            );
+        }
+        assert_eq!(before, app.panels_scroll);
+        assert!(out.is_empty());
+    }
+
+    /// The scroll holds at the column's first line and at the one that
+    /// puts the last line on the bottom row.
+    #[test]
+    fn the_wheel_holds_at_both_ends() {
+        let mut app = panels_app();
+        let mut out = Vec::new();
+        long_sessions(&mut app, 40);
+        draw(&mut app);
+        let at = HitTarget::PanelBg(Focus::Sessions);
+        wheel_at(&mut app, at.clone(), MouseEventKind::ScrollUp, &mut out);
+        assert_eq!(app.panels_scroll[2].top, 0, "held at the top");
+        for _ in 0..100 {
+            wheel_at(&mut app, at.clone(), MouseEventKind::ScrollDown, &mut out);
+        }
+        let max = app.panels_scroll[2].max;
+        assert!(max > 0, "the column is longer than it is tall");
+        assert_eq!(app.panels_scroll[2].top, max, "held at the bottom");
+        draw(&mut app);
+        assert!(on_screen(&app, Row::Session(40)), "the last row shows");
+    }
+
+    /// With the cursor's row wheeled off screen, the next `j` or `k` in the
+    /// column brings it back — even a `k` on the first row, which has
+    /// nowhere to go.
+    #[test]
+    fn a_walk_after_the_wheel_brings_the_cursor_back() {
+        let mut app = panels_app();
+        let mut out = Vec::new();
+        long_sessions(&mut app, 40);
+        app.focus = Focus::Sessions;
+        draw(&mut app);
+        let at = HitTarget::PanelBg(Focus::Sessions);
+        for _ in 0..4 {
+            wheel_at(&mut app, at.clone(), MouseEventKind::ScrollDown, &mut out);
+        }
+        draw(&mut app);
+        assert!(!on_screen(&app, Row::Session(0)), "wheeled away");
+        key(&mut app, 'k', &mut out);
+        assert_eq!(app.sel_session, 0);
+        draw(&mut app);
+        assert!(on_screen(&app, Row::Session(0)), "k at the top: back");
+        for _ in 0..100 {
+            wheel_at(&mut app, at.clone(), MouseEventKind::ScrollDown, &mut out);
+        }
+        draw(&mut app);
+        assert!(!on_screen(&app, Row::Session(0)));
+        key(&mut app, 'j', &mut out);
+        assert_eq!(app.sel_session, 1);
+        draw(&mut app);
+        assert!(on_screen(&app, Row::Session(1)), "j: back on the cursor");
+    }
+
+    /// Over the pane the wheel is the pane's: no column's cursor moves and
+    /// FOCUS stays where it was.
+    #[test]
+    fn the_wheel_over_the_pane_leaves_the_columns_alone() {
+        let mut app = panels_app();
+        let mut out = Vec::new();
+        app.focus = Focus::Terminal;
+        let before = (app.sel_project, app.sel_worktree, app.sel_session);
+        draw(&mut app);
+        wheel_at(
+            &mut app,
+            HitTarget::TerminalPane,
+            MouseEventKind::ScrollDown,
+            &mut out,
+        );
+        assert_eq!(before, (app.sel_project, app.sel_worktree, app.sel_session));
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    /// `?` beside the columns teaches the columns' keys, not the grid's
+    /// cards and project tabs.
+    #[test]
+    fn question_mark_in_the_panels_describes_the_panels() {
+        let mut app = panels_app();
+        let mut out = Vec::new();
+        app.focus = Focus::Sessions;
+        draw(&mut app);
+        key(&mut app, '?', &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Help(_))),
+            "{:?}",
+            app.overlay
+        );
+        let (_, text) = draw(&mut app);
+        for want in [
+            "THE COLUMNS",
+            "walk the three columns",
+            "session: follow-up modal",
+            "fold the ARCHIVED group",
+            "project tabs: none here",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        for gone in [
+            "NAVIGATE & SEARCH",
+            "walk the cards",
+            "fold / unfold the pane",
+        ] {
+            assert!(!text.contains(gone), "{gone}: {text}");
+        }
+    }
+
+    /// With the grid up `?` is what it always was.
+    #[test]
+    fn question_mark_in_the_grid_is_unchanged() {
+        let mut app = panels_app();
+        app.panels = false;
+        let mut out = Vec::new();
+        draw(&mut app);
+        key(&mut app, '?', &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Help(_))),
+            "{:?}",
+            app.overlay
+        );
+        let (_, text) = draw(&mut app);
+        for want in [
+            "NAVIGATE & SEARCH",
+            "walk the cards",
+            "fold / unfold the pane",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        assert!(!text.contains("THE COLUMNS"), "{text}");
     }
 }
