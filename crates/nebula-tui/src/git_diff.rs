@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 /// Keep pathological diffs from bloating the overlay state.
-const MAX_DIFF_LINES: usize = 20_000;
+pub(crate) const MAX_DIFF_LINES: usize = 20_000;
 
 /// One changed file from `git status --porcelain=v1 -z`.
 #[derive(Debug, Clone, PartialEq)]
@@ -311,10 +311,28 @@ pub fn head_oid(root: &Path) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Diff text for one file. Never fails: errors become the displayed text so
-/// the modal survives a repo vanishing out from under it.
-pub fn diff_for(root: &Path, file: &DiffFile, head_ok: bool) -> String {
-    let output = if file.is_untracked() {
+/// Diff text for one file: its uncommitted changes, or (given a commit)
+/// what that commit changed in it against its first parent. Never fails:
+/// errors become the displayed text so the modal survives a repo vanishing
+/// out from under it.
+pub fn diff_for(root: &Path, file: &DiffFile, head_ok: bool, commit: Option<&str>) -> String {
+    let output = if let Some(sha) = commit {
+        let mut args = vec![
+            "show",
+            "--format=",
+            "--no-color",
+            "--no-ext-diff",
+            "-M",
+            "--diff-merges=first-parent",
+            sha,
+            "--",
+            &file.path,
+        ];
+        if let Some(orig) = &file.orig_path {
+            args.push(orig);
+        }
+        run_git(root, &args)
+    } else if file.is_untracked() {
         // --no-index exits 1 when the files differ; only >= 2 is an error.
         run_git(
             root,
@@ -387,7 +405,7 @@ pub fn read_listing(root: &Path) -> Result<crate::view_jobs::DiffListing, String
         .iter()
         .filter_map(|file| {
             let mark = *stored.get(&file.path)?;
-            let diff = diff_for(root, file, head.is_some());
+            let diff = diff_for(root, file, head.is_some(), None);
             (crate::review::fingerprint(&diff) == mark).then(|| (file.path.clone(), mark))
         })
         .collect();
@@ -451,6 +469,41 @@ pub fn fill_view(view: &mut DiffView, listing: crate::view_jobs::DiffListing) {
     }
 }
 
+/// Ask for the checkout's changed files, off the loop when the view can.
+/// Read inline (a view with no BACKGROUND READS) they land at once, and
+/// `Err` is the reason they could not be read.
+pub fn request_listing(view: &mut DiffView) -> Result<(), String> {
+    let ticket = crate::view_jobs::ticket();
+    view.listing = Some(ticket);
+    let root = view.root.clone();
+    match view.jobs.clone() {
+        Some(jobs) => {
+            jobs.run(move || {
+                Some(crate::view_jobs::Answer::DiffListing {
+                    ticket,
+                    result: read_listing(&root),
+                })
+            });
+            Ok(())
+        }
+        None => take_listing(view, read_listing(&root)),
+    }
+}
+
+/// The changed files landed: fill the view, and put a cursor nobody has
+/// moved yet on the first of them, or on HEAD's commit when there are
+/// none. `Err` is git's refusal, for the caller to close the modal with.
+pub fn take_listing(
+    view: &mut DiffView,
+    result: Result<crate::view_jobs::DiffListing, String>,
+) -> Result<(), String> {
+    fill_view(view, result?);
+    if view.settle() {
+        load_selected_diff(view);
+    }
+    Ok(())
+}
+
 /// Reload `view.diff` for the currently selected file and reset the scroll.
 /// A view whose diffs were fetched whole (a pull request) reads them out of
 /// `prefetched` instead of shelling out — there is no local commit to ask
@@ -466,6 +519,9 @@ pub fn fill_view(view: &mut DiffView, listing: crate::view_jobs::DiffListing) {
 /// longer than a diff takes; past that the pane says `loading…`. Either way
 /// the answer comes back through [`land_diff`].
 pub fn load_selected_diff(view: &mut DiffView) {
+    if view.place != crate::app::Place::Changes {
+        return crate::git_log::load_selected(view);
+    }
     view.waiting = None;
     let Some(file) = view.selected_file().cloned() else {
         let summary = view.dir_summary().unwrap_or_default();
@@ -481,7 +537,7 @@ pub fn load_selected_diff(view: &mut DiffView) {
         return;
     }
     let Some(jobs) = view.jobs.clone() else {
-        let diff = diff_for(&view.root, &file, view.head_ok);
+        let diff = diff_for(&view.root, &file, view.head_ok, None);
         view.show_diff(Some(&file.path), diff, false);
         return;
     };
@@ -505,7 +561,7 @@ fn request_diff(
         Some(crate::view_jobs::Answer::DiffText {
             view: id,
             ticket,
-            diff: diff_for(&root, &file, head_ok),
+            diff: diff_for(&root, &file, head_ok, None),
             path: file.path,
             prefetch,
         })
@@ -542,6 +598,9 @@ pub fn land_diff(
     if !(same_file && view.diff == diff) {
         view.show_diff(Some(path), diff, same_file);
     }
+    if view.place != crate::app::Place::Changes {
+        return crate::git_log::read_ahead(view);
+    }
     let next = view
         .file_after_cursor()
         .filter(|file| view.cached(&file.path).is_none())
@@ -554,17 +613,135 @@ pub fn land_diff(
 /// The diff in flight has outlasted the grace the last file's text was kept
 /// for: say so, rather than leave one file's diff under another's name.
 pub fn diff_slow(view: &mut DiffView, ticket: u64) {
-    if view.waiting == Some(ticket)
-        && view.shown.as_deref() != view.selected_file().map(|f| f.path.as_str())
-    {
+    if view.waiting == Some(ticket) && view.shown != view.selected_key() {
         view.show_diff(None, "loading…".to_string(), false);
     }
+}
+
+/// One row of a diff laid out side by side: the old file left, the new
+/// one right.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SplitRow {
+    /// A hunk header, or a line about the file (a rename, a mode change),
+    /// across both sides.
+    Note(String, DiffLineKind),
+    /// A line of each side, numbered; `None` is a side with nothing facing
+    /// the other's added or removed line. `changed` sets a removed line
+    /// against its replacement, rather than one line both sides share.
+    Pair {
+        left: Option<(u32, String)>,
+        right: Option<(u32, String)>,
+        changed: bool,
+    },
+}
+
+/// A unified diff laid out side by side: context lines face themselves,
+/// and each run of removed lines faces the added lines that follow it, row
+/// by row. The `diff --git` / `index` / `---` / `+++` headers say nothing
+/// the pane's title does not, and are dropped. `None` for text with no
+/// hunk in it (a commit's summary, a status, an error), which is shown as
+/// it is.
+pub fn split_rows(diff: &str) -> Option<Vec<SplitRow>> {
+    if !diff.lines().any(|l| l.starts_with("@@")) {
+        return None;
+    }
+    let mut rows = Vec::new();
+    let (mut old, mut new) = (0u32, 0u32);
+    let (mut removed, mut added): (Vec<(u32, String)>, Vec<(u32, String)>) = (Vec::new(), Vec::new());
+    let flush = |rows: &mut Vec<SplitRow>, removed: &mut Vec<_>, added: &mut Vec<_>| {
+        let n = removed.len().max(added.len());
+        let mut left = removed.drain(..);
+        let mut right = added.drain(..);
+        for _ in 0..n {
+            rows.push(SplitRow::Pair {
+                left: left.next(),
+                right: right.next(),
+                changed: true,
+            });
+        }
+    };
+    let mut in_hunk = false;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("@@") {
+            flush(&mut rows, &mut removed, &mut added);
+            // `@@ -12,7 +12,8 @@ fn context`: where each side picks up.
+            let mut starts = rest.split_whitespace().take(2).map(|r| {
+                r.get(1..)
+                    .and_then(|r| r.split(',').next())
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .unwrap_or(1)
+            });
+            old = starts.next().unwrap_or(1);
+            new = starts.next().unwrap_or(1);
+            rows.push(SplitRow::Note(line.to_string(), DiffLineKind::Hunk));
+            in_hunk = true;
+        } else if line.starts_with("diff --git") {
+            flush(&mut rows, &mut removed, &mut added);
+            in_hunk = false;
+        } else if !in_hunk {
+            const DROPPED: [&str; 3] = ["index ", "--- ", "+++ "];
+            if !DROPPED.iter().any(|d| line.starts_with(d)) {
+                rows.push(SplitRow::Note(line.to_string(), DiffLineKind::Header));
+            }
+        } else if let Some(text) = line.strip_prefix('-') {
+            removed.push((old, text.to_string()));
+            old += 1;
+        } else if let Some(text) = line.strip_prefix('+') {
+            added.push((new, text.to_string()));
+            new += 1;
+        } else if line.starts_with('\\') {
+            // `\ No newline at end of file`
+            flush(&mut rows, &mut removed, &mut added);
+            rows.push(SplitRow::Note(line.to_string(), DiffLineKind::Header));
+        } else {
+            flush(&mut rows, &mut removed, &mut added);
+            let text = line.strip_prefix(' ').unwrap_or(line).to_string();
+            rows.push(SplitRow::Pair {
+                left: Some((old, text.clone())),
+                right: Some((new, text)),
+                changed: false,
+            });
+            old += 1;
+            new += 1;
+        }
+    }
+    flush(&mut rows, &mut removed, &mut added);
+    Some(rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Removed lines face the added lines after them, numbered from the
+    /// hunk header; context faces itself; the file headers are dropped and
+    /// a mode line is kept.
+    #[test]
+    fn split_rows_pairs_removals_with_the_additions_after_them() {
+        let diff = "diff --git a/x b/x\nold mode 100644\nnew mode 100755\nindex 1..2\n--- a/x\n+++ b/x\n\
+                    @@ -10,4 +10,5 @@ fn f\n keep\n-gone one\n-gone two\n+new one\n+new two\n+new three\n tail\n";
+        let rows = split_rows(diff).unwrap();
+        let pair = |l: Option<(u32, &str)>, r: Option<(u32, &str)>, changed| SplitRow::Pair {
+            left: l.map(|(n, t)| (n, t.to_string())),
+            right: r.map(|(n, t)| (n, t.to_string())),
+            changed,
+        };
+        assert_eq!(
+            rows,
+            vec![
+                SplitRow::Note("old mode 100644".into(), DiffLineKind::Header),
+                SplitRow::Note("new mode 100755".into(), DiffLineKind::Header),
+                SplitRow::Note("@@ -10,4 +10,5 @@ fn f".into(), DiffLineKind::Hunk),
+                pair(Some((10, "keep")), Some((10, "keep")), false),
+                pair(Some((11, "gone one")), Some((11, "new one")), true),
+                pair(Some((12, "gone two")), Some((12, "new two")), true),
+                pair(None, Some((13, "new three")), true),
+                pair(Some((13, "tail")), Some((14, "tail")), false),
+            ]
+        );
+        assert_eq!(split_rows("commit abc\n\n    subject"), None, "no hunk: shown as it is");
+    }
 
     fn modified(path: &str) -> DiffFile {
         DiffFile {
@@ -794,11 +971,11 @@ mod tests {
         assert!(fresh.is_untracked());
 
         assert!(has_head(&repo));
-        let diff = diff_for(&repo, tracked, true);
+        let diff = diff_for(&repo, tracked, true, None);
         assert!(diff.contains("-old line"), "{diff}");
         assert!(diff.contains("+new line"), "{diff}");
         // Untracked goes through the --no-index exit-1 path.
-        let diff = diff_for(&repo, fresh, true);
+        let diff = diff_for(&repo, fresh, true, None);
         assert!(diff.contains("+hello"), "{diff}");
     }
 
@@ -847,7 +1024,7 @@ mod tests {
         let files = changed_files(&repo).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].is_untracked());
-        let diff = diff_for(&repo, &files[0], false);
+        let diff = diff_for(&repo, &files[0], false, None);
         assert!(diff.contains("+content"), "{diff}");
     }
 

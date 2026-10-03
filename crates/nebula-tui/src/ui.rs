@@ -1684,36 +1684,30 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Diff(view) => {
+            use crate::app::Place;
             let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
             f.render_widget(Clear, area);
             // Cap first, floor second: on a tiny screen the file list keeps
             // its minimum and SPLIT_PANE_LAYOUT_MIN squeezes the diff pane
             // instead.
-            let files_w = view
-                .files_width
-                .min(area.width.saturating_sub(crate::app::MIN_DIFF_PANE_W))
-                .max(crate::app::MIN_DIFF_FILES_W);
+            let files_w = match view.files_width {
+                0 => area.width / crate::app::DIFF_SIDEBAR_SHARE,
+                width => width,
+            }
+            .min(area.width.saturating_sub(crate::app::MIN_DIFF_PANE_W))
+            .max(crate::app::MIN_DIFF_FILES_W);
             let [files_a, diff_a] = Layout::horizontal([
                 Constraint::Length(files_w),
                 Constraint::Min(SPLIT_PANE_LAYOUT_MIN),
             ])
             .areas(area);
 
-            // Left: changed-file list — flat paths, or the directory tree
-            // (`Ctrl+t`); a stateless follow-window keeps the selected row
-            // visible.
-            let mut files_title = if view.listing.is_some() && view.files.is_empty() {
-                "Files (…)".to_string()
-            } else if view.filter.is_empty() {
-                format!("Files ({})", view.files.len())
-            } else {
-                format!("Files ({}/{})", view.matches.len(), view.files.len())
-            };
-            if !view.reviewed.is_empty() {
-                files_title.push_str(&format!(" · {}✓", view.reviewed.len()));
-            }
+            // Left: the SOURCE CONTROL sidebar, the CHANGES (flat paths, or
+            // the directory tree, `Ctrl+t`) over the GRAPH (`git_log`),
+            // each under a header that folds it; a stateless follow-window
+            // keeps the cursor's row visible.
             // The hint names the list `Ctrl+t` leads to, not the one up.
-            let block = panel_block(&files_title, true, th).title_bottom(Line::from(Span::styled(
+            let block = panel_block("Source control", true, th).title_bottom(Line::from(Span::styled(
                 if view.tree.is_some() {
                     " ^t: flat list "
                 } else {
@@ -1730,148 +1724,114 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 f.render_widget(Paragraph::new(line), filter_area);
             }
             let list_inner = below_first_row(files_inner);
-
-            if view.listing.is_some() && view.files.is_empty() {
-                empty_list_row(f, list_inner, "reading changes…", th);
-            } else if view.row_count() == 0 {
-                empty_list_row(f, list_inner, NO_MATCHES, th);
-            }
             let start = view.window_start(list_inner.height as usize);
-            // Both lists open a row the same way: the status code, then the
-            // ✓ — so the two columns read straight down whichever is up.
-            let gutter = |file: Option<&crate::git_diff::DiffFile>, reviewed: bool| {
-                let status = match file {
-                    Some(file) => Span::styled(
-                        format!("{} ", file.status_str()),
-                        Style::default().fg(match (file.xy[0], file.xy[1]) {
-                            ('?', '?') | ('A', _) => th.ok,
-                            ('D', _) | (_, 'D') => th.err,
-                            ('R', _) | ('C', _) => th.accent,
-                            _ => th.warn,
-                        }),
-                    ),
-                    None => Span::raw("   "),
+            let cursor = view.side_cursor();
+            let done = view
+                .tree
+                .as_ref()
+                .map(|tree| tree.reviewed_nodes(&view.files, &view.reviewed));
+            let now = crate::app::now_ms();
+            for (row, index) in (start..view.side_len()).enumerate() {
+                let Some(row_area) = row_rect(list_inner, row) else {
+                    break;
                 };
-                let mark = if reviewed {
-                    Span::styled("✓ ", Style::default().fg(th.ok))
-                } else {
-                    Span::raw("  ")
+                let Some((place, i)) = view.side_row(index) else {
+                    break;
                 };
-                vec![status, mark]
-            };
-            match &view.tree {
-                None => {
-                    for (row, (i, m)) in view.matches.iter().enumerate().skip(start).enumerate() {
-                        let Some(row_area) = row_rect(list_inner, row) else {
-                            break;
-                        };
-                        let file = &view.files[m.file];
-                        let budget = (list_inner.width as usize).saturating_sub(5);
-                        let mut spans = gutter(Some(file), view.reviewed.contains_key(&file.path));
-                        let shown = truncate(&file.path, budget);
-                        let used = shown.chars().count();
-                        spans.extend(fuzzy_highlight_spans(&shown, &m.positions, th));
-                        if let Some(orig) = &file.orig_path {
-                            let rest = budget.saturating_sub(used);
-                            if rest > 3 {
-                                spans.push(Span::styled(
-                                    truncate(&format!(" ← {orig}"), rest),
-                                    Style::default().fg(th.dim),
-                                ));
-                            }
-                        }
-                        render_row(f, row_area, spans, i == view.selected, true, th);
+                let mut spans = match place {
+                    Place::ChangesHeader => changes_header_spans(&view, th),
+                    Place::GraphHeader => graph_header_spans(&view, th),
+                    _ => vec![Span::raw("  ")],
+                };
+                match (place, &view.log) {
+                    (Place::Changes, _) => {
+                        let width = list_inner.width.saturating_sub(2);
+                        spans.extend(change_row_spans(&view, i, done.as_deref(), width, th));
                     }
+                    (Place::Graph, Some(log)) => spans.extend(log_row_spans(log, i, now, th)),
+                    _ => {}
                 }
-                // The TREE BROWSER's rows behind the flat list's gutter: a
-                // directory wears the fold marker and the accent, and its ✓
-                // once every file under it has one.
-                Some(tree) => {
-                    let done = tree.reviewed_nodes(&view.files, &view.reviewed);
-                    for (row, (i, r)) in tree.rows.iter().enumerate().skip(start).enumerate() {
-                        let Some(row_area) = row_rect(list_inner, row) else {
-                            break;
-                        };
-                        let node = &tree.nodes[r.node];
-                        let file = tree.file_of[r.node].map(|f| &view.files[f]);
-                        let indent = "  ".repeat(node.depth);
-                        let marker = if !node.is_dir {
-                            "  "
-                        } else if tree.is_open(r.node, !view.filter.is_empty()) {
-                            "▾ "
-                        } else {
-                            "▸ "
-                        };
-                        let budget = (list_inner.width as usize)
-                            .saturating_sub(5 + indent.chars().count() + 2);
-                        let shown = truncate(&node.name, budget);
-                        let mut spans = gutter(file, done[r.node]);
-                        spans.push(Span::raw(indent));
-                        spans.push(Span::styled(marker, Style::default().fg(th.accent)));
-                        if node.is_dir {
-                            spans.push(Span::styled(shown, Style::default().fg(th.accent)));
-                        } else {
-                            let positions = visible_positions(&r.positions, &shown, &node.name);
-                            spans.extend(fuzzy_highlight_spans(&shown, positions, th));
-                        }
-                        render_row(f, row_area, spans, i == tree.selected, true, th);
-                    }
-                }
+                render_row(f, row_area, spans, index == cursor, true, th);
             }
 
-            // Right: the selected file's diff, scrolled — or, on a tree
-            // directory's row, the list of what changed under it.
-            let sel_path = match view.selected_dir() {
-                Some(dir) => format!("{dir}/"),
-                None => view.selected_path().unwrap_or("").to_string(),
+            // Right: what the cursor is on: a changed file's diff (a tree
+            // directory's list of what changed under it), a commit, one of
+            // its files, or on a header the checkout's `git status`.
+            let title = match (view.place, view.log.as_ref()) {
+                (Place::Changes, _) => {
+                    let sel_path = match view.selected_dir() {
+                        Some(dir) => format!("{dir}/"),
+                        None => view.selected_path().unwrap_or("").to_string(),
+                    };
+                    let sel_reviewed = view.reviewed.contains_key(&sel_path);
+                    let mark = if sel_reviewed { " ✓" } else { "" };
+                    format!("{}: {sel_path}{mark}", view.branch)
+                }
+                (Place::Graph, Some(log)) => match log.selected_entry() {
+                    Some(crate::git_log::Entry::File(c, file)) => format!(
+                        "{}: {}",
+                        log.commits[c].short,
+                        log.file_at(c, file).map_or("", |f| f.path.as_str())
+                    ),
+                    _ => log
+                        .selected_commit()
+                        .map_or(view.branch.clone(), |c| format!("{} {}", c.short, c.subject)),
+                },
+                _ => format!("{}: status", view.branch),
             };
-            let sel_reviewed = view.reviewed.contains_key(&sel_path);
-            let title = truncate(
-                &format!(
-                    "{}: {}{}",
-                    view.branch,
-                    sel_path,
-                    if sel_reviewed { " ✓" } else { "" }
-                ),
-                (diff_a.width as usize).saturating_sub(4),
-            );
-            let mut block = panel_block(&title, true, th).title_bottom(Line::from(Span::styled(
-                " ^r: toggle reviewed ",
+            let title = truncate(&title, (diff_a.width as usize).saturating_sub(4));
+            let mut block = panel_block(&title, true, th);
+            if view.place == Place::Changes && view.prefetched.is_none() {
+                block = block.title_bottom(Line::from(Span::styled(
+                    " ^r: toggle reviewed ",
+                    Style::default().fg(th.dim),
+                )));
+            }
+            block = block.title_bottom(Line::from(Span::styled(
+                if view.split {
+                    " ^s: unified "
+                } else {
+                    " ^s: side by side "
+                },
                 Style::default().fg(th.dim),
             )));
             let diff_inner = block.inner(diff_a);
-            let max_scroll = (view.diff_line_count as u16).saturating_sub(diff_inner.height.max(1));
+            // Side by side when it fits; a narrow pane reads the unified
+            // diff instead.
+            let split = view
+                .split_rows
+                .as_deref()
+                .filter(|_| diff_inner.width >= crate::app::MIN_SPLIT_W);
+            let total = split.map_or(view.diff_line_count, <[_]>::len);
+            let max_scroll = (total as u16).saturating_sub(diff_inner.height.max(1));
             let scroll = view.scroll.min(max_scroll);
             if max_scroll > 0 {
                 block = block.title_bottom(
                     Line::from(Span::styled(
-                        format!(" {}/{} ", scroll + 1, view.diff_line_count),
+                        format!(" {}/{} ", scroll + 1, total),
                         Style::default().fg(th.dim),
                     ))
                     .right_aligned(),
                 );
             }
             f.render_widget(block, diff_a);
-            // Only the rows in view are styled: a diff runs to 20 000
-            // lines, and building a `Line` for each of them on every frame
-            // was most of what scrolling a large one cost.
-            let lines: Vec<Line> = view
-                .diff
-                .lines()
-                .skip(scroll as usize)
-                .take(diff_inner.height as usize)
-                .map(|l| {
-                    let style = match classify_diff_line(l) {
-                        DiffLineKind::Add => Style::default().fg(th.ok),
-                        DiffLineKind::Remove => Style::default().fg(th.err),
-                        DiffLineKind::Hunk => Style::default().fg(th.accent),
-                        DiffLineKind::Header => Style::default().fg(th.dim),
-                        DiffLineKind::Context => Style::default(),
-                    };
-                    Line::from(Span::styled(l.to_string(), style))
-                })
-                .collect();
-            f.render_widget(Paragraph::new(lines), diff_inner);
+            match split {
+                Some(rows) => draw_split_diff(f, rows, scroll, diff_inner, th),
+                None => {
+                    // Only the rows in view are styled: a diff runs to
+                    // 20 000 lines, and building a `Line` for each of them
+                    // on every frame was most of what scrolling a large one
+                    // cost.
+                    let lines: Vec<Line> = view
+                        .diff
+                        .lines()
+                        .skip(scroll as usize)
+                        .take(diff_inner.height as usize)
+                        .map(|l| Line::from(Span::styled(l.to_string(), diff_line_style(l, th))))
+                        .collect();
+                    f.render_widget(Paragraph::new(lines), diff_inner);
+                }
+            }
 
             // Write-back (draw works on a clone): page size for key paging,
             // scroll re-clamped so resizes never strand the view.
@@ -1881,6 +1841,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 v.list_area = list_inner;
                 v.area = area;
                 v.files_width = files_w;
+                v.split_shown = split.is_some();
             }
         }
         Overlay::Palette(palette) => {
@@ -2848,6 +2809,321 @@ fn render_modal_frame<'a>(
 
 /// A dim one-line placeholder on the first row of an otherwise empty list,
 /// when the list has a first row at all.
+/// A unified diff line's color: added green, removed red, hunk headers in
+/// the accent, file headers dimmed.
+fn diff_line_style(line: &str, th: Theme) -> Style {
+    match classify_diff_line(line) {
+        DiffLineKind::Add => Style::default().fg(th.ok),
+        DiffLineKind::Remove => Style::default().fg(th.err),
+        DiffLineKind::Hunk => Style::default().fg(th.accent),
+        DiffLineKind::Header => Style::default().fg(th.dim),
+        DiffLineKind::Context => Style::default(),
+    }
+}
+
+/// A diff side by side (`git_diff::split_rows`): the old file left and the
+/// new one right, each line numbered, a removed line facing what replaced
+/// it. Only the rows in view are built.
+fn draw_split_diff(
+    f: &mut Frame,
+    rows: &[crate::git_diff::SplitRow],
+    scroll: u16,
+    area: Rect,
+    th: Theme,
+) {
+    use crate::git_diff::SplitRow;
+    let widest = rows
+        .iter()
+        .filter_map(|row| match row {
+            SplitRow::Pair { left, right, .. } => {
+                Some(left.as_ref().map_or(0, |l| l.0).max(right.as_ref().map_or(0, |r| r.0)))
+            }
+            SplitRow::Note(..) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let num_w = widest.to_string().len();
+    let [left_a, sep_a, right_a] = Layout::horizontal([
+        Constraint::Length(area.width.saturating_sub(1) / 2),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    let dim = Style::default().fg(th.dim);
+    let cell = |side: &Option<(u32, String)>, style: Style| match side {
+        Some((n, text)) => Line::from(vec![
+            Span::styled(format!("{n:>num_w$} "), dim),
+            Span::styled(text.replace('\t', "    "), style),
+        ]),
+        None => Line::default(),
+    };
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    for row in rows.iter().skip(scroll as usize).take(area.height as usize) {
+        match row {
+            SplitRow::Note(text, kind) => {
+                let style = if *kind == DiffLineKind::Hunk {
+                    Style::default().fg(th.accent)
+                } else {
+                    dim
+                };
+                left.push(Line::from(Span::styled(text.clone(), style)));
+                right.push(Line::default());
+            }
+            SplitRow::Pair {
+                left: old,
+                right: new,
+                changed,
+            } => {
+                let (old_style, new_style) = if *changed {
+                    (Style::default().fg(th.err), Style::default().fg(th.ok))
+                } else {
+                    (Style::default(), Style::default())
+                };
+                left.push(cell(old, old_style));
+                right.push(cell(new, new_style));
+            }
+        }
+    }
+    let seam = vec![Line::from(Span::styled("│", dim)); area.height as usize];
+    f.render_widget(Paragraph::new(left), left_a);
+    f.render_widget(Paragraph::new(seam), sep_a);
+    f.render_widget(Paragraph::new(right), right_a);
+}
+
+/// A section header's fold marker and name, bold.
+fn header_spans(open: bool, name: &str, th: Theme) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(if open { "▾ " } else { "▸ " }, Style::default().fg(th.accent)),
+        Span::styled(name.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+    ]
+}
+
+/// `▾ CHANGES (3) · 1✓`: the changed files, how many the filter kept, how
+/// many are reviewed. A pull request's view lists its FILES.
+fn changes_header_spans(view: &crate::app::DiffView, th: Theme) -> Vec<Span<'static>> {
+    let name = if view.prefetched.is_some() {
+        "FILES"
+    } else {
+        "CHANGES"
+    };
+    let mut spans = header_spans(view.changes_open, name, th);
+    let count = if view.listing.is_some() && view.files.is_empty() {
+        " (…)".to_string()
+    } else if view.filter.is_empty() {
+        format!(" ({})", view.files.len())
+    } else {
+        format!(" ({}/{})", view.matches.len(), view.files.len())
+    };
+    spans.push(Span::styled(count, Style::default().fg(th.dim)));
+    if !view.reviewed.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {}✓", view.reviewed.len()),
+            Style::default().fg(th.dim),
+        ));
+    }
+    spans
+}
+
+/// `▾ GRAPH (40)  ↑2 ↓1`: the commits listed, and how many HEAD's upstream
+/// lacks (a push would send) and HEAD lacks (a pull would bring).
+fn graph_header_spans(view: &crate::app::DiffView, th: Theme) -> Vec<Span<'static>> {
+    let mut spans = header_spans(view.graph_open, "GRAPH", th);
+    let Some(log) = &view.log else {
+        return spans;
+    };
+    let commits = log.rows.iter().filter(|r| matches!(r.entry, crate::git_log::Entry::Commit(_)));
+    let count = if log.reading.is_some() && log.commits.is_empty() {
+        " (…)".to_string()
+    } else if view.filter.is_empty() {
+        format!(" ({})", log.commits.len())
+    } else {
+        format!(" ({}/{})", commits.count(), log.commits.len())
+    };
+    spans.push(Span::styled(count, Style::default().fg(th.dim)));
+    let (ahead, behind) = log.sides();
+    if ahead > 0 {
+        spans.push(Span::styled(format!("  ↑{ahead}"), Style::default().fg(th.ok)));
+    }
+    if behind > 0 {
+        spans.push(Span::styled(format!("  ↓{behind}"), Style::default().fg(th.warn)));
+    }
+    spans
+}
+
+/// A changed file's status code and reviewed ✓, the two columns both
+/// lists of the CHANGES open a row with.
+fn change_gutter(file: Option<&crate::git_diff::DiffFile>, reviewed: bool, th: Theme) -> Vec<Span<'static>> {
+    let status = match file {
+        Some(file) => Span::styled(
+            format!("{} ", file.status_str()),
+            Style::default().fg(match (file.xy[0], file.xy[1]) {
+                ('?', '?') | ('A', _) => th.ok,
+                ('D', _) | (_, 'D') => th.err,
+                ('R', _) | ('C', _) => th.accent,
+                _ => th.warn,
+            }),
+        ),
+        None => Span::raw("   "),
+    };
+    let mark = if reviewed {
+        Span::styled("✓ ", Style::default().fg(th.ok))
+    } else {
+        Span::raw("  ")
+    };
+    vec![status, mark]
+}
+
+/// Row `i` of the CHANGES: a flat path, or a row of the directory tree (a
+/// directory wears the fold marker and the accent, and its ✓ once every
+/// file under it has one).
+fn change_row_spans(
+    view: &crate::app::DiffView,
+    i: usize,
+    done: Option<&[bool]>,
+    width: u16,
+    th: Theme,
+) -> Vec<Span<'static>> {
+    let Some(tree) = &view.tree else {
+        let Some(m) = view.matches.get(i) else {
+            return Vec::new();
+        };
+        let file = &view.files[m.file];
+        let budget = (width as usize).saturating_sub(5);
+        let mut spans = change_gutter(Some(file), view.reviewed.contains_key(&file.path), th);
+        let shown = truncate(&file.path, budget);
+        let used = shown.chars().count();
+        spans.extend(fuzzy_highlight_spans(&shown, &m.positions, th));
+        if let Some(orig) = &file.orig_path {
+            let rest = budget.saturating_sub(used);
+            if rest > 3 {
+                spans.push(Span::styled(
+                    truncate(&format!(" ← {orig}"), rest),
+                    Style::default().fg(th.dim),
+                ));
+            }
+        }
+        return spans;
+    };
+    let Some(r) = tree.rows.get(i) else {
+        return Vec::new();
+    };
+    let node = &tree.nodes[r.node];
+    let file = tree.file_of[r.node].map(|f| &view.files[f]);
+    let indent = "  ".repeat(node.depth);
+    let marker = if !node.is_dir {
+        "  "
+    } else if tree.is_open(r.node, !view.filter.is_empty()) {
+        "▾ "
+    } else {
+        "▸ "
+    };
+    let budget = (width as usize).saturating_sub(5 + indent.chars().count() + 2);
+    let shown = truncate(&node.name, budget);
+    let reviewed = done.is_some_and(|d| d[r.node]);
+    let mut spans = change_gutter(file, reviewed, th);
+    spans.push(Span::raw(indent));
+    spans.push(Span::styled(marker, Style::default().fg(th.accent)));
+    if node.is_dir {
+        spans.push(Span::styled(shown, Style::default().fg(th.accent)));
+    } else {
+        let positions = visible_positions(&r.positions, &shown, &node.name);
+        spans.extend(fuzzy_highlight_spans(&shown, positions, th));
+    }
+    spans
+}
+
+/// `git log --graph`'s ASCII drawn with box lines, each lane in a color of
+/// its own and each commit a dot on its lane. Under an unfolded commit its
+/// files carry the lanes on, the commit's dot a line.
+fn graph_spans(graph: &str, under: bool, th: Theme) -> Vec<Span<'static>> {
+    let lanes = [th.accent, th.ok, th.warn, th.special, th.merged, th.err];
+    graph
+        .chars()
+        .enumerate()
+        .map(|(col, ch)| {
+            let glyph = match ch {
+                '*' if under => '│',
+                '*' => '●',
+                '|' => '│',
+                '/' => '╱',
+                '\\' => '╲',
+                '-' | '_' => '─',
+                other => other,
+            };
+            Span::styled(glyph.to_string(), Style::default().fg(lanes[col / 2 % lanes.len()]))
+        })
+        .collect()
+}
+
+/// Row `i` of the GRAPH: the graph, then a commit's arrow against HEAD's
+/// upstream (`↑` to push, `↓` to pull), its hash, refs and subject (the
+/// filter's matches lit, while it narrows the list) and who and when,
+/// dimmed; or under an unfolded commit, one of its files.
+fn log_row_spans(log: &crate::git_log::GitLog, i: usize, now: i64, th: Theme) -> Vec<Span<'static>> {
+    use crate::git_log::{Entry, RefKind, Side};
+    let Some(r) = log.rows.get(i) else {
+        return Vec::new();
+    };
+    let dim = Style::default().fg(th.dim);
+    let graph = r.line.map_or("", |n| log.lines[n].0.as_str());
+    let under = matches!(r.entry, Entry::File(..) | Entry::Note(_));
+    let mut spans = graph_spans(graph, under, th);
+    if !graph.is_empty() {
+        spans.push(Span::raw(" "));
+    }
+    match r.entry {
+        Entry::Graph => {}
+        Entry::Note(c) => spans.push(Span::styled(format!("   {}", log.note(c)), dim)),
+        Entry::File(c, f) => {
+            if let Some(file) = log.file_at(c, f) {
+                spans.push(Span::raw("  "));
+                spans.extend(change_gutter(Some(file), false, th).into_iter().take(1));
+                spans.push(Span::raw(file.path.clone()));
+                if let Some(orig) = &file.orig_path {
+                    spans.push(Span::styled(format!(" ← {orig}"), dim));
+                }
+            }
+        }
+        Entry::Commit(c) => {
+            let c = &log.commits[c];
+            match c.side {
+                Side::Ahead => spans.push(Span::styled("↑ ", Style::default().fg(th.ok))),
+                Side::Behind => spans.push(Span::styled("↓ ", Style::default().fg(th.warn))),
+                Side::Shared => {}
+            }
+            if r.positions.is_empty() {
+                spans.push(Span::styled(c.short.clone(), Style::default().fg(th.muted)));
+                if !c.refs.is_empty() {
+                    spans.push(Span::raw(" ("));
+                    for (n, rf) in c.refs.iter().enumerate() {
+                        if n > 0 {
+                            spans.push(Span::raw(", "));
+                        }
+                        let style = Style::default().fg(match rf.kind {
+                            RefKind::Head | RefKind::Local => th.ok,
+                            RefKind::Remote => th.accent,
+                            RefKind::Tag => th.warn,
+                        });
+                        let style = if rf.kind == RefKind::Head {
+                            style.add_modifier(Modifier::BOLD)
+                        } else {
+                            style
+                        };
+                        spans.push(Span::styled(rf.label(), style));
+                    }
+                    spans.push(Span::raw(")"));
+                }
+                spans.push(Span::raw(format!(" {}", c.subject)));
+            } else {
+                spans.extend(fuzzy_highlight_spans(&c.haystack(), &r.positions, th));
+            }
+            let ago = crate::hosts::ago_label(now - c.time * 1000);
+            spans.push(Span::styled(format!("  {} · {ago}", c.author), dim));
+        }
+    }
+    spans
+}
+
 pub(crate) fn empty_list_row(f: &mut Frame, list_inner: Rect, text: &str, th: Theme) {
     if let Some(row_area) = row_rect(list_inner, 0) {
         f.render_widget(
@@ -3869,13 +4145,9 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::Diff(view)) = &app.overlay {
+    } else if let Some(Overlay::Diff(_)) = &app.overlay {
         Span::styled(
-            if view.tree.is_some() {
-                "type: filter  ↑/↓: move  ←/→: fold  ⇧↑/↓: scroll  Ctrl+d/u: half list  Ctrl+t: flat list  Ctrl+u: clear filter  Esc: clear/close"
-            } else {
-                "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: half list  Ctrl+t: tree  Ctrl+u: clear filter  Esc: clear/close"
-            },
+            "type: filter  ↑/↓: move  Enter/→/←: unfold/fold  ⇧↑/↓: scroll  Ctrl+d/u: half list  Ctrl+s: split/unified  Ctrl+t: tree  Ctrl+r: reviewed  Esc: clear/close",
             Style::default().fg(th.dim),
         )
     } else if let Some(Overlay::FileTabs(view)) = &app.overlay {

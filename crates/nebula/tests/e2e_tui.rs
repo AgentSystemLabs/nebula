@@ -699,7 +699,7 @@ fn tui_git_diff_modal() {
 
     // ---- open the modal; the selected file's diff renders ----
     tui.send(b"g");
-    tui.wait_for_text("Files (2)");
+    tui.wait_for_text("CHANGES (2)");
     // Status is path-ordered, so .keep (modified) is selected first.
     tui.wait_for_selected(".keep");
     tui.wait_for_text("+tracked change");
@@ -726,33 +726,39 @@ fn tui_git_diff_modal() {
 
     // ---- type-to-filter narrows the list and reselects the top match ----
     tui.type_str("kee");
-    tui.wait_for_text("Files (1/2)");
+    tui.wait_for_text("CHANGES (1/2)");
     tui.wait_for_selected(".keep");
     tui.wait_for_text("+tracked change");
     tui.send(ESC); // first clears the filter, not the modal
-    tui.wait_for_text("Files (2)");
+    tui.wait_for_text("CHANGES (2)");
 
     // ---- the modal blocks other interaction ----
     // n would open the NEW SESSION PICKER on the grid; inside the modal it
     // feeds the filter instead (verified after close — stale-frame
     // convention).
     tui.send(b"n");
-    tui.wait_for_text("no matches");
+    tui.wait_for_text("CHANGES (0/2)");
     tui.send(ESC); // clears the filter…
-    tui.wait_for_text("Files (2)"); // (also keeps the two Escs from coalescing)
+    tui.wait_for_text("CHANGES (2)"); // (also keeps the two Escs from coalescing)
     tui.send(ESC); // …and the second closes the modal
-    tui.wait_for_gone("Files (2)");
+    tui.wait_for_gone("CHANGES (2)");
     assert!(
         !tui.screen_text().contains("what should the agent do?"),
         "modal swallowed n\n--- screen ---\n{}",
         tui.screen_text()
     );
 
-    // ---- clean tree flashes instead of opening ----
+    // ---- a clean tree opens on HEAD's commit in the graph ----
     repo_git(&repo, &["add", "."]);
     repo_git(&repo, &["commit", "-m", "wip"]);
     tui.send(b"g");
-    tui.wait_for_text("no changes in main");
+    tui.wait_for_text("CHANGES (0)");
+    tui.wait_for_text("(HEAD → main) wip");
+    // Enter unfolds the commit into its files, right under it.
+    tui.send(b"\r");
+    tui.wait_for_text("A  hello.txt");
+    tui.send(ESC);
+    tui.wait_for_gone("GRAPH (");
 }
 
 /// The BRANCH SWITCHER end to end: `c` lists the repo's branches, typing

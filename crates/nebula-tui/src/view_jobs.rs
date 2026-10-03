@@ -1,5 +1,6 @@
-//! BACKGROUND READS for the worktree views — the DIFF VIEWER (`g`), the FILE
-//! FINDER (`f`), its grep view (`F`) and the TREE BROWSER (`b`).
+//! BACKGROUND READS for the worktree views — the DIFF VIEWER (`g`) and its
+//! GRAPH, the FILE FINDER (`f`), its grep view (`F`) and the TREE BROWSER
+//! (`b`).
 //!
 //! Every one of them is git and the disk: `git status -uall` to list what
 //! changed, `git ls-files` for the finder and the tree, a `git diff` per
@@ -82,6 +83,18 @@ pub enum Answer {
     Preview {
         ticket: u64,
         preview: Box<crate::tree_browser::Preview>,
+    },
+    /// The DIFF VIEWER's GRAPH (`git_log::read_log`).
+    Log {
+        ticket: u64,
+        result: Result<crate::git_log::LogRead, String>,
+    },
+    /// The files of a commit unfolded in the GRAPH.
+    CommitFiles {
+        /// The `DiffView::id` that asked.
+        view: u64,
+        sha: String,
+        result: Result<Vec<DiffFile>, String>,
     },
     /// [`STALE_GRACE`] is up on `ticket`.
     Slow { ticket: u64 },
