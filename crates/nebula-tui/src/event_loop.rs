@@ -273,6 +273,14 @@ async fn main_loop(
     let cfg = crate::config::Config::load();
     apply_config(&mut app, &cfg);
     app.keymap = cfg.keymap();
+    // The PANELS open with the keys on PROJECTS, the column at the top of
+    // the tree — where they always opened — rather than on the GRID's
+    // cards, which beside the columns is an empty SESSIONS column.
+    if app.panels {
+        app.focus = Focus::Projects;
+        // PROJECTS folded to its RAIL: the first open column, or the pane.
+        crate::panels::settle_focus(&mut app);
+    }
     // Every pull request the last run knew about, painted before the
     // daemon's snapshot even lands; the lookups below refresh them all in
     // the background (`pr_cache`).
@@ -2973,8 +2981,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // down; in a full-screen session the hatches and the pane fold's
         // `^`` bring it back down too, rather than straight out to the
         // grid — the keys stay in the session, now in its pane.
+        // A PANELS session full-screened by `z` or `^F` comes back down
+        // to its pane on `^F` alone: a hatch leaves it for the columns, as
+        // it always did there.
         let zooms = toggles_full_screen(app, &chord)
-            || (app.collapsed && (is_hatch || folds_launcher_pane(app, &chord)));
+            || (app.collapsed
+                && !app.panels_active()
+                && (is_hatch || folds_launcher_pane(app, &chord)));
         if app.launcher_active() && zooms {
             let did = launcher::toggle_full_screen(app, out);
             crate::key_combo::note(app, &[chord], Some(did));
@@ -3106,6 +3119,15 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // in between — bound or not — breaks it, so the arm is taken here and
     // only the edge arms below put one back.
     let armed = app.edge_tap.take();
+    // The PANELS' fold keys and their own keys come ahead of the keymap —
+    // `⇧P` folds PROJECTS there, whatever the GRID binds it to — and only
+    // beside the columns (`panels::fold_key`, `panels::panel_key`).
+    if app.panels_active()
+        && !app.collapsed
+        && (panels::fold_key(app, &chord) || panels::panel_key(app, &chord, out))
+    {
+        return;
+    }
     let action = app.keymap.lookup(crate::keymap::Scope::Global, &chord);
     // The KEY COMBO DISPLAY: the key and the label of what it fired — an
     // unbound key shows bare, so a watcher sees it did nothing. Noted
@@ -5326,6 +5348,13 @@ fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
                 None => app.selected_worktree().map(|w| worktree_menu_items(app, w)),
             },
         },
+        // A PANELS session row: the session's verbs alone, the checkout's
+        // being its WORKTREES row's there.
+        Focus::Sessions if app.panels_active() => Some(match app.selected_session_row()? {
+            SessionRow::Agent(a) => menu_items_for_session(&a),
+            SessionRow::Terminal(t) => menu_items_for_terminal(&t),
+            SessionRow::Link(l) => menu_items_for_link(&l),
+        }),
         // An EMPTY BAND on the grid: its checkout's own menu, the same
         // **Delete worktree** its `d` opens — its pull request's link row
         // under the cursor or not (#104).
@@ -6465,6 +6494,28 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.launcher_pane_at = cfg.pane_side();
     app.launcher_list = cfg.list_layout();
     app.panels = cfg.panels_layout();
+    // The PANELS keep the FOCUS TINT they always had, the GRID its own.
+    if app.panels {
+        app.theme.focus_tint = crate::panels::focus_tint(&cfg.theme);
+    }
+    // The PANELS' columns folded as they were left (`panels::set_hidden`,
+    // which steps a FOCUS off a column folding under it).
+    let hidden = [cfg.hide_projects, cfg.hide_worktrees, cfg.hide_sessions];
+    for (i, hidden) in hidden.into_iter().enumerate() {
+        panels::set_hidden(app, i, hidden);
+    }
+    // Their RECENT PROMPTS under each session pill; and a FOLLOW-UP
+    // COMPOSER open in a session pill folds with the columns, so the GRID
+    // never inherits a box it does not draw holding the keys.
+    app.recent_prompts = cfg.recent_prompts_shown();
+    if !app.panels {
+        app.follow_up = None;
+        // The GRID has no PROJECTS or WORKTREES column to hold the keys: `d`
+        // and `r` there would act on the project.
+        if matches!(app.focus, Focus::Projects | Focus::Worktrees) {
+            app.focus = Focus::Sessions;
+        }
+    }
     app.launcher_all_open = cfg.expand_all_worktrees;
     set_hide_draft_prs(app, cfg.hide_draft_prs);
 }
@@ -7240,7 +7291,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         // of the PANE, which has to be there and reading the right
         // session first: same intent, one step more, so this row and
         // Space on the card end in the same place.
-        MenuAction::FollowUp if app.launcher_active() => launcher::follow_up(app),
+        // Beside the PANELS the row's pill expands into its FOLLOW-UP
+        // COMPOSER, as Space does there; the grid's card opens its modal.
+        MenuAction::FollowUp if app.launcher_active() && !app.panels_active() => {
+            launcher::follow_up(app)
+        }
         MenuAction::FollowUp => activate::follow_up(app),
         MenuAction::EditLink(id) => open_prompt(app, PromptKind::EditLink { id }),
         MenuAction::DeleteLink(id) => {
@@ -9679,6 +9734,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // A PANELS column's BORDER: a resize drag armed, and
                 // nothing selected or focused (`panels::grab_border`).
                 Some(HitTarget::PanelsBorder(i)) => panels::grab_border(app, i, mouse.column),
+                // A PANELS column's `◀` folds it to its RAIL, and the rail
+                // opens it again (`panels::click_fold`).
+                Some(HitTarget::PanelsFold(focus)) => panels::click_fold(app, focus),
                 // The `❮` / `❯` beside a band's row: one card that way
                 // along the band, the very step `h` / `l` take.
                 Some(HitTarget::LauncherStripLeft(i)) => {

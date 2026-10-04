@@ -495,23 +495,92 @@ Settings → Appearance → **Layout** `panels` puts the three-column layout bac
 PROJECTS, WORKTREES and SESSIONS side by side, and the TERMINAL PANE beside them. Every launch path
 above works from it, on the selection the columns show.
 
-- **PROJECTS** lists every project on the machine, the one last worked in first, each with the
-  rolled-up status dot of its sessions, how long since anything in it moved and its unread finishes.
+- **PROJECTS** lists every project on the machine, the one last worked in first, each a 3-row button
+  with the rolled-up status dot of its sessions, its name in bold, how long since anything in it
+  moved, its PR and issue counts (`3m ago - 3 prs · 2 issues`, dropped whole on a column too narrow
+  for them beside the name) and its unread finishes. A renamed project names the folder it lives in
+  on the row under its name (`└ api-server`).
 - **WORKTREES** lists the selected project's checkouts — the root first, `⌂ root` — then the
   project's open pull requests under `OPEN PRS` (a checkout on a pull request's branch nested under
-  it with a `└`) and its open issues under `ISSUES`. A click on either header folds the group. Resting
-  on a pull request or an issue reads it in the pane.
-- **SESSIONS** lists the selected checkout's sessions under `RECENT`, most recently touched first,
-  then its `TERMINALS`, its `PULL REQUESTS` and the `ARCHIVED` group, folded to its count until
-  `Shift+A` or a click opens it. Walking the list shows each session in the pane; `Enter` steps
-  into it.
-- `n` in SESSIONS is the NEW SESSION PICKER for the selected checkout, `p` the QUICK PROMPT, `Space`
-  the FOLLOW-UP MODAL. The breadcrumb in the footer reads `project ▸ worktree ▸ session`.
+  it with a `└`) and its open issues under `ISSUES`. A click on either header folds the group. The
+  `OPEN PRS` count reads `9/12` while drafts are hidden — and the header stays when every pull
+  request is a hidden draft — and either count ends in `+` when the list hit GitHub's fetch cap.
+  A checkout whose pull request has merged goes purple, its branch sweeping once as the merge
+  lands; one whose run command is up says `▶ running` (`▶` alone when the word would cut the
+  branch). Resting on a pull request or an issue reads it in the pane, and the SESSIONS column
+  folds to its bare rule — a pull request or an issue has no checkout, so no sessions to list — so
+  the pane takes the width until the cursor steps back onto a checkout. That fold is the row's, not
+  yours: `hide_sessions` is neither read nor written by it. A project with nothing to list says
+  `n starts a worktree`.
+- **SESSIONS** lists the selected checkout's live sessions, most recently touched first, as one list
+  with no header, then its `TERMINALS`, its `PULL REQUESTS` and the archived ones — folded to
+  `… 3 archived` until `Shift+A` or a click opens it as `ARCHIVED · 3`. The checkout's pull request
+  says how many comments landed since it was last opened from nebula (`2 new`) in place of its state.
+  Walking the list shows each session in the pane; `Enter` steps into it. With **Recent prompts** on
+  (Settings → Appearance, under PANELS LAYOUT) each live session's pill lists its last prompts under
+  its name ([RECENT PROMPTS](#recent-prompts-under-a-session-pill)).
+- Checkouts and sessions are 2-row pills: the cursor's row is a raised slab with a rail down its
+  left edge in the row's status color, dim while its column hasn't the keys.
+- The panels open with the keys on PROJECTS. `n` in SESSIONS is the NEW SESSION PICKER for the
+  selected checkout, `p` the QUICK PROMPT, `Space` the session's
+  [FOLLOW-UP COMPOSER](#the-follow-up-composer-in-a-session-pill). The breadcrumb in the
+  footer reads `project ▸ worktree ▸ session`, followed by the selected checkout's changed files
+  (`+3 files`), and its hints end `m: menu  ?: help`; the key combo echo stays off.
+- The keys the columns always had are theirs again: `Shift+Tab` walks FOCUS back a column, `Ctrl+→`
+  steps into the pane without typing into it, `z` full-screens the pane with its input locked
+  (`^q` comes back to the columns), `m` opens the cursor row's right-click menu near the columns' top
+  left, and `Shift+C` opens a Ghostty tab. `?` lists them in the help's old
+  sections ([Keys](keys.md#the-panels)).
+- The focused column, or the pane, wears the faintly lit gray tint the panels always had, not the
+  grid's near-black accent.
 - Dragging a column's right border resizes it, the pane taking up the difference; the widths are
   remembered across restarts.
+- Each column's title carries a `◀` that collapses the column to a slim rail, the pane taking its
+  width; a click on the rail's `▶` brings it back at the width it had. `Shift+P`, `Shift+B` and
+  `Shift+S` do the same from the keyboard, `Ctrl+B` (or `Shift+Z`) every column at once. A collapsed
+  column is skipped by `h`/`l` and `Tab`, its key leads the footer (`⇧P: show projects`), and it
+  stays collapsed across restarts (`hide_projects`, `hide_worktrees`, `hide_sessions`, also in
+  Settings → Appearance).
 
-The cards' own extras — the last prompt and line counts on a card, the header's PR and issue
-counts, the pane's terminal strip — are the grid's and have no column here.
+The cards' own extras — the last prompt and line counts on a card, the pane's terminal strip — are
+the grid's and have no column here.
+
+### The FOLLOW-UP COMPOSER in a session pill
+
+The next turn for a session already running, typed into its own pill. Put the cursor on an agent's row
+in the SESSIONS column and press `Space` — or click the `▸` at the end of its name row, or pick
+**Follow-up prompt** from its `m` menu — and the pill expands in place: a small framed box opens inside
+it, under whatever RECENT PROMPTS the row carries, with `follow-up` on its top border and the keys on
+its bottom one. There is no modal over the screen; the columns stay exactly where they were, and every
+pill below this one moves down by what the box took, off the bottom of the column if it runs out. The
+column scrolls to keep the box you are typing into on screen, and goes on doing so as the box grows —
+it takes up to four lines of text before it starts scrolling under its own caret.
+
+`Enter` sends what you typed to the agent as its next turn and folds the pill back up, with
+`sent to <session>` in the footer; `Shift+Enter`, `Option+Enter` and `Ctrl+J` break a line, and `Esc`
+folds the pill without sending. The text goes straight down the session's PTY, and the pane swaps to
+that session so you can watch the turn land; a prompt with line breaks in it crosses as one bracketed
+paste. While the box is open it owns the keyboard: the column's verbs are bare letters, so `a`, `d`
+and `r` are letters in your prompt and not archive, delete and rename aimed at the session you are
+prompting. `Tab` still walks on and leaves the pill expanded behind it, and clicking another pill folds
+the box. The toggle on each pill says which state it is in — `▸` folded, `▾` expanded — and a click
+on it does either. Only a live local agent has a pill to expand; an archived session, a Claude Cloud
+row, a shell terminal and a pull request row each say what they take instead. A session whose CLI is
+not up is booted first and the box left as it is, so press `Enter` again once it is up. The grid's
+cards open the [FOLLOW-UP MODAL](#the-follow-up-composer) instead.
+
+### RECENT PROMPTS under a session pill
+
+With **Recent prompts** on (Settings → Appearance, under PANELS LAYOUT; `recent_prompts` in
+CONFIG.JSON) every live session row in the SESSIONS column grows a short list under its pill: the last
+few prompts typed into it, oldest first so the bottom line is the latest ask, each condensed to one line
+and clipped to the column, with a dim `30m ago` pinned to the right. **Recent prompts shown**
+(`recent_prompts_count`, `3` by default, `1` to `5` in the overlay) says how many; the DAEMON keeps the
+newest ten per session — the same history the grid's cards read their last prompt from — so raising
+the number later has history to draw from at once. Prompts nebula composes itself are left out. The
+lines belong to their row: they sit inside its pill, and on the row the cursor is on they take the
+pill's fill with the rail running down beside them. A click on any of them lands on the session,
+archived rows list none, and off, the rows are the single pills they always were.
 
 ## The ISSUES MODAL and ISSUE SESSIONS
 

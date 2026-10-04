@@ -50,6 +50,13 @@ pub const WORKTREE_LAYOUTS: &[&str] = &["cards", "list"];
 /// `crate::panels`).
 pub const LAYOUTS: &[&str] = &["grid", "panels"];
 
+/// The **Recent prompts shown** choices (Settings → Appearance, PANELS
+/// LAYOUT), in the order the row cycles them; a hand edit off the list is
+/// clamped to what the DAEMON keeps ([`Config::recent_prompts_shown`]).
+pub const RECENT_PROMPT_COUNTS: &[&str] = &["1", "2", "3", "4", "5"];
+/// How many RECENT PROMPTS a session row lists until the count is changed.
+pub const DEFAULT_RECENT_PROMPTS_COUNT: usize = 3;
+
 /// The **Preset text** choices (Settings → Sessions), in the order the row
 /// cycles them: the [`PresetText`] sides by label.
 pub const PRESET_TEXTS: &[&str] = &[
@@ -405,6 +412,11 @@ pub enum SettingKind {
     Animations,
     BlackBackground,
     Layout,
+    HideProjects,
+    HideWorktrees,
+    HideSessions,
+    RecentPrompts,
+    RecentPromptsCount,
     HideCardMarks,
     HighlightCurrentCard,
     SessionPane,
@@ -478,14 +490,21 @@ impl SettingKind {
             | SettingKind::SessionIdleTimeout
             | SettingKind::Theme
             | SettingKind::Animations => (2026, 8, 22),
-            // v0.16.0
-            SettingKind::DoneSound => (2026, 8, 28),
+            // v0.16.0; the PANELS' rows came back with the layout, never
+            // new to anyone who had them
+            SettingKind::DoneSound
+            | SettingKind::HideProjects
+            | SettingKind::HideWorktrees
+            | SettingKind::HideSessions => (2026, 8, 28),
             // v0.19.0 – v0.21.0
             SettingKind::CloseFinderOnOpen
             | SettingKind::QuickPromptKind
             | SettingKind::QuickPromptFocus => (2026, 8, 29),
-            // v0.23.0 / v0.24.0
+            // v0.23.0 / v0.24.0; RECENT PROMPTS came back with the
+            // PANELS, never new to anyone who had them
             SettingKind::FeedbackSound
+            | SettingKind::RecentPrompts
+            | SettingKind::RecentPromptsCount
             | SettingKind::WorktreeBaseBranch
             | SettingKind::PrewarmAgents
             | SettingKind::PrewarmSessions => (2026, 9, 9),
@@ -708,6 +727,38 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 label: "Draft pull requests",
                 hint: "Show or hide draft pull requests in / search; checkouts always stay",
                 group: "",
+            },
+            // The PANELS' own rows, under their own header: the GRID has
+            // no columns to collapse, and never reads them.
+            SettingSpec {
+                kind: SettingKind::HideProjects,
+                label: "Projects panel",
+                hint: "Collapse or expand the Projects panel (Shift+P toggles)",
+                group: "PANELS LAYOUT",
+            },
+            SettingSpec {
+                kind: SettingKind::HideWorktrees,
+                label: "Worktrees panel",
+                hint: "Collapse or expand the Worktrees panel (Shift+B toggles)",
+                group: "PANELS LAYOUT",
+            },
+            SettingSpec {
+                kind: SettingKind::HideSessions,
+                label: "Sessions panel",
+                hint: "Collapse or expand the Sessions panel (Shift+S toggles)",
+                group: "PANELS LAYOUT",
+            },
+            SettingSpec {
+                kind: SettingKind::RecentPrompts,
+                label: "Recent prompts",
+                hint: "List a session's last prompts under its row, newest at the bottom, each with how long ago",
+                group: "PANELS LAYOUT",
+            },
+            SettingSpec {
+                kind: SettingKind::RecentPromptsCount,
+                label: "Recent prompts shown",
+                hint: "How many of a session's recent prompts the Sessions panel lists",
+                group: "PANELS LAYOUT",
             },
         ]),
     },
@@ -1162,17 +1213,20 @@ pub struct Config {
     /// edits it. Still loaded and written back as stored, so an older
     /// build sharing the file keeps the bar its user chose.
     pub show_workspaces: bool,
-    /// RETIRED with the three-panel layout. Through 0.37 the **Projects panel**
-    /// SETTING (Settings → Appearance) collapsed that panel to a rail; the
-    /// GRID has no panels, so no tab shows the row and nothing reads it.
-    /// Still loaded and written back as stored, so an older build sharing
-    /// the file keeps the layout its user chose.
+    /// The PANELS' PROJECTS column folded to its RAIL (Settings →
+    /// Appearance → **Projects panel**, `⇧P` or the `◀` on its title
+    /// beside the columns), the pane taking its width. The GRID has no
+    /// columns and never reads it. False by default, so configs from
+    /// before the key open all three columns.
     pub hide_projects: bool,
-    /// RETIRED with the three-panel layout, as `hide_projects` is: the
-    /// **Worktrees panel** SETTING through 0.37.
+    /// The WORKTREES column the same way (**Worktrees panel**, `⇧B`),
+    /// independently of the other two.
     pub hide_worktrees: bool,
-    /// RETIRED with the three-panel layout, as `hide_projects` is: the
-    /// **Sessions panel** SETTING through 0.37.
+    /// The SESSIONS column the same way (**Sessions panel**, `⇧S`),
+    /// independently of the other two. Whatever this says, the column
+    /// folds to a bare rule while the WORKTREES cursor is on a pull
+    /// request or an issue, which has no sessions — a fold never written
+    /// here.
     pub hide_sessions: bool,
     /// RETIRED with the root always listed. Through 0.27 one switch for
     /// every project (Settings → Experimental), then through 0.35 the
@@ -1186,15 +1240,18 @@ pub struct Config {
     /// stored, so an older build sharing the file keeps the choice its
     /// user made.
     pub hide_root_worktree: bool,
-    /// RETIRED with every card carrying its session's last prompt. Through
-    /// 0.37 the **Recent prompts** SETTING (Settings → Experimental) listed a
-    /// session's last prompts under its row; the card shows the newest one
-    /// whatever this says, so no tab shows the row and nothing reads it.
-    /// Still loaded and written back as stored, so an older build sharing
-    /// the file keeps the rows its user chose.
+    /// The PANELS' RECENT PROMPTS (Settings → Appearance → **Recent
+    /// prompts**, under PANELS LAYOUT): the last few things typed into each
+    /// session, as the daemon captured them off the `UserPromptSubmit`
+    /// hook, listed under its row in the SESSIONS column, newest at the
+    /// bottom, each with an ago label. Off by default: the rows are three
+    /// lines taller with it on. The GRID's cards carry the newest prompt
+    /// whatever this says, and never read it.
     pub recent_prompts: bool,
-    /// RETIRED with `recent_prompts`: how many prompts that build listed
-    /// (`1` to `5` in its overlay). Loaded and written back as stored.
+    /// How many of those prompts to list while `recent_prompts` is on.
+    /// The overlay cycles [`RECENT_PROMPT_COUNTS`]; a hand edit is clamped
+    /// to what the daemon keeps. Read through
+    /// [`Config::recent_prompts_shown`].
     pub recent_prompts_count: usize,
     /// RETIRED with the KEY COMBO DISPLAY always on. Through 0.37 the
     /// **Key combo display** SETTING (Settings → Experimental) switched
@@ -1461,7 +1518,7 @@ impl Default for Config {
             hide_sessions: false,
             hide_root_worktree: false,
             recent_prompts: false,
-            recent_prompts_count: 3,
+            recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
             projects: BTreeMap::new(),
             show_key_combos: false,
             remember_harness: false,
@@ -1628,6 +1685,18 @@ impl Config {
     /// `layout` says the PANELS rather than the grid.
     pub fn panels_layout(&self) -> bool {
         self.layout.trim().eq_ignore_ascii_case("panels")
+    }
+
+    /// How many RECENT PROMPTS the PANELS' SESSIONS column lists under a
+    /// session: zero while the feature is off, else the count clamped to
+    /// what the daemon keeps (a hand-edited `0` or `50` reads as `1` or the
+    /// cap, never as nothing while the switch says on).
+    pub fn recent_prompts_shown(&self) -> usize {
+        if !self.recent_prompts {
+            return 0;
+        }
+        self.recent_prompts_count
+            .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
     }
 
     /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
@@ -2262,6 +2331,14 @@ impl Config {
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::WorktreeLayout => WORKTREE_LAYOUTS[usize::from(self.list_layout())].into(),
             SettingKind::Layout => LAYOUTS[usize::from(self.panels_layout())].into(),
+            SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
+            SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
+            SettingKind::HideSessions => shown_hidden(self.hide_sessions).into(),
+            SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
+            SettingKind::RecentPromptsCount => self
+                .recent_prompts_count
+                .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
+                .to_string(),
             SettingKind::ExpandAllWorktrees => on_off(self.expand_all_worktrees).into(),
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
@@ -2375,6 +2452,25 @@ impl Config {
             SettingKind::Layout => {
                 let now = LAYOUTS[usize::from(self.panels_layout())];
                 self.layout = cycle_choice(now, LAYOUTS, step).into();
+            }
+            SettingKind::HideProjects => {
+                self.hide_projects = !self.hide_projects;
+            }
+            SettingKind::HideWorktrees => {
+                self.hide_worktrees = !self.hide_worktrees;
+            }
+            SettingKind::HideSessions => {
+                self.hide_sessions = !self.hide_sessions;
+            }
+            SettingKind::RecentPrompts => {
+                self.recent_prompts = !self.recent_prompts;
+            }
+            SettingKind::RecentPromptsCount => {
+                // A hand-edited count off the list steps onto it.
+                let current = self.recent_prompts_count.to_string();
+                self.recent_prompts_count = cycle_choice(&current, RECENT_PROMPT_COUNTS, step)
+                    .parse()
+                    .unwrap_or(DEFAULT_RECENT_PROMPTS_COUNT);
             }
             SettingKind::ExpandAllWorktrees => {
                 self.expand_all_worktrees = !self.expand_all_worktrees;
@@ -3736,8 +3832,10 @@ mod tests {
             rows.iter().all(|r| r.label != "Card line counts"),
             "no row edits it"
         );
+        // The PANELS LAYOUT rows close the tab under their own header.
+        let mut grid_rows = rows.iter().filter(|r| r.group.is_empty());
         assert_eq!(
-            rows.last().map(|r| r.kind),
+            grid_rows.next_back().map(|r| r.kind),
             Some(SettingKind::HideDraftPrs),
             "Appearance ends on DRAFT PULL REQUESTS"
         );
@@ -3959,6 +4057,78 @@ mod tests {
         assert!(!older.panels_layout(), "predating the key");
         let odd: Config = serde_json::from_str(r#"{"layout": "cards"}"#).unwrap();
         assert!(!odd.panels_layout(), "a word off the list");
+    }
+
+    /// RECENT PROMPTS: a PANELS LAYOUT switch on the Appearance tab that is
+    /// off by default and a count beside it, read together through
+    /// `recent_prompts_shown` — zero while off, the count while on, a hand
+    /// edit clamped to what the daemon keeps — and both persisted under
+    /// their own keys.
+    #[test]
+    fn recent_prompts_are_off_by_default_and_the_count_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.recent_prompts, "rows stay short until asked");
+        assert_eq!(cfg.recent_prompts_count, DEFAULT_RECENT_PROMPTS_COUNT);
+        assert_eq!(cfg.recent_prompts_shown(), 0, "off means none drawn");
+        assert_eq!(cfg.value_label(SettingKind::RecentPrompts), "off");
+        assert_eq!(cfg.value_label(SettingKind::RecentPromptsCount), "3");
+
+        let (tab, row) = locate(SettingKind::RecentPrompts).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        let (count_tab, count_row) = locate(SettingKind::RecentPromptsCount).unwrap();
+        assert_eq!(count_tab, tab);
+        assert_eq!(count_row, row + 1, "the count sits under its switch");
+
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.recent_prompts);
+        assert_eq!(cfg.recent_prompts_shown(), 3);
+
+        // The count walks the list both ways and wraps.
+        cfg.cycle(count_tab, count_row, 1);
+        assert_eq!(cfg.recent_prompts_count, 4);
+        cfg.cycle(count_tab, count_row, 1);
+        cfg.cycle(count_tab, count_row, 1);
+        assert_eq!(cfg.recent_prompts_count, 1, "wraps past 5");
+        cfg.cycle(count_tab, count_row, -1);
+        assert_eq!(cfg.recent_prompts_count, 5);
+        assert_eq!(cfg.value_label(SettingKind::RecentPromptsCount), "5");
+        let most: usize = RECENT_PROMPT_COUNTS.last().unwrap().parse().unwrap();
+        assert!(
+            most <= nebula_core::RECENT_PROMPTS_KEPT,
+            "the overlay never asks for more than the daemon keeps"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.recent_prompts);
+        assert_eq!(loaded.recent_prompts_count, 5);
+        assert_eq!(loaded.recent_prompts_shown(), 5);
+
+        // A hand edit past the list is clamped, not refused; a count that
+        // is off the list steps back onto it when cycled.
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"recent_prompts": true, "recent_prompts_count": 50}"#)
+                .unwrap();
+        assert_eq!(cfg.recent_prompts_shown(), nebula_core::RECENT_PROMPTS_KEPT);
+        assert_eq!(
+            cfg.value_label(SettingKind::RecentPromptsCount),
+            nebula_core::RECENT_PROMPTS_KEPT.to_string()
+        );
+        cfg.cycle(count_tab, count_row, 1);
+        assert_eq!(
+            cfg.recent_prompts_count, 2,
+            "off-list steps from the first choice"
+        );
+        let cfg: Config =
+            serde_json::from_str(r#"{"recent_prompts": true, "recent_prompts_count": 0}"#).unwrap();
+        assert_eq!(cfg.recent_prompts_shown(), 1);
+
+        // A config predating the keys reads as off, with the default count.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.recent_prompts);
+        assert_eq!(cfg.recent_prompts_count, DEFAULT_RECENT_PROMPTS_COUNT);
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,

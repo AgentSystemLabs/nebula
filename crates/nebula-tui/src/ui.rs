@@ -186,6 +186,9 @@ const HELP_KEY_W: usize = 14;
 enum HelpKeys {
     Lit(&'static str),
     Act(&'static [crate::keymap::Action]),
+    /// The actions' chords, then fixed keys beside them — the PANELS'
+    /// own (`panels::PANEL_KEYS`), which no keymap row carries.
+    Also(&'static [crate::keymap::Action], &'static str),
 }
 type HelpSection = (&'static str, &'static [(HelpKeys, &'static str)]);
 const SETTINGS_W: u16 = 84;
@@ -967,7 +970,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // are for keys that belong to an overlay rather than the
             // grid, which is why they aren't rebindable.
             use crate::keymap::Action::*;
-            use HelpKeys::{Act, Lit};
+            use HelpKeys::{Act, Also, Lit};
             const LEFT: &[HelpSection] = &[
                 (
                     "NAVIGATE & SEARCH",
@@ -1093,6 +1096,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let keys_of = |k: &HelpKeys| -> String {
                 match k {
                     Lit(s) => (*s).to_string(),
+                    Also(actions, more) => {
+                        let shown = actions
+                            .iter()
+                            .map(|a| app.keymap.shown_label(*a))
+                            .collect::<Vec<_>>()
+                            .join(" / ");
+                        format!("{shown} {more}")
+                    }
                     Act(actions) => {
                         let full = actions
                             .iter()
@@ -3818,10 +3829,14 @@ fn editor_name(cmd: &str) -> &str {
 }
 
 /// The bottom bar, drawn under the splash and the collapsed view too,
-/// with the KEY COMBO DISPLAY on the padding row above it.
+/// with the KEY COMBO DISPLAY on the padding row above it — except beside
+/// the PANELS, whose padding row stays the breathing space it always was
+/// there.
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     draw_footer_bar(f, app, area);
-    draw_key_combo(f, app, area);
+    if !app.panels_active() {
+        draw_key_combo(f, app, area);
+    }
 }
 
 /// The KEY COMBO DISPLAY: the last key press
@@ -4114,6 +4129,8 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
         // overlay is: these are the first place a rebound key would start
         // lying.
         let k = |a| key_hint(app, a);
+        // The PANELS' `m` opens the cursor row's menu (`panels_view::menu_hint`).
+        let menu = panels_view::menu_hint(app);
         let text = match app.focus {
             // The pane is the CLOUD SESSION PANEL: there is no terminal to
             // type into, and Enter hands the session to the browser.
@@ -4164,7 +4181,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Focus::Terminal => "select a session and press Enter to attach".to_string(),
             Focus::Projects => format!(
-                "{}/{}: add  {}: rename  {}: remove  {}: search  {}: help",
+                "{}/{}: add  {}: rename  {}: remove  {}: search  {menu}{}: help",
                 k(Action::New),
                 k(Action::AddProject),
                 k(Action::Rename),
@@ -4175,7 +4192,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             // An open-PR row answers to a different set of verbs than a
             // checkout does, so the hint follows the cursor into the group.
             Focus::Worktrees if app.selected_worktree_pr().is_some() => format!(
-                "{}: new session  {}: preset  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: search  {}: help",
+                "{}: new session  {}: preset  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: search  {menu}{}: help",
                 k(Action::New),
                 k(Action::AgentPresets),
                 k(Action::Activate),
@@ -4187,7 +4204,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             // An issue row: the browser, a prompt or a preset on it, and
             // the pane's scroll keys.
             Focus::Worktrees if app.selected_worktree_issue().is_some() => format!(
-                "{}: open in browser  {}: prompt  {}: preset  PgUp/PgDn: scroll  {}: search  {}: help",
+                "{}: open in browser  {}: prompt  {}: preset  PgUp/PgDn: scroll  {}: search  {menu}{}: help",
                 k(Action::Activate),
                 k(Action::QuickPrompt),
                 k(Action::AgentPresets),
@@ -4195,7 +4212,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 k(Action::Help)
             ),
             Focus::Worktrees => format!(
-                "{}: new worktree  {}: presets  {}: {}  {}: open  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {}: help",
+                "{}: new worktree  {}: presets  {}: {}  {}: open  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {menu}{}: help",
                 k(Action::New),
                 k(Action::AgentPresets),
                 k(Action::Rename),
@@ -4224,7 +4241,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                     .is_some_and(|row| row.id().is_none()) =>
             {
                 format!(
-                    "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: help",
+                    "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {menu}{}: help",
                     k(Action::Activate),
                     k(Action::GitDiff),
                     k(Action::RefreshPullRequests),
@@ -4232,7 +4249,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 )
             }
             Focus::Sessions if app.selected_link().is_some() => format!(
-                "{}: open in browser  {}: edit URL  {}: delete  {}: help",
+                "{}: open in browser  {}: edit URL  {}: delete  {menu}{}: help",
                 k(Action::Activate),
                 k(Action::Rename),
                 k(Action::Delete),
@@ -4241,7 +4258,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             // A Cloud row leads out of nebula like a link row does; the
             // menu holds the one verb that reaches the session from here.
             Focus::Sessions if app.previewed_cloud().is_some() => format!(
-                "{}: open in browser  {}: rename  {}: archive  {}: del  {}: help",
+                "{}: open in browser  {}: rename  {}: archive  {}: del  {menu}{}: help",
                 k(Action::Activate),
                 k(Action::Rename),
                 k(Action::Archive),
@@ -4249,7 +4266,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 k(Action::Help)
             ),
             Focus::Sessions => format!(
-                "{}: focus  {}: agent  {}: presets  {}: terminal  {}: rename  {}: archive  {}: del  {}: help",
+                "{}: focus  {}: agent  {}: presets  {}: terminal  {}: rename  {}: archive  {}: del  {menu}{}: help",
                 k(Action::Activate),
                 k(Action::New),
                 k(Action::AgentPresets),
@@ -4259,6 +4276,12 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 k(Action::Delete),
                 k(Action::Help)
             ),
+        };
+        // A PANELS column folded to its RAIL leads the hints with the key
+        // that opens it again (`panels_view::restore_hints`).
+        let text = match panels_view::restore_hints(app) {
+            Some(restore) if !app.term_locked => format!("{restore}  {text}"),
+            _ => text,
         };
         Span::styled(text, Style::default().fg(th.dim))
     };
@@ -4282,8 +4305,19 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let crumbs = breadcrumb(app);
     if !crumbs.is_empty() {
         spans.extend(crumbs);
-        // No changed-file count here: it rides each card's branch, where
-        // it reads as that checkout's (`launcher_view::draw_card`).
+        // No changed-file count here on the GRID: it rides each card's
+        // branch, where it reads as that checkout's
+        // (`launcher_view::draw_card`). The PANELS have no card to carry
+        // it, so the selected checkout's count rides the breadcrumb, as
+        // it always did there.
+        if app.panels_active() {
+            if let Some(n) = app.selected_worktree_changes().filter(|n| *n > 0) {
+                spans.push(Span::styled(
+                    format!("  +{n} file{}", if n == 1 { "" } else { "s" }),
+                    Style::default().fg(th.warn),
+                ));
+            }
+        }
         spans.push(Span::styled("    ", Style::default()));
     }
     let mut hints = hints;

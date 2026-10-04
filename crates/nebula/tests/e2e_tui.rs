@@ -1116,18 +1116,18 @@ fn tui_layout_setting_switches_grid_and_panels_live() {
             }
             tui.send(TAB);
         }
+        // Each `j` waits for the repaint it causes (the highlight moves, so
+        // the styled screen changes) before the next look: no timing guess.
         for _ in 0..12 {
-            let deadline = Instant::now() + Duration::from_millis(400);
-            while Instant::now() < deadline {
-                if row_is_selected(tui.parser.lock().unwrap().screen(), "Layout") {
-                    tui.send(ENTER);
-                    tui.send(ESC);
-                    tui.wait_for_gone("Color theme");
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(20));
+            if row_is_selected(tui.parser.lock().unwrap().screen(), "Layout") {
+                tui.send(ENTER);
+                tui.send(ESC);
+                tui.wait_for_gone("Color theme");
+                return;
             }
+            let before = tui.parser.lock().unwrap().screen().contents_formatted();
             tui.send(b"j");
+            tui.wait_for("the cursor to move", |s| s.contents_formatted() != before);
         }
         panic!(
             "the Layout row never came under the cursor:\n{}",

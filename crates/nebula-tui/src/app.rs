@@ -80,6 +80,10 @@ pub enum HitTarget {
     /// (`panels::Columns::grab_zone`). Registered ahead of the rows, so a
     /// grab there never selects one.
     PanelsBorder(usize),
+    /// A PANELS column's fold button: the `◀` at the right end of its
+    /// title, which folds it to its RAIL, or the RAIL itself, which opens
+    /// it again (`event_loop::panels::click_fold`).
+    PanelsFold(Focus),
     TerminalPane,
     /// The session URL on the CLOUD SESSION PANEL; a click opens it in the
     /// browser. Registered ahead of the pane it sits on, so it wins.
@@ -2336,10 +2340,12 @@ impl<'a> WorktreeRow<'a> {
 }
 
 /// What a click landed on, for the double-click window. Sessions are their
-/// own reference; a checkout is its id.
+/// own reference; a link has none — a PANELS pull request, issue or link
+/// row — so its URL is the identity; a checkout is its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKey {
     Session(SessionRef),
+    Link(String),
     Worktree(WorktreeId),
 }
 
@@ -3322,6 +3328,21 @@ pub struct App {
     /// kept from a wider window come back with it. Remembered across
     /// restarts.
     pub panels_widths: Option<[u16; 3]>,
+    /// The PANELS' columns folded by hand to their RAILS — PROJECTS,
+    /// WORKTREES, SESSIONS — by their title's `◀`, their `⇧P` / `⇧B` /
+    /// `⇧S`, or `^B` for all three (`event_loop::panels`); mirrors
+    /// CONFIG.JSON's `hide_projects`, `hide_worktrees` and
+    /// `hide_sessions`, written as they change so a fold survives a
+    /// restart. A folded column keeps its `panels_widths` entry and opens
+    /// back up to it. What a frame folds is `panels::folds`, which adds
+    /// the SESSIONS fold beside a pull request or an issue.
+    pub panels_hidden: [bool; 3],
+    /// How many RECENT PROMPTS the PANELS' SESSIONS column hangs under
+    /// each live session's pill: the **Recent prompts** switch and
+    /// **Recent prompts shown** (Settings → Appearance, PANELS LAYOUT),
+    /// resolved through `Config::recent_prompts_shown` — 0 while off. The
+    /// GRID's cards carry the newest prompt whatever this says.
+    pub recent_prompts: usize,
     /// In-progress drag of a PANELS column's BORDER: the column, and
     /// `border column - grab column` at mouse-down, so the border tracks
     /// the pointer instead of jumping by one depending on which of the two
@@ -3907,6 +3928,8 @@ impl App {
             panels: false,
             panels_scroll: Default::default(),
             panels_widths: None,
+            panels_hidden: [false; 3],
+            recent_prompts: 0,
             panels_drag: None,
             hover_panels_border: None,
             launcher_all_open: false,
@@ -5353,7 +5376,7 @@ impl App {
     }
 
     /// The same for a checkout already in hand ([`App::sessions_in`]).
-    fn group_counts_in(&self, wt: &WorktreeId) -> (usize, usize) {
+    pub(crate) fn group_counts_in(&self, wt: &WorktreeId) -> (usize, usize) {
         let live = self
             .tree
             .agents
@@ -5484,6 +5507,17 @@ impl App {
         worktree_rollup(&self.tree, worktree_id)
     }
 
+    /// The cached changed-file count when it belongs to the selected
+    /// worktree; `None` while unknown or the checkout is unreadable. The
+    /// PANELS' footer carries it after the breadcrumb.
+    pub fn selected_worktree_changes(&self) -> Option<usize> {
+        let wt = self.selected_worktree()?;
+        match &self.git_changes {
+            Some((id, count)) if *id == wt.id => *count,
+            _ => None,
+        }
+    }
+
     /// Whether the checkout's row wears its pull request's merge instead of
     /// its sessions' status. The PR ROW keeps a merged pull request
     /// (`pull_requests` holds it, state and all), and a checkout whose
@@ -5533,10 +5567,14 @@ impl App {
 
     /// The two places FOCUS can rest: the LAUNCHER VIEW's GRID of cards
     /// and the PANE under them. The three columns the other variants name
-    /// are drawn only by the PANELS ([`App::panels_active`]), where all
-    /// four are places to rest.
+    /// are drawn only by the PANELS ([`App::panels_active`]), where the
+    /// pane and every column not folded are places to rest
+    /// (`panels::focus_open`).
     pub fn focus_visible(&self, focus: Focus) -> bool {
-        matches!(focus, Focus::Sessions | Focus::Terminal) || self.panels_active()
+        if self.panels_active() {
+            return crate::panels::focus_open(self, focus);
+        }
+        matches!(focus, Focus::Sessions | Focus::Terminal)
     }
 
     fn focus_rank(focus: Focus) -> u8 {
@@ -5597,16 +5635,6 @@ impl App {
 /// Test-only accessors: nothing in the app reads these any more.
 #[cfg(test)]
 impl App {
-    /// The cached changed-file count when it belongs to the selected
-    /// worktree; `None` while unknown or the checkout is unreadable.
-    pub fn selected_worktree_changes(&self) -> Option<usize> {
-        let wt = self.selected_worktree()?;
-        match &self.git_changes {
-            Some((id, count)) if *id == wt.id => *count,
-            _ => None,
-        }
-    }
-
     /// (live, archived) agent counts for the selected worktree.
     pub fn session_group_counts(&self) -> (usize, usize) {
         let Some(wt) = self.selected_worktree() else {
