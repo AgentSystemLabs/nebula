@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -225,17 +225,29 @@ pub enum ClientRequest {
         base: Option<String>,
     },
     /// `nebula spawn "<task>"`, run by the agent from inside its own
-    /// session: start a new AGENT beside it — same WORKTREE, and the same
-    /// AGENT KIND / MODEL / EFFORT unless `kind` names another harness —
-    /// with `starting_prompt` as the new CLI's first prompt, so it begins
-    /// the task at once. The caller's own process is untouched. Answered
-    /// with `Ack { created: Some(EntityId::Agent(..)) }`; the row reaches
-    /// every TUI as an ordinary `EntityUpserted`.
+    /// session: start a new AGENT beside it — same WORKTREE unless
+    /// `worktree` names a branch, and the same AGENT KIND / MODEL / EFFORT
+    /// unless `kind` names another harness — with `starting_prompt` as the
+    /// new CLI's first prompt, so it begins the task at once. The caller's
+    /// own process is untouched. Answered with `Ack { created:
+    /// Some(EntityId::Agent(..)) }`; the row reaches every TUI as an
+    /// ordinary `EntityUpserted`.
     SpawnSiblingAgent {
         req_id: u64,
         id: AgentId,
         kind: Option<AgentKind>,
         starting_prompt: String,
+        /// `--worktree <branch>`: start the session in the caller's
+        /// PROJECT's worktree on this branch instead, created (as
+        /// `EnterWorktree` creates one) when there is none. None: the
+        /// caller's own worktree.
+        #[serde(default)]
+        worktree: Option<String>,
+        /// `--base <ref>`: start point for a new `worktree` branch, resolved
+        /// and refused as `EnterWorktree`'s `base` is (a branch that
+        /// already exists is refused). Ignored without `worktree`.
+        #[serde(default)]
+        base: Option<String>,
     },
     /// `nebula open <file>…`, run by the agent from inside its own session:
     /// show these files to the user in every attached TUI's FILE TABS —

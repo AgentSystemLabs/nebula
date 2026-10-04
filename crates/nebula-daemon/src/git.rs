@@ -197,7 +197,18 @@ pub async fn add_worktree_off_default(repo: &Path, branch: &str) -> Result<PathB
 /// decides. The rewrite does not wait on the fetch succeeding: offline,
 /// `origin/main` as last fetched is still never behind the local branch's
 /// last pull, and the daemon log says the fetch failed.
+///
+/// A `branch` that already exists locally is refused: it already has a
+/// start point, and `add_worktree_inner`'s fallback would check it out
+/// with `base` dropped without a word — so a session reported as started
+/// off `base` would run on the branch's own history instead.
 pub async fn add_worktree_off_ref(repo: &Path, branch: &str, base: &str) -> Result<PathBuf> {
+    if local_branch(repo, branch).await {
+        bail!(
+            "branch `{branch}` already exists; --base only applies to a new branch — run it \
+             again without --base to use the branch as it is"
+        );
+    }
     fetch_origin_if_any(repo).await;
     match origin_branch(repo, base).await {
         Some(remote) => add_worktree_inner(repo, branch, Some(&remote), false).await,
@@ -1059,6 +1070,28 @@ mod tests {
         let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
         assert_eq!(head, local_head, "HEAD is this checkout's, not origin's");
         assert_ne!(head, landed);
+    }
+
+    /// A named base is refused for a branch that already exists without a
+    /// worktree — a kept branch of a deleted checkout — instead of being
+    /// dropped by the check-out-the-existing-branch fallback.
+    #[tokio::test]
+    async fn a_named_base_is_refused_for_a_branch_that_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        git(&repo, &["tag", "v1"]).await.unwrap();
+        git(&repo, &["branch", "hotfix"]).await.unwrap();
+
+        let err = add_worktree_off_ref(&repo, "hotfix", "v1")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(
+            !worktree_dir(&repo, "hotfix").exists(),
+            "nothing is checked out"
+        );
     }
 
     /// The `worktree_base_branch` SETTING says `main` while the checkout's

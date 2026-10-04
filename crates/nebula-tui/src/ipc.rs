@@ -315,21 +315,42 @@ pub async fn rename_current_agent(title: &str, mode: RenameMode) -> Result<()> {
     Ok(())
 }
 
-/// CLI: `nebula spawn "<task>" [--kind <claude|codex|cursor>]` from inside
-/// an agent session — ask the daemon to start a new agent beside this one,
-/// in the same worktree, opening on `task` as its first prompt. The caller
-/// is untouched: no relocation, no turn-end wait. Never spawns a daemon: no
-/// daemon means no session to sit beside.
+/// CLI: `nebula spawn "<task>" [--kind <claude|codex|cursor>] [--worktree
+/// <branch> [--base <ref>]]` from inside an agent session — ask the daemon
+/// to start a new agent beside this one, in the same worktree or in the
+/// project's worktree on `worktree` (created when the branch has none),
+/// opening on `task` as its first prompt. The caller is untouched: no
+/// relocation, no turn-end wait. Never spawns a daemon: no daemon means no
+/// session to sit beside.
 ///
 /// What this prints is read by the model that ran it, so it says what
 /// happened and that this session carries on. A daemon-side refusal (a
-/// blank task, a missing CLI) is a nonzero exit the model reports.
-pub async fn spawn_sibling_for_current_agent(task: &str, kind: Option<AgentKind>) -> Result<()> {
+/// blank task, a missing CLI, a worktree git could not create) is a
+/// nonzero exit the model reports.
+pub async fn spawn_sibling_for_current_agent(
+    task: &str,
+    kind: Option<AgentKind>,
+    worktree: Option<String>,
+    base: Option<String>,
+) -> Result<()> {
     let agent_id = current_agent_id("spawn")?;
     let task = task.trim();
     if task.is_empty() {
         bail!("the task is empty — `nebula spawn \"<task>\"` needs the work the new session starts on");
     }
+    // The words become a branch as `nebula worktree`'s do, so both
+    // commands land on the same branch for the same words. Unlike there, no
+    // name is invented for a blank one: a spawn names where its work goes.
+    let worktree = match worktree.as_deref().map(crate::branch_name::slugify) {
+        Some(slug) if slug.is_empty() => {
+            bail!("the branch is empty — `nebula spawn --worktree <branch>` needs a branch name")
+        }
+        other => other,
+    };
+    let base = match base.as_deref().map(str::trim) {
+        Some("") => bail!("the base is empty — `--base <ref>` needs a branch, tag or commit"),
+        other => other.map(str::to_string),
+    };
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
         bail!("no nebula daemon is running — no session started");
@@ -343,13 +364,19 @@ pub async fn spawn_sibling_for_current_agent(task: &str, kind: Option<AgentKind>
             id: AgentId(agent_id),
             kind,
             starting_prompt: task.to_string(),
+            worktree: worktree.clone(),
+            base,
         },
     )
     .await?;
     await_ack(&mut conn, req_id).await?;
     let harness = kind.map(|k| format!("{} ", k.as_str())).unwrap_or_default();
+    let place = match &worktree {
+        Some(branch) => format!("the worktree on branch \"{branch}\""),
+        None => "this worktree".to_string(),
+    };
     println!(
-        "started a new {harness}session in this worktree; it is working on that task now and \
+        "started a new {harness}session in {place}; it is working on that task now and \
          shows in the sessions list. This session is unaffected — carry on."
     );
     Ok(())

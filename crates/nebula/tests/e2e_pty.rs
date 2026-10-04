@@ -4115,6 +4115,123 @@ async fn nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree() {
         "agent-3"
     );
 
+    // `--worktree` starts it in the project's worktree on that branch,
+    // cutting one first (the words slugified as `nebula worktree` does).
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "feat login", "port the tests"],
+    );
+    assert!(
+        out.status.success(),
+        "nebula spawn --worktree failed: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("branch \"feat-login\""),
+        "stdout names the branch: {out:?}"
+    );
+    let worktree_of = |evs: &[ServerEvent]| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "feat-login" => Some(w.clone()),
+            _ => None,
+        })
+    };
+    let in_worktree = |evs: &[ServerEvent], worktree: &nebula_core::WorktreeId| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if &a.worktree_id == worktree && a.alive => Some(a.clone()),
+            _ => None,
+        })
+    };
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        worktree_of(evs).is_some_and(|w| in_worktree(evs, &w.id).is_some())
+    })
+    .await;
+    let feat = worktree_of(&events).unwrap();
+    assert!(!feat.is_main && feat.path.is_dir(), "a real new checkout");
+    let spawned = in_worktree(&events, &feat.id).unwrap();
+    assert_eq!(spawned.kind, AgentKind::Claude, "the caller's harness");
+    assert_eq!(spawned.name, "agent-1", "named against its own worktree");
+    let caller_row = events.iter().rev().find_map(|e| match e {
+        ServerEvent::EntityUpserted {
+            entity: Entity::Agent(a),
+        } if a.id == caller => Some(a.clone()),
+        _ => None,
+    });
+    assert!(
+        caller_row.is_none_or(|a| a.worktree_id == main_worktree.id),
+        "the caller stays in its own worktree"
+    );
+    // Asked again, the same branch reuses that checkout.
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "feat-login", "review it"],
+    );
+    assert!(out.status.success(), "reusing the worktree failed: {out:?}");
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.worktree_id == feat.id && a.name == "agent-2" && a.alive)
+        })
+    })
+    .await;
+    assert!(
+        worktree_of(&events).is_none(),
+        "no second worktree for the same branch"
+    );
+
+    // A start point for a branch that already has a checkout is refused,
+    // never silently dropped, and nothing is spawned for it.
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "feat-login", "--base", "main", "x"],
+    );
+    assert!(
+        !out.status.success(),
+        "--base on an existing worktree: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already has a worktree"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // So is one for a branch kept without a checkout (a deleted worktree's).
+    let kept = std::process::Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "branch", "kept"])
+        .output()
+        .unwrap();
+    assert!(kept.status.success(), "git branch: {kept:?}");
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "kept", "--base", "main", "x"],
+    );
+    assert!(!out.status.success(), "--base on a kept branch: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already exists"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--base` means nothing without `--worktree`, or blank.
+    let out = agent_cli(&env, &caller, &["spawn", "--base", "main", "x"]);
+    assert!(!out.status.success(), "--base alone must fail: {out:?}");
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "feat-login", "--base", " ", "x"],
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("base is empty"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     // A bad harness name and a blank task are the CLI's own refusals.
     let out = agent_cli(&env, &caller, &["spawn", "--kind", "gemini", "x"]);
     assert!(!out.status.success(), "unknown harness must fail: {out:?}");
