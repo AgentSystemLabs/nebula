@@ -14,6 +14,7 @@ nebula-daemon = { workspace = true }
 nebula-tui = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive", "wrap_help"] }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
