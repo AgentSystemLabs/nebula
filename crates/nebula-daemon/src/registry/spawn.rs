@@ -199,7 +199,7 @@ impl Daemon {
                 DEFAULT_COLS,
                 DEFAULT_ROWS,
                 cloud_prompt.as_deref(),
-                starting_prompt.as_deref(),
+                starting_prompt.as_deref().map(FirstPrompt::Task),
             );
             self.rollback_agent_on_spawn_error(&agent.id, spawned)?;
         }
@@ -344,11 +344,12 @@ impl Daemon {
         rows: u16,
     ) -> Result<Arc<PtySession>> {
         self.spawn_agent_session_with(agent, worktree, cols, rows, None, None)
+            .map(|spawned| spawned.session)
     }
 
     /// The general spawn: `cloud_task` makes it a Claude Cloud dispatch
     /// (`claude --cloud <task>`, which creates the session, prints its id
-    /// and exits), `initial_prompt` a first turn the CLI submits on its own
+    /// and exits), `first_prompt` a first turn the CLI submits on its own
     /// (the relocation notice a `nebula worktree` respawn opens with, or the
     /// prefix + task + postfix an AGENT PRESET launch composes). Both
     /// are intentionally transient: later restarts/resumes follow the
@@ -362,8 +363,8 @@ impl Daemon {
         cols: u16,
         rows: u16,
         cloud_task: Option<&str>,
-        initial_prompt: Option<&str>,
-    ) -> Result<Arc<PtySession>> {
+        first_prompt: Option<FirstPrompt<'_>>,
+    ) -> Result<Spawned> {
         // A session the user sent to Claude's background (`/background`)
         // can't be resumed, only attached to — see `claude_bg`. The probe
         // costs a login shell, so it hides behind the one-`stat` hint.
@@ -378,14 +379,14 @@ impl Daemon {
             cols,
             rows,
             cloud_task,
-            initial_prompt,
+            first_prompt,
             attach.as_deref(),
         )
     }
 
     /// [`Self::spawn_agent_session_with`] past its look for a backgrounded
     /// Claude session: `attach` is the id `claude attach` takes, and wins
-    /// over a resume of the stored session id — and over `initial_prompt`,
+    /// over a resume of the stored session id — and over `first_prompt`,
     /// which `attach` has no way to submit.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_agent_pty(
@@ -395,9 +396,9 @@ impl Daemon {
         cols: u16,
         rows: u16,
         cloud_task: Option<&str>,
-        initial_prompt: Option<&str>,
+        first_prompt: Option<FirstPrompt<'_>>,
         attach: Option<&str>,
-    ) -> Result<Arc<PtySession>> {
+    ) -> Result<Spawned> {
         // Before anything touches the path: the hook install below creates
         // its directories, so a spawn into a deleted checkout would recreate
         // it as an empty folder and resume the agent there.
@@ -453,6 +454,7 @@ impl Daemon {
         // sent a prompt, or a session Claude's cleanup has deleted — resumes
         // into "No conversation found" and a dead pane: boot fresh instead.
         // An override (tests) never resumes, so it skips the look.
+        let had_session = agent.session_id.is_some();
         let unresumable;
         let agent = match agent.session_id.as_deref() {
             Some(sid)
@@ -474,6 +476,12 @@ impl Daemon {
             }
             _ => agent,
         };
+        // The one resume decision, past the fresh-boot look above: the
+        // command, the rule's placement and a relocation's notice all read
+        // it, so the notice is picked from what this spawn really does.
+        let plain_launch = cloud_task.is_none() && attach.is_none() && cmd_override.is_none();
+        let resume_sid = resume_session_id(agent, &harness, !plain_launch);
+        let initial_prompt = pick_first_prompt(first_prompt, resume_sid.is_some());
         // A PR SESSION's rule — or an ISSUE SESSION's — rides Claude's
         // system prompt, or opens a Codex / Cursor cold spawn as its first
         // prompt (see `pr_scope`). Rebuilt from the row's *current*
@@ -508,7 +516,9 @@ impl Daemon {
         let rule = crate::pr_scope::combined_rule(scope.as_ref(), issue_scope.as_ref());
         let prompts = crate::pr_scope::launch_prompts(
             harness.system.append_flag.is_some(),
-            agent.session_id.is_some(),
+            // An attach reopens the conversation too: the rule stays out
+            // of a first prompt it has no way to submit.
+            resume_sid.is_some() || attach.is_some(),
             rule.as_deref(),
             initial_prompt,
         );
@@ -534,7 +544,7 @@ impl Daemon {
             }
             (None, None) => agent_spawn_command_with(
                 &harness,
-                agent.session_id.as_deref(),
+                resume_sid,
                 Some(&worktree.path),
                 agent.model.as_deref(),
                 agent.effort.as_deref(),
@@ -543,6 +553,19 @@ impl Daemon {
                 prompts.system.as_deref(),
                 true,
             ),
+        };
+        // Whether the CLI is handed a first turn — a task, a notice or a
+        // scope rule — which `attach` drops. An override (tests) stands in
+        // for a CLI that would have taken it.
+        let prompted = prompts.initial.is_some() && attach.is_none();
+        // A stored conversation this spawn does not bring back: not an
+        // attach (which reopens it) or a stand-in, and a harness that
+        // resumes at all.
+        let lost_session = had_session && plain_launch && harness.resumes() && resume_sid.is_none();
+        // A relocation's lost notice, kept for a resume that fails fast.
+        let fresh_prompt = match first_prompt {
+            Some(FirstPrompt::Relocation { fresh, .. }) if resumed => Some(fresh.to_string()),
+            _ => None,
         };
         // Run the agent through the user's login+interactive shell so it sees
         // the same env as a Terminal.app tab (~/.zprofile, ~/.zshrc,
@@ -586,6 +609,7 @@ impl Daemon {
                         spawned_at: Instant::now(),
                         cols,
                         rows,
+                        fresh_prompt,
                     },
                 );
             } else {
@@ -602,7 +626,11 @@ impl Daemon {
         if agent.kind == AgentKind::Cursor {
             session.arm_question_scan();
         }
-        Ok(session)
+        Ok(Spawned {
+            session,
+            prompted,
+            lost_session,
+        })
     }
 
     /// A resumed session (`claude --resume` / `codex resume` /
@@ -612,7 +640,13 @@ impl Daemon {
     /// only, so a restart or relocation that killed the PTY on purpose (and
     /// has respawned it already) never gets a second CLI. (`pi --session-id`
     /// creates a missing id instead of dying, so pi never lands here.)
-    pub(super) fn respawn_failed_resume(self: &Arc<Self>, id: &AgentId, cols: u16, rows: u16) {
+    pub(super) fn respawn_failed_resume(
+        self: &Arc<Self>,
+        id: &AgentId,
+        cols: u16,
+        rows: u16,
+        fresh_prompt: Option<String>,
+    ) {
         // `ensure_session`'s gate: an Attach reaching for the dead session
         // right now must not fork a CLI beside this one.
         let _gate = self.spawn_gate.lock();
@@ -666,10 +700,26 @@ impl Daemon {
         if let Err(e) = self.store.set_agent_session_id(id, None) {
             tracing::warn!(agent = %id, error = %e, "clear session id failed");
         }
+        // A relocation's resume that failed: the fresh CLI says the
+        // conversation was lost rather than opening silent, and, working
+        // on that notice from the moment it boots, is seeded as a launch
+        // like the relocation's own respawn.
         if self
-            .spawn_agent_session(&agent, &worktree, cols, rows)
+            .spawn_agent_session_with(
+                &agent,
+                &worktree,
+                cols,
+                rows,
+                None,
+                fresh_prompt.as_deref().map(FirstPrompt::Task),
+            )
             .is_ok()
         {
+            if fresh_prompt.is_some() {
+                self.status_machines
+                    .lock()
+                    .insert(id.clone(), AgentStatusMachine::launching());
+            }
             agent.alive = true;
             self.broadcast(ServerEvent::EntityUpserted {
                 entity: Entity::Agent(agent),
