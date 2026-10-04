@@ -10,7 +10,9 @@
 //!
 //! Every row registers a `HitTarget::PanelsRow` ahead of its column's
 //! `PanelBg`, so a click lands on the row and a click on the air under the
-//! rows only takes FOCUS.
+//! rows only takes FOCUS. Each column's BORDER — its rule and the cell
+//! after it — registers a `HitTarget::PanelsBorder` ahead of them all, and
+//! wears a grip that lights while it is hovered or dragged.
 
 use super::{
     ago_badge, draw_focus_tint, draw_terminal, fit_ago, key_hint, render_button, row_rect,
@@ -40,11 +42,20 @@ const ROOT_GLYPH: &str = " ⌂";
 const RUN_BADGE: &str = " ▶";
 /// What hangs a checkout under the pull request on its head branch.
 const NESTED_INDENT: &str = "└";
+/// Rows a BORDER's grip runs down the middle of its rule: the LAUNCHER
+/// VIEW's pane grip beside the cards is as tall.
+const GRIP_H: u16 = 4;
 
 /// The PANELS over `body`: the three columns and the pane beside them.
 pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     app.body_area = body;
-    let cols = crate::panels::columns(body);
+    let cols = crate::panels::columns(body, app.panels_widths);
+    // The BORDERS first, so they win `hit_at`'s first-match scan against
+    // the row, or the pane, a grab cell lands on.
+    for i in 0..3 {
+        app.hits
+            .push((cols.grab_zone(i), HitTarget::PanelsBorder(i)));
+    }
     draw_projects(f, app, cols.projects);
     draw_worktrees(f, app, cols.worktrees);
     draw_sessions(f, app, cols.sessions);
@@ -62,6 +73,36 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
         }
     };
     draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+    draw_grips(f.buffer_mut(), app, &cols, body);
+}
+
+/// The grip on each column's rule: a short heavy stretch down its middle,
+/// the one visible sign that the BORDER can be dragged — muted at rest,
+/// the accent while the pointer rests on it or while it is being dragged,
+/// as the LAUNCHER VIEW's pane grip is.
+fn draw_grips(
+    buf: &mut ratatui::buffer::Buffer,
+    app: &App,
+    cols: &crate::panels::Columns,
+    body: Rect,
+) {
+    let th = app.theme;
+    if body.height < GRIP_H + 2 {
+        return; // no room for the grip and rule either side of it
+    }
+    let top = body.y + (body.height - GRIP_H) / 2;
+    for i in 0..3 {
+        let x = cols.border(i).saturating_sub(1);
+        let active =
+            app.panels_drag.map(|(at, _)| at) == Some(i) || app.hover_panels_border == Some(i);
+        let fg = if active { th.accent } else { th.muted };
+        for y in top..top + GRIP_H {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol("┃");
+                cell.set_style(Style::default().fg(fg));
+            }
+        }
+    }
 }
 
 /// A column's frame: its rule down the right, a blank row, the title with
@@ -218,6 +259,7 @@ pub(super) fn help_sections() -> (&'static [HelpSection], &'static [HelpSection]
                 (Lit("⌥click"), "open URL / file under cursor"),
                 (Lit("⇧drag"), "select via your terminal"),
                 (Lit("right-click"), "row menu: run, restart"),
+                (Lit("drag a border"), "resize the column"),
                 (Lit("click outside"), "dismiss any modal (= Esc)"),
             ],
         ),

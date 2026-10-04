@@ -113,6 +113,7 @@ pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut V
         // the pane itself takes.
         Some(
             HitTarget::LauncherPaneSplitter
+            | HitTarget::PanelsBorder(_)
             | HitTarget::LauncherCrumb
             | HitTarget::LauncherTab(_)
             | HitTarget::LauncherTabClose(_)

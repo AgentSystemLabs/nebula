@@ -5,8 +5,9 @@
 //! (`move_selection`), Enter into the pane, and every verb that reads the
 //! selection — so this module only takes the keys the GRID owns and gives
 //! them their panel meaning, or a word saying they have none here
-//! ([`handle_action`]), and translates a click on a row ([`click_row`]) or
-//! a notch of the wheel over a column ([`wheel`]).
+//! ([`handle_action`]), and translates a click on a row ([`click_row`]), a
+//! drag of a column's BORDER ([`grab_border`], [`move_border`]) or a
+//! notch of the wheel over a column ([`wheel`]).
 
 use super::{
     activate, attach_selected, is_double_click, jump_attention, launcher, select_project_row,
@@ -185,6 +186,33 @@ pub(super) fn click_row(app: &mut App, row: Row, out: &mut Vec<ClientRequest>) {
     }
 }
 
+/// A press on a PANELS column's BORDER (`HitTarget::PanelsBorder`) at
+/// screen column `x`: a resize drag armed, as quietly as the LAUNCHER
+/// VIEW's pane edge arms one — no row selected, no FOCUS taken. The offset
+/// from the grabbed cell to the border is kept so the border does not jump
+/// by one depending on which of its two grab cells was caught; the border
+/// is measured by the arithmetic the draw laid it out with.
+pub(super) fn grab_border(app: &mut App, column: usize, x: u16) {
+    let border = crate::panels::columns(app.body_area, app.panels_widths).border(column);
+    app.panels_drag = Some((column, i32::from(border) - i32::from(x)));
+}
+
+/// The pointer at screen column `x` with a BORDER held: the border follows
+/// it (`panels::drag_border`, which holds the column and the pane to their
+/// floors) and the width is remembered. The PANE takes up what the columns
+/// leave, and its PTY is resized to that once the frame has drawn it
+/// (`sync_pty_size`), as it is when the window itself resizes.
+pub(super) fn move_border(app: &mut App, x: u16) {
+    let Some((column, grab)) = app.panels_drag else {
+        return;
+    };
+    let to = i32::from(x) + grab;
+    if let Some(widths) = crate::panels::drag_border(app.body_area, app.panels_widths, column, to) {
+        app.panels_widths = Some(widths);
+    }
+    app.dirty = true;
+}
+
 /// Lines a notch of the wheel scrolls a PANELS column: a third of the
 /// GRID's card, as `launcher::GRID_WHEEL_ROWS`.
 const WHEEL_LINES: isize = 3;
@@ -214,8 +242,10 @@ pub(super) fn wheel(app: &mut App, over: Option<&HitTarget>, up: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{buffer_text, hse, press, seed_tree, with_config_json};
-    use super::super::{apply_config, handle_mouse};
-    use crate::app::{App, Focus, HitTarget, Overlay, PromptKind};
+    use super::super::{
+        apply_config, handle_mouse, restore_ui_state, sync_pty_size, ui_state_json,
+    };
+    use crate::app::{App, AttachedTerm, Focus, HitTarget, Overlay, PointerShape, PromptKind};
     use crate::panels::Row;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use nebula_core::{
@@ -720,6 +750,163 @@ mod tests {
         assert_eq!(app.focus, Focus::Terminal);
     }
 
+    /// One mouse event at a cell, unmodified.
+    fn mouse_at(
+        app: &mut App,
+        kind: MouseEventKind,
+        (column, row): (u16, u16),
+        out: &mut Vec<ClientRequest>,
+    ) {
+        let modifiers = KeyModifiers::NONE;
+        handle_mouse(
+            app,
+            MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers,
+            },
+            out,
+        );
+    }
+
+    /// Column `i`'s rule, a few rows down: the left of its BORDER's two
+    /// grab cells.
+    fn rule_cell(app: &App, i: usize) -> (u16, u16) {
+        let zone = app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == HitTarget::PanelsBorder(i))
+            .map(|(r, _)| *r)
+            .unwrap_or_else(|| panic!("border {i} is not on screen"));
+        (zone.x, zone.y + 5)
+    }
+
+    /// A press on a BORDER arms a drag that keeps its grab offset, moves no
+    /// cursor or FOCUS and selects nothing; the motion resizes the one
+    /// column, the release ends it, and the pane — and the PTY in it —
+    /// take up what the column gave or took.
+    #[test]
+    fn dragging_a_border_resizes_its_column_and_the_pane_follows() {
+        let mut app = panels_app();
+        let mut out = Vec::new();
+        app.focus = Focus::Projects;
+        draw(&mut app);
+        let sref = app.selected_session_row().and_then(|r| r.sref()).unwrap();
+        app.term = Some(AttachedTerm::new(sref, 40, 10));
+        draw(&mut app);
+        sync_pty_size(&mut app, &mut out);
+        out.clear();
+        let pane = app.term_area;
+        let cursors = (app.sel_project, app.sel_worktree, app.sel_session);
+        let (x, y) = rule_cell(&app, 1);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        mouse_at(&mut app, down, (x, y), &mut out);
+        assert_eq!(app.panels_drag, Some((1, 1)), "one short of the border");
+        assert_eq!(app.pointer_shape, PointerShape::ColResize);
+        assert_eq!(app.hover_panels_border, Some(1));
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        mouse_at(&mut app, drag, (x + 8, y), &mut out);
+        assert_eq!(app.panels_widths, Some([20, 30, 32]));
+        mouse_at(&mut app, drag, (x + 3, y), &mut out);
+        assert_eq!(app.panels_widths, Some([20, 25, 32]), "and back");
+        assert_eq!(
+            cursors,
+            (app.sel_project, app.sel_worktree, app.sel_session)
+        );
+        assert_eq!(app.focus, Focus::Projects, "FOCUS stays");
+        assert!(app.term_selection.is_none(), "nothing selected");
+        assert!(out.is_empty(), "{out:?}");
+        let up = MouseEventKind::Up(MouseButton::Left);
+        mouse_at(&mut app, up, (x + 3, y), &mut out);
+        assert!(app.panels_drag.is_none(), "mouse-up ends the drag");
+        draw(&mut app);
+        assert_eq!(
+            (app.term_area.x, app.term_area.width),
+            (pane.x + 3, pane.width - 3)
+        );
+        sync_pty_size(&mut app, &mut out);
+        assert!(
+            out.iter().any(
+                |r| matches!(r, ClientRequest::Resize { cols, .. } if *cols == pane.width - 3)
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// Dragged off either end, the column rests at its floor and the pane
+    /// at its own; the drag holds the resize arrows past the grab zone.
+    #[test]
+    fn a_border_drag_stops_at_both_floors() {
+        use crate::panels::{MIN_PANE_W, MIN_W};
+        let mut app = panels_app();
+        let mut out = Vec::new();
+        draw(&mut app);
+        let body = app.body_area;
+        let (x, y) = rule_cell(&app, 0);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        mouse_at(&mut app, down, (x, y), &mut out);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        mouse_at(&mut app, drag, (0, y), &mut out);
+        assert_eq!(app.panels_widths, Some([MIN_W, 22, 32]));
+        mouse_at(&mut app, drag, (body.right() - 1, y), &mut out);
+        let [p, w, s] = app.panels_widths.unwrap();
+        assert_eq!((w, s), (22, 32), "only the dragged column moved");
+        assert_eq!(body.width - (p + w + s), MIN_PANE_W);
+        assert_eq!(app.pointer_shape, PointerShape::ColResize);
+        assert_eq!(app.hover_panels_border, Some(0), "the grip stays lit");
+    }
+
+    /// The pointer resting on a BORDER asks for the resize arrows and
+    /// lights that border's grip; moved off, both rest again.
+    #[test]
+    fn hovering_a_border_lights_its_grip() {
+        let mut app = panels_app();
+        let mut out = Vec::new();
+        draw(&mut app);
+        let (x, y) = rule_cell(&app, 2);
+        mouse_at(&mut app, MouseEventKind::Moved, (x + 1, y), &mut out);
+        assert_eq!(app.pointer_shape, PointerShape::ColResize);
+        assert_eq!(app.hover_panels_border, Some(2));
+        let (terminal, _) = draw(&mut app);
+        let lit = |i: usize| {
+            let x = rule_cell(&app, i).0;
+            let buf = terminal.backend().buffer();
+            (0..buf.area.height).any(|y| {
+                let cell = &buf[(x, y)];
+                cell.symbol() == "┃" && cell.fg == app.theme.accent
+            })
+        };
+        assert!(lit(2), "the hovered grip is lit");
+        assert!(!lit(0) && !lit(1), "the others rest");
+        mouse_at(&mut app, MouseEventKind::Moved, (x - 5, y), &mut out);
+        assert_eq!(app.pointer_shape, PointerShape::Default);
+        assert_eq!(app.hover_panels_border, None);
+    }
+
+    /// The widths a drag left outlive a restart; a blob from before there
+    /// were any opens the columns at their defaults, and a nonsense one is
+    /// held to sane widths.
+    #[test]
+    fn the_dragged_widths_outlive_a_restart() {
+        let mut app = panels_app();
+        app.panels_widths = Some([30, 15, 40]);
+        let json = ui_state_json(&app);
+        let mut next = panels_app();
+        restore_ui_state(&mut next, &json);
+        assert_eq!(next.panels_widths, Some([30, 15, 40]));
+        restore_ui_state(&mut next, r#"{"show_archived":false,"collapsed":false}"#);
+        assert_eq!(next.panels_widths, None, "an older blob: the defaults");
+        restore_ui_state(
+            &mut next,
+            r#"{"show_archived":false,"collapsed":false,"panels_widths":[0,9999,40]}"#,
+        );
+        assert_eq!(
+            next.panels_widths,
+            Some([crate::panels::MIN_W, super::super::MAX_RESTORED_WIDTH, 40])
+        );
+    }
+
     /// `?` beside the columns teaches the columns' keys, not the grid's
     /// cards and project tabs.
     #[test]
@@ -741,6 +928,7 @@ mod tests {
             "session: follow-up modal",
             "fold the ARCHIVED group",
             "project tabs: none here",
+            "resize the column",
         ] {
             assert!(text.contains(want), "{want}: {text}");
         }

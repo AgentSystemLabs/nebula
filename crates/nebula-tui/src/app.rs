@@ -75,6 +75,11 @@ pub enum HitTarget {
     /// (`crate::panels::Row`). Registered ahead of its column's
     /// `PanelBg`, so it wins.
     PanelsRow(crate::panels::Row),
+    /// The draggable BORDER on a PANELS column's right — its rule and the
+    /// cell after it — by the column's index, PROJECTS first
+    /// (`panels::Columns::grab_zone`). Registered ahead of the rows, so a
+    /// grab there never selects one.
+    PanelsBorder(usize),
     TerminalPane,
     /// The session URL on the CLOUD SESSION PANEL; a click opens it in the
     /// browser. Registered ahead of the pane it sits on, so it wins.
@@ -2858,6 +2863,11 @@ pub struct UiState {
     /// blobs, which open with it showing.
     #[serde(default)]
     pub launcher_pane_hidden: bool,
+    /// Widths the PANELS' columns were dragged to; absent in older blobs,
+    /// and None in ones written before a BORDER was ever dragged, both of
+    /// which open the columns at `panels::WIDTHS`.
+    #[serde(default)]
+    pub panels_widths: Option<[u16; 3]>,
     /// The band left open as the ACCORDION
     /// ([`App::launcher_expanded`]), by its worktree id; absent, or None,
     /// in blobs saved before there was one, which open with every band
@@ -3305,6 +3315,22 @@ pub struct App {
     /// column under its cursor, which stays put, and a move of the
     /// cursor brings it back on screen. Drawn by `ui::panels_view`.
     pub panels_scroll: [crate::panels::ColumnScroll; 3],
+    /// Widths the PANELS' columns were dragged to by their BORDERS —
+    /// PROJECTS, WORKTREES, SESSIONS — in columns; None until one is,
+    /// which opens them at `panels::WIDTHS`. Re-fitted to the body on
+    /// every draw (`panels::columns`) without being rewritten, so widths
+    /// kept from a wider window come back with it. Remembered across
+    /// restarts.
+    pub panels_widths: Option<[u16; 3]>,
+    /// In-progress drag of a PANELS column's BORDER: the column, and
+    /// `border column - grab column` at mouse-down, so the border tracks
+    /// the pointer instead of jumping by one depending on which of the two
+    /// grab cells was caught (`event_loop::panels::grab_border`).
+    pub panels_drag: Option<(usize, i32)>,
+    /// The column whose BORDER is under the mouse, or being dragged: its
+    /// grip lights up. Carries `hover_launcher_pane`'s caveat — only
+    /// terminals that report plain motion set it before a drag.
+    pub hover_panels_border: Option<usize>,
     /// Every BAND is laid out open at once — its cards wrapped into rows,
     /// or every entry of the LIST listed — and there is no ACCORDION:
     /// Settings → Appearance → **Expand all worktrees**
@@ -3880,6 +3906,9 @@ impl App {
             launcher_list: false,
             panels: false,
             panels_scroll: Default::default(),
+            panels_widths: None,
+            panels_drag: None,
+            hover_panels_border: None,
             launcher_all_open: false,
             launcher_pane_hidden: false,
             launcher_expanded: None,
@@ -4520,16 +4549,18 @@ impl App {
 
     /// Is the left button down, as far as nebula knows — a press came and
     /// its release has not: a panel splitter being dragged (the LAUNCHER
-    /// VIEW's pane edge, the diff and tree modals' file-list border), a
-    /// program in the pane holding the button, or a drag-selection under
-    /// way? While it is, the host terminal is left exactly as it is:
-    /// re-asking it for its modes mid-drag is a change under a gesture in
-    /// progress, and xterm.js (`nebula browser`) takes the `?1000h` in
-    /// that re-ask as the end of the drag — it drops its motion listener
-    /// and reports nothing more until the next press. A motion report
-    /// with no button named is still the drag.
+    /// VIEW's pane edge, a PANELS column's BORDER, the diff and tree
+    /// modals' file-list border), a program in the pane holding the
+    /// button, or a drag-selection under way? While it is, the host
+    /// terminal is left exactly as it is: re-asking it for its modes
+    /// mid-drag is a change under a gesture in progress, and xterm.js
+    /// (`nebula browser`) takes the `?1000h` in that re-ask as the end of
+    /// the drag — it drops its motion listener and reports nothing more
+    /// until the next press. A motion report with no button named is
+    /// still the drag.
     pub fn mouse_held(&self) -> bool {
         let splitter = self.launcher_pane_drag.is_some()
+            || self.panels_drag.is_some()
             || match &self.overlay {
                 Some(Overlay::Diff(view)) => view.files_drag.is_some(),
                 Some(Overlay::Tree(view)) => view.files_drag.is_some(),

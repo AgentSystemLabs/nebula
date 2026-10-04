@@ -507,6 +507,8 @@ above works from it, on the selection the columns show.
   into it.
 - `n` in SESSIONS is the NEW SESSION PICKER for the selected checkout, `p` the QUICK PROMPT, `Space`
   the FOLLOW-UP MODAL. The breadcrumb in the footer reads `project ▸ worktree ▸ session`.
+- Dragging a column's right border resizes it, the pane taking up the difference; the widths are
+  remembered across restarts.
 
 The cards' own extras — the last prompt and line counts on a card, the header's PR and issue
 counts, the pane's terminal strip — are the grid's and have no column here.

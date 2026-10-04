@@ -140,6 +140,7 @@ PROJECTS column lists every project and stands in for the PROJECT TABS.
 | `x`, `1`–`9`, `+`, `` ` ``, `` ^` `` | grid-only — the PROJECT TABS, the pane's terminal strip and its fold have nothing to act on here, and the footer says so |
 | click | a row selects it and its column takes the keys, a second click is `Enter` on it; a click on a group header (`OPEN PRS`, `ISSUES`, `ARCHIVED`) folds it; a click on the pane steps into it |
 | wheel | over a column longer than the screen: scroll it under the cursor, which stays put; the next key that moves the cursor brings it back on screen. `?` lists the panels' keys while they are up |
+| drag a border | a column's right border — its rule, with the grip down its middle — resizes that column, and the pane takes up the difference; a column stops at 10 columns wide and the pane at 20. The widths are remembered across restarts, and a window too narrow for them squeezes the columns without forgetting them. Grabbing a border selects nothing and moves no FOCUS |
 
 ## Chips and readouts
 

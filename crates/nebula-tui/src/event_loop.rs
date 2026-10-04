@@ -2191,6 +2191,7 @@ fn ui_state_json(app: &App) -> String {
         launcher_pane_h: app.launcher_pane_h,
         launcher_pane_w: app.launcher_pane_w,
         launcher_pane_hidden: app.launcher_pane_hidden,
+        panels_widths: app.panels_widths,
         launcher_expanded: app.launcher_expanded.as_ref().map(|w| w.to_string()),
         launcher_open_bands: saved_open_bands(app),
         launcher_tabs: app.launcher_tabs.iter().map(|id| id.to_string()).collect(),
@@ -2248,6 +2249,10 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
     app.launcher_pane_w = state
         .launcher_pane_w
         .map(|w| w.clamp(crate::launcher::PANE_MIN_W, MAX_RESTORED_WIDTH));
+    // The PANELS' columns the same way (`panels::columns` re-fits them).
+    app.panels_widths = state
+        .panels_widths
+        .map(|w| w.map(|w| w.clamp(crate::panels::MIN_W, MAX_RESTORED_WIDTH)));
     // A pane folded away with `^~` stays folded across a restart, as its
     // height does. Nothing is unselected on the way back in: the restore
     // lands on the cards either way.
@@ -9019,6 +9024,22 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
         app.hover_launcher_pane = on_pane_edge;
         app.dirty = true;
     }
+    // A PANELS column's BORDER: the column held, or the one under it.
+    let on_border = if on_panels {
+        app.panels_drag.map(|(i, _)| i).or(match &hit {
+            Some(HitTarget::PanelsBorder(i)) => Some(*i),
+            _ => None,
+        })
+    } else {
+        None
+    };
+    if on_border.is_some() {
+        app.pointer_shape = PointerShape::ColResize;
+    }
+    if app.hover_panels_border != on_border {
+        app.hover_panels_border = on_border;
+        app.dirty = true;
+    }
     // The header's PROJECT TABS (each tab, its `×`, the `+` after them)
     // and a full-screen session's `‹ sessions` are the other things on
     // the main screen a click acts on without the cursor moving there
@@ -9655,6 +9676,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // FOCUS; a second click is Enter on it. A group header
                 // folds its group.
                 Some(HitTarget::PanelsRow(row)) => panels::click_row(app, row, out),
+                // A PANELS column's BORDER: a resize drag armed, and
+                // nothing selected or focused (`panels::grab_border`).
+                Some(HitTarget::PanelsBorder(i)) => panels::grab_border(app, i, mouse.column),
                 // The `❮` / `❯` beside a band's row: one card that way
                 // along the band, the very step `h` / `l` take.
                 Some(HitTarget::LauncherStripLeft(i)) => {
@@ -9798,6 +9822,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // straight away must not snap it to the middle.
                 app.last_pane_edge_click = None;
                 app.dirty = true;
+            } else if app.panels_drag.is_some() {
+                panels::move_border(app, mouse.column);
             } else if let Some(sref) = &app.term_mouse_grab {
                 // The program holding the button gets the motion — if it
                 // asked for motion at all (`?1002h` / `?1003h`); press-only
@@ -9819,9 +9845,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            // The pane edge lets go here.
+            // The pane edge and a PANELS BORDER let go here. They are
+            // never armed at once, but each is taken on its own so one
+            // can't strand the other.
             let pane_ended = app.launcher_pane_drag.take().is_some();
-            if pane_ended {
+            let border_ended = app.panels_drag.take().is_some();
+            if pane_ended || border_ended {
                 app.dirty = true;
             } else if let Some(sref) = app.term_mouse_grab.take() {
                 // The release closes the program's button — except under

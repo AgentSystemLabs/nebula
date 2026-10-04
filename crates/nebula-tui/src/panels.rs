@@ -16,7 +16,8 @@
 //! is whichever its cursor is on, which is also the tab the GRID lights.
 //!
 //! What lives here is what the layout adds: the columns' widths
-//! ([`columns`]), the lines each column lays out ([`project_lines`],
+//! ([`columns`]) and the drag of a column's BORDER that changes them
+//! ([`drag_border`]), the lines each column lays out ([`project_lines`],
 //! [`worktree_lines`], [`session_lines`]) and the scroll that keeps the
 //! cursor's line on screen ([`scroll_to`]) until the wheel moves it
 //! ([`ColumnScroll`]). The keys are
@@ -27,8 +28,8 @@ use nebula_core::{ProjectId, WorktreeId};
 use ratatui::layout::{Constraint, Layout, Rect};
 
 /// Widths of the PROJECTS, WORKTREES and SESSIONS columns on a body wide
-/// enough for them and the pane: the widths the three panels opened at
-/// before they were dragged.
+/// enough for them and the pane, until a BORDER is dragged
+/// (`App::panels_widths`).
 pub const WIDTHS: [u16; 3] = [20, 22, 32];
 /// Narrowest a column is squeezed to on a narrow body.
 pub const MIN_W: u16 = 10;
@@ -76,10 +77,13 @@ pub enum Line {
     Row(Row),
 }
 
-/// The four rects of the PANELS: the three columns at [`WIDTHS`], and the
-/// PANE taking every column left over. A body too narrow for that squeezes
-/// the columns in proportion — down to [`MIN_W`] each — so the pane keeps
-/// [`MIN_PANE_W`] for as long as the window allows.
+/// The four rects of the PANELS: the three columns at the widths they were
+/// dragged to — [`WIDTHS`] until then — and the PANE taking every column
+/// left over. A body too narrow for that squeezes the columns in
+/// proportion — down to [`MIN_W`] each — so the pane keeps [`MIN_PANE_W`]
+/// for as long as the window allows. The squeeze is the frame's alone:
+/// the widths remembered are untouched, so a window that grows back opens
+/// the columns back up to them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Columns {
     pub projects: Rect,
@@ -98,17 +102,47 @@ impl Columns {
             Focus::Terminal => self.pane,
         }
     }
+
+    /// The three columns' widths as laid out, PROJECTS first.
+    pub fn widths(&self) -> [u16; 3] {
+        [self.projects, self.worktrees, self.sessions].map(|r| r.width)
+    }
+
+    /// Column `i`'s BORDER: the screen column just past its rule, where the
+    /// next column — or, past SESSIONS, the pane — starts.
+    pub fn border(&self, i: usize) -> u16 {
+        let col = self.column(i);
+        col.x + col.width
+    }
+
+    /// Column `i`, PROJECTS first.
+    fn column(&self, i: usize) -> Rect {
+        [self.projects, self.worktrees, self.sessions][i]
+    }
+
+    /// Column `i`'s BORDER as a drag target (`HitTarget::PanelsBorder`):
+    /// its rule and the cell after it, down the whole body — the two
+    /// touching cells every splitter grabs by.
+    pub fn grab_zone(&self, i: usize) -> Rect {
+        Rect {
+            x: self.border(i).saturating_sub(1),
+            width: 2,
+            ..self.column(i)
+        }
+    }
 }
 
-/// Lay the PANELS out over `body` ([`Columns`]).
-pub fn columns(body: Rect) -> Columns {
-    let want: u16 = WIDTHS.iter().sum();
+/// Lay the PANELS out over `body` ([`Columns`]), the columns at `widths` —
+/// [`WIDTHS`] when None.
+pub fn columns(body: Rect, widths: Option<[u16; 3]>) -> Columns {
+    let widths = widths.unwrap_or(WIDTHS);
+    let want: u16 = widths.iter().sum();
     let budget = body.width.saturating_sub(MIN_PANE_W);
-    let widths = WIDTHS.map(|w| {
+    let widths = widths.map(|w| {
         if budget >= want {
             w
         } else {
-            (u32::from(w) * u32::from(budget) / u32::from(want)) as u16
+            (u32::from(w) * u32::from(budget) / u32::from(want.max(1))) as u16
         }
         .max(MIN_W)
     });
@@ -125,6 +159,30 @@ pub fn columns(body: Rect) -> Columns {
         sessions,
         pane,
     }
+}
+
+/// The widths that leave column `i`'s BORDER at screen column `border`,
+/// the other two kept as `body` lays them out this frame: the column held
+/// to [`MIN_W`] at the narrow end and, at the wide one, to what leaves the
+/// pane its [`MIN_PANE_W`]. None on a body with no room to widen or narrow
+/// it at all — there is nothing a drag there could remember.
+pub fn drag_border(
+    body: Rect,
+    widths: Option<[u16; 3]>,
+    i: usize,
+    border: i32,
+) -> Option<[u16; 3]> {
+    let cols = columns(body, widths);
+    let mut widths = cols.widths();
+    let left = cols.column(i).x;
+    let others: u16 = widths.iter().sum::<u16>() - widths[i];
+    let max = body.width.saturating_sub(others + MIN_PANE_W);
+    if max < MIN_W {
+        return None;
+    }
+    let want = (border - i32::from(left)).clamp(0, i32::from(u16::MAX)) as u16;
+    widths[i] = want.clamp(MIN_W, max);
+    Some(widths)
 }
 
 /// The PROJECTS column: one row per project, most recently worked in
@@ -401,7 +459,7 @@ mod tests {
     /// every column left over.
     #[test]
     fn the_columns_open_at_their_widths_and_the_pane_takes_the_rest() {
-        let c = columns(body(190));
+        let c = columns(body(190), None);
         assert_eq!(
             [c.projects.width, c.worktrees.width, c.sessions.width],
             WIDTHS
@@ -416,11 +474,53 @@ mod tests {
     /// pane keeps its own.
     #[test]
     fn a_narrow_body_squeezes_the_columns_for_the_pane() {
-        let c = columns(body(80));
+        let c = columns(body(80), None);
         assert!(c.pane.width >= MIN_PANE_W, "{c:?}");
         for w in [c.projects.width, c.worktrees.width, c.sessions.width] {
             assert!((MIN_W..32).contains(&w), "{c:?}");
         }
+        // Widths dragged wide on a bigger window squeeze the same way.
+        let c = columns(body(80), Some([60, 60, 60]));
+        assert!(c.pane.width >= MIN_PANE_W, "{c:?}");
+        assert!(c.widths().iter().all(|w| *w >= MIN_W), "{c:?}");
+    }
+
+    /// Widths a drag left are the ones laid out, and each BORDER sits
+    /// just past its column's rule.
+    #[test]
+    fn the_columns_open_at_the_widths_they_were_dragged_to() {
+        let c = columns(body(190), Some([30, 15, 40]));
+        assert_eq!(c.widths(), [30, 15, 40]);
+        assert_eq!(c.pane.x, 85);
+        assert_eq!([c.border(0), c.border(1), c.border(2)], [30, 45, 85]);
+        assert_eq!(c.grab_zone(2), Rect::new(84, 0, 2, 30));
+    }
+
+    /// A drag moves the one column's BORDER, wider or narrower, and the
+    /// other two keep their widths.
+    #[test]
+    fn a_drag_widens_and_narrows_the_one_column() {
+        let wide = drag_border(body(190), None, 1, 50);
+        assert_eq!(wide, Some([20, 30, 32]));
+        let narrow = drag_border(body(190), wide, 2, 70);
+        assert_eq!(narrow, Some([20, 30, 20]));
+    }
+
+    /// The column rests at its floor dragged off the left, and dragged
+    /// off the right it stops where the pane keeps its own.
+    #[test]
+    fn a_drag_holds_the_column_and_the_pane_to_their_floors() {
+        assert_eq!(drag_border(body(190), None, 0, -40), Some([MIN_W, 22, 32]));
+        let [p, w, s] = drag_border(body(190), None, 1, 500).unwrap();
+        assert_eq!((p, s), (20, 32), "only the dragged column moved");
+        assert_eq!(190 - (p + w + s), MIN_PANE_W);
+    }
+
+    /// A body already squeezed to the floors has nothing to drag: the
+    /// widths stay as they were remembered.
+    #[test]
+    fn a_body_with_no_room_remembers_no_drag() {
+        assert_eq!(drag_border(body(40), None, 0, 30), None);
     }
 
     fn rows(n: usize) -> Vec<Line> {
