@@ -35,6 +35,7 @@ mod host_terminal;
 mod launcher;
 mod optimistic;
 mod pacing;
+mod panels;
 mod placeholder;
 mod quick_launch;
 mod release_watch;
@@ -3140,6 +3141,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     if app.launcher_grid() && launcher::handle_action(app, action, armed, &chord, out) {
         return;
     }
+    // The PANELS take the grid's own keys that mean something else — or
+    // nothing — beside the columns; the rest keep their panel meaning.
+    if app.panels_active() && !app.collapsed && panels::handle_action(app, action, out) {
+        return;
+    }
     use crate::keymap::Action;
     match action {
         Action::Quit => app.overlay = Some(Overlay::Confirm(confirm_quit())),
@@ -4585,8 +4591,13 @@ fn confirm_archive_agent(name: &str, id: AgentId) -> ConfirmDialog {
 ///
 /// INPUT PARITY: the key reaches `launcher::toggle_archived` through the
 /// grid's own `handle_action`; the menu and everything else reaches it
-/// here, so both ends land the cursor the same way.
+/// here, so both ends land the cursor the same way. The PANELS fold their
+/// SESSIONS column's ARCHIVED group in place instead.
 fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app.panels_active() {
+        panels::toggle_archived(app, out);
+        return;
+    }
     launcher::toggle_archived(app, out);
 }
 
@@ -5395,6 +5406,7 @@ fn select_clicked_row(app: &mut App, target: &HitTarget, out: &mut Vec<ClientReq
         }
         HitTarget::LauncherBandPr(ref wid) => launcher::select_band_of(app, wid, out),
         HitTarget::LauncherCardIssue(ref id) => launcher::select_issue_card(app, id, out),
+        HitTarget::PanelsRow(row) => panels::select_row(app, row, out),
         _ => false,
     }
 }
@@ -6447,6 +6459,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.highlight_current_card = cfg.highlight_current_card;
     app.launcher_pane_at = cfg.pane_side();
     app.launcher_list = cfg.list_layout();
+    app.panels = cfg.panels_layout();
     app.launcher_all_open = cfg.expand_all_worktrees;
     set_hide_draft_prs(app, cfg.hide_draft_prs);
 }
@@ -9638,6 +9651,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // A BAND's rule: the cursor lands on the band, as `j`/`k`
                 // walking onto it do.
                 Some(HitTarget::LauncherBand(i)) => launcher::click_band(app, i, out),
+                // A PANELS row: the cursor lands on it, its column takes
+                // FOCUS; a second click is Enter on it. A group header
+                // folds its group.
+                Some(HitTarget::PanelsRow(row)) => panels::click_row(app, row, out),
                 // The `❮` / `❯` beside a band's row: one card that way
                 // along the band, the very step `h` / `l` take.
                 Some(HitTarget::LauncherStripLeft(i)) => {
@@ -9851,6 +9868,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 )
             {
                 launcher::wheel_grid(app, up);
+                return;
+            }
+            // The PANELS' columns: a notch scrolls the column under it.
+            if app.panels_active() && !app.collapsed && panels::wheel(app, over.as_ref(), up) {
                 return;
             }
             let in_term = matches!(over, Some(HitTarget::TerminalPane)) || app.collapsed;
