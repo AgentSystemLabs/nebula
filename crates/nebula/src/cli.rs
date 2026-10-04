@@ -149,16 +149,18 @@ pub(crate) enum Command {
         ///
         /// A branch name origin has means origin's copy of it, fetched first:
         /// `main` is `origin/main`, never this checkout's local branch. A tag,
-        /// a SHA or a branch origin lacks is used as named.
+        /// a SHA or a branch origin lacks is used as named. Refused when the
+        /// branch already exists, since it already has a start point.
         #[arg(long, value_name = "REF")]
         base: Option<String>,
     },
     /// Start another agent session beside this one.
     ///
     /// Run from inside a nebula agent session; agents run it when you ask for
-    /// a new nebula session. The new session starts in the same worktree, on
-    /// the task you name as its first prompt, and shows up on the grid on
-    /// its own — this session carries on untouched.
+    /// a new nebula session. The new session starts in the same worktree (or
+    /// the one `--worktree` names), on the task you name as its first
+    /// prompt, and shows up on the grid on its own — this session carries
+    /// on untouched.
     #[command(after_help = SPAWN_EXAMPLES)]
     Spawn {
         /// The task the new session starts on; multiple words need no quotes.
@@ -170,6 +172,17 @@ pub(crate) enum Command {
         /// Defaults to the harness this session is running.
         #[arg(long, value_name = "KIND", value_parser = parse_agent_kind)]
         kind: Option<nebula_core::AgentKind>,
+        /// Start the session in this project's worktree on BRANCH instead,
+        /// creating the worktree when the branch has none; spaces become
+        /// hyphens.
+        #[arg(long, value_name = "BRANCH")]
+        worktree: Option<String>,
+        /// Start point for a new `--worktree` branch, resolved as
+        /// `nebula worktree --base` resolves it (default: the
+        /// `worktree_base_branch` setting, else origin's default branch).
+        /// Refused when the branch already exists.
+        #[arg(long, value_name = "REF", requires = "worktree")]
+        base: Option<String>,
     },
     /// Show files to the user inside this nebula.
     ///
@@ -359,7 +372,10 @@ Examples:
 const SPAWN_EXAMPLES: &str = "\
 Examples:
   nebula spawn \"port the tests to the new fixture\"
-  nebula spawn --kind codex \"review the diff on this branch\"";
+  nebula spawn --kind codex \"review the diff on this branch\"
+  nebula spawn --worktree fix-login \"fix the login redirect\"
+                                   start it in that branch's worktree, made if new
+  nebula spawn --worktree hotfix --base v0.21.0 \"backport the fix\"";
 
 const OPEN_EXAMPLES: &str = "\
 Examples:
