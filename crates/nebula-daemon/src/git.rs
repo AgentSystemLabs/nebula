@@ -81,9 +81,22 @@ pub struct WorktreeEntry {
 
 /// Parse `git worktree list --porcelain`. The first entry is the main
 /// checkout.
+///
+/// Only checkouts that are really there are returned. The parse drops the
+/// ones git marks `prunable`; a *locked* checkout is never marked prunable
+/// however gone it is (Claude Code locks its worktrees and a killed session
+/// never unlocks), so a linked checkout whose `.git` file is missing is
+/// dropped here too. Git's registry is left exactly as it was: nebula never
+/// prunes or unlocks for the user, and the checkout is listed again the
+/// moment its directory comes back (a remounted volume, say).
 pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
     let out = git(repo, &["worktree", "list", "--porcelain"]).await?;
     let mut entries = parse_worktree_list(&out);
+    let mut index = 0;
+    entries.retain(|entry| {
+        index += 1;
+        index == 1 || entry.path.join(".git").exists()
+    });
     for entry in &mut entries {
         if entry.branch != "(detached)" && !entry.branch.starts_with("detached @ ") {
             continue;
@@ -1286,13 +1299,40 @@ mod tests {
 
         remove_worktree(&repo, &wt, false).await.unwrap();
         // The stale registration should be pruned from git's registry too.
-        // `list_worktrees` leaves a `prunable` checkout out whether or not
-        // it was pruned, so ask git's raw listing instead.
+        // `list_worktrees` hides a gone checkout whether or not it was
+        // pruned, so ask git's raw listing instead.
         let raw = git(&repo, &["worktree", "list", "--porcelain"])
             .await
             .unwrap();
         assert!(!raw.contains("prunable"), "{raw}");
         assert_eq!(raw.matches("worktree ").count(), 1, "{raw}");
+    }
+
+    /// A locked checkout is never marked `prunable`, however gone it is, so
+    /// the parse alone would keep it. It is still not a checkout anyone can
+    /// work in, and the lock is git's business: it is left in place.
+    #[tokio::test]
+    async fn list_worktrees_leaves_out_a_locked_checkout_that_was_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        git(&repo, &["worktree", "lock", &wt.to_string_lossy()])
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&wt).unwrap();
+
+        let raw = git(&repo, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        assert!(raw.contains("locked") && !raw.contains("prunable"), "{raw}");
+        let entries = list_worktrees(&repo).await.unwrap();
+        assert_eq!(entries.len(), 1, "only the main checkout: {entries:?}");
+        assert!(git(&repo, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap()
+            .contains("locked"));
     }
 
     #[tokio::test]
