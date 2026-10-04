@@ -973,6 +973,20 @@ impl Daemon {
             bail!("branch name is empty");
         }
         let ops = self.worktree_ops.lock().await;
+        let worktree = self.cut_worktree(project_id, branch, base).await?;
+        drop(ops);
+        Ok(EntityId::Worktree(worktree.id))
+    }
+
+    /// [`Self::create_worktree`]'s work, for a caller that already holds
+    /// `worktree_ops`: cut the checkout, register its row, run the
+    /// WORKTREE HOOK.
+    async fn cut_worktree(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<Worktree> {
         let project = self
             .store
             .get_project(project_id)?
@@ -1002,8 +1016,80 @@ impl Daemon {
         // what that holds the lock for.
         self.run_worktree_hook(WorktreeHook::Create, &project.repo_path, &worktree)
             .await;
+        Ok(worktree)
+    }
+
+    /// The PROJECT's worktree on `branch` — the ROOT WORKTREE when the
+    /// branch is checked out there — or a new one cut from `base` (None:
+    /// the configured base). Looked up under `worktree_ops`, as
+    /// [`Self::pr_worktree`] does, so two requests for one new branch get
+    /// one checkout instead of a race the second loses. What `nebula
+    /// worktree` moves a session into and `nebula spawn --worktree` starts
+    /// one in.
+    pub(crate) async fn worktree_on_branch(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<Worktree> {
+        self.worktree_on_branch_inner(project_id, branch, base, false)
+            .await
+    }
+
+    /// `nebula spawn --worktree --base` promises the new session starts from
+    /// the named ref, so refuse existing branches instead of silently using
+    /// their current history. Plain `nebula worktree --base` keeps its
+    /// legacy fallback in [`Self::worktree_on_branch`].
+    pub(crate) async fn worktree_on_branch_for_spawn(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<Worktree> {
+        self.worktree_on_branch_inner(project_id, branch, base, true)
+            .await
+    }
+
+    async fn worktree_on_branch_inner(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+        branch: &str,
+        base: Option<&str>,
+        refuse_existing_branch_with_base: bool,
+    ) -> Result<Worktree> {
+        if branch.trim().is_empty() {
+            bail!("branch name is empty");
+        }
+        let ops = self.worktree_ops.lock().await;
+        let (_, worktrees, _, _) = self.store.load_tree()?;
+        if let Some(existing) = worktrees
+            .into_iter()
+            .find(|w| &w.project_id == project_id && w.branch == branch)
+        {
+            if base.is_some() && refuse_existing_branch_with_base {
+                bail!(
+                    "branch `{branch}` already has a worktree at {}; --base only applies to a new \
+                     branch — run it again without --base to use that worktree",
+                    existing.path.display()
+                );
+            }
+            return Ok(existing);
+        }
+        if let (Some(_), true) = (base, refuse_existing_branch_with_base) {
+            let project = self
+                .store
+                .get_project(project_id)?
+                .context("project not found")?;
+            if git::local_branch(&project.repo_path, branch).await {
+                bail!(
+                    "branch `{branch}` already exists; --base only applies to a new branch — run \
+                     it again without --base to use the branch as it is"
+                );
+            }
+        }
+        let worktree = self.cut_worktree(project_id, branch, base).await?;
         drop(ops);
-        Ok(EntityId::Worktree(worktree.id))
+        Ok(worktree)
     }
 
     /// The checkout every PR SESSION for pull request `number` runs in: the
@@ -1220,6 +1306,27 @@ impl Daemon {
     }
 
     // ---- agents ----
+
+    /// The refusals [`Self::create_agent`] would give a cold launch on a
+    /// STARTING PROMPT — the prompt, the harness, a missing CLI — asked
+    /// ahead of it, for a caller about to do something costly first
+    /// (`nebula spawn --worktree` cuts a checkout) that the create could
+    /// then refuse. A miss is re-probed, so the create's own check is the
+    /// cached hit this leaves behind.
+    pub(crate) async fn check_cold_launch(
+        &self,
+        kind: AgentKind,
+        custom_harness: Option<&str>,
+        starting_prompt: &str,
+    ) -> Result<()> {
+        validate_starting_prompt(starting_prompt)?;
+        let harness = resolve_harness(kind, custom_harness)?;
+        let program = harness.program.trim();
+        if !self.cli_available_for_create(program).await {
+            bail!("{}", cli_missing_message(program));
+        }
+        Ok(())
+    }
 
     pub(crate) async fn create_agent(self: &Arc<Self>, spec: CreateAgentSpec) -> Result<EntityId> {
         let CreateAgentSpec {
@@ -1771,24 +1878,9 @@ impl Daemon {
             .store
             .get_worktree(&agent.worktree_id)?
             .context("worktree not found")?;
-        let (_, worktrees, _, _) = self.store.load_tree()?;
-        let existing = worktrees
-            .into_iter()
-            .find(|w| w.project_id == current.project_id && w.branch == branch);
-        let target = match existing {
-            Some(w) => w,
-            None => {
-                let created = self
-                    .create_worktree(&current.project_id, branch, base)
-                    .await?;
-                let EntityId::Worktree(new_id) = created else {
-                    bail!("worktree creation returned a non-worktree entity");
-                };
-                self.store
-                    .get_worktree(&new_id)?
-                    .context("worktree not found")?
-            }
-        };
+        let target = self
+            .worktree_on_branch(&current.project_id, branch, base)
+            .await?;
         // A row whose checkout is gone (removed outside nebula, kept because
         // sessions hang off it) is no place to move to, and not one this
         // command can recreate: refuse before the row moves, so the agent is
@@ -3337,16 +3429,19 @@ fn test_custom_harness(
 /// pi has no EnterWorktree, but does run `git worktree add` on its own
 /// unless told otherwise): codex and cursor have no system-prompt flag.
 pub const CLAUDE_WORKTREE_GUIDANCE: &str = "[nebula] This session runs inside nebula, which \
-manages this project's git worktrees. When the user asks you to work in a worktree (\"do this in a \
-worktree\", \"in a new worktree\", \"branch this off in its own checkout\"), do not use the \
-EnterWorktree tool and do not run `git worktree add` yourself. Run this shell command instead, \
-exactly once:\n\n  nebula worktree <name>\n\nwhere <name> is the branch name the user gave, or a \
-short kebab-case name for the task (`nebula worktree` with no name invents one; `--base <ref>` picks \
-the start point). nebula creates the worktree, associates this session with it, and relocates the \
-session into it once your current turn ends. So when the command succeeds, end your turn at once: \
-tell the user in one line that the session is moving into the worktree, and make no further tool \
-calls or edits — you will be resumed inside the worktree with a prompt to carry on there. If the \
-command fails, report the error and carry on in the current checkout.";
+manages this project's git worktrees. When the user asks this session to work in a worktree or move \
+to one (\"do this in a worktree\", \"do this in a new worktree\", \"move to a worktree\", \"branch \
+this off in its own checkout\"), do not use the EnterWorktree tool and do not run `git worktree add` \
+yourself. Run this shell command instead, exactly once:\n\n  nebula worktree <name>\n\nwhere <name> \
+is the branch name the user gave, or a short kebab-case name for the task (`nebula worktree` with no \
+name invents one; `--base <ref>` picks the start point). nebula creates or reuses the worktree, \
+associates this current session with it, and relocates the session into it once your current turn \
+ends. So when the command succeeds, end your turn at once: tell the user in one line that the \
+session is moving into the worktree, and make no further tool calls or edits — you will be resumed \
+inside the worktree with a prompt to carry on there. Do not use `nebula spawn --worktree` for these \
+relocation requests; that belongs to the spawn guidance and is only for starting or handing off to a \
+separate new/parallel session. If the command fails, report the error and carry on in the current \
+checkout.";
 
 /// The prompt a relocated session is resumed with: it names the checkout
 /// the process now runs in and asks for the work to pick back up there, so
@@ -5886,6 +5981,12 @@ mod tests {
 
         // Blank names are refused before anything is touched.
         assert!(daemon.enter_worktree(&a1, "  ", None).await.is_err());
+        // So is a start point for a branch that already has a checkout.
+        let err = daemon
+            .enter_worktree(&a1, "feat", Some("main"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already has a worktree"), "{err}");
     }
 
     /// Between `nebula worktree` and the turn's Stop the row already sits

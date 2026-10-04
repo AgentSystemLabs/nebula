@@ -487,10 +487,19 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     id,
                     kind,
                     starting_prompt,
+                    worktree,
+                    base,
                 } => {
                     // Logged by mode only — never the prompt text.
+                    let worktree =
+                        worktree
+                            .as_deref()
+                            .map(|branch| crate::sibling::SiblingWorktree {
+                                branch,
+                                base: base.as_deref(),
+                            });
                     let result = daemon
-                        .spawn_sibling_agent(&id, kind, &starting_prompt)
+                        .spawn_sibling_agent(&id, kind, worktree, &starting_prompt)
                         .await;
                     match &result {
                         Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
