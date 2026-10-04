@@ -160,7 +160,7 @@ pub(super) fn worktrees_row(app: &mut App, out: &mut Vec<ClientRequest>) {
         .or_else(|| app.selected_worktree_issue().map(|i| i.url.clone()));
     match link {
         Some(url) => open_link(app, &url, out),
-        None => app.focus = Focus::Sessions,
+        None => super::walk_focus_forward(app, out),
     }
 }
 
@@ -179,6 +179,10 @@ pub(super) fn cloud_link(app: &mut App, out: &mut Vec<ClientRequest>) -> bool {
 /// on one, **Attach** in its CONTEXT MENU: the pane shows the session, takes
 /// FOCUS and the input lock.
 pub(super) fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    if app.is_archived_session(&sref) {
+        app.flash = Some(super::AGENT_ARCHIVED.into());
+        return;
+    }
     attach_now(app, sref, out);
     app.focus = Focus::Terminal;
     app.term_locked = true;

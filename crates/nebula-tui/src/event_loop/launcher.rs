@@ -34,12 +34,6 @@ const LIVE_VIEW: &str = "live sessions — ⇧A reads the archived ones";
 const NO_SESSIONS: &str = "no sessions yet — p starts one";
 const NO_ARCHIVED_SESSIONS: &str = "nothing archived here — ⇧A back to the live sessions";
 
-/// Is the card under this id one of the ARCHIVED VIEW's? Its session was
-/// reaped when it was archived, so nothing on it can be stepped into.
-fn is_archived(app: &App, id: &AgentId) -> bool {
-    app.tree.agents.iter().any(|a| &a.id == id && a.archived)
-}
-
 /// The one of those two this grid means.
 fn nothing_here(app: &App) -> &'static str {
     if app.show_archived {
@@ -88,6 +82,12 @@ pub(super) const UNAIMED: &str = "nothing selected — j/k or a click picks a ca
 /// on the card) — so which of the worktree's cards the cursor last
 /// rested on does not matter, only which worktree.
 pub(super) fn open_box(app: &mut App) {
+    if app.panels_active()
+        && (app.selected_worktree_pr().is_some() || app.selected_worktree_issue().is_some())
+    {
+        crate::quick_prompt::open_quick_prompt(app);
+        return;
+    }
     if let Some(launch) = box_launch(app) {
         crate::quick_prompt::open_box(app, launch);
     }
@@ -1988,7 +1988,7 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
             // An ARCHIVED card has no session to read: the daemon reaped
             // it when it was archived. Say what to press rather than
             // handing the keys to an empty pane.
-            if is_archived(app, &id) {
+            if app.is_archived_agent_id(&id) {
                 app.flash = Some(super::AGENT_ARCHIVED.into());
                 return;
             }
@@ -2009,29 +2009,27 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// session takes the whole screen. The jump attaches the card outright,
 /// so a card the pane's debounce had not reached yet is the one that
 /// comes up.
-pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
+pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) -> bool {
     let Some(sref) = cursor_or_first(app) else {
         app.flash = Some(nothing_here(app).into());
-        return;
+        return false;
     };
     match sref {
         SessionRef::Terminal(id) => {
             select_card(app, SessionRef::Terminal(id.clone()), out);
             super::attach_now(app, SessionRef::Terminal(id), out);
-            super::zoom_pane(app, out);
+            super::zoom_pane(app, out)
         }
         SessionRef::Agent(id) => {
-            if is_archived(app, &id) {
+            if app.is_archived_agent_id(&id) {
                 app.flash = Some(super::AGENT_ARCHIVED.into());
-                return;
+                return false;
             }
             take_aim(app);
             jump_to_target(app, PaletteTarget::Session(id), Landing::Attach, out);
             // A Cloud row's Enter is its browser page, not a PTY: the jump
             // has already opened it and there is nothing to full-screen.
-            if app.term.is_some() {
-                super::zoom_pane(app, out);
-            }
+            app.term.is_some() && super::zoom_pane(app, out)
         }
     }
 }
@@ -2044,28 +2042,31 @@ pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// A session full-screened for want of a pane (a body too short to draw
 /// one, the pane folded away) has nothing to come back down to, and
 /// lands on the grid the way the crumb always took it. Returns what it
-/// did, for the KEY COMBO DISPLAY.
+/// did, for the KEY COMBO DISPLAY: nothing when it refused.
 ///
 /// INPUT PARITY: the one function behind the chord (from the grid, or let
 /// through a LOCKED PANE), `^q` and `^`` in a full-screen session, the
 /// `‹ sessions` crumb and the header's button.
-pub(super) fn toggle_full_screen(app: &mut App, out: &mut Vec<ClientRequest>) -> &'static str {
+pub(super) fn toggle_full_screen(
+    app: &mut App,
+    out: &mut Vec<ClientRequest>,
+) -> Option<&'static str> {
     app.dirty = true;
     if app.collapsed {
         app.collapsed = false;
         // The PANELS always have their pane beside the columns.
         if !app.panels_active() && (app.launcher_pane_hidden || !has_pane(app)) {
             super::leave_terminal_lock(app);
-            return "Back to the grid";
+            return Some("Back to the grid");
         }
-        return NORMAL_SIZE;
+        return Some(NORMAL_SIZE);
     }
-    if app.focus == Focus::Terminal && app.term.is_some() {
-        super::zoom_pane(app, out);
+    let zoomed = if app.focus == Focus::Terminal && app.term.is_some() {
+        super::zoom_pane(app, out)
     } else {
-        open_session(app, out);
-    }
-    FULL_SCREEN
+        open_session(app, out)
+    };
+    zoomed.then_some(FULL_SCREEN)
 }
 
 /// What [`toggle_full_screen`] says it did, for the KEY COMBO DISPLAY.

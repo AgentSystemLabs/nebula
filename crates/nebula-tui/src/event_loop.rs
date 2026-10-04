@@ -2470,7 +2470,7 @@ fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequ
     // With the pane holding input, whatever this event turns into is headed
     // for the PTY — and the daemon drops Input for a session it hasn't
     // spawned. A still-debounced attach has to land before the keystroke.
-    if app.term_locked {
+    if app.term_locked && app.pane_accepts_input() {
         fire_pending_attach(app, out);
     }
     // The LAUNCHER VIEW's card under the cursor, ahead of a key or a click
@@ -2537,7 +2537,7 @@ fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
         Event::Paste(text) => {
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
-            if app.focus == Focus::Terminal && app.term_locked && !app.pane_shows_placeholder() {
+            if app.focus == Focus::Terminal && app.term_locked && app.pane_accepts_input() {
                 if let Some(term) = &app.term {
                     let session = term.sref.clone();
                     let data = pasted(term.parser.screen(), &text);
@@ -2575,7 +2575,7 @@ fn typing_into_pane(app: &App) -> bool {
         && app.flash.is_none()
         && app.term_selection.is_none()
         && app.key_combo.is_none()
-        && !app.pane_shows_placeholder()
+        && app.pane_accepts_input()
         && app
             .term
             .as_ref()
@@ -2990,7 +2990,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 && (is_hatch || folds_launcher_pane(app, &chord)));
         if app.launcher_active() && zooms {
             let did = launcher::toggle_full_screen(app, out);
-            crate::key_combo::note(app, &[chord], Some(did));
+            crate::key_combo::note(app, &[chord], did);
             return;
         }
         if is_hatch {
@@ -3036,7 +3036,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // A stand-in pane (QUICK PROMPT, checkout still being cut) has no
         // PTY behind it: the keystroke has nowhere to go until the real
         // session attaches, and must not land in the previous one.
-        let stand_in = app.pane_shows_placeholder();
+        let unavailable = !app.pane_accepts_input();
         if !exited {
             if let Some(term) = &mut app.term {
                 // Typing changes the content under a persisted selection
@@ -3049,7 +3049,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 if term.scroll_offset() > 0 {
                     term.set_scroll(0);
                 }
-                if stand_in {
+                if unavailable {
                     return;
                 }
                 if let Some(data) = keys::encode_key(&key, term.kitty_flags) {
@@ -3082,9 +3082,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // Reading a pull request or an issue in the pane: the diff modal's
     // scroll keys work here too. Page/Home/End only — shift+↑/↓ already
     // move a project, and ↑/↓ have to keep walking the list itself. From
-    // either list that can rest on one; a focused pane keeps its keys for
-    // the PTY.
-    if app.reading_url().is_some() && matches!(app.focus, Focus::Worktrees | Focus::Sessions) {
+    // either list that can rest on one, or the pane when it shows a
+    // reader rather than the PTY.
+    if app.reading_url().is_some()
+        && matches!(
+            app.focus,
+            Focus::Worktrees | Focus::Sessions | Focus::Terminal
+        )
+    {
         let page = app.term_area.height.max(1);
         let max = app.pr_preview_max_scroll();
         let scrolled = match key.code {
@@ -8003,6 +8008,10 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     let Some(row) = rows.get(app.sel_session) else {
         return;
     };
+    if row.is_archived_agent() {
+        app.flash = Some(AGENT_ARCHIVED.into());
+        return;
+    }
     let Some(sref) = row.sref() else {
         if let Some(link) = row.as_link() {
             open_link(app, link.url(), out);
@@ -8035,13 +8044,27 @@ fn cloud_session_url_of(app: &App, sref: &SessionRef) -> Option<String> {
 /// double-click on a card step into the pane under the cards
 /// (`launcher::enter_pane`); only a body too short to draw that pane
 /// comes here instead (`launcher::open_session`). [`leave_terminal_lock`]
-/// is its undo.
-pub(super) fn zoom_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
+/// is its undo. False, with a flash, when the pane has no terminal to take
+/// the screen (nothing attached, or a reader covering it).
+pub(super) fn zoom_pane(app: &mut App, out: &mut Vec<ClientRequest>) -> bool {
+    // The readers cover the pane by what has FOCUS, so ask as the full
+    // screen would have it.
+    let previous_focus = std::mem::replace(&mut app.focus, Focus::Terminal);
+    if !app.pane_shows_terminal() {
+        app.focus = previous_focus;
+        app.flash = Some(NOTHING_TO_FULL_SCREEN.into());
+        return false;
+    }
     app.collapsed = true;
-    app.focus = Focus::Terminal;
     app.term_locked = true;
-    fire_pending_attach(app, out);
+    if app.pane_accepts_input() {
+        fire_pending_attach(app, out);
+    }
+    true
 }
+
+/// What `^F` and `z` say with nothing in the pane to full-screen.
+pub(super) const NOTHING_TO_FULL_SCREEN: &str = "no session in the pane — j/k onto one, then ^F";
 
 /// Leave a locked pane for the cards (`Focus::Sessions`). Also ends a
 /// full screen, so there is something on screen to land in — which is
@@ -8630,6 +8653,9 @@ fn forward_mouse(
     release: bool,
     mouse: &MouseEvent,
 ) {
+    if !app.pane_accepts_input() {
+        return;
+    }
     if let Some(term) = &app.term {
         let (col, row) = pane_cell(app.term_area, mouse.column, mouse.row);
         out.push(ClientRequest::Input {
@@ -9146,6 +9172,20 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) {
+    // Only another row click can continue a row's double-click gesture.
+    if app.panels_active() && matches!(mouse.kind, MouseEventKind::Down(_)) {
+        let row_click = mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && app.overlay.is_none()
+            && matches!(
+                app.hit_at(mouse.column, mouse.row),
+                Some(HitTarget::PanelsRow(
+                    crate::panels::Row::Session(_) | crate::panels::Row::Worktree(_)
+                ))
+            );
+        if !row_click {
+            app.last_session_click = None;
+        }
+    }
     let mouse_pos = ratatui::layout::Position::new(mouse.column, mouse.row);
     update_pointer(app, &mouse);
     // The editor modal swallows the mouse entirely — its selection/scroll
@@ -9658,6 +9698,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             // (Cmd never reaches us — the SGR mouse protocol has no such
             // bit — so Option is the "open link" modifier.)
             if mouse.modifiers.contains(KeyModifiers::ALT)
+                && app.pane_shows_terminal()
                 && matches!(
                     app.hit_at(mouse.column, mouse.row),
                     Some(HitTarget::TerminalPane)
@@ -9831,6 +9872,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     // pane the daemon had not been asked for yet.
                     if let Some(sref) = app.term.as_ref().map(|t| t.sref.clone()) {
                         enter_terminal_pane(app, out);
+                        if !app.pane_shows_terminal() {
+                            app.last_term_click = None;
+                            app.dirty = true;
+                            return;
+                        }
                         let cell = pane_cell(app.term_area, mouse.column, mouse.row);
                         let (mode, sgr) = app.child_mouse_mode();
                         if mode != vt100::MouseProtocolMode::None {

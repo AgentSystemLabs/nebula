@@ -17,7 +17,7 @@ use super::{
     activate, attach_selected, context_menu_items, is_double_click, jump_attention,
     open_ghostty_tab, open_menu, select_project_row, select_session_row, select_worktree_row,
     toggle_issues, toggle_open_prs, walk_focus_back, walk_focus_forward, zoom_pane,
-    KEYBOARD_MENU_ANCHOR,
+    KEYBOARD_MENU_ANCHOR, NOTHING_TO_FULL_SCREEN,
 };
 use crate::app::{App, Focus, HitTarget, RowKey};
 use crate::keymap::{Action, KeyChord};
@@ -34,8 +34,6 @@ const NO_FOLD_IN_PANELS: &str = "the panels' pane doesn't fold — ^F full-scree
 /// What `` ` `` says: a checkout's terminals are rows of the SESSIONS
 /// column here, not chips over the pane.
 const NO_PANE_TABS_IN_PANELS: &str = "terminals are rows under TERMINALS in the SESSIONS column";
-/// What `^F` says with nothing in the pane to full-screen.
-const NOTHING_TO_FULL_SCREEN: &str = "no session in the pane — j/k onto one, then ^F";
 
 /// A panel key while the PANELS are up — true when it was taken here. Only
 /// the keys the GRID's own handler owns (`launcher::handle_action`) and
@@ -117,11 +115,7 @@ pub(super) fn panel_key(app: &mut App, chord: &KeyChord, out: &mut Vec<ClientReq
         PanelKey::FocusNext => walk_focus_forward(app, out),
         PanelKey::FocusTerminal => app.focus = app.next_visible_focus(app.focus),
         PanelKey::Zoom => {
-            if app.term.is_some() {
-                zoom_pane(app, out);
-            } else {
-                app.flash = Some(ATTACH_FIRST.into());
-            }
+            zoom_pane(app, out);
         }
         PanelKey::ContextMenu => open_row_menu(app),
         PanelKey::OpenGhosttyTab => open_ghostty_tab(app),
@@ -129,9 +123,6 @@ pub(super) fn panel_key(app: &mut App, chord: &KeyChord, out: &mut Vec<ClientReq
     app.dirty = true;
     true
 }
-
-/// What `z` says with nothing in the pane to full-screen.
-const ATTACH_FIRST: &str = "attach a session first";
 
 /// `m`: the CONTEXT MENU of the row under the focused column's cursor —
 /// the one a right-click on that row opens (`context_menu_items`) — at
@@ -308,6 +299,9 @@ pub(super) fn select_row(app: &mut App, row: Row, out: &mut Vec<ClientRequest>) 
 /// folds it — `activate::follow_up`, exactly what Space on it does — and
 /// a click inside the open composer only gives SESSIONS FOCUS.
 pub(super) fn click_row(app: &mut App, row: Row, out: &mut Vec<ClientRequest>) {
+    if !matches!(row, Row::Session(_) | Row::Worktree(_)) {
+        app.last_session_click = None;
+    }
     match row {
         Row::OpenPrsHeader => toggle_open_prs(app, out),
         Row::IssuesHeader => toggle_issues(app, out),
@@ -347,18 +341,19 @@ pub(super) fn click_row(app: &mut App, row: Row, out: &mut Vec<ClientRequest>) {
             select_row(app, row, out);
             match app.selected_session_row() {
                 Some(row) if row.is_archived_agent() => {
+                    app.last_session_click = None;
                     app.flash = Some(super::AGENT_ARCHIVED.into());
                 }
                 Some(row) => {
                     let key = match row.sref() {
                         Some(sref) => RowKey::Session(sref),
-                        None => RowKey::Link(row.name().to_string()),
+                        None => RowKey::Link(row.as_link().unwrap().url().to_string()),
                     };
                     if is_double_click(&mut app.last_session_click, key) {
                         attach_selected(app, out);
                     }
                 }
-                None => {}
+                None => app.last_session_click = None,
             }
         }
     }
@@ -435,6 +430,7 @@ mod tests {
     };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::time::Duration;
 
     /// `seed_tree`'s `demo` (root `main`, session `agent-1`) with a second
     /// checkout `feat` running `polish-nav`, and a second project `web`
@@ -1410,7 +1406,7 @@ mod tests {
         app.focus = Focus::Sessions;
         draw(&mut app);
         key(&mut app, 'z', &mut out);
-        assert_eq!(app.flash.as_deref(), Some(super::ATTACH_FIRST));
+        assert_eq!(app.flash.as_deref(), Some(super::NOTHING_TO_FULL_SCREEN));
         assert!(!app.collapsed);
         let sref = app.selected_session_row().and_then(|r| r.sref()).unwrap();
         app.term = Some(AttachedTerm::new(sref, 40, 10));
@@ -2142,5 +2138,429 @@ mod tests {
         mouse_at(&mut app, down, (rect.x + 2, rect.y + 1), &mut out);
         assert_eq!(app.flash.as_deref(), Some(super::super::AGENT_ARCHIVED));
         assert!(!app.term_locked);
+    }
+
+    /// Readers can cover a retained attachment. Every route into the pane
+    /// must keep typing and paste away from that hidden session.
+    #[test]
+    fn readers_never_take_input_for_the_retained_session() {
+        with_config_json("{}", || {
+            for issue in [false, true] {
+                for entry in 0..4 {
+                    let mut app = panels_app();
+                    let mut out = Vec::new();
+                    demo_root(&mut app);
+                    draw(&mut app);
+                    press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+                    press(
+                        &mut app,
+                        KeyCode::Char('q'),
+                        KeyModifiers::CONTROL,
+                        &mut out,
+                    );
+                    let session = app.term.as_ref().unwrap().sref.clone();
+                    if issue {
+                        super::super::tests::seed_issues(&mut app, &[(7, "fix login")]);
+                        app.issues_collapsed = false;
+                    } else {
+                        super::super::tests::seed_open_prs(&mut app, &[(7, "fix login")]);
+                    }
+                    let at = app
+                        .worktree_rows()
+                        .iter()
+                        .position(|row| {
+                            if issue {
+                                row.open_issue().is_some()
+                            } else {
+                                row.open_pr().is_some()
+                            }
+                        })
+                        .unwrap();
+                    super::select_worktree_row(&mut app, at, &mut out);
+                    app.focus = Focus::Worktrees;
+                    draw(&mut app);
+                    app.pending_attach =
+                        Some((session, std::time::Instant::now() + Duration::from_secs(30)));
+                    out.clear();
+                    match entry {
+                        0 => press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out),
+                        1 => {
+                            let pane = hit_rect(&app, HitTarget::TerminalPane);
+                            mouse_at(
+                                &mut app,
+                                MouseEventKind::Down(MouseButton::Left),
+                                (pane.x + 1, pane.y + 1),
+                                &mut out,
+                            );
+                        }
+                        2 => key(&mut app, 'z', &mut out),
+                        _ => press(
+                            &mut app,
+                            KeyCode::Char('f'),
+                            KeyModifiers::CONTROL,
+                            &mut out,
+                        ),
+                    }
+                    assert!(
+                        !app.term_locked,
+                        "reader took the lock: issue={issue}, entry={entry}"
+                    );
+                    assert!(!app.collapsed, "reader full-screened a hidden attachment");
+                    assert!(app.pending_attach.is_some());
+                    if entry <= 1 {
+                        assert_eq!(app.focus, Focus::Terminal);
+                        assert!(
+                            app.term_selection.is_none(),
+                            "reader selected hidden PTY text"
+                        );
+                        // Drawing a long reader records this count. Set it
+                        // directly so this checks key routing independently
+                        // of markdown wrapping and detail-fetch fixtures.
+                        app.pr_preview_lines = 200;
+                        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE, &mut out);
+                        assert!(
+                            app.pr_preview_scroll > 0,
+                            "focused reader must take paging keys"
+                        );
+                    }
+                    assert!(!out
+                        .iter()
+                        .any(|r| matches!(r, ClientRequest::Attach { .. })));
+                    // Also guard a stale lock, before dispatch can flush an
+                    // attachment or route a paste into its hidden PTY.
+                    app.focus = Focus::Terminal;
+                    app.term_locked = true;
+                    super::super::dispatch_terminal_event(
+                        &mut app,
+                        crossterm::event::Event::Paste("secret paste".into()),
+                        &mut out,
+                    );
+                    key(&mut app, 'x', &mut out);
+                    assert!(
+                        !out.iter().any(|r| matches!(
+                            r,
+                            ClientRequest::Input { .. } | ClientRequest::Attach { .. }
+                        )),
+                        "{out:?}"
+                    );
+                    assert!(app.pending_attach.is_some());
+                    assert!(if issue {
+                        app.previewed_issue().is_some()
+                    } else {
+                        app.previewed_pr().is_some()
+                    });
+                }
+            }
+        });
+    }
+
+    /// The same refusal in the GRID: with a reader over the pane, `^F` says
+    /// so, and neither full-screens nor takes the lock, nor reports it.
+    #[test]
+    fn the_grid_refuses_to_full_screen_a_reader() {
+        with_config_json("{}", || {
+            for issue in [false, true] {
+                let mut app = panels_app();
+                let mut out = Vec::new();
+                demo_root(&mut app);
+                draw(&mut app);
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+                press(
+                    &mut app,
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                    &mut out,
+                );
+                if issue {
+                    super::super::tests::seed_issues(&mut app, &[(7, "fix login")]);
+                    app.issues_collapsed = false;
+                } else {
+                    super::super::tests::seed_open_prs(&mut app, &[(7, "fix login")]);
+                }
+                let at = app
+                    .worktree_rows()
+                    .iter()
+                    .position(|row| {
+                        if issue {
+                            row.open_issue().is_some()
+                        } else {
+                            row.open_pr().is_some()
+                        }
+                    })
+                    .unwrap();
+                super::select_worktree_row(&mut app, at, &mut out);
+                app.panels = false;
+                draw(&mut app);
+                assert!(app.launcher_grid());
+                // FOCUS in the pane, a retained attachment under the reader.
+                app.focus = Focus::Terminal;
+                assert!(!app.pane_shows_terminal(), "issue={issue}");
+                app.flash = None;
+                assert_eq!(
+                    crate::event_loop::launcher::toggle_full_screen(&mut app, &mut out),
+                    None,
+                    "issue={issue}"
+                );
+                assert_eq!(app.flash.as_deref(), Some(super::NOTHING_TO_FULL_SCREEN));
+                assert!(!app.collapsed && !app.term_locked, "issue={issue}");
+            }
+        });
+    }
+
+    /// An exited PTY's output and a starting session are still visible
+    /// terminal surfaces. They may zoom while input remains unavailable.
+    #[test]
+    fn exited_and_starting_sessions_can_zoom_and_keep_the_escape_hatch() {
+        for starting in [false, true] {
+            let mut app = panels_app();
+            let mut out = Vec::new();
+            demo_root(&mut app);
+            draw(&mut app);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            if starting {
+                let agent = selected_agent(&app);
+                app.pending.insert(
+                    999,
+                    crate::app::PendingIntent::AttachCreated {
+                        focus: true,
+                        placeholder: Some(agent),
+                    },
+                );
+                assert!(app.pane_shows_placeholder());
+            } else {
+                app.term.as_mut().unwrap().exited = true;
+            }
+            app.focus = Focus::Worktrees;
+            assert!(app.pane_shows_terminal());
+            assert!(!app.pane_accepts_input());
+            out.clear();
+            key(&mut app, 'z', &mut out);
+            assert!(app.collapsed && app.term_locked);
+            key(&mut app, 'x', &mut out);
+            assert!(!out.iter().any(|r| matches!(r, ClientRequest::Input { .. })));
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(!app.collapsed && !app.term_locked);
+            assert!(!app.should_quit);
+        }
+    }
+
+    #[test]
+    fn checkout_activation_walks_past_folded_sessions() {
+        for double_click in [false, true] {
+            let mut app = panels_app();
+            let mut out = Vec::new();
+            demo_root(&mut app);
+            draw(&mut app);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            app.panels_hidden[2] = true;
+            app.focus = Focus::Worktrees;
+            draw(&mut app);
+            if double_click {
+                let row = Row::Worktree(app.sel_worktree);
+                super::click_row(&mut app, row, &mut out);
+                super::click_row(&mut app, row, &mut out);
+            } else {
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            }
+            draw(&mut app);
+            assert_eq!(app.focus, Focus::Terminal);
+            assert!(app.term_locked, "a visible live session takes the lock");
+        }
+    }
+
+    #[test]
+    fn archived_activation_never_attaches_or_locks() {
+        for full_screen in [false, true] {
+            let mut app = panels_app();
+            let mut out = Vec::new();
+            demo_root(&mut app);
+            app.show_archived = true;
+            app.tree
+                .agents
+                .iter_mut()
+                .find(|a| a.id.0 == "b1")
+                .unwrap()
+                .archived = true;
+            draw(&mut app);
+            app.sel_session = app
+                .visible_session_rows()
+                .iter()
+                .position(|r| r.is_archived_agent())
+                .unwrap();
+            press(
+                &mut app,
+                if full_screen {
+                    KeyCode::Char('f')
+                } else {
+                    KeyCode::Enter
+                },
+                if full_screen {
+                    KeyModifiers::CONTROL
+                } else {
+                    KeyModifiers::NONE
+                },
+                &mut out,
+            );
+            assert_eq!(app.flash.as_deref(), Some(super::super::AGENT_ARCHIVED));
+            assert!(!app.term_locked);
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::Attach { .. })),
+                "{out:?}"
+            );
+        }
+    }
+
+    fn quick_launch(app: &App) -> &crate::quick_prompt::QuickLaunch {
+        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            panic!("no prompt: {:?}", app.overlay);
+        };
+        let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+            panic!("not a quick prompt: {:?}", prompt.kind);
+        };
+        launch
+    }
+
+    #[test]
+    fn quick_prompt_uses_the_visible_empty_checkout_and_can_flip_back() {
+        for new_worktree in [false, true] {
+            with_config_json(
+                &format!(
+                    r#"{{"show_all_worktrees":false,"quick_prompt_new_worktree":{new_worktree}}}"#
+                ),
+                || {
+                    let mut app = panels_app();
+                    let mut out = Vec::new();
+                    demo_root(&mut app);
+                    app.show_all_worktrees = false;
+                    app.tree.agents.retain(|a| a.worktree_id.0 != "w2");
+                    let at = app
+                        .worktree_rows()
+                        .iter()
+                        .position(|r| {
+                            matches!(r,
+                    crate::app::WorktreeRow::Checkout(w) if w.id.0 == "w2")
+                        })
+                        .unwrap();
+                    super::select_worktree_row(&mut app, at, &mut out);
+                    app.focus = Focus::Worktrees;
+                    draw(&mut app);
+                    key(&mut app, 'p', &mut out);
+                    assert_eq!(quick_launch(&app).is_new_worktree(), new_worktree);
+                    if !new_worktree {
+                        assert!(
+                            matches!(&quick_launch(&app).target, crate::quick_prompt::QuickTarget::Worktree(id) if id.0 == "w2")
+                        );
+                        press(
+                            &mut app,
+                            KeyCode::Char('n'),
+                            KeyModifiers::CONTROL,
+                            &mut out,
+                        );
+                        assert!(quick_launch(&app).is_new_worktree());
+                    }
+                    press(
+                        &mut app,
+                        KeyCode::Char('n'),
+                        KeyModifiers::CONTROL,
+                        &mut out,
+                    );
+                    assert!(
+                        matches!(&quick_launch(&app).target, crate::quick_prompt::QuickTarget::Worktree(id) if id.0 == "w2")
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn quick_prompt_carries_the_selected_pr_or_issue() {
+        with_config_json("{}", || {
+            for issue in [false, true] {
+                let mut app = panels_app();
+                let mut out = Vec::new();
+                demo_root(&mut app);
+                if issue {
+                    super::super::tests::seed_issues(&mut app, &[(7, "fix login")]);
+                    app.issues_collapsed = false;
+                } else {
+                    super::super::tests::seed_open_prs(&mut app, &[(7, "fix login")]);
+                }
+                app.sel_worktree = app
+                    .worktree_rows()
+                    .iter()
+                    .position(|row| {
+                        if issue {
+                            row.open_issue().is_some()
+                        } else {
+                            row.open_pr().is_some()
+                        }
+                    })
+                    .unwrap();
+                app.focus = Focus::Worktrees;
+                draw(&mut app);
+                key(&mut app, 'p', &mut out);
+                let launch = quick_launch(&app);
+                assert_eq!(launch.issue.is_some(), issue);
+                assert_eq!(launch.pr.is_some(), !issue);
+            }
+        });
+    }
+
+    #[test]
+    fn intervening_clicks_break_a_session_double_click() {
+        for interruption in 0..4 {
+            let mut app = panels_app();
+            let mut out = Vec::new();
+            demo_root(&mut app);
+            draw(&mut app);
+            super::click_row(&mut app, Row::Session(0), &mut out);
+            match interruption {
+                0 => {
+                    let project = app.sel_project;
+                    super::click_row(&mut app, Row::Project(project), &mut out);
+                }
+                1 => super::click_row(&mut app, Row::FollowUpBox, &mut out),
+                2 => {
+                    let background = hit_rect(&app, HitTarget::PanelBg(Focus::Projects));
+                    mouse_at(
+                        &mut app,
+                        MouseEventKind::Down(MouseButton::Left),
+                        (background.x + 1, background.bottom() - 1),
+                        &mut out,
+                    );
+                }
+                _ => mouse_at(
+                    &mut app,
+                    MouseEventKind::Down(MouseButton::Left),
+                    (0, 0),
+                    &mut out,
+                ),
+            }
+            super::click_row(&mut app, Row::Session(0), &mut out);
+            assert!(
+                !app.term_locked,
+                "intervening click {interruption} kept the gesture alive"
+            );
+            super::click_row(&mut app, Row::Session(0), &mut out);
+            assert!(app.term_locked, "two consecutive row clicks still attach");
+        }
     }
 }

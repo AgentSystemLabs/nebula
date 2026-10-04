@@ -1629,7 +1629,12 @@ pub fn target_for(app: &App, project: &ProjectId, new_worktree: bool) -> QuickTa
 /// `^P`. A checkout still being cut is stepped over to the root. None
 /// for a project with no usable checkout at all.
 pub fn launch_checkout(app: &App, project: &ProjectId) -> Option<WorktreeId> {
-    cursor_checkout(app)
+    let checkout = if app.panels_active() {
+        app.selected_worktree().map(|w| w.id.clone())
+    } else {
+        cursor_checkout(app)
+    };
+    checkout
         .filter(|id| {
             app.tree
                 .worktrees
