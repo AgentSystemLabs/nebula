@@ -3,6 +3,7 @@
 //! from one place — a typo here fails to build instead of silently falling
 //! back to a default.
 
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 /// Id of the agent a hook or CLI invocation is running inside. Set on every
@@ -86,6 +87,87 @@ pub const PANE_COLORTERM: &str = "truecolor";
 /// out, so a user who wants none keeps none.
 pub const PANE_COLOR_OVERRIDES: &[&str] = &["NO_COLOR", "FORCE_COLOR"];
 
+/// Variables a Claude Code session sets on the shells it runs tools in,
+/// naming that session: its id, its process, its messaging socket and
+/// token, and the marker that says "this process is my sub-process". A
+/// daemon started from such a shell — `nebula` typed by an agent, or run
+/// in its terminal — would pass them to every agent, terminal and `claude`
+/// probe it starts, and each would believe it belonged to that other
+/// session: Claude Code turns its transcript off for an inherited
+/// `CLAUDE_CODE_CHILD_SESSION` (so `--resume`, and with it a `nebula
+/// worktree` relocation, finds no conversation), reports the wrong
+/// session id, and talks to the other session's socket. Only identity is
+/// listed: user settings that share the `CLAUDE_CODE_` prefix
+/// (`CLAUDE_CODE_USE_BEDROCK`, an OAuth token) are kept.
+pub const HOST_CLAUDE_SESSION_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_INVOKED_SKILLS",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "AI_AGENT",
+];
+
+/// Overrides Claude Code puts on its tool shells for its own non-interactive
+/// use: `GIT_EDITOR=true` (in a nebula pane a bare `git commit` would abort
+/// on an empty message) and `COREPACK_ENABLE_AUTO_PIN=0`. Dropped only at
+/// exactly the value it sets, and only beside a session marker, so a user
+/// who sets either themselves keeps it.
+pub const HOST_CLAUDE_TOOL_SHELL_OVERRIDES: &[(&str, &str)] =
+    &[("GIT_EDITOR", "true"), ("COREPACK_ENABLE_AUTO_PIN", "0")];
+
+/// Whether an inherited `name=value` belongs to the Claude Code session
+/// `nebula` was started from: one of [`HOST_CLAUDE_SESSION_VARS`], or —
+/// when `in_session` (a session marker sits in the same environment) —
+/// one of [`HOST_CLAUDE_TOOL_SHELL_OVERRIDES`] at its exact value.
+pub fn is_host_claude_session_var(name: &OsStr, value: &OsStr, in_session: bool) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    HOST_CLAUDE_SESSION_VARS.contains(&name)
+        || (in_session
+            && HOST_CLAUDE_TOOL_SHELL_OVERRIDES
+                .iter()
+                .any(|&(var, set)| var == name && value == set))
+}
+
+/// The names in `vars` that belong to the host Claude Code session.
+pub fn host_claude_session_names(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<OsString> {
+    let vars: Vec<(OsString, OsString)> = vars.into_iter().collect();
+    let in_session = vars
+        .iter()
+        .any(|(name, _)| name == "CLAUDECODE" || name == "CLAUDE_CODE_CHILD_SESSION");
+    vars.into_iter()
+        .filter(|(name, value)| is_host_claude_session_var(name, value, in_session))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Drop the inherited Claude Code session variables from this process's
+/// environment, returning the names dropped. Called first thing in
+/// `main`, before a thread or a child exists, so nothing `nebula` starts —
+/// the daemon and its agents, terminals and probes, or the TUI's own
+/// helpers — inherits them.
+pub fn scrub_host_claude_session() -> Vec<String> {
+    let names = host_claude_session_names(std::env::vars_os());
+    for name in &names {
+        std::env::remove_var(name);
+    }
+    names
+        .into_iter()
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// The value of `var`, treating unset and empty the same way — an empty
 /// override is how a caller says "use the default".
 pub fn non_empty(var: &str) -> Option<String> {
@@ -101,6 +183,76 @@ pub fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_claude_session_vars_are_identity_only() {
+        let is = |name: &str, value: &str| {
+            is_host_claude_session_var(OsStr::new(name), OsStr::new(value), true)
+        };
+        for name in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_PID",
+        ] {
+            assert!(is(name, "1"), "{name}");
+        }
+        // User settings under the same prefix stay.
+        for name in [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            CLAUDE_CONFIG_DIR,
+            AGENT_ID,
+            "PATH",
+        ] {
+            assert!(!is(name, "1"), "{name}");
+        }
+        assert!(is("GIT_EDITOR", "true"));
+        assert!(!is("GIT_EDITOR", "vim"), "a user's editor stays");
+        assert!(is("COREPACK_ENABLE_AUTO_PIN", "0"));
+        assert!(
+            !is("COREPACK_ENABLE_AUTO_PIN", "1"),
+            "a user's choice stays"
+        );
+        assert!(
+            !is_host_claude_session_var(OsStr::new("GIT_EDITOR"), OsStr::new("true"), false),
+            "outside a Claude session, GIT_EDITOR=true is the user's"
+        );
+        assert!(
+            !is("CLAUDE_CODE_SSE_PORT", "1"),
+            "an IDE terminal's link stays"
+        );
+    }
+
+    #[test]
+    fn host_session_names_are_picked_out_of_an_environment() {
+        let vars = [
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDE_CODE_USE_BEDROCK", "1"),
+            ("GIT_EDITOR", "true"),
+            ("COREPACK_ENABLE_AUTO_PIN", "0"),
+            ("COREPACK_ENABLE_AUTO_PIN_EXTRA", "0"),
+            ("PATH", "/bin"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        assert_eq!(
+            host_claude_session_names(vars.clone()),
+            [
+                "CLAUDE_CODE_CHILD_SESSION",
+                "GIT_EDITOR",
+                "COREPACK_ENABLE_AUTO_PIN"
+            ]
+            .map(OsString::from)
+        );
+        // No session marker: the overrides are the user's own.
+        let plain: Vec<_> = vars
+            .into_iter()
+            .filter(|(name, _)| name != "CLAUDE_CODE_CHILD_SESSION")
+            .collect();
+        assert!(host_claude_session_names(plain).is_empty());
+    }
 
     #[test]
     fn non_empty_treats_unset_and_empty_alike() {

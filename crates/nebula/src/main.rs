@@ -15,9 +15,16 @@ fn main() -> Result<()> {
     // settings along. Merge them before anything reads a setting, and before
     // a thread or a child exists to inherit the variable.
     nebula_tui::bundle::apply_forwarded();
+    // Likewise before any thread or child: nothing `nebula` starts — the
+    // daemon and everything it runs, or the TUI's own helpers — may
+    // inherit the Claude Code session it was typed in.
+    let dropped = nebula_core::env::scrub_host_claude_session();
     match cli.command {
         Some(Command::Daemon { foreground }) => {
             init_daemon_logging(foreground)?;
+            if !dropped.is_empty() {
+                tracing::info!(vars = ?dropped, "dropped the inherited Claude Code session env");
+            }
             log_fatal(
                 nebula_daemon::run_daemon(),
                 &nebula_core::paths::daemon_log_path(),
@@ -94,6 +101,9 @@ fn main() -> Result<()> {
             Some(dir) => nebula_tui::run_add_project(dir),
             None => {
                 init_tui_logging()?;
+                if !dropped.is_empty() {
+                    tracing::info!(vars = ?dropped, "dropped the inherited Claude Code session env");
+                }
                 let handoff =
                     log_fatal(nebula_tui::run_tui(), &nebula_core::paths::tui_log_path())?;
                 match handoff {
