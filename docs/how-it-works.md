@@ -87,10 +87,11 @@
   falling back to `origin/HEAD` in a repo that has no branch of that name.
 - **Worktrees made outside nebula show up anyway — WORKTREE SYNC.** Every 2 s the DAEMON mtime-probes
   the git files a worktree operation touches — the repo's shared `.git/HEAD`, the `.git/worktrees`
-  directory, and each linked checkout's own `HEAD` — and only when the newest of those stamps has moved
-  does it spend a `git worktree list` and reconcile the rows. So an agent that runs `git worktree add`
-  itself, a `git checkout` you did in another terminal, or a worktree someone removed lands on the
-  grid within a couple of seconds without a restart, while an idle repo costs nothing but a few
+  directory, and each linked checkout's own `HEAD` — and only when the newest of those stamps has moved,
+  or a registered checkout's directory has disappeared, does it spend a `git worktree list` and
+  reconcile the rows. So an agent that runs `git worktree add` itself, a `git checkout` you did in
+  another terminal, or a worktree someone removed (with `git worktree remove` or a plain `rm -rf`)
+  lands on the grid within a couple of seconds without a restart, while an idle repo costs nothing but a few
   `stat` calls (`NEBULA_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
   100 ms). This structural sync is the *only* git polling the DAEMON does — the pull request lookups
   further down are the TUI's own.

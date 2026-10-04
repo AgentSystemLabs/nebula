@@ -99,6 +99,12 @@ pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
 /// against captured porcelain output: one stanza per checkout, `worktree
 /// <path>` first, then `HEAD <sha>` and either `branch refs/heads/<name>`
 /// or `detached`, separated by blank lines.
+///
+/// A stanza marked `prunable` is left out: its directory was deleted without
+/// `git worktree remove` (`rm -rf`, Finder, a disk sweep), and git keeps
+/// listing it only until the next `git worktree prune`. It is not a checkout
+/// anyone can work in, so it must not be adopted or keep a row alive. The
+/// main checkout is never prunable, so it stays first.
 fn parse_worktree_list(out: &str) -> Vec<WorktreeEntry> {
     /// Close out the stanza in progress, if one is open: a `branch` line
     /// named it, otherwise it is a detached HEAD. The next `worktree` line
@@ -108,11 +114,16 @@ fn parse_worktree_list(out: &str) -> Vec<WorktreeEntry> {
         path: Option<PathBuf>,
         branch: &mut Option<String>,
         head: Option<&str>,
+        prunable: bool,
     ) {
+        let branch_name = branch.take();
+        if prunable {
+            return;
+        }
         if let Some(path) = path {
             entries.push(WorktreeEntry {
                 path,
-                branch: branch.take().unwrap_or_else(|| detached_label(head)),
+                branch: branch_name.unwrap_or_else(|| detached_label(head)),
             });
         }
     }
@@ -121,18 +132,28 @@ fn parse_worktree_list(out: &str) -> Vec<WorktreeEntry> {
     let mut path: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
     let mut head: Option<String> = None;
+    let mut prunable = false;
     for line in out.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            close(&mut entries, path.take(), &mut branch, head.as_deref());
+            close(
+                &mut entries,
+                path.take(),
+                &mut branch,
+                head.as_deref(),
+                prunable,
+            );
             head = None;
+            prunable = false;
             path = Some(PathBuf::from(p));
         } else if let Some(sha) = line.strip_prefix("HEAD ") {
             head = Some(sha.to_string());
         } else if let Some(b) = line.strip_prefix("branch ") {
             branch = Some(b.trim_start_matches("refs/heads/").to_string());
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            prunable = true;
         }
     }
-    close(&mut entries, path, &mut branch, head.as_deref());
+    close(&mut entries, path, &mut branch, head.as_deref(), prunable);
     entries
 }
 
@@ -662,6 +683,43 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].branch, "b");
         assert!(parse_worktree_list("").is_empty());
+    }
+
+    #[test]
+    fn parse_worktree_list_leaves_out_checkouts_deleted_without_git() {
+        // The `gone` stanza is git's porcelain after `rm -rf` on a linked
+        // worktree (git 2.31+ prints `prunable`, with a reason). The
+        // `bare-mark` one is hand-written: it guards against a git that
+        // prints the mark with no reason.
+        let porcelain = "worktree /repo\n\
+                         HEAD 0123456789abcdef0123456789abcdef01234567\n\
+                         branch refs/heads/main\n\
+                         \n\
+                         worktree /repo-worktrees/gone\n\
+                         HEAD 0123456789abcdef0123456789abcdef01234567\n\
+                         branch refs/heads/gone\n\
+                         prunable gitdir file points to non-existent location\n\
+                         \n\
+                         worktree /repo-worktrees/bare-mark\n\
+                         HEAD 0123456789abcdef0123456789abcdef01234567\n\
+                         detached\n\
+                         prunable\n\
+                         \n\
+                         worktree /repo-worktrees/kept\n\
+                         HEAD fedcba9876543210fedcba9876543210fedcba98\n\
+                         branch refs/heads/kept\n";
+        let entries = parse_worktree_list(porcelain);
+        let got: Vec<(&Path, &str)> = entries
+            .iter()
+            .map(|e| (e.path.as_path(), e.branch.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Path::new("/repo"), "main"),
+                (Path::new("/repo-worktrees/kept"), "kept"),
+            ]
+        );
     }
 
     #[test]
@@ -1227,9 +1285,14 @@ mod tests {
         std::fs::remove_dir_all(&wt).unwrap();
 
         remove_worktree(&repo, &wt, false).await.unwrap();
-        // The stale registration should be pruned from git's list too.
-        let entries = list_worktrees(&repo).await.unwrap();
-        assert!(entries.iter().all(|e| e.path != wt));
+        // The stale registration should be pruned from git's registry too.
+        // `list_worktrees` leaves a `prunable` checkout out whether or not
+        // it was pruned, so ask git's raw listing instead.
+        let raw = git(&repo, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        assert!(!raw.contains("prunable"), "{raw}");
+        assert_eq!(raw.matches("worktree ").count(), 1, "{raw}");
     }
 
     #[tokio::test]
