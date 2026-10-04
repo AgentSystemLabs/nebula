@@ -1,0 +1,24 @@
+# The PANELS with PROJECTS and WORKTREES collapsed to their rails by ⇧P and ⇧B: two one-column rails down the left edge,
+# each with its ▶, SESSIONS beside them with the keys, the pane taking the width, and the footer leading with
+# ⇧P: show projects  ⇧B: show worktrees.
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+p
+Sort the changelog entries by date, newest first
+Enter
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+P
+B

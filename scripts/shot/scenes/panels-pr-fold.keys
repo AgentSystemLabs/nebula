@@ -1,0 +1,25 @@
+# The PANELS with the WORKTREES cursor on the draft pull request #39: SESSIONS folds to its bare rule
+# and the pane reading the pull request takes its width.
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+p
+Sort the changelog entries by date, newest first
+Enter
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+l
+j
+j
+j

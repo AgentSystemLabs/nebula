@@ -1,0 +1,22 @@
+# The PANELS with SESSIONS|pane dragged far past the window's right edge: the column stops where the
+# pane is down to MIN_PANE_W (20 cols).
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+p
+Sort the changelog entries by date, newest first
+Enter
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+drag 74 6 186 6

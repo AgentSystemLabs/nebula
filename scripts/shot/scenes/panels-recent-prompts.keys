@@ -1,0 +1,19 @@
+# The PANELS' RECENT PROMPTS: three quick prompts on the root checkout from its SESSIONS column; the
+# stand-in agent (see the .setup.sh) posts each session's prompts through the hooks, so every session's
+# pill grows its RECENT PROMPTS lines under its name, the cursor's on its fill.
+Tab
+Tab
+p
+Fix the login redirect
+Enter
+p
+Sort the changelog by date
+Enter
+p
+Profile the daemon startup
+Enter
+F12
+F12
+F12
+F12
+F12

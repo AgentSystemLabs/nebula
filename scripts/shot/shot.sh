@@ -6,6 +6,10 @@
 # repository with two worktrees, drives it inside a private tmux server, and captures the screen as
 # design-screenshots/<scene>.{txt,ansi,png}. Never touches the real daemon or the real data dir.
 #
+# RESTART=1 (or a scene's setup.sh setting it) quits the TUI after the keys and starts a fresh one on the
+# same data dir before capturing: a scene for what survives a restart. The screen before the quit is kept as
+# design-screenshots/<scene>.before-quit.txt.
+#
 # Traps this encodes (learned 2026-08-20 / 2026-08-21): NEBULA_RUNTIME_DIR must be short (the unix
 # socket path caps at ~104 chars); NEBULA_AGENT_CMD must be set even with no agent (the PREWARM POOL
 # launches a real claude otherwise); the first exec of a fresh binary can stall on macOS signature
@@ -73,6 +77,10 @@ if [ -f "$HERE/scenes/$SCENE.keys" ]; then
   while IFS= read -r key; do case "$key" in ''|'#'*) continue;; esac; send "$key"; done < "$HERE/scenes/$SCENE.keys"
 fi
 for key in ${KEYS:-}; do send "$key"; done
+if [ -n "${RESTART:-}" ]; then
+  sleep 1; $TMUX capture-pane -pN > "$OUT/$SCENE.before-quit.txt"; send C-q; send q; send y; sleep 2
+  $TMUX kill-server 2>/dev/null || true; $TMUX new-session -d -x "$COLS" -y "$ROWS" "$BIN"; sleep 4
+fi
 sleep 1
 $TMUX capture-pane -epN > "$OUT/$SCENE.ansi"
 $TMUX capture-pane -pN  > "$OUT/$SCENE.txt"

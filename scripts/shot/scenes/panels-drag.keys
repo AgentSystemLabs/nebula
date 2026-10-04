@@ -1,0 +1,23 @@
+# The PANELS with two borders dragged: PROJECTS|WORKTREES right from col 20 to 32 (PROJECTS 20 -> 32),
+# then SESSIONS|pane left from its new col 86 to 76 (SESSIONS 32 -> 22); the pane takes the difference.
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+p
+Sort the changelog entries by date, newest first
+Enter
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+drag 20 6 32 6
+drag 86 6 76 6
