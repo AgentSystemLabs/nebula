@@ -88,6 +88,21 @@ impl KittyScanner {
         }
     }
 
+    /// A scanner picking up where another image's left off: the flags stack
+    /// and the bracketed-paste mode are all an IN-PLACE RESTART carries.
+    pub fn restored(stack: Vec<u8>, bracketed_paste: bool) -> Self {
+        Self {
+            stack,
+            bracketed_paste,
+            ..Self::new()
+        }
+    }
+
+    /// The pushed flags, oldest first.
+    pub fn stack(&self) -> &[u8] {
+        &self.stack
+    }
+
     /// Effective flags: top of the stack, or 0 (legacy) when empty.
     pub fn flags(&self) -> u8 {
         self.stack.last().copied().unwrap_or(0)

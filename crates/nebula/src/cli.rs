@@ -94,6 +94,9 @@ pub(crate) enum Command {
         /// Stay attached to the terminal instead of logging to file.
         #[arg(long)]
         foreground: bool,
+        /// Take over the sessions a restarting daemon wrote to this file.
+        #[arg(long, hide = true, value_name = "STATE")]
+        adopt: Option<std::path::PathBuf>,
     },
     /// Shut the running daemon down (stops all sessions).
     ///
@@ -101,10 +104,20 @@ pub(crate) enum Command {
     /// A daemon from a build on another protocol can't take that request, so
     /// it gets SIGTERM instead, which it handles the same clean way.
     /// Quitting the TUI does not do this — the daemon outlives its clients on
-    /// purpose — so this is how you stop everything, and how you move onto a
-    /// newly installed binary.
+    /// purpose — so this is how you stop everything. To move onto a newly
+    /// installed binary without stopping anything, use `nebula reload`.
     #[command(after_help = KILL_EXAMPLES)]
     Kill,
+    /// Move the daemon onto the installed binary, keeping every session.
+    ///
+    /// Restarts the running daemon in place: it execs the `nebula` binary
+    /// this command runs from, and every session — agents mid-turn included —
+    /// keeps running, its scrollback intact. Open TUIs lose their connection;
+    /// relaunch `nebula` to pick the sessions back up. `nebula upgrade` does
+    /// this on its own after installing. Needs a daemon from a build that
+    /// has this command; an older one can only be restarted by `nebula kill`.
+    #[command(after_help = RELOAD_EXAMPLES)]
+    Reload,
     /// Title the session this command runs inside.
     ///
     /// Run from inside a nebula agent session: it titles that session's row.
@@ -282,10 +295,12 @@ pub(crate) enum Command {
     },
     /// Install the latest published nebula over this one.
     ///
-    /// Runs the install script for the newest release. Upgrading with a daemon
-    /// running is safe: sessions keep running on the old binary until you
-    /// restart it with `nebula kill` (which stops all sessions). When the new
-    /// build can't attach to that daemon, it says so and offers the restart.
+    /// Runs the install script for the newest release, then moves a running
+    /// daemon onto the new binary in place (see `nebula reload`): every
+    /// session keeps running. A daemon from before in-place restarts can't
+    /// be moved; its sessions keep running on the old binary until you
+    /// restart it with `nebula kill` (which stops all sessions), and when the
+    /// new build can't attach to it, upgrade says so and offers that restart.
     #[command(after_help = UPGRADE_EXAMPLES)]
     Upgrade {
         /// Upgrade even when running from a local cargo build.
@@ -301,6 +316,10 @@ pub(crate) enum Command {
     /// attach to the daemon left running.
     #[command(hide = true, name = "_protocol-version")]
     ProtocolVersion,
+    /// Reload hook: print the newest restart-state version this binary
+    /// reads, so a daemon asked to restart onto it knows it can.
+    #[command(hide = true, name = "_restart-version")]
+    RestartVersion,
 }
 
 const ADD_EXAMPLES: &str = "\
@@ -318,6 +337,11 @@ Examples:
 const KILL_EXAMPLES: &str = "\
 Examples:
   nebula kill                      stop the daemon and every session";
+
+const RELOAD_EXAMPLES: &str = "\
+Examples:
+  nebula reload                    restart the daemon, sessions and all
+  make install && nebula reload    cut over to a local build";
 
 const RENAME_EXAMPLES: &str = "\
 Examples:

@@ -10,11 +10,13 @@ use anyhow::{Context, Result};
 use cloud::CloudScanner;
 use cursor::CursorTracker;
 use nebula_core::SessionRef;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use progress::ProgressScanner;
 use ring::ScrollbackRing;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 
@@ -211,7 +213,6 @@ pub struct PtySession {
     pub sref: SessionRef,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// Child pid: drives the SIGHUP → SIGKILL escalation (the child is its
     /// PTY session's leader — portable-pty does setsid — so pgid == pid,
     /// though an agent run as a job under a login shell sits in a group of
@@ -275,38 +276,128 @@ impl PtySession {
             cmd.env(k, v);
         }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .context("spawn child in pty")?;
         drop(pair.slave);
 
-        let killer = child.clone_killer();
         let child_pid = child.process_id();
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer = pair.master.take_writer().context("take pty writer")?;
+        let reap: Reap = Box::new(move || child.wait().ok().map(|st| st.exit_code() as i32));
 
-        let (events, _) = broadcast::channel(256);
-        let session = Arc::new(Self {
-            sref,
-            writer: Mutex::new(writer),
-            master: Mutex::new(pair.master),
-            killer: Mutex::new(killer),
-            child_pid,
-            ring: Mutex::new(ScrollbackRing::new(RING_CAPACITY)),
-            events,
-            last_size: Mutex::new((spec.cols, spec.rows)),
-            kitty: Mutex::new(kitty::KittyScanner::new()),
-            progress: Mutex::new(ProgressScanner::new()),
-            title: Mutex::new(title::TitleScanner::new()),
-            cloud: Mutex::new(None),
-            cursor: Mutex::new(None),
-        });
+        Ok(Self::start(
+            Self {
+                sref,
+                writer: Mutex::new(writer),
+                master: Mutex::new(pair.master),
+                child_pid,
+                ring: Mutex::new(ScrollbackRing::new(RING_CAPACITY)),
+                events: broadcast::channel(256).0,
+                last_size: Mutex::new((spec.cols, spec.rows)),
+                kitty: Mutex::new(kitty::KittyScanner::new()),
+                progress: Mutex::new(ProgressScanner::new()),
+                title: Mutex::new(title::TitleScanner::new()),
+                cloud: Mutex::new(None),
+                cursor: Mutex::new(None),
+            },
+            reader,
+            reap,
+        ))
+    }
 
-        let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
-        spawn_reader_thread(reader, child, tx);
-        tokio::spawn(pump(session.clone(), rx));
+    /// Take over a session an earlier image of this daemon ran, from what
+    /// [`Self::carry`] wrote down: the master fd survived the exec, and the
+    /// child is still this process's child, so it is reaped as before.
+    pub fn adopt(carried: Carried) -> Result<Arc<Self>> {
+        // SAFETY: the fd was named by the image that exec'd us, which held it
+        // open across the exec for exactly this; nothing else here owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(carried.master_fd) };
+        set_cloexec(fd.as_raw_fd(), true)?;
+        let master = AdoptedMaster { fd };
+        let reader = master.try_clone_reader().context("clone pty reader")?;
+        let writer = master.take_writer().context("take pty writer")?;
+        let pid = carried.pid;
+        let reap: Reap = Box::new(move || reap_pid(pid));
+        let (cols, rows) = carried.size;
+        let cloud_scan = carried.cloud_scan;
+        let session = Self::start(
+            Self {
+                sref: carried.sref,
+                writer: Mutex::new(writer),
+                master: Mutex::new(Box::new(master)),
+                child_pid: Some(pid),
+                ring: Mutex::new(ScrollbackRing::restored(
+                    RING_CAPACITY,
+                    carried.ring_start_seq,
+                    &carried.ring,
+                )),
+                events: broadcast::channel(256).0,
+                last_size: Mutex::new((cols, rows)),
+                kitty: Mutex::new(kitty::KittyScanner::restored(
+                    carried.kitty_stack,
+                    carried.bracketed_paste,
+                )),
+                progress: Mutex::new(ProgressScanner::restored(carried.progress_busy)),
+                title: Mutex::new(title::TitleScanner::restored(carried.title)),
+                cloud: Mutex::new(None),
+                cursor: Mutex::new(None),
+            },
+            reader,
+            reap,
+        );
+        // Armed before anything subscribes: what the ring already shows,
+        // the previous image already acted on.
+        if cloud_scan {
+            session.arm_cloud_scan();
+        }
         Ok(session)
+    }
+
+    fn start(session: Self, reader: Box<dyn Read + Send>, reap: Reap) -> Arc<Self> {
+        let session = Arc::new(session);
+        let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
+        spawn_reader_thread(reader, reap, tx);
+        tokio::spawn(pump(session.clone(), rx));
+        session
+    }
+
+    /// Everything a new image of the daemon needs to take this session
+    /// over (see [`Self::adopt`]), with the master fd left open across the
+    /// exec. None for a session with no child pid to reap. Output the
+    /// reader has read but the pump has not yet added to the ring is lost;
+    /// the attach that follows repaints the screen anyway.
+    pub fn carry(&self) -> Result<Option<Carried>> {
+        let (Some(pid), Some(master_fd)) =
+            (self.child_pid, self.master.lock().unwrap().as_raw_fd())
+        else {
+            return Ok(None);
+        };
+        set_cloexec(master_fd, false)?;
+        let (ring_start_seq, ring) = self.ring.lock().unwrap().snapshot_from(None);
+        let kitty = self.kitty.lock().unwrap();
+        Ok(Some(Carried {
+            sref: self.sref.clone(),
+            master_fd,
+            pid,
+            size: *self.last_size.lock().unwrap(),
+            ring_start_seq,
+            ring,
+            kitty_stack: kitty.stack().to_vec(),
+            bracketed_paste: kitty.bracketed_paste(),
+            progress_busy: self.progress.lock().unwrap().busy(),
+            title: self.title.lock().unwrap().title().map(str::to_string),
+            cloud_scan: self.cloud.lock().unwrap().is_some(),
+        }))
+    }
+
+    /// Undo [`Self::carry`]'s hold on the master fd: the exec it was for
+    /// failed, and this image keeps running.
+    pub fn uncarry(&self) {
+        if let Some(fd) = self.master.lock().unwrap().as_raw_fd() {
+            let _ = set_cloexec(fd, true);
+        }
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
@@ -354,8 +445,11 @@ impl PtySession {
         // job it was running to init, where no walk from `pid` would find
         // it afterwards. ~10ms, and a kill is rare.
         let mut groups = self.child_pid.map(process_groups_under).unwrap_or_default();
-        let _ = self.killer.lock().unwrap().kill();
         let Some(pid) = self.child_pid else { return };
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGHUP,
+        );
         let sref = self.sref.clone();
         // Watchdog on a plain thread: it must not hold the session Arc (that
         // would pin the ring), and it outlives any tokio context `kill` was
@@ -536,13 +630,128 @@ impl PtySession {
     }
 }
 
+/// What an IN-PLACE RESTART carries of one live session across the exec.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Carried {
+    pub sref: SessionRef,
+    /// The PTY master, open in the new image under the same number.
+    pub master_fd: RawFd,
+    pub pid: u32,
+    pub size: (u16, u16),
+    pub ring_start_seq: u64,
+    #[serde(with = "serde_bytes")]
+    pub ring: Vec<u8>,
+    #[serde(default)]
+    pub kitty_stack: Vec<u8>,
+    #[serde(default)]
+    pub bracketed_paste: bool,
+    #[serde(default)]
+    pub progress_busy: Option<bool>,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// A `claude --cloud` create still watched for the session id it
+    /// prints (`arm_cloud_scan`).
+    #[serde(default)]
+    pub cloud_scan: bool,
+}
+
+/// Blocks until the child exits; its exit code, when the OS gave one.
+type Reap = Box<dyn FnOnce() -> Option<i32> + Send>;
+
+/// `waitpid` for a child this image did not spawn, but inherited across an
+/// exec. A signal death reads as 1, the code portable-pty gives it.
+fn reap_pid(pid: u32) -> Option<i32> {
+    use nix::sys::wait::{waitpid, WaitStatus};
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    loop {
+        match waitpid(pid, None) {
+            Ok(WaitStatus::Exited(_, code)) => return Some(code),
+            Ok(WaitStatus::Signaled(..)) => return Some(1),
+            Ok(_) | Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+pub(crate) fn set_cloexec(fd: RawFd, on: bool) -> Result<()> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+    // SAFETY: only ever called on an fd this process holds open.
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let mut flags = FdFlag::from_bits_truncate(fcntl(borrowed, FcntlArg::F_GETFD)?);
+    flags.set(FdFlag::FD_CLOEXEC, on);
+    fcntl(borrowed, FcntlArg::F_SETFD(flags))?;
+    Ok(())
+}
+
+/// A PTY master inherited across an exec, where portable-pty has no way to
+/// wrap an fd it did not open itself.
+struct AdoptedMaster {
+    fd: OwnedFd,
+}
+
+impl AdoptedMaster {
+    fn dup(&self) -> anyhow::Result<std::fs::File> {
+        Ok(std::fs::File::from(self.fd.try_clone()?))
+    }
+}
+
+impl MasterPty for AdoptedMaster {
+    fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+        let ws = nix::libc::winsize {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: size.pixel_width,
+            ws_ypixel: size.pixel_height,
+        };
+        // SAFETY: TIOCSWINSZ reads one winsize from the pointer, which
+        // outlives the call.
+        if unsafe { nix::libc::ioctl(self.fd.as_raw_fd(), nix::libc::TIOCSWINSZ, &ws) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    fn get_size(&self) -> anyhow::Result<PtySize> {
+        let mut ws: nix::libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: TIOCGWINSZ writes one winsize through the pointer.
+        if unsafe { nix::libc::ioctl(self.fd.as_raw_fd(), nix::libc::TIOCGWINSZ, &mut ws) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(PtySize {
+            rows: ws.ws_row,
+            cols: ws.ws_col,
+            pixel_width: ws.ws_xpixel,
+            pixel_height: ws.ws_ypixel,
+        })
+    }
+
+    fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(self.dup()?))
+    }
+
+    fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+        Ok(Box::new(self.dup()?))
+    }
+
+    fn process_group_leader(&self) -> Option<nix::libc::pid_t> {
+        match unsafe { nix::libc::tcgetpgrp(self.fd.as_raw_fd()) } {
+            pid if pid > 0 => Some(pid),
+            _ => None,
+        }
+    }
+
+    fn as_raw_fd(&self) -> Option<RawFd> {
+        Some(self.fd.as_raw_fd())
+    }
+
+    fn tty_name(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
 /// PTY reads are blocking → dedicated thread per session. After EOF it reaps
 /// the child to get the exit code.
-fn spawn_reader_thread(
-    mut reader: Box<dyn Read + Send>,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    tx: mpsc::Sender<ReaderMsg>,
-) {
+fn spawn_reader_thread(mut reader: Box<dyn Read + Send>, reap: Reap, tx: mpsc::Sender<ReaderMsg>) {
     std::thread::Builder::new()
         .name("pty-reader".into())
         .stack_size(256 * 1024)
@@ -561,7 +770,7 @@ fn spawn_reader_thread(
                     }
                 }
             }
-            let exit_code = child.wait().ok().map(|st| st.exit_code() as i32);
+            let exit_code = reap();
             let _ = tx.blocking_send(ReaderMsg::Eof { exit_code });
         })
         .expect("spawn pty reader thread");

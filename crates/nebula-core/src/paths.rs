@@ -49,6 +49,31 @@ pub fn buildstamp_path() -> PathBuf {
     runtime_dir().join("daemon.build")
 }
 
+/// `<pid> <version>` of a daemon that can restart in place onto a new
+/// binary, keeping its sessions. A daemon from before IN-PLACE RESTARTS
+/// never writes it, which is how a client knows not to ask.
+pub fn restart_capability_path() -> PathBuf {
+    runtime_dir().join("daemon.restart")
+}
+
+/// A client's request for an IN-PLACE RESTART: which binary to restart
+/// onto. The daemon reads and removes it when signalled.
+pub fn restart_request_path() -> PathBuf {
+    runtime_dir().join("restart.request")
+}
+
+/// How the last IN-PLACE RESTART went, written by whichever image of the
+/// daemon finished it: the old one on a refusal, the new one on success.
+pub fn restart_result_path() -> PathBuf {
+    runtime_dir().join("restart.result")
+}
+
+/// The live sessions an IN-PLACE RESTART carries across the exec, read
+/// and removed by the new image as it boots.
+pub fn restart_state_path() -> PathBuf {
+    runtime_dir().join("restart.state")
+}
+
 /// The platform's per-user dirs for this app (`~/Library/Application
 /// Support/dev.nebula.nebula` on macOS, `~/.local/share/nebula` on Linux).
 fn project_dirs() -> Option<directories::ProjectDirs> {

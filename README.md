@@ -102,10 +102,11 @@ It downloads the prebuilt binary for your platform from the latest GitHub releas
 Afterwards, `nebula upgrade` runs that same script for you; it refuses to clobber a local `cargo build`
 (pass `--force` if you mean it). Upgrading with a DAEMON running is safe: an idle one — nothing live in
 it — is shut down for you, so the next launch comes up on the new binary. A DAEMON with live SESSIONS is
-left alone and they keep running the old binary until you `nebula kill` and relaunch — unless the new
-build speaks a different protocol, in which case it can't attach until that restart, and `nebula upgrade`
-says so and offers to do it for you. `nebula --version`
-(`-V`) says which binary you are on.
+restarted in place onto the new binary: every agent keeps running, mid-turn or not, and relaunching
+`nebula` picks them back up with their scrollback (`nebula reload` does the same by hand, say after a
+`make install`). Only a DAEMON from a release before that existed is left on the old binary until you
+`nebula kill` and relaunch — and when the new build speaks a different protocol, `nebula upgrade` says
+so and offers that restart for you. `nebula --version` (`-V`) says which binary you are on.
 
 > **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, or `opencode`.
 > nebula spawns them; it doesn't ship them.

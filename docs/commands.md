@@ -14,6 +14,7 @@ nebula                      open the TUI (auto-starts the daemon)
 nebula add <dir>            register a git checkout as a project
 nebula daemon               run the daemon that owns every session
 nebula kill                 shut the running daemon down (stops all sessions)
+nebula reload               move the daemon onto the installed binary, keeping every session
 nebula rename <title>       title the session this runs inside          (agents run this)
 nebula worktree [name]      move this session into a worktree           (agents run this)
 nebula spawn <task>         start another agent session beside it       (agents run this)
@@ -44,6 +45,11 @@ nebula add .              # same, for the repo you're in (bare `nebula <dir>` / 
 nebula daemon             # run the daemon (normally auto-spawned)
 nebula daemon --foreground  # daemon with logs to stdout, for debugging
 nebula kill               # stop the daemon and all sessions cleanly
+nebula reload             # restart the daemon in place onto the binary this runs from: every
+                          # session keeps its process, scrollback and status, and agents' hooks
+                          # keep reaching it. Open TUIs drop their connection — relaunch `nebula`
+                          # to pick the sessions back up. The cut-over after `make install`; a
+                          # daemon from before reload existed can only be restarted by `kill`
 ```
 
 ## What agents run for you
@@ -121,8 +127,11 @@ nebula browser [--port N] [--bind ADDR | --public] [--credential USER:PASSWORD] 
 nebula upgrade            # install the latest release (--force on a dev build). Swapping the
                           # binary doesn't touch a running daemon, so afterwards it shuts an idle
                           # one (no live sessions) down for you and the next launch starts on the
-                          # new binary. With sessions live it leaves the daemon up — they'd die
-                          # with it — and says to run `nebula kill` when you're ready to restart.
-                          # When the new build speaks another protocol, and so can't attach to
-                          # that daemon, it says that too and offers the restart then and there
+                          # new binary. With sessions live it restarts the daemon in place onto
+                          # the new binary (what `nebula reload` does), and they keep running.
+                          # A daemon from before in-place restarts is left up — its sessions
+                          # would die with it — and it says to run `nebula kill` when you're
+                          # ready. When the new build speaks another protocol, and so can't
+                          # attach to that daemon, it says that too and offers the restart then
+                          # and there
 ```

@@ -234,14 +234,35 @@ pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent>
     })
 }
 
-/// Bind 127.0.0.1:0 and serve the hook route. Returns the env (port + fresh
-/// bearer token) and the receiving end of the event pipe.
+/// A hook receiver an earlier image of the daemon was serving: its
+/// listening socket, open across the exec, and the token every live agent
+/// already carries in its environment.
+pub struct InheritedHooks {
+    pub listener: std::net::TcpListener,
+    pub token: String,
+}
+
+/// Serve the hook route — on 127.0.0.1:0 with a fresh bearer token, or on
+/// what an IN-PLACE RESTART inherited. Returns the env (port + token), the
+/// receiving end of the event pipe, and the listener's fd for the next
+/// restart to carry.
 pub async fn start_hook_server(
     store: Arc<Store>,
-) -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    inherited: Option<InheritedHooks>,
+) -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>, std::os::fd::RawFd)> {
+    use std::os::fd::AsRawFd;
+    let (listener, token) = match inherited {
+        Some(InheritedHooks { listener, token }) => {
+            listener.set_nonblocking(true)?;
+            (tokio::net::TcpListener::from_std(listener)?, token)
+        }
+        None => (
+            tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+            generate_token(),
+        ),
+    };
     let port = listener.local_addr()?.port();
-    let token = generate_token();
+    let fd = listener.as_raw_fd();
     let (tx, rx) = mpsc::channel(256);
 
     let state = Arc::new(HookServerState {
@@ -270,7 +291,7 @@ pub async fn start_hook_server(
         }
     });
 
-    Ok((HookEnv { port, token }, rx))
+    Ok((HookEnv { port, token }, rx, fd))
 }
 
 fn generate_token() -> String {
@@ -534,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn claude_prompt_reply_pushes_the_row_name_as_session_title() {
         let store = seeded_store();
-        let (env, mut rx) = start_hook_server(store.clone()).await.unwrap();
+        let (env, mut rx, _) = start_hook_server(store.clone(), None).await.unwrap();
         let payload = r#"{"session_id":"s1","transcript_path":"/t/p/s1.jsonl"}"#;
 
         let (status, body) = http_post(
@@ -616,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn user_prompt_submit_injects_title_instruction_only_while_pending() {
         let store = seeded_store();
-        let (env, mut rx) = start_hook_server(store.clone()).await.unwrap();
+        let (env, mut rx, _) = start_hook_server(store.clone(), None).await.unwrap();
         let payload = r#"{"session_id":"s1"}"#;
 
         // Untitled session: the instruction rides the response body (and the
@@ -707,7 +728,7 @@ mod tests {
     #[tokio::test]
     async fn bash_tool_use_carries_cwd_but_subagent_traffic_does_not() {
         let store = seeded_store();
-        let (env, mut rx) = start_hook_server(store).await.unwrap();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
 
         // The mid-turn position signal: a Bash call that just `cd`ed into a
         // fresh worktree, long before the turn's Stop.
@@ -749,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn user_prompt_submit_carries_the_condensed_prompt() {
         let store = seeded_store();
-        let (env, mut rx) = start_hook_server(store).await.unwrap();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
         let post = |event: &'static str, body: &'static str| {
             let port = env.port;
             let token = env.token.clone();

@@ -768,22 +768,42 @@ impl Store {
         self.delete_by_id("agents", id.as_str())
     }
 
-    /// Boot sweep: agents whose PTYs died with the previous daemon.
-    pub fn sweep_disconnected(&self) -> Result<Vec<AgentId>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id FROM agents WHERE status IN ('running', 'needs_feedback')")?;
-        let ids: Vec<AgentId> = stmt
+    /// Boot sweep: agents whose PTYs died with the previous daemon. Those in
+    /// `carried` did not — an IN-PLACE RESTART brought them along — and
+    /// keep the status they had.
+    pub fn sweep_disconnected(
+        &self,
+        carried: &std::collections::HashSet<AgentId>,
+    ) -> Result<Vec<AgentId>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let ids: Vec<AgentId> = tx
+            .prepare("SELECT id FROM agents WHERE status IN ('running', 'needs_feedback')")?
             .query_map([], |r| r.get::<_, String>(0))?
             .filter_map(|r| r.ok())
             .map(AgentId)
+            .filter(|id| !carried.contains(id))
             .collect();
-        drop(stmt);
-        conn.execute(
-            "UPDATE agents SET status = 'disconnected', status_changed_at = ?1 WHERE status IN ('running', 'needs_feedback')",
-            params![now_ms()],
-        )?;
+        let changed_at = now_ms();
+        for id in &ids {
+            tx.execute(
+                "UPDATE agents SET status = 'disconnected', status_changed_at = ?2 WHERE id = ?1",
+                params![id.as_str(), changed_at],
+            )?;
+        }
+        tx.commit()?;
         Ok(ids)
+    }
+
+    /// Fold the WAL into the database and hold the connection, so nothing
+    /// writes while the guard lives — an IN-PLACE RESTART execs with it
+    /// held, and the new image opens a database no write is halfway into.
+    pub fn quiesce(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let conn = self.conn.lock().unwrap();
+        if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            tracing::warn!(error = %e, "wal checkpoint before restart failed");
+        }
+        conn
     }
 
     // ---- terminals ----
@@ -2013,7 +2033,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let swept = store.sweep_disconnected().unwrap();
+        let swept = store.sweep_disconnected(&Default::default()).unwrap();
         assert_eq!(swept.len(), 2);
         let (_, _, agents, _) = store.load_tree().unwrap();
         assert_eq!(
@@ -2030,6 +2050,65 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// An agent an IN-PLACE RESTART carried over is still running: the
+    /// boot sweep leaves its status alone.
+    #[test]
+    fn sweep_disconnected_spares_carried_agents() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            id: ProjectId::generate(),
+            name: "p".into(),
+            repo_path: "/tmp/p".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        let wt = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/p".into(),
+            branch: "main".into(),
+            is_main: true,
+            sort_order: 0,
+        };
+        store.insert_worktree(&wt).unwrap();
+        for name in ["kept", "gone"] {
+            store
+                .insert_agent(&Agent {
+                    id: AgentId(format!("agent-{name}")),
+                    worktree_id: wt.id.clone(),
+                    name: name.into(),
+                    status: AgentStatus::Running,
+                    archived: false,
+                    archived_at: 0,
+                    unseen: false,
+                    kind: AgentKind::Claude,
+                    custom_harness: None,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    cloud_session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: false,
+                    issue_url: None,
+                    recent_prompts: Vec::new(),
+                })
+                .unwrap();
+        }
+        let carried = [AgentId("agent-kept".into())].into_iter().collect();
+        let swept = store.sweep_disconnected(&carried).unwrap();
+        assert_eq!(swept, vec![AgentId("agent-gone".into())]);
+        let status = |id: &str| {
+            store
+                .get_agent(&AgentId(id.into()))
+                .unwrap()
+                .unwrap()
+                .status
+        };
+        assert_eq!(status("agent-kept"), AgentStatus::Running);
+        assert_eq!(status("agent-gone"), AgentStatus::Disconnected);
     }
 
     /// `Agent::unseen` rides along with the status: a live turn landing on
@@ -2128,7 +2207,7 @@ mod tests {
         // A daemon restart disconnects live rows and leaves finished ones alone.
         let c = seed("c", AgentStatus::Running);
         assert!(flip(&c, AgentStatus::Finished));
-        store.sweep_disconnected().unwrap();
+        store.sweep_disconnected(&Default::default()).unwrap();
         assert!(unseen(&c), "still waiting to be read after the restart");
     }
 

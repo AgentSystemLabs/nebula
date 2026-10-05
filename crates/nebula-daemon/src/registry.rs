@@ -399,6 +399,110 @@ impl Daemon {
         }
     }
 
+    // ---- in-place restart ----
+
+    /// Every live session, written down for the image an IN-PLACE RESTART
+    /// execs into, with its master fd left open across the exec. A warm
+    /// spare from the PREWARM POOL goes too, marked, so the new image reaps
+    /// it rather than leaving an unreaped child behind.
+    pub fn carry_sessions(&self) -> Result<Vec<crate::handoff::CarriedSession>> {
+        let spares: std::collections::HashSet<AgentId> = self
+            .prewarmed
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| e.agent_id.clone())
+            .collect();
+        let launching: std::collections::HashSet<AgentId> = self
+            .status_machines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, m)| m.is_launching())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let sessions: Vec<Arc<PtySession>> =
+            self.sessions.lock().unwrap().values().cloned().collect();
+        let mut carried = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let (spare, launching) = match &session.sref {
+                SessionRef::Agent(id) => (spares.contains(id), launching.contains(id)),
+                SessionRef::Terminal(_) => (false, false),
+            };
+            match session.carry() {
+                Ok(Some(pty)) => carried.push(crate::handoff::CarriedSession {
+                    pty,
+                    spare,
+                    launching,
+                }),
+                Ok(None) => {}
+                Err(e) => {
+                    self.uncarry_sessions();
+                    return Err(e.context(format!("carry {:?}", session.sref)));
+                }
+            }
+        }
+        Ok(carried)
+    }
+
+    /// Keep [`Self::ensure_session`] from spawning while the guard lives.
+    pub fn hold_spawns(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.spawn_gate.lock().unwrap()
+    }
+
+    /// The exec [`Self::carry_sessions`] prepared for failed: close the
+    /// master fds on exec again.
+    pub fn uncarry_sessions(&self) {
+        for session in self.sessions.lock().unwrap().values() {
+            session.uncarry();
+        }
+    }
+
+    /// Take over what the previous image carried. Spares are reaped at
+    /// once: the pool that would hand them out did not come along. Returns
+    /// how many sessions are live here now.
+    pub fn adopt_sessions(self: &Arc<Self>, carried: Vec<crate::handoff::CarriedSession>) -> usize {
+        let mut adopted = 0;
+        for crate::handoff::CarriedSession {
+            pty,
+            spare,
+            launching,
+        } in carried
+        {
+            let sref = pty.sref.clone();
+            match PtySession::adopt(pty) {
+                Ok(session) if spare => session.kill(),
+                Ok(session) => {
+                    if let (true, SessionRef::Agent(id)) = (launching, &sref) {
+                        self.status_machines
+                            .lock()
+                            .unwrap()
+                            .insert(id.clone(), AgentStatusMachine::launching());
+                    }
+                    self.install_session(session);
+                    adopted += 1;
+                }
+                Err(e) => tracing::warn!(session = ?sref, error = %e, "could not adopt session"),
+            }
+        }
+        adopted
+    }
+
+    /// Relocations still waiting on their turn to end (`nebula worktree`),
+    /// for an IN-PLACE RESTART to carry.
+    pub fn pending_moves(&self) -> Vec<(AgentId, Worktree)> {
+        self.pending_moves
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, wt)| (id.clone(), wt.clone()))
+            .collect()
+    }
+
+    pub fn restore_pending_moves(&self, moves: Vec<(AgentId, Worktree)>) {
+        self.pending_moves.lock().unwrap().extend(moves);
+    }
+
     // ---- attach tracking & idle reaping ----
 
     /// A client attached to `sref` (the server dedupes re-attaches per

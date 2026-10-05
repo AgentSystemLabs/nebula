@@ -306,6 +306,11 @@ impl AgentStatusMachine {
         self.status
     }
 
+    /// Still holding the [`Self::launching`] reprieve.
+    pub fn is_launching(&self) -> bool {
+        self.launch_idle_pending
+    }
+
     /// Whether a `nebula worktree` relocation is waiting on the turn's
     /// end. The daemon sets it from its own record before every event; a
     /// turn end that arrives while it is set holds at `running` (see

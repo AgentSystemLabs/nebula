@@ -23,6 +23,22 @@ impl ScrollbackRing {
         }
     }
 
+    /// A ring holding `data` as its retained bytes, the first of them at
+    /// `start_seq` — an IN-PLACE RESTART rebuilding what the old image held,
+    /// so a client's `from_seq` still means the same byte.
+    pub fn restored(cap: usize, start_seq: u64, data: &[u8]) -> Self {
+        let kept = &data[data.len().saturating_sub(cap)..];
+        let mut buf = VecDeque::with_capacity(cap);
+        buf.extend(kept);
+        let end_seq = start_seq + data.len() as u64;
+        Self {
+            buf,
+            cap,
+            start_seq: end_seq - kept.len() as u64,
+            end_seq,
+        }
+    }
+
     /// Append output; returns the seq of the chunk's first byte.
     pub fn append(&mut self, data: &[u8]) -> u64 {
         let chunk_seq = self.end_seq;
@@ -133,6 +149,20 @@ mod tests {
         r.append(b"ghij"); // "cdefghij" retained
         assert_eq!(r.tail(3), b"hij");
         assert_eq!(r.tail(0), b"");
+    }
+
+    #[test]
+    fn a_restored_ring_keeps_its_seqs() {
+        let mut r = ScrollbackRing::new(4);
+        r.append(b"abcdefgh");
+        let (base, data) = r.snapshot_from(None);
+        let mut restored = ScrollbackRing::restored(4, base, &data);
+        assert_eq!(restored.snapshot_from(None), (4, b"efgh".to_vec()));
+        assert_eq!(restored.append(b"ij"), 8);
+        assert_eq!(restored.snapshot_from(Some(8)), (8, b"ij".to_vec()));
+        // More than the ring holds keeps the tail, at the seqs it had.
+        let big = ScrollbackRing::restored(2, 10, b"wxyz");
+        assert_eq!(big.snapshot_from(None), (12, b"yz".to_vec()));
     }
 
     #[test]

@@ -1994,12 +1994,15 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     let term_id = term_id.clone();
 
     // Stub installer: the upgrade command runs it, then handles the daemon.
+    // No `nebula` on PATH, so there is no installed binary to restart onto
+    // and the live daemon is left where it is.
     let script = env.tmp.path().join("stub-install.sh");
     std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
     let run_upgrade = || {
         env.cli()
             .args(["upgrade", "--force"])
             .env(env::INSTALL_URL, format!("file://{}", script.display()))
+            .env("PATH", "/usr/bin:/bin")
             .output()
             .unwrap()
     };
@@ -2066,6 +2069,408 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
         "expected idle-shutdown note, got: {stdout}"
     );
     wait_for_exit(&mut daemon);
+}
+
+/// The number printed after the first `key` in `text` that has one — the
+/// shell's answer, not the echo of the command that asked for it.
+fn number_after(text: &str, key: &str) -> Option<i32> {
+    text.match_indices(key).find_map(|(at, _)| {
+        let digits: String = text[at + key.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    })
+}
+
+/// Close-out of a connection the daemon dropped: everything it still had
+/// queued, then the end of the stream.
+async fn read_until_closed(stream: &mut UnixStream) {
+    let closed = tokio::time::timeout(SLOW_TIMEOUT, async {
+        while let Ok(Some(_)) = read_frame::<ServerEvent, _>(stream).await {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the restart never closed the old connection"
+    );
+}
+
+/// IN-PLACE RESTART, end to end: `nebula reload` moves the daemon onto a
+/// binary while an agent and a terminal keep running — the same processes,
+/// scrollback intact, status kept, hooks still reaching the daemon on the
+/// port and token the agent was born with — and `nebula upgrade` does it
+/// again onto the `nebula` it finds on PATH, from the image the first
+/// restart left behind.
+#[tokio::test]
+async fn reload_and_upgrade_restart_the_daemon_without_stopping_sessions() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "kept", 2).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 3,
+            worktree: worktree.id.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    }) = find_ack(&events, 3)
+    else {
+        panic!("CreateTerminal failed: {events:#?}");
+    };
+    let term_id = term_id.clone();
+    let agent = SessionRef::Agent(agent_id.clone());
+    let term = SessionRef::Terminal(term_id.clone());
+
+    let attach = |sref: &SessionRef| ClientRequest::Attach {
+        session: sref.clone(),
+        from_seq: None,
+        cols: 100,
+        rows: 30,
+    };
+    let input = |sref: &SessionRef, line: String| ClientRequest::Input {
+        session: sref.clone(),
+        data: line.into_bytes(),
+    };
+    for (sref, label) in [(&agent, "agent"), (&term, "term")] {
+        write_frame(&mut c, &attach(sref)).await.unwrap();
+        write_frame(&mut c, &input(sref, format!("echo \"pid-{label}=$$\"\n")))
+            .await
+            .unwrap();
+    }
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        let text = String::from_utf8_lossy(&collected_output(evs)).into_owned();
+        number_after(&text, "pid-agent=").is_some() && number_after(&text, "pid-term=").is_some()
+    })
+    .await;
+    let text = String::from_utf8_lossy(&collected_output(&events)).into_owned();
+    let agent_pid = number_after(&text, "pid-agent=").unwrap();
+    let term_pid = number_after(&text, "pid-term=").unwrap();
+
+    // The agent is mid-turn as the restart happens.
+    let curl = |event: &str| {
+        format!(
+            "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+             -H 'Content-Type: application/json' -d '{{\"session_id\":\"sess-1\"}}' \
+             \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent={event}\"\n"
+        )
+    };
+    write_frame(&mut c, &input(&agent, curl("UserPromptSubmit")))
+        .await
+        .unwrap();
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
+    // ---- `nebula reload`: onto the binary the command runs from ----
+    let out = env.cli().arg("reload").output().unwrap();
+    assert!(
+        out.status.success(),
+        "reload failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("2 live sessions kept running"), "{stdout}");
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "the daemon restarts in place — same process"
+    );
+    read_until_closed(&mut c).await;
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let events = subscribe(&mut c).await;
+    let Some(ServerEvent::Snapshot {
+        agents, terminals, ..
+    }) = events.last()
+    else {
+        panic!("expected a snapshot: {events:#?}");
+    };
+    let row = agents.iter().find(|a| a.id == agent_id).unwrap();
+    assert!(row.alive, "the agent is still live: {row:?}");
+    assert_eq!(row.status, nebula_core::AgentStatus::Running, "status kept");
+    assert!(terminals.iter().any(|t| t.id == term_id && t.alive));
+
+    // The scrollback came along, and the same shell answers.
+    write_frame(&mut c, &attach(&agent)).await.unwrap();
+    write_frame(&mut c, &input(&agent, "echo \"after-agent=$$\"\n".into()))
+        .await
+        .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        let text = String::from_utf8_lossy(&collected_output(evs)).into_owned();
+        number_after(&text, "after-agent=").is_some()
+    })
+    .await;
+    let text = String::from_utf8_lossy(&collected_output(&events)).into_owned();
+    assert_eq!(
+        number_after(&text, "pid-agent="),
+        Some(agent_pid),
+        "replayed"
+    );
+    assert_eq!(number_after(&text, "after-agent="), Some(agent_pid));
+
+    // Its hooks still land, on the port and token it was spawned with.
+    write_frame(&mut c, &input(&agent, curl("Stop")))
+        .await
+        .unwrap();
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
+    // ---- `nebula upgrade`: onto the `nebula` on PATH, a second time ----
+    let script = env.tmp.path().join("stub-install.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    let bin = env.tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_nebula"), bin.join("nebula")).unwrap();
+    let out = env
+        .cli()
+        .args(["upgrade", "--force"])
+        .env(env::INSTALL_URL, format!("file://{}", script.display()))
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "upgrade failed: {stdout}");
+    assert!(stdout.contains("2 live sessions kept running"), "{stdout}");
+    read_until_closed(&mut c).await;
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+    write_frame(&mut c, &attach(&term)).await.unwrap();
+    write_frame(&mut c, &input(&term, "echo \"again-term=$$\"\n".into()))
+        .await
+        .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        let text = String::from_utf8_lossy(&collected_output(evs)).into_owned();
+        number_after(&text, "again-term=").is_some()
+    })
+    .await;
+    let text = String::from_utf8_lossy(&collected_output(&events)).into_owned();
+    assert_eq!(number_after(&text, "again-term="), Some(term_pid));
+    assert!(pid_alive(agent_pid) && pid_alive(term_pid));
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    wait_pid_dead(agent_pid, SLOW_TIMEOUT, "agent shell").await;
+    wait_pid_dead(term_pid, SLOW_TIMEOUT, "terminal shell").await;
+}
+
+/// IN-PLACE RESTART for every harness: one live agent of each kind goes
+/// mid-turn, the daemon restarts, and each ends its turn afterward on the
+/// same process — the hooked kinds through their own `/api/hooks/<kind>`
+/// route, the hookless ones through the progress bar their CLI draws.
+#[tokio::test]
+async fn reload_keeps_an_agent_of_every_harness() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    env.write_config(r#"{"custom_harnesses": [{"id": "agy", "program": "agy"}]}"#);
+    let homes = ["codex-home", "pi-home", "xdg-config"].map(|d| {
+        let dir = env.tmp.path().join(d);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_str().unwrap().to_string()
+    });
+    let mut daemon = env.spawn_daemon_with(
+        "/bin/sh",
+        &[
+            ("CODEX_HOME", &homes[0]),
+            ("PI_CODING_AGENT_DIR", &homes[1]),
+            ("XDG_CONFIG_HOME", &homes[2]),
+        ],
+    );
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let mut agents = Vec::new();
+    for (req_id, kind) in (10u64..).zip(AgentKind::ALL) {
+        write_frame(
+            &mut c,
+            &ClientRequest::CreateAgent {
+                req_id,
+                worktree: worktree.id.clone(),
+                name: kind.as_str().into(),
+                kind,
+                custom_harness: (kind == AgentKind::Custom).then(|| "agy".into()),
+                model: None,
+                effort: None,
+                auto_title: false,
+                cloud_prompt: None,
+                starting_prompt: None,
+                issue_url: None,
+            },
+        )
+        .await
+        .unwrap();
+        let events = read_events_until(&mut c, SPAWN_CHAIN_TIMEOUT, |evs| {
+            find_ack(evs, req_id).is_some()
+        })
+        .await;
+        let Some(ServerEvent::Ack {
+            created: Some(EntityId::Agent(id)),
+            ..
+        }) = find_ack(&events, req_id)
+        else {
+            panic!("CreateAgent {kind:?} failed: {events:#?}");
+        };
+        agents.push((kind, id.clone()));
+    }
+
+    let hooked = |kind: AgentKind| {
+        matches!(
+            kind,
+            AgentKind::Claude
+                | AgentKind::Codex
+                | AgentKind::Cursor
+                | AgentKind::Pi
+                | AgentKind::OpenCode
+        )
+    };
+    // A hooked kind posts the event to its own route; a hookless one draws
+    // (`UserPromptSubmit`) or clears (`Stop`) its progress bar.
+    let turn = |kind: AgentKind, event: &str| {
+        let line = if hooked(kind) {
+            format!(
+                "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+                 -H 'Content-Type: application/json' -d '{{\"session_id\":\"sess-{kind}\"}}' \
+                 \"$NEBULA_API_URL/api/hooks/{kind}?agentId=$NEBULA_AGENT_ID&hookEvent={event}\" \
+                 >/dev/null\n",
+                kind = kind.as_str()
+            )
+        } else {
+            let state = if event == "Stop" { 0 } else { 3 };
+            format!("printf '\\033]9;4;{state};\\007'\n")
+        };
+        ClientRequest::Input {
+            session: SessionRef::Agent(agents.iter().find(|(k, _)| *k == kind).unwrap().1.clone()),
+            data: line.into_bytes(),
+        }
+    };
+    let attach = |id: &nebula_core::AgentId| ClientRequest::Attach {
+        session: SessionRef::Agent(id.clone()),
+        from_seq: None,
+        cols: 100,
+        rows: 30,
+    };
+    let echo_pid = |id: &nebula_core::AgentId, key: &str| ClientRequest::Input {
+        session: SessionRef::Agent(id.clone()),
+        data: format!("echo \"{key}-{}=$$\"\n", id.0).into_bytes(),
+    };
+    let all_reached = |evs: &[ServerEvent], want: nebula_core::AgentStatus| {
+        agents.iter().all(|(_, id)| {
+            evs.iter().any(|e| {
+                matches!(e, ServerEvent::StatusChanged { agent, status, .. }
+                    if agent == id && *status == want)
+            })
+        })
+    };
+
+    // Every agent answers with its shell's pid and starts a turn.
+    for (kind, id) in &agents {
+        write_frame(&mut c, &attach(id)).await.unwrap();
+        write_frame(&mut c, &echo_pid(id, "pid")).await.unwrap();
+        write_frame(&mut c, &turn(*kind, "UserPromptSubmit"))
+            .await
+            .unwrap();
+    }
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        all_reached(evs, nebula_core::AgentStatus::Running)
+    })
+    .await;
+    let mut pids = std::collections::HashMap::new();
+    let mut text = String::from_utf8_lossy(&collected_output(&events)).into_owned();
+    for (kind, id) in &agents {
+        let key = format!("pid-{}=", id.0);
+        if number_after(&text, &key).is_none() {
+            let more = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+                number_after(&String::from_utf8_lossy(&collected_output(evs)), &key).is_some()
+            })
+            .await;
+            text.push_str(&String::from_utf8_lossy(&collected_output(&more)));
+        }
+        pids.insert(*kind, number_after(&text, &key).unwrap());
+    }
+
+    let out = env.cli().arg("reload").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "reload failed: {stdout}");
+    assert!(
+        stdout.contains(&format!("{} live sessions kept running", agents.len())),
+        "{stdout}"
+    );
+    read_until_closed(&mut c).await;
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let events = subscribe(&mut c).await;
+    let Some(ServerEvent::Snapshot { agents: rows, .. }) = events.last() else {
+        panic!("expected a snapshot: {events:#?}");
+    };
+    for (kind, id) in &agents {
+        let row = rows.iter().find(|a| a.id == *id).unwrap();
+        assert!(row.alive, "{kind:?} is still live: {row:?}");
+        assert_eq!(
+            row.status,
+            nebula_core::AgentStatus::Running,
+            "{kind:?} kept its status"
+        );
+    }
+
+    // The same shell answers each, and each turn ends the way its harness
+    // reports one.
+    for (kind, id) in &agents {
+        write_frame(&mut c, &attach(id)).await.unwrap();
+        write_frame(&mut c, &echo_pid(id, "after")).await.unwrap();
+        write_frame(&mut c, &turn(*kind, "Stop")).await.unwrap();
+    }
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        all_reached(evs, nebula_core::AgentStatus::Finished)
+    })
+    .await;
+    let mut text = String::from_utf8_lossy(&collected_output(&events)).into_owned();
+    for (kind, id) in &agents {
+        let key = format!("after-{}=", id.0);
+        if number_after(&text, &key).is_none() {
+            let more = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+                number_after(&String::from_utf8_lossy(&collected_output(evs)), &key).is_some()
+            })
+            .await;
+            text.push_str(&String::from_utf8_lossy(&collected_output(&more)));
+        }
+        assert_eq!(
+            number_after(&text, &key),
+            Some(pids[kind]),
+            "{kind:?} runs on the same process"
+        );
+    }
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    for (kind, pid) in pids {
+        wait_pid_dead(pid, SLOW_TIMEOUT, &format!("{kind:?} shell")).await;
+    }
 }
 
 /// AddProject with `create_missing` makes the directory and `git init`s it.

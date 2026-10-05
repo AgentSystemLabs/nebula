@@ -50,6 +50,25 @@ impl PidfileLock {
         }))
     }
 
+    /// The lock an earlier image of this daemon held, open across the exec
+    /// of an IN-PLACE RESTART: the flock belongs to the open file, so the
+    /// daemon never stops holding it and no client can start a second one.
+    ///
+    /// # Safety
+    /// `fd` must be the pidfile fd that image named, open and owned by
+    /// nothing else in this process.
+    pub unsafe fn inherit(fd: std::os::fd::RawFd) -> Self {
+        use std::os::fd::FromRawFd;
+        Self {
+            file: std::fs::File::from_raw_fd(fd),
+            path: paths::pidfile_path(),
+        }
+    }
+
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+
     /// Keep the pidfile where clients look for it for as long as the daemon
     /// runs. The default runtime dir is under /tmp, and macOS's tmp_cleaner
     /// deletes regular files there untouched for three days — sparing the

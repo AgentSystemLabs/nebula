@@ -20,10 +20,41 @@ pub(crate) fn install_url() -> String {
         .unwrap_or_else(|| INSTALL_URL.to_string())
 }
 
-/// Printed whenever a daemon from an older binary is left running: the only
-/// way onto the new code is a restart, and a restart takes the sessions.
+/// Printed whenever a daemon from before IN-PLACE RESTARTS is left running:
+/// the only way onto the new code is a restart, and a restart takes the
+/// sessions.
 pub(crate) const KILL_HINT: &str =
     "      run 'nebula kill' to restart onto the new binary (stops all sessions).";
+
+/// Printed for a stale daemon that can move onto the new binary in place.
+pub(crate) const RELOAD_HINT: &str =
+    "      run 'nebula reload' to move it onto the new binary (sessions keep running).";
+
+/// `nebula reload`: restart the daemon in place onto the binary this
+/// command runs from.
+pub fn run_reload() -> Result<()> {
+    use nebula_daemon::handoff::{request_restart, Restart};
+    let exe = std::env::current_exe().context("resolve current_exe")?;
+    match request_restart(&exe)? {
+        Restart::NoDaemon => {
+            println!("no nebula daemon running — the next launch starts this binary");
+        }
+        Restart::Unsupported => bail!(
+            "the running daemon predates in-place restarts, so it can't move onto this \
+             binary with its sessions.\nRun 'nebula kill' to restart it (stops all sessions)."
+        ),
+        Restart::Restarted { sessions } => println!("{}", restarted_note(sessions)),
+    }
+    Ok(())
+}
+
+fn restarted_note(sessions: usize) -> String {
+    let plural = if sessions == 1 { "" } else { "s" };
+    format!(
+        "the daemon now runs the new binary — {sessions} live session{plural} kept running.\n\
+         relaunch nebula to pick them back up."
+    )
+}
 
 pub fn run_upgrade(force: bool) -> Result<()> {
     let url = install_url();
@@ -37,9 +68,11 @@ pub fn run_upgrade(force: bool) -> Result<()> {
 
 /// Swapping the binary on disk doesn't touch the running daemon — it keeps
 /// executing the old code. An idle daemon (no live PTYs) is shut down here so
-/// the next launch spawns the new binary; live sessions would die with the
-/// daemon, so that restart stays the user's call. Never fails the upgrade:
-/// the install already succeeded.
+/// the next launch spawns the new binary; one with live sessions is
+/// restarted in place onto it, sessions and all. Only a daemon from before
+/// IN-PLACE RESTARTS is left on the old code, the restart that would take
+/// its sessions the user's call. Never fails the upgrade: the install
+/// already succeeded.
 ///
 /// This process is still the old binary, so it speaks the daemon's protocol
 /// whatever the new one does. That makes now the moment to say when the new
@@ -56,6 +89,9 @@ fn finish_daemon_handoff() {
             );
         }
         Ok(IdleShutdown::SessionsLive { count }) => {
+            if restart_onto_installed() {
+                return;
+            }
             let plural = if count == 1 { "" } else { "s" };
             println!("note: the old daemon is still running with {count} live session{plural}.");
             let installed = std::env::var_os("PATH").and_then(|path| {
@@ -72,10 +108,45 @@ fn finish_daemon_handoff() {
             }
         }
         Ok(IdleShutdown::Skewed) | Err(_) => {
+            if restart_onto_installed() {
+                return;
+            }
             println!("note: a daemon from a previous version may still be running.");
             println!("{KILL_HINT}");
         }
     }
+}
+
+/// Restart the daemon in place onto the `nebula` install.sh just put on
+/// PATH. True when nothing is left on the old binary.
+fn restart_onto_installed() -> bool {
+    use nebula_daemon::handoff::{request_restart, Restart};
+    let Some(exe) = std::env::var_os("PATH").and_then(|path| nebula_on_path(&path)) else {
+        return false;
+    };
+    match request_restart(&exe) {
+        Ok(Restart::NoDaemon) => true,
+        Ok(Restart::Restarted { sessions }) => {
+            println!("{}", restarted_note(sessions));
+            true
+        }
+        Ok(Restart::Unsupported) => false,
+        Err(err) => {
+            println!("could not move the daemon onto the new binary: {err:#}");
+            false
+        }
+    }
+}
+
+/// The first executable `nebula` on `path` — the one the user runs next.
+fn nebula_on_path(path: &OsStr) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .map(|dir| dir.join("nebula"))
+        .find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
 }
 
 /// Why the restart can't wait, when the new build speaks another protocol.
@@ -124,13 +195,7 @@ fn is_yes(answer: &str) -> bool {
 /// runs from `cwd` — the runtime dir, where no directory by that name will
 /// ever sit to be registered as a project.
 fn protocol_version_on_path(path: &OsStr, cwd: &Path) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    let exe = std::env::split_paths(path)
-        .map(|dir| dir.join("nebula"))
-        .find(|p| {
-            p.metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })?;
+    let exe = nebula_on_path(path)?;
     let out = Command::new(exe)
         .arg("_protocol-version")
         .current_dir(cwd)

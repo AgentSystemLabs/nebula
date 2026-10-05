@@ -58,6 +58,15 @@ impl ProgressScanner {
         }
     }
 
+    /// A scanner that already knows the child's busy state, so the next
+    /// edge after an IN-PLACE RESTART is a real one.
+    pub fn restored(busy: Option<bool>) -> Self {
+        Self {
+            busy,
+            ..Self::new()
+        }
+    }
+
     /// The child's current busy state, or `None` if it never advertised one.
     pub fn busy(&self) -> Option<bool> {
         self.busy

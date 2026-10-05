@@ -45,8 +45,16 @@ impl TitleScanner {
         }
     }
 
+    /// A scanner that already knows the child's title, so re-setting it
+    /// after an IN-PLACE RESTART is not reported as a change.
+    pub fn restored(title: Option<String>) -> Self {
+        Self {
+            title,
+            ..Self::new()
+        }
+    }
+
     /// The last title the child set, if any.
-    #[cfg(test)]
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }

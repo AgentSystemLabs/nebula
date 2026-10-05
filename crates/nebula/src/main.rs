@@ -16,13 +16,14 @@ fn main() -> Result<()> {
     // a thread or a child exists to inherit the variable.
     nebula_tui::bundle::apply_forwarded();
     match cli.command {
-        Some(Command::Daemon { foreground }) => {
+        Some(Command::Daemon { foreground, adopt }) => {
             init_daemon_logging(foreground)?;
             log_fatal(
-                nebula_daemon::run_daemon(),
+                nebula_daemon::run_daemon(nebula_daemon::DaemonOpts { foreground, adopt }),
                 &nebula_core::paths::daemon_log_path(),
             )
         }
+        Some(Command::Reload) => upgrade::run_reload(),
         Some(Command::Add { path }) => nebula_tui::run_add_project(path),
         Some(Command::Config { command }) => nebula_tui::run_config(match command {
             ConfigCommand::Path => nebula_tui::ConfigOp::Path,
@@ -82,12 +83,20 @@ fn main() -> Result<()> {
         Some(Command::StaleDaemonNote) => {
             if nebula_daemon::lifecycle::daemon_is_stale() {
                 println!("note: the running daemon was built from older code.");
-                println!("{}", upgrade::KILL_HINT);
+                if nebula_daemon::handoff::daemon_can_restart() {
+                    println!("{}", upgrade::RELOAD_HINT);
+                } else {
+                    println!("{}", upgrade::KILL_HINT);
+                }
             }
             Ok(())
         }
         Some(Command::ProtocolVersion) => {
             println!("{}", nebula_core::PROTOCOL_VERSION);
+            Ok(())
+        }
+        Some(Command::RestartVersion) => {
+            println!("{}", nebula_daemon::handoff::VERSION);
             Ok(())
         }
         None => match cli.dir {
