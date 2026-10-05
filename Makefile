@@ -11,7 +11,8 @@
 # `make dev-ls` shows them all.
 #   make install  put it in ~/.cargo/bin for real use (then `make kill` to cut over)
 #   make cycle    install + kill + prune + dev in one go — the re-runnable full cutover
-#   make prune    drop stale build artifacts (every hash of a crate but the newest KEEP)
+#   make prune    drop stale build artifacts (every hash of a crate but the newest KEEP
+#                 and whatever those still depend on)
 
 PREFIX      ?= $(HOME)/.cargo/bin
 RELEASE_BIN := target/release/nebula
@@ -187,11 +188,14 @@ kill: ## Stop every session and the daemon — the cutover step after `make inst
 # (`split-debuginfo=unpacked`, the dev default) — ~200MB per build of
 # nebula_tui alone — and nothing ever removes the old ones: ten days of
 # sessions grew target/ to 41GB and filled the disk (2026-08-29). This keeps
-# the newest KEEP builds of every crate and drops the rest, under cargo's own
-# build lock so it waits for a running build instead of deleting under it.
-# An evicted build that was still in use costs one recompile of that crate,
-# nothing worse; `make clean` is still the full reset.
-prune: ## Drop stale build artifacts — all but the newest KEEP (3) builds of every crate
+# the newest KEEP builds of every crate, plus every build those depend on, and
+# drops the rest, under cargo's own build lock so it waits for a running build
+# instead of deleting under it. The dependency walk matters: one build holds
+# several hashes under one crate name (thiserror 1 and 2, a build script's
+# compile and run), and evicting those made every `make cycle` recompile
+# nix, thiserror, ratatui and the nebula crates above them. `make clean` is
+# still the full reset.
+prune: ## Drop stale build artifacts — all but the newest KEEP (3) builds of every crate and their deps
 	python3 scripts/prune-target.py --keep $(KEEP)
 
 # The whole cutover as one command, safe to re-run as often as you like:

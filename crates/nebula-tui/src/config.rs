@@ -40,8 +40,10 @@ pub const PANE_SIDES: &[&str] = &[
 /// the row cycles them: the GRID's row of cards per worktree, the default,
 /// then the compact LIST — each worktree's sessions stacked one line apiece,
 /// the most recent few shown until Tab opens the rest
-/// ([`crate::launcher::LIST_RECENT`]).
-pub const WORKTREE_LAYOUTS: &[&str] = &["cards", "list"];
+/// ([`crate::launcher::LIST_RECENT`]) — then the NESTED layout: each
+/// worktree a header, and under it, along a rail, a full-width card per
+/// session and terminal, every worktree open until Tab folds it.
+pub const WORKTREE_LAYOUTS: &[&str] = &["cards", "list", "nested"];
 
 /// The **Preset text** choices (Settings → Sessions), in the order the row
 /// cycles them: the [`PresetText`] sides by label.
@@ -412,6 +414,7 @@ pub enum SettingKind {
     OpenCommand,
     RememberHarness,
     HideUninstalledHarnesses,
+    AskBeforeArchive,
 }
 
 /// One harness field row in the Agents tab. The tab renders one section
@@ -503,6 +506,7 @@ impl SettingKind {
             | SettingKind::CardIssueNumber => (2026, 9, 24),
             SettingKind::ExpandAllWorktrees | SettingKind::FollowNewSession => (2026, 9, 26),
             SettingKind::HighlightCurrentCard => (2026, 9, 28),
+            SettingKind::AskBeforeArchive => (2026, 10, 3),
         }
     }
 
@@ -629,6 +633,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 hint: "Every worktree gets a band on the grid, even an empty one (d deletes it); deleting a last card keeps the worktree unless Delete emptied worktree is on",
                 group: "",
             },
+            SettingSpec {
+                kind: SettingKind::AskBeforeArchive,
+                label: "Confirm on archive",
+                hint: "a and the card menu's Archive ask before archiving a session (off archives at once; u brings it back)",
+                group: "",
+            },
         ]),
     },
     SettingsTab {
@@ -661,7 +671,7 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::WorktreeLayout,
                 label: "Worktree layout",
-                hint: "Each worktree's sessions as a row of cards, or as a compact list of the 3 most recent (Tab shows them all)",
+                hint: "Each worktree as a row of cards, a compact list, or a thread of prompts",
                 group: "",
             },
             SettingSpec {
@@ -1071,8 +1081,11 @@ pub struct Config {
     /// How the LAUNCHER VIEW lays out each worktree's BAND: `cards` (a row
     /// of cards, the default) or `list` (every session one line, stacked
     /// under the band's rule, the [`crate::launcher::LIST_RECENT`] most
-    /// recent shown until Tab — the ACCORDION — opens the rest). Read
-    /// through [`Config::list_layout`], so a word off the list is the cards.
+    /// recent shown until Tab — the ACCORDION — opens the rest) or `nested`
+    /// (a thread per worktree: its first prompt the root row, every later
+    /// prompt and terminal a one-line child under it). Read through
+    /// [`Config::worktree_layout_word`], so a word off the list is the
+    /// cards.
     pub worktree_layout: String,
     /// EXPAND ALL WORKTREES: every BAND on the GRID laid out open at once
     /// — each worktree's sessions and terminals wrapped into rows under
@@ -1118,13 +1131,23 @@ pub struct Config {
     /// it any more. Still loaded and written back as stored, so an older
     /// build sharing the file keeps the behavior its user chose.
     pub skip_session_naming: bool,
-    /// RETIRED with the archive confirm made unconditional. Through 0.34,
-    /// on, it put a CONFIRM DIALOG in front of archiving a session — the
-    /// `a` key and the row menu's Archive alike — and off (the default)
-    /// archived at once. Every archive asks now, so no tab shows the row
-    /// and nothing reads it. Still loaded and written back as stored, so
-    /// an older build sharing the file keeps the behavior its user chose.
+    /// RETIRED. Through 0.34, on, it put a CONFIRM DIALOG in front of
+    /// archiving a session — the `a` key and the row menu's Archive alike
+    /// — and off (the default) archived at once; 0.35 through 0.42 asked
+    /// always. The **Confirm on archive** row is back, on
+    /// [`Config::ask_before_archive`]: a new key, because every file an
+    /// earlier build saved holds this one's old default `false`, which
+    /// would have switched the confirm off for nearly everyone. Nothing
+    /// reads it; still loaded and written back as stored, so an older
+    /// build sharing the file keeps the behavior its user chose.
     pub confirm_on_archive: bool,
+    /// CONFIRM ON ARCHIVE (Settings → Sessions): on, the default, `a` and
+    /// a card's menu Archive put a CONFIRM DIALOG in front of archiving
+    /// the session — Enter/`y` archives, Esc/`n` keeps it — so a letter
+    /// aimed at an agent that lands on the grid archives nothing. Off
+    /// archives at once (`u` in the ARCHIVED VIEW brings it back), and a
+    /// held `a` still archives one card per press (the RELEASE WATCH).
+    pub ask_before_archive: bool,
     /// The key of the **Focused panel tint** SETTING (Settings →
     /// Appearance, through 0.34): whether the faint accent wash behind
     /// whatever keys land in — the card under the cursor, or the session
@@ -1432,6 +1455,7 @@ impl Default for Config {
             card_line_changes: false,
             skip_session_naming: false,
             confirm_on_archive: false,
+            ask_before_archive: true,
             focus_tint: true,
             show_workspaces: true,
             hide_projects: false,
@@ -1600,7 +1624,23 @@ impl Config {
 
     /// `worktree_layout` says the compact LIST rather than the cards.
     pub fn list_layout(&self) -> bool {
-        self.worktree_layout.trim().eq_ignore_ascii_case("list")
+        self.worktree_layout_word() == "list"
+    }
+
+    /// `worktree_layout` says the NESTED layout rather than the cards.
+    pub fn nested_layout(&self) -> bool {
+        self.worktree_layout_word() == "nested"
+    }
+
+    /// The **Worktree layout** in force, as one of [`WORKTREE_LAYOUTS`]:
+    /// the stored word when it is on the list, else the cards.
+    pub fn worktree_layout_word(&self) -> &'static str {
+        let stored = self.worktree_layout.trim();
+        WORKTREE_LAYOUTS
+            .iter()
+            .copied()
+            .find(|word| word.eq_ignore_ascii_case(stored))
+            .unwrap_or(WORKTREE_LAYOUTS[0])
     }
 
     /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
@@ -2227,13 +2267,14 @@ impl Config {
             SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::DeleteEmptyWorktree => on_off(self.delete_empty_worktree).into(),
             SettingKind::ShowAllWorktrees => on_off(self.show_all_worktrees).into(),
+            SettingKind::AskBeforeArchive => on_off(self.ask_before_archive).into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::BlackBackground => on_off(self.black_background).into(),
             SettingKind::HideCardMarks => shown_hidden(self.hide_card_marks).into(),
             SettingKind::HighlightCurrentCard => on_off(self.highlight_current_card).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
-            SettingKind::WorktreeLayout => WORKTREE_LAYOUTS[usize::from(self.list_layout())].into(),
+            SettingKind::WorktreeLayout => self.worktree_layout_word().into(),
             SettingKind::ExpandAllWorktrees => on_off(self.expand_all_worktrees).into(),
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
@@ -2319,6 +2360,9 @@ impl Config {
             SettingKind::ShowAllWorktrees => {
                 self.show_all_worktrees = !self.show_all_worktrees;
             }
+            SettingKind::AskBeforeArchive => {
+                self.ask_before_archive = !self.ask_before_archive;
+            }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
             }
@@ -2341,7 +2385,7 @@ impl Config {
                     cycle_choice(self.pane_side().as_str(), PANE_SIDES, step).into();
             }
             SettingKind::WorktreeLayout => {
-                let now = WORKTREE_LAYOUTS[usize::from(self.list_layout())];
+                let now = self.worktree_layout_word();
                 self.worktree_layout = cycle_choice(now, WORKTREE_LAYOUTS, step).into();
             }
             SettingKind::ExpandAllWorktrees => {
@@ -2863,17 +2907,12 @@ mod tests {
         assert_eq!(read_json_file(&path)["skip_session_naming"], true);
     }
 
-    /// Retired with the archive confirm made unconditional: no tab shows
-    /// the row, and a `true` an earlier release wrote still loads and is
-    /// written back unchanged for the older builds that read it.
+    /// The retired key drives nothing — the **Confirm on archive** row is
+    /// `ask_before_archive`'s — and a `true` an earlier release wrote
+    /// still loads and is written back unchanged for the older builds
+    /// that read it.
     #[test]
-    fn confirm_on_archive_has_no_row_and_is_written_back_for_older_builds() {
-        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
-            TabBody::Values(rows) | TabBody::Project(rows) => {
-                rows.iter().all(|row| row.label != "Confirm on archive")
-            }
-            TabBody::Hotkeys | TabBody::Agents => true,
-        }));
+    fn confirm_on_archive_is_written_back_for_older_builds() {
         assert!(!Config::default().confirm_on_archive);
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.confirm_on_archive);
@@ -2881,12 +2920,53 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, r#"{"confirm_on_archive": true}"#).unwrap();
-        let cfg = load_from(&path);
+        let mut cfg = load_from(&path);
         assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
         assert!(cfg.confirm_on_archive);
 
+        let (tab, row) = locate(SettingKind::AskBeforeArchive).unwrap();
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.ask_before_archive);
+        assert!(cfg.confirm_on_archive, "the row leaves the retired key be");
         cfg.save_to(&path).unwrap();
         assert_eq!(read_json_file(&path)["confirm_on_archive"], true);
+    }
+
+    /// CONFIRM ON ARCHIVE starts on — `a` asks before a session is
+    /// archived — sits on the Sessions tab, toggles like any bool, and a
+    /// config predating the key reads as on: so does one holding the
+    /// retired `confirm_on_archive`'s old default, which every file an
+    /// earlier build saved carries.
+    #[test]
+    fn ask_before_archive_is_on_by_default_and_toggles() {
+        let mut cfg = Config::default();
+        assert!(cfg.ask_before_archive);
+        let (tab, row) = locate(SettingKind::AskBeforeArchive).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        assert_eq!(cfg.value_label(SettingKind::AskBeforeArchive), "on");
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.ask_before_archive);
+        assert_eq!(cfg.value_label(SettingKind::AskBeforeArchive), "off");
+        cfg.cycle(tab, row, 1);
+        assert!(cfg.ask_before_archive, "←/→ toggle it like Enter does");
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.ask_before_archive, "a missing key reads as on");
+        let cfg: Config = serde_json::from_str(r#"{"confirm_on_archive": false}"#).unwrap();
+        assert!(
+            cfg.ask_before_archive,
+            "the retired key's false is not read"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = Config {
+            ask_before_archive: false,
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+        assert_eq!(read_json_file(&path)["ask_before_archive"], false);
+        assert!(!load_from(&path).ask_before_archive, "off sticks");
     }
 
     /// Workspaces are gone, so **Workspaces bar** has no row to be edited
@@ -3864,9 +3944,10 @@ mod tests {
     }
 
     /// The **Worktree layout**: the cards out of the box, cycled from its
-    /// Appearance row to the compact list and back, persisted under
-    /// `worktree_layout`. A config predating the key, or holding a word
-    /// off the list, reads as the cards.
+    /// Appearance row to the compact list, on to the nested layout and
+    /// round to the cards again, persisted under `worktree_layout`. A
+    /// config predating the key, or holding a word off the list, reads as
+    /// the cards.
     #[test]
     fn worktree_layout_defaults_to_cards_cycles_and_persists() {
         let mut cfg = Config::default();
@@ -3894,6 +3975,21 @@ mod tests {
         assert!(!older.list_layout(), "predating the key");
         let odd: Config = serde_json::from_str(r#"{"worktree_layout": "grid"}"#).unwrap();
         assert!(!odd.list_layout(), "a word off the list");
+        assert_eq!(odd.value_label(SettingKind::WorktreeLayout), "cards");
+
+        // The third choice: one step on from the list, and one more wraps
+        // round to the cards.
+        let mut cfg = Config::default();
+        cfg.cycle(tab, row, 1);
+        cfg.cycle(tab, row, 1);
+        assert!(cfg.nested_layout() && !cfg.list_layout());
+        assert_eq!(cfg.value_label(SettingKind::WorktreeLayout), "nested");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).nested_layout());
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.value_label(SettingKind::WorktreeLayout), "cards");
+        cfg.cycle(tab, row, -1);
+        assert!(cfg.nested_layout(), "and back from the cards");
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,

@@ -3768,7 +3768,11 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     if let Some(worktree) = app.selected_worktree() {
         spans.push(sep());
         spans.push(seg(&worktree.branch, app.focus == Focus::Worktrees));
-        if let Some(session) = app.selected_session_row() {
+        // A folded worktree's header (the NESTED layout) is where the
+        // cursor is: the trail stops at the checkout, never naming the
+        // card its fold hides.
+        let session = app.selected_session_row().filter(|_| !app.on_folded_band());
+        if let Some(session) = session {
             spans.push(sep());
             // A link's crumb is its display label, not the raw URL — the
             // crumb has 20 cells and "https://" would eat eight of them.
@@ -3854,6 +3858,9 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
         ConnState::Connected => Span::styled("⏻ connected", Style::default().fg(th.ok)),
         ConnState::Disconnected => Span::styled("✗ disconnected", Style::default().fg(th.err)),
     };
+    // The NESTED layout's KEY BAR, when it is what the hints are: its
+    // keys and their words, drawn apart further down.
+    let mut key_bar: Option<Vec<(String, &'static str)>> = None;
     let hints = if let Some(flash) = &app.flash {
         Span::styled(flash.clone(), Style::default().fg(th.warn))
     } else if app.vim.is_some() {
@@ -4053,12 +4060,24 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             k(Action::MoveUp),
             k(Action::FocusRight),
         );
-        Span::styled(
-            if app.show_archived {
-                // The ARCHIVED VIEW is a different list with different
-                // verbs on it: there is nothing to attach, prompt or
-                // archive there, only the two a card in it takes.
-                format!(
+        if app.launcher_nested && !app.show_archived {
+            // The NESTED layout walks with `j`/`k`, and its three verbs
+            // are the whole bar: the pull request's key is on the DETAIL
+            // STRIP, beside the pull request it opens.
+            let walk = format!("{}{}", k(Action::MoveDown), k(Action::MoveUp));
+            key_bar = Some(vec![
+                (walk, "move"),
+                (k(Action::Activate), "open"),
+                (k(Action::QuickPrompt), "sub-prompt"),
+            ]);
+            Span::raw("")
+        } else {
+            Span::styled(
+                if app.show_archived {
+                    // The ARCHIVED VIEW is a different list with different
+                    // verbs on it: there is nothing to attach, prompt or
+                    // archive there, only the two a card in it takes.
+                    format!(
                     "{move_keys}: move  {}: unarchive  {}: delete  {}: back to live sessions  {}: jump  {}: help  {}: quit",
                     k(Action::Unarchive),
                     k(Action::Delete),
@@ -4067,8 +4086,8 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                     k(Action::Help),
                     k(Action::Quit),
                 )
-            } else {
-                format!(
+                } else {
+                    format!(
                     "{move_keys}: move  {}: open  {}: new session  {}{}: project tabs  {}: terminals  {}: archive  {}: archived  {}: diff  {}: jump  {}: settings  {}: help  {}: quit",
                     k(Action::Activate),
                     k(Action::QuickPrompt),
@@ -4083,9 +4102,10 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                     k(Action::Help),
                     k(Action::Quit),
                 )
-            },
-            Style::default().fg(th.dim),
-        )
+                },
+                Style::default().fg(th.dim),
+            )
+        }
     } else {
         // Spelled from the live keymap for the same reason the Help
         // overlay is: these are the first place a rebound key would start
@@ -4263,11 +4283,29 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
         // it reads as that checkout's (`launcher_view::draw_card`).
         spans.push(Span::styled("    ", Style::default()));
     }
-    let mut hints = hints;
-    if hints.style.fg == Some(th.dim) {
-        hints.style.fg = Some(th.muted);
+    match key_bar {
+        // Each key in the text color and its word muted beside it, two
+        // columns of air between one pair and the next.
+        Some(keys) => {
+            for (i, (key, does)) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(key, Style::default().fg(th.text)));
+                spans.push(Span::styled(
+                    format!(" {does}"),
+                    Style::default().fg(th.muted),
+                ));
+            }
+        }
+        None => {
+            let mut hints = hints;
+            if hints.style.fg == Some(th.dim) {
+                hints.style.fg = Some(th.muted);
+            }
+            spans.push(hints);
+        }
     }
-    spans.push(hints);
     // Right edge: live session/process counts and nebula's total memory
     // footprint, fed by the footer metrics poll. The hints clip before the
     // readout does.

@@ -23,6 +23,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use ratatui::Frame;
 
+mod nested;
+
 /// Width of the view's QUICK PROMPT, and its height: wider and taller than
 /// the panels' box, since here it is the front door. The extra row over
 /// the panels' box pays for the blank one between the details and the
@@ -63,7 +65,16 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     // The project the grid is on gets its tab, whichever way it was
     // opened, before the header lays the tabs out.
     app.settle_project_tabs();
+    // Threads nobody has opened or folded yet: the one under the cursor
+    // starts open, the rest collapsed. Before the layout, so this frame
+    // draws what `j`/`k` will walk.
+    app.classify_nested_threads();
     let bands = crate::launcher::bands(app);
+    // The NESTED layout's DETAIL STRIP, pinned to the bottom with a row of
+    // air over it: the list scrolls in what is left, and the keys walk
+    // the same list (`App::body_area`).
+    let (body, strip) = nested_strip_split(app, body, &bands);
+    app.body_area = body;
     let g = crate::launcher::bands_layout(body);
     let cursor = wearing(app, crate::launcher::band_cursor(app, &bands));
     let count = HeadCount::of(&bands);
@@ -85,11 +96,54 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     // screen and scrolls as one list.
     // In the compact LIST every band is its entries stacked a line
     // apiece instead (Settings → Appearance → **Worktree layout**), and
-    // with **Expand all worktrees** on every band is open at once.
+    // with **Expand all worktrees** on every band is open at once. The
+    // NESTED layout is the third: a thread of one-line rows per worktree
+    // over a DETAIL STRIP, drawn by its own module.
     let panel = app.panel_layout(&bands);
     let scroll = settle_panel_scroll(app, &panel, &bands, cursor);
     draw_head(f, app, body, count, panel.hidden(scroll));
-    draw_bands(f, app, &g, &panel, &bands, cursor, scroll);
+    if app.launcher_nested {
+        nested::draw_bands(f, app, &g, &panel, &bands, cursor, scroll);
+        if let Some(strip) = strip {
+            nested::draw_strip(f, app, strip, &bands, cursor);
+        }
+    } else {
+        draw_bands(f, app, &g, &panel, &bands, cursor, scroll);
+    }
+}
+
+/// Fewest list rows the NESTED layout keeps over its DETAIL STRIP: a body
+/// shorter than that drops the strip rather than the list.
+const STRIP_MIN_LIST: u16 = 3;
+
+/// `body` less the NESTED layout's DETAIL STRIP, and where the strip goes:
+/// its last [`nested::STRIP_H`] rows, a row of air above them, as wide as
+/// the rows' accent bar to their right edge. The whole body, and no strip,
+/// in the other layouts, on an empty grid, or on a body too short to keep
+/// a few rows of the list over it.
+fn nested_strip_split(
+    app: &App,
+    body: Rect,
+    bands: &[crate::launcher::Band],
+) -> (Rect, Option<Rect>) {
+    use crate::launcher::{HEAD_H, PAD_X};
+    let taken = nested::STRIP_H + 1;
+    if !app.launcher_nested || bands.is_empty() || body.height < HEAD_H + taken + STRIP_MIN_LIST {
+        return (body, None);
+    }
+    let strip = Rect {
+        x: body.x + PAD_X - 1,
+        y: body.bottom() - nested::STRIP_H,
+        width: body.width.saturating_sub((PAD_X - 1) * 2),
+        height: nested::STRIP_H,
+    };
+    (
+        Rect {
+            height: body.height - taken,
+            ..body
+        },
+        Some(strip),
+    )
 }
 
 /// The scroll this frame draws the GRID at, settled from what the last

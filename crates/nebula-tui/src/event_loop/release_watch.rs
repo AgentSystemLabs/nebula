@@ -1,5 +1,5 @@
-//! The RELEASE WATCH: one unarchive per press of the key, however long
-//! the key is held.
+//! The RELEASE WATCH: one archive or unarchive per press of the key,
+//! however long the key is held.
 //!
 //! A terminal repeats a held key — after its initial delay, then every
 //! few dozen milliseconds until the key comes up — and in the legacy key
@@ -7,24 +7,25 @@
 //! to tell the two apart. `u` unarchives the card under the cursor and
 //! the next card slides under it, so a held `u` walked the ARCHIVED VIEW,
 //! a card per repeat — as a held `a` once walked the live grid backwards
-//! ("it seemed to have run so fast it archived two"). `a` asks first now,
-//! and its repeats land on the confirm, where they are nothing; `u` has
-//! no dialog, so the watch is its.
+//! ("it seemed to have run so fast it archived two"). `a` asks first by
+//! default, and its repeats land on the confirm, where they are nothing;
+//! `u` has no dialog, so the watch is its — and `a`'s too with the
+//! **Confirm on archive** SETTING off, when the press archives at once.
 //!
 //! The kitty keyboard protocol marks repeats and releases, but only on
 //! keys it reports as escape codes — a text key like `u` stays plain text
 //! under the flags nebula rests on (`host_terminal::KITTY_FLAGS`), and
 //! reporting every key as an escape code all the time would cost composed
 //! text (a dead key's `é`, a non-Latin layout). So the watch asks for it
-//! only while it matters: the press that unarchived flips the host to
+//! only while it matters: the press that (un)archived flips the host to
 //! `host_terminal::HOLD_FLAGS`; the held key's repeats then arrive marked
 //! `Repeat` and are swallowed here; its `Release` — or any fresh press —
 //! ends the watch and flips the host back. A fresh press of the same key
-//! is a new unarchive: the key had to come up first.
+//! is a new (un)archive: the key had to come up first.
 //!
 //! A host without the protocol (Terminal.app, `nebula browser`, tmux)
 //! marks nothing, so there a held key's first repeat arrives as a press,
-//! ends the watch and unarchives as it always did: the watch is only as
+//! ends the watch and acts as it always did: the watch is only as
 //! good as the host's reports.
 
 use crate::keymap::KeyChord;
@@ -36,8 +37,8 @@ use std::time::{Duration, Instant};
 /// (tmux) would otherwise keep them until the next key.
 pub(super) const LINGER: Duration = Duration::from_secs(2);
 
-/// The key that just unarchived a card, watched until the host reports
-/// it let go.
+/// The key that just archived or unarchived a card, watched until the
+/// host reports it let go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseWatch {
     /// The chord as the press arrived. Its repeats and release arrive as
@@ -48,7 +49,7 @@ pub struct ReleaseWatch {
     since: Instant,
 }
 
-/// Start watching `chord`, the key that just unarchived, at `now`.
+/// Start watching `chord`, the key that just (un)archived, at `now`.
 pub(super) fn arm(watch: &mut Option<ReleaseWatch>, chord: KeyChord, now: Instant) {
     *watch = Some(ReleaseWatch { chord, since: now });
 }

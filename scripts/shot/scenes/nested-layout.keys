@@ -1,0 +1,49 @@
+# Three launches through the box's ^T worktree picker — fix/rate-limits (finishes unread once the
+# cursor has moved on), feat/auth-tokens (stops on a permission prompt), main (left running) — then
+# a terminal in main, and ^q back to the cards with the cursor on its card. An F12 (unbound, 0.6 s)
+# after each launch lets it settle; the run of them at the end lets the pull request lookups and
+# the delayed finish land.
+p
+C-t
+rate
+Enter
+F12
+Review the rate limit pull request and merge it once the checks pass
+Enter
+F12
+p
+C-t
+auth
+Enter
+F12
+Do one last review to check for major security issues, fix anything you find and push it
+Enter
+F12
+p
+C-t
+main
+Enter
+F12
+Add a label of screenshots requested to any pr that seems to be missing its screenshots
+Enter
+F12
+t
+C-q
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12

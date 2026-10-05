@@ -387,12 +387,47 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   time, as with the cards. A band that already lists everything has nothing to open, and `Tab`
   there says so. `j` and `k` walk the lines as one column, off a band's last line onto the next
   band's first; `Enter` and a click work on a line as on a card.
+- **The nested layout.** **Worktree layout** → `nested` draws the grid as a list of threads, one
+  per worktree, with no header, no card border and no blank line between threads. Threads are
+  sorted by their latest prompt, the one that moved last on top. The first prompt run in a
+  worktree is the thread's root row and its title is the thread's title; every later prompt, and
+  each terminal in that worktree, is a child row under it, oldest first. Every row is one line: a
+  fold caret (`▾` open, `▸` folded, a blank space when the thread has no children), the status
+  dot, the title, then two fixed, right-aligned columns — the pull request and how long since it
+  moved (`6m`, `now`). A root whose checkout has an open pull request shows its `#141` there,
+  underlined in link blue; a click on it opens the PULL REQUESTS MODAL on that pull request
+  without opening the session, and `v` does the same for the thread under the cursor. A root in
+  the project's root checkout carries `⌂ main` after its title in gold; no row names its
+  worktree. A child sits two cells in, its `├` under the root's dot, the last one on a `└`. A
+  collapsed thread that has children says `1 sub` or `3 subs` after the title. The row under the
+  cursor is a filled bar with a one-cell accent at the left edge — its title bold and
+  accent-coloured — and selecting a child does not highlight the root. Threads start collapsed
+  except the one that holds the selection; `l` / `→` expands a collapsed root, `h` / `←` collapses
+  an expanded one, and `h` / `←` on a child moves to its root. `j` / `k` walk only the rows on
+  screen. `Enter` opens the selected row, root or child. A thread with no children ignores `h` /
+  `l`. `Tab`, or a click on the caret, toggles the same fold, and which threads are open is
+  remembered across restarts. A DETAIL STRIP is pinned under the list, six rows in a box, and
+  always describes the selected row: its title (with the checkout's `+265 −3` at the right), what
+  it runs on (`agent    claude · opus · high`), its checkout (`worktree feat`, or `⌂ main`), and
+  its pull request (`pr       #141 open`, with `v open PR` at the right, or `none`). A child shows
+  its own title and harness and its thread's checkout, pull request and changes. The list scrolls between the project tabs and the
+  strip, and the strip never moves. The bottom bar is `jk move  Enter open  p sub-prompt`.
+  `d` on a root that has children deletes the whole thread — every prompt and terminal nested
+  under it — and `a` there archives every prompt in it and closes its terminals. Both ask first in
+  a CONFIRM DIALOG that counts and lists what goes, `a` included with **Confirm on archive** off,
+  since a closed shell does not come back with `u`. On a child, or a root with nothing under it,
+  each takes the one row. The root checkout's thread goes the same way (its checkout stays); with
+  nothing left anywhere in the project, the grid is the welcome nebula opens on, even with **Show
+  all worktrees** on.
 - **Every worktree open.** Settings → Appearance → **Expand all worktrees** (`expand_all_worktrees`,
   off by default) lays every band out open at once — each worktree's sessions and terminals wrapped
-  into rows under its rule, or every line of the compact list — so there is no accordion: `Tab`, and
+  into rows under its rule, every line of the compact list, or every thread of the nested layout
+  whatever was folded — so there is no accordion: `Tab`, and
   a second click on a rule, open and fold nothing (the footer says so), no rule offers a `Tab:` verb,
   and `Esc` has no band to close. `h`/`l` walk a row, `j`/`k` walk down every worktree's rows as one
-  column — off a band's last row onto the next band's first, in the column the cursor was in. Which
+  column — off a band's last row onto the next band's first, in the column the cursor was in. In the
+  nested layout the threads stay open, so `h`/`l` do not fold them; `h` on a child still moves to
+  its root. Which
   band `Tab` last opened is kept, and comes back open when the setting is switched off.
 - **The pane** runs down the right side of the cards, full height and half the width — or along
   the bottom, under them, with the `⬓` button just before the `×` on its header (`◨` there moves
@@ -448,9 +483,10 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   out to: `Esc` lets the card go, a second does nothing, and `k` on the first band stays put.
 
 Every other key acts on the session under the cursor — `a` archives, `d` deletes, `g` opens its
-diff, `/` jumps, `s` opens Settings. `a` asks first, always: a CONFIRM DIALOG names
+diff, `/` jumps, `s` opens Settings. `a` asks first: a CONFIRM DIALOG names
 the session, `Enter` or `y` archives it and `Esc` or `n` keeps it, so a letter aimed at an agent
-that lands on the grid archives nothing — and saying yes is cheap, since `u` brings it back. The
+that lands on the grid archives nothing — and saying yes is cheap, since `u` brings it back.
+**Confirm on archive** (Settings → Sessions, on by default) off archives at once. The
 cursor lands on the card after the one archived in its band — the one that slides up into its
 place — or, when the band's last card went, on the one before it; a band's only card leaving takes
 the band with it, and the cursor lands on the one that slid up into its slot. `d` lands
@@ -467,7 +503,8 @@ default) skips the question: the card's ordinary confirm says the worktree goes 
 deletes both — except when archived sessions are still filed under it, which always get the
 three-way question. **Show all worktrees** takes the question away, not the setting: with both on,
 the worktree still goes with its last card. A held `a` opens one dialog and
-archives nothing by itself; a held `u` in the ARCHIVED VIEW unarchives one card, and the next needs
+archives nothing by itself (with the confirm off, it archives one card); a held `u` in the ARCHIVED
+VIEW unarchives one card, and the next needs
 the key let go and pressed again (on a terminal with the kitty keyboard protocol, which is what
 tells a held key's repeats from a fresh press; without it a long hold still walks the row).
 

@@ -259,7 +259,9 @@ impl Band {
 /// first (`App::visible_worktrees`). A checkout with nothing running has
 /// no band: the grid is what is running, not what is checked out — unless
 /// the **Show all worktrees** SETTING is on (`App::show_all_worktrees`),
-/// when every checkout gets one, an empty band with no cards on it. The
+/// when every checkout gets one, an empty band with no cards on it — but
+/// not the root checkout alone, which leaves no band and the grid's
+/// welcome in its place. The
 /// ARCHIVED VIEW's bands hold the archived sessions alone; a terminal is
 /// never archived, so none is listed there, and no empty band is either.
 pub fn bands(app: &App) -> Vec<Band> {
@@ -296,6 +298,17 @@ pub fn bands(app: &App) -> Vec<Band> {
             cards,
         });
     }
+    // The root checkout's empty band alone is a project with nothing left
+    // in it: the grid's welcome says what to do there, and the band would
+    // only say it smaller.
+    if out.iter().all(|band| band.is_main && band.cards.is_empty()) {
+        out.clear();
+    }
+    // The NESTED layout is a list of threads, the one that moved last on
+    // top. Stable, so threads that never moved keep the checkouts' order.
+    if app.launcher_nested {
+        out.sort_by_key(|band| std::cmp::Reverse(thread_activity(band)));
+    }
     out
 }
 
@@ -321,7 +334,9 @@ pub fn band_cursor(app: &App, bands: &[Band]) -> Option<usize> {
 
 /// The card the cursor is on inside `band`: the selected row's session
 /// or terminal, when it is one of the band's. None on a link row, an
-/// archived session on the live grid, or nothing.
+/// archived session on the live grid, or nothing. A NESTED thread folded
+/// to its root still names that root: the children are what the fold
+/// hides, and the root row is the session under the cursor.
 pub fn card_cursor(app: &App, band: &Band) -> Option<usize> {
     let sref = app.selected_session_row()?.sref()?;
     band.position(&sref)
@@ -1093,6 +1108,12 @@ impl PanelLayout {
             Some(cell) => (cell.y.saturating_sub(BAND_RULE_H), cell.y + cell.height),
             None => (pb.rule_y, pb.rule_y + pb.height),
         };
+        self.reveal_rows(scroll, top, bottom)
+    }
+
+    /// `scroll` moved just far enough that panel rows `top..bottom` are
+    /// on screen, as [`PanelLayout::reveal`] moves it for a card.
+    pub fn reveal_rows(&self, scroll: u16, top: u16, bottom: u16) -> u16 {
         let rows = self.window().height;
         let mut scroll = scroll;
         if bottom > scroll + rows {
@@ -1272,6 +1293,141 @@ pub fn list_layout(body: Rect, band: &Band, open: bool, pin: Option<usize>) -> E
     }
 }
 
+// ---- the NESTED layout ----
+
+/// One line per row in the NESTED layout (Settings → Appearance →
+/// **Worktree layout** → `nested`): a thread is a worktree, and every
+/// visible row — its root and each child — is exactly this tall.
+pub const NESTED_ROW_H: u16 = 1;
+
+/// The cards of `band` in thread order: the earliest session first — the
+/// thread's root, the first prompt run in the worktree — then every later
+/// session oldest to newest, then its terminals in tree order. A worktree
+/// with no session threads its terminals the same way, the first of them
+/// the root. Agent ids are ULIDs, so the oldest session is the least id.
+pub fn thread_order(band: &Band) -> Vec<usize> {
+    let mut sessions = Vec::new();
+    let mut terminals = Vec::new();
+    for (i, card) in band.cards.iter().enumerate() {
+        if card.is_terminal() {
+            terminals.push(i);
+        } else {
+            sessions.push(i);
+        }
+    }
+    sessions.sort_by(|&a, &b| {
+        let id = |i: usize| match &band.cards[i] {
+            Card::Session(row) => &row.agent.id,
+            Card::Terminal(_) => unreachable!("sessions only"),
+        };
+        id(a).cmp(id(b))
+    });
+    sessions.append(&mut terminals);
+    sessions
+}
+
+/// When a NESTED thread last moved: the latest stamp of any prompt in it.
+/// Terminals carry no stamp, so a terminal-only thread is 0, and sorts
+/// last.
+pub fn thread_activity(band: &Band) -> i64 {
+    band.cards
+        .iter()
+        .filter_map(|card| match card {
+            Card::Session(row) => Some(row.agent.status_changed_at.max(row.agent.archived_at)),
+            Card::Terminal(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The NESTED thread `sref` is the root of, when that thread has children:
+/// a delete or an archive on its root takes every session and terminal
+/// in it. None on a child, on a thread that is only its root, in the
+/// other layouts and in the ARCHIVED VIEW, where either takes one card.
+pub fn nested_thread(app: &App, sref: &SessionRef) -> Option<Band> {
+    if !app.launcher_nested || app.show_archived {
+        return None;
+    }
+    bands(app).into_iter().find(|band| {
+        let order = thread_order(band);
+        order.len() > 1 && band.position(sref) == order.first().copied()
+    })
+}
+
+/// `band` as one thread of the NESTED layout: the root row, then — when
+/// `show_children` — a row per later prompt and terminal ([`thread_order`]),
+/// each one line and full width, with no air between them. Folded, the
+/// root is the only row. A band with no cards keeps the one line that
+/// says so.
+pub fn nested_layout(body: Rect, band: &Band, show_children: bool) -> ExpandedLayout {
+    let area = grid(body).area;
+    let order = thread_order(band);
+    let mut cells = vec![None; band.cards.len()];
+    let mut rows = Vec::new();
+    let mut y = 0u16;
+    if order.is_empty() {
+        return ExpandedLayout {
+            cells,
+            more: 0,
+            rules: Vec::new(),
+            rows,
+            height: NESTED_ROW_H,
+        };
+    }
+    let last = if show_children { order.len() } else { 1 };
+    for &i in &order[..last] {
+        cells[i] = Some(Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: NESTED_ROW_H,
+        });
+        rows.push(vec![i]);
+        y += NESTED_ROW_H;
+    }
+    ExpandedLayout {
+        cells,
+        more: 0,
+        rules: Vec::new(),
+        rows,
+        height: y,
+    }
+}
+
+/// [`panel_layout`] for the NESTED layout: one thread per worktree
+/// ([`nested_layout`]), packed with no blank row between them. A thread
+/// shows its children unless `folded` holds its checkout — `h` folds the
+/// one under the cursor and `l` opens it (`event_loop::launcher`) — and
+/// every thread is open with `all_open` (**Expand all worktrees**).
+pub fn nested_panel_layout(
+    body: Rect,
+    bands: &[Band],
+    folded: &std::collections::HashSet<WorktreeId>,
+    all_open: bool,
+) -> PanelLayout {
+    let mut y = 0u16;
+    let mut out = Vec::with_capacity(bands.len());
+    for band in bands {
+        let show_children = all_open || !folded.contains(&band.worktree);
+        let content = nested_layout(body, band, show_children);
+        let height = content.height();
+        out.push(PanelBand {
+            rule_y: y,
+            content: Some(content),
+            // Each visible row is its own thing to scroll past. An empty
+            // band is the one line that says nothing is running.
+            open: !band.cards.is_empty(),
+            height,
+        });
+        y += height;
+    }
+    PanelLayout {
+        area: grid(body).area,
+        bands: out,
+        height: y,
+    }
+}
+
 /// A card, or a rule, as the scrolled window lands it on screen: the
 /// part of it inside the window, and how many of its rows the window's
 /// edges cut off — none for one drawn whole.
@@ -1378,10 +1534,12 @@ impl ExpandedLayout {
         Some(cells[col.min(cells.len() - 1)])
     }
 
-    /// Is `card` on the top row — where `k` walks up into the header?
+    /// Is `card` on the top row — where `k` walks up into the header? A
+    /// layout with no row to walk — a band the NESTED layout has folded
+    /// to its header — is all top row, whichever card the pane reads.
     pub fn on_top_row(&self, card: Option<usize>) -> bool {
         match card {
-            Some(i) => self.row_of(i).is_some_and(|(r, _)| r == 0),
+            Some(i) => self.rows.is_empty() || self.row_of(i).is_some_and(|(r, _)| r == 0),
             None => self.rows.is_empty(),
         }
     }

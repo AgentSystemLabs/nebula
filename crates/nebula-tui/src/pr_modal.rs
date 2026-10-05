@@ -160,6 +160,14 @@ impl PullRequestsView {
 /// the Worktrees cursor rests on, when it rests on one — the row the user
 /// was already reading.
 pub(crate) fn open(app: &mut App) {
+    let url = app.selected_worktree_pr().map(|pr| pr.url.clone());
+    open_on(app, url.as_deref());
+}
+
+/// [`open`] with the cursor on the pull request at `url` — a NESTED
+/// thread's `#42`, clicked — rather than the Worktrees cursor's. A URL
+/// the list does not hold starts on its first row.
+pub(crate) fn open_on(app: &mut App, url: Option<&str>) {
     let Some(project) = app.selected_project().cloned() else {
         app.flash = Some("pull requests: select a project first".into());
         return;
@@ -170,9 +178,8 @@ pub(crate) fn open(app: &mut App) {
         project.repo_path.clone(),
     );
     let list = rows(app, &project.id);
-    let start = app
-        .selected_worktree_pr()
-        .and_then(|pr| list.iter().position(|row| row.url == pr.url))
+    let start = url
+        .and_then(|url| list.iter().position(|row| row.url == url))
         .unwrap_or(0);
     view.selected = clamp_selection(start as i64, list.len());
     view.selected_url = list.get(view.selected).map(|pr| pr.url.clone());

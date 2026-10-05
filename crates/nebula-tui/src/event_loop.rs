@@ -2192,6 +2192,8 @@ fn ui_state_json(app: &App) -> String {
         launcher_pane_hidden: app.launcher_pane_hidden,
         launcher_expanded: app.launcher_expanded.as_ref().map(|w| w.to_string()),
         launcher_open_bands: saved_open_bands(app),
+        launcher_folded: saved_folded_bands(app),
+        launcher_thread_open: saved_open_threads(app),
         launcher_tabs: app.launcher_tabs.iter().map(|id| id.to_string()).collect(),
         projects_closed: app.projects_closed,
     };
@@ -2220,6 +2222,30 @@ fn saved_open_bands(app: &App) -> std::collections::HashMap<String, String> {
         })
         .map(|(pid, wid)| (pid.to_string(), wid.to_string()))
         .collect()
+}
+
+/// The worktrees the NESTED layout has folded ([`App::launcher_folded`]),
+/// for the blob: less any the tree no longer has, in a stable order so
+/// the blob only changes when the set does.
+fn saved_folded_bands(app: &App) -> Vec<String> {
+    saved_worktree_set(&app.launcher_folded, app)
+}
+
+/// The worktrees the NESTED layout has expanded
+/// ([`App::launcher_thread_open`]), for the blob, on the same terms as
+/// [`saved_folded_bands`].
+fn saved_open_threads(app: &App) -> Vec<String> {
+    saved_worktree_set(&app.launcher_thread_open, app)
+}
+
+fn saved_worktree_set(ids: &std::collections::HashSet<WorktreeId>, app: &App) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .iter()
+        .filter(|wid| app.tree.worktrees.iter().any(|w| &w.id == *wid))
+        .map(|wid| wid.to_string())
+        .collect();
+    out.sort();
+    out
 }
 
 /// Re-seat the cursor from the persisted blob. Returns whether the
@@ -2252,6 +2278,12 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
     // lands on the cards either way.
     app.launcher_pane_hidden = state.launcher_pane_hidden;
     app.launcher_expanded = state.launcher_expanded.map(nebula_core::WorktreeId::from);
+    app.launcher_folded = state.launcher_folded.into_iter().map(WorktreeId).collect();
+    app.launcher_thread_open = state
+        .launcher_thread_open
+        .into_iter()
+        .map(WorktreeId)
+        .collect();
     // Every other project's open band too; the restored project's own is
     // `launcher_expanded` above, which the next switch away files here.
     app.launcher_open_bands = state
@@ -3331,7 +3363,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Archive => {
             if app.focus == Focus::Sessions {
                 match app.selected_session_row() {
-                    Some(SessionRow::Agent(a)) if !a.archived => archive_agent(app, a.id),
+                    Some(SessionRow::Agent(a)) if !a.archived => {
+                        // With the confirm off, one card per press of
+                        // `a`, however long it is held.
+                        if archive_agent(app, a.id, out) {
+                            release_watch::arm(
+                                &mut app.release_watch,
+                                chord,
+                                std::time::Instant::now(),
+                            );
+                        }
+                    }
                     Some(SessionRow::Terminal(_)) => {
                         app.flash = Some("terminals can't be archived — d closes them".into());
                     }
@@ -4551,22 +4593,112 @@ fn handle_vim_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Archive asks first, always — the CONFIRM DIALOG `d` goes behind — so
-/// a letter aimed at an agent that lands on the grid archives nothing
-/// until it is answered. The `a` key and the row menu's Archive both
-/// come through here, so the two never differ; the archive itself runs
-/// on the dialog's Enter ([`archive_agent_now`]).
-fn archive_agent(app: &mut App, id: AgentId) {
+/// Archive asks first — the CONFIRM DIALOG `d` goes behind — so a letter
+/// aimed at an agent that lands on the grid archives nothing until it is
+/// answered; the archive itself runs on the dialog's Enter
+/// ([`archive_agent_now`]). The **Confirm on archive** SETTING
+/// (`ask_before_archive`, on by default) off archives at once — except on
+/// a NESTED thread's root, which takes the whole thread and always asks
+/// ([`confirm_archive_thread`]). The `a`
+/// key and the row menu's Archive both come through here, so the two
+/// never differ. True when the session was archived on the spot, so the
+/// key can arm the RELEASE WATCH.
+fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) -> bool {
+    if let Some(band) = crate::launcher::nested_thread(app, &SessionRef::Agent(id.clone())) {
+        app.overlay = Some(Overlay::Confirm(confirm_archive_thread(&band)));
+        return false;
+    }
+    if !crate::config::Config::load().ask_before_archive {
+        archive_agent_now(app, id, out);
+        return true;
+    }
     if let Some(a) = app.tree.agents.iter().find(|a| a.id == id) {
         app.overlay = Some(Overlay::Confirm(confirm_archive_agent(&a.name, id)));
     }
+    false
 }
 
 /// The archive itself: release the pane if it shows the agent, then ask
-/// the daemon. From the dialog's Enter (`run_pending_action`).
+/// the daemon. From the dialog's Enter (`run_pending_action`), or
+/// straight from [`archive_agent`] with the confirm off.
 fn archive_agent_now(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
     optimistic::set_archived(app, id, true, out);
+}
+
+/// `n` of `noun`, the noun plural unless `n` is one.
+fn count_of(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// A NESTED thread's cards split by kind, root first, and their names for
+/// the confirm's listing.
+fn thread_cards(band: &crate::launcher::Band) -> (Vec<AgentId>, Vec<TerminalId>, Vec<String>) {
+    let mut agents = Vec::new();
+    let mut terminals = Vec::new();
+    let mut names = Vec::new();
+    for i in crate::launcher::thread_order(band) {
+        let card = &band.cards[i];
+        names.push(card.name().to_string());
+        match card {
+            crate::launcher::Card::Session(row) => agents.push(row.agent.id.clone()),
+            crate::launcher::Card::Terminal(t) => terminals.push(t.id.clone()),
+        }
+    }
+    (agents, terminals, names)
+}
+
+/// The confirm before a NESTED thread's root is archived: it takes every
+/// session in the thread to the archive and closes every terminal, so the
+/// dialog always asks, whatever **Confirm on archive** says — a shell
+/// killed is not one `u` brings back — and lists what goes.
+fn confirm_archive_thread(band: &crate::launcher::Band) -> ConfirmDialog {
+    let (agents, terminals, names) = thread_cards(band);
+    let mut message = format!(
+        "Archive '{}' and everything nested under it?\n{} archived — u brings {} back.",
+        names[0],
+        count_of(agents.len(), "session"),
+        if agents.len() == 1 { "it" } else { "them" },
+    );
+    if !terminals.is_empty() {
+        message.push_str(&format!(
+            "\n{} closed — their shells are killed.",
+            count_of(terminals.len(), "terminal")
+        ));
+    }
+    message.push('\n');
+    message.push_str(&bulk_confirm_listing(&names));
+    ConfirmDialog {
+        title: format!("Archive thread · {}", count_of(names.len(), "row")),
+        message,
+        action: PendingAction::ArchiveThread { agents, terminals },
+        area: ratatui::layout::Rect::default(),
+    }
+}
+
+/// The confirm before a NESTED thread's root is deleted: every session
+/// and terminal in the thread goes with it, listed, with the worktree
+/// question folded in as for any delete that empties one
+/// ([`with_worktree_offer`]) — never asked of the ROOT WORKTREE.
+fn confirm_delete_thread(app: &App, band: &crate::launcher::Band) -> ConfirmDialog {
+    let (agents, terminals, names) = thread_cards(band);
+    let gone: Vec<String> = [(agents.len(), "session"), (terminals.len(), "terminal")]
+        .into_iter()
+        .filter(|&(n, _)| n > 0)
+        .map(|(n, noun)| count_of(n, noun))
+        .collect();
+    let dialog = ConfirmDialog {
+        title: format!("Delete thread · {}", count_of(names.len(), "row")),
+        message: format!(
+            "Delete '{}' and everything nested under it?\n{} go away, history and shells.\n{}",
+            names[0],
+            gone.join(" and "),
+            bulk_confirm_listing(&names),
+        ),
+        action: PendingAction::DeleteAllSessions { agents, terminals },
+        area: ratatui::layout::Rect::default(),
+    };
+    with_worktree_offer(app, dialog, &band.worktree, band.cards.len())
 }
 
 /// The confirm before an agent is archived. The message says why saying
@@ -5312,8 +5444,9 @@ fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
         },
         // An EMPTY BAND on the grid: its checkout's own menu, the same
         // **Delete worktree** its `d` opens — its pull request's link row
-        // under the cursor or not (#104).
-        Focus::Sessions => match launcher::empty_band(app) {
+        // under the cursor or not (#104). A folded worktree's header (the
+        // NESTED layout) is the checkout too, never the card it hides.
+        Focus::Sessions => match launcher::empty_band(app).or_else(|| launcher::folded_band(app)) {
             Some(id) => {
                 let w = app.tree.worktrees.iter().find(|w| w.id == id)?;
                 Some(worktree_menu_items(app, w))
@@ -5390,9 +5523,9 @@ fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
 fn select_clicked_row(app: &mut App, target: &HitTarget, out: &mut Vec<ClientRequest>) -> bool {
     match *target {
         HitTarget::LauncherCard(at) => launcher::select_card_row(app, at, out),
-        HitTarget::LauncherBand(i) | HitTarget::LauncherBandMore(i) => {
-            launcher::select_band_row(app, i, out)
-        }
+        HitTarget::LauncherBand(i)
+        | HitTarget::LauncherBandMore(i)
+        | HitTarget::LauncherBandFold(i) => launcher::select_band_row(app, i, out),
         HitTarget::LauncherBandPr(ref wid) => launcher::select_band_of(app, wid, out),
         HitTarget::LauncherCardIssue(ref id) => launcher::select_issue_card(app, id, out),
         _ => false,
@@ -6447,6 +6580,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.highlight_current_card = cfg.highlight_current_card;
     app.launcher_pane_at = cfg.pane_side();
     app.launcher_list = cfg.list_layout();
+    app.launcher_nested = cfg.nested_layout();
     app.launcher_all_open = cfg.expand_all_worktrees;
     set_hide_draft_prs(app, cfg.hide_draft_prs);
 }
@@ -6878,6 +7012,14 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             });
         }
         PendingAction::ArchiveAgent(id) => archive_agent_now(app, id, out),
+        PendingAction::ArchiveThread { agents, terminals } => {
+            for id in agents {
+                archive_agent_now(app, id, out);
+            }
+            for id in terminals {
+                close_terminal(app, id, out);
+            }
+        }
         PendingAction::DeleteAgent(id) => delete_agent(app, id, out),
         PendingAction::CloseTerminal(id) => close_terminal(app, id, out),
         PendingAction::DeleteLink(id) => {
@@ -7048,15 +7190,24 @@ fn with_worktree_offer(
 
 /// The confirm before an agent is deleted, with the worktree question
 /// folded in when the agent is the last card of a linked worktree
-/// ([`with_worktree_offer`]). From the `d` key and the row menu alike.
+/// ([`with_worktree_offer`]). From the `d` key and the row menu alike. On
+/// a NESTED thread's root it is the whole thread's
+/// ([`confirm_delete_thread`]).
 fn confirm_delete_agent_in(app: &App, a: &nebula_core::Agent) -> ConfirmDialog {
+    if let Some(band) = crate::launcher::nested_thread(app, &SessionRef::Agent(a.id.clone())) {
+        return confirm_delete_thread(app, &band);
+    }
     let dialog = confirm_delete_agent(&a.name, a.id.clone());
     with_worktree_offer(app, dialog, &a.worktree_id, usize::from(!a.archived))
 }
 
 /// The confirm before a terminal is closed, with the worktree question
-/// folded in when the terminal is the last card of a linked worktree.
+/// folded in when the terminal is the last card of a linked worktree —
+/// or, on the root of a NESTED thread of terminals, the whole thread's.
 fn confirm_close_terminal_in(app: &App, t: &nebula_core::TerminalTab) -> ConfirmDialog {
+    if let Some(band) = crate::launcher::nested_thread(app, &SessionRef::Terminal(t.id.clone())) {
+        return confirm_delete_thread(app, &band);
+    }
     let dialog = confirm_close_terminal(&t.name, t.id.clone());
     with_worktree_offer(app, dialog, &t.worktree_id, 1)
 }
@@ -7089,7 +7240,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::SendCloudMessage(id) => open_prompt(app, PromptKind::CloudMessage { id }),
         MenuAction::DuplicateAgent(id) => launcher::duplicate_agent(app, id),
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
-        MenuAction::ArchiveAgent(id) => archive_agent(app, id),
+        MenuAction::ArchiveAgent(id) => {
+            archive_agent(app, id, out);
+        }
         MenuAction::UnarchiveAgent(id) => activate::unarchive(app, id, out),
         MenuAction::DeleteAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
@@ -7380,7 +7533,13 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     match target {
         Some((index, sref)) => {
             app.sel_session = index;
-            attach(app, sref, out);
+            // A worktree the NESTED layout has folded is its header under
+            // the cursor, not the card it was left on: the row is kept
+            // for when the band opens, and nothing off screen is attached
+            // — or marked read (`App::on_folded_band`).
+            if !app.on_folded_band() {
+                attach(app, sref, out);
+            }
         }
         None => {
             if app.term.is_some() {
@@ -7406,6 +7565,8 @@ fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>) {
     {
         app.sel_session = index;
         app.select_when_seen = None;
+        // A card landed on is a card on screen (the NESTED layout's fold).
+        launcher::unfold_cursor_band(app);
         // The pane follows the cursor; a session about to be attached
         // outright (the create flow's Ack) dedupes in attach().
         preview_selected(app, out);
@@ -7433,6 +7594,7 @@ fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>) {
                 .position(|r| r.sref().as_ref() == Some(&pending_sref))
             {
                 app.sel_session = index;
+                launcher::unfold_cursor_band(app);
                 preview_selected(app, out);
             }
             app.select_when_seen = None;
@@ -7614,8 +7776,9 @@ fn jump_to_target_inner(
                 return;
             };
             app.sel_session = index;
-            // A session picked by name is its card on the grid, aimed at.
-            launcher::land_on_grid(app);
+            // A session picked by name is its card on the grid, aimed at
+            // — and on screen: its worktree opens if it was folded.
+            launcher::land_on_card(app);
             match landing {
                 Landing::Attach => attach_selected(app, out),
                 Landing::FocusOnly => {
@@ -7909,6 +8072,11 @@ fn preview_selected_now(app: &mut App, out: &mut Vec<ClientRequest>) {
 }
 
 fn preview_inner(app: &mut App, delay: Duration, out: &mut Vec<ClientRequest>) {
+    // A folded worktree's header (the NESTED layout) has no card under
+    // the cursor for the pane to read (`App::on_folded_band`).
+    if app.on_folded_band() {
+        return;
+    }
     let Some(row) = app.selected_session_row() else {
         return;
     };
@@ -9027,6 +9195,8 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
                 | HitTarget::LauncherStripLeft(_)
                 | HitTarget::LauncherStripRight(_)
                 | HitTarget::LauncherBandMore(_)
+                | HitTarget::LauncherBandFold(_)
+                | HitTarget::LauncherThreadPr(_)
                 | HitTarget::LauncherTabClose(_)
                 | HitTarget::LauncherPaneClose
                 | HitTarget::LauncherPaneSide
@@ -9649,6 +9819,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // `▾ 6 more · Tab: see all 8` under a band's row: the band
                 // opens, the very toggle Tab runs.
                 Some(HitTarget::LauncherBandMore(i)) => launcher::click_band_more(app, i, out),
+                // The fold caret on a worktree's header (the NESTED
+                // layout): the band folds or opens, the very toggle Tab
+                // runs.
+                Some(HitTarget::LauncherBandFold(i)) => launcher::click_band_fold(app, i, out),
+                // A NESTED thread's `#42`: the PULL REQUESTS MODAL on it.
+                Some(HitTarget::LauncherThreadPr(wid)) => launcher::click_thread_pr(app, &wid),
                 // The PULL REQUEST on a band's rule: it opens in the
                 // browser, through the very `open_pull_request` `⇧V` runs.
                 Some(HitTarget::LauncherBandPr(wid)) => {
@@ -9846,6 +10022,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             | HitTarget::LauncherStripLeft(_)
                             | HitTarget::LauncherStripRight(_)
                             | HitTarget::LauncherBandMore(_)
+                            | HitTarget::LauncherBandFold(_)
+                            | HitTarget::LauncherThreadPr(_)
                             | HitTarget::PanelBg(Focus::Sessions)
                     )
                 )
@@ -25275,10 +25453,11 @@ diff --git a/src/c.rs b/src/c.rs
 
     /// `a` asks first: nothing is sent until the dialog is answered, Esc
     /// keeps the session, and Enter archives it — pane released and all.
-    /// Always, whatever `config.json` says: the retired
-    /// `confirm_on_archive` key is not read.
+    /// The retired `confirm_on_archive` key's `false`, which every file
+    /// an older build saved holds, does not switch the confirm off: only
+    /// `ask_before_archive` does.
     #[test]
-    fn a_asks_before_archiving_whatever_the_config_says() {
+    fn a_asks_before_archiving_by_default() {
         with_config_json(r#"{"confirm_on_archive": false}"#, || {
             let mut app = App::new();
             seed_tree(&mut app); // p1 / w1(main) / a1
@@ -25354,6 +25533,56 @@ diff --git a/src/c.rs b/src/c.rs
                 app.overlay
             );
             assert!(out.is_empty(), "nothing sent before the answer: {out:?}");
+        })
+    }
+
+    /// With **Confirm on archive** off, `a` archives at once — no dialog,
+    /// the pane released — and arms the RELEASE WATCH, so a held `a`
+    /// archives the one card.
+    #[test]
+    fn a_archives_at_once_with_the_confirm_off() {
+        with_config_json(r#"{"ask_before_archive": false}"#, || {
+            let mut app = App::new();
+            seed_tree(&mut app); // p1 / w1(main) / a1
+            app.focus = Focus::Sessions;
+            app.sel_session = 0;
+            let a1 = SessionRef::Agent(AgentId("a1".into()));
+            app.term = Some(AttachedTerm::new(a1, 40, 10));
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "no confirm: {:?}", app.overlay);
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::ArchiveAgent { id, .. } if *id == AgentId("a1".into())
+                )),
+                "a archives the agent: {out:?}"
+            );
+            assert!(app.term.is_none(), "the archive releases the pane");
+            assert!(app.release_watch.is_some(), "and the key is watched");
+        })
+    }
+
+    /// The row menu's Archive skips the dialog the same way `a` does.
+    #[test]
+    fn the_row_menus_archive_skips_the_confirm_when_it_is_off() {
+        with_config_json(r#"{"ask_before_archive": false}"#, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+            run_menu_action(
+                &mut app,
+                MenuAction::ArchiveAgent(AgentId("a1".into())),
+                &mut out,
+            );
+            assert!(app.overlay.is_none(), "no confirm: {:?}", app.overlay);
+            assert!(
+                out.iter()
+                    .any(|r| matches!(r, ClientRequest::ArchiveAgent { .. })),
+                "the menu's Archive archives at once: {out:?}"
+            );
+            assert!(app.release_watch.is_none(), "a click has no key to watch");
         })
     }
 

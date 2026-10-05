@@ -250,6 +250,26 @@ impl Theme {
     }
 }
 
+/// The NESTED layout's grays (Settings → Appearance → **Worktree layout**
+/// → `nested`): a live root's title against an idle one's, the ages and
+/// counts, and the cursor row's fill. Truecolor, like `focus_tint`: an
+/// ANSI gray is whatever the terminal's palette makes of it, and the two
+/// title steps could land on one shade there. Every hue the layout draws
+/// — the status dots, the cursor's accent — is still the preset's own.
+pub mod nested {
+    use ratatui::style::Color;
+
+    /// A live root's title: working, or waiting on you.
+    pub const BRIGHT: Color = Color::Rgb(0xf2, 0xf2, 0xf2);
+    /// An idle root's title, and every row's age, count and connector.
+    pub const DIM: Color = Color::Rgb(0x8c, 0x8c, 0x8c);
+    /// A pull request's `#42`, underlined: a link, in the blue links wear.
+    pub const LINK: Color = Color::Rgb(0x58, 0xa6, 0xff);
+    /// How much of the accent the cursor's row keeps as its fill: the
+    /// accent taken nearly to black, so the row is washed in it.
+    pub const SELECTED_FILL: f32 = 0.18;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

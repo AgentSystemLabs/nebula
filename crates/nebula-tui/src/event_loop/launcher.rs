@@ -331,6 +331,57 @@ pub(super) fn land_on_grid(app: &mut App) {
     take_aim(app);
 }
 
+/// [`land_on_grid`] for a landing on one card — a session picked by name,
+/// walked or clicked onto: a card under the cursor is a card on screen,
+/// so its worktree opens if the NESTED layout had it folded
+/// ([`unfold_cursor_band`]). A landing on the checkout itself
+/// ([`select_band`]) leaves the fold alone: there the cursor is the
+/// worktree's header.
+pub(super) fn land_on_card(app: &mut App) {
+    if !app.launcher_active() {
+        return;
+    }
+    unfold_cursor_band(app);
+    take_aim(app);
+}
+
+/// Open the NESTED thread the selection is in when that selection is a
+/// child the fold is hiding. The root row is on screen either way, so
+/// landing on it — `j` onto a collapsed thread — leaves the fold as it
+/// is. A jump onto a later prompt or a terminal opens the thread so the
+/// row under the cursor is one the grid is drawing. The other layouts
+/// keep no fold, and leave the NESTED one's as it was left.
+pub(super) fn unfold_cursor_band(app: &mut App) {
+    if !app.launcher_nested || app.launcher_all_open {
+        return;
+    }
+    let bands = view::bands(app);
+    let Some(index) = view::band_cursor(app, &bands) else {
+        return;
+    };
+    let band = &bands[index];
+    if !app.band_folded(band) {
+        return;
+    }
+    let Some(&root) = view::thread_order(band).first() else {
+        return;
+    };
+    if view::card_cursor(app, band) == Some(root) {
+        return;
+    }
+    expand_nested_thread(app, &band.worktree);
+}
+
+/// The checkout of a folded NESTED thread whose cursor sits on a child
+/// the fold is hiding (`App::on_folded_band`). What a right-click acts
+/// on there: the worktree itself, never the card that cannot be seen.
+/// The root row is a session, and a right-click on it is that session's.
+pub(super) fn folded_band(app: &App) -> Option<WorktreeId> {
+    app.on_folded_band()
+        .then(|| app.selected_worktree().map(|w| w.id.clone()))
+        .flatten()
+}
+
 /// The checkout of the EMPTY BAND under the grid's cursor — a band with
 /// no card on it, which only **Show all worktrees** draws. What `d` and
 /// a right-click act on there: the worktree itself, as nothing else is.
@@ -437,7 +488,61 @@ fn select_terminal(app: &mut App, id: nebula_core::TerminalId, out: &mut Vec<Cli
     app.sel_session = index;
     app.focus = Focus::Sessions;
     app.dirty = true;
+    unfold_cursor_band(app);
     super::preview_selected(app, out);
+}
+
+/// Show `worktree`'s children in the NESTED layout, and remember that
+/// against the default of collapsed.
+fn expand_nested_thread(app: &mut App, worktree: &WorktreeId) {
+    let removed = app.launcher_folded.remove(worktree);
+    let inserted = app.launcher_thread_open.insert(worktree.clone());
+    if removed || inserted {
+        app.dirty = true;
+    }
+}
+
+/// Hide `worktree`'s children in the NESTED layout. The root row stays.
+fn collapse_nested_thread(app: &mut App, worktree: &WorktreeId) {
+    let inserted = app.launcher_folded.insert(worktree.clone());
+    let removed = app.launcher_thread_open.remove(worktree);
+    if inserted || removed {
+        app.dirty = true;
+    }
+}
+
+/// `l` / `→` expands the collapsed NESTED thread under the cursor; `h` /
+/// `←` collapses an expanded one, and on a child moves the cursor to
+/// that thread's root instead. A thread with no children ignores both.
+/// **Expand all worktrees** keeps every thread open, so collapse is a
+/// no-op there; `h` on a child still walks up to the root.
+fn nested_side(app: &mut App, expand: bool, out: &mut Vec<ClientRequest>) {
+    app.classify_nested_threads();
+    let bands = view::bands(app);
+    let Some(index) = view::band_cursor(app, &bands) else {
+        return;
+    };
+    let band = &bands[index];
+    let order = view::thread_order(band);
+    if order.len() <= 1 {
+        return;
+    }
+    let root = order[0];
+    let at = view::card_cursor(app, band);
+    if !expand && at.is_some_and(|i| i != root) {
+        select_card(app, band.cards[root].sref(), out);
+        return;
+    }
+    if app.launcher_all_open {
+        return;
+    }
+    if expand {
+        if app.band_folded(band) {
+            expand_nested_thread(app, &band.worktree);
+        }
+    } else if !app.band_folded(band) {
+        collapse_nested_thread(app, &band.worktree);
+    }
 }
 
 /// Tab on the GRID: the ACCORDION opens the band under the cursor — its
@@ -452,13 +557,22 @@ fn select_terminal(app: &mut App, id: nebula_core::TerminalId, out: &mut Vec<Cli
 /// (Settings → Appearance → **Expand all worktrees**) there is nothing to
 /// open or fold, and the footer says so.
 ///
-/// INPUT PARITY: the one function behind the key and a second click on
-/// a band's rule ([`click_band`]).
+/// In the NESTED layout Tab toggles the thread under the cursor: `h`
+/// folds an expanded root and `l` opens a collapsed one
+/// ([`nested_side`]), and any number can be open at once. Folding while
+/// a child is selected moves the cursor to the root, which stays on
+/// screen; the children are what disappear. A thread with nothing under
+/// its root has nothing to fold.
+///
+/// INPUT PARITY: the one function behind the key, a second click on a
+/// band's rule ([`click_band`]) and a click on a NESTED thread's fold
+/// caret ([`click_band_fold`]).
 pub(super) fn toggle_band_expand(app: &mut App, out: &mut Vec<ClientRequest>) {
     if app.launcher_all_open {
         app.flash = Some(ALL_OPEN.into());
         return;
     }
+    app.classify_nested_threads();
     let bands = view::bands(app);
     if bands.is_empty() {
         app.flash = Some(nothing_here(app).into());
@@ -478,6 +592,23 @@ pub(super) fn toggle_band_expand(app: &mut App, out: &mut Vec<ClientRequest>) {
         return;
     }
     let worktree = bands[index].worktree.clone();
+    if app.launcher_nested {
+        take_aim(app);
+        if view::thread_order(&bands[index]).len() <= 1 {
+            return;
+        }
+        if app.band_folded(&bands[index]) {
+            expand_nested_thread(app, &worktree);
+            super::preview_selected_now(app, out);
+        } else {
+            let root = view::thread_order(&bands[index])[0];
+            if view::card_cursor(app, &bands[index]) != Some(root) {
+                select_card(app, bands[index].cards[root].sref(), out);
+            }
+            collapse_nested_thread(app, &worktree);
+        }
+        return;
+    }
     let open = app.launcher_expanded.as_ref() == Some(&worktree);
     if app.launcher_list && !open && bands[index].cards.len() <= view::LIST_RECENT {
         // The LIST already shows every entry of a band this short:
@@ -653,6 +784,38 @@ pub(super) fn handle_action(
     if app.launcher_tab_cursor.is_some() && tabs_action(app, action, armed, chord, out) {
         return true;
     }
+    // The NESTED layout's `h` / `l` fold the thread under the cursor
+    // rather than walking a row of cards: `l` opens a collapsed root,
+    // `h` closes an expanded one, and `h` on a child moves to its root.
+    if app.launcher_nested {
+        match action {
+            Action::FocusRight => {
+                nested_side(app, true, out);
+                return true;
+            }
+            Action::FocusLeft => {
+                nested_side(app, false, out);
+                return true;
+            }
+            _ => {}
+        }
+    }
+    // A child a folded thread is hiding has no row under the cursor: a
+    // key that acts on a card says what brings the children back rather
+    // than reaching for the session the fold covers. Enter still opens
+    // the root, which is on screen.
+    if app.on_folded_band() {
+        if matches!(action, Action::Activate) {
+            take_aim(app);
+            enter_pane(app, out);
+            return true;
+        }
+        if acts_on_card(action) {
+            take_aim(app);
+            app.flash = Some(FOLDED.into());
+            return true;
+        }
+    }
     match action {
         Action::MoveDown => step_grid(app, 0, 1, out),
         Action::MoveUp => step_up(app, armed, chord, out),
@@ -741,6 +904,29 @@ pub(super) fn follow_up(app: &mut App) {
         return;
     };
     super::open_follow_up(app, agent.id, String::new());
+}
+
+/// What a card's key says when the cursor sits on a child a folded
+/// NESTED thread is hiding.
+pub(super) const FOLDED: &str = "this thread is folded — l or → expands it";
+
+/// Does `action` act on the card under the cursor — the session or the
+/// terminal itself, rather than its checkout or the grid? The keys a
+/// folded worktree's header refuses ([`handle_action`]); the ones left
+/// out act on the worktree (`⇧V`, the diff, a new session or terminal)
+/// or on nothing in particular.
+fn acts_on_card(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Rename
+            | Action::Archive
+            | Action::Unarchive
+            | Action::Delete
+            | Action::FollowUp
+            | Action::OpenIssue
+            | Action::DuplicateSession
+            | Action::ToggleFullScreen
+    )
 }
 
 /// What `⇧V` says with no card under the cursor to read a pull request
@@ -1016,9 +1202,14 @@ pub(super) fn tab_menu(app: &mut App, id: &ProjectId, out: &mut Vec<ClientReques
 /// last row, or `k` off its first, steps onto the next band down or up,
 /// so the open band sits in the walk rather than trapping it.
 pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientRequest>) {
+    app.classify_nested_threads();
     let bands = view::bands(app);
     if bands.is_empty() {
         app.flash = Some(nothing_here(app).into());
+        return;
+    }
+    if app.launcher_nested && dx == 0 {
+        step_nested(app, &bands, dy, out);
         return;
     }
     // The cursor itself, aimed or not: a step from a card let go of
@@ -1056,14 +1247,24 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
         None => last as usize,
         Some(b) => (b as i64 + dy).clamp(0, last) as usize,
     };
-    if (app.launcher_list || app.launcher_all_open) && Some(next) != at {
+    if (app.launcher_list || app.launcher_nested || app.launcher_all_open) && Some(next) != at {
         // The LIST reads as one column down every band: `j` off a band's
         // last line lands on the next band's first, `k` off its first on
         // the band above's last — not on whichever card that band last
         // had, which may be lines away from where the eye is. Every band
         // open reads the same way, row by row, in the column the cursor
-        // was in (or the row's last card, on a shorter row).
-        let entries = if app.launcher_list {
+        // was in (or the row's last card, on a shorter row). The NESTED
+        // layout is a column of cards too; a band folded to its header
+        // there has no card to land on, and takes the cursor as a band —
+        // on its header, the pane reading nothing ([`select_band`]).
+        let entries = if app.launcher_nested {
+            app.panel_layout(&bands)
+                .bands
+                .swap_remove(next)
+                .content
+                .map(|content| content.rows)
+                .unwrap_or_default()
+        } else if app.launcher_list {
             view::list_layout(app.body_area, &bands[next], app.launcher_all_open, None).rows
         } else {
             view::expanded_layout(app.body_area, &bands[next]).rows
@@ -1081,8 +1282,10 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
     if Some(next) == at {
         // On the band already, but on none of its cards — the selection
         // on a row the grid has no card for: its first card, as `h`/`l`
-        // take it. An EMPTY BAND has none: the cursor is on all of it.
-        if view::card_cursor(app, &bands[next]).is_none() {
+        // take it. An EMPTY BAND has none: the cursor is on all of it —
+        // as it is on a band the NESTED layout has folded, whose cards
+        // are not there to be taken.
+        if view::card_cursor(app, &bands[next]).is_none() && !app.band_folded(&bands[next]) {
             match bands[next].cards.first() {
                 Some(first) => select_card(app, first.sref(), out),
                 None => take_aim(app),
@@ -1093,6 +1296,72 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
         return;
     }
     select_band(app, bands[next].worktree.clone(), out);
+}
+
+/// One row the NESTED layout draws, in the order `j` walks them: a card,
+/// or an EMPTY BAND's one line — each by its band's place in
+/// `launcher::bands`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedStop {
+    Card(CardRef),
+    Empty(usize),
+}
+
+/// Every row the NESTED layout draws, top to bottom: each thread's
+/// visible rows.
+fn nested_stops(app: &App, bands: &[view::Band]) -> Vec<NestedStop> {
+    let panel = app.panel_layout(bands);
+    let mut out = Vec::new();
+    for (index, (band, pb)) in bands.iter().zip(&panel.bands).enumerate() {
+        if band.cards.is_empty() {
+            out.push(NestedStop::Empty(index));
+            continue;
+        }
+        let Some(content) = &pb.content else {
+            continue;
+        };
+        for &card in content.rows.iter().flatten() {
+            out.push(NestedStop::Card(CardRef { band: index, card }));
+        }
+    }
+    out
+}
+
+/// The row the NESTED cursor is on, aimed or not — a step from a row let
+/// go of starts where the eye last saw it.
+fn nested_at(app: &App, bands: &[view::Band]) -> Option<NestedStop> {
+    let band = view::band_cursor(app, bands)?;
+    match view::card_cursor(app, &bands[band]) {
+        Some(card) => Some(NestedStop::Card(CardRef { band, card })),
+        None if bands[band].cards.is_empty() => Some(NestedStop::Empty(band)),
+        None => None,
+    }
+}
+
+/// `j` / `k` (and the half-page jumps) in the NESTED layout: `dy` rows
+/// through what is drawn — roots, the children of expanded threads, empty
+/// worktrees' lines — stopping at either end.
+fn step_nested(app: &mut App, bands: &[view::Band], dy: i64, out: &mut Vec<ClientRequest>) {
+    let stops = nested_stops(app, bands);
+    let Some(last) = stops.len().checked_sub(1) else {
+        app.flash = Some(nothing_here(app).into());
+        return;
+    };
+    let at = nested_at(app, bands).and_then(|s| stops.iter().position(|&x| x == s));
+    let next = match at {
+        None if dy > 0 => 0,
+        None => last,
+        Some(i) => (i as i64 + dy).clamp(0, last as i64) as usize,
+    };
+    if Some(next) == at {
+        // Against an end: nowhere to go, but the row is aimed at again.
+        take_aim(app);
+        return;
+    }
+    match stops[next] {
+        NestedStop::Card(at) => select_card(app, bands[at.band].cards[at.card].sref(), out),
+        NestedStop::Empty(index) => select_band(app, bands[index].worktree.clone(), out),
+    }
 }
 
 /// `k` (↑): a row up the grid — and on the top row, where there is no
@@ -1111,6 +1380,10 @@ fn step_up(
 ) {
     let bands = view::bands(app);
     let top = match app.walked_band(&bands) {
+        Some(_) if app.launcher_nested => {
+            let stops = nested_stops(app, &bands);
+            stops.is_empty() || nested_at(app, &bands) == stops.first().copied()
+        }
         Some((band, layout)) => {
             band == 0 && layout.on_top_row(view::card_cursor(app, &bands[band]))
         }
@@ -1771,6 +2044,38 @@ pub(super) fn click_band_more(app: &mut App, index: usize, out: &mut Vec<ClientR
     }
 }
 
+/// A click on the fold caret of a NESTED thread's root row
+/// (`HitTarget::LauncherBandFold`): the cursor onto that root, then the
+/// thread folds or opens.
+///
+/// INPUT PARITY: the toggle is [`toggle_band_expand`], the one Tab runs.
+pub(super) fn click_band_fold(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) {
+    let bands = view::bands(app);
+    let Some(band) = bands.get(index) else {
+        return;
+    };
+    if let Some(&root) = view::thread_order(band).first() {
+        select_card(app, band.cards[root].sref(), out);
+    } else if !select_band_row(app, index, out) {
+        return;
+    }
+    toggle_band_expand(app, out);
+}
+
+/// A click on the `#42` in a NESTED thread's PR column, or on the DETAIL
+/// STRIP's (`HitTarget::LauncherThreadPr`): the PULL REQUESTS MODAL, its
+/// cursor on that pull request — what `v` opens on the thread under the
+/// cursor. The cursor and the pane stay where they were: the click opens
+/// the pull request, not the session.
+pub(super) fn click_thread_pr(app: &mut App, worktree: &WorktreeId) {
+    let url = view::bands(app)
+        .into_iter()
+        .find(|b| &b.worktree == worktree)
+        .and_then(|b| b.pr)
+        .map(|pr| pr.url);
+    crate::pr_modal::open_on(app, url.as_deref());
+}
+
 /// A right-click's first half on a card, `select_clicked_row`'s arm: the
 /// cursor on the card at `at` and the pane open on it, as a left click
 /// leaves them. False off the grid.
@@ -1832,8 +2137,9 @@ pub(super) struct CursorCard {
     worktree: WorktreeId,
     band_index: usize,
     /// The card, when the cursor was on one: its session or terminal,
-    /// where it sat in the band, and its neighbours by identity — the
-    /// card before it and the one after — so [`keep_cursor`] lands on
+    /// where it sat in the band as drawn ([`shown_order`]), and its
+    /// neighbours by identity — the row before it and the one after on
+    /// screen — so [`keep_cursor`] lands on
     /// the card that slid up into the slot rather than on whatever a bare
     /// index points at once the list has moved.
     sref: Option<SessionRef>,
@@ -1848,19 +2154,31 @@ pub(super) struct CursorCard {
     archived: bool,
 }
 
+/// `band`'s cards in the order the grid shows them: the NESTED layout's
+/// thread order — root, then its children oldest to newest — and every
+/// other layout's band order.
+fn shown_order(app: &App, band: &view::Band) -> Vec<usize> {
+    if app.launcher_nested && !app.launcher_list {
+        view::thread_order(band)
+    } else {
+        (0..band.cards.len()).collect()
+    }
+}
+
 pub(super) fn cursor_entry(app: &App) -> Option<CursorCard> {
     let bands = view::bands(app);
     let band_index = view::band_cursor(app, &bands)?;
     let band = &bands[band_index];
-    let card = view::card_cursor(app, band);
-    let sref_at = |i: usize| band.cards.get(i).map(|c| c.sref());
+    let order = shown_order(app, band);
+    let at = view::card_cursor(app, band).and_then(|c| order.iter().position(|&i| i == c));
+    let sref_at = |n: usize| order.get(n).map(|&i| band.cards[i].sref());
     Some(CursorCard {
         worktree: band.worktree.clone(),
         band_index,
-        sref: card.and_then(sref_at),
-        index: card.unwrap_or(0),
-        before: card.and_then(|c| c.checked_sub(1)).and_then(sref_at),
-        after: card.and_then(|c| sref_at(c + 1)),
+        sref: at.and_then(sref_at),
+        index: at.unwrap_or(0),
+        before: at.and_then(|n| n.checked_sub(1)).and_then(sref_at),
+        after: at.and_then(|n| sref_at(n + 1)),
         project: app.selected_project().map(|p| p.id.clone()),
         archived: app.show_archived,
     })
@@ -1931,7 +2249,10 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
     let at = |s: &Option<SessionRef>| s.as_ref().and_then(|s| band.position(s));
     let next = at(&before.after)
         .or_else(|| at(&before.before))
-        .unwrap_or_else(|| before.index.min(band.cards.len() - 1));
+        .unwrap_or_else(|| {
+            let order = shown_order(app, band);
+            order[before.index.min(order.len() - 1)]
+        });
     let next_sref = band.cards[next].sref();
     tracing::debug!(
         was_at = before.index,
@@ -5142,13 +5463,14 @@ mod tests {
     }
 
     /// **Show all worktrees** keeps a band on the grid for a checkout with
-    /// nothing running, so a project with no session still has one — its
-    /// root's. Switching to it folds the PANE away all the same: an EMPTY
-    /// BAND is no card, and the pane never goes on reading the session of
-    /// the project that was left. INPUT PARITY: the `+` dropdown's pick,
-    /// the `/` PALETTE's and [`open_project`] itself end in the same state.
+    /// nothing running — but not for the root checkout alone, so a project
+    /// with no session and no other checkout is the welcome. Switching to
+    /// it folds the PANE away: the pane never goes on reading the session
+    /// of the project that was left, and `j` finds nothing to bring it
+    /// back for. INPUT PARITY: the `+` dropdown's pick, the `/` PALETTE's
+    /// and [`open_project`] itself end in the same state.
     #[test]
-    fn an_empty_project_folds_the_pane_with_its_empty_band_on_the_grid() {
+    fn an_empty_project_folds_the_pane_onto_the_welcome() {
         type Way = fn(&mut App);
         let by_dropdown: Way = |app| {
             key(app, KeyCode::Char('+'), KeyModifiers::NONE);
@@ -5196,18 +5518,16 @@ mod tests {
                 assert!(!super::has_pane(&app), "{way}: the pane folded: {text}");
                 assert!(!text.contains("polish-nav"), "{way}: {text}");
                 assert!(
-                    text.contains("nothing running"),
-                    "{way}: docs' empty band is the grid: {text}"
+                    text.contains("Welcome to nebula"),
+                    "{way}: docs' lone empty root is the welcome: {text}"
                 );
                 assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS), "{way}");
 
-                // `j` takes the aim back, onto the band: the pane it
-                // brings up is docs', and docs has nothing to read.
                 key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
                 let text = buffer_text(&draw(&mut app));
-                assert!(super::has_pane(&app), "{way}: aimed at the band: {text}");
-                assert_eq!(reading(&app), None, "{way}: and it reads nothing");
-                assert!(!text.contains("polish-nav"), "{way}: {text}");
+                assert!(!super::has_pane(&app), "{way}: no band to aim at: {text}");
+                assert_eq!(reading(&app), None, "{way}");
+                assert!(text.contains("Welcome to nebula"), "{way}: {text}");
             }
         });
     }
@@ -6795,7 +7115,8 @@ mod tests {
     /// dialog the first press opened, where `a` is nothing. Enter on the
     /// dialog is the one archive, and the card the cursor lands on needs
     /// `a` pressed again. No RELEASE WATCH is armed: nothing ran on the
-    /// press (event_loop/release_watch.rs is `u`'s).
+    /// press (event_loop/release_watch.rs is `u`'s, and `a`'s only with
+    /// the confirm off).
     #[test]
     fn a_held_down_opens_one_confirm_and_archives_nothing_by_itself() {
         use crossterm::event::KeyEventKind::{Release, Repeat};
@@ -6844,6 +7165,38 @@ mod tests {
                 "the card before it in its band"
             );
             assert!(app.release_watch.is_none(), "still nothing to watch");
+        });
+    }
+
+    /// With **Confirm on archive** off, `a` archives the card under the
+    /// cursor on the press, and a held `a` archives that one card alone:
+    /// the RELEASE WATCH swallows its repeats until it comes up, and a
+    /// fresh press archives the next.
+    #[test]
+    fn a_held_down_with_the_confirm_off_archives_one_card() {
+        use crossterm::event::KeyEventKind::{Release, Repeat};
+        with_config_json(r#"{"ask_before_archive": false}"#, || {
+            let mut app = three_sessions();
+            draw(&mut app);
+            assert_eq!(cards(&app), ["a9", "a2", "a1"]);
+            let (x, y) = row_cell(&app, 2);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(selected(&app).as_deref(), Some("a1"), "the last card");
+
+            key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "no confirm: {:?}", app.overlay);
+            assert_eq!(cards(&app), ["a9", "a2"], "the press archives it");
+            assert_eq!(selected(&app).as_deref(), Some("a9"));
+            assert!(app.release_watch.is_some(), "and the key is watched");
+            for _ in 0..5 {
+                key_kind(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, Repeat);
+            }
+            assert_eq!(cards(&app), ["a9", "a2"], "held, it archives no more");
+            key_kind(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, Release);
+            assert!(app.release_watch.is_none(), "the release ends the watch");
+
+            key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+            assert_eq!(cards(&app), ["a2"], "a fresh press archives the next");
         });
     }
 
@@ -10276,5 +10629,1104 @@ mod tests {
             click_at(&mut app, hint.x + 1, hint.y);
             assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[0].worktree));
         });
+    }
+
+    // ---- the NESTED layout ----
+
+    use crate::theme::nested as gray;
+
+    /// [`two_sessions`] in the NESTED layout, with a terminal beside
+    /// `agent-1` in `demo`'s root: the `main` band holds a session and a
+    /// terminal, the `feat` band the running `polish-nav`.
+    fn nested() -> App {
+        let mut app = two_sessions();
+        app.launcher_nested = true;
+        seed_terminal(&mut app, "t1", "w1", "term-1");
+        app
+    }
+
+    /// The cells of `r`'s first row, as the frame drew them.
+    fn row_text(terminal: &Terminal<TestBackend>, r: ratatui::layout::Rect) -> String {
+        let buf = terminal.backend().buffer();
+        (r.x..r.right())
+            .map(|x| buf[(x, r.y)].symbol().to_string())
+            .collect()
+    }
+
+    /// The header of band `index` as the frame drew it: where, and what
+    /// it says. The header's own hit is laid down ahead of the band's
+    /// whole area, so it is the first of the two.
+    fn band_header(
+        app: &App,
+        terminal: &Terminal<TestBackend>,
+        index: usize,
+    ) -> (ratatui::layout::Rect, String) {
+        let r = app
+            .hit_rect(&HitTarget::LauncherBand(index))
+            .unwrap_or_else(|| panic!("band {index} has no header on screen"));
+        assert_eq!(r.height, 1, "a header is one row");
+        (r, row_text(terminal, r))
+    }
+
+    /// Session `id` changed, as the daemon reports it: its row upserted
+    /// with `change` applied, so everything keyed to the tree's order
+    /// settles the way it does on a live update.
+    fn update_agent(app: &mut App, id: &str, change: impl FnOnce(&mut Agent)) {
+        let mut agent = app
+            .tree
+            .agents
+            .iter()
+            .find(|a| a.id.0 == id)
+            .expect("the session is in the tree")
+            .clone();
+        change(&mut agent);
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(agent),
+            },
+        );
+    }
+
+    /// The third **Worktree layout** reaches the app as the other two do
+    /// (`apply_config`), and is never on beside the LIST.
+    #[test]
+    fn the_worktree_layout_setting_turns_the_nested_layout_on_and_off() {
+        with_config_json(r#"{"worktree_layout": "nested"}"#, || {
+            let mut app = two_sessions();
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(app.launcher_nested);
+            assert!(!app.launcher_list);
+        });
+        with_config_json(r#"{"worktree_layout": "list"}"#, || {
+            let mut app = two_sessions();
+            app.launcher_nested = true;
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(app.launcher_list && !app.launcher_nested);
+        });
+        with_default_config(|| {
+            let mut app = two_sessions();
+            app.launcher_nested = true;
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(!app.launcher_nested, "the cards out of the box");
+        });
+    }
+
+    /// One thread per worktree, every row one line: the earliest session
+    /// is the root, later prompts and terminals are children under it, and
+    /// the next thread starts on the very next row. No header, no border,
+    /// no rail.
+    #[test]
+    fn a_thread_is_its_first_prompt_with_later_runs_as_children() {
+        with_default_config(|| {
+            let mut app = nested();
+            let now = crate::app::now_ms();
+            update_agent(&mut app, "a1", |a| {
+                a.name = "Work On Issue 135".into();
+                a.status_changed_at = now - 6 * 60 * 1000;
+            });
+            seed_running(&mut app, "a4", "w1", "Add repair regression test");
+            update_agent(&mut app, "a4", |a| {
+                a.status_changed_at = now - 4 * 60 * 1000
+            });
+            seed_running(&mut app, "a8", "w1", "Run full test suite");
+            update_agent(&mut app, "a8", |a| a.status_changed_at = now - 1000);
+            // A second prompt in `feat`, not the selection: it starts folded.
+            seed_running(&mut app, "a3", "w2", "Admin Spawn Menu");
+            update_agent(&mut app, "a3", |a| {
+                a.status_changed_at = now - 8 * 60 * 1000
+            });
+            update_agent(&mut app, "a2", |a| {
+                a.status_changed_at = now - 9 * 60 * 1000
+            });
+            super::select_card(
+                &mut app,
+                SessionRef::Agent(AgentId("a1".into())),
+                &mut Vec::new(),
+            );
+            let term = draw_tall(&mut app);
+            let main = drawn_entries(&app, 0);
+            assert_eq!(main.len(), 4, "root, two later prompts, the terminal");
+            let lines: Vec<String> = main.iter().map(|(_, r)| row_text(&term, *r)).collect();
+            assert!(
+                lines[0].starts_with("▾ ● Work On Issue 135"),
+                "{:?}",
+                lines[0]
+            );
+            assert!(lines[0].trim_end().ends_with("6m"), "{:?}", lines[0]);
+            assert!(
+                lines[1].starts_with("  ├ ● Add repair regression test"),
+                "{:?}",
+                lines[1]
+            );
+            assert!(lines[1].trim_end().ends_with("4m"), "{:?}", lines[1]);
+            assert!(
+                lines[2].starts_with("  ├ ● Run full test suite"),
+                "{:?}",
+                lines[2]
+            );
+            assert!(lines[2].trim_end().ends_with("now"), "{:?}", lines[2]);
+            // The last child closes the thread on the `└`. A terminal
+            // wears its shell mark where a session has its dot.
+            assert!(lines[3].starts_with("  └ ❯ term-1"), "{:?}", lines[3]);
+            assert_eq!(
+                term.backend().buffer()[(main[3].1.x + 4, main[3].1.y)].fg,
+                app.theme.ok,
+                "green while it runs"
+            );
+            let dot = |line: &str| line.chars().position(|c| c == '●').unwrap();
+            let col = |line: &str, word: &str| {
+                let at = line.find(word).expect(word);
+                line[..at].chars().count()
+            };
+            assert_eq!(dot(&lines[0]), 2, "caret, space, dot");
+            assert_eq!(
+                dot(&lines[1]),
+                dot(&lines[0]) + 2,
+                "a child's dot sits two in"
+            );
+            assert_eq!(col(&lines[0], "Work"), 4, "caret, space, dot, space");
+            assert_eq!(col(&lines[1], "Add"), col(&lines[0], "Work") + 2);
+            assert_eq!(main[0].1.height, 1);
+            assert_eq!(main[1].1.y, main[0].1.bottom());
+            assert_eq!(main[3].1.y, main[2].1.bottom(), "no air between children");
+            let feat = drawn_entries(&app, 1);
+            assert_eq!(feat.len(), 1, "folded to its root");
+            assert_eq!(
+                feat[0].1.y,
+                main[3].1.bottom(),
+                "no blank row between threads"
+            );
+            let feat_line = row_text(&term, feat[0].1);
+            assert!(
+                feat_line.starts_with("▸ ● polish-nav 1 sub"),
+                "{feat_line:?}"
+            );
+            assert!(feat_line.trim_end().ends_with("9m"), "{feat_line:?}");
+            assert_eq!(
+                lines[0].trim_end().chars().count(),
+                feat_line.trim_end().chars().count(),
+                "ages share the right edge"
+            );
+            // The list's own rows, above the DETAIL STRIP's box.
+            let grid: Vec<String> = screen_text(&term)
+                .lines()
+                .skip(usize::from(main[0].1.y))
+                .take(usize::from(feat[0].1.bottom() - main[0].1.y))
+                .map(str::to_string)
+                .collect();
+            assert_eq!(grid.len(), 5, "one line a row, no header: {grid:#?}");
+            let grid = grid.join("\n");
+            assert!(!grid.contains('│'), "no rail: {grid}");
+            assert!(!grid.contains('┌'), "no card border: {grid}");
+            assert!(!grid.contains("files"), "no diff line: {grid}");
+        });
+    }
+
+    /// The cursor's row is a filled bar across the full width, with a
+    /// one-cell accent at the left edge. Its title is bold and accent
+    /// coloured. A selected child does not light its root.
+    #[test]
+    fn the_selected_row_is_a_filled_bar_and_a_child_does_not_light_its_root() {
+        with_default_config(|| {
+            let mut app = nested();
+            let term = draw_tall(&mut app);
+            let th = app.theme;
+            let main = drawn_entries(&app, 0);
+            let buf = term.backend().buffer();
+            let root = main[0].1;
+            let child = main[1].1;
+            let fill = buf[(root.x + 4, root.y)].bg;
+            assert_ne!(
+                fill,
+                buf[(child.x + 4, child.y)].bg,
+                "only the root is filled"
+            );
+            assert_eq!(buf[(root.right() - 1, root.y)].bg, fill, "edge to edge");
+            assert_eq!(buf[(root.x - 1, root.y)].bg, th.accent, "the accent bar");
+            let title = &buf[(root.x + 4, root.y)];
+            assert_eq!(title.fg, th.accent);
+            assert!(title.modifier.contains(Modifier::BOLD));
+            let child_title = &buf[(child.x + 6, child.y)];
+            assert_eq!(child_title.fg, th.text, "a child is ordinary text");
+            assert!(!child_title.modifier.contains(Modifier::BOLD));
+
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            let term = draw_tall(&mut app);
+            let main = drawn_entries(&app, 0);
+            let buf = term.backend().buffer();
+            assert_eq!(buf[(main[1].1.x + 6, main[1].1.y)].fg, th.accent);
+            assert!(buf[(main[1].1.x + 6, main[1].1.y)]
+                .modifier
+                .contains(Modifier::BOLD));
+            assert_ne!(
+                buf[(main[0].1.x + 4, main[0].1.y)].fg,
+                th.accent,
+                "the root stays unselected"
+            );
+            assert_ne!(
+                buf[(main[0].1.x + 4, main[0].1.y)].bg,
+                buf[(main[1].1.x + 6, main[1].1.y)].bg
+            );
+        });
+    }
+
+    /// A working root's title sweeps the way a card's name does; held
+    /// still, with animations off, it is bright white. An idle one's is
+    /// dim, and neither is bold until it is the row under the cursor.
+    #[test]
+    fn a_live_root_title_sweeps_and_an_idle_one_is_dim() {
+        with_default_config(|| {
+            // The cursor is on `agent-1`, so `polish-nav` is the root read.
+            let mut app = nested();
+            let th = app.theme;
+            app.animations = true;
+            let term = draw_tall(&mut app);
+            let feat = drawn_entries(&app, 1)[0].1;
+            let title: Vec<_> = (0.."polish-nav".len() as u16)
+                .map(|i| term.backend().buffer()[(feat.x + 4 + i, feat.y)].fg)
+                .collect();
+            assert!(
+                title.iter().all(|fg| th.warn_sweep.contains(fg)),
+                "a running title sweeps: {title:?}"
+            );
+
+            app.animations = false;
+            let term = draw_tall(&mut app);
+            let live = &term.backend().buffer()[(feat.x + 4, feat.y)];
+            assert_eq!(live.fg, gray::BRIGHT, "working, held still");
+            assert!(
+                !live.modifier.contains(Modifier::BOLD),
+                "bold is the cursor's"
+            );
+
+            update_agent(&mut app, "a2", |a| a.status = AgentStatus::Finished);
+            let term = draw_tall(&mut app);
+            let feat = drawn_entries(&app, 1)[0].1;
+            let idle = &term.backend().buffer()[(feat.x + 4, feat.y)];
+            assert_eq!(idle.fg, gray::DIM, "finished");
+            assert!(!idle.modifier.contains(Modifier::BOLD));
+        });
+    }
+
+    /// A root whose checkout's pull request has merged is purple, dot and
+    /// title, the way the PR's own state reads; under the cursor it is
+    /// bold purple. A live session in the checkout still wins, and a merge
+    /// seen to land moments ago sweeps the title on the merged ramp.
+    #[test]
+    fn a_merged_pull_request_turns_its_root_purple() {
+        with_default_config(|| {
+            let mut app = nested();
+            let th = app.theme;
+            app.animations = false;
+            let w2 = WorktreeId("w2".into());
+            app.pull_requests.insert(
+                w2.clone(),
+                Some(crate::pull_request::PullRequest {
+                    state: crate::pull_request::STATE_MERGED.into(),
+                    ..pull_request(42)
+                }),
+            );
+            let feat_root = |app: &mut App| {
+                let term = draw_tall(app);
+                let band = crate::launcher::bands(app)
+                    .iter()
+                    .position(|b| b.worktree == w2)
+                    .expect("feat's thread");
+                let r = drawn_entries(app, band)[0].1;
+                let buf = term.backend().buffer();
+                let dot = buf[(r.x + 2, r.y)].clone();
+                let title: Vec<_> = (0.."polish-nav".len() as u16)
+                    .map(|i| buf[(r.x + 4 + i, r.y)].clone())
+                    .collect();
+                (dot, title)
+            };
+
+            let (_, title) = feat_root(&mut app);
+            assert_ne!(title[0].fg, th.merged, "a running session wins");
+
+            update_agent(&mut app, "a2", |a| a.status = AgentStatus::Finished);
+            let (dot, title) = feat_root(&mut app);
+            assert_eq!(dot.fg, th.merged, "the dot is purple");
+            assert!(
+                title.iter().all(|c| c.fg == th.merged),
+                "the title is solid purple: {:?}",
+                title.iter().map(|c| c.fg).collect::<Vec<_>>()
+            );
+            assert!(!title[0].modifier.contains(Modifier::BOLD));
+
+            app.animations = true;
+            app.note_merge_landed(w2.clone());
+            let (_, title) = feat_root(&mut app);
+            assert!(
+                title.iter().all(|c| th.merged_sweep.contains(&c.fg)),
+                "a fresh merge sweeps: {:?}",
+                title.iter().map(|c| c.fg).collect::<Vec<_>>()
+            );
+
+            app.animations = false;
+            super::select_card(
+                &mut app,
+                SessionRef::Agent(AgentId("a2".into())),
+                &mut Vec::new(),
+            );
+            let (_, title) = feat_root(&mut app);
+            assert_eq!(title[0].fg, th.merged, "purple under the cursor too");
+            assert!(title[0].modifier.contains(Modifier::BOLD));
+        });
+    }
+
+    /// `j`/`k` walk the rows on screen. `h` on a child moves to its root
+    /// without folding; `h` again folds, and `l` opens. A thread with no
+    /// children ignores both. Folded, the walk lands on the root session,
+    /// which the pane still reads.
+    #[test]
+    fn j_and_k_walk_visible_rows_and_h_l_fold_the_thread() {
+        with_default_config(|| {
+            let mut app = nested();
+            draw_tall(&mut app);
+            let at = |band, card| Some(CardRef { band, card });
+            let j = |app: &mut App| key(app, KeyCode::Char('j'), KeyModifiers::NONE);
+            let k = |app: &mut App| key(app, KeyCode::Char('k'), KeyModifiers::NONE);
+            let h = |app: &mut App| key(app, KeyCode::Char('h'), KeyModifiers::NONE);
+            let l = |app: &mut App| key(app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_eq!(cursor_card(&app), at(0, 0));
+            j(&mut app);
+            assert_eq!(cursor_card(&app), at(0, 1), "the terminal under it");
+            j(&mut app);
+            assert_eq!(cursor_card(&app), at(1, 0), "then the next thread's root");
+            k(&mut app);
+            assert_eq!(cursor_card(&app), at(0, 1));
+            h(&mut app);
+            assert_eq!(
+                cursor_card(&app),
+                at(0, 0),
+                "h on a child moves to the root"
+            );
+            assert_eq!(drawn_after(&mut app, 0).len(), 2, "and does not fold");
+            h(&mut app);
+            assert!(app.launcher_folded.contains(&WorktreeId("w1".into())));
+            assert_eq!(drawn_after(&mut app, 0).len(), 1, "folded to the root");
+            assert!(super::has_pane(&app), "the root session stays on screen");
+            l(&mut app);
+            assert!(!app.band_folded(&crate::launcher::bands(&app)[0]));
+            assert_eq!(drawn_after(&mut app, 0).len(), 2);
+
+            j(&mut app);
+            j(&mut app);
+            assert_eq!(cursor_card(&app), at(1, 0), "the next thread's root");
+            l(&mut app);
+            h(&mut app);
+            assert_eq!(
+                cursor_card(&app),
+                at(1, 0),
+                "no children, so h and l do nothing"
+            );
+            k(&mut app);
+            assert_eq!(cursor_card(&app), at(0, 1), "the thread above's last child");
+
+            h(&mut app);
+            h(&mut app);
+            assert!(app.band_folded(&crate::launcher::bands(&app)[0]));
+            j(&mut app);
+            assert_eq!(cursor_card(&app), at(1, 0));
+            k(&mut app);
+            assert_eq!(cursor_card(&app), at(0, 0), "a folded thread is its root");
+            assert_eq!(drawn_after(&mut app, 0).len(), 1);
+        });
+    }
+
+    /// Enter opens the row under the cursor, root or child, and does not
+    /// fold or expand the thread.
+    #[test]
+    fn enter_opens_the_selected_row_root_or_child() {
+        with_default_config(|| {
+            let mut app = nested();
+            draw_tall(&mut app);
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert!(app.band_folded(&crate::launcher::bands(&app)[0]));
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.focus, Focus::Terminal, "Enter opens the root session");
+            assert!(
+                app.band_folded(&crate::launcher::bands(&app)[0]),
+                "and leaves it folded"
+            );
+            assert_eq!(selected(&app).as_deref(), Some("a1"));
+
+            let mut child = nested();
+            draw_tall(&mut child);
+            key(&mut child, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut child, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                reading(&child),
+                Some(SessionRef::Terminal(TerminalId("t1".into())))
+            );
+            assert_eq!(child.focus, Focus::Terminal);
+        });
+    }
+
+    /// `k`,`k` on the top row — the first thread's root — walks up into
+    /// the PROJECT TABS.
+    #[test]
+    fn k_k_on_the_nested_top_row_walks_up_into_the_project_tabs() {
+        with_default_config(|| {
+            let mut app = nested();
+            draw_tall(&mut app);
+            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(app.launcher_tab_cursor, None, "one press stays put");
+            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+        });
+    }
+
+    /// A click on the caret folds and opens the thread, the same toggle
+    /// Tab runs.
+    #[test]
+    fn a_click_on_the_fold_caret_toggles_the_thread() {
+        with_default_config(|| {
+            let mut app = nested();
+            draw_tall(&mut app);
+            let caret = app
+                .hit_rect(&HitTarget::LauncherBandFold(0))
+                .expect("main's caret");
+            click_at(&mut app, caret.x, caret.y);
+            assert!(app.launcher_folded.contains(&WorktreeId("w1".into())));
+            assert_eq!(drawn_after(&mut app, 0).len(), 1);
+            let caret = app.hit_rect(&HitTarget::LauncherBandFold(0)).unwrap();
+            click_at(&mut app, caret.x, caret.y);
+            assert!(!app.band_folded(&crate::launcher::bands(&app)[0]));
+            assert_eq!(drawn_after(&mut app, 0).len(), 2);
+        });
+    }
+
+    /// An EMPTY BAND is one line, in the title column, and `h`/`l` do
+    /// nothing to it. Tab still says there is nothing to open.
+    #[test]
+    fn an_empty_worktree_is_one_line_in_the_nested_layout() {
+        with_default_config(|| {
+            let mut app = with_empty_band();
+            app.launcher_nested = true;
+            let term = draw_tall(&mut app);
+            let (head, text) = band_header(&app, &term, 2);
+            assert_eq!(head.height, 1);
+            assert!(text.contains("nothing running"), "{text:?}");
+            assert!(text.contains("d: delete worktree"), "{text:?}");
+            let above = drawn_entries(&app, 1)[0].1;
+            assert_eq!(head.y, above.bottom(), "no blank row above it");
+
+            // polish-nav, and on to the empty worktree.
+            keys(&mut app, &[KeyCode::Char('j'); 2]);
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.0.clone()).as_deref(),
+                Some("w3")
+            );
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert!(app.launcher_folded.is_empty());
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+        });
+    }
+
+    /// [`nested`] with a second prompt under the root checkout's thread:
+    /// `agent-1` its root, `second-prompt` and `term-1` its children.
+    fn nested_with_children() -> App {
+        let mut app = nested();
+        seed_running(&mut app, "a5", "w1", "second-prompt");
+        draw_tall(&mut app);
+        app
+    }
+
+    fn deleted_agents(out: &[ClientRequest]) -> Vec<&str> {
+        out.iter()
+            .filter_map(|r| match r {
+                ClientRequest::DeleteAgent { id, .. } => Some(id.0.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn archived_agents(out: &[ClientRequest]) -> Vec<&str> {
+        out.iter()
+            .filter_map(|r| match r {
+                ClientRequest::ArchiveAgent { id, .. } => Some(id.0.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn closed_terminals(out: &[ClientRequest]) -> Vec<&str> {
+        out.iter()
+            .filter_map(|r| match r {
+                ClientRequest::CloseTerminal { id, .. } => Some(id.0.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `d` on a NESTED thread's root takes the whole thread — every prompt
+    /// and terminal nested under it — behind one confirm that lists them,
+    /// in the root checkout too. On a child it is that child's own delete.
+    #[test]
+    fn d_on_a_threads_root_deletes_everything_nested_under_it() {
+        with_default_config(|| {
+            let mut app = nested_with_children();
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    if c.action == PendingAction::DeleteAgent(AgentId("a5".into()))),
+                "a child deletes alone: {:?}",
+                app.overlay
+            );
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            let Some(Overlay::Confirm(c)) = &app.overlay else {
+                panic!("the root asks: {:?}", app.overlay);
+            };
+            assert_eq!(
+                c.action,
+                PendingAction::DeleteAllSessions {
+                    agents: vec![AgentId("a1".into()), AgentId("a5".into())],
+                    terminals: vec![TerminalId("t1".into())],
+                },
+                "the root checkout keeps its worktree"
+            );
+            assert!(c.title.contains("3 rows"), "{}", c.title);
+            assert!(
+                c.message.contains("2 sessions and 1 terminal go away"),
+                "{}",
+                c.message
+            );
+            for name in ["agent-1", "second-prompt", "term-1"] {
+                assert!(c.message.contains(name), "{name} listed: {}", c.message);
+            }
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(deleted_agents(&out), ["a1", "a5"]);
+            assert_eq!(closed_terminals(&out), ["t1"]);
+            let left: Vec<String> = crate::launcher::bands(&app)
+                .iter()
+                .flat_map(|b| b.cards.iter().map(|c| c.name().to_string()))
+                .collect();
+            assert_eq!(left, ["polish-nav"]);
+        });
+    }
+
+    /// Deleting or archiving a child takes the cursor to the row drawn
+    /// under it, or, on the thread's last row, the one drawn above — a
+    /// sweep through the children ends on the root. The band's own order
+    /// is by recency, which is not the order the rows are drawn in.
+    #[test]
+    fn a_child_leaving_lands_on_the_next_row_of_its_thread() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            app.launcher_nested = true;
+            for id in ["a5", "a7", "a9"] {
+                seed_running(&mut app, id, "w1", id);
+            }
+            let now = crate::app::now_ms();
+            for (id, age) in [("a1", 4), ("a5", 0), ("a7", 3), ("a9", 2)] {
+                update_agent(&mut app, id, |a| a.status_changed_at = now - age * 1000);
+            }
+            draw_tall(&mut app);
+            let main = &crate::launcher::bands(&app)[0];
+            let drawn: Vec<String> = crate::launcher::thread_order(main)
+                .into_iter()
+                .map(|i| main.cards[i].name().to_string())
+                .collect();
+            assert_eq!(drawn, ["agent-1", "a5", "a7", "a9"]);
+            assert_ne!(main.cards[1].name(), "a5", "recency is another order");
+
+            super::select(&mut app, AgentId("a7".into()), &mut Vec::new());
+            for c in ['d', 'y'] {
+                key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+            }
+            assert_eq!(selected(&app).as_deref(), Some("a9"), "the row under it");
+
+            for c in ['a', 'y'] {
+                key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+            }
+            assert_eq!(
+                selected(&app).as_deref(),
+                Some("a5"),
+                "the last row: up one"
+            );
+
+            for c in ['d', 'y'] {
+                key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+            }
+            assert_eq!(selected(&app).as_deref(), Some("a1"), "back up to the root");
+        });
+    }
+
+    /// `a` on a NESTED thread's root archives every session in the thread
+    /// and closes its terminals, and always asks first — even with
+    /// **Confirm on archive** off — since a killed shell does not come
+    /// back with `u`.
+    #[test]
+    fn a_on_a_threads_root_archives_the_thread_and_closes_its_terminals() {
+        with_config_json(r#"{"ask_before_archive": false}"#, || {
+            let mut app = nested_with_children();
+            key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+            let Some(Overlay::Confirm(c)) = &app.overlay else {
+                panic!("the root asks: {:?}", app.overlay);
+            };
+            assert_eq!(
+                c.action,
+                PendingAction::ArchiveThread {
+                    agents: vec![AgentId("a1".into()), AgentId("a5".into())],
+                    terminals: vec![TerminalId("t1".into())],
+                }
+            );
+            assert!(c.message.contains("1 terminal closed"), "{}", c.message);
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(archived_agents(&out), ["a1", "a5"]);
+            assert_eq!(closed_terminals(&out), ["t1"]);
+            assert!(app.tree.terminals.iter().all(|t| t.id.0 != "t1"));
+
+            // A child, with the confirm off, archives alone and at once.
+            seed_running(&mut app, "a6", "w2", "follow-on");
+            super::select_card(
+                &mut app,
+                SessionRef::Agent(AgentId("a6".into())),
+                &mut Vec::new(),
+            );
+            draw_tall(&mut app);
+            let out = key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert_eq!(archived_agents(&out), ["a6"]);
+        });
+    }
+
+    /// The right-click menu's Archive and Delete on a root take the
+    /// thread, as `a` and `d` do.
+    #[test]
+    fn the_root_rows_menu_takes_the_thread_too() {
+        with_default_config(|| {
+            let mut app = nested_with_children();
+            let mut out = Vec::new();
+            super::super::run_menu_action(
+                &mut app,
+                crate::app::MenuAction::DeleteAgent(AgentId("a1".into())),
+                &mut out,
+            );
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    if matches!(c.action, PendingAction::DeleteAllSessions { .. })),
+                "{:?}",
+                app.overlay
+            );
+            app.overlay = None;
+            super::super::run_menu_action(
+                &mut app,
+                crate::app::MenuAction::ArchiveAgent(AgentId("a1".into())),
+                &mut out,
+            );
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    if matches!(c.action, PendingAction::ArchiveThread { .. })),
+                "{:?}",
+                app.overlay
+            );
+        });
+    }
+
+    /// With every thread gone — the root checkout's included, whose empty
+    /// band **Show all worktrees** would otherwise keep — the grid is the
+    /// welcome nebula opens on.
+    #[test]
+    fn deleting_every_thread_leaves_the_welcome() {
+        with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+            let mut app = nested_with_children();
+            app.show_all_worktrees = true;
+            super::select_card(
+                &mut app,
+                SessionRef::Agent(AgentId("a2".into())),
+                &mut Vec::new(),
+            );
+            draw_tall(&mut app);
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
+
+            super::select_card(
+                &mut app,
+                SessionRef::Agent(AgentId("a1".into())),
+                &mut Vec::new(),
+            );
+            draw_tall(&mut app);
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(crate::launcher::bands(&app).is_empty());
+            let text = buffer_text(&draw_tall(&mut app));
+            assert!(text.contains("Welcome to nebula"), "{text}");
+            assert!(!super::has_pane(&app), "nothing for the pane to read");
+        });
+    }
+
+    /// **Expand all worktrees** shows every child, and `h` / Tab do not
+    /// fold. `h` on a child still moves to the root.
+    #[test]
+    fn expand_all_worktrees_holds_every_nested_thread_open() {
+        with_default_config(|| {
+            let mut app = nested();
+            app.launcher_folded.insert(WorktreeId("w1".into()));
+            app.launcher_all_open = true;
+            let term = draw_tall(&mut app);
+            assert_eq!(drawn_entries(&app, 0).len(), 2);
+            let root = row_text(&term, drawn_entries(&app, 0)[0].1);
+            assert!(root.starts_with("▾ ● agent-1"), "{root:?}");
+            let screen = screen_text(&term);
+            assert!(
+                screen.contains("jk move  Enter open  p sub-prompt"),
+                "{screen}"
+            );
+
+            key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(app.flash.as_deref(), Some(super::ALL_OPEN));
+            assert!(app.launcher_folded.contains(&WorktreeId("w1".into())));
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(drawn_after(&mut app, 0).len(), 2, "h does not fold");
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(cursor_card(&app), Some(CardRef { band: 0, card: 0 }));
+        });
+    }
+
+    /// More rows than the window holds: the grid scrolls by rows and the
+    /// cursor's row stays on screen, one line tall.
+    #[test]
+    fn the_nested_layout_scrolls_to_keep_the_cursors_row_on_screen() {
+        with_default_config(|| {
+            let mut app = list_of_five();
+            app.launcher_list = false;
+            app.launcher_nested = true;
+            app.launcher_pane_hidden = true;
+            let root = SessionRef::Agent(AgentId("a1".into()));
+            super::select_card(&mut app, root, &mut Vec::new());
+            // A body with a three-row grid: two rows and the marker.
+            let term = draw_at(&mut app, 80, 9);
+            let shown = drawn_entries(&app, 0);
+            assert!(shown.len() < 5, "five rows do not fit: {shown:?}");
+            assert_eq!(app.launcher_scroll, 0, "the root is the top row");
+            let screen = screen_text(&term);
+            assert!(screen.contains("more below"), "{screen}");
+
+            let order = crate::launcher::thread_order(&crate::launcher::bands(&app)[0]);
+            assert_eq!(order.len(), 5);
+            for _ in 0..order.len() - 1 {
+                key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            }
+            draw_at(&mut app, 80, 9);
+            let last = order.len() - 1;
+            let card = order[last];
+            let drawn = drawn_entries(&app, 0)
+                .into_iter()
+                .find(|(i, _)| *i == card)
+                .expect("the cursor's row is drawn");
+            assert_eq!(drawn.1.height, 1);
+            assert!(app.launcher_scroll > 0);
+        });
+    }
+
+    /// Which threads were folded, and which were opened, come back after
+    /// a restart, less any the tree no longer has. A blob from before
+    /// either set existed starts empty, and the next draw collapses every
+    /// thread but the selection.
+    #[test]
+    fn folded_threads_are_remembered_across_a_restart() {
+        let mut app = nested();
+        seed_running(&mut app, "a3", "w2", "later");
+        app.launcher_folded.insert(WorktreeId("w2".into()));
+        app.launcher_folded.insert(WorktreeId("gone".into()));
+        app.launcher_thread_open.insert(WorktreeId("w1".into()));
+        let json = super::super::ui_state_json(&app);
+
+        let mut back = nested();
+        seed_running(&mut back, "a3", "w2", "later");
+        super::super::restore_ui_state(&mut back, &json);
+        assert_eq!(
+            back.launcher_folded,
+            [WorktreeId("w2".into())].into_iter().collect()
+        );
+        assert_eq!(
+            back.launcher_thread_open,
+            [WorktreeId("w1".into())].into_iter().collect()
+        );
+
+        let mut blob: serde_json::Value = serde_json::from_str(&json).unwrap();
+        blob.as_object_mut().unwrap().remove("launcher_folded");
+        blob.as_object_mut().unwrap().remove("launcher_thread_open");
+        super::super::restore_ui_state(&mut back, &blob.to_string());
+        assert!(back.launcher_folded.is_empty());
+        assert!(back.launcher_thread_open.is_empty());
+        draw_tall(&mut back);
+        assert!(
+            back.launcher_folded.contains(&WorktreeId("w2".into())),
+            "feat starts collapsed"
+        );
+        assert!(
+            back.launcher_thread_open.contains(&WorktreeId("w1".into())),
+            "the selection starts open"
+        );
+    }
+
+    /// Picking a later prompt by name opens the thread it is in, so the
+    /// row under the cursor is on screen. A right-click on the root is
+    /// that session's menu.
+    #[test]
+    fn landing_on_a_child_opens_its_thread() {
+        with_default_config(|| {
+            let mut app = nested();
+            seed_running(&mut app, "a3", "w2", "later");
+            draw_tall(&mut app);
+            assert!(app.launcher_folded.contains(&WorktreeId("w2".into())));
+            super::super::jump_to_target(
+                &mut app,
+                crate::palette::PaletteTarget::Session(AgentId("a3".into())),
+                super::super::Landing::FocusOnly,
+                &mut Vec::new(),
+            );
+            assert!(!app.launcher_folded.contains(&WorktreeId("w2".into())));
+            assert_eq!(selected(&app).as_deref(), Some("a3"));
+            draw_tall(&mut app);
+            assert_eq!(drawn_entries(&app, 1).len(), 2, "the child is on screen");
+
+            let root = drawn_entries(&app, 0)[0].1;
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Right),
+                root.x + 4,
+                root.y,
+            );
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("a right-click opens a menu: {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert!(labels.contains(&"Archive"), "{labels:?}");
+            assert!(!labels.contains(&"Delete worktree"), "{labels:?}");
+        });
+    }
+
+    /// [`nested`] as the PR column and the DETAIL STRIP read it: `feat`
+    /// (`polish-nav`, 6m) moved last, with a later prompt in it (4m) on
+    /// `opus` at `high`, open pull request #141 and `+265 −3` uncommitted;
+    /// `main` (`agent-1` and `term-1`) moved 37m ago. The cursor is on
+    /// `polish-nav`.
+    fn nested_with_detail() -> App {
+        let mut app = nested();
+        let now = crate::app::now_ms();
+        update_agent(&mut app, "a1", |a| {
+            a.status_changed_at = now - 37 * 60 * 1000
+        });
+        update_agent(&mut app, "a2", |a| {
+            a.status_changed_at = now - 6 * 60 * 1000
+        });
+        seed_running(&mut app, "a4", "w2", "Add repair regression test");
+        update_agent(&mut app, "a4", |a| {
+            a.status_changed_at = now - 4 * 60 * 1000;
+            a.model = Some("opus".into());
+            a.effort = Some("high".into());
+        });
+        let open = crate::pull_request::OpenPr {
+            number: 141,
+            title: "Polish the nav".into(),
+            url: "https://github.com/o/demo/pull/141".into(),
+            is_draft: false,
+            health: Default::default(),
+            head: "feat".into(),
+        };
+        let at = std::time::Instant::now();
+        app.open_prs.insert(
+            ProjectId("p1".into()),
+            crate::app::OpenPrs {
+                list: vec![open],
+                at,
+                due: at + std::time::Duration::from_secs(60),
+                step: std::time::Duration::from_secs(60),
+            },
+        );
+        app.worktree_lines.insert(
+            WorktreeId("w2".into()),
+            crate::git_diff::LineChanges {
+                added: 265,
+                removed: 3,
+            },
+        );
+        super::select_card(
+            &mut app,
+            SessionRef::Agent(AgentId("a2".into())),
+            &mut Vec::new(),
+        );
+        app
+    }
+
+    /// The four lines inside the DETAIL STRIP's box, as drawn.
+    fn strip_lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let screen = screen_text(terminal);
+        let lines: Vec<&str> = screen.lines().collect();
+        let top = lines
+            .iter()
+            .position(|l| l.contains('┌'))
+            .unwrap_or_else(|| panic!("no strip: {screen}"));
+        assert!(
+            lines[top + 5].contains('└'),
+            "six rows, border to border: {screen}"
+        );
+        lines[top + 1..top + 5]
+            .iter()
+            .map(|l| l.trim().trim_matches('│').trim().to_string())
+            .collect()
+    }
+
+    /// Threads are listed by their latest prompt, the newest on top, and a
+    /// new prompt in an older thread brings it back up.
+    #[test]
+    fn threads_sort_by_their_latest_prompt_newest_on_top() {
+        with_default_config(|| {
+            let mut app = nested_with_detail();
+            draw_tall(&mut app);
+            let order = |app: &App| -> Vec<String> {
+                crate::launcher::bands(app)
+                    .iter()
+                    .map(|b| b.worktree.0.clone())
+                    .collect()
+            };
+            assert_eq!(order(&app), ["w2", "w1"], "feat moved last");
+            let feat = drawn_entries(&app, 0)[0].1;
+            let main = drawn_entries(&app, 1)[0].1;
+            assert!(feat.y < main.y, "and is drawn first");
+
+            seed_running(&mut app, "a9", "w1", "a fresh one");
+            update_agent(&mut app, "a9", |a| {
+                a.status_changed_at = crate::app::now_ms()
+            });
+            assert_eq!(order(&app), ["w1", "w2"]);
+            let main = crate::launcher::bands(&app).remove(0);
+            let names: Vec<&str> = crate::launcher::thread_order(&main)
+                .into_iter()
+                .map(|i| main.cards[i].name())
+                .collect();
+            assert_eq!(
+                names,
+                ["agent-1", "a fresh one", "term-1"],
+                "inside the thread, still oldest first"
+            );
+        });
+    }
+
+    /// A root whose checkout has an open pull request shows its number,
+    /// underlined in the link blue, in a PR column as wide on every row;
+    /// a child never does. A click on it opens the PULL REQUESTS MODAL on
+    /// that pull request and leaves the cursor where it was.
+    #[test]
+    fn a_roots_open_pr_is_a_link_in_its_own_column() {
+        with_default_config(|| {
+            let mut app = nested_with_detail();
+            let term = draw_tall(&mut app);
+            let feat = drawn_entries(&app, 0);
+            let root = row_text(&term, feat[0].1);
+            let child = row_text(&term, feat[1].1);
+            let main = row_text(&term, drawn_entries(&app, 1)[0].1);
+            assert!(root.trim_end().ends_with("#141   6m"), "{root:?}");
+            assert!(!child.contains('#'), "a child has no PR: {child:?}");
+            assert!(!main.contains('#'), "main has none: {main:?}");
+            let end = |line: &str| line.trim_end().chars().count();
+            assert_eq!(end(&root), end(&child), "the ages line up");
+            assert_eq!(end(&root), end(&main));
+
+            let link = app
+                .hit_rect(&HitTarget::LauncherThreadPr(WorktreeId("w2".into())))
+                .expect("the #141 is a button");
+            let cell = &term.backend().buffer()[(link.x, link.y)];
+            assert_eq!(cell.symbol(), "#");
+            assert_eq!(cell.fg, gray::LINK);
+            assert!(cell.modifier.contains(Modifier::UNDERLINED));
+            assert_eq!(link.width, 4);
+
+            click_at(&mut app, link.x + 1, link.y);
+            let Some(Overlay::PullRequests(view)) = &app.overlay else {
+                panic!("the PR modal: {:?}", app.overlay);
+            };
+            assert_eq!(
+                view.selected_url.as_deref(),
+                Some("https://github.com/o/demo/pull/141")
+            );
+            assert_eq!(selected(&app).as_deref(), Some("a2"), "the cursor stayed");
+            assert_ne!(app.focus, Focus::Terminal, "no session opened");
+        });
+    }
+
+    /// A root in the project's ROOT checkout says so: `⌂ main` one space
+    /// after its title, in the root's gold. A worktree's root carries no
+    /// tag, and no row names its worktree.
+    #[test]
+    fn a_root_checkout_thread_wears_the_main_tag() {
+        with_default_config(|| {
+            let mut app = nested_with_detail();
+            let term = draw_tall(&mut app);
+            let main = drawn_entries(&app, 1)[0].1;
+            let line = row_text(&term, main);
+            assert!(line.starts_with("▸ ● agent-1 ⌂ main 1 sub"), "{line:?}");
+            let at = line.chars().position(|c| c == '⌂').unwrap() as u16;
+            assert_eq!(
+                term.backend().buffer()[(main.x + at, main.y)].fg,
+                app.theme.root
+            );
+            let feat = row_text(&term, drawn_entries(&app, 0)[0].1);
+            assert!(!feat.contains('⌂') && !feat.contains("feat"), "{feat:?}");
+        });
+    }
+
+    /// The DETAIL STRIP, pinned under the list, describes the row under
+    /// the cursor: a root its own title and harness and the thread's
+    /// checkout, pull request and changes; a child its own title and
+    /// harness and the rest from its thread. Its six rows never change, so
+    /// the list never moves.
+    #[test]
+    fn the_detail_strip_describes_the_selected_row() {
+        with_default_config(|| {
+            let mut app = nested_with_detail();
+            let term = draw_tall(&mut app);
+            let body = app.body_area;
+            let lines = strip_lines(&term);
+            assert!(lines[0].starts_with("polish-nav"), "{lines:#?}");
+            assert!(lines[0].ends_with("+265 −3"), "{lines:#?}");
+            assert_eq!(lines[1], "agent    claude");
+            assert_eq!(lines[2], "worktree feat");
+            assert!(lines[3].starts_with("pr       #141 open"), "{lines:#?}");
+            assert!(lines[3].ends_with("v open PR"), "{lines:#?}");
+            assert!(
+                screen_text(&term).contains("jk move  Enter open  p sub-prompt"),
+                "the footer's three verbs"
+            );
+
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            let term = draw_tall(&mut app);
+            let lines = strip_lines(&term);
+            assert!(
+                lines[0].starts_with("Add repair regression test"),
+                "{lines:#?}"
+            );
+            assert!(lines[0].ends_with("+265 −3"), "the thread's changes");
+            assert_eq!(lines[1], "agent    claude · opus · high");
+            assert_eq!(lines[2], "worktree feat");
+            assert!(lines[3].starts_with("pr       #141 open"));
+            assert_eq!(app.body_area, body, "the list keeps its height");
+
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            let lines = strip_lines(&draw_tall(&mut app));
+            assert_eq!(lines[0], "agent-1", "no changes, nothing at the right");
+            assert_eq!(lines[2], "worktree ⌂ main");
+            assert_eq!(lines[3], "pr       none", "no PR, no hint");
+        });
+    }
+
+    /// A fresh frame's drawn rows of `band`.
+    fn drawn_after(app: &mut App, band: usize) -> Vec<(usize, ratatui::layout::Rect)> {
+        draw_tall(app);
+        drawn_entries(app, band)
     }
 }

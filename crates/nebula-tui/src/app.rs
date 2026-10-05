@@ -107,6 +107,18 @@ pub enum HitTarget {
     /// it as the ACCORDION, the very toggle Tab runs
     /// (`event_loop::launcher::click_band_more`).
     LauncherBandMore(usize),
+    /// The fold caret (`▾` / `▸`) at the left of a worktree's header in
+    /// the NESTED layout, by the band's place in `launcher::bands`,
+    /// registered ahead of the header, so it wins: a click puts the
+    /// cursor on the band and folds it to its header, or opens it again —
+    /// the very toggle Tab runs (`event_loop::launcher::click_band_fold`).
+    LauncherBandFold(usize),
+    /// The `#42` in a NESTED thread's PR column, by the thread's checkout,
+    /// registered ahead of the row, so it wins: a click opens the PULL
+    /// REQUESTS MODAL on that pull request
+    /// (`event_loop::launcher::click_thread_pr`) and leaves the cursor and
+    /// the pane where they were.
+    LauncherThreadPr(WorktreeId),
     /// The `‹ sessions` crumb in a full-screen session's header
     /// (LAUNCHER VIEW): a click leaves the session for the grid, as `^q`
     /// does.
@@ -626,6 +638,12 @@ pub enum PendingAction {
     /// `a` (or the row menu's Archive): archive the agent once the dialog
     /// is answered.
     ArchiveAgent(AgentId),
+    /// `a` on a NESTED thread's root: archive every session in the thread
+    /// and close every terminal in it, a terminal having no archive.
+    ArchiveThread {
+        agents: Vec<AgentId>,
+        terminals: Vec<TerminalId>,
+    },
     DeleteAgent(AgentId),
     CloseTerminal(TerminalId),
     DeleteWorktree(WorktreeId),
@@ -2864,6 +2882,19 @@ pub struct UiState {
     /// the one in `launcher_expanded`.
     #[serde(default)]
     pub launcher_open_bands: HashMap<String, String>,
+    /// The worktrees the NESTED layout was left with folded to their
+    /// root row ([`App::launcher_folded`]), by worktree id; absent in
+    /// older blobs, which take the default — collapsed, except the
+    /// thread that holds the selection.
+    #[serde(default)]
+    pub launcher_folded: Vec<String>,
+    /// The worktrees the NESTED layout was left expanded
+    /// ([`App::launcher_thread_open`]), by worktree id. A thread in
+    /// neither this nor `launcher_folded` has not been chosen yet and
+    /// starts collapsed, unless it holds the selection. Absent in older
+    /// blobs.
+    #[serde(default)]
+    pub launcher_thread_open: Vec<String>,
     /// The LAUNCHER VIEW's PROJECT TABS, by project id, far left first;
     /// absent in older blobs, which open with the one project restored.
     #[serde(default)]
@@ -3229,8 +3260,10 @@ pub struct App {
     /// jumps the boundary the way ⇧Tab / Tab would. Any other key in
     /// between clears it.
     pub edge_tap: Option<(crate::keymap::Action, std::time::Instant)>,
-    /// The key that just unarchived a card, watched until the host reports
-    /// it let go, so a held `u` unarchives once (event_loop/release_watch.rs).
+    /// The key that just archived or unarchived a card, watched until the
+    /// host reports it let go, so a held `u` unarchives once — and a held
+    /// `a` with the archive confirm off archives once
+    /// (event_loop/release_watch.rs).
     pub release_watch: Option<crate::event_loop::ReleaseWatch>,
     pub overlay: Option<Overlay>,
     /// The expanded session card's FOLLOW-UP COMPOSER, or None with every
@@ -3286,6 +3319,28 @@ pub struct App {
     /// (`event_loop::apply_config`). What a frame lays out is
     /// [`App::panel_layout`].
     pub launcher_list: bool,
+    /// Each BAND is the NESTED layout — one thread per worktree, the
+    /// earliest session its root row and every later prompt and terminal
+    /// a child row under it — rather than its row of cards: the third
+    /// **Worktree layout** (`event_loop::apply_config`). Never on with
+    /// [`App::launcher_list`]. What a frame lays out is
+    /// [`App::panel_layout`].
+    pub launcher_nested: bool,
+    /// The worktrees the NESTED layout has folded to their root row
+    /// (`h` / `Tab`, `event_loop::launcher::toggle_band_expand`). A thread
+    /// starts collapsed unless it holds the selection or the user has
+    /// expanded it ([`App::launcher_thread_open`]); any number can be
+    /// folded at once — kept apart from the ACCORDION's one open band
+    /// ([`App::launcher_expanded`]), so switching layouts loses neither.
+    /// Worktree ids are unique across projects, so one set serves every
+    /// project's grid. Remembered across restarts.
+    pub launcher_folded: std::collections::HashSet<WorktreeId>,
+    /// The worktrees the NESTED layout has expanded, children showing.
+    /// A thread in neither this nor [`App::launcher_folded`] has not been
+    /// chosen yet: [`App::classify_nested_threads`] opens it when it
+    /// holds the selection and folds every other. Remembered across
+    /// restarts, beside the folded set.
+    pub launcher_thread_open: std::collections::HashSet<WorktreeId>,
     /// Every BAND is laid out open at once — its cards wrapped into rows,
     /// or every entry of the LIST listed — and there is no ACCORDION:
     /// Settings → Appearance → **Expand all worktrees**
@@ -3859,6 +3914,9 @@ impl App {
             launcher_pane_w: None,
             launcher_pane_at: crate::launcher::PaneSide::default(),
             launcher_list: false,
+            launcher_nested: false,
+            launcher_folded: std::collections::HashSet::new(),
+            launcher_thread_open: std::collections::HashSet::new(),
             launcher_all_open: false,
             launcher_pane_hidden: false,
             launcher_expanded: None,
@@ -4187,6 +4245,7 @@ impl App {
             && self.term.is_some()
             && !self.launcher_pane_hidden
             && self.launcher_aimed()
+            && !self.on_folded_band()
         {
             return;
         }
@@ -4316,7 +4375,9 @@ impl App {
     /// every band open ([`App::launcher_all_open`]): there is no
     /// accordion then, so nothing for Esc to close.
     pub fn open_band(&self, bands: &[crate::launcher::Band]) -> Option<usize> {
-        if self.launcher_all_open {
+        // Nor in the NESTED layout, where every band is open unless it
+        // has been folded ([`App::band_folded`]).
+        if self.launcher_all_open || self.launcher_nested {
             return None;
         }
         let open = self.launcher_expanded.as_ref()?;
@@ -4340,10 +4401,20 @@ impl App {
     /// rule, the cursor's card among them wherever it sits
     /// (`launcher::list_panel_layout`). With every band open
     /// ([`App::launcher_all_open`]) each is laid out as the open one is
-    /// (`launcher::open_panel_layout`). The draw, the wheel and the keys
+    /// (`launcher::open_panel_layout`). In the NESTED layout
+    /// ([`App::launcher_nested`]) every band is one thread: its root row,
+    /// and the children of the threads left open
+    /// (`launcher::nested_panel_layout`). The draw, the wheel and the keys
     /// all read this one, so what `j`/`k` walk is what is on screen.
     pub fn panel_layout(&self, bands: &[crate::launcher::Band]) -> crate::launcher::PanelLayout {
-        if self.launcher_list {
+        if self.launcher_nested {
+            crate::launcher::nested_panel_layout(
+                self.body_area,
+                bands,
+                &self.launcher_folded,
+                self.launcher_all_open,
+            )
+        } else if self.launcher_list {
             crate::launcher::list_panel_layout(
                 self.body_area,
                 bands,
@@ -4360,10 +4431,74 @@ impl App {
         }
     }
 
+    /// `band` is folded to its root row in the NESTED layout: it has
+    /// children, and `h` or `Tab` folded it ([`App::launcher_folded`]).
+    /// Every thread is open with **Expand all worktrees** on, and one
+    /// with nothing under its root has nothing to fold. Always false in
+    /// the other two layouts.
+    pub fn band_folded(&self, band: &crate::launcher::Band) -> bool {
+        self.launcher_nested
+            && !self.launcher_all_open
+            && crate::launcher::thread_order(band).len() > 1
+            && self.launcher_folded.contains(&band.worktree)
+    }
+
+    /// File each NESTED thread that has not been opened or folded yet.
+    /// The one holding the selection starts open, so the row under the
+    /// cursor is in view; every other thread starts collapsed. A thread
+    /// already in [`App::launcher_folded`] or [`App::launcher_thread_open`]
+    /// is left as the user left it, including across a restart.
+    pub fn classify_nested_threads(&mut self) {
+        if !self.launcher_nested || self.launcher_all_open {
+            return;
+        }
+        let selected = self.selected_worktree().map(|w| w.id.clone());
+        let bands = crate::launcher::bands(self);
+        for band in bands {
+            if crate::launcher::thread_order(&band).len() <= 1 {
+                continue;
+            }
+            let id = &band.worktree;
+            if self.launcher_folded.contains(id) || self.launcher_thread_open.contains(id) {
+                continue;
+            }
+            if Some(id) == selected.as_ref() {
+                self.launcher_thread_open.insert(id.clone());
+            } else {
+                self.launcher_folded.insert(id.clone());
+            }
+        }
+    }
+
+    /// The GRID's cursor is on a child a folded NESTED thread is hiding.
+    /// The root row stays on screen and stays the session under the
+    /// cursor when the fold happens on it; this is only the child that
+    /// was selected and then covered, which nothing should read until the
+    /// thread opens or the cursor moves back to the root. Derived from
+    /// the fold and the selection rather than kept.
+    pub fn on_folded_band(&self) -> bool {
+        if !self.launcher_nested || self.launcher_all_open || !self.launcher_grid() {
+            return false;
+        }
+        let bands = crate::launcher::bands(self);
+        let Some(index) = crate::launcher::band_cursor(self, &bands) else {
+            return false;
+        };
+        let band = &bands[index];
+        if !self.band_folded(band) {
+            return false;
+        }
+        let Some(&root) = crate::launcher::thread_order(band).first() else {
+            return false;
+        };
+        crate::launcher::card_cursor(self, band).is_some_and(|at| at != root)
+    }
+
     /// The band whose cards the keys walk as rows, and those rows: the
     /// ACCORDION's open band while the cursor is on it — or, in the
-    /// compact LIST, whichever band the cursor is on, every band there
-    /// being a column of entries — and, with every band open
+    /// compact LIST and the NESTED layout, whichever band the cursor is
+    /// on, every band there being a column of entries (none at all on a
+    /// band the NESTED layout has folded) — and, with every band open
     /// ([`App::launcher_all_open`]), whichever band the cursor is on too.
     /// None on a collapsed band of cards, where `h`/`l` walk the STRIP
     /// and `j`/`k` the bands.
@@ -4371,7 +4506,7 @@ impl App {
         &self,
         bands: &[crate::launcher::Band],
     ) -> Option<(usize, crate::launcher::ExpandedLayout)> {
-        if self.launcher_list || self.launcher_all_open {
+        if self.launcher_list || self.launcher_nested || self.launcher_all_open {
             let index = crate::launcher::band_cursor(self, bands)?;
             let layout = self.panel_layout(bands).bands.swap_remove(index).content?;
             return Some((index, layout));
@@ -4396,9 +4531,13 @@ impl App {
     /// session, so with nothing selected there is nothing for it to be
     /// and the grid takes the whole body back. Clicking a card selects
     /// it and the pane opens beside the cards; letting the card go —
-    /// Esc, a click on the air between them — collapses it again.
+    /// Esc, a click on the air between them — collapses it again. So does
+    /// the cursor resting on a child a folded NESTED thread is hiding
+    /// ([`App::on_folded_band`]): that row is off screen, and the pane
+    /// never reads a session the grid is not showing. The thread's root
+    /// is on screen, and the pane reads it.
     pub fn launcher_split(&self, body: Rect) -> (Rect, Option<Rect>) {
-        if self.launcher_pane_hidden || !self.launcher_aimed() {
+        if self.launcher_pane_hidden || !self.launcher_aimed() || self.on_folded_band() {
             return (body, None);
         }
         let side = crate::launcher::fitted_side(body, self.launcher_pane_at);
