@@ -79,11 +79,12 @@ included, and leaves red the moment you answer: a question's answer is its own t
 and an approved permission prompt shows up as the gated tool running, whichever tool it was. Codex
 has no `Notification` hook and no `AskUserQuestion` tool, but its native `PermissionRequest` is
 installed, so the red state stays reachable there (and, with no `PostToolUse` to say you approved,
-a Codex row stays red until the turn ends). Cursor has no `PermissionRequest` hook to install,
-and since nebula runs it with `--force` there is nothing left to wait on anyway: its hooks are
+a Codex row stays red until the turn ends). Cursor has no `PermissionRequest` hook to install, and
+since nebula runs it with `--force` it never stops for a permission prompt: its hooks are
 `sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart` and `subagentStop`, which is busy versus
-idle and nothing else. **A Cursor SESSION can never show the red NEEDS FEEDBACK dot** — if you are
-watching one and waiting for it to ask you something, it is not going to. Pi has no shell hooks at all:
+idle. The one thing a Cursor SESSION does stop for is its `AskQuestion` dialog, and Cursor fires no
+hook for that tool, so nebula reads the dialog off the SESSION's screen instead: the row goes red
+while the question is up and back to yellow a moment after you answer or skip it. Pi has no shell hooks at all:
 nebula installs one managed extension (`~/.pi/agent/extensions/nebula.ts`, inert outside nebula) that
 posts pi's `session_start`, `before_agent_start`, `agent_end` and `ask_question` tool events as
 `SessionStart`, `UserPromptSubmit`, `Stop` and `PreToolUse` / `PostToolUse`, and any blocking prompt an
@@ -391,24 +392,26 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   per worktree, with no header, no card border and no blank line between threads. Threads are
   sorted by their latest prompt, the one that moved last on top. The first prompt run in a
   worktree is the thread's root row and its title is the thread's title; every later prompt, and
-  each terminal in that worktree, is a child row under it, oldest first. Every row is one line: a
-  fold caret (`▾` open, `▸` folded, a blank space when the thread has no children), the status
-  dot, the title, then two fixed, right-aligned columns — the pull request and how long since it
+  each terminal in that worktree, is a child row under it, oldest first. The project's root
+  checkout is not one thread: prompts run there are usually separate work, so each of its
+  sessions and terminals is a root row of its own, with no children, sorted among the worktrees'
+  threads by when it last moved. Every row is one line: a
+  fold caret (`▾` open, `▸` folded, a blank space when the thread has no children), then the
+  title — no status dot: the title itself is drawn in the status color the dot would wear
+  (purple on a merged root) — then two fixed, right-aligned columns — the pull request and how long since it
   moved (`6m`, `now`). A root whose checkout has an open pull request shows its `#141` there,
   underlined in link blue; a click on it opens the PULL REQUESTS MODAL on that pull request
-  without opening the session, and `v` does the same for the thread under the cursor. A root in
-  the project's root checkout carries `⌂ main` after its title in gold; no row names its
-  worktree. A child sits two cells in, its `├` under the root's dot, the last one on a `└`. A
+  without opening the session, and `v` does the same for the thread under the cursor. No row names
+  its worktree. A child sits four cells in, its `├` under the root's title, the last one on a `└`. A
   collapsed thread that has children says `1 sub` or `3 subs` after the title. The row under the
-  cursor is a filled bar with a one-cell accent at the left edge — its title bold and
-  accent-coloured — and selecting a child does not highlight the root. Threads start collapsed
+  cursor is a filled bar with a one-cell accent at the left edge — its title bold — and selecting a child does not highlight the root. Threads start collapsed
   except the one that holds the selection; `l` / `→` expands a collapsed root, `h` / `←` collapses
   an expanded one, and `h` / `←` on a child moves to its root. `j` / `k` walk only the rows on
   screen. `Enter` opens the selected row, root or child. A thread with no children ignores `h` /
   `l`. `Tab`, or a click on the caret, toggles the same fold, and which threads are open is
   remembered across restarts. A DETAIL STRIP is pinned under the list, six rows in a box, and
   always describes the selected row: its title (with the checkout's `+265 −3` at the right), what
-  it runs on (`agent    claude · opus · high`), its checkout (`worktree feat`, or `⌂ main`), and
+  it runs on (`agent    claude · opus · high`), its checkout (`worktree feat`, or `⌂ root main` with the branch the root has checked out), and
   its pull request (`pr       #141 open`, with `v open PR` at the right, or `none`). A child shows
   its own title and harness and its thread's checkout, pull request and changes. The list scrolls between the project tabs and the
   strip, and the strip never moves. The bottom bar is `jk move  Enter open  p sub-prompt`.

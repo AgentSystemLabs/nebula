@@ -2217,7 +2217,16 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
         fold_empty_grid(app, out);
         return;
     }
-    let Some(band_index) = bands.iter().position(|b| b.worktree == before.worktree) else {
+    // A solo band is its one card: with the card gone, so is its band,
+    // whichever of the checkout's other cards are still up.
+    let Some(band_index) = bands.iter().position(|b| {
+        b.worktree == before.worktree
+            && (!b.solo
+                || before
+                    .sref
+                    .as_ref()
+                    .is_some_and(|s| b.position(s).is_some()))
+    }) else {
         let next = before.band_index.min(bands.len() - 1);
         tracing::debug!(
             left = %before.worktree.0,
@@ -2230,7 +2239,10 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
         if app.launcher_expanded.as_ref() == Some(&before.worktree) {
             app.launcher_expanded = None;
         }
-        select_band(app, bands[next].worktree.clone(), out);
+        match &bands[next] {
+            band if band.solo => select_card(app, band.cards[0].sref(), out),
+            band => select_band(app, band.worktree.clone(), out),
+        }
         return;
     };
     let band = &bands[band_index];
@@ -10636,11 +10648,68 @@ mod tests {
     use crate::theme::nested as gray;
 
     /// [`two_sessions`] in the NESTED layout, with a terminal beside
-    /// `agent-1` in `demo`'s root: the `main` band holds a session and a
-    /// terminal, the `feat` band the running `polish-nav`.
+    /// `agent-1`: the `main` band holds a session and a terminal, the
+    /// `feat` band the running `polish-nav`. `main` is a worktree of its
+    /// own here, not the root checkout, whose rows never thread
+    /// ([`nested_root`]).
     fn nested() -> App {
+        let mut app = threaded();
+        seed_terminal(&mut app, "t1", "w1", "term-1");
+        app
+    }
+
+    /// [`two_sessions`] in the NESTED layout, `main` a worktree of its own
+    /// so what runs in it threads, and the thread on top: `agent-1` moved
+    /// a minute ago, `polish-nav` never.
+    fn threaded() -> App {
         let mut app = two_sessions();
         app.launcher_nested = true;
+        unroot(&mut app);
+        let now = crate::app::now_ms();
+        update_agent(&mut app, "a1", |a| a.status_changed_at = now - 60 * 1000);
+        app
+    }
+
+    /// `demo`'s root checkout `w1` made a worktree of its own.
+    fn unroot(app: &mut App) {
+        let root = app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.id.0 == "w1")
+            .cloned()
+            .expect("demo's root");
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    is_main: false,
+                    ..root
+                }),
+            },
+        );
+    }
+
+    /// [`two_sessions`] in the NESTED layout with `demo`'s root checkout
+    /// holding three sessions and a terminal, `agent-1` the oldest.
+    fn nested_root() -> App {
+        let mut app = two_sessions();
+        app.launcher_nested = true;
+        let now = crate::app::now_ms();
+        update_agent(&mut app, "a1", |a| {
+            a.status_changed_at = now - 30 * 60 * 1000
+        });
+        update_agent(&mut app, "a2", |a| {
+            a.status_changed_at = now - 20 * 60 * 1000
+        });
+        seed_running(&mut app, "a5", "w1", "fix-login");
+        update_agent(&mut app, "a5", |a| {
+            a.status_changed_at = now - 10 * 60 * 1000
+        });
+        seed_running(&mut app, "a6", "w1", "bump-deps");
+        update_agent(&mut app, "a6", |a| {
+            a.status_changed_at = now - 60 * 60 * 1000
+        });
         seed_terminal(&mut app, "t1", "w1", "term-1");
         app
     }
@@ -10749,43 +10818,37 @@ mod tests {
             assert_eq!(main.len(), 4, "root, two later prompts, the terminal");
             let lines: Vec<String> = main.iter().map(|(_, r)| row_text(&term, *r)).collect();
             assert!(
-                lines[0].starts_with("▾ ● Work On Issue 135"),
+                lines[0].starts_with("▾ ↳ Work On Issue 135"),
                 "{:?}",
                 lines[0]
             );
             assert!(lines[0].trim_end().ends_with("6m"), "{:?}", lines[0]);
             assert!(
-                lines[1].starts_with("  ├ ● Add repair regression test"),
+                lines[1].starts_with("    ├ Add repair regression test"),
                 "{:?}",
                 lines[1]
             );
             assert!(lines[1].trim_end().ends_with("4m"), "{:?}", lines[1]);
             assert!(
-                lines[2].starts_with("  ├ ● Run full test suite"),
+                lines[2].starts_with("    ├ Run full test suite"),
                 "{:?}",
                 lines[2]
             );
             assert!(lines[2].trim_end().ends_with("now"), "{:?}", lines[2]);
             // The last child closes the thread on the `└`. A terminal
-            // wears its shell mark where a session has its dot.
-            assert!(lines[3].starts_with("  └ ❯ term-1"), "{:?}", lines[3]);
+            // wears its shell mark before its title; a session has none.
+            assert!(lines[3].starts_with("    └ ❯ term-1"), "{:?}", lines[3]);
             assert_eq!(
-                term.backend().buffer()[(main[3].1.x + 4, main[3].1.y)].fg,
+                term.backend().buffer()[(main[3].1.x + 6, main[3].1.y)].fg,
                 app.theme.ok,
                 "green while it runs"
             );
-            let dot = |line: &str| line.chars().position(|c| c == '●').unwrap();
+            assert!(!lines.iter().any(|l| l.contains('●')), "no status dot");
             let col = |line: &str, word: &str| {
                 let at = line.find(word).expect(word);
                 line[..at].chars().count()
             };
-            assert_eq!(dot(&lines[0]), 2, "caret, space, dot");
-            assert_eq!(
-                dot(&lines[1]),
-                dot(&lines[0]) + 2,
-                "a child's dot sits two in"
-            );
-            assert_eq!(col(&lines[0], "Work"), 4, "caret, space, dot, space");
+            assert_eq!(col(&lines[0], "Work"), 4, "caret, space, scope mark, space");
             assert_eq!(col(&lines[1], "Add"), col(&lines[0], "Work") + 2);
             assert_eq!(main[0].1.height, 1);
             assert_eq!(main[1].1.y, main[0].1.bottom());
@@ -10799,7 +10862,7 @@ mod tests {
             );
             let feat_line = row_text(&term, feat[0].1);
             assert!(
-                feat_line.starts_with("▸ ● polish-nav 1 sub"),
+                feat_line.starts_with("▸ ↳ polish-nav 1 sub"),
                 "{feat_line:?}"
             );
             assert!(feat_line.trim_end().ends_with("9m"), "{feat_line:?}");
@@ -10824,8 +10887,8 @@ mod tests {
     }
 
     /// The cursor's row is a filled bar across the full width, with a
-    /// one-cell accent at the left edge. Its title is bold and accent
-    /// coloured. A selected child does not light its root.
+    /// one-cell accent at the left edge. Its title is bold, still in its
+    /// status color. A selected child does not light its root.
     #[test]
     fn the_selected_row_is_a_filled_bar_and_a_child_does_not_light_its_root() {
         with_default_config(|| {
@@ -10845,37 +10908,40 @@ mod tests {
             assert_eq!(buf[(root.right() - 1, root.y)].bg, fill, "edge to edge");
             assert_eq!(buf[(root.x - 1, root.y)].bg, th.accent, "the accent bar");
             let title = &buf[(root.x + 4, root.y)];
-            assert_eq!(title.fg, th.accent);
+            assert_eq!(title.fg, gray::DIM, "a fresh session's status color");
             assert!(title.modifier.contains(Modifier::BOLD));
-            let child_title = &buf[(child.x + 6, child.y)];
-            assert_eq!(child_title.fg, th.text, "a child is ordinary text");
+            // The child is `term-1`, its title past the `└ ❯ `.
+            let child_title = &buf[(child.x + 8, child.y)];
+            assert_eq!(child_title.fg, th.ok, "a live terminal is green");
             assert!(!child_title.modifier.contains(Modifier::BOLD));
 
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
             let term = draw_tall(&mut app);
             let main = drawn_entries(&app, 0);
             let buf = term.backend().buffer();
-            assert_eq!(buf[(main[1].1.x + 6, main[1].1.y)].fg, th.accent);
-            assert!(buf[(main[1].1.x + 6, main[1].1.y)]
+            assert_eq!(buf[(main[1].1.x + 8, main[1].1.y)].fg, th.ok);
+            assert!(buf[(main[1].1.x + 8, main[1].1.y)]
                 .modifier
                 .contains(Modifier::BOLD));
-            assert_ne!(
-                buf[(main[0].1.x + 4, main[0].1.y)].fg,
-                th.accent,
+            assert!(
+                !buf[(main[0].1.x + 4, main[0].1.y)]
+                    .modifier
+                    .contains(Modifier::BOLD),
                 "the root stays unselected"
             );
             assert_ne!(
                 buf[(main[0].1.x + 4, main[0].1.y)].bg,
-                buf[(main[1].1.x + 6, main[1].1.y)].bg
+                buf[(main[1].1.x + 8, main[1].1.y)].bg
             );
         });
     }
 
     /// A working root's title sweeps the way a card's name does; held
-    /// still, with animations off, it is bright white. An idle one's is
-    /// dim, and neither is bold until it is the row under the cursor.
+    /// still, with animations off, it is the running color. A finished
+    /// one's is the finished color, and neither is bold until it is the
+    /// row under the cursor.
     #[test]
-    fn a_live_root_title_sweeps_and_an_idle_one_is_dim() {
+    fn a_root_title_wears_its_status_color() {
         with_default_config(|| {
             // The cursor is on `agent-1`, so `polish-nav` is the root read.
             let mut app = nested();
@@ -10894,7 +10960,7 @@ mod tests {
             app.animations = false;
             let term = draw_tall(&mut app);
             let live = &term.backend().buffer()[(feat.x + 4, feat.y)];
-            assert_eq!(live.fg, gray::BRIGHT, "working, held still");
+            assert_eq!(live.fg, th.warn, "working, held still");
             assert!(
                 !live.modifier.contains(Modifier::BOLD),
                 "bold is the cursor's"
@@ -10904,12 +10970,12 @@ mod tests {
             let term = draw_tall(&mut app);
             let feat = drawn_entries(&app, 1)[0].1;
             let idle = &term.backend().buffer()[(feat.x + 4, feat.y)];
-            assert_eq!(idle.fg, gray::DIM, "finished");
+            assert_eq!(idle.fg, th.ok, "finished");
             assert!(!idle.modifier.contains(Modifier::BOLD));
         });
     }
 
-    /// A root whose checkout's pull request has merged is purple, dot and
+    /// A root whose checkout's pull request has merged has a purple
     /// title, the way the PR's own state reads; under the cursor it is
     /// bold purple. A live session in the checkout still wins, and a merge
     /// seen to land moments ago sweeps the title on the merged ramp.
@@ -10935,19 +11001,16 @@ mod tests {
                     .expect("feat's thread");
                 let r = drawn_entries(app, band)[0].1;
                 let buf = term.backend().buffer();
-                let dot = buf[(r.x + 2, r.y)].clone();
-                let title: Vec<_> = (0.."polish-nav".len() as u16)
+                (0.."polish-nav".len() as u16)
                     .map(|i| buf[(r.x + 4 + i, r.y)].clone())
-                    .collect();
-                (dot, title)
+                    .collect::<Vec<_>>()
             };
 
-            let (_, title) = feat_root(&mut app);
+            let title = feat_root(&mut app);
             assert_ne!(title[0].fg, th.merged, "a running session wins");
 
             update_agent(&mut app, "a2", |a| a.status = AgentStatus::Finished);
-            let (dot, title) = feat_root(&mut app);
-            assert_eq!(dot.fg, th.merged, "the dot is purple");
+            let title = feat_root(&mut app);
             assert!(
                 title.iter().all(|c| c.fg == th.merged),
                 "the title is solid purple: {:?}",
@@ -10957,7 +11020,7 @@ mod tests {
 
             app.animations = true;
             app.note_merge_landed(w2.clone());
-            let (_, title) = feat_root(&mut app);
+            let title = feat_root(&mut app);
             assert!(
                 title.iter().all(|c| th.merged_sweep.contains(&c.fg)),
                 "a fresh merge sweeps: {:?}",
@@ -10970,7 +11033,7 @@ mod tests {
                 SessionRef::Agent(AgentId("a2".into())),
                 &mut Vec::new(),
             );
-            let (_, title) = feat_root(&mut app);
+            let title = feat_root(&mut app);
             assert_eq!(title[0].fg, th.merged, "purple under the cursor too");
             assert!(title[0].modifier.contains(Modifier::BOLD));
         });
@@ -11166,7 +11229,8 @@ mod tests {
 
     /// `d` on a NESTED thread's root takes the whole thread — every prompt
     /// and terminal nested under it — behind one confirm that lists them,
-    /// in the root checkout too. On a child it is that child's own delete.
+    /// and offers the worktree it empties. On a child it is that child's
+    /// own delete.
     #[test]
     fn d_on_a_threads_root_deletes_everything_nested_under_it() {
         with_default_config(|| {
@@ -11188,11 +11252,14 @@ mod tests {
             };
             assert_eq!(
                 c.action,
-                PendingAction::DeleteAllSessions {
-                    agents: vec![AgentId("a1".into()), AgentId("a5".into())],
-                    terminals: vec![TerminalId("t1".into())],
-                },
-                "the root checkout keeps its worktree"
+                PendingAction::ThenDeleteWorktree {
+                    first: Box::new(PendingAction::DeleteAllSessions {
+                        agents: vec![AgentId("a1".into()), AgentId("a5".into())],
+                        terminals: vec![TerminalId("t1".into())],
+                    }),
+                    worktree: WorktreeId("w1".into()),
+                    offered: true,
+                }
             );
             assert!(c.title.contains("3 rows"), "{}", c.title);
             assert!(
@@ -11221,8 +11288,7 @@ mod tests {
     #[test]
     fn a_child_leaving_lands_on_the_next_row_of_its_thread() {
         with_default_config(|| {
-            let mut app = two_sessions();
-            app.launcher_nested = true;
+            let mut app = threaded();
             for id in ["a5", "a7", "a9"] {
                 seed_running(&mut app, id, "w1", id);
             }
@@ -11314,7 +11380,8 @@ mod tests {
             );
             assert!(
                 matches!(&app.overlay, Some(Overlay::Confirm(c))
-                    if matches!(c.action, PendingAction::DeleteAllSessions { .. })),
+                    if matches!(&c.action, PendingAction::ThenDeleteWorktree { first, .. }
+                        if matches!(**first, PendingAction::DeleteAllSessions { .. }))),
                 "{:?}",
                 app.overlay
             );
@@ -11377,7 +11444,7 @@ mod tests {
             let term = draw_tall(&mut app);
             assert_eq!(drawn_entries(&app, 0).len(), 2);
             let root = row_text(&term, drawn_entries(&app, 0)[0].1);
-            assert!(root.starts_with("▾ ● agent-1"), "{root:?}");
+            assert!(root.starts_with("▾ ↳ agent-1"), "{root:?}");
             let screen = screen_text(&term);
             assert!(
                 screen.contains("jk move  Enter open  p sub-prompt"),
@@ -11403,6 +11470,7 @@ mod tests {
             let mut app = list_of_five();
             app.launcher_list = false;
             app.launcher_nested = true;
+            unroot(&mut app);
             app.launcher_pane_hidden = true;
             let root = SessionRef::Agent(AgentId("a1".into()));
             super::select_card(&mut app, root, &mut Vec::new());
@@ -11506,7 +11574,7 @@ mod tests {
             };
             let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
             assert!(labels.contains(&"Archive"), "{labels:?}");
-            assert!(!labels.contains(&"Delete worktree"), "{labels:?}");
+            assert!(labels.contains(&"Attach"), "the session's menu: {labels:?}");
         });
     }
 
@@ -11659,24 +11727,80 @@ mod tests {
         });
     }
 
-    /// A root in the project's ROOT checkout says so: `⌂ main` one space
-    /// after its title, in the root's gold. A worktree's root carries no
-    /// tag, and no row names its worktree.
+    /// The root checkout is not one thread: prompts run there are
+    /// separate work, so each session and terminal is a root row of its
+    /// own — no caret, no children, no tag — sorted among the worktrees'
+    /// threads by when it last moved. The DETAIL STRIP names the checkout:
+    /// `⌂ root` and the branch checked out there.
     #[test]
-    fn a_root_checkout_thread_wears_the_main_tag() {
+    fn the_root_checkouts_rows_each_stand_alone() {
         with_default_config(|| {
-            let mut app = nested_with_detail();
-            let term = draw_tall(&mut app);
-            let main = drawn_entries(&app, 1)[0].1;
-            let line = row_text(&term, main);
-            assert!(line.starts_with("▸ ● agent-1 ⌂ main 1 sub"), "{line:?}");
-            let at = line.chars().position(|c| c == '⌂').unwrap() as u16;
+            let mut app = nested_root();
+            let bands = crate::launcher::bands(&app);
+            let names: Vec<&str> = bands.iter().map(|b| b.cards[0].name()).collect();
             assert_eq!(
-                term.backend().buffer()[(main.x + at, main.y)].fg,
-                app.theme.root
+                names,
+                ["fix-login", "polish-nav", "agent-1", "bump-deps", "term-1"]
             );
-            let feat = row_text(&term, drawn_entries(&app, 0)[0].1);
-            assert!(!feat.contains('⌂') && !feat.contains("feat"), "{feat:?}");
+            assert!(bands.iter().all(|b| b.solo == b.is_main), "{bands:#?}");
+            assert!(bands.iter().filter(|b| b.solo).all(|b| b.cards.len() == 1));
+
+            super::select(&mut app, AgentId("a1".into()), &mut Vec::new());
+            let term = draw_tall(&mut app);
+            for index in [0, 2, 3, 4] {
+                let line = row_text(&term, drawn_entries(&app, index)[0].1);
+                assert!(
+                    line.starts_with("  ⌂ "),
+                    "no caret, the root mark: {line:?}"
+                );
+                assert!(!line.contains("sub"), "{line:?}");
+            }
+            let lines = strip_lines(&term);
+            assert_eq!(lines[0], "agent-1");
+            assert_eq!(lines[2], "worktree ⌂ root main");
+
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId("w1".into()),
+                        project_id: ProjectId("p1".into()),
+                        path: "/tmp/demo".into(),
+                        branch: "dev".into(),
+                        is_main: true,
+                        sort_order: 0,
+                    }),
+                },
+            );
+            let lines = strip_lines(&draw_tall(&mut app));
+            assert_eq!(lines[2], "worktree ⌂ root dev", "the branch checked out");
+        });
+    }
+
+    /// `j` / `k` walk the root checkout's rows one by one, and `d` on one
+    /// deletes that session alone — the cursor onto the row that slides up
+    /// into its place, not some other row of the same checkout.
+    #[test]
+    fn a_root_row_walks_and_deletes_alone() {
+        with_default_config(|| {
+            let mut app = nested_root();
+            super::select(&mut app, AgentId("a1".into()), &mut Vec::new());
+            draw_tall(&mut app);
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(selected(&app).as_deref(), Some("a6"));
+            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(selected(&app).as_deref(), Some("a1"));
+
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    if c.action == PendingAction::DeleteAgent(AgentId("a1".into()))),
+                "{:?}",
+                app.overlay
+            );
+            let out = key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert_eq!(deleted_agents(&out), ["a1"]);
+            assert_eq!(selected(&app).as_deref(), Some("a6"), "the row under it");
         });
     }
 
@@ -11719,7 +11843,7 @@ mod tests {
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
             let lines = strip_lines(&draw_tall(&mut app));
             assert_eq!(lines[0], "agent-1", "no changes, nothing at the right");
-            assert_eq!(lines[2], "worktree ⌂ main");
+            assert_eq!(lines[2], "worktree main");
             assert_eq!(lines[3], "pr       none", "no PR, no hint");
         });
     }

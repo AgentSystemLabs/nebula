@@ -418,6 +418,7 @@ mod tests {
                     progress_busy: Some(true),
                     title: Some("✳ Fix Login".into()),
                     cloud_scan: true,
+                    question_scan: true,
                 },
                 spare: false,
                 launching: true,
@@ -435,7 +436,7 @@ mod tests {
         );
         assert_eq!(pty.title.as_deref(), Some("✳ Fix Login"));
         assert!(pty.bracketed_paste);
-        assert!(pty.cloud_scan && back.sessions[0].launching);
+        assert!(pty.cloud_scan && pty.question_scan && back.sessions[0].launching);
     }
 
     #[test]
@@ -452,6 +453,7 @@ mod tests {
             progress_busy: None,
             title: None,
             cloud_scan: false,
+            question_scan: false,
         };
         let carry = Carry {
             nonce: String::new(),

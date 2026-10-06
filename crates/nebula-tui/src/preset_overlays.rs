@@ -1328,21 +1328,22 @@ pub(crate) fn draw_list(f: &mut Frame, app: &mut App, view: &AgentPresetsView, t
 fn worktree_line(app: &App, view: &AgentPresetsView, width: u16, th: Theme) -> Line<'static> {
     let dim = Style::default().fg(th.dim);
     let target = view.target();
-    let branch = match &target {
-        QuickTarget::NewWorktree { branch, .. } => branch.clone(),
-        QuickTarget::Worktree(id) => app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| &w.id == id)
-            .map_or_else(|| "(worktree gone)".into(), |w| w.branch.clone()),
+    let (branch, scope) = match &target {
+        QuickTarget::NewWorktree { branch, .. } => (branch.clone(), th.worktree),
+        QuickTarget::Worktree(id) => app.tree.worktrees.iter().find(|w| &w.id == id).map_or_else(
+            || ("(worktree gone)".into(), th.muted),
+            |w| {
+                let scope = if w.is_main { th.root } else { th.worktree };
+                (w.branch.clone(), scope)
+            },
+        ),
     };
     let pr = view.quick.as_ref().and_then(|q| q.launch.pr.as_ref());
     let (left, right) = if let Some(pr) = pr {
         (
             vec![
                 Span::styled(format!(" PR #{} · worktree: ", pr.number), dim),
-                Span::styled(pr.head.clone(), Style::default().fg(th.muted)),
+                Span::styled(pr.head.clone(), Style::default().fg(th.worktree)),
             ],
             vec![Span::styled("reused or cut on Enter ", dim)],
         )
@@ -1367,7 +1368,7 @@ fn worktree_line(app: &App, view: &AgentPresetsView, width: u16, th: Theme) -> L
         (
             vec![
                 Span::styled(" worktree: ", dim),
-                Span::styled(branch, Style::default().fg(th.muted)),
+                Span::styled(branch, Style::default().fg(scope)),
             ],
             vec![
                 Span::styled("[ ] new worktree", dim),

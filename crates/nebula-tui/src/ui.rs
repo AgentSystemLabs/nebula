@@ -129,7 +129,7 @@ fn quick_target_line(
         (
             vec![
                 Span::styled(format!("PR #{} · worktree: ", pr.number), dim),
-                Span::styled(branch, Style::default().fg(th.muted)),
+                Span::styled(branch, Style::default().fg(th.worktree)),
             ],
             vec![Span::styled("reused or cut on Enter ", dim)],
         )
@@ -151,10 +151,19 @@ fn quick_target_line(
         )
     } else {
         let dim = Style::default().fg(th.dim);
+        let scope = match &launch.target {
+            crate::quick_prompt::QuickTarget::Worktree(id) => app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| &w.id == id)
+                .map_or(th.muted, |w| if w.is_main { th.root } else { th.worktree }),
+            crate::quick_prompt::QuickTarget::NewWorktree { .. } => th.worktree,
+        };
         (
             vec![
                 Span::styled("worktree: ", dim),
-                Span::styled(branch, Style::default().fg(th.muted)),
+                Span::styled(branch, Style::default().fg(scope)),
             ],
             vec![
                 Span::styled("[ ] new worktree", dim),

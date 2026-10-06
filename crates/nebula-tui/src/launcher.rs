@@ -233,6 +233,11 @@ pub struct Band {
     pub branch: String,
     /// The checkout is the project's ROOT WORKTREE (`⌂`).
     pub is_main: bool,
+    /// One card of the root checkout standing as a NESTED thread of its
+    /// own: prompts run on the root are separate work, not one thread,
+    /// so each gets its own band. Several bands share the checkout then,
+    /// and only the card tells them apart.
+    pub solo: bool,
     pub pr: Option<RowPr>,
     /// The sessions in `rows` order, then the terminals in tree order.
     pub cards: Vec<Card>,
@@ -264,6 +269,8 @@ impl Band {
 /// welcome in its place. The
 /// ARCHIVED VIEW's bands hold the archived sessions alone; a terminal is
 /// never archived, so none is listed there, and no empty band is either.
+/// The NESTED layout gives each card of the root checkout a band of its
+/// own ([`Band::solo`]).
 pub fn bands(app: &App) -> Vec<Band> {
     let Some(project) = app.selected_project() else {
         return Vec::new();
@@ -290,13 +297,23 @@ pub fn bands(app: &App) -> Vec<Band> {
         if cards.is_empty() && (app.show_archived || !app.show_all_worktrees) {
             continue;
         }
-        out.push(Band {
+        let band = Band {
             worktree: w.id.clone(),
             branch: w.branch.clone(),
             is_main: w.is_main,
+            solo: false,
             pr: row_pr(app, &w.id, &project.id, &w.branch),
-            cards,
-        });
+            cards: Vec::new(),
+        };
+        if app.launcher_nested && w.is_main && !cards.is_empty() {
+            out.extend(cards.into_iter().map(|card| Band {
+                solo: true,
+                cards: vec![card],
+                ..band.clone()
+            }));
+        } else {
+            out.push(Band { cards, ..band });
+        }
     }
     // The root checkout's empty band alone is a project with nothing left
     // in it: the grid's welcome says what to do there, and the band would
@@ -324,12 +341,19 @@ pub fn card_at(bands: &[Band], at: CardRef) -> Option<&Card> {
     bands.get(at.band)?.cards.get(at.card)
 }
 
-/// The band the cursor is on: the SELECTED WORKTREE's, when it has one.
-/// None while the selection rests on a pull request, an issue, or a
-/// checkout with nothing running.
+/// The band the cursor is on: the SELECTED WORKTREE's, when it has one —
+/// of the checkout's [`Band::solo`] bands, the one holding the selected
+/// card. None while the selection rests on a pull request, an issue, or
+/// a checkout with nothing running.
 pub fn band_cursor(app: &App, bands: &[Band]) -> Option<usize> {
     let w = app.selected_worktree()?;
-    bands.iter().position(|b| b.worktree == w.id)
+    let sref = app.selected_session_row().and_then(|row| row.sref());
+    sref.and_then(|sref| {
+        bands
+            .iter()
+            .position(|b| b.worktree == w.id && b.position(&sref).is_some())
+    })
+    .or_else(|| bands.iter().position(|b| b.worktree == w.id))
 }
 
 /// The card the cursor is on inside `band`: the selected row's session
@@ -1296,8 +1320,9 @@ pub fn list_layout(body: Rect, band: &Band, open: bool, pin: Option<usize>) -> E
 // ---- the NESTED layout ----
 
 /// One line per row in the NESTED layout (Settings → Appearance →
-/// **Worktree layout** → `nested`): a thread is a worktree, and every
-/// visible row — its root and each child — is exactly this tall.
+/// **Worktree layout** → `nested`): a thread is a worktree — or one
+/// session or terminal of the root checkout — and every visible row — its
+/// root and each child — is exactly this tall.
 pub const NESTED_ROW_H: u16 = 1;
 
 /// The cards of `band` in thread order: the earliest session first — the

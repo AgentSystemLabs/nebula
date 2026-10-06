@@ -2660,6 +2660,9 @@ impl Daemon {
         if cloud_task.is_some() {
             session.arm_cloud_scan();
         }
+        if agent.kind == AgentKind::Cursor {
+            session.arm_question_scan();
+        }
         Ok(session)
     }
 
@@ -2935,6 +2938,15 @@ impl Daemon {
                     Ok(PtyEvent::Title { title }) => {
                         if let SessionRef::Agent(id) = &sref {
                             daemon.on_pty_title(id, &title);
+                        }
+                    }
+                    // Cursor's ask-question dialog, which no hook reports
+                    // (see `pty::question`). Owned PTYs only, as above.
+                    Ok(PtyEvent::Question { open }) => {
+                        if let SessionRef::Agent(id) = &sref {
+                            if daemon.owns_session(&sref, &session) {
+                                daemon.apply_hook_event(id, HookEvent::Question { open }, None);
+                            }
                         }
                     }
                     // The Cloud session this row launched, read off the

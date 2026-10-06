@@ -122,6 +122,11 @@ pub enum HookEvent {
     Progress {
         busy: bool,
     },
+    /// Synthetic: cursor-agent's ask-question dialog came up or went away
+    /// on its screen (`pty::question`) — it fires no hook for the tool.
+    Question {
+        open: bool,
+    },
 }
 
 /// The tools whose call means the turn is waiting on you: Claude's
@@ -501,6 +506,20 @@ impl AgentStatusMachine {
                 // clears its progress bar on startup and on exit too, and
                 // neither is a finished turn.
             }
+            HookEvent::Question { open } => {
+                if open {
+                    if !matches!(
+                        self.status,
+                        AgentStatus::Terminated | AgentStatus::Disconnected
+                    ) {
+                        self.wait_on(Origin::Foreground, true, &mut effects);
+                    }
+                } else if self.status == AgentStatus::NeedsFeedback {
+                    // Answered or skipped: the turn carries on either way.
+                    // A turn that already ended keeps its own status.
+                    self.set_status(AgentStatus::Running, &mut effects);
+                }
+            }
             HookEvent::SessionEnded { exit_code } => {
                 // Dead process: laggard subagent POSTs must never resurrect it.
                 self.subagents.clear();
@@ -840,6 +859,34 @@ mod tests {
         assert_eq!(status_of(&fx), Some(AgentStatus::Running));
         let fx = m.handle(HookEvent::Stop, Some("ses_1"), now);
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    /// Cursor's ask-question dialog, seen on its screen since no hook
+    /// reports it: red while it is up, running once it goes. Closing never
+    /// talks over a turn that already ended, and a dead agent stays dead.
+    #[test]
+    fn cursor_question_dialog_reads_as_waiting_on_you() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("c1"), now);
+        let fx = m.handle(HookEvent::Question { open: true }, None, now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        let fx = m.handle(HookEvent::Question { open: false }, None, now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+        let fx = m.handle(HookEvent::Stop, Some("c1"), now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+        let fx = m.handle(HookEvent::Question { open: false }, None, now);
+        assert_eq!(status_of(&fx), None, "a late close does not revive it");
+
+        // A turn that ends with the dialog up (a cancel) finishes as usual.
+        m.handle(HookEvent::UserPromptSubmit, Some("c1"), now);
+        m.handle(HookEvent::Question { open: true }, None, now);
+        let fx = m.handle(HookEvent::Stop, Some("c1"), now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+
+        let mut m = AgentStatusMachine::new(AgentStatus::Terminated, None);
+        let fx = m.handle(HookEvent::Question { open: true }, None, now);
+        assert_eq!(status_of(&fx), None);
     }
 
     /// pi's question tool goes through the same red-then-back flow as

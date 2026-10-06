@@ -3070,8 +3070,10 @@ pub(super) fn crumb_frame(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
 /// is never dropped, only cut — where a session lands is the one thing
 /// worth a whole row on its own — and a long branch is cut before it is.
 ///
-/// A fresh worktree's branch — the one Enter will cut — is drawn in the
-/// green the box's frame turns. A box aimed away from the grid behind it
+/// The branch wears the SCOPE COLOR the grid paints its checkout in —
+/// `root` on the project's root branch, `worktree` on one of its own —
+/// except a fresh worktree's, the one Enter will cut, drawn in the green
+/// the box's frame turns. A box aimed away from the grid behind it
 /// fires a BACKGROUND LAUNCH: the project is the half that changed, and
 /// nothing on screen will move when Enter lands, so the project is lit.
 /// A PR SESSION's head branch wears no `^T` and is no button: its
@@ -3151,6 +3153,8 @@ struct Details {
     pickable: bool,
     /// Enter cuts the branch as a fresh worktree first.
     fresh: bool,
+    /// The branch is the project's ROOT WORKTREE.
+    root: bool,
     /// The box is aimed away from the grid behind it.
     background: bool,
 }
@@ -3186,6 +3190,9 @@ impl Details {
             model,
             pickable: launch.pr.is_none(),
             fresh: launch.is_new_worktree(),
+            root: launch.pr.is_none()
+                && matches!(&launch.target, crate::quick_prompt::QuickTarget::Worktree(id)
+                    if app.tree.worktrees.iter().any(|w| &w.id == id && w.is_main)),
             background: crate::launcher::project_of(app, &launch.target)
                 .is_some_and(|project| crate::launcher::is_background(app, &project)),
         }
@@ -3228,7 +3235,13 @@ impl Details {
             spans.push(span);
         };
         let project_fg = if self.background { th.accent } else { th.text };
-        let branch_fg = if self.fresh { th.ok } else { th.text };
+        let branch_fg = if self.fresh {
+            th.ok
+        } else if self.root {
+            th.root
+        } else {
+            th.worktree
+        };
         for (i, (field, label, value, fg, key)) in [
             (
                 BoxField::Project,
@@ -4941,6 +4954,7 @@ mod tests {
             worktree: WorktreeId("w1".into()),
             branch: branch.into(),
             is_main,
+            solo: false,
             pr: None,
             cards: vec![crate::launcher::Card::Session(LauncherRow {
                 agent: Agent {

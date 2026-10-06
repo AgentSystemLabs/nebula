@@ -3,7 +3,9 @@
 //! geometry): one thread per worktree, the one that moved last on top,
 //! packed with no blank row between them. The earliest session in the
 //! worktree is the root row — its title is the thread's title — and every
-//! later prompt and terminal is a child row under it, one line each. No
+//! later prompt and terminal is a child row under it, one line each. The
+//! root checkout is not one thread: each of its sessions and terminals is
+//! a root row of its own, with no children. No
 //! worktree header, no card border, no rail: what a row runs on, where,
 //! and its pull request are on the DETAIL STRIP pinned under the list
 //! ([`draw_strip`]).
@@ -14,7 +16,6 @@ use crate::keymap::Action;
 use crate::launcher::{Band, BandsLayout, Card, CardRef, PanelLayout, RowPr, NESTED_ROW_H};
 use crate::pull_request::Standing;
 use crate::theme::{nested as gray, Theme};
-use nebula_core::AgentStatus;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -28,8 +29,13 @@ const CARET_FOLDED: &str = "▸";
 /// The tree under a root: every child but the last, and the last.
 const BRANCH: &str = "├";
 const LAST_BRANCH: &str = "└";
-/// The tag after a title in the project's ROOT checkout.
-const MAIN_TAG: &str = "⌂ main";
+/// How the DETAIL STRIP names the project's ROOT checkout, its branch
+/// after it.
+const ROOT_TAG: &str = "⌂ root";
+/// The scope mark between a root's caret and its title: the project's ROOT
+/// checkout, and a worktree.
+const ROOT_MARK: &str = "⌂";
+const WORKTREE_MARK: &str = "↳";
 
 /// The PR column, right-aligned: `#141`, on a root whose checkout has an
 /// open pull request, blank on every other row.
@@ -81,19 +87,6 @@ fn sub_label(n: usize) -> String {
     } else {
         format!("{n} subs")
     }
-}
-
-/// A root's title is dim when the session is idle: not working and not
-/// waiting on you. A live one is the bright white; the cursor's row is
-/// the accent either way.
-fn root_idle(agent: &nebula_core::Agent) -> bool {
-    if agent.archived || (!agent.alive && agent.cloud_session_id.is_none()) {
-        return true;
-    }
-    !matches!(
-        agent.status,
-        AgentStatus::Running | AgentStatus::NeedsFeedback
-    )
 }
 
 /// The pull request a thread's PR column shows: one still open, draft or
@@ -185,7 +178,7 @@ pub(super) fn draw_bands(
                 folded,
                 selected: at == Some(card_index),
                 keys,
-                main: !child && band.is_main,
+                root: band.is_main,
                 pr: if child { None } else { open_pr(band) },
                 merged: !child && merged,
                 merge_sweeps: !child && merge_sweeps,
@@ -223,8 +216,8 @@ fn draw_empty(buf: &mut Buffer, app: &App, r: Rect, band: &Band, lit: bool) {
         text.push_str(EMPTY_BAND_DELETE);
     }
     let fg = if lit { th.accent } else { gray::DIM };
-    // Four cells: the caret column, its space, and the dot column with
-    // its space, so the words start where a root's title does.
+    // Four cells: the caret column and the scope mark's, each with its
+    // space, so the words start where a root's title does.
     let shown = format!(
         "    {}",
         truncate(&text, usize::from(r.width).saturating_sub(4))
@@ -251,12 +244,13 @@ struct Row<'a> {
     selected: bool,
     /// The keys are on the grid, so the cursor's row wears the accent.
     keys: bool,
-    /// A root in the project's ROOT checkout: `⌂ main` after its title.
-    main: bool,
+    /// The thread is in the project's ROOT checkout: its root row's scope
+    /// mark is `⌂`, not a worktree's `↳`.
+    root: bool,
     /// A root's open pull request, for its PR column.
     pr: Option<&'a RowPr>,
     /// A root whose checkout wears its merged pull request
-    /// (`App::worktree_wears_merge`): its dot and title are purple.
+    /// (`App::worktree_wears_merge`): its title is purple.
     merged: bool,
     /// The merge was seen to land moments ago: the title rides the
     /// merged sweep instead of holding still.
@@ -311,10 +305,12 @@ fn fill_selected(buf: &mut Buffer, r: Rect, th: Theme) {
     }
 }
 
-/// One thread row. A root is `▾ ● Title`, the caret a blank space when
-/// the thread has no children, `⌂ main` after the title in the root
-/// checkout and `1 sub` after that only while those children are folded.
-/// A child is `  ├ ● Title`, the connector sitting under the root's dot.
+/// One thread row. A root is `▾ ↳ Title`, the caret a blank space when
+/// the thread has no children, the scope mark `⌂` in the root checkout
+/// and `↳` in a worktree, and `1 sub` after the title only while those
+/// children are folded. No status dot: the title is in the status color.
+/// A child is `    ├ Title`, the connector sitting under the root's title.
+/// A terminal keeps its `▶`/`❯` mark before its title.
 /// Right of the title, the PR column — a root's open `#42`, as a link —
 /// and the dim age, both fixed width and right-aligned on every row.
 /// Returns where the `#42` landed, for its hit.
@@ -325,54 +321,49 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         return None;
     }
     let RowParts {
-        mut dot,
+        mut mark,
         age,
-        idle,
+        color,
         title,
         mut ramp,
     } = row_parts(app, card, th);
     if row.merged {
-        dot.style = dot.style.fg(th.merged);
+        if let Some(mark) = mark.as_mut() {
+            mark.style = mark.style.fg(th.merged);
+        }
         ramp = row.merge_sweeps.then_some(th.merged_sweep);
     }
-    let dot_w = dot.width();
+    let mark_w = mark.as_ref().map_or(0, Span::width);
     let lead = if row.child {
-        2 + 1 + 1 + dot_w
+        4 + 1 + 1 + mark_w
     } else {
-        1 + 1 + dot_w
+        1 + 1 + 1 + 1 + mark_w
     };
     let columns = Columns::fit(width, lead);
     let room = width.saturating_sub(lead + columns.width());
-    let mut tag = row.main;
     let mut count = if !row.child && row.folded && row.children > 0 {
         sub_label(row.children)
     } else {
         String::new()
     };
-    // The title gives up letters first, down to a few; then the count,
-    // then the tag.
-    let extra = |tag: bool, count: &str| {
-        let tag_w = if tag { 1 + MAIN_TAG.chars().count() } else { 0 };
-        let count_w = if count.is_empty() {
+    // The title gives up letters first, down to a few; then the count.
+    let extra = |count: &str| {
+        if count.is_empty() {
             0
         } else {
             1 + count.chars().count()
-        };
-        tag_w + count_w
+        }
     };
-    if room < MIN_TITLE + extra(tag, &count) {
+    if room < MIN_TITLE + extra(&count) {
         count.clear();
     }
-    if room < MIN_TITLE + extra(tag, &count) {
-        tag = false;
-    }
-    let title = clip(&title, room.saturating_sub(extra(tag, &count)));
-    let title_style = title_style(th, row, idle);
+    let title = clip(&title, room.saturating_sub(extra(&count)));
+    let title_style = title_style(th, row, color);
     let dim = Style::default().fg(gray::DIM);
 
     let mut spans = Vec::new();
     if row.child {
-        spans.push(Span::raw("  "));
+        spans.push(Span::raw("    "));
         let connector = if row.last { LAST_BRANCH } else { BRANCH };
         spans.push(Span::styled(connector, dim));
         spans.push(Span::raw(" "));
@@ -394,8 +385,15 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         };
         spans.push(Span::styled(caret, Style::default().fg(caret_fg)));
         spans.push(Span::raw(" "));
+        let (mark, mark_fg) = if row.root {
+            (ROOT_MARK, th.root)
+        } else {
+            (WORKTREE_MARK, th.worktree)
+        };
+        spans.push(Span::styled(mark, Style::default().fg(mark_fg)));
+        spans.push(Span::raw(" "));
     }
-    spans.push(dot);
+    spans.extend(mark);
     let mut used = lead + title.chars().count();
     spans.extend(super::status_name_spans(
         title,
@@ -403,11 +401,6 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         ramp,
         app.sweep_phase(),
     ));
-    if tag {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(MAIN_TAG, Style::default().fg(th.root)));
-        used += 1 + MAIN_TAG.chars().count();
-    }
     if !count.is_empty() {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(count.clone(), dim));
@@ -452,10 +445,11 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
 
 /// What a row shows, before it is fitted to the width.
 struct RowParts {
-    dot: Span<'static>,
+    /// A terminal's `▶`/`❯` before its title; a session has none.
+    mark: Option<Span<'static>>,
     age: String,
-    /// A root's title recedes.
-    idle: bool,
+    /// The title's color: the status color the cards' STATUS DOT wears.
+    color: Color,
     title: String,
     /// The status sweep across the title, while it animates — the same
     /// ramp the cards and the list sweep a session's name with.
@@ -466,36 +460,36 @@ fn row_parts(app: &App, card: &Card, th: Theme) -> RowParts {
     match card {
         Card::Session(row) => {
             let look = session_look(app, &row.agent, false, th);
-            let mut dot = look.dot;
-            if dot.style.fg == Some(th.dim) {
-                dot.style = dot.style.fg(gray::DIM);
-            }
+            let color = match look.dot.style.fg {
+                Some(c) if c != th.dim => c,
+                _ => gray::DIM,
+            };
             let age = if row.agent.archived {
                 thread_age(row.agent.archived_at)
             } else {
                 thread_age(row.agent.status_changed_at)
             };
             RowParts {
-                dot,
+                mark: None,
                 age,
-                idle: root_idle(&row.agent),
+                color,
                 title: row.agent.name.clone(),
                 ramp: look.ramp,
             }
         }
         Card::Terminal(t) => {
             let color = if t.alive { th.ok } else { gray::DIM };
-            // A terminal's mark where a session has its dot, as the cards
-            // and the list draw it: `▶` running a command, `❯` a shell.
+            // As the cards and the list draw it: `▶` running a command,
+            // `❯` a shell.
             let mark = if t.run_command.is_some() {
                 "▶ "
             } else {
                 "❯ "
             };
             RowParts {
-                dot: Span::styled(mark, Style::default().fg(color)),
+                mark: Some(Span::styled(mark, Style::default().fg(color))),
                 age: String::new(),
-                idle: !t.alive,
+                color,
                 title: t.name.clone(),
                 ramp: None,
             }
@@ -503,28 +497,15 @@ fn row_parts(app: &App, card: &Card, th: Theme) -> RowParts {
     }
 }
 
-/// Title colour: a merged root is purple, bold under the cursor; any other
-/// cursor row is bold accent, a child is ordinary text, an idle root is
-/// dim, and a live root is bright white. Only the selected title is bold.
-fn title_style(th: Theme, row: &Row, idle: bool) -> Style {
-    if row.merged {
-        let style = Style::default().fg(th.merged);
-        return if row.selected {
-            style.add_modifier(Modifier::BOLD)
-        } else {
-            style
-        };
-    }
+/// Title colour: a merged root is purple, any other row its status color.
+/// Only the selected title is bold.
+fn title_style(th: Theme, row: &Row, color: Color) -> Style {
+    let fg = if row.merged { th.merged } else { color };
+    let style = Style::default().fg(fg);
     if row.selected {
-        return Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
-    }
-    if row.child {
-        return Style::default().fg(th.text);
-    }
-    if idle {
-        Style::default().fg(gray::DIM)
+        style.add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(gray::BRIGHT)
+        style
     }
 }
 
@@ -653,10 +634,17 @@ pub(super) fn draw_strip(
             ]
         })
         .unwrap_or_default();
+    let scope = if band.is_main { th.root } else { th.worktree };
+    let branch = Span::styled(band.branch.clone(), Style::default().fg(scope));
     let worktree = if band.is_main {
-        Span::styled(MAIN_TAG, Style::default().fg(th.root))
+        vec![
+            label("worktree"),
+            Span::styled(ROOT_TAG, Style::default().fg(th.root)),
+            Span::raw(" "),
+            branch,
+        ]
     } else {
-        Span::styled(band.branch.clone(), Style::default().fg(th.text))
+        vec![label("worktree"), branch]
     };
     let mut pr_hit = None;
     let (pr_left, pr_right) = match &band.pr {
@@ -707,7 +695,7 @@ pub(super) fn draw_strip(
             Vec::new(),
             width,
         ),
-        strip_line(vec![label("worktree"), worktree], Vec::new(), width),
+        strip_line(worktree, Vec::new(), width),
         strip_line(pr_left, pr_right, width),
     ];
     f.render_widget(Paragraph::new(lines), inner);

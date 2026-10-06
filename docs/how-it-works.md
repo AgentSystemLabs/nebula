@@ -200,8 +200,11 @@
   `PermissionRequest` already covers waiting on you — which also means a Codex row approved out of a
   permission prompt stays red until the turn ends. Cursor gets five camelCase events —
   `sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart`, `subagentStop` — and no permission
-  event at all; nebula runs `cursor-agent --force`, so waiting-on-you is simply not detectable there
-  and a Cursor session never reaches NEEDS FEEDBACK, only busy or idle. Pi runs TypeScript extensions
+  event at all, which `cursor-agent --force` never needs. Its `AskQuestion` dialog does wait on you,
+  but Cursor fires no hook for that tool (not even `preToolUse`), so the daemon keeps a small screen
+  model of each Cursor session and watches for the dialog's key legend: it goes red the moment the
+  legend is drawn and back to running once the legend has stayed gone for 150 ms — long enough that
+  a repaint split across two PTY reads is not mistaken for a close. Pi runs TypeScript extensions
   instead of shell hooks, so nebula writes one managed extension into its global agent dir
   (`~/.pi/agent/extensions/nebula.ts`, or `$PI_CODING_AGENT_DIR/extensions/` — global because pi loads
   those without the trust prompt a per-project `.pi/extensions/` raises) that maps pi's events onto the

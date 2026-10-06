@@ -94,7 +94,8 @@ const CODEX_EVENTS: &[(&str, Option<&str>)] = &[
 
 /// (cursor hook event, nebula hookEvent query value). Cursor has no
 /// PermissionRequest hook and nebula always runs cursor-agent with
-/// `--force`, so waiting-on-user is simply not detectable — busy/idle is.
+/// `--force`; its `AskQuestion` dialog fires no tool hook at all, so that
+/// wait is read off the screen instead (`pty::question`).
 /// `sessionEnd` is skipped: PTY-exit synthetics already cover agent death.
 const CURSOR_EVENTS: &[(&str, &str)] = &[
     ("sessionStart", "SessionStart"),

@@ -3,6 +3,7 @@ pub mod cursor;
 pub mod kitty;
 mod osc;
 pub mod progress;
+pub mod question;
 pub mod ring;
 pub mod title;
 
@@ -12,6 +13,7 @@ use cursor::CursorTracker;
 use nebula_core::SessionRef;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use progress::ProgressScanner;
+use question::QuestionScanner;
 use ring::ScrollbackRing;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -202,6 +204,12 @@ pub enum PtyEvent {
     CloudSession {
         id: String,
     },
+    /// Cursor's ask-question dialog came up or went away. Only scanned for
+    /// on cursor-agent sessions (`arm_question_scan`), which fire no hook
+    /// for it (see `pty::question`).
+    Question {
+        open: bool,
+    },
 }
 
 enum ReaderMsg {
@@ -231,6 +239,9 @@ pub struct PtySession {
     /// Claude Cloud session id scanner; `None` until a `--cloud` launch
     /// arms it, so ordinary sessions pay nothing.
     cloud: Mutex<Option<CloudScanner>>,
+    /// Cursor's ask-question dialog watcher; `None` until a cursor-agent
+    /// session arms it, so other sessions keep no screen for it.
+    question: Mutex<Option<QuestionScanner>>,
     /// Screen for answering cursor position reports; `None` until the child
     /// first asks, so sessions that never do parse nothing.
     cursor: Mutex<Option<CursorTracker>>,
@@ -300,6 +311,7 @@ impl PtySession {
                 progress: Mutex::new(ProgressScanner::new()),
                 title: Mutex::new(title::TitleScanner::new()),
                 cloud: Mutex::new(None),
+                question: Mutex::new(None),
                 cursor: Mutex::new(None),
             },
             reader,
@@ -322,6 +334,7 @@ impl PtySession {
         let reap: Reap = Box::new(move || reap_pid(pid));
         let (cols, rows) = carried.size;
         let cloud_scan = carried.cloud_scan;
+        let question_scan = carried.question_scan;
         let session = Self::start(
             Self {
                 sref: carried.sref,
@@ -342,6 +355,7 @@ impl PtySession {
                 progress: Mutex::new(ProgressScanner::restored(carried.progress_busy)),
                 title: Mutex::new(title::TitleScanner::restored(carried.title)),
                 cloud: Mutex::new(None),
+                question: Mutex::new(None),
                 cursor: Mutex::new(None),
             },
             reader,
@@ -351,6 +365,9 @@ impl PtySession {
         // the previous image already acted on.
         if cloud_scan {
             session.arm_cloud_scan();
+        }
+        if question_scan {
+            session.arm_question_scan();
         }
         Ok(session)
     }
@@ -389,6 +406,7 @@ impl PtySession {
             progress_busy: self.progress.lock().unwrap().busy(),
             title: self.title.lock().unwrap().title().map(str::to_string),
             cloud_scan: self.cloud.lock().unwrap().is_some(),
+            question_scan: self.question.lock().unwrap().is_some(),
         }))
     }
 
@@ -413,6 +431,9 @@ impl PtySession {
         *self.last_size.lock().unwrap() = (cols, rows);
         if let Some(cursor) = self.cursor.lock().unwrap().as_mut() {
             cursor.resize(cols, rows);
+        }
+        if let Some(question) = self.question.lock().unwrap().as_mut() {
+            question.resize(cols, rows);
         }
         Ok(())
     }
@@ -599,6 +620,18 @@ impl PtySession {
         }
     }
 
+    /// Start watching this cursor-agent child's screen for its
+    /// ask-question dialog (see `pty::question`); edges then arrive as
+    /// `PtyEvent::Question`. The screen is built from the ring under the
+    /// scanner's lock, which the pump takes before it appends a chunk, so
+    /// no byte is missed or fed twice.
+    pub fn arm_question_scan(&self) {
+        let mut slot = self.question.lock().unwrap();
+        let (cols, rows) = *self.last_size.lock().unwrap();
+        let (_, history) = self.snapshot(None);
+        *slot = Some(QuestionScanner::new(cols, rows, &history));
+    }
+
     /// The bytes owed to the child for one chunk's queries, in query order.
     /// A cursor report reads the screen as it stood just past its query, so
     /// the tracker takes `chunk` up to each one in turn, then the rest: once
@@ -653,6 +686,10 @@ pub struct Carried {
     /// prints (`arm_cloud_scan`).
     #[serde(default)]
     pub cloud_scan: bool,
+    /// A cursor-agent session watched for its ask-question dialog
+    /// (`arm_question_scan`).
+    #[serde(default)]
+    pub question_scan: bool,
 }
 
 /// Blocks until the child exits; its exit code, when the OS gave one.
@@ -836,6 +873,12 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             Some(scanner) => scanner.feed(pending),
             None => Vec::new(),
         };
+        let question_edge = session
+            .question
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|scanner| scanner.feed(pending, std::time::Instant::now()));
         let seq = session.ring.lock().unwrap().append(pending);
         let _ = session.events.send(PtyEvent::Output {
             seq,
@@ -856,6 +899,10 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         for sighting in cloud_sightings {
             tracing::info!(session = ?session.sref, ?sighting, "cloud sighting in child output");
             let _ = session.events.send(sighting.into());
+        }
+        if let Some(open) = question_edge {
+            tracing::debug!(session = ?session.sref, open, "child question dialog changed");
+            let _ = session.events.send(PtyEvent::Question { open });
         }
     };
 
