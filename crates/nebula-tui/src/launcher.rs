@@ -1691,6 +1691,17 @@ fn project_sessions(app: &App, project: &ProjectId) -> Vec<Agent> {
         .worktrees
         .iter()
         .filter(|w| &w.project_id == project)
+        // Repository-member rows belong to their enclosing workspace band.
+        // Counting them as checkouts as well would double-count a session
+        // whose ownership is the workspace folder.
+        .filter(|w| {
+            !app.tree.session_workspaces.iter().any(|workspace| {
+                workspace
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.id == w.id)
+            })
+        })
         .map(|w| &w.id)
         .collect();
     let mut out: Vec<Agent> = app
@@ -2668,6 +2679,95 @@ mod tests {
                 running: 1,
                 ..Tally::default()
             }
+        );
+    }
+
+    #[test]
+    fn project_tally_includes_workspace_sessions_once_across_all_project_bands() {
+        use nebula_core::{SessionWorkspace, WorkspaceRepository, WorkspaceState};
+
+        let mut app = app();
+        app.tree.projects[0].repo_path = "/tmp/api-project".into();
+        app.tree.worktrees.push(Worktree {
+            id: WorktreeId("workspace".into()),
+            project_id: ProjectId("p1".into()),
+            path: "/tmp/api-project/worktrees/task".into(),
+            branch: "pilot/task".into(),
+            is_main: false,
+            sort_order: 1,
+        });
+        app.tree.worktrees.push(Worktree {
+            id: WorktreeId("workspace-2".into()),
+            project_id: ProjectId("p1".into()),
+            path: "/tmp/api-project/worktrees/another-task".into(),
+            branch: "pilot/another-task".into(),
+            is_main: false,
+            sort_order: 2,
+        });
+        app.tree.worktrees.extend([
+            Worktree {
+                id: WorktreeId("member-api".into()),
+                project_id: ProjectId("p1".into()),
+                path: "/tmp/api-project/worktrees/task/api".into(),
+                branch: "pilot/task".into(),
+                is_main: false,
+                sort_order: 0,
+            },
+            Worktree {
+                id: WorktreeId("member-web".into()),
+                project_id: ProjectId("p1".into()),
+                path: "/tmp/api-project/worktrees/task/web".into(),
+                branch: "pilot/task".into(),
+                is_main: false,
+                sort_order: 0,
+            },
+        ]);
+        app.tree.session_workspaces.push(SessionWorkspace {
+            worktree_id: WorktreeId("workspace".into()),
+            name: "task".into(),
+            state: WorkspaceState::Ready,
+            repositories: vec![
+                WorkspaceRepository {
+                    id: WorktreeId("member-api".into()),
+                    name: "api".into(),
+                    path: "/tmp/api-project/worktrees/task/api".into(),
+                    base: Some("origin/main".into()),
+                    fetch_succeeded: true,
+                    warning: None,
+                },
+                WorkspaceRepository {
+                    id: WorktreeId("member-web".into()),
+                    name: "web".into(),
+                    path: "/tmp/api-project/worktrees/task/web".into(),
+                    base: Some("origin/master".into()),
+                    fetch_succeeded: true,
+                    warning: None,
+                },
+            ],
+        });
+        app.tree.session_workspaces.push(SessionWorkspace {
+            worktree_id: WorktreeId("workspace-2".into()),
+            name: "another-task".into(),
+            state: WorkspaceState::Ready,
+            repositories: Vec::new(),
+        });
+        app.tree
+            .agents
+            .push(agent("workspace-agent", "workspace", "shared-task"));
+        app.tree.agents.last_mut().unwrap().status = AgentStatus::NeedsFeedback;
+        app.tree
+            .agents
+            .push(agent("workspace-agent-2", "workspace-2", "another-task"));
+        app.tree.agents.last_mut().unwrap().status = AgentStatus::Running;
+
+        assert_eq!(
+            project_tally(&app, &ProjectId("p1".into())),
+            Tally {
+                needs_you: 1,
+                running: 3,
+                done: 0,
+            },
+            "two main-workspace sessions and one session in each of two session workspaces count once"
         );
     }
 

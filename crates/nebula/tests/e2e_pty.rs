@@ -5507,6 +5507,474 @@ async fn session_workspace_agents_and_terminals_start_in_workspace_folder() {
     wait_for_exit(&mut daemon);
 }
 
+#[tokio::test]
+async fn shared_workspace_sessions_keep_independent_ownership_when_hooks_report_other_cwds() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    make_repo_at(&folder.join("alpha"));
+    make_repo_at(&folder.join("beta"));
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+    let project = project.clone();
+
+    for (req_id, name) in [(2, "shared"), (3, "other")] {
+        write_frame(
+            &mut client,
+            &ClientRequest::CreateSessionWorkspace {
+                req_id,
+                project: project.clone(),
+                name: name.into(),
+            },
+        )
+        .await
+        .unwrap();
+        read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+            events.iter().any(|event| {
+                matches!(event,
+                    ServerEvent::SessionWorkspaceCreated { req_id: got, .. } if *got == req_id
+                )
+            })
+        })
+        .await;
+    }
+    let snapshot = subscribe(&mut client).await;
+    let Some(ServerEvent::Snapshot {
+        session_workspaces,
+        worktrees,
+        ..
+    }) = snapshot
+        .iter()
+        .find(|event| matches!(event, ServerEvent::Snapshot { .. }))
+    else {
+        panic!("workspace snapshot missing: {snapshot:#?}");
+    };
+    let shared = session_workspaces
+        .iter()
+        .find(|workspace| workspace.name == "shared")
+        .unwrap();
+    let other = session_workspaces
+        .iter()
+        .find(|workspace| workspace.name == "other")
+        .unwrap();
+    let shared_id = shared.worktree_id.clone();
+    let shared_path = shared.repositories[0].path.parent().unwrap().to_path_buf();
+    let foreign_cwd = other.repositories[0].path.clone();
+    let main = worktrees
+        .iter()
+        .find(|worktree| worktree.project_id == project && worktree.is_main)
+        .unwrap();
+    let main_id = main.id.clone();
+    let main_path = main.path.clone();
+
+    let mut sessions = Vec::new();
+    for (req_id, name, workspace, workspace_path) in [
+        (4, "first", shared_id.clone(), shared_path.clone()),
+        (5, "second", shared_id.clone(), shared_path.clone()),
+        (6, "main-first", main_id.clone(), main_path.clone()),
+        (7, "main-second", main_id.clone(), main_path.clone()),
+    ] {
+        write_frame(
+            &mut client,
+            &ClientRequest::CreateAgent {
+                req_id,
+                worktree: workspace.clone(),
+                name: name.into(),
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                auto_title: false,
+                cloud_prompt: None,
+                starting_prompt: None,
+                issue_url: None,
+            },
+        )
+        .await
+        .unwrap();
+        let events = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+            find_ack(events, req_id).is_some()
+        })
+        .await;
+        let Some(ServerEvent::Ack {
+            created: Some(EntityId::Agent(agent)),
+            ..
+        }) = find_ack(&events, req_id)
+        else {
+            panic!("agent creation failed: {events:#?}");
+        };
+        sessions.push((agent.clone(), workspace, workspace_path));
+    }
+
+    for (index, (agent_id, _workspace, expected_cwd)) in sessions.iter().enumerate() {
+        let session = SessionRef::Agent(agent_id.clone());
+        write_frame(
+            &mut client,
+            &ClientRequest::Attach {
+                session: session.clone(),
+                from_seq: None,
+                cols: 100,
+                rows: 30,
+            },
+        )
+        .await
+        .unwrap();
+        let marker = format!("shared_session_marker_{index}");
+        write_frame(
+            &mut client,
+            &ClientRequest::Input {
+                session: session.clone(),
+                data: format!("printf '{marker}\\n'; printf '%s\\n' \"$PWD\"\n").into_bytes(),
+            },
+        )
+        .await
+        .unwrap();
+        let events = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+            events.iter().any(|event| {
+                matches!(event,
+                    ServerEvent::Output { session: got, data, .. }
+                        if got == &session
+                            && String::from_utf8_lossy(data).contains(&marker)
+                            && String::from_utf8_lossy(data).contains(&expected_cwd.to_string_lossy().to_string())
+                )
+            })
+        })
+        .await;
+        assert!(
+            !events.iter().any(|event| match event {
+                ServerEvent::Output {
+                    session: got, data, ..
+                }
+                | ServerEvent::Scrollback {
+                    session: got, data, ..
+                } => {
+                    got != &session && String::from_utf8_lossy(data).contains(&marker)
+                }
+                _ => false,
+            }),
+            "input for {agent_id} appeared in another session's terminal"
+        );
+        let own_output = events
+            .iter()
+            .filter_map(|event| match event {
+                ServerEvent::Output {
+                    session: got, data, ..
+                }
+                | ServerEvent::Scrollback {
+                    session: got, data, ..
+                } if got == &session => Some(String::from_utf8_lossy(data).into_owned()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            own_output.contains(&expected_cwd.to_string_lossy().to_string()),
+            "session cwd: {own_output}"
+        );
+        if index < 2 {
+            assert!(!own_output.contains(&format!("shared_session_marker_{}", 1 - index)));
+        }
+
+        if index == 0 || index == 2 {
+            let cwd = foreign_cwd.to_string_lossy();
+            let session_id = if index == 0 { "shared-sid" } else { "main-sid" };
+            let command = format!(
+                "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H 'Content-Type: application/json' -d '{{\"session_id\":\"{session_id}\",\"cwd\":\"{cwd}\"}}' \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\"\n"
+            );
+            write_frame(
+                &mut client,
+                &ClientRequest::Input {
+                    session,
+                    data: command.into_bytes(),
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    write_frame(&mut client, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    let snapshot = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let Some(ServerEvent::Snapshot { agents, .. }) = snapshot
+        .iter()
+        .find(|event| matches!(event, ServerEvent::Snapshot { .. }))
+    else {
+        panic!("post-hook snapshot missing: {snapshot:#?}");
+    };
+    assert!(
+        sessions.iter().all(|(id, workspace, _)| agents
+            .iter()
+            .any(|agent| { &agent.id == id && &agent.worktree_id == workspace })),
+        "hook cwd changed session workspace: {agents:#?}"
+    );
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+#[tokio::test]
+async fn opencode_continuation_after_daemon_restart_uses_workspace_folder_and_session_id() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    make_repo_at(&folder.join("alpha"));
+    make_repo_at(&folder.join("beta"));
+    let fake_bin = env.tmp.path().join("bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    let calls = env.tmp.path().join("opencode-calls");
+    let agent_env_path = env.tmp.path().join("agent-env");
+    let opencode = fake_bin.join("opencode");
+    std::fs::write(
+        &opencode,
+        format!("#!/bin/sh\nprintf 'args:%s\\ncwd:%s\\n' \"$*\" \"$PWD\" >> '{}'\nprintf 'NEBULA_API_URL=%s\\nNEBULA_API_TOKEN=%s\\n' \"$NEBULA_API_URL\" \"$NEBULA_API_TOKEN\" > '{}'\nexec sleep 60\n", calls.display(), agent_env_path.display()),
+    )
+    .unwrap();
+    make_executable(&opencode);
+    let shell = env.tmp.path().join("login-shell.sh");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nPATH='{}:/usr/bin:/bin'\nexport PATH\nexec /bin/sh -c \"$4\"\n",
+            fake_bin.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&shell);
+    let isolated_config = env.tmp.path().join("isolated-xdg");
+    let isolated_claude = env.tmp.path().join("isolated-claude");
+    let envs = [
+        ("XDG_CONFIG_HOME", isolated_config.to_str().unwrap()),
+        ("CLAUDE_CONFIG_DIR", isolated_claude.to_str().unwrap()),
+    ];
+    let mut daemon = env.spawn_daemon_in(&shell, None, &envs);
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "resume-here".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let created = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+            )
+        })
+    })
+    .await;
+    let Some(ServerEvent::SessionWorkspaceCreated { workspace, .. }) =
+        created.iter().find(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+            )
+        })
+    else {
+        panic!("workspace creation failed: {created:#?}");
+    };
+    let workspace_id = workspace.id.clone();
+    let workspace_path = workspace.path.clone();
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateAgent {
+            req_id: 3,
+            worktree: workspace_id,
+            name: "resume me".into(),
+            kind: AgentKind::OpenCode,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let created_agent = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        find_ack(events, 3).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    }) = find_ack(&created_agent, 3)
+    else {
+        panic!("OpenCode session creation failed: {created_agent:#?}");
+    };
+    let agent_id = agent_id.clone();
+    let session = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut client,
+        &ClientRequest::Attach {
+            session: session.clone(),
+            from_seq: None,
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    wait_for_file(&agent_env_path).await;
+    let first_spawn = std::fs::read_to_string(&calls).unwrap();
+    assert!(
+        first_spawn.contains(&format!("cwd:{}", workspace_path.display())),
+        "initial cwd: {first_spawn}"
+    );
+
+    // Seed the resume identifier through OpenCode's real plugin hook route.
+    let env_file = read_env_file(&agent_env_path).await;
+    let port: u16 = env_file[env::API_URL]
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let token = env_file[env::API_TOKEN].clone();
+    let path_query = format!("/api/hooks/opencode?agentId={agent_id}&hookEvent=UserPromptSubmit");
+    let (status, _) = hook_post_json(
+        port,
+        &path_query,
+        &token,
+        r#"{"session_id":"ses_workspace_resume_06"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+    let mut restarted = env.spawn_daemon_in(&shell, None, &envs);
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    let snapshot = subscribe(&mut client).await;
+    let saved_agent = snapshot
+        .iter()
+        .find_map(|event| match event {
+            ServerEvent::Snapshot {
+                agents,
+                session_workspaces,
+                ..
+            } => {
+                assert!(session_workspaces
+                    .iter()
+                    .any(|workspace| workspace.name == "resume-here"));
+                agents.iter().find(|agent| agent.id == agent_id).cloned()
+            }
+            _ => None,
+        })
+        .expect("agent association persisted through daemon restart");
+    assert_eq!(
+        saved_agent.session_id.as_deref(),
+        Some("ses_workspace_resume_06")
+    );
+    write_frame(
+        &mut client,
+        &ClientRequest::Attach {
+            session,
+            from_seq: None,
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(SLOW_TIMEOUT, async {
+        loop {
+            let text = std::fs::read_to_string(&calls).unwrap_or_default();
+            if text
+                .lines()
+                .filter(|line| line.starts_with("args:"))
+                .count()
+                >= 2
+            {
+                assert!(
+                    text.contains("--session ses_workspace_resume_06"),
+                    "resume args: {text}"
+                );
+                assert!(
+                    text.lines()
+                        .filter(|line| line.starts_with("cwd:"))
+                        .all(|line| line == format!("cwd:{}", workspace_path.display())),
+                    "workspace cwd: {text}"
+                );
+                return;
+            }
+            tokio::time::sleep(POLL_STEP).await;
+        }
+    })
+    .await
+    .expect("continued OpenCode spawn was recorded");
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut restarted);
+}
+
 /// `nebula spawn "<task>"` from inside a session, end to end over real
 /// processes: the CLI (what the model runs) makes the daemon start a second
 /// agent in the caller's worktree — booted at once, on the default name so

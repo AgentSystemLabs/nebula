@@ -26,15 +26,15 @@ const ENTER: &[u8] = b"\r";
 const TAB: &[u8] = b"\t";
 const ESC: &[u8] = &[0x1b];
 const DOWN: &[u8] = b"\x1b[B";
-const CTRL_Q: &[u8] = &[0x11];
 const CTRL_R: &[u8] = &[0x12];
 const CTRL_E: &[u8] = &[0x05];
+const CTRL_Q: &[u8] = &[0x11];
 
 /// A row only the PROJECT's own menu carries.
 const PROJECT_MENU_ROW: &str = "Remove from list";
 /// Terminal pane input-locked: keys forward to the PTY. The footer spells
 /// chords the compact way `KeyChord::display` does — `^q`, not `Ctrl+q`.
-const FOOTER_TERMINAL_LOCKED: &str = "^q: sessions";
+const FOOTER_TERMINAL_LOCKED: &str = "^`: back to the card";
 
 struct TuiHarness {
     writer: Box<dyn Write + Send>,
@@ -136,6 +136,58 @@ impl TuiHarness {
             harness_config,
             _repos: repos,
         }
+    }
+
+    /// Restart only the TUI process, keeping its daemon, persisted state,
+    /// isolated config and Git fixtures. The new terminal gets a fresh
+    /// parser so assertions observe only the restored screen.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: ROWS,
+                cols: COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.env(nebula_core::env::RUNTIME_DIR, &self.runtime_dir);
+        cmd.env(nebula_core::env::DATA_DIR, &self.data_dir);
+        cmd.env("HOME", &self.harness_config);
+        cmd.env("XDG_CONFIG_HOME", self.harness_config.join("xdg"));
+        cmd.env("CODEX_HOME", self.harness_config.join("codex"));
+        cmd.env("PI_CODING_AGENT_DIR", self.harness_config.join("pi"));
+        cmd.env("CLAUDE_CONFIG_DIR", self.harness_config.join("claude"));
+        cmd.env(nebula_core::env::AGENT_CMD, "/bin/sh");
+        cmd.env(nebula_core::env::WORKTREE_SYNC_MS, "100");
+        cmd.env(nebula_core::env::UPDATE_CHECK_SECS, "0");
+        cmd.env(nebula_core::env::LOG, "debug");
+        cmd.env("SHELL", "/bin/sh");
+        cmd.env("TERM", "xterm-256color");
+        cmd.env_remove("NO_COLOR");
+        cmd.env_remove("FORCE_COLOR");
+        cmd.cwd(self._repos.path());
+        self.child = pty.slave.spawn_command(cmd).unwrap();
+        drop(pty.slave);
+
+        let mut reader = pty.master.try_clone_reader().unwrap();
+        self.writer = pty.master.take_writer().unwrap();
+        std::mem::forget(pty.master);
+        self.parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+        self.output = Arc::new(Mutex::new(Vec::new()));
+        let parser = self.parser.clone();
+        let output = self.output.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                output.lock().unwrap().extend_from_slice(&buf[..n]);
+                parser.lock().unwrap().process(&buf[..n]);
+            }
+        });
     }
 
     /// A committed git repo named `name` (fresh `git init` + one commit —
@@ -429,6 +481,27 @@ fn host_working_directory_follows_project_switches_and_restores_on_exit() {
     tui.wait_for_text("Quit nebula");
     tui.send(ENTER);
     tui.wait_for_working_directory(&tui._repos.path().canonicalize().unwrap());
+}
+
+#[test]
+fn tui_restart_restores_the_selected_project_and_agent_card() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("restore-selection");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "restore-selection");
+    tui.send(b"p");
+    tui.wait_for_text("what should the agent do?");
+    tui.type_str("keep this card selected");
+    tui.send(ENTER);
+    tui.wait_for_gone("what should the agent do?");
+    tui.wait_for_text("agent-1");
+    tui.wait_for_text("sh-3.2$");
+
+    tui.restart();
+    tui.wait_for_text("restore-selection");
+    tui.wait_for_text("agent-1");
+    tui.wait_for_text("sh-3.2$");
 }
 
 #[test]

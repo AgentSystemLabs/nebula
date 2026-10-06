@@ -2234,6 +2234,22 @@ impl Daemon {
         if self.pending_moves.lock().unwrap().contains_key(agent_id) {
             return Ok(());
         }
+        let Some(worktree) = self.store.get_worktree(&agent.worktree_id)? else {
+            return Ok(());
+        };
+        // A multi-repository project's worktree rows describe either its
+        // workspace folders or the repositories inside them. A hook cwd is
+        // navigation within that workspace, never a change of session owner.
+        // Do not remember it either: a later Git sync must not replay it as
+        // an ownership change after adopting another checkout.
+        if !self
+            .store
+            .project_repositories(&worktree.project_id)?
+            .is_empty()
+        {
+            self.last_cwd.lock().unwrap().remove(agent_id);
+            return Ok(());
+        }
         // Same foreign-session rule as the status machine: a payload from a
         // different CLI session only counts when the event (re)establishes
         // session ownership (UserPromptSubmit / SessionStart).
