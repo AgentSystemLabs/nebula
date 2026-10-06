@@ -287,3 +287,37 @@ pub(super) fn delete_worktree(app: &mut App, id: &WorktreeId) {
         area: ratatui::layout::Rect::default(),
     }));
 }
+
+pub(super) fn close_session_workspace(app: &mut App, id: &WorktreeId) {
+    let Some(workspace) = app
+        .tree
+        .session_workspaces
+        .iter()
+        .find(|workspace| &workspace.worktree_id == id)
+    else {
+        app.flash = Some("only a session workspace can be closed".into());
+        return;
+    };
+    if workspace.state == nebula_core::WorkspaceState::Creating
+        || workspace.state == nebula_core::WorkspaceState::Closing
+    {
+        app.flash = Some("session workspace is still changing".into());
+        return;
+    }
+    if workspace.state == nebula_core::WorkspaceState::Unavailable {
+        if let Some(failure) = &workspace.failure {
+            app.flash = Some(format!("workspace unavailable: {failure}"));
+            return;
+        }
+    }
+    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+        title: "Close session workspace".into(),
+        message: format!(
+            "Close '{}' and remove all {} repository worktrees? Branches are kept.",
+            workspace.name,
+            workspace.repositories.len()
+        ),
+        action: PendingAction::CloseSessionWorkspace(id.clone()),
+        area: ratatui::layout::Rect::default(),
+    }));
+}

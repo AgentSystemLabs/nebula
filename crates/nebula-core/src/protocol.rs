@@ -100,6 +100,12 @@ pub enum ClientRequest {
         project: ProjectId,
         name: String,
     },
+    /// Close an entire session workspace after the daemon has verified that
+    /// its repository worktrees and workspace folder contain no user data.
+    CloseSessionWorkspace {
+        req_id: u64,
+        id: WorktreeId,
+    },
     DeleteWorktree {
         req_id: u64,
         id: WorktreeId,

@@ -912,6 +912,19 @@ pub(super) fn handle_action(
             return true;
         }
     }
+    if action == Action::Delete {
+        if let Some(id) = app.selected_worktree().map(|worktree| worktree.id.clone()) {
+            if app
+                .tree
+                .session_workspaces
+                .iter()
+                .any(|workspace| workspace.worktree_id == id)
+            {
+                super::activate::close_session_workspace(app, &id);
+                return true;
+            }
+        }
+    }
     match action {
         Action::MoveDown => step_grid(app, 0, 1, out),
         Action::MoveUp => step_up(app, armed, chord, out),
@@ -1268,10 +1281,22 @@ fn project_menu(app: &mut App, at: (u16, u16)) {
         ));
         items.push(MenuItem::new("Open", MenuAction::OpenWorktree(w.clone())));
         if !app.tree.worktrees.iter().any(|x| x.id == w && x.is_main) {
-            items.push(MenuItem::destructive(
-                "Delete worktree",
-                MenuAction::DeleteWorktree(w),
-            ));
+            if app
+                .tree
+                .session_workspaces
+                .iter()
+                .any(|workspace| workspace.worktree_id == w)
+            {
+                items.push(MenuItem::destructive(
+                    "Close session workspace…",
+                    MenuAction::CloseSessionWorkspace(w),
+                ));
+            } else {
+                items.push(MenuItem::destructive(
+                    "Delete worktree",
+                    MenuAction::DeleteWorktree(w),
+                ));
+            }
         }
     }
     items.push(MenuItem::new(
@@ -3985,6 +4010,67 @@ mod tests {
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(app.launcher_expanded, None);
             assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+        });
+    }
+
+    /// INPUT PARITY: `d` on a session workspace band and its destructive
+    /// menu action open the same close confirmation.
+    #[test]
+    fn d_and_the_menu_on_a_session_workspace_confirm_close() {
+        with_default_config(|| {
+            let id = WorktreeId("w3".into());
+            let by_key_confirm = |app: &App| {
+                matches!(&app.overlay, Some(Overlay::Confirm(confirm))
+                if confirm.action == PendingAction::CloseSessionWorkspace(WorktreeId("w3".into())))
+            };
+            let mut by_key = with_empty_band();
+            by_key
+                .tree
+                .session_workspaces
+                .push(nebula_core::SessionWorkspace {
+                    worktree_id: id.clone(),
+                    name: "idle".into(),
+                    state: nebula_core::WorkspaceState::Ready,
+                    failure: None,
+                    repositories: vec![],
+                });
+            draw_tall(&mut by_key);
+            keys(&mut by_key, &[KeyCode::Char('j'), KeyCode::Char('j')]);
+            key(&mut by_key, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert!(by_key_confirm(&by_key), "{:?}", by_key.overlay);
+
+            let mut by_click = with_empty_band();
+            by_click
+                .tree
+                .session_workspaces
+                .push(nebula_core::SessionWorkspace {
+                    worktree_id: id,
+                    name: "idle".into(),
+                    state: nebula_core::WorkspaceState::Ready,
+                    failure: None,
+                    repositories: vec![],
+                });
+            draw_tall(&mut by_click);
+            let area = band_area(&by_click, 2);
+            mouse(
+                &mut by_click,
+                MouseEventKind::Down(MouseButton::Right),
+                area.x + 4,
+                area.y + 1,
+            );
+            let at = match &by_click.overlay {
+                Some(Overlay::Menu(menu)) => menu
+                    .items
+                    .iter()
+                    .position(|item| item.label.contains("Close session workspace"))
+                    .expect("session workspace close action in band menu"),
+                other => panic!("expected workspace menu, got {other:?}"),
+            };
+            for _ in 0..at {
+                key(&mut by_click, KeyCode::Down, KeyModifiers::NONE);
+            }
+            key(&mut by_click, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(by_key_confirm(&by_click), "{:?}", by_click.overlay);
         });
     }
 

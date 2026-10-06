@@ -5539,6 +5539,512 @@ async fn session_workspace_creation_builds_all_repository_worktrees() {
     wait_for_exit(&mut restarted);
 }
 
+/// Closing a session workspace is an explicit daemon operation: Git dirt
+/// blocks it without removing anything, ignored files and Nebula's managed
+/// hook files do not, and a clean close keeps branches and primary checkouts.
+#[tokio::test]
+async fn session_workspace_close_checks_cleanliness_and_keeps_branches() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let alpha = folder.join("alpha");
+    let beta = folder.join("beta");
+    make_repo_at(&alpha);
+    make_repo_at(&beta);
+    let hook = env.tmp.path().join("dirty-next-repo.sh");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nworkspace=$(dirname \"$2\")\nprintf 'must not be discarded\\n' > \"$workspace/beta/README.md\"\n",
+    )
+    .unwrap();
+    make_executable(&hook);
+    git_run(
+        &alpha,
+        &["config", "nebula.worktreeDeleteHook", "/usr/bin/true"],
+    )
+    .unwrap();
+    git_run(
+        &beta,
+        &[
+            "config",
+            "nebula.worktreeDeleteHook",
+            hook.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    std::fs::write(alpha.join(".gitignore"), "ignored.txt\n").unwrap();
+    git_run(&alpha, &["add", ".gitignore"]).unwrap();
+    git_run(&alpha, &["commit", "-m", "ignore generated file"]).unwrap();
+    let alpha_head = git_output(&alpha, &["rev-parse", "HEAD"]);
+    let beta_head = git_output(&beta, &["rev-parse", "HEAD"]);
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "close-me".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let created = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+            )
+        })
+    })
+    .await;
+    let Some(ServerEvent::SessionWorkspaceCreated {
+        workspace,
+        repositories,
+        ..
+    }) = created.iter().find(|event| {
+        matches!(
+            event,
+            ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+        )
+    })
+    else {
+        panic!("workspace creation failed: {created:#?}");
+    };
+    let workspace_id = workspace.id.clone();
+    let workspace_path = workspace.path.clone();
+    let alpha_worktree = repositories
+        .iter()
+        .find(|repo| repo.name == "alpha")
+        .unwrap();
+    let beta_worktree = repositories
+        .iter()
+        .find(|repo| repo.name == "beta")
+        .unwrap();
+    let clean_readme = std::fs::read(alpha_worktree.path.join("README.md")).unwrap();
+    for repository in [&alpha, &beta] {
+        git_run(
+            repository,
+            &[
+                "update-ref",
+                "refs/remotes/origin/pilot/close-me",
+                "refs/heads/pilot/close-me",
+            ],
+        )
+        .unwrap();
+    }
+
+    // A live terminal can be stopped as part of a successful close.
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateTerminal {
+            req_id: 8,
+            worktree: workspace_id.clone(),
+            name: Some("close tab".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let terminal = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        find_ack(events, 8).is_some()
+    })
+    .await;
+    assert!(matches!(
+        find_ack(&terminal, 8),
+        Some(ServerEvent::Ack { .. })
+    ));
+
+    // A main workspace id is not a closeable session workspace.
+    let snapshot = subscribe(&mut client).await;
+    let main_id = snapshot
+        .iter()
+        .find_map(|event| match event {
+            ServerEvent::Snapshot { worktrees, .. } => worktrees
+                .iter()
+                .find(|worktree| worktree.project_id == *project && worktree.is_main)
+                .map(|worktree| worktree.id.clone()),
+            _ => None,
+        })
+        .expect("registered project main workspace");
+    write_frame(
+        &mut client,
+        &ClientRequest::CloseSessionWorkspace {
+            req_id: 3,
+            id: main_id,
+        },
+    )
+    .await
+    .unwrap();
+    let main_refused = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 3).is_some()
+    })
+    .await;
+    assert!(matches!(
+        find_ack(&main_refused, 3),
+        Some(ServerEvent::Error { .. })
+    ));
+    assert_eq!(git_output(&alpha, &["rev-parse", "HEAD"]), alpha_head);
+
+    // Tracked edits, untracked files, and workspace-level extras all block;
+    // neither the worktrees nor their contents are touched.
+    let tracked = workspace_path.join("alpha/README.md");
+    std::fs::write(&tracked, "edited in session workspace\n").unwrap();
+    write_frame(
+        &mut client,
+        &ClientRequest::CloseSessionWorkspace {
+            req_id: 4,
+            id: workspace_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let tracked_refused = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 4).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&tracked_refused, 4), Some(ServerEvent::Error { message, .. })
+        if message.contains("alpha") && message.contains("README.md"))
+    );
+    assert!(alpha_worktree.path.is_dir() && beta_worktree.path.is_dir());
+
+    std::fs::write(&tracked, &clean_readme).unwrap();
+    let untracked = workspace_path.join("beta/untracked.txt");
+    std::fs::write(&untracked, "keep me\n").unwrap();
+    write_frame(
+        &mut client,
+        &ClientRequest::CloseSessionWorkspace {
+            req_id: 5,
+            id: workspace_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let untracked_refused = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 5).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&untracked_refused, 5), Some(ServerEvent::Error { message, .. })
+        if message.contains("beta") && message.contains("untracked.txt"))
+    );
+    assert_eq!(std::fs::read_to_string(&untracked).unwrap(), "keep me\n");
+
+    std::fs::remove_file(&untracked).unwrap();
+    let extra = workspace_path.join("notes.txt");
+    std::fs::write(&extra, "outside the repositories\n").unwrap();
+    write_frame(
+        &mut client,
+        &ClientRequest::CloseSessionWorkspace {
+            req_id: 6,
+            id: workspace_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let extra_refused = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 6).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&extra_refused, 6), Some(ServerEvent::Error { message, .. })
+        if message.contains("notes.txt"))
+    );
+    assert!(workspace_path.is_dir());
+    std::fs::remove_file(extra).unwrap();
+
+    // These are precisely the per-workspace hook destinations Nebula owns.
+    let claude_hooks = workspace_path.join(".claude/settings.local.json");
+    let cursor_hooks = workspace_path.join(".cursor/hooks.json");
+    let cursor_rule = workspace_path.join(".cursor/rules/nebula-title.mdc");
+    std::fs::create_dir_all(claude_hooks.parent().unwrap()).unwrap();
+    std::fs::write(&claude_hooks, "{}\n").unwrap();
+    std::fs::create_dir_all(cursor_hooks.parent().unwrap()).unwrap();
+    std::fs::write(&cursor_hooks, "{}\n").unwrap();
+    std::fs::create_dir_all(cursor_rule.parent().unwrap()).unwrap();
+    std::fs::write(&cursor_rule, "managed by nebula\n").unwrap();
+    std::fs::write(alpha_worktree.path.join("ignored.txt"), "ignored\n").unwrap();
+
+    write_frame(
+        &mut client,
+        &ClientRequest::CloseSessionWorkspace {
+            req_id: 7,
+            id: workspace_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let closed = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        find_ack(events, 7).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&closed, 7), Some(ServerEvent::Ack { .. })),
+        "{closed:#?}"
+    );
+    assert!(
+        !workspace_path.exists(),
+        "workspace folder removed after clean close"
+    );
+    assert_eq!(
+        git_output(
+            &alpha,
+            &[
+                "show-ref",
+                "--verify",
+                "--hash",
+                "refs/heads/pilot/close-me"
+            ]
+        )
+        .len(),
+        40
+    );
+    assert_eq!(
+        git_output(
+            &beta,
+            &[
+                "show-ref",
+                "--verify",
+                "--hash",
+                "refs/heads/pilot/close-me"
+            ]
+        )
+        .len(),
+        40
+    );
+    for repository in [&alpha, &beta] {
+        assert_eq!(
+            git_output(
+                repository,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--hash",
+                    "refs/remotes/origin/pilot/close-me",
+                ],
+            )
+            .len(),
+            40
+        );
+    }
+    assert_eq!(git_output(&alpha, &["rev-parse", "HEAD"]), alpha_head);
+    assert_eq!(git_output(&beta, &["rev-parse", "HEAD"]), beta_head);
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+#[tokio::test]
+async fn session_workspace_close_partial_failure_is_unavailable_and_retryable() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let alpha = folder.join("alpha");
+    let beta = folder.join("beta");
+    make_repo_at(&alpha);
+    make_repo_at(&beta);
+    let hook = env.tmp.path().join("dirty-next-repo.sh");
+    let marker = env.tmp.path().join("delete-hook-ran");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ ! -e '{}' ]; then touch '{}'; workspace=$(dirname \"$2\"); printf 'must not be discarded\\n' > \"$workspace/beta/README.md\"; fi\n",
+            marker.display(),
+            marker.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&hook);
+    git_run(
+        &alpha,
+        &[
+            "config",
+            "nebula.worktreeDeleteHook",
+            hook.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    git_run(
+        &beta,
+        &["config", "nebula.worktreeDeleteHook", "/usr/bin/true"],
+    )
+    .unwrap();
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "retry-close".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let created = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+            )
+        })
+    })
+    .await;
+    let Some(ServerEvent::SessionWorkspaceCreated {
+        workspace,
+        repositories,
+        ..
+    }) = created.iter().find(|event| {
+        matches!(
+            event,
+            ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+        )
+    })
+    else {
+        panic!("workspace creation failed: {created:#?}");
+    };
+    let workspace_id = workspace.id.clone();
+    let workspace_path = workspace.path.clone();
+    let alpha_path = repositories
+        .iter()
+        .find(|repository| repository.name == "alpha")
+        .unwrap()
+        .path
+        .clone();
+    let beta_path = repositories
+        .iter()
+        .find(|repository| repository.name == "beta")
+        .unwrap()
+        .path
+        .clone();
+
+    // The first repository's configured post-delete hook dirties the second
+    // checkout after the second preflight, so non-forced Git removal fails
+    // after one member has already been removed.
+    write_frame(
+        &mut client,
+        &ClientRequest::CloseSessionWorkspace {
+            req_id: 3,
+            id: workspace_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let failed = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 3).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&failed, 3), Some(ServerEvent::Error { message, .. })
+        if message.contains("beta") && message.contains(beta_path.to_str().unwrap())),
+        "{failed:#?}"
+    );
+    assert!(
+        !alpha_path.exists(),
+        "the earlier clean repository was removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(beta_path.join("README.md")).unwrap(),
+        "must not be discarded\n"
+    );
+    let snapshot = subscribe(&mut client).await;
+    let saved = snapshot
+        .iter()
+        .find_map(|event| match event {
+            ServerEvent::Snapshot {
+                session_workspaces, ..
+            } => session_workspaces
+                .iter()
+                .find(|workspace| workspace.worktree_id == workspace_id),
+            _ => None,
+        })
+        .expect("failed close remains visible");
+    assert_eq!(saved.state, nebula_core::WorkspaceState::Unavailable);
+    assert!(saved.failure.as_deref().is_some_and(
+        |failure| failure.contains("beta") && failure.contains(beta_path.to_str().unwrap())
+    ));
+
+    let beta_clean_readme = git_output(&beta, &["show", "HEAD:README.md"]);
+    std::fs::write(
+        beta_path.join("README.md"),
+        format!("{beta_clean_readme}\n"),
+    )
+    .unwrap();
+    write_frame(
+        &mut client,
+        &ClientRequest::CloseSessionWorkspace {
+            req_id: 4,
+            id: workspace_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let retried = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        find_ack(events, 4).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&retried, 4), Some(ServerEvent::Ack { .. })),
+        "{retried:#?}"
+    );
+    assert!(!workspace_path.exists());
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// A repository that disappears after registration makes grouped creation
 /// fail after the earlier checkout was built; that earlier branch and
 /// worktree are rolled back and the error identifies the failed member.

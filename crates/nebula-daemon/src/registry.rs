@@ -85,6 +85,223 @@ const NO_RUN_COMMAND: &str =
 /// run ended before a DAEMON restart, typically.
 const RUN_NOT_RUNNING: &str = "this run has stopped — press r on its worktree to start it again";
 
+/// Report user-owned dirt in repository worktrees and unexpected entries at
+/// the workspace root. Git status omits ignored files and reports individual
+/// untracked paths for actionable refusal messages.
+fn session_workspace_dirt(
+    repositories: &[nebula_core::WorkspaceRepository],
+    folder: &Path,
+) -> Result<Vec<String>> {
+    let mut faults = Vec::new();
+    for repository in repositories {
+        if !repository.path.exists() {
+            let member_exists = std::fs::symlink_metadata(&folder.join(&repository.name)).is_ok();
+            if member_exists {
+                faults.push(format!(
+                    "repository `{}` folder {} is not a registered Git worktree",
+                    repository.name,
+                    folder.join(&repository.name).display()
+                ));
+            }
+            continue;
+        }
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository.path)
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .output()
+            .with_context(|| format!("inspect repository `{}`", repository.name))?;
+        if !output.status.success() {
+            faults.push(format!(
+                "repository `{}` at {}: {}",
+                repository.name,
+                repository.path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            continue;
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let path = line.get(3..).unwrap_or(line).trim();
+            faults.push(format!("repository `{}` path {}", repository.name, path));
+        }
+    }
+    faults.extend(
+        workspace_folder_extras_for_names(
+            folder,
+            &repositories
+                .iter()
+                .map(|repository| repository.name.as_str())
+                .collect::<Vec<_>>(),
+        )?
+        .into_iter()
+        .map(|path| format!("workspace path {}", path.display())),
+    );
+    Ok(faults)
+}
+
+fn workspace_folder_extras_for_names(folder: &Path, repositories: &[&str]) -> Result<Vec<PathBuf>> {
+    if !folder.exists() {
+        return Ok(Vec::new());
+    }
+    let mut extras = Vec::new();
+    for entry in std::fs::read_dir(folder).with_context(|| format!("read {}", folder.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let rel = path
+            .strip_prefix(folder)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if file_type.is_dir() && repositories.iter().any(|repository| *repository == rel) {
+            continue;
+        }
+        if matches!(rel.as_str(), ".claude" | ".cursor") {
+            collect_hook_tree_extras(folder, &path, &mut extras)?;
+        } else {
+            extras.push(path);
+        }
+    }
+    Ok(extras)
+}
+
+fn collect_hook_tree_extras(folder: &Path, dir: &Path, extras: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let rel = path
+            .strip_prefix(folder)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if matches!(
+            rel.as_str(),
+            ".claude/settings.local.json" | ".cursor/hooks.json" | ".cursor/rules/nebula-title.mdc"
+        ) && file_type.is_file()
+        {
+            continue;
+        }
+        if file_type.is_dir() && matches!(rel.as_str(), ".claude" | ".cursor" | ".cursor/rules") {
+            collect_hook_tree_extras(folder, &path, extras)?;
+        } else {
+            extras.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn remove_workspace_hook_files(folder: &Path) -> Result<()> {
+    for (path, cursor) in [
+        (folder.join(".claude/settings.local.json"), false),
+        (folder.join(".cursor/hooks.json"), true),
+    ] {
+        remove_nebula_groups_from_file(&path, cursor)?;
+        if path.exists() {
+            bail!(
+                "preserved non-Nebula settings remain in {}; review or remove this file before retrying",
+                path.display()
+            );
+        }
+    }
+    remove_file_if_present(&folder.join(".cursor/rules/nebula-title.mdc"))?;
+    for dir in [
+        folder.join(".claude"),
+        folder.join(".cursor/rules"),
+        folder.join(".cursor"),
+    ] {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(())
+}
+
+fn remove_nebula_groups_from_file(path: &Path, cursor: bool) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let source =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut root: serde_json::Value =
+        serde_json::from_str(&source).with_context(|| format!("parse {}", path.display()))?;
+    if let Some(hooks) = root
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for groups in hooks.values_mut() {
+            if let Some(groups) = groups.as_array_mut() {
+                groups.retain(|group| {
+                    group
+                        .get("_nebulaManaged")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                        && !group.to_string().contains("/api/hooks/")
+                });
+            }
+        }
+        hooks.retain(|_, groups| groups.as_array().is_none_or(|groups| !groups.is_empty()));
+    }
+    if let Some(allow) = root
+        .get_mut("permissions")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|permissions| permissions.get_mut("allow"))
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        allow.retain(|rule| {
+            !matches!(
+                rule.as_str(),
+                Some("Bash(nebula rename:*)")
+                    | Some("Bash(nebula worktree:*)")
+                    | Some("Bash(nebula spawn:*)")
+                    | Some("Bash(nebula open:*)")
+            )
+        });
+    }
+    if let Some(object) = root.as_object_mut() {
+        if let Some(permissions) = object
+            .get_mut("permissions")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            permissions.retain(|_, value| {
+                value.as_array().is_none_or(|values| !values.is_empty())
+                    && value.as_object().is_none_or(|values| !values.is_empty())
+            });
+            if permissions.is_empty() {
+                object.remove("permissions");
+            }
+        }
+        if object
+            .get("hooks")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|hooks| hooks.is_empty())
+        {
+            object.remove("hooks");
+        }
+    }
+    let empty_after_cleanup = root.as_object().is_some_and(|object| object.is_empty());
+    if empty_after_cleanup {
+        return remove_file_if_present(path);
+    }
+    let empty = root.as_object().is_some_and(|object| {
+        cursor
+            && object.keys().all(|key| key == "version")
+            && object.get("version").and_then(serde_json::Value::as_i64) == Some(1)
+    });
+    if empty {
+        return remove_file_if_present(path);
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(&root)?)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
 async fn validate_workspace_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("workspace name is empty");
@@ -1248,6 +1465,231 @@ impl Daemon {
         Ok((workspace, report))
     }
 
+    /// Close a complete session workspace. A refusal during either
+    /// cleanliness check leaves its rows and processes intact; after the
+    /// workspace enters closing, any failure preserves it as unavailable so
+    /// the developer can fix the reported cause and retry.
+    pub async fn close_session_workspace(self: &Arc<Self>, id: &WorktreeId) -> Result<()> {
+        let _ops = self.worktree_ops.lock().await;
+        let metadata = self
+            .store
+            .session_workspaces()?
+            .into_iter()
+            .find(|workspace| &workspace.worktree_id == id)
+            .context("cannot close the main workspace; only session workspaces can be closed")?;
+        let workspace = self
+            .store
+            .get_worktree(id)?
+            .context("session workspace not found")?;
+        let project = self
+            .store
+            .get_project(&workspace.project_id)?
+            .context("project not found")?;
+        let project_repositories = self.store.project_repositories(&project.id)?;
+
+        let faults = session_workspace_dirt(&metadata.repositories, &workspace.path)?;
+        if !faults.is_empty() {
+            bail!("session workspace is not clean: {}", faults.join(", "));
+        }
+        if !matches!(
+            metadata.state,
+            WorkspaceState::Ready | WorkspaceState::Unavailable
+        ) {
+            bail!(
+                "session workspace cannot be closed while it is {:?}",
+                metadata.state
+            );
+        }
+
+        self.store
+            .set_session_workspace_state(id, WorkspaceState::Closing, None)?;
+        let mut closing = metadata.clone();
+        closing.state = WorkspaceState::Closing;
+        closing.failure = None;
+        self.broadcast(ServerEvent::SessionWorkspaceUpserted {
+            workspace: closing.clone(),
+        });
+
+        let (_, _, agents, terminals) = self.store.load_tree()?;
+        let ids: Vec<_> = std::iter::once(id.clone())
+            .chain(
+                metadata
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.id.clone()),
+            )
+            .collect();
+        self.kill_sessions_in(&ids, &agents, &terminals);
+
+        let faults = session_workspace_dirt(&metadata.repositories, &workspace.path)?;
+        if !faults.is_empty() {
+            let message = format!(
+                "session workspace changed while closing: {}",
+                faults.join(", ")
+            );
+            self.mark_session_workspace_unavailable(&closing, &message)?;
+            bail!("{message}");
+        }
+
+        for repository in &metadata.repositories {
+            // Missing members are expected only after a prior close removed
+            // them before a later operation failed. A same-named folder left
+            // behind is not ours to delete; the final root emptiness check
+            // reports it and keeps the workspace unavailable.
+            if !repository.path.exists() {
+                continue;
+            }
+            let Some(project_repository) = project_repositories
+                .iter()
+                .find(|member| member.name == repository.name)
+            else {
+                let message = format!(
+                    "repository `{}` is no longer registered (path {})",
+                    repository.name,
+                    repository.path.display()
+                );
+                self.mark_session_workspace_unavailable(&closing, &message)?;
+                bail!("{message}");
+            };
+            if let Err(error) =
+                git::remove_worktree(&project_repository.path, &repository.path, false).await
+            {
+                let message = format!(
+                    "could not remove repository `{}` at {}: {error:#}",
+                    repository.name,
+                    repository.path.display()
+                );
+                self.mark_session_workspace_unavailable(&closing, &message)?;
+                bail!("{message}");
+            }
+            if let Err(error) = self
+                .store
+                .delete_workspace_repository(&repository.id)
+                .and_then(|()| self.store.delete_worktree(&repository.id))
+            {
+                let message = format!(
+                    "repository `{}` was removed from Git at {}, but its Nebula record could not be removed: {error:#}",
+                    repository.name,
+                    repository.path.display()
+                );
+                self.mark_session_workspace_unavailable(&closing, &message)?;
+                bail!("{message}");
+            }
+            // Keep the membership record until the entire workspace is
+            // removed. If a later repository fails, retry needs this path
+            // to distinguish the already-removed checkout from an extra
+            // workspace-folder entry.
+            self.broadcast(ServerEvent::EntityRemoved {
+                id: EntityId::Worktree(repository.id.clone()),
+            });
+            let deletion_hook = worktree_hooks::run(
+                WorktreeHook::Delete,
+                HookContext {
+                    repo: &project_repository.path,
+                    worktree: &repository.path,
+                    branch: &workspace.branch,
+                    id: &repository.id,
+                },
+            )
+            .await;
+            if let Err(error) = deletion_hook {
+                self.warn_clients(format!("{error:#}"));
+            }
+        }
+
+        if let Err(error) = remove_workspace_hook_files(&workspace.path) {
+            let message = format!(
+                "could not remove Nebula hook files in {}: {error:#}",
+                workspace.path.display()
+            );
+            closing
+                .repositories
+                .retain(|repository| repository.path.exists());
+            self.store
+                .update_session_workspace_repositories(id, &closing.repositories)?;
+            self.mark_session_workspace_unavailable(&closing, &message)?;
+            bail!("{message}");
+        }
+        let remaining_members: Vec<_> = metadata
+            .repositories
+            .iter()
+            .filter(|repository| repository.path.exists())
+            .map(|repository| repository.name.as_str())
+            .collect();
+        if let Some(fault) =
+            workspace_folder_extras_for_names(&workspace.path, &remaining_members)?.first()
+        {
+            let message = format!(
+                "workspace folder {} has unexpected path {}",
+                workspace.path.display(),
+                fault.display()
+            );
+            closing
+                .repositories
+                .retain(|repository| repository.path.exists());
+            self.store
+                .update_session_workspace_repositories(id, &closing.repositories)?;
+            self.mark_session_workspace_unavailable(&closing, &message)?;
+            bail!("{message}");
+        }
+        if let Err(error) = std::fs::remove_dir(&workspace.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                let remaining = workspace_folder_extras_for_names(
+                    &workspace.path,
+                    &metadata
+                        .repositories
+                        .iter()
+                        .map(|repository| repository.name.as_str())
+                        .collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+                let detail = if remaining.is_empty() {
+                    workspace.path.display().to_string()
+                } else {
+                    remaining.join(", ")
+                };
+                let message = format!(
+                    "workspace folder {} is not empty: {detail} ({error})",
+                    workspace.path.display()
+                );
+                closing
+                    .repositories
+                    .retain(|repository| repository.path.exists());
+                self.store
+                    .update_session_workspace_repositories(id, &closing.repositories)?;
+                self.mark_session_workspace_unavailable(&closing, &message)?;
+                bail!("{message}");
+            }
+        }
+
+        self.store.delete_session_workspace(id)?;
+        self.broadcast(ServerEvent::EntityRemoved {
+            id: EntityId::Worktree(id.clone()),
+        });
+        Ok(())
+    }
+
+    fn mark_session_workspace_unavailable(
+        &self,
+        workspace: &nebula_core::SessionWorkspace,
+        failure: &str,
+    ) -> Result<()> {
+        let mut unavailable = workspace.clone();
+        unavailable.state = WorkspaceState::Unavailable;
+        unavailable.failure = Some(failure.to_string());
+        self.store.set_session_workspace_state(
+            &workspace.worktree_id,
+            WorkspaceState::Unavailable,
+            Some(failure),
+        )?;
+        self.broadcast(ServerEvent::SessionWorkspaceUpserted {
+            workspace: unavailable,
+        });
+        Ok(())
+    }
+
     async fn rollback_session_workspace(
         &self,
         workspace: &Worktree,
@@ -1291,6 +1733,10 @@ impl Daemon {
                     ));
                     continue;
                 }
+            }
+            if !repository.path.exists() {
+                let _ = self.store.delete_workspace_repository(&repository.id);
+                let _ = self.store.delete_worktree(&repository.id);
             }
             // Preflight proved this branch absent in every member before
             // creation started, so any matching ref is owned by this attempt,
@@ -1453,7 +1899,6 @@ impl Daemon {
             .store
             .get_project(&worktree.project_id)?
             .context("project not found")?;
-
         // Kill sessions living in this worktree.
         let (_, _, agents, terminals) = self.store.load_tree()?;
         self.kill_sessions_in(std::slice::from_ref(id), &agents, &terminals);
