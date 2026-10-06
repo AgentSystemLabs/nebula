@@ -3199,8 +3199,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // the aim let go, or on a fresh worktree.
         Action::QuickPrompt if app.launcher_active() => launcher::open_box(app),
         Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
-        Action::Issues => crate::issues::open_issues(app),
-        Action::PullRequests => crate::pr_modal::open(app),
+        Action::Issues => {
+            if !selected_project_uses_workspace_layout(app) {
+                crate::issues::open_issues(app);
+            }
+        }
+        Action::PullRequests => {
+            if !selected_project_uses_workspace_layout(app) {
+                crate::pr_modal::open(app);
+            }
+        }
         Action::SwitchBranch => crate::branch_switch::open_branch_switch(app),
         Action::FocusRight => match app.focus {
             Focus::Sessions => {
@@ -5245,6 +5253,9 @@ fn selected_project_main_worktree(app: &App) -> Option<WorktreeId> {
 /// rows, every one carrying the PR's URL and — through the same MODEL /
 /// EFFORT submenus, and as directly on Enter — launching a PR SESSION.
 pub(super) fn open_pr_agent_picker(app: &mut App) {
+    if selected_project_uses_workspace_layout(app) {
+        return;
+    }
     let Some(pr) = app.selected_worktree_pr().cloned() else {
         return;
     };
@@ -5268,9 +5279,13 @@ fn issue_row_menu_items(issue: &crate::issues::Issue) -> Vec<MenuItem> {
 /// enabled harness (none when the PROJECT has no ROOT WORKTREE to launch
 /// in), then the row's browser and diff verbs.
 fn pr_row_menu_items(app: &App, pr: &crate::pull_request::OpenPr) -> Vec<MenuItem> {
-    let mut items = match selected_project_main_worktree(app) {
-        Some(worktree) => agent_picker::pr_session_menu_rows(worktree, pr),
-        None => Vec::new(),
+    let mut items = if selected_project_uses_workspace_layout(app) {
+        Vec::new()
+    } else {
+        match selected_project_main_worktree(app) {
+            Some(worktree) => agent_picker::pr_session_menu_rows(worktree, pr),
+            None => Vec::new(),
+        }
     };
     items.extend([
         MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url.clone())),
@@ -5474,15 +5489,18 @@ fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
                     "New worktree",
                     MenuAction::NewWorktree(p.id.clone()),
                 )];
-                // Only once there is a group to fold.
-                if !app.listed_open_prs().is_empty() {
-                    items.push(MenuItem::new(
-                        "Show/hide open PRs",
-                        MenuAction::ToggleOpenPrs,
-                    ));
-                }
-                if !app.listed_issues().is_empty() {
-                    items.push(MenuItem::new("Show/hide issues", MenuAction::ToggleIssues));
+                let workspace_layout = app.tree.uses_workspace_layout(&p.id);
+                if !workspace_layout {
+                    // Only once there is a group to fold.
+                    if !app.listed_open_prs().is_empty() {
+                        items.push(MenuItem::new(
+                            "Show/hide open PRs",
+                            MenuAction::ToggleOpenPrs,
+                        ));
+                    }
+                    if !app.listed_issues().is_empty() {
+                        items.push(MenuItem::new("Show/hide issues", MenuAction::ToggleIssues));
+                    }
                 }
                 // And drafts to hide — or, once hidden, a way back that
                 // doesn't need the list to still hold one.
@@ -5508,6 +5526,11 @@ fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
             .unwrap_or_default(),
         Focus::Terminal => vec![],
     }
+}
+
+fn selected_project_uses_workspace_layout(app: &App) -> bool {
+    app.selected_project()
+        .is_some_and(|project| app.tree.uses_workspace_layout(&project.id))
 }
 
 /// A click landed on a panel row: the cursor goes there exactly as the
@@ -7154,6 +7177,9 @@ fn with_worktree_offer(
     let Some(w) = app.tree.worktrees.iter().find(|w| &w.id == worktree) else {
         return dialog;
     };
+    if app.tree.uses_workspace_layout(&w.project_id) {
+        return dialog;
+    }
     if w.is_main
         || app.is_placeholder_worktree(worktree)
         || live_cards_in(app, worktree) != live_taken
@@ -31667,6 +31693,144 @@ diff --git a/src/c.rs b/src/c.rs
         seed_linked_worktree(app);
     }
 
+    fn mark_project_as_registered_multi_repository(app: &mut App) {
+        use nebula_core::{ProjectId, ProjectRepository};
+        app.tree.repositories = ["api", "web"]
+            .into_iter()
+            .map(|name| ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: name.into(),
+                path: format!("/tmp/demo/{name}").into(),
+                branch: "main".into(),
+            })
+            .collect();
+    }
+
+    #[test]
+    fn multi_repository_projects_do_not_offer_pull_request_or_issue_modals() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        mark_project_as_registered_multi_repository(&mut app);
+        seed_open_prs(&mut app, &[(42, "PR")]);
+        seed_issues(&mut app, &[(15, "Issue")]);
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "the PR hotkey is unavailable");
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "the issues hotkey is unavailable");
+
+        let menu_labels: Vec<_> = panel_menu_items(&app, Focus::Worktrees)
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+        assert!(
+            !menu_labels.iter().any(|label| label.contains("open PRs")),
+            "{menu_labels:?}"
+        );
+        assert!(
+            !menu_labels.iter().any(|label| label.contains("issues")),
+            "{menu_labels:?}"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        draw_frame(&mut terminal, &mut app).unwrap();
+        assert!(
+            !app.hits.iter().any(|(_, target)| matches!(
+                target,
+                HitTarget::LauncherPullRequests | HitTarget::LauncherIssues
+            )),
+            "header modal buttons must not be present: {:?}",
+            app.hits
+        );
+
+        app.overlay = None;
+        app.hits.push((
+            ratatui::layout::Rect::new(40, 1, 6, 1),
+            HitTarget::LauncherPullRequests,
+        ));
+        click(&mut app, 42, 1, &mut out);
+        assert!(
+            app.overlay.is_none(),
+            "stale or synthetic PR hit cannot open the modal"
+        );
+        assert!(
+            out.is_empty(),
+            "no fetch or create request is sent: {out:?}"
+        );
+
+        app.open_prs_collapsed = true;
+        app.issues_collapsed = true;
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 0;
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert!(
+            app.open_prs_collapsed,
+            "navigation cannot reveal a PR group"
+        );
+        assert!(
+            app.issues_collapsed,
+            "navigation cannot reveal an issue group"
+        );
+        assert_eq!(app.worktree_row_count(), 1, "lists are not offered as rows");
+
+        app.open_prs.insert(
+            nebula_core::ProjectId("p1".into()),
+            crate::app::OpenPrs {
+                list: vec![crate::pull_request::OpenPr {
+                    number: 42,
+                    title: "PR".into(),
+                    url: "https://github.com/o/r/pull/42".into(),
+                    is_draft: false,
+                    health: Default::default(),
+                    head: "pr-42-head".into(),
+                }],
+                at: std::time::Instant::now(),
+                due: std::time::Instant::now() + OPEN_PRS_REFRESH,
+                step: OPEN_PRS_REFRESH,
+            },
+        );
+        app.issues.insert(
+            nebula_core::ProjectId("p1".into()),
+            crate::issues::IssueList {
+                list: vec![crate::issues::Issue {
+                    number: 15,
+                    url: "https://github.com/o/r/issues/15".into(),
+                    title: "Issue".into(),
+                    author: "tester".into(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    labels: Vec::new(),
+                    body: String::new(),
+                }],
+                at: std::time::Instant::now(),
+            },
+        );
+        app.hits.clear();
+        draw_frame(&mut terminal, &mut app).unwrap();
+        assert!(
+            !app.hits.iter().any(|(_, target)| matches!(
+                target,
+                HitTarget::LauncherPullRequests | HitTarget::LauncherIssues
+            )),
+            "header buttons remain hidden after cached responses: {:?}",
+            app.hits
+        );
+    }
+
+    #[test]
+    fn legacy_projects_keep_the_pull_request_and_issue_modals() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE, &mut out);
+        assert!(matches!(app.overlay, Some(Overlay::PullRequests(_))));
+        app.overlay = None;
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE, &mut out);
+        assert!(matches!(app.overlay, Some(Overlay::Issues(_))));
+    }
+
     fn delete_worktree_requests(out: &[ClientRequest]) -> Vec<&str> {
         out.iter()
             .filter_map(|r| match r {
@@ -31985,6 +32149,39 @@ diff --git a/src/c.rs b/src/c.rs
             );
             assert_eq!(delete_worktree_requests(&out), ["w2"]);
             assert!(!app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
+        });
+    }
+
+    #[test]
+    fn deleting_last_multi_repository_card_never_deletes_its_workspace() {
+        with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+            let mut app = App::new();
+            seed_emptiable_tree(&mut app);
+            mark_project_as_registered_multi_repository(&mut app);
+            upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+
+            let confirm = menu_delete(&mut app, "a2");
+            assert_eq!(
+                confirm.action,
+                PendingAction::DeleteAgent(AgentId("a2".into()))
+            );
+            assert!(!confirm.message.contains("worktree"), "{confirm:?}");
+
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                out.iter().any(|request| matches!(request, ClientRequest::DeleteAgent { id, .. } if id.0 == "a2")),
+                "the card is deleted: {out:?}"
+            );
+            assert!(
+                delete_worktree_requests(&out).is_empty(),
+                "workspace stays: {out:?}"
+            );
+            assert!(app
+                .tree
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.id.0 == "w2"));
         });
     }
 

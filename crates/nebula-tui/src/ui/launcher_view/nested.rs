@@ -197,7 +197,10 @@ pub(super) fn draw_bands(
                 &row,
                 &band.cards[card_index],
             );
-            if let Some(rect) = pr_hit {
+            let pr_available = app
+                .selected_project()
+                .is_none_or(|project| !app.tree.uses_workspace_layout(&project.id));
+            if let Some(rect) = pr_hit.filter(|_| pr_available) {
                 app.hits
                     .push((rect, HitTarget::LauncherThreadPr(band.worktree.clone())));
             }
@@ -711,7 +714,10 @@ pub(super) fn draw_strip(
         strip_line(pr_left, pr_right, width),
     ];
     f.render_widget(Paragraph::new(lines), inner);
-    if let Some(rect) = pr_hit.filter(|r| r.width > 0 && inner.height > 3) {
+    let pr_available = app
+        .selected_project()
+        .is_none_or(|project| !app.tree.uses_workspace_layout(&project.id));
+    if let Some(rect) = pr_hit.filter(|r| r.width > 0 && inner.height > 3 && pr_available) {
         app.hits
             .push((rect, HitTarget::LauncherThreadPr(band.worktree.clone())));
     }

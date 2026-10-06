@@ -2948,6 +2948,224 @@ async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebul
         .expect("main worktree upsert")
 }
 
+#[tokio::test]
+async fn registered_project_rejects_agent_worktree_relocation_and_pr_sessions() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    make_repo_at(&folder.join("api"));
+    make_repo_at(&folder.join("web"));
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "project".into(),
+            repositories: vec!["api".into(), "web".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut c, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+            && events.iter().any(|event| {
+                matches!(event, ServerEvent::EntityUpserted { entity: Entity::Worktree(worktree) } if worktree.is_main)
+            })
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    } = find_ack(&registered, 1).unwrap()
+    else {
+        panic!("RegisterProject failed: {registered:#?}");
+    };
+    let project = project.clone();
+    let main = registered
+        .iter()
+        .find_map(|event| match event {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(worktree),
+            } if worktree.is_main => Some(worktree.clone()),
+            _ => None,
+        })
+        .expect("registered main workspace");
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: main.id.clone(),
+            name: "agent".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let created = read_events_until(&mut c, EVENT_TIMEOUT, |events| {
+        find_ack(events, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent)),
+        ..
+    } = find_ack(&created, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {created:#?}");
+    };
+    let agent = agent.clone();
+
+    let session = SessionRef::Agent(agent.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: session.clone(),
+            from_seq: None,
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: session.clone(),
+            data: b"pwd\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    let before_relocation = read_events_for(&mut c, Duration::from_millis(500)).await;
+    assert!(
+        String::from_utf8_lossy(&collected_output(&before_relocation))
+            .contains(folder.to_str().unwrap()),
+        "the agent starts in the project workspace folder: {before_relocation:#?}"
+    );
+
+    write_frame(
+        &mut c,
+        &ClientRequest::EnterWorktree {
+            req_id: 3,
+            id: agent.clone(),
+            branch: "agent-branch".into(),
+            base: None,
+        },
+    )
+    .await
+    .unwrap();
+    let relocated = read_events_until(&mut c, EVENT_TIMEOUT, |events| {
+        find_ack(events, 3).is_some()
+    })
+    .await;
+    assert!(
+        matches!(
+            find_ack(&relocated, 3),
+            Some(ServerEvent::Error { message, .. }) if message.contains("not available")
+        ),
+        "worktree request should explain its rejection: {relocated:#?}"
+    );
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session,
+            data: b"pwd\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    let after_relocation = read_events_for(&mut c, Duration::from_millis(500)).await;
+    assert!(
+        String::from_utf8_lossy(&collected_output(&after_relocation))
+            .contains(folder.to_str().unwrap()),
+        "the agent remains in its original workspace folder: {after_relocation:#?}"
+    );
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreatePrAgent {
+            req_id: 4,
+            project: project.clone(),
+            name: "pr-agent".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            pr_url: "https://example.test/org/repo/pull/1".into(),
+            head: "feature".into(),
+            starting_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let pr = read_events_until(&mut c, EVENT_TIMEOUT, |events| {
+        find_ack(events, 4).is_some()
+    })
+    .await;
+    assert!(
+        matches!(
+            find_ack(&pr, 4),
+            Some(ServerEvent::Error { message, .. }) if message.contains("not available")
+        ),
+        "PR session request should explain its rejection: {pr:#?}"
+    );
+
+    let snapshot = subscribe(&mut c).await;
+    let ServerEvent::Snapshot {
+        worktrees, agents, ..
+    } = snapshot
+        .iter()
+        .find(|event| matches!(event, ServerEvent::Snapshot { .. }))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        worktrees.len(),
+        1,
+        "no single repository worktree was created"
+    );
+    assert_eq!(
+        agents.len(),
+        1,
+        "the original agent is still the only agent"
+    );
+    assert_eq!(agents[0].id, agent);
+    assert_eq!(
+        agents[0].worktree_id, main.id,
+        "the agent stays in its start workspace"
+    );
+    let before_bytes = collected_output(&before_relocation);
+    let after_bytes = collected_output(&after_relocation);
+    let before = String::from_utf8_lossy(&before_bytes);
+    let after = String::from_utf8_lossy(&after_bytes);
+    let project_path = folder.to_str().unwrap();
+    assert!(
+        before.contains(project_path) && after.contains(project_path),
+        "the agent stays in its original workspace folder; before={before:?}, after={after:?}"
+    );
+    assert!(
+        !folder.join("worktrees").exists(),
+        "neither request created a worktree"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// PrewarmAgent boots the CLI while the user is "typing the name"; the
 /// following CreateAgent must adopt that already-running PTY (its slow boot
 /// output is already in scrollback) and replay the hooks it fired before the

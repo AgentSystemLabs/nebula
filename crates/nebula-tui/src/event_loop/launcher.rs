@@ -1041,6 +1041,12 @@ pub(super) fn click_pull_request(
     worktree: &WorktreeId,
     out: &mut Vec<ClientRequest>,
 ) {
+    if app
+        .selected_project()
+        .is_some_and(|project| app.tree.uses_workspace_layout(&project.id))
+    {
+        return;
+    }
     if app.selected_worktree().map(|w| &w.id) != Some(worktree) {
         select_band(app, worktree.clone(), out);
     }
@@ -2120,6 +2126,12 @@ pub(super) fn click_band_fold(app: &mut App, index: usize, out: &mut Vec<ClientR
 /// cursor. The cursor and the pane stay where they were: the click opens
 /// the pull request, not the session.
 pub(super) fn click_thread_pr(app: &mut App, worktree: &WorktreeId) {
+    if app
+        .selected_project()
+        .is_some_and(|project| app.tree.uses_workspace_layout(&project.id))
+    {
+        return;
+    }
     let url = view::bands(app)
         .into_iter()
         .find(|b| &b.worktree == worktree)

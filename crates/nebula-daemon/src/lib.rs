@@ -264,9 +264,9 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
 
     // Worktrees created, removed, or re-checked-out outside nebula (an agent
     // running `git worktree add`, a manual `git checkout` on the root) should
-    // show up without a restart. A cheap mtime probe over the git files those
-    // operations touch gates the full `git worktree list` reconcile; the
-    // first tick also runs one boot-time sync per project.
+    // show up without a restart. Multi-repository projects have explicit
+    // workspace membership and are never reconciled this way. A cheap mtime
+    // probe gates the full `git worktree list` reconcile.
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {

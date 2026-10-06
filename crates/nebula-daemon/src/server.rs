@@ -397,6 +397,19 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     head,
                     starting_prompt,
                 } => {
+                    if daemon
+                        .store
+                        .project_repositories(&project)
+                        .is_ok_and(|repositories| !repositories.is_empty())
+                    {
+                        let _ = out_tx
+                            .send(ServerEvent::Error {
+                                req_id: Some(req_id),
+                                message: "pull-request agent sessions are not available in multi-repository projects".into(),
+                            })
+                            .await;
+                        continue;
+                    }
                     // A PR SESSION whose checkout does not exist yet is a
                     // fetch, a `git worktree add` and the WORKTREE HOOK
                     // before the CLI spawns — seconds, each step bounded by

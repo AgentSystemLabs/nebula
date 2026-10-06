@@ -172,6 +172,10 @@ pub(crate) fn open_on(app: &mut App, url: Option<&str>) {
         app.flash = Some("pull requests: select a project first".into());
         return;
     };
+    if app.tree.uses_workspace_layout(&project.id) {
+        app.flash = Some("pull requests are not available in multi-repository projects".into());
+        return;
+    }
     let mut view = PullRequestsView::new(
         project.id.clone(),
         project.name.clone(),

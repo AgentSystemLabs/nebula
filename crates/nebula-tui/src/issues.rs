@@ -660,6 +660,10 @@ pub(crate) fn open_issues(app: &mut App) {
         app.flash = Some("issues: select a project first".into());
         return;
     };
+    if app.tree.uses_workspace_layout(&project.id) {
+        app.flash = Some("issues are not available in multi-repository projects".into());
+        return;
+    }
     let mut view = IssuesView::new(
         project.id.clone(),
         project.name.clone(),

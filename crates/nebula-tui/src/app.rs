@@ -2614,6 +2614,14 @@ impl Tree {
                     .any(|repository| repository.project_id == p.id && repository.path == path)
         })
     }
+
+    /// A project registered with explicit repository membership uses the
+    /// workspace layout and cannot use single-worktree features.
+    pub fn uses_workspace_layout(&self, project: &ProjectId) -> bool {
+        self.repositories
+            .iter()
+            .any(|repository| &repository.project_id == project)
+    }
 }
 
 /// What the pane's terminal emulation reports back beyond the screen
@@ -5147,6 +5155,12 @@ impl App {
     /// every draft at once with no refetch, and a draft marked ready on
     /// GitHub joins the rows on the refresh that says so.
     pub fn listed_open_prs(&self) -> Vec<&OpenPr> {
+        if self
+            .selected_project()
+            .is_some_and(|project| self.tree.uses_workspace_layout(&project.id))
+        {
+            return Vec::new();
+        }
         self.all_open_prs()
             .iter()
             .filter(|pr| !(self.hide_draft_prs && pr.is_draft))
@@ -5170,6 +5184,12 @@ impl App {
     /// header counts while it is folded. Empty until the first answer, or
     /// when the repo has none.
     pub fn listed_issues(&self) -> &[crate::issues::Issue] {
+        if self
+            .selected_project()
+            .is_some_and(|project| self.tree.uses_workspace_layout(&project.id))
+        {
+            return &[];
+        }
         self.selected_project()
             .and_then(|p| self.issues.get(&p.id))
             .map(|l| l.list.as_slice())
