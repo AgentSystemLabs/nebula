@@ -165,6 +165,103 @@ pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
         .join(safe_branch)
 }
 
+/// Where a base used for a new worktree came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeBaseSource {
+    /// The chosen base was resolved from the freshly fetched origin.
+    FreshFetch,
+    /// The caller's configured base was used as the fallback.
+    ConfiguredBase,
+    /// The configured branch was available only in the local checkout.
+    LocalBranch,
+    /// No suitable configured or remote base was available; use checkout HEAD.
+    CheckoutHead,
+}
+
+/// The base and fetch outcome used when creating an explicitly located worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeCreation {
+    pub path: PathBuf,
+    pub base: Option<String>,
+    pub fetch_succeeded: bool,
+    pub base_source: WorktreeBaseSource,
+}
+
+/// Add a worktree at a caller-selected destination. The destination is checked
+/// before invoking git, and its parent directories are created as needed. When
+/// `configured_base` is supplied, origin's branch is preferred after fetch,
+/// then a same-named local branch; otherwise the remote default is used. If
+/// fetching/resolution cannot supply a base, the checkout's HEAD is used.
+/// `refuse_existing_branch` opts into rejecting an existing local branch;
+/// false preserves the legacy checkout-existing-branch behavior.
+pub async fn add_worktree_at(
+    repo: &Path,
+    branch: &str,
+    destination: &Path,
+    configured_base: Option<&str>,
+    refuse_existing_branch: bool,
+) -> Result<WorktreeCreation> {
+    if std::fs::symlink_metadata(destination).is_ok() {
+        bail!("worktree path already exists: {}", destination.display());
+    }
+    if refuse_existing_branch && local_branch(repo, branch).await {
+        bail!("local branch already exists: {branch}");
+    }
+
+    let fetch_succeeded = fetch_origin_if_any(repo).await;
+    let (base, base_source) = if let Some(configured) = configured_base {
+        if fetch_succeeded {
+            if let Some(remote) = origin_branch(repo, configured).await {
+                (Some(remote), WorktreeBaseSource::FreshFetch)
+            } else if local_branch(repo, configured).await {
+                (
+                    Some(configured.to_string()),
+                    WorktreeBaseSource::LocalBranch,
+                )
+            } else {
+                match origin_head(repo).await {
+                    Some(base) => (Some(base), WorktreeBaseSource::FreshFetch),
+                    None => (None, WorktreeBaseSource::CheckoutHead),
+                }
+            }
+        } else if local_branch(repo, configured).await {
+            (
+                Some(configured.to_string()),
+                WorktreeBaseSource::ConfiguredBase,
+            )
+        } else if let Some(remote) = origin_branch(repo, configured).await {
+            // A stale cached remote ref is usable when offline, but it is not
+            // represented as freshly fetched data.
+            (Some(remote), WorktreeBaseSource::ConfiguredBase)
+        } else {
+            (None, WorktreeBaseSource::CheckoutHead)
+        }
+    } else if fetch_succeeded {
+        match origin_head(repo).await {
+            Some(base) => (Some(base), WorktreeBaseSource::FreshFetch),
+            None => (None, WorktreeBaseSource::CheckoutHead),
+        }
+    } else {
+        (None, WorktreeBaseSource::CheckoutHead)
+    };
+
+    let path = add_worktree_inner_at(
+        repo,
+        branch,
+        destination,
+        base.as_deref(),
+        false,
+        refuse_existing_branch,
+    )
+    .await?;
+    Ok(WorktreeCreation {
+        path,
+        base,
+        fetch_succeeded,
+        base_source,
+    })
+}
+
 /// `git worktree add <path> -b <branch> [base]`. Falls back to checking out an
 /// existing branch when `-b` fails because it already exists. `None` is
 /// git's own default — the checkout's HEAD; a base that is a
@@ -249,8 +346,22 @@ async fn add_worktree_inner(
     track: bool,
 ) -> Result<PathBuf> {
     let path = worktree_dir(repo, branch);
+    add_worktree_inner_at(repo, branch, &path, base, track, false).await
+}
+
+async fn add_worktree_inner_at(
+    repo: &Path,
+    branch: &str,
+    path: &Path,
+    base: Option<&str>,
+    track: bool,
+    refuse_existing_branch: bool,
+) -> Result<PathBuf> {
     if path.exists() {
         bail!("worktree path already exists: {}", path.display());
+    }
+    if refuse_existing_branch && local_branch(repo, branch).await {
+        bail!("local branch already exists: {branch}");
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -265,11 +376,11 @@ async fn add_worktree_inner(
         args.push(base);
     }
     match git(repo, &args).await {
-        Ok(_) => Ok(path),
-        Err(e) if e.to_string().contains("already exists") => {
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(e) if !refuse_existing_branch && e.to_string().contains("already exists") => {
             // Branch exists: check it out instead of creating.
             git(repo, &["worktree", "add", &path_str, branch]).await?;
-            Ok(path)
+            Ok(path.to_path_buf())
         }
         Err(e) => Err(e),
     }
@@ -758,6 +869,210 @@ mod tests {
         git(repo, &["push", "origin", "feat-x"]).await.unwrap();
         git(repo, &["branch", "-D", "feat-x"]).await.unwrap();
         origin
+    }
+
+    async fn add_bare_origin_with_default(repo: &Path, tmp: &Path, branch: &str) -> PathBuf {
+        let origin = tmp.join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", branch])
+            .await
+            .unwrap();
+        let origin_str = origin.to_string_lossy().into_owned();
+        git(repo, &["remote", "add", "origin", &origin_str])
+            .await
+            .unwrap();
+        git(repo, &["branch", "-m", branch]).await.unwrap();
+        git(repo, &["push", "-u", "origin", branch]).await.unwrap();
+        git(repo, &["remote", "set-head", "origin", "--auto"])
+            .await
+            .unwrap();
+        origin
+    }
+
+    #[tokio::test]
+    async fn explicit_worktree_destination_reports_fetched_non_main_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        add_bare_origin_with_default(&repo, tmp.path(), "master").await;
+        let destination = tmp.path().join("nested/session/repos/repo");
+
+        let result = add_worktree_at(&repo, "pilot/session", &destination, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result.path, destination);
+        assert_eq!(result.base.as_deref(), Some("origin/master"));
+        assert!(result.fetch_succeeded);
+        assert_eq!(result.base_source, WorktreeBaseSource::FreshFetch);
+        assert!(destination.is_dir());
+        let head = git(&destination, &["rev-parse", "HEAD"]).await.unwrap();
+        let remote_head = git(&repo, &["rev-parse", "origin/master"]).await.unwrap();
+        assert_eq!(head.trim(), remote_head.trim());
+    }
+
+    #[tokio::test]
+    async fn explicit_worktree_destination_refuses_existing_path_before_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let destination = tmp.path().join("already-here");
+        std::fs::create_dir(&destination).unwrap();
+
+        let error = add_worktree_at(&repo, "pilot/session", &destination, None, true)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("worktree path already exists"));
+        assert!(
+            git(&repo, &["show-ref", "--verify", "refs/heads/pilot/session"])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_worktree_destination_can_refuse_or_reuse_local_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        git(&repo, &["branch", "pilot/session"]).await.unwrap();
+        let refused_path = tmp.path().join("refused/pilot-session");
+
+        let error = add_worktree_at(&repo, "pilot/session", &refused_path, None, true)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("local branch already exists"));
+        assert!(!refused_path.exists());
+        assert!(git(&repo, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap()
+            .lines()
+            .all(|line| !line.starts_with("worktree ") || !line.contains("refused")));
+
+        let legacy_path = tmp.path().join("legacy/pilot-session");
+        let result = add_worktree_at(&repo, "pilot/session", &legacy_path, None, false)
+            .await
+            .unwrap();
+        assert_eq!(result.path, legacy_path);
+        assert_eq!(
+            git(&legacy_path, &["branch", "--show-current"])
+                .await
+                .unwrap()
+                .trim(),
+            "pilot/session"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_worktree_result_reports_offline_head_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let local_base = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        let missing_origin = tmp.path().join("offline.git");
+        git(
+            &repo,
+            &["remote", "add", "origin", missing_origin.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        let destination = tmp.path().join("offline/session/repo");
+
+        let result = add_worktree_at(&repo, "pilot/offline", &destination, None, true)
+            .await
+            .unwrap();
+
+        assert!(!result.fetch_succeeded);
+        assert_eq!(result.base, None);
+        assert_eq!(result.base_source, WorktreeBaseSource::CheckoutHead);
+        assert_eq!(
+            git(&destination, &["rev-parse", "HEAD"])
+                .await
+                .unwrap()
+                .trim(),
+            local_base.trim()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_worktree_result_reports_local_configured_base_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        git(&repo, &["branch", "stable"]).await.unwrap();
+        git(&repo, &["commit", "--allow-empty", "-m", "advance HEAD"])
+            .await
+            .unwrap();
+        let configured_base = git(&repo, &["rev-parse", "stable"]).await.unwrap();
+        let missing_origin = tmp.path().join("offline.git");
+        git(
+            &repo,
+            &["remote", "add", "origin", missing_origin.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        let destination = tmp.path().join("configured/session/repo");
+
+        let result = add_worktree_at(
+            &repo,
+            "pilot/configured",
+            &destination,
+            Some("stable"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.fetch_succeeded);
+        assert_eq!(result.base.as_deref(), Some("stable"));
+        assert_eq!(result.base_source, WorktreeBaseSource::ConfiguredBase);
+        assert_eq!(
+            git(&destination, &["rev-parse", "HEAD"])
+                .await
+                .unwrap()
+                .trim(),
+            configured_base.trim()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_worktree_result_reports_local_branch_when_remote_lacks_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        add_bare_origin_with_default(&repo, tmp.path(), "main").await;
+        git(&repo, &["branch", "stable"]).await.unwrap();
+        let local_base = git(&repo, &["rev-parse", "stable"]).await.unwrap();
+        let destination = tmp.path().join("local/session/repo");
+
+        let result = add_worktree_at(
+            &repo,
+            "pilot/local-base",
+            &destination,
+            Some("stable"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.fetch_succeeded);
+        assert_eq!(result.base.as_deref(), Some("stable"));
+        assert_eq!(result.base_source, WorktreeBaseSource::LocalBranch);
+        assert_eq!(
+            git(&destination, &["rev-parse", "HEAD"])
+                .await
+                .unwrap()
+                .trim(),
+            local_base.trim()
+        );
     }
 
     /// A same-repo PR: the branch comes from `origin` and the new checkout
