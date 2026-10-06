@@ -466,6 +466,33 @@ async fn local_branch(repo: &Path, name: &str) -> bool {
         .is_ok()
 }
 
+/// Whether either local or cached origin branch refs contain `name`.
+pub async fn branch_exists(repo: &Path, name: &str) -> bool {
+    let local = format!("refs/heads/{name}");
+    if git(repo, &["show-ref", "--verify", "--quiet", &local])
+        .await
+        .is_ok()
+    {
+        return true;
+    }
+    git(
+        repo,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+    )
+    .await
+    .is_ok_and(|refs| {
+        refs.lines()
+            .any(|reference| reference.ends_with(&format!("/{name}")))
+    })
+}
+
+/// Refresh configured remotes before a grouped operation validates all
+/// branch conflicts. Failure remains a usable offline condition; the caller
+/// still checks every cached remote-tracking ref.
+pub async fn refresh_origin(repo: &Path) -> bool {
+    fetch_origin_if_any(repo).await
+}
+
 /// `git fetch origin`, killed and reported as an error past `REMOTE_TIMEOUT`.
 async fn fetch_origin(repo: &Path) -> Result<()> {
     git_remote(repo, &["fetch", "--quiet", "origin"]).await?;

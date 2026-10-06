@@ -1330,6 +1330,7 @@ fn worktree_line(app: &App, view: &AgentPresetsView, width: u16, th: Theme) -> L
     let target = view.target();
     let branch = match &target {
         QuickTarget::NewWorktree { branch, .. } => branch.clone(),
+        QuickTarget::NewSessionWorkspace { name, .. } => format!("pilot/{name}"),
         QuickTarget::Worktree(id) => app
             .tree
             .worktrees

@@ -272,7 +272,14 @@ pub fn bands(app: &App) -> Vec<Band> {
     };
     let rows = rows(app);
     let mut out = Vec::new();
-    for w in app.visible_worktrees() {
+    for w in app.visible_worktrees().into_iter().filter(|worktree| {
+        !app.tree.session_workspaces.iter().any(|workspace| {
+            workspace
+                .repositories
+                .iter()
+                .any(|repository| repository.id == worktree.id)
+        })
+    }) {
         let mut cards: Vec<Card> = rows
             .iter()
             .filter(|r| r.agent.worktree_id == w.id)
@@ -295,21 +302,50 @@ pub fn bands(app: &App) -> Vec<Band> {
                 .repositories
                 .iter()
                 .any(|repository| repository.project_id == project.id);
+        let session_workspace = app
+            .tree
+            .session_workspaces
+            .iter()
+            .find(|workspace| workspace.worktree_id == w.id);
         if cards.is_empty()
-            && (app.show_archived || (!app.show_all_worktrees && !registered_main_workspace))
+            && (app.show_archived
+                || (!app.show_all_worktrees
+                    && !registered_main_workspace
+                    && session_workspace.is_none()))
         {
             continue;
         }
         out.push(Band {
             worktree: w.id.clone(),
             branch: w.branch.clone(),
-            workspace_name: registered_main_workspace.then(|| project.name.clone()),
+            workspace_name: if registered_main_workspace {
+                Some(project.name.clone())
+            } else {
+                session_workspace.map(|workspace| workspace.name.clone())
+            },
             repositories: if w.is_main {
                 app.tree
                     .repositories
                     .iter()
                     .filter(|repository| repository.project_id == project.id)
                     .map(|repository| repository.name.clone())
+                    .collect()
+            } else if let Some(workspace) = session_workspace {
+                workspace
+                    .repositories
+                    .iter()
+                    .map(|repository| {
+                        format!(
+                            "{}={}{}",
+                            repository.name,
+                            repository.base.as_deref().unwrap_or("HEAD"),
+                            if repository.fetch_succeeded {
+                                " ✓"
+                            } else {
+                                " offline"
+                            }
+                        )
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -1855,7 +1891,8 @@ pub fn root_checkout(app: &App, project: &ProjectId) -> Option<WorktreeId> {
 /// The PROJECT a launch target is in.
 pub fn project_of(app: &App, target: &QuickTarget) -> Option<ProjectId> {
     match target {
-        QuickTarget::NewWorktree { project, .. } => Some(project.clone()),
+        QuickTarget::NewWorktree { project, .. }
+        | QuickTarget::NewSessionWorkspace { project, .. } => Some(project.clone()),
         QuickTarget::Worktree(id) => app
             .tree
             .worktrees

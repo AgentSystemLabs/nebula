@@ -1751,7 +1751,8 @@ fn draw_band_rule(
                 added.chars().count() + removed.chars().count()
             })
     });
-    let label = if band.repositories.is_empty() {
+    let is_session_workspace = !band.is_main && !band.repositories.is_empty();
+    let label = if band.repositories.is_empty() || is_session_workspace {
         band.workspace_name
             .as_deref()
             .unwrap_or(&band.branch)

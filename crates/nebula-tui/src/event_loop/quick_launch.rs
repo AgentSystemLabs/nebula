@@ -126,6 +126,50 @@ pub(super) fn submit(
                 },
             );
         }
+        QuickTarget::NewSessionWorkspace { project, name } => {
+            app.bring_tab_forward(&project);
+            let placeholder = WorktreeId::generate();
+            if let Some(project_row) = app
+                .tree
+                .projects
+                .iter()
+                .find(|row| row.id == project)
+                .cloned()
+            {
+                app.tree.worktrees.push(nebula_core::Worktree {
+                    id: placeholder.clone(),
+                    project_id: project_row.id.clone(),
+                    path: project_row.repo_path.join("worktrees").join(&name),
+                    branch: format!("pilot/{name}"),
+                    is_main: false,
+                    sort_order: i64::MAX,
+                });
+                app.tree
+                    .session_workspaces
+                    .push(nebula_core::SessionWorkspace {
+                        worktree_id: placeholder.clone(),
+                        name: name.clone(),
+                        state: nebula_core::WorkspaceState::Creating,
+                        repositories: Vec::new(),
+                    });
+            }
+            send_with_follow(
+                app,
+                out,
+                PendingIntent::CreateSessionWorkspaceAndLaunch {
+                    launch,
+                    text,
+                    focus: focus_pane,
+                    placeholder,
+                },
+                !stay,
+                |req_id| ClientRequest::CreateSessionWorkspace {
+                    req_id,
+                    project,
+                    name,
+                },
+            );
+        }
     }
 }
 
@@ -225,6 +269,28 @@ pub(super) fn launch_in_created_worktree(
         AgentLaunchDraft {
             follow,
             ..draft(launch, worktree, text, focus, Some(placeholder.agent))
+        },
+        out,
+    );
+}
+
+/// The daemon's grouped-create result is the readiness acknowledgement. Only
+/// after it arrives do we issue the agent create against the workspace root.
+pub(super) fn launch_in_created_session_workspace(
+    app: &mut App,
+    mut launch: QuickLaunch,
+    text: String,
+    workspace: WorktreeId,
+    follow: bool,
+    focus: bool,
+    out: &mut Vec<ClientRequest>,
+) {
+    launch.target = QuickTarget::Worktree(workspace.clone());
+    create_agent(
+        app,
+        AgentLaunchDraft {
+            follow,
+            ..draft(launch, workspace, text, focus, None)
         },
         out,
     );

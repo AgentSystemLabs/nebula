@@ -3193,6 +3193,33 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::FocusLeft => walk_focus_back(app),
         Action::Hosts => open_hosts_picker(app),
         Action::AgentPresets => crate::preset_overlays::open_agent_presets(app),
+        Action::NewSessionWorkspace => {
+            if let Some(project) = app.selected_project().map(|project| project.id.clone()) {
+                let suggested = crate::branch_name::random_name(&app.project_branches(&project));
+                open_prompt(app, PromptKind::NewSessionWorkspace { project });
+                if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+                    prompt.input.insert_str(&suggested);
+                }
+            } else {
+                app.flash = Some("select a project first".into());
+            }
+        }
+        Action::QuickPromptNewSessionWorkspace => {
+            if let Some(project) = app.selected_project().map(|project| project.id.clone()) {
+                open_prompt(
+                    app,
+                    PromptKind::QuickPrompt(crate::quick_prompt::QuickLaunch::from_config(
+                        crate::quick_prompt::QuickTarget::NewSessionWorkspace {
+                            project: project.clone(),
+                            name: crate::branch_name::random_name(&app.project_branches(&project)),
+                        },
+                        &crate::config::Config::load(),
+                    )),
+                );
+            } else {
+                app.flash = Some("select a project first".into());
+            }
+        }
         // Full-screen over a session with a project anywhere: the same box
         // the GRID's `p` opens, in the checkout under the grid's cursor —
         // the session on screen's own worktree — on the root branch with
@@ -3521,6 +3548,11 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
         PromptKind::NewWorktree { suggestion, .. } => (
             "New worktree".into(),
             format!("branch name (empty = {suggestion})").into(),
+            String::new(),
+        ),
+        PromptKind::NewSessionWorkspace { .. } => (
+            "New session workspace".into(),
+            "workspace name (letters, numbers, dots, dashes or underscores)".into(),
             String::new(),
         ),
         PromptKind::ClaudeCloudTask { .. } => (
@@ -5424,6 +5456,13 @@ fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
                     0,
                     MenuItem::new("New worktree", MenuAction::NewWorktree(p.id.clone())),
                 );
+                items.insert(
+                    1,
+                    MenuItem::new(
+                        "New session workspace",
+                        MenuAction::NewSessionWorkspace(p.id.clone()),
+                    ),
+                );
                 items.push(MenuItem::new(
                     "Rename",
                     MenuAction::RenameProject(p.id.clone()),
@@ -5470,10 +5509,13 @@ fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
         Focus::Worktrees => app
             .selected_project()
             .map(|p| {
-                let mut items = vec![MenuItem::new(
-                    "New worktree",
-                    MenuAction::NewWorktree(p.id.clone()),
-                )];
+                let mut items = vec![
+                    MenuItem::new("New worktree", MenuAction::NewWorktree(p.id.clone())),
+                    MenuItem::new(
+                        "New session workspace",
+                        MenuAction::NewSessionWorkspace(p.id.clone()),
+                    ),
+                ];
                 // Only once there is a group to fold.
                 if !app.listed_open_prs().is_empty() {
                     items.push(MenuItem::new(
@@ -6811,6 +6853,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
     // For every other prompt an empty field is a cancel.
     let empty_is_a_default = match &prompt.kind {
         PromptKind::NewWorktree { .. }
+        | PromptKind::NewSessionWorkspace { .. }
         | PromptKind::RenameProject { .. }
         | PromptKind::SettingText { .. }
         | PromptKind::AgentPresetTask { .. } => true,
@@ -6877,6 +6920,53 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                     base: None,
                 },
             );
+        }
+        PromptKind::NewSessionWorkspace { ref project } => {
+            let name = value.trim().to_string();
+            if name.is_empty() {
+                app.flash = Some("workspace name cannot be empty".into());
+                app.overlay = Some(Overlay::Prompt(prompt));
+                return;
+            }
+            let focus = app.focus;
+            app.bring_tab_forward(project);
+            let placeholder = WorktreeId::generate();
+            let project_row = app
+                .tree
+                .projects
+                .iter()
+                .find(|row| row.id == *project)
+                .cloned();
+            if let Some(project_row) = project_row {
+                app.tree.worktrees.push(nebula_core::Worktree {
+                    id: placeholder.clone(),
+                    project_id: project_row.id.clone(),
+                    path: project_row.repo_path.join("worktrees").join(&name),
+                    branch: format!("pilot/{name}"),
+                    is_main: false,
+                    sort_order: i64::MAX,
+                });
+                app.tree
+                    .session_workspaces
+                    .push(nebula_core::SessionWorkspace {
+                        worktree_id: placeholder.clone(),
+                        name: name.clone(),
+                        state: nebula_core::WorkspaceState::Creating,
+                        repositories: Vec::new(),
+                    });
+            }
+            let req_id = app.alloc_req_id(PendingIntent::CreateSessionWorkspace {
+                project: project.clone(),
+                name: name.clone(),
+                focus,
+                placeholder,
+            });
+            app.flash = Some(format!("creating session workspace {name}…"));
+            out.push(ClientRequest::CreateSessionWorkspace {
+                req_id,
+                project: project.clone(),
+                name,
+            });
         }
         PromptKind::ClaudeCloudTask {
             worktree,
@@ -7368,6 +7458,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             );
         }
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
+        MenuAction::NewSessionWorkspace(project) => {
+            open_prompt(app, PromptKind::NewSessionWorkspace { project })
+        }
         MenuAction::OpenLink(url) => open_link(app, &url, out),
         MenuAction::ViewPrDiff => request_pr_diff(app),
         MenuAction::CommentPullRequest => open_pr_comment(app),
@@ -10134,6 +10227,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         ServerEvent::Snapshot {
             projects,
             repositories,
+            session_workspaces,
             worktrees,
             agents,
             terminals,
@@ -10143,6 +10237,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         } => {
             app.tree.projects = projects;
             app.tree.repositories = repositories;
+            app.tree.session_workspaces = session_workspaces;
             app.tree.worktrees = worktrees;
             app.tree.agents = agents;
             app.tree.terminals = terminals;
@@ -10184,6 +10279,144 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 .repositories
                 .retain(|repository| repository.project_id != project);
             app.tree.repositories.extend(repositories);
+            app.dirty = true;
+        }
+        ServerEvent::SessionWorkspaceUpserted { workspace } => {
+            app.tree
+                .session_workspaces
+                .retain(|known| known.worktree_id != workspace.worktree_id);
+            app.tree.session_workspaces.push(workspace);
+            app.dirty = true;
+        }
+        ServerEvent::SessionWorkspaceCreated {
+            req_id,
+            workspace,
+            repositories,
+        } => {
+            let follow = !app.left_behind.remove(&req_id);
+            let pending = app.pending.remove(&req_id);
+            if let Some(
+                PendingIntent::CreateSessionWorkspace { placeholder, .. }
+                | PendingIntent::CreateSessionWorkspaceAndLaunch { placeholder, .. },
+            ) = &pending
+            {
+                app.tree.worktrees.retain(|row| row.id != *placeholder);
+                app.tree
+                    .session_workspaces
+                    .retain(|row| row.worktree_id != *placeholder);
+            }
+            if let Some(
+                PendingIntent::CreateSessionWorkspace { placeholder, .. }
+                | PendingIntent::CreateSessionWorkspaceAndLaunch { placeholder, .. },
+            ) = &pending
+            {
+                app.tree.worktrees.retain(|known| known.id != *placeholder);
+                app.tree
+                    .session_workspaces
+                    .retain(|known| known.worktree_id != *placeholder);
+            }
+            app.tree.worktrees.retain(|known| known.id != workspace.id);
+            app.tree.worktrees.push(workspace.clone());
+            app.tree
+                .session_workspaces
+                .retain(|known| known.worktree_id != workspace.id);
+            app.tree
+                .session_workspaces
+                .push(nebula_core::SessionWorkspace {
+                    worktree_id: workspace.id.clone(),
+                    name: workspace.branch.trim_start_matches("pilot/").to_string(),
+                    state: nebula_core::WorkspaceState::Ready,
+                    repositories: repositories.clone(),
+                });
+            let meta_name = workspace.branch.trim_start_matches("pilot/").to_string();
+            for repository in &repositories {
+                app.tree.worktrees.retain(|known| known.id != repository.id);
+                app.tree.worktrees.push(nebula_core::Worktree {
+                    id: repository.id.clone(),
+                    project_id: workspace.project_id.clone(),
+                    path: repository.path.clone(),
+                    branch: workspace.branch.clone(),
+                    is_main: false,
+                    sort_order: 0,
+                });
+            }
+            app.flash = Some(format!(
+                "created {meta_name}: {} repositories",
+                repositories.len()
+            ));
+            if follow {
+                app.focus = Focus::Sessions;
+                app.select_worktree_when_seen = Some(workspace.id.clone());
+            }
+            match pending {
+                Some(PendingIntent::CreateSessionWorkspaceAndLaunch {
+                    launch,
+                    text,
+                    focus,
+                    ..
+                }) => {
+                    let launch_ref = launch.clone();
+                    app.tree
+                        .session_workspaces
+                        .retain(|known| known.worktree_id != workspace.id);
+                    app.tree
+                        .session_workspaces
+                        .push(nebula_core::SessionWorkspace {
+                            worktree_id: workspace.id.clone(),
+                            name: meta_name,
+                            state: nebula_core::WorkspaceState::Ready,
+                            repositories: repositories.clone(),
+                        });
+                    crate::event_loop::quick_launch::launch_in_created_session_workspace(
+                        app,
+                        launch,
+                        text,
+                        workspace.id,
+                        follow,
+                        focus,
+                        out,
+                    );
+                    let _ = launch_ref;
+                }
+                Some(PendingIntent::CreateSessionWorkspace { .. }) | None => {
+                    app.tree
+                        .session_workspaces
+                        .retain(|known| known.worktree_id != workspace.id);
+                    app.tree
+                        .session_workspaces
+                        .push(nebula_core::SessionWorkspace {
+                            worktree_id: workspace.id,
+                            name: meta_name,
+                            state: nebula_core::WorkspaceState::Ready,
+                            repositories: repositories.clone(),
+                        });
+                    app.flash = Some(format!(
+                        "created {} · bases: {}",
+                        repositories.len(),
+                        repositories
+                            .iter()
+                            .map(|r| {
+                                let mut report = format!(
+                                    "{}={} ({})",
+                                    r.name,
+                                    r.base.as_deref().unwrap_or("checkout HEAD"),
+                                    if r.fetch_succeeded {
+                                        "fetched"
+                                    } else {
+                                        "offline"
+                                    }
+                                );
+                                if let Some(warning) = &r.warning {
+                                    report.push_str(&format!(" ⚠ {warning}"));
+                                }
+                                report
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                _ => {}
+            }
             app.dirty = true;
         }
         ServerEvent::Scrollback {
@@ -10567,6 +10800,37 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             match req_id.and_then(|id| app.pending.remove(&id)) {
                 Some(PendingIntent::DeleteWorktree(rollback)) => {
                     restore_worktree_rows(app, rollback)
+                }
+                Some(PendingIntent::CreateSessionWorkspace {
+                    project,
+                    placeholder,
+                    focus,
+                    ..
+                }) => {
+                    app.tree
+                        .worktrees
+                        .retain(|worktree| worktree.id != placeholder);
+                    open_prompt(app, PromptKind::NewSessionWorkspace { project });
+                    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+                        if let Some((_, name)) = message.split_once('`') {
+                            let name = name.split('`').next().unwrap_or_default();
+                            prompt.input.insert_str(name);
+                        }
+                    }
+                    app.flash = Some(message.clone());
+                    let _ = focus;
+                }
+                Some(PendingIntent::CreateSessionWorkspaceAndLaunch {
+                    launch,
+                    text,
+                    placeholder,
+                    ..
+                }) => {
+                    app.tree
+                        .worktrees
+                        .retain(|worktree| worktree.id != placeholder);
+                    reopen_prompt_with(app, PromptKind::QuickPrompt(launch), text);
+                    app.flash = Some(message.clone());
                 }
                 // A rename, an archive or a delete shown on the keypress
                 // and then refused: the row goes back to what it was.
@@ -14670,6 +14934,7 @@ diff --git a/docs/keys.md b/docs/keys.md
             ServerEvent::Snapshot {
                 projects: tree.projects,
                 repositories: tree.repositories,
+                session_workspaces: tree.session_workspaces,
                 worktrees: tree.worktrees,
                 agents: tree.agents,
                 terminals: tree.terminals,
@@ -15611,6 +15876,7 @@ diff --git a/src/c.rs b/src/c.rs
             ServerEvent::Snapshot {
                 projects: tree.projects,
                 repositories: tree.repositories,
+                session_workspaces: tree.session_workspaces,
                 worktrees: tree.worktrees,
                 agents: tree.agents,
                 terminals: tree.terminals,
@@ -15635,6 +15901,7 @@ diff --git a/src/c.rs b/src/c.rs
         let snapshot = |ui_state: Option<String>| ServerEvent::Snapshot {
             projects: tree.projects.clone(),
             repositories: tree.repositories.clone(),
+            session_workspaces: tree.session_workspaces.clone(),
             worktrees: tree.worktrees.clone(),
             agents: tree.agents.clone(),
             terminals: tree.terminals.clone(),

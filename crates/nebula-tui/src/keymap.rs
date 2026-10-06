@@ -112,6 +112,8 @@ pub enum Action {
     OpenWorktree,
     // sessions
     NewTerminal,
+    NewSessionWorkspace,
+    QuickPromptNewSessionWorkspace,
     Rename,
     Archive,
     Unarchive,
@@ -462,6 +464,24 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["t"],
+    },
+    ActionSpec {
+        action: Action::NewSessionWorkspace,
+        id: "new_session_workspace",
+        label: "New session workspace",
+        hint: "Create one isolated repository worktree per project repository",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["shift+w"],
+    },
+    ActionSpec {
+        action: Action::QuickPromptNewSessionWorkspace,
+        id: "quick_prompt_new_session_workspace",
+        label: "Quick prompt in new session workspace",
+        hint: "Create a complete session workspace, then launch the agent there",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["ctrl+w"],
     },
     // `t`'s shift pair: the same terminal, outside nebula.
     ActionSpec {

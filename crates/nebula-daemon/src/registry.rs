@@ -78,6 +78,36 @@ const NO_RUN_COMMAND: &str =
 /// run ended before a DAEMON restart, typically.
 const RUN_NOT_RUNNING: &str = "this run has stopped — press r on its worktree to start it again";
 
+async fn validate_workspace_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("workspace name is empty");
+    }
+    let path = Path::new(name);
+    if path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || name == "."
+        || name == ".."
+    {
+        bail!("workspace name `{name}` must be a single safe folder name");
+    }
+    if name.contains(['\\', ':']) || name.ends_with('.') || name.ends_with(' ') {
+        bail!("workspace name `{name}` is not safe as a folder name");
+    }
+    let branch = format!("pilot/{name}");
+    if tokio::process::Command::new("git")
+        .args(["check-ref-format", "--branch", &branch])
+        .status()
+        .await
+        .map_or(true, |status| !status.success())
+    {
+        bail!("workspace name `{name}` is not valid in a Git branch name");
+    }
+    Ok(())
+}
+
 pub(crate) struct CreateAgentSpec {
     pub worktree: WorktreeId,
     pub name: String,
@@ -677,6 +707,7 @@ impl Daemon {
         Ok(ServerEvent::Snapshot {
             projects,
             repositories,
+            session_workspaces: self.store.session_workspaces()?,
             worktrees,
             agents,
             terminals,
@@ -993,6 +1024,167 @@ impl Daemon {
         Ok(EntityId::Worktree(worktree.id))
     }
 
+    /// Create one branch/worktree per registered repository under the
+    /// project's shared workspace folder. Conflicts and path safety are
+    /// checked for every member before the first filesystem mutation.
+    pub async fn create_session_workspace(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+        raw_name: &str,
+    ) -> Result<(Worktree, Vec<nebula_core::WorkspaceRepository>)> {
+        let name = raw_name.trim();
+        validate_workspace_name(name).await?;
+        let _ops = self.worktree_ops.lock().await;
+        let project = self
+            .store
+            .get_project(project_id)?
+            .context("project not found")?;
+        if self.store.session_workspaces()?.iter().any(|workspace| {
+            workspace.name == name
+                && self
+                    .store
+                    .get_worktree(&workspace.worktree_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|worktree| worktree.project_id == *project_id)
+        }) {
+            bail!("session workspace `{name}` already exists in this project");
+        }
+        let members = self.store.project_repositories(project_id)?;
+        if members.is_empty() {
+            bail!("project has no registered repositories");
+        }
+        let folder = project.repo_path.join("worktrees").join(name);
+        if std::fs::symlink_metadata(&folder).is_ok() {
+            bail!("workspace folder already exists: {}", folder.display());
+        }
+        let branch = format!("pilot/{name}");
+        for member in &members {
+            let _ = git::refresh_origin(&member.path).await;
+        }
+        for member in &members {
+            if git::branch_exists(&member.path, &branch).await {
+                bail!("repository `{}` already has branch `{branch}`; delete the kept branch before reusing this workspace name", member.name);
+            }
+        }
+
+        let mut report = Vec::with_capacity(members.len());
+        let mut roots = Vec::with_capacity(members.len());
+        let config = crate::config::Config::load();
+        for member in members {
+            let destination = folder.join(&member.name);
+            let creation = git::add_worktree_at(
+                &member.path,
+                &branch,
+                &destination,
+                config.worktree_base_branch().as_deref(),
+                true,
+            )
+            .await
+            .with_context(|| format!("repository `{}`: create {branch}", member.name))?;
+            let root = Worktree {
+                id: WorktreeId::generate(),
+                project_id: project_id.clone(),
+                path: destination.clone(),
+                branch: branch.clone(),
+                is_main: false,
+                sort_order: 0,
+            };
+            let warning = worktree_hooks::run(
+                WorktreeHook::Create,
+                HookContext {
+                    repo: &member.path,
+                    worktree: &destination,
+                    branch: &branch,
+                    id: &root.id,
+                },
+            )
+            .await
+            .err()
+            .map(|error| {
+                format!(
+                    "repository `{}` worktree-create hook: {error:#}",
+                    member.name
+                )
+            });
+            if let Some(warning) = &warning {
+                self.warn_clients(warning.clone());
+            }
+            report.push(nebula_core::WorkspaceRepository {
+                id: root.id.clone(),
+                name: member.name,
+                path: destination,
+                base: creation.base,
+                fetch_succeeded: creation.fetch_succeeded,
+                warning,
+            });
+            roots.push(root);
+        }
+
+        let workspace = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project_id.clone(),
+            path: folder,
+            branch,
+            is_main: false,
+            sort_order: self.store.next_worktree_sort_order(project_id)?,
+        };
+        let metadata = nebula_core::SessionWorkspace {
+            worktree_id: workspace.id.clone(),
+            name: name.to_string(),
+            state: nebula_core::WorkspaceState::Ready,
+            repositories: report.clone(),
+        };
+        self.store.insert_session_workspace(&workspace, &metadata)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Worktree(workspace.clone()),
+        });
+        for root in roots {
+            self.broadcast(ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(root),
+            });
+        }
+        self.broadcast(ServerEvent::SessionWorkspaceUpserted {
+            workspace: metadata,
+        });
+        self.sync_workspace_member_order(project_id, &workspace.id)?;
+        Ok((workspace, report))
+    }
+
+    fn sync_workspace_member_order(
+        &self,
+        project_id: &ProjectId,
+        workspace_id: &WorktreeId,
+    ) -> Result<()> {
+        let (_, worktrees, _, _) = self.store.load_tree()?;
+        let root = worktrees
+            .iter()
+            .find(|worktree| &worktree.id == workspace_id)
+            .context("session workspace row missing")?;
+        let members = self
+            .store
+            .session_workspaces()?
+            .into_iter()
+            .find(|workspace| &workspace.worktree_id == workspace_id)
+            .map(|workspace| workspace.repositories)
+            .unwrap_or_default();
+        for (index, member) in members.iter().enumerate() {
+            if let Some(mut worktree) = self.store.get_worktree(&member.id)? {
+                worktree.sort_order = root.sort_order * 1000 + index as i64;
+                self.store
+                    .set_worktree_sort_order(&worktree.id, worktree.sort_order)?;
+                let _ = project_id;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn session_workspace_ready(&self, id: &WorktreeId) -> Result<bool> {
+        Ok(self.store.session_workspaces()?.iter().any(|workspace| {
+            &workspace.worktree_id == id && workspace.state == nebula_core::WorkspaceState::Ready
+        }))
+    }
+
     /// The checkout every PR SESSION for pull request `number` runs in: the
     /// PROJECT's worktree already on its head branch `head` (the ROOT
     /// WORKTREE only when the branch is checked out there — git allows a
@@ -1055,6 +1247,16 @@ impl Daemon {
     pub async fn delete_worktree(self: &Arc<Self>, id: &WorktreeId, force: bool) -> Result<()> {
         let ops = self.worktree_ops.lock().await;
         let worktree = self.store.get_worktree(id)?.context("worktree not found")?;
+        let session_workspaces = self.store.session_workspaces()?;
+        if session_workspaces.iter().any(|workspace| {
+            workspace.worktree_id == *id
+                || workspace
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.id == *id)
+        }) {
+            bail!("cannot delete a single repository worktree from a session workspace; close the whole workspace instead");
+        }
         if worktree.is_main {
             bail!("cannot delete the main checkout — remove the project instead");
         }
@@ -1272,10 +1474,35 @@ impl Daemon {
             starting_prompt.as_deref(),
             pr_url.is_some() || issue_url.is_some(),
         ) && cloud_prompt.is_none();
-        let worktree = self
+        let requested_worktree = self
             .store
             .get_worktree(&worktree_id)?
             .context("worktree not found")?;
+        let workspace = self
+            .store
+            .session_workspaces()?
+            .into_iter()
+            .find(|workspace| {
+                workspace.worktree_id == worktree_id
+                    || workspace
+                        .repositories
+                        .iter()
+                        .any(|repository| repository.id == worktree_id)
+            });
+        if workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.state != nebula_core::WorkspaceState::Ready)
+        {
+            bail!("session workspace is not ready");
+        }
+        let worktree = match workspace {
+            Some(workspace) if workspace.worktree_id != requested_worktree.id => self
+                .store
+                .get_worktree(&workspace.worktree_id)?
+                .context("session workspace folder not found")?,
+            _ => requested_worktree,
+        };
+        let owning_worktree_id = worktree.id.clone();
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant. A starting prompt rides the
@@ -1299,7 +1526,7 @@ impl Daemon {
                 .as_ref()
                 .map(|e| e.agent_id.clone())
                 .unwrap_or_else(AgentId::generate),
-            worktree_id,
+            worktree_id: owning_worktree_id,
             name: if name.trim().is_empty() {
                 "agent".into()
             } else {
@@ -1452,8 +1679,32 @@ impl Daemon {
             // adopted by another. Custom creates stay cold.
             return Ok(());
         }
+        let workspace = self
+            .store
+            .session_workspaces()?
+            .into_iter()
+            .find(|workspace| {
+                workspace.worktree_id == *worktree_id
+                    || workspace
+                        .repositories
+                        .iter()
+                        .any(|repository| repository.id == *worktree_id)
+            });
+        if workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.state != nebula_core::WorkspaceState::Ready)
+        {
+            return Ok(());
+        }
         let Some(worktree) = self.store.get_worktree(worktree_id)? else {
             return Ok(());
+        };
+        let worktree = match workspace {
+            Some(workspace) if workspace.worktree_id != *worktree_id => self
+                .store
+                .get_worktree(&workspace.worktree_id)?
+                .unwrap_or(worktree),
+            _ => worktree,
         };
         let stale = {
             // One warm slot per key; keep a live, young one with the same
@@ -2188,10 +2439,34 @@ impl Daemon {
         worktree_id: &WorktreeId,
         name: Option<String>,
     ) -> Result<EntityId> {
-        let worktree = self
+        let requested = self
             .store
             .get_worktree(worktree_id)?
             .context("worktree not found")?;
+        let workspace = self
+            .store
+            .session_workspaces()?
+            .into_iter()
+            .find(|workspace| {
+                workspace.worktree_id == *worktree_id
+                    || workspace
+                        .repositories
+                        .iter()
+                        .any(|repository| repository.id == *worktree_id)
+            });
+        if workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.state != nebula_core::WorkspaceState::Ready)
+        {
+            bail!("session workspace is not ready");
+        }
+        let worktree = match workspace {
+            Some(workspace) if workspace.worktree_id != *worktree_id => self
+                .store
+                .get_worktree(&workspace.worktree_id)?
+                .context("session workspace folder not found")?,
+            _ => requested,
+        };
         let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
             let n = self.store.count_terminals(worktree_id).unwrap_or(0);
             format!("term-{}", n + 1)
@@ -2206,6 +2481,25 @@ impl Daemon {
         };
         self.store.insert_terminal(&terminal)?;
         self.spawn_terminal_session(&terminal, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
+        let terminal = match self
+            .store
+            .session_workspaces()?
+            .into_iter()
+            .find(|workspace| {
+                workspace
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.id == *worktree_id)
+            }) {
+            Some(workspace) => {
+                self.store
+                    .set_terminal_worktree(&terminal.id, &workspace.worktree_id)?;
+                let mut updated = terminal;
+                updated.worktree_id = workspace.worktree_id;
+                updated
+            }
+            None => terminal,
+        };
         let mut broadcast_term = terminal.clone();
         broadcast_term.alive = true;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -2255,10 +2549,34 @@ impl Daemon {
         worktree_id: &WorktreeId,
         config: &crate::config::Config,
     ) -> Result<EntityId> {
-        let worktree = self
+        let requested = self
             .store
             .get_worktree(worktree_id)?
             .context("worktree not found")?;
+        let workspace = self
+            .store
+            .session_workspaces()?
+            .into_iter()
+            .find(|workspace| {
+                workspace.worktree_id == *worktree_id
+                    || workspace
+                        .repositories
+                        .iter()
+                        .any(|repository| repository.id == *worktree_id)
+            });
+        if workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.state != nebula_core::WorkspaceState::Ready)
+        {
+            bail!("session workspace is not ready");
+        }
+        let worktree = match workspace {
+            Some(workspace) if workspace.worktree_id != *worktree_id => self
+                .store
+                .get_worktree(&workspace.worktree_id)?
+                .context("session workspace folder not found")?,
+            _ => requested,
+        };
         // Held across the check and the spawn, like `ensure_session`: two
         // presses racing must produce one run, not two.
         let _gate = self.spawn_gate.lock().unwrap();
@@ -2407,6 +2725,30 @@ impl Daemon {
                     .store
                     .get_worktree(&agent.worktree_id)?
                     .context("worktree not found")?;
+                let workspace = self
+                    .store
+                    .session_workspaces()?
+                    .into_iter()
+                    .find(|workspace| {
+                        workspace.worktree_id == agent.worktree_id
+                            || workspace
+                                .repositories
+                                .iter()
+                                .any(|repository| repository.id == agent.worktree_id)
+                    });
+                if workspace
+                    .as_ref()
+                    .is_some_and(|workspace| workspace.state != nebula_core::WorkspaceState::Ready)
+                {
+                    bail!("session workspace is not ready");
+                }
+                let worktree = match workspace {
+                    Some(workspace) if workspace.worktree_id != agent.worktree_id => self
+                        .store
+                        .get_worktree(&workspace.worktree_id)?
+                        .context("session workspace folder not found")?,
+                    _ => worktree,
+                };
                 let session = self.spawn_agent_session(&agent, &worktree, cols, rows)?;
                 let mut broadcast_agent = agent;
                 broadcast_agent.alive = true;
@@ -2431,6 +2773,30 @@ impl Daemon {
                     .store
                     .get_worktree(&term.worktree_id)?
                     .context("worktree not found")?;
+                let workspace = self
+                    .store
+                    .session_workspaces()?
+                    .into_iter()
+                    .find(|workspace| {
+                        workspace.worktree_id == term.worktree_id
+                            || workspace
+                                .repositories
+                                .iter()
+                                .any(|repository| repository.id == term.worktree_id)
+                    });
+                if workspace
+                    .as_ref()
+                    .is_some_and(|workspace| workspace.state != nebula_core::WorkspaceState::Ready)
+                {
+                    bail!("session workspace is not ready");
+                }
+                let worktree = match workspace {
+                    Some(workspace) if workspace.worktree_id != term.worktree_id => self
+                        .store
+                        .get_worktree(&workspace.worktree_id)?
+                        .context("session workspace folder not found")?,
+                    _ => worktree,
+                };
                 let session = self.spawn_terminal_session(&term, &worktree, cols, rows)?;
                 let mut broadcast_term = term;
                 broadcast_term.alive = true;
