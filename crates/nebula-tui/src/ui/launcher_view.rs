@@ -1082,8 +1082,25 @@ fn draw_empty_band(
     let Some(placed) = crate::launcher::place(window, scroll, row) else {
         return;
     };
-    let mut text = String::from(EMPTY_BAND_HINT);
-    if !band.is_main {
+    let unavailable = band
+        .workspace_state
+        .filter(|state| *state != nebula_core::WorkspaceState::Ready);
+    let mut text = match unavailable {
+        Some(state) => format!(
+            "{} · {}",
+            match state {
+                nebula_core::WorkspaceState::Creating => "creating workspace".to_string(),
+                nebula_core::WorkspaceState::Unavailable => "unavailable".to_string(),
+                nebula_core::WorkspaceState::Closing => "closing workspace".to_string(),
+                nebula_core::WorkspaceState::Ready => unreachable!(),
+            },
+            band.workspace_failure
+                .as_deref()
+                .unwrap_or("launch disabled"),
+        ),
+        None => EMPTY_BAND_HINT.to_string(),
+    };
+    if !band.is_main && unavailable.is_none() {
         text.push_str(EMPTY_BAND_DELETE);
     }
     let fg = if lit { th.accent } else { th.dim };
@@ -1770,6 +1787,12 @@ fn draw_band_rule(
         format!("{} · {}", label, band.repositories.join(", "))
     } else {
         label
+    };
+    let label = match band.workspace_state {
+        Some(nebula_core::WorkspaceState::Creating) => format!("{label} · creating"),
+        Some(nebula_core::WorkspaceState::Unavailable) => format!("{label} · unavailable"),
+        Some(nebula_core::WorkspaceState::Closing) => format!("{label} · closing"),
+        Some(nebula_core::WorkspaceState::Ready) | None => label,
     };
     let branch = truncate(&label, room.saturating_sub(glyph.chars().count() + taken));
     // The rule's left end: `──` like every other band's, or the CURSOR
@@ -4965,6 +4988,8 @@ mod tests {
             worktree: WorktreeId("w1".into()),
             branch: branch.into(),
             workspace_name: None,
+            workspace_state: None,
+            workspace_failure: None,
             repositories: Vec::new(),
             is_main,
             pr: None,

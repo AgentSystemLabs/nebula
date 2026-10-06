@@ -232,6 +232,8 @@ pub struct Band {
     pub worktree: WorktreeId,
     pub branch: String,
     pub workspace_name: Option<String>,
+    pub workspace_state: Option<nebula_core::WorkspaceState>,
+    pub workspace_failure: Option<String>,
     pub repositories: Vec<String>,
     /// The checkout is the project's ROOT WORKTREE (`⌂`).
     pub is_main: bool,
@@ -323,6 +325,8 @@ pub fn bands(app: &App) -> Vec<Band> {
             } else {
                 session_workspace.map(|workspace| workspace.name.clone())
             },
+            workspace_state: session_workspace.map(|workspace| workspace.state),
+            workspace_failure: session_workspace.and_then(|workspace| workspace.failure.clone()),
             repositories: if w.is_main {
                 app.tree
                     .repositories

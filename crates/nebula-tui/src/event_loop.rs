@@ -7270,6 +7270,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         worktree_id: placeholder.clone(),
                         name: name.clone(),
                         state: nebula_core::WorkspaceState::Creating,
+                        failure: None,
                         repositories: Vec::new(),
                     });
             }
@@ -8875,6 +8876,28 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
     // may have gone on to work somewhere else while the checkout was cut.
     if draft.placeholder.is_none() {
         worked_in(app, &draft.worktree);
+    }
+    if let Some(workspace) = app.tree.session_workspaces.iter().find(|workspace| {
+        workspace.worktree_id == draft.worktree
+            || workspace
+                .repositories
+                .iter()
+                .any(|repository| repository.id == draft.worktree)
+    }) {
+        if workspace.state != nebula_core::WorkspaceState::Ready {
+            app.flash = Some(workspace.failure.clone().unwrap_or_else(|| {
+                format!(
+                    "session workspace is {}",
+                    match workspace.state {
+                        nebula_core::WorkspaceState::Creating => "still being created",
+                        nebula_core::WorkspaceState::Unavailable => "unavailable",
+                        nebula_core::WorkspaceState::Closing => "closing",
+                        nebula_core::WorkspaceState::Ready => unreachable!(),
+                    }
+                )
+            }));
+            return;
+        }
     }
     // A stand-in checkout is not a place the DAEMON knows. A launch that
     // made it (a QUICK PROMPT's, a PR SESSION's) follows on its own Ack;
@@ -10655,6 +10678,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     worktree_id: workspace.id.clone(),
                     name: workspace.branch.trim_start_matches("pilot/").to_string(),
                     state: nebula_core::WorkspaceState::Ready,
+                    failure: None,
                     repositories: repositories.clone(),
                 });
             let meta_name = workspace.branch.trim_start_matches("pilot/").to_string();
@@ -10694,6 +10718,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                             worktree_id: workspace.id.clone(),
                             name: meta_name,
                             state: nebula_core::WorkspaceState::Ready,
+                            failure: None,
                             repositories: repositories.clone(),
                         });
                     crate::event_loop::quick_launch::launch_in_created_session_workspace(
@@ -10717,6 +10742,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                             worktree_id: workspace.id,
                             name: meta_name,
                             state: nebula_core::WorkspaceState::Ready,
+                            failure: None,
                             repositories: repositories.clone(),
                         });
                     app.flash = Some(format!(
@@ -11139,6 +11165,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     app.tree
                         .worktrees
                         .retain(|worktree| worktree.id != placeholder);
+                    app.tree
+                        .session_workspaces
+                        .retain(|workspace| workspace.worktree_id != placeholder);
                     open_prompt(app, PromptKind::NewSessionWorkspace { project });
                     if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
                         if let Some((_, name)) = message.split_once('`') {
@@ -11158,6 +11187,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     app.tree
                         .worktrees
                         .retain(|worktree| worktree.id != placeholder);
+                    app.tree
+                        .session_workspaces
+                        .retain(|workspace| workspace.worktree_id != placeholder);
                     reopen_prompt_with(app, PromptKind::QuickPrompt(launch), text);
                     app.flash = Some(message.clone());
                 }
@@ -31012,6 +31044,7 @@ diff --git a/src/c.rs b/src/c.rs
                     worktree_id: WorktreeId("workspace-feature".into()),
                     name: "feature".into(),
                     state: nebula_core::WorkspaceState::Ready,
+                    failure: None,
                     repositories: vec![
                         nebula_core::WorkspaceRepository {
                             id: WorktreeId("w-api".into()),

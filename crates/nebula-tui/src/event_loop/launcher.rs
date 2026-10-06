@@ -88,9 +88,46 @@ pub(super) const UNAIMED: &str = "nothing selected — j/k or a click picks a ca
 /// on the card) — so which of the worktree's cards the cursor last
 /// rested on does not matter, only which worktree.
 pub(super) fn open_box(app: &mut App) {
+    if !selected_workspace_is_ready(app) {
+        return;
+    }
     if let Some(launch) = box_launch(app) {
         crate::quick_prompt::open_box(app, launch);
     }
+}
+
+fn selected_workspace_is_ready(app: &mut App) -> bool {
+    let Some(selected) = app.selected_worktree() else {
+        return true;
+    };
+    let Some(workspace) = app.tree.session_workspaces.iter().find(|workspace| {
+        workspace.worktree_id == selected.id
+            || workspace
+                .repositories
+                .iter()
+                .any(|repository| repository.id == selected.id)
+    }) else {
+        return true;
+    };
+    if workspace.state == nebula_core::WorkspaceState::Ready {
+        return true;
+    }
+    app.flash = Some(
+        workspace
+            .failure
+            .clone()
+            .unwrap_or_else(|| match workspace.state {
+                nebula_core::WorkspaceState::Creating => {
+                    "session workspace is still being created".into()
+                }
+                nebula_core::WorkspaceState::Unavailable => {
+                    "session workspace is unavailable".into()
+                }
+                nebula_core::WorkspaceState::Closing => "session workspace is closing".into(),
+                nebula_core::WorkspaceState::Ready => unreachable!(),
+            }),
+    );
+    false
 }
 
 /// `n`: the NEW SESSION PICKER first — which harness, `→` its model and
@@ -100,6 +137,9 @@ pub(super) fn open_box(app: &mut App) {
 /// OPENS the box rather than launching, and Esc closes the picker and
 /// opens nothing. The cursor starts on the harness `p` would have used.
 pub(super) fn open_new_session(app: &mut App) {
+    if !selected_workspace_is_ready(app) {
+        return;
+    }
     let Some(launch) = box_launch(app) else {
         return;
     };
@@ -641,6 +681,9 @@ pub(super) fn show_created_terminal(app: &mut App) {
 /// for a terminal: the key, and an EMPTY BAND's **New terminal**, are
 /// how one opens.
 pub(super) fn new_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if !selected_workspace_is_ready(app) {
+        return;
+    }
     if !app.launcher_unaimed && app.selected_worktree().is_some() {
         super::create_terminal_for_context(app, out);
         return;

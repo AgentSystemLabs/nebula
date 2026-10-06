@@ -31,7 +31,7 @@ use std::time::Duration;
 /// The state-file format this build writes, and the newest it reads. A
 /// daemon only restarts onto a binary whose `_restart-version` is at least
 /// its own, so a change that an older reader could misread bumps this.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// A request older than this is a leftover, not a client still waiting.
 const REQUEST_MAX_AGE_MS: i64 = 60_000;

@@ -165,6 +165,8 @@ pub struct SessionWorkspace {
     pub worktree_id: WorktreeId,
     pub name: String,
     pub state: WorkspaceState,
+    /// Why creation or cleanup left this workspace unavailable.
+    pub failure: Option<String>,
     pub repositories: Vec<WorkspaceRepository>,
 }
 

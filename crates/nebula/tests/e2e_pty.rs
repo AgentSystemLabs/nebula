@@ -5288,6 +5288,360 @@ async fn session_workspace_creation_builds_all_repository_worktrees() {
     wait_for_exit(&mut restarted);
 }
 
+/// A repository that disappears after registration makes grouped creation
+/// fail after the earlier checkout was built; that earlier branch and
+/// worktree are rolled back and the error identifies the failed member.
+#[tokio::test]
+async fn failed_session_workspace_creation_cleans_up_prior_repositories() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let first = folder.join("alpha");
+    let second = folder.join("beta");
+    make_repo_at(&first);
+    make_repo_at(&second);
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+
+    // Keep the registration valid, then make the second repository fail
+    // deterministically only after alpha's worktree has been created.
+    std::fs::rename(&second, folder.join("beta-missing")).unwrap();
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "failed-create".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let failed = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        find_ack(events, 2).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&failed, 2), Some(ServerEvent::Error { message, .. }) if message.contains("beta")),
+        "failure should identify beta: {failed:#?}"
+    );
+    assert!(!folder.join("worktrees/failed-create/alpha").exists());
+    assert!(
+        !git_output(&first, &["branch", "--list", "pilot/failed-create"])
+            .contains("pilot/failed-create")
+    );
+    assert!(!folder.join("worktrees/failed-create").exists());
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+#[tokio::test]
+async fn interrupted_workspace_creation_stays_creating_and_rejects_spawns() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let first = folder.join("alpha");
+    let second = folder.join("beta");
+    make_repo_at(&first);
+    make_repo_at(&second);
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+    let hook = env.tmp.path().join("blocking-hook.sh");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 30\n").unwrap();
+    make_executable(&hook);
+    git_run(
+        &first,
+        &[
+            "config",
+            "nebula.worktreeCreateHook",
+            hook.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "interrupted".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let creating = read_events_until(&mut client, SLOW_TIMEOUT, |events| events.iter().any(|event| matches!(event, ServerEvent::SessionWorkspaceUpserted { workspace } if workspace.state == nebula_core::WorkspaceState::Creating && workspace.name == "interrupted"))).await;
+    let Some(ServerEvent::SessionWorkspaceUpserted { workspace }) = creating.iter().find(|event| matches!(event, ServerEvent::SessionWorkspaceUpserted { workspace } if workspace.state == nebula_core::WorkspaceState::Creating && workspace.name == "interrupted")) else {
+        panic!("creating workspace state was not emitted: {creating:#?}");
+    };
+    assert_eq!(workspace.state, nebula_core::WorkspaceState::Creating);
+    let workspace_id = workspace.worktree_id.clone();
+    assert!(workspace.repositories.is_empty());
+
+    // The request arrives while the durable workspace is still creating.
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateAgent {
+            req_id: 3,
+            worktree: workspace_id.clone(),
+            name: "should-not-start".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let refused = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 3).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&refused, 3), Some(ServerEvent::Error { message, .. }) if message.contains("not ready")),
+        "{refused:#?}"
+    );
+
+    // Restart must preserve the persisted lifecycle rather than making the
+    // interrupted workspace launchable by default.
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    let snapshot = subscribe(&mut client).await;
+    let Some(ServerEvent::Snapshot {
+        session_workspaces, ..
+    }) = snapshot
+        .iter()
+        .find(|event| matches!(event, ServerEvent::Snapshot { .. }))
+    else {
+        panic!("snapshot missing");
+    };
+    assert!(session_workspaces
+        .iter()
+        .any(|saved| saved.worktree_id == workspace_id
+            && saved.state == nebula_core::WorkspaceState::Unavailable
+            && saved
+                .failure
+                .as_deref()
+                .is_some_and(|reason| reason.contains("interrupted"))));
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateAgent {
+            req_id: 4,
+            worktree: workspace_id,
+            name: "still-not-start".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let refused = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 4).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&refused, 4), Some(ServerEvent::Error { message, .. }) if message.contains("not ready")),
+        "{refused:#?}"
+    );
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+#[tokio::test]
+async fn cleanup_failure_persists_unavailable_workspace_and_leftover_path() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let first = folder.join("alpha");
+    let second = folder.join("beta");
+    make_repo_at(&first);
+    make_repo_at(&second);
+    let hook = env.tmp.path().join("leftover-hook.sh");
+    std::fs::write(&hook, "#!/bin/sh\ntouch \"$2/../leftover.txt\"\n").unwrap();
+    make_executable(&hook);
+    git_run(
+        &first,
+        &[
+            "config",
+            "nebula.worktreeCreateHook",
+            hook.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+    // A later checkout fails after alpha's create hook leaves an extra
+    // workspace-level file that Nebula must not delete during rollback.
+    std::fs::rename(&second, folder.join("beta-missing")).unwrap();
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "cannot-clean".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        find_ack(events, 2).is_some()
+            && events.iter().any(|event| matches!(event, ServerEvent::SessionWorkspaceUpserted { workspace } if workspace.state == nebula_core::WorkspaceState::Unavailable))
+    }).await;
+    let Some(ServerEvent::Error { message, .. }) = find_ack(&events, 2) else {
+        panic!("expected failed create");
+    };
+    assert!(
+        message.contains("beta") && message.contains("leftovers"),
+        "{message}"
+    );
+    let Some(ServerEvent::SessionWorkspaceUpserted { workspace }) = events.iter().find(|event| matches!(event, ServerEvent::SessionWorkspaceUpserted { workspace } if workspace.state == nebula_core::WorkspaceState::Unavailable)) else {
+        panic!("unavailable workspace was not broadcast: {events:#?}");
+    };
+    let workspace_id = workspace.worktree_id.clone();
+    assert_eq!(workspace.state, nebula_core::WorkspaceState::Unavailable);
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateAgent {
+            req_id: 3,
+            worktree: workspace_id.clone(),
+            name: "must-not-launch".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let refused = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 3).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&refused, 3), Some(ServerEvent::Error { message, .. }) if message.contains("not ready")),
+        "{refused:#?}"
+    );
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    let snapshot = subscribe(&mut client).await;
+    let Some(ServerEvent::Snapshot {
+        session_workspaces, ..
+    }) = snapshot
+        .iter()
+        .find(|event| matches!(event, ServerEvent::Snapshot { .. }))
+    else {
+        panic!("snapshot missing");
+    };
+    assert!(session_workspaces
+        .iter()
+        .any(|saved| saved.worktree_id == workspace_id
+            && saved.state == nebula_core::WorkspaceState::Unavailable
+            && saved
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("leftovers"))));
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 #[tokio::test]
 async fn session_workspace_branch_conflict_is_checked_across_all_members_first() {
     let env = TestEnv::new();

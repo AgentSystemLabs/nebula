@@ -150,6 +150,7 @@ pub(super) fn submit(
                         worktree_id: placeholder.clone(),
                         name: name.clone(),
                         state: nebula_core::WorkspaceState::Creating,
+                        failure: None,
                         repositories: Vec::new(),
                     });
             }

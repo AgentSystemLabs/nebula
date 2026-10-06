@@ -14,7 +14,7 @@ use nebula_core::project_file::{self, ProjectCommand};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, LinkId, PrewarmInfo,
     Project, ProjectId, ProjectRepository, ServerEvent, SessionRef, TerminalId, TerminalTab,
-    Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    WorkspaceState, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1077,10 +1077,32 @@ impl Daemon {
 
         let mut report = Vec::with_capacity(members.len());
         let mut roots = Vec::with_capacity(members.len());
+        let workspace = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project_id.clone(),
+            path: folder.clone(),
+            branch: branch.clone(),
+            is_main: false,
+            sort_order: self.store.next_worktree_sort_order(project_id)?,
+        };
+        let mut metadata = nebula_core::SessionWorkspace {
+            worktree_id: workspace.id.clone(),
+            name: name.to_string(),
+            state: WorkspaceState::Creating,
+            failure: None,
+            repositories: vec![],
+        };
+        self.store.insert_session_workspace(&workspace, &metadata)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Worktree(workspace.clone()),
+        });
+        self.broadcast(ServerEvent::SessionWorkspaceUpserted {
+            workspace: metadata.clone(),
+        });
         let config = crate::config::Config::load();
         for member in members {
             let destination = folder.join(&member.name);
-            let creation = git::add_worktree_at(
+            let creation = match git::add_worktree_at(
                 &member.path,
                 &branch,
                 &destination,
@@ -1088,7 +1110,62 @@ impl Daemon {
                 true,
             )
             .await
-            .with_context(|| format!("repository `{}`: create {branch}", member.name))?;
+            {
+                Ok(creation) => creation,
+                Err(error) => {
+                    let message =
+                        format!("repository `{}`: create {branch}: {error:#}", member.name);
+                    let mut attempted = report.clone();
+                    attempted.push(nebula_core::WorkspaceRepository {
+                        id: WorktreeId::generate(),
+                        name: member.name.clone(),
+                        path: destination.clone(),
+                        base: None,
+                        fetch_succeeded: false,
+                        warning: None,
+                    });
+                    let (leftovers, remaining) = self
+                        .rollback_session_workspace(&workspace, &attempted)
+                        .await;
+                    if leftovers.is_empty() {
+                        self.store.delete_session_workspace(&workspace.id)?;
+                        self.broadcast(ServerEvent::EntityRemoved {
+                            id: EntityId::Worktree(workspace.id.clone()),
+                        });
+                        return Err(anyhow::anyhow!(message));
+                    }
+                    let failure = format!(
+                        "{message}; cleanup failed; leftovers: {}",
+                        leftovers.join(", ")
+                    );
+                    metadata.repositories = attempted
+                        .into_iter()
+                        .filter(|repository| {
+                            remaining.iter().any(|leftover| {
+                                leftover.contains(&repository.path.display().to_string())
+                            }) || remaining.iter().any(|leftover| {
+                                leftover.contains(&repository.name)
+                                    && !leftover.starts_with("leftover path ")
+                            })
+                        })
+                        .collect();
+                    metadata.state = WorkspaceState::Unavailable;
+                    metadata.failure = Some(failure.clone());
+                    self.store.set_session_workspace_state(
+                        &workspace.id,
+                        WorkspaceState::Unavailable,
+                        Some(&failure),
+                    )?;
+                    let _ = self.store.update_session_workspace_repositories(
+                        &workspace.id,
+                        &metadata.repositories,
+                    );
+                    self.broadcast(ServerEvent::SessionWorkspaceUpserted {
+                        workspace: metadata,
+                    });
+                    return Err(anyhow::anyhow!(failure));
+                }
+            };
             let root = Worktree {
                 id: WorktreeId::generate(),
                 project_id: project_id.clone(),
@@ -1097,6 +1174,24 @@ impl Daemon {
                 is_main: false,
                 sort_order: 0,
             };
+            let mut repository = nebula_core::WorkspaceRepository {
+                id: root.id.clone(),
+                name: member.name.clone(),
+                path: destination.clone(),
+                base: creation.base,
+                fetch_succeeded: creation.fetch_succeeded,
+                warning: None,
+            };
+            // Persist the new member before running hooks, so a daemon
+            // interruption during a slow hook can still diagnose and gate it.
+            self.store.insert_workspace_repository(
+                &workspace.id,
+                project_id,
+                &branch,
+                &repository,
+            )?;
+            report.push(repository.clone());
+            roots.push(root.clone());
             let warning = worktree_hooks::run(
                 WorktreeHook::Create,
                 HookContext {
@@ -1117,35 +1212,25 @@ impl Daemon {
             if let Some(warning) = &warning {
                 self.warn_clients(warning.clone());
             }
-            report.push(nebula_core::WorkspaceRepository {
-                id: root.id.clone(),
-                name: member.name,
-                path: destination,
-                base: creation.base,
-                fetch_succeeded: creation.fetch_succeeded,
-                warning,
-            });
-            roots.push(root);
+            if let Some(warning) = warning {
+                repository.warning = Some(warning);
+                self.store.update_workspace_repository_warning(
+                    &workspace.id,
+                    &repository.id,
+                    repository.warning.as_deref(),
+                )?;
+                if let Some(saved) = report.last_mut() {
+                    saved.warning = repository.warning.clone();
+                }
+            }
         }
 
-        let workspace = Worktree {
-            id: WorktreeId::generate(),
-            project_id: project_id.clone(),
-            path: folder,
-            branch,
-            is_main: false,
-            sort_order: self.store.next_worktree_sort_order(project_id)?,
-        };
-        let metadata = nebula_core::SessionWorkspace {
-            worktree_id: workspace.id.clone(),
-            name: name.to_string(),
-            state: nebula_core::WorkspaceState::Ready,
-            repositories: report.clone(),
-        };
-        self.store.insert_session_workspace(&workspace, &metadata)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Worktree(workspace.clone()),
-        });
+        metadata.state = WorkspaceState::Ready;
+        metadata.repositories = report.clone();
+        self.store
+            .update_session_workspace_repositories(&workspace.id, &report)?;
+        self.store
+            .set_session_workspace_state(&workspace.id, WorkspaceState::Ready, None)?;
         for root in roots {
             self.broadcast(ServerEvent::EntityUpserted {
                 entity: Entity::Worktree(root),
@@ -1156,6 +1241,90 @@ impl Daemon {
         });
         self.sync_workspace_member_order(project_id, &workspace.id)?;
         Ok((workspace, report))
+    }
+
+    async fn rollback_session_workspace(
+        &self,
+        workspace: &Worktree,
+        repositories: &[nebula_core::WorkspaceRepository],
+    ) -> (Vec<String>, Vec<String>) {
+        let mut leftovers = Vec::new();
+        let mut remaining = Vec::new();
+        for repository in repositories.iter().rev() {
+            let project_repo = self
+                .store
+                .project_repositories(&workspace.project_id)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|member| member.name == repository.name);
+            let Some(project_repo) = project_repo else {
+                leftovers.push(format!(
+                    "{} ({})",
+                    repository.name,
+                    repository.path.display()
+                ));
+                remaining.push(format!(
+                    "{} ({})",
+                    repository.name,
+                    repository.path.display()
+                ));
+                continue;
+            };
+            if repository.path.exists() {
+                if let Err(error) =
+                    git::remove_worktree(&project_repo.path, &repository.path, true).await
+                {
+                    leftovers.push(format!(
+                        "{} ({}): {error:#}",
+                        repository.name,
+                        repository.path.display()
+                    ));
+                    remaining.push(format!(
+                        "{} ({})",
+                        repository.name,
+                        repository.path.display()
+                    ));
+                    continue;
+                }
+            }
+            // Preflight proved this branch absent in every member before
+            // creation started, so any matching ref is owned by this attempt,
+            // including a git add that failed after creating its branch.
+            if git::branch_exists(&project_repo.path, &workspace.branch).await {
+                if let Err(error) = git::delete_branch(&project_repo.path, &workspace.branch).await
+                {
+                    leftovers.push(format!(
+                        "{} branch {}: {error:#}",
+                        repository.name, workspace.branch
+                    ));
+                    remaining.push(format!("{} branch {}", repository.name, workspace.branch));
+                    continue;
+                }
+            }
+            let _ = self.store.delete_workspace_repository(&repository.id);
+            let _ = self.store.delete_worktree(&repository.id);
+        }
+        let _ = self
+            .store
+            .update_session_workspace_repositories(&workspace.id, repositories);
+        if leftovers.is_empty() {
+            match std::fs::remove_dir(&workspace.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    leftovers.push(format!(
+                        "workspace folder {}: {error}",
+                        workspace.path.display()
+                    ));
+                    if let Ok(entries) = std::fs::read_dir(&workspace.path) {
+                        for entry in entries.flatten() {
+                            leftovers.push(format!("leftover path {}", entry.path().display()));
+                        }
+                    }
+                }
+            }
+        }
+        (leftovers, remaining)
     }
 
     fn sync_workspace_member_order(
@@ -1187,9 +1356,17 @@ impl Daemon {
     }
 
     pub fn session_workspace_ready(&self, id: &WorktreeId) -> Result<bool> {
-        Ok(self.store.session_workspaces()?.iter().any(|workspace| {
-            &workspace.worktree_id == id && workspace.state == nebula_core::WorkspaceState::Ready
-        }))
+        let workspaces = self.store.session_workspaces()?;
+        Ok(workspaces
+            .iter()
+            .find(|workspace| {
+                &workspace.worktree_id == id
+                    || workspace
+                        .repositories
+                        .iter()
+                        .any(|repository| &repository.id == id)
+            })
+            .is_none_or(|workspace| workspace.state == WorkspaceState::Ready))
     }
 
     /// The checkout every PR SESSION for pull request `number` runs in: the
@@ -1500,7 +1677,15 @@ impl Daemon {
             .as_ref()
             .is_some_and(|workspace| workspace.state != nebula_core::WorkspaceState::Ready)
         {
-            bail!("session workspace is not ready");
+            let workspace = workspace.as_ref().unwrap();
+            bail!(
+                "session workspace is not ready{}",
+                workspace
+                    .failure
+                    .as_ref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            );
         }
         let worktree = match workspace {
             Some(workspace) if workspace.worktree_id != requested_worktree.id => self
@@ -1678,6 +1863,9 @@ impl Daemon {
         effort: Option<String>,
     ) -> Result<()> {
         if !crate::config::Config::load().prewarm_agents {
+            return Ok(());
+        }
+        if !self.session_workspace_ready(worktree_id)? {
             return Ok(());
         }
         if kind == AgentKind::Custom {
@@ -2378,6 +2566,9 @@ impl Daemon {
             .store
             .get_worktree(&agent.worktree_id)?
             .context("worktree not found")?;
+        if !self.session_workspace_ready(&agent.worktree_id)? {
+            bail!("session workspace is not ready");
+        }
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
         let mut broadcast_agent = agent.clone();
@@ -2453,6 +2644,9 @@ impl Daemon {
         worktree_id: &WorktreeId,
         name: Option<String>,
     ) -> Result<EntityId> {
+        if !self.session_workspace_ready(worktree_id)? {
+            bail!("session workspace is not ready");
+        }
         let requested = self
             .store
             .get_worktree(worktree_id)?
@@ -2584,6 +2778,9 @@ impl Daemon {
         repository_name: Option<&str>,
         config: &crate::config::Config,
     ) -> Result<EntityId> {
+        if !self.session_workspace_ready(worktree_id)? {
+            bail!("session workspace is not ready");
+        }
         let requested = self
             .store
             .get_worktree(worktree_id)?
@@ -2804,6 +3001,17 @@ impl Daemon {
         if let Some(s) = self.session(sref) {
             return Ok(s);
         }
+        if let Some(worktree_id) = match sref {
+            SessionRef::Agent(id) => self.store.get_agent(id)?.map(|agent| agent.worktree_id),
+            SessionRef::Terminal(id) => self
+                .store
+                .get_terminal(id)?
+                .map(|terminal| terminal.worktree_id),
+        } {
+            if !self.session_workspace_ready(&worktree_id)? {
+                bail!("session workspace is not ready");
+            }
+        }
         // Hold the gate across the whole check-and-install: an Attach and the
         // prewarm sweep racing the same dead session must produce one CLI,
         // not two. Re-check under it — the winner installed while we waited.
@@ -2927,6 +3135,9 @@ impl Daemon {
         if !crate::config::Config::load().prewarm_sessions {
             return;
         }
+        if !self.session_workspace_ready(worktree_id).unwrap_or(false) {
+            return;
+        }
         let daemon = self.clone();
         let worktree_id = worktree_id.clone();
         let handle = tokio::spawn(async move {
@@ -2949,6 +3160,14 @@ impl Daemon {
         cols: u16,
         rows: u16,
     ) {
+        if !self.session_workspace_ready(worktree_id).unwrap_or(false)
+            && self
+                .store
+                .is_session_workspace(worktree_id)
+                .unwrap_or(false)
+        {
+            return;
+        }
         let Ok((_, _, agents, terminals)) = self.store.load_tree() else {
             return;
         };
@@ -5541,6 +5760,7 @@ mod tests {
             worktree_id: workspace_id.clone(),
             name: "feature".into(),
             state: nebula_core::WorkspaceState::Ready,
+            failure: None,
             repositories: vec![repository],
         };
         daemon

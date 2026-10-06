@@ -103,6 +103,7 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
     );
 
     let store = std::sync::Arc::new(store::Store::open(&paths::db_path())?);
+    store.mark_interrupted_session_workspaces_unavailable()?;
     // Agents persisted as live had their PTYs die with the previous daemon —
     // all but those an IN-PLACE RESTART carried over.
     let carried_agents = carry

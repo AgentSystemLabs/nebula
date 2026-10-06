@@ -486,6 +486,13 @@ pub async fn branch_exists(repo: &Path, name: &str) -> bool {
     })
 }
 
+/// Delete a branch created by a failed grouped-workspace attempt. Callers
+/// must only use this for branches proven absent before that attempt.
+pub async fn delete_branch(repo: &Path, name: &str) -> Result<()> {
+    git(repo, &["branch", "-D", name]).await?;
+    Ok(())
+}
+
 /// Refresh configured remotes before a grouped operation validates all
 /// branch conflicts. Failure remains a usable offline condition; the caller
 /// still checks every cached remote-tracking ref.

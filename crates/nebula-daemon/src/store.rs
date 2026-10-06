@@ -14,6 +14,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+fn workspace_state_str(state: nebula_core::WorkspaceState) -> &'static str {
+    match state {
+        nebula_core::WorkspaceState::Creating => "creating",
+        nebula_core::WorkspaceState::Ready => "ready",
+        nebula_core::WorkspaceState::Unavailable => "unavailable",
+        nebula_core::WorkspaceState::Closing => "closing",
+    }
+}
+
 const MIGRATIONS: &[&str] = &[
     // 1: initial schema
     "
@@ -374,6 +383,13 @@ const MIGRATIONS: &[&str] = &[
       UNIQUE (id)
     );
     ",
+    // 31: durable lifecycle and failure detail. A daemon killed during
+    // grouped creation leaves the workspace visibly creating and unlaunchable.
+    "
+    ALTER TABLE session_workspaces ADD COLUMN state TEXT NOT NULL DEFAULT 'unavailable';
+    ALTER TABLE session_workspaces ADD COLUMN failure TEXT;
+    UPDATE session_workspaces SET state = CASE WHEN ready != 0 THEN 'ready' ELSE 'unavailable' END;
+    ",
 ];
 
 pub struct Store {
@@ -502,18 +518,21 @@ impl Store {
     pub fn session_workspaces(&self) -> Result<Vec<nebula_core::SessionWorkspace>> {
         let conn = self.conn.lock().unwrap();
         let roots = conn
-            .prepare("SELECT worktree_id, name, ready FROM session_workspaces ORDER BY name")?
+            .prepare(
+                "SELECT worktree_id, name, state, failure FROM session_workspaces ORDER BY name",
+            )?
             .query_map([], |row| {
                 Ok((
                     WorktreeId(row.get(0)?),
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         roots
             .into_iter()
-            .map(|(worktree_id, name, ready)| {
+            .map(|(worktree_id, name, state, failure)| {
                 let repositories = conn
                     .prepare("SELECT id, name, path, base, fetch_succeeded, warning FROM workspace_repositories WHERE worktree_id = ?1 ORDER BY name")?
                     .query_map(params![worktree_id.as_str()], |row| {
@@ -530,7 +549,13 @@ impl Store {
                 Ok(nebula_core::SessionWorkspace {
                     worktree_id,
                     name,
-                    state: if ready { nebula_core::WorkspaceState::Ready } else { nebula_core::WorkspaceState::Unavailable },
+                    state: match state.as_str() {
+                        "creating" => nebula_core::WorkspaceState::Creating,
+                        "ready" => nebula_core::WorkspaceState::Ready,
+                        "closing" => nebula_core::WorkspaceState::Closing,
+                        _ => nebula_core::WorkspaceState::Unavailable,
+                    },
+                    failure,
                     repositories,
                 })
             })
@@ -559,11 +584,12 @@ impl Store {
             params![root.id.as_str(), root.project_id.as_str(), root.path.to_string_lossy(), root.branch, now_ms()],
         )?;
         tx.execute(
-            "INSERT INTO session_workspaces (worktree_id, name, ready) VALUES (?1, ?2, ?3)",
+            "INSERT INTO session_workspaces (worktree_id, name, ready, state) VALUES (?1, ?2, ?3, ?4)",
             params![
                 workspace.worktree_id.as_str(),
                 workspace.name,
-                (workspace.state == nebula_core::WorkspaceState::Ready) as i64
+                (workspace.state == nebula_core::WorkspaceState::Ready) as i64,
+                workspace_state_str(workspace.state)
             ],
         )?;
         for repository in &workspace.repositories {
@@ -582,10 +608,102 @@ impl Store {
 
     pub fn set_session_workspace_ready(&self, id: &WorktreeId, ready: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "UPDATE session_workspaces SET ready = ?2 WHERE worktree_id = ?1",
-            params![id.as_str(), ready as i64],
+            "UPDATE session_workspaces SET ready = ?2, state = ?3 WHERE worktree_id = ?1",
+            params![
+                id.as_str(),
+                ready as i64,
+                if ready { "ready" } else { "unavailable" }
+            ],
         )?;
         Ok(())
+    }
+
+    pub fn set_session_workspace_state(
+        &self,
+        id: &WorktreeId,
+        state: nebula_core::WorkspaceState,
+        failure: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE session_workspaces SET ready = ?2, state = ?3, failure = ?4 WHERE worktree_id = ?1",
+            params![
+                id.as_str(),
+                (state == nebula_core::WorkspaceState::Ready) as i64,
+                workspace_state_str(state),
+                failure,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_interrupted_session_workspaces_unavailable(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE session_workspaces SET ready = 0, state = 'unavailable', failure = 'creation interrupted by daemon restart; inspect workspace folder' WHERE state = 'creating'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_workspace_repository(
+        &self,
+        workspace_id: &WorktreeId,
+        project_id: &ProjectId,
+        branch: &str,
+        repository: &nebula_core::WorkspaceRepository,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+            params![repository.id.as_str(), project_id.as_str(), repository.path.to_string_lossy(), branch, now_ms()],
+        )?;
+        tx.execute(
+            "INSERT INTO workspace_repositories (worktree_id, id, name, path, base, fetch_succeeded, warning) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![workspace_id.as_str(), repository.id.as_str(), repository.name, repository.path.to_string_lossy(), repository.base, repository.fetch_succeeded as i64, repository.warning],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn update_workspace_repository_warning(
+        &self,
+        workspace_id: &WorktreeId,
+        repository_id: &WorktreeId,
+        warning: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE workspace_repositories SET warning = ?3 WHERE worktree_id = ?1 AND id = ?2",
+            params![workspace_id.as_str(), repository_id.as_str(), warning],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_session_workspace_repositories(
+        &self,
+        id: &WorktreeId,
+        repositories: &[nebula_core::WorkspaceRepository],
+    ) -> Result<()> {
+        for repository in repositories {
+            self.update_workspace_repository_warning(
+                id,
+                &repository.id,
+                repository.warning.as_deref(),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_workspace_repository(&self, id: &WorktreeId) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM workspace_repositories WHERE id = ?1",
+            params![id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_session_workspace(&self, id: &WorktreeId) -> Result<()> {
+        self.delete_by_id("worktrees", id.as_str())
     }
 
     pub fn is_session_workspace(&self, id: &WorktreeId) -> Result<bool> {
