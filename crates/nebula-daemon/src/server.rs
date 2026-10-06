@@ -336,6 +336,13 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         }
                     });
                 }
+                ClientRequest::CloseSessionWorkspace { req_id, id } => {
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        reply_done(&out_tx, req_id, daemon.close_session_workspace(&id).await).await;
+                    });
+                }
                 ClientRequest::DeleteWorktree { req_id, id, force } => {
                     let grouped = daemon.store.session_workspaces().is_ok_and(|workspaces| {
                         workspaces.iter().any(|workspace| workspace.worktree_id == id

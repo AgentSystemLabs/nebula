@@ -5159,12 +5159,30 @@ fn open_delete_confirm(app: &mut App) {
         }
         Focus::Worktrees => {
             if let Some(id) = app.selected_worktree().map(|w| w.id.clone()) {
-                activate::delete_worktree(app, &id);
+                if app
+                    .tree
+                    .session_workspaces
+                    .iter()
+                    .any(|workspace| workspace.worktree_id == id)
+                {
+                    activate::close_session_workspace(app, &id);
+                } else {
+                    activate::delete_worktree(app, &id);
+                }
             }
         }
         // An EMPTY BAND on the grid: the worktree is all there is — even
         // with its pull request's link row under the cursor (#104).
         Focus::Sessions => match launcher::empty_band(app) {
+            Some(id)
+                if app
+                    .tree
+                    .session_workspaces
+                    .iter()
+                    .any(|workspace| workspace.worktree_id == id) =>
+            {
+                activate::close_session_workspace(app, &id)
+            }
             Some(id) => activate::delete_worktree(app, &id),
             None => match app.selected_session_row() {
                 Some(SessionRow::Agent(a)) => {
@@ -5495,10 +5513,22 @@ fn menu_items_for_session_in(app: &App, a: &nebula_core::Agent) -> Vec<MenuItem>
             MenuAction::SwitchBranch(w.id.clone()),
         ));
     } else {
-        items.push(MenuItem::destructive(
-            "Delete worktree",
-            MenuAction::DeleteWorktree(w.id.clone()),
-        ));
+        if app
+            .tree
+            .session_workspaces
+            .iter()
+            .any(|ws| ws.worktree_id == w.id)
+        {
+            items.push(MenuItem::destructive(
+                "Close session workspace…",
+                MenuAction::CloseSessionWorkspace(w.id.clone()),
+            ));
+        } else {
+            items.push(MenuItem::destructive(
+                "Delete worktree",
+                MenuAction::DeleteWorktree(w.id.clone()),
+            ));
+        }
     }
     items
 }
@@ -5745,10 +5775,22 @@ fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
             MenuAction::SwitchBranch(w.id.clone()),
         ));
     } else {
-        items.push(MenuItem::destructive(
-            "Delete worktree",
-            MenuAction::DeleteWorktree(w.id.clone()),
-        ));
+        if app
+            .tree
+            .session_workspaces
+            .iter()
+            .any(|workspace| workspace.worktree_id == w.id)
+        {
+            items.push(MenuItem::destructive(
+                "Close session workspace…",
+                MenuAction::CloseSessionWorkspace(w.id.clone()),
+            ));
+        } else {
+            items.push(MenuItem::destructive(
+                "Delete worktree",
+                MenuAction::DeleteWorktree(w.id.clone()),
+            ));
+        }
     }
     items
 }
@@ -7435,6 +7477,12 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             send(app, out, |req_id| ClientRequest::DeleteLink { req_id, id });
         }
         PendingAction::DeleteWorktree(id) => delete_worktree_and_settle(app, id, out),
+        PendingAction::CloseSessionWorkspace(id) => {
+            send(app, out, |req_id| ClientRequest::CloseSessionWorkspace {
+                req_id,
+                id,
+            });
+        }
         PendingAction::ThenDeleteWorktree {
             first, worktree, ..
         } => {
@@ -7813,6 +7861,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             }
         }
         MenuAction::DeleteWorktree(id) => activate::delete_worktree(app, &id),
+        MenuAction::CloseSessionWorkspace(id) => activate::close_session_workspace(app, &id),
         MenuAction::SwitchBranch(id) => crate::branch_switch::open_for(app, &id),
         MenuAction::SelectRepository(workspace) => open_repository_picker_for(app, &workspace),
         MenuAction::PickRepository {
@@ -11484,6 +11533,27 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree.agents.retain(|a| &a.worktree_id != id);
             app.tree.terminals.retain(|t| &t.worktree_id != id);
             app.tree.links.retain(|l| &l.worktree_id != id);
+            let repository_ids = app
+                .tree
+                .session_workspaces
+                .iter()
+                .find(|workspace| &workspace.worktree_id == id)
+                .map(|workspace| {
+                    workspace
+                        .repositories
+                        .iter()
+                        .map(|repository| repository.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !repository_ids.is_empty() {
+                app.tree
+                    .worktrees
+                    .retain(|worktree| !repository_ids.contains(&worktree.id));
+            }
+            app.tree
+                .session_workspaces
+                .retain(|workspace| &workspace.worktree_id != id);
             app.pr_cache_dirty |= app.pull_requests.remove(id).is_some();
             app.pr_recheck.remove(id);
             app.tree.worktrees.retain(|w| &w.id != id);
@@ -31282,6 +31352,172 @@ diff --git a/src/c.rs b/src/c.rs
             );
             assert_eq!(ui_digest(&by_menu, &menu_out), ui_digest(&by_key, &key_out));
         });
+    }
+
+    #[test]
+    fn session_workspace_close_is_explicit_confirmed_and_replaces_single_worktree_delete() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let workspace_id = WorktreeId("w-workspace".into());
+        app.tree.worktrees.push(nebula_core::Worktree {
+            id: workspace_id.clone(),
+            project_id: ProjectId("p1".into()),
+            path: std::path::PathBuf::from("/tmp/worktrees/feature"),
+            branch: "pilot/feature".into(),
+            is_main: false,
+            sort_order: 2,
+        });
+        app.tree
+            .session_workspaces
+            .push(nebula_core::SessionWorkspace {
+                worktree_id: workspace_id.clone(),
+                name: "feature".into(),
+                state: nebula_core::WorkspaceState::Ready,
+                failure: None,
+                repositories: vec![nebula_core::WorkspaceRepository {
+                    id: WorktreeId("w-member".into()),
+                    name: "api".into(),
+                    path: std::path::PathBuf::from("/tmp/worktrees/feature/api"),
+                    base: None,
+                    fetch_succeeded: false,
+                    warning: None,
+                }],
+            });
+        let row = app.worktree_row_of(&workspace_id).unwrap();
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = row;
+        let items = worktree_menu_items(
+            &app,
+            app.tree
+                .worktrees
+                .iter()
+                .find(|w| w.id == workspace_id)
+                .unwrap(),
+        );
+        assert!(items
+            .iter()
+            .any(|item| item.label.contains("Close session workspace")));
+        assert!(!items.iter().any(|item| item.label == "Delete worktree"));
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+            panic!("close action requires confirmation");
+        };
+        assert_eq!(confirm.title, "Close session workspace");
+        assert!(matches!(
+            confirm.action,
+            PendingAction::CloseSessionWorkspace(_)
+        ));
+
+        app.overlay = None;
+        app.tree.session_workspaces.clear();
+        activate::close_session_workspace(&mut app, &workspace_id);
+        assert!(app.overlay.is_none(), "main workspace cannot be closed");
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("only a session workspace can be closed")
+        );
+
+        app.tree
+            .session_workspaces
+            .push(nebula_core::SessionWorkspace {
+                worktree_id: workspace_id.clone(),
+                name: "feature".into(),
+                state: nebula_core::WorkspaceState::Unavailable,
+                failure: Some("beta at /tmp/beta could not be removed".into()),
+                repositories: vec![],
+            });
+        activate::close_session_workspace(&mut app, &workspace_id);
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("workspace unavailable: beta at /tmp/beta could not be removed")
+        );
+    }
+
+    #[test]
+    fn removing_workspace_root_removes_its_cards_and_member_checkout_cards() {
+        let mut app = App::new();
+        let root = WorktreeId("workspace-root".into());
+        let member = WorktreeId("workspace-member".into());
+        app.tree.worktrees.extend([
+            nebula_core::Worktree {
+                id: root.clone(),
+                project_id: ProjectId("p1".into()),
+                path: "/tmp/workspaces/task".into(),
+                branch: "pilot/task".into(),
+                is_main: false,
+                sort_order: 1,
+            },
+            nebula_core::Worktree {
+                id: member.clone(),
+                project_id: ProjectId("p1".into()),
+                path: "/tmp/workspaces/task/api".into(),
+                branch: "pilot/task".into(),
+                is_main: false,
+                sort_order: 2,
+            },
+        ]);
+        app.tree
+            .session_workspaces
+            .push(nebula_core::SessionWorkspace {
+                worktree_id: root.clone(),
+                name: "task".into(),
+                state: nebula_core::WorkspaceState::Ready,
+                failure: None,
+                repositories: vec![nebula_core::WorkspaceRepository {
+                    id: member.clone(),
+                    name: "api".into(),
+                    path: "/tmp/workspaces/task/api".into(),
+                    base: None,
+                    fetch_succeeded: false,
+                    warning: None,
+                }],
+            });
+        app.tree.agents.push(nebula_core::Agent {
+            id: AgentId("agent-in-closed-workspace".into()),
+            worktree_id: root.clone(),
+            name: "agent".into(),
+            status: nebula_core::AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            status_changed_at: 0,
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 0,
+            alive: false,
+            issue_url: None,
+            recent_prompts: Vec::new(),
+        });
+        apply_removal(&mut app, &nebula_core::EntityId::Worktree(root.clone()));
+        assert!(!app
+            .tree
+            .worktrees
+            .iter()
+            .any(|worktree| worktree.id == root || worktree.id == member));
+        assert!(app.tree.session_workspaces.is_empty());
+        assert!(app.tree.agents.is_empty());
+    }
+
+    #[test]
+    fn close_workspace_confirmation_sends_the_explicit_close_request() {
+        let mut app = App::new();
+        let id = WorktreeId("workspace-1".into());
+        let mut out = Vec::new();
+        run_pending_action(
+            &mut app,
+            PendingAction::CloseSessionWorkspace(id.clone()),
+            &mut out,
+        );
+        assert!(
+            matches!(out.as_slice(), [ClientRequest::CloseSessionWorkspace { id: requested, .. }] if requested == &id)
+        );
     }
 
     /// A click into the pane is Enter on it: FOCUS, the input lock, and the

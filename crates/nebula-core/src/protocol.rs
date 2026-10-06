@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 48;
+pub const PROTOCOL_VERSION: u32 = 49;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -99,6 +99,12 @@ pub enum ClientRequest {
         req_id: u64,
         project: ProjectId,
         name: String,
+    },
+    /// Close an entire session workspace after the daemon has verified that
+    /// its repository worktrees and workspace folder contain no user data.
+    CloseSessionWorkspace {
+        req_id: u64,
+        id: WorktreeId,
     },
     DeleteWorktree {
         req_id: u64,

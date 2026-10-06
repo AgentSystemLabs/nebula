@@ -317,6 +317,7 @@ pub enum MenuAction {
     EditLink(LinkId),
     DeleteLink(LinkId),
     DeleteWorktree(WorktreeId),
+    CloseSessionWorkspace(WorktreeId),
     /// The ROOT WORKTREE row's menu: open the BRANCH SWITCHER on it.
     SwitchBranch(WorktreeId),
     /// Select the repository Git tools target inside a workspace.
@@ -655,6 +656,7 @@ pub enum PendingAction {
     DeleteAgent(AgentId),
     CloseTerminal(TerminalId),
     DeleteWorktree(WorktreeId),
+    CloseSessionWorkspace(WorktreeId),
     /// A row delete that empties a linked worktree — the last card of the
     /// band going — with the checkout's fate decided in the same dialog:
     /// `Enter`/`y` runs `first` (the row's own delete) and then deletes
@@ -2145,6 +2147,7 @@ pub enum PendingIntent {
     },
     /// Worktree removed optimistically; restore these rows on Error.
     DeleteWorktree(WorktreeRollback),
+    CloseSessionWorkspace(WorktreeId),
     /// A row renamed, archived, unarchived or deleted on the keypress
     /// (`event_loop::optimistic`): put it back on Error.
     Undo(Undo),
