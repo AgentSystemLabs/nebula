@@ -10181,6 +10181,21 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         } => {
             if let Some(term) = &mut app.term {
                 if term.sref == session {
+                    // The session started after all (its checkout came
+                    // back, its CLI was installed): the refusal is over, on
+                    // the pane and in the status line.
+                    term.refused = None;
+                    if app
+                        .refusal_flash
+                        .as_ref()
+                        .is_some_and(|(refused, _)| *refused == session)
+                    {
+                        if let Some((_, line)) = app.refusal_flash.take() {
+                            if app.flash.as_deref() == Some(line.as_str()) {
+                                app.flash = None;
+                            }
+                        }
+                    }
                     // A replay continuing a kept screen lands on it; any
                     // other rebuilds the screen from scratch, and a
                     // selection anchored to the old cells goes with it.
@@ -10545,6 +10560,17 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 land_terminal_tail(app, id, tail);
             }
         }
+        ServerEvent::AttachRefused { session, message } => {
+            // The pane waiting on this session says why, in full; the
+            // status line gets the first sentence, which fits it.
+            let line = refusal_flash(&message);
+            app.flash = Some(line.clone());
+            app.refusal_flash = Some((session.clone(), line));
+            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+                term.refused = Some(message);
+            }
+            app.dirty = true;
+        }
         ServerEvent::Error { req_id, message } => {
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back. A
@@ -10661,6 +10687,17 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         _ => {}
     }
+}
+
+/// The status-line form of an attach refusal: its first sentence, so the
+/// part that says what is wrong is what the one line shows; the pane has
+/// the rest.
+fn refusal_flash(message: &str) -> String {
+    let first = message.split(". ").next().unwrap_or(message);
+    format!(
+        "couldn't start this session: {}",
+        first.trim_end_matches('.')
+    )
 }
 
 /// The Ack of a create: select the new session and show it — `focus` also
@@ -18500,6 +18537,70 @@ diff --git a/src/c.rs b/src/c.rs
     /// A replay continuing from there lands on the kept screen; one from
     /// anywhere else — the ring wrapped past what was seen, or a new
     /// process — rebuilds it.
+    /// A session the DAEMON refuses to start (its checkout was deleted
+    /// outside nebula) must not leave the pane booting forever: the pane
+    /// keeps the full reason, the status line its first sentence, and a
+    /// later attach that does start the session clears both. A refusal of
+    /// some other session leaves the pane on screen alone.
+    #[test]
+    fn a_refused_attach_tells_the_pane_why_until_the_session_starts() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach_now(&mut app, a1.clone(), &mut out);
+        let why = "the checkout for 'feat' is gone from disk (/x/feat). Recreate it where it was";
+
+        hse(
+            &mut app,
+            ServerEvent::AttachRefused {
+                session: SessionRef::Agent(AgentId("other".into())),
+                message: "elsewhere".into(),
+            },
+        );
+        assert_eq!(app.term.as_ref().unwrap().refused, None, "not this pane's");
+
+        hse(
+            &mut app,
+            ServerEvent::AttachRefused {
+                session: a1.clone(),
+                message: why.into(),
+            },
+        );
+        assert_eq!(app.term.as_ref().unwrap().refused.as_deref(), Some(why));
+        assert_eq!(
+            app.flash.as_deref(),
+            Some(
+                "couldn't start this session: the checkout for 'feat' is gone from disk (/x/feat)"
+            )
+        );
+
+        // Away and back by mouse (no key press clears the line): the pane
+        // is rebuilt, and the line must still clear when the session starts.
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w1", "agent-2", false),
+            },
+        );
+        attach_now(&mut app, SessionRef::Agent(AgentId("a2".into())), &mut out);
+        attach_now(&mut app, a1.clone(), &mut out);
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 0,
+                data: b"back".to_vec(),
+            },
+        );
+        assert_eq!(
+            app.term.as_ref().unwrap().refused,
+            None,
+            "started after all"
+        );
+        assert_eq!(app.flash, None, "the refusal no longer stands");
+    }
+
     #[test]
     fn returning_to_a_session_keeps_its_screen_and_asks_for_the_delta() {
         let mut app = App::new();

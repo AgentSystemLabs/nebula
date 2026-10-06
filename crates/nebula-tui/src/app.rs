@@ -2682,6 +2682,11 @@ pub struct AttachedTerm {
     /// The scroll offset to land on once that replay has rebuilt the
     /// history: the notch that asked for it.
     pub pending_scroll: Option<usize>,
+    /// The DAEMON refused to start this session (`ServerEvent::AttachRefused`),
+    /// and why: the pane says so in place of "starting session…", which
+    /// would otherwise wait for a screen that is never coming. Cleared by
+    /// the replay of a later attach that did start it.
+    pub refused: Option<String>,
 }
 
 /// Lines of scrollback the attached pane's parser keeps.
@@ -2706,6 +2711,7 @@ impl AttachedTerm {
             next_seq: 0,
             history_dropped: false,
             pending_scroll: None,
+            refused: None,
         }
     }
 
@@ -2722,6 +2728,7 @@ impl AttachedTerm {
         self.booting = false;
         self.next_seq = 0;
         self.history_dropped = false;
+        self.refused = None;
     }
 
     /// Apply a ring replay. One that continues exactly where this parser
@@ -3249,6 +3256,11 @@ pub struct App {
     /// process with a fresh connection.
     pub pending_ssh: Option<crate::hosts::HostEntry>,
     pub flash: Option<String>,
+    /// The session whose attach refusal `flash` is showing, with the text
+    /// it put there: that session starting after all (its first replay)
+    /// clears the line, however the pane got back to it — a switch away
+    /// and back rebuilds the pane, so the pane cannot carry this.
+    pub refusal_flash: Option<(SessionRef, String)>,
     /// The newest release published on GitHub (`0.22.0`) when it is newer
     /// than this build — the footer's `⇡ v0.22.0` beside the version
     /// nameplate. `None` until the update check finds one; a check that
@@ -3900,6 +3912,7 @@ impl App {
             should_quit: false,
             pending_ssh: None,
             flash: None,
+            refusal_flash: None,
             update_available: None,
             edge_tap: None,
             release_watch: None,

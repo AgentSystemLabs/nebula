@@ -4846,17 +4846,17 @@ exit 0
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(e, ServerEvent::Error { req_id: None, message } if message.contains("runs in Claude Cloud"))
-        })
-    })
-    .await;
-    assert!(
-        events.iter().any(|e| matches!(
+    // The refusal names the session, so the pane waiting on it can say why.
+    let refused = |e: &ServerEvent| {
+        matches!(
             e,
-            ServerEvent::Error { req_id: None, message } if message.contains("runs in Claude Cloud")
-        )),
+            ServerEvent::AttachRefused { session: SessionRef::Agent(id), message }
+                if *id == agent_id && message.contains("runs in Claude Cloud")
+        )
+    };
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| evs.iter().any(refused)).await;
+    assert!(
+        events.iter().any(refused),
         "a cloud row's attach must be refused: {events:#?}"
     );
     assert_eq!(runs(), "1", "neither verb spawned a CLI");

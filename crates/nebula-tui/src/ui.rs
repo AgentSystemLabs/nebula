@@ -10,7 +10,7 @@ use nebula_core::{AgentStatus, SessionRef};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 mod launcher_view;
@@ -3563,6 +3563,11 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             "exited".to_string(),
             Style::default().fg(th.err).add_modifier(Modifier::BOLD),
         )),
+        // Refused, not booting: nothing is starting.
+        Some(t) if t.refused.is_some() => Some(Span::styled(
+            "not started".to_string(),
+            Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
+        )),
         Some(t) if t.scroll_offset() > 0 => Some(Span::styled(
             format!("scroll {}", t.scroll_offset()),
             Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
@@ -3610,6 +3615,30 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.push((inner, HitTarget::TerminalPane));
 
     let links = match &app.term {
+        // Refused: the DAEMON would not start this session, so no screen is
+        // coming. Say why in full, wrapped, where the boot notice would
+        // otherwise wait forever: the reason usually ends in what to do.
+        Some(term) if term.refused.is_some() => {
+            let why = term.refused.clone().unwrap_or_default();
+            let msg = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "couldn't start this session",
+                    Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
+                ))
+                .centered(),
+                Line::from(""),
+                Line::from(Span::styled(why, Style::default().fg(th.text))),
+            ])
+            .wrap(Wrap { trim: false });
+            let padded = Rect {
+                x: inner.x + 2,
+                width: inner.width.saturating_sub(4),
+                ..inner
+            };
+            f.render_widget(msg, padded);
+            (Vec::new(), Vec::new())
+        }
         // Booting: the grid is empty because the CLI hasn't painted yet, so
         // there is nothing to render and nothing to scan for links. A word
         // in the middle of the pane beats an unexplained void.
@@ -4855,6 +4884,44 @@ mod tests {
         // Scrolled past the selection: nothing to paint.
         app.term.as_mut().unwrap().set_scroll(5);
         assert!(reversed_rows(&mut app).is_empty());
+    }
+
+    /// A refused session's pane says so, with the whole reason wrapped,
+    /// where a booting one would say "starting session…" and wait for a
+    /// screen that is never coming.
+    #[test]
+    fn a_refused_session_shows_why_instead_of_booting() {
+        let mut app = App::new();
+        let mut term = crate::app::AttachedTerm::new(
+            SessionRef::Agent(nebula_core::ids::AgentId("a1".into())),
+            40,
+            12,
+        );
+        term.booting = true;
+        term.refused = Some(
+            "the checkout for 'feat' is gone from disk (/x/feat). Recreate it: git worktree add /x/feat feat".into(),
+        );
+        app.term = Some(term);
+        let area = Rect::new(0, 0, 44, 16);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(44, 16)).unwrap();
+        terminal.draw(|f| draw_terminal(f, &mut app, area)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..16)
+            .map(|y| {
+                (0..44)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(text.contains("couldn't start this session"), "{text}");
+        assert!(text.contains("not started"), "{text}");
+        assert!(
+            text.contains("worktree add /x/feat feat"),
+            "the recovery is on screen: {text}"
+        );
+        assert!(!text.contains("starting session"), "{text}");
     }
 
     /// The BLACK BACKGROUND setting leaves nothing on the terminal's own
