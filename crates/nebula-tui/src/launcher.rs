@@ -235,11 +235,25 @@ pub struct Band {
     pub workspace_state: Option<nebula_core::WorkspaceState>,
     pub workspace_failure: Option<String>,
     pub repositories: Vec<String>,
+    /// Branch and changed-file observations for each member, in membership
+    /// order. Empty for legacy single-repository worktrees.
+    pub repository_states: Vec<RepositoryState>,
+    pub repository_total_changes: usize,
+    pub repository_known_changes: usize,
+    pub repository_state_complete: bool,
+    pub workspace_unavailable: bool,
     /// The checkout is the project's ROOT WORKTREE (`⌂`).
     pub is_main: bool,
     pub pr: Option<RowPr>,
     /// The sessions in `rows` order, then the terminals in tree order.
     pub cards: Vec<Card>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryState {
+    pub name: String,
+    pub branch: String,
+    pub changed_files: Option<usize>,
 }
 
 impl Band {
@@ -309,6 +323,33 @@ pub fn bands(app: &App) -> Vec<Band> {
             .session_workspaces
             .iter()
             .find(|workspace| workspace.worktree_id == w.id);
+        let repository_states = if w.is_main {
+            app.tree
+                .repositories
+                .iter()
+                .filter(|repository| repository.project_id == project.id)
+                .map(|repository| RepositoryState {
+                    name: repository.name.clone(),
+                    branch: repository.branch.clone(),
+                    changed_files: repository.changed_files,
+                })
+                .collect::<Vec<_>>()
+        } else if let Some(workspace) = session_workspace {
+            workspace
+                .repositories
+                .iter()
+                .map(|repository| RepositoryState {
+                    name: repository.name.clone(),
+                    branch: repository
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| "unavailable".into()),
+                    changed_files: repository.changed_files,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if cards.is_empty()
             && (app.show_archived
                 || (!app.show_all_worktrees
@@ -317,6 +358,22 @@ pub fn bands(app: &App) -> Vec<Band> {
         {
             continue;
         }
+        let repository_total_changes = repository_states
+            .iter()
+            .filter_map(|repository| repository.changed_files)
+            .sum();
+        let repository_known_changes = repository_states
+            .iter()
+            .filter_map(|repository| repository.changed_files)
+            .count();
+        let repository_state_complete = repository_known_changes == repository_states.len();
+        let workspace_unavailable = session_workspace.is_some_and(|workspace| {
+            workspace.state == nebula_core::WorkspaceState::Unavailable
+                || workspace
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.path.is_dir() == false)
+        });
         out.push(Band {
             worktree: w.id.clone(),
             branch: w.branch.clone(),
@@ -354,6 +411,11 @@ pub fn bands(app: &App) -> Vec<Band> {
             } else {
                 Vec::new()
             },
+            repository_states,
+            repository_total_changes,
+            repository_known_changes,
+            repository_state_complete,
+            workspace_unavailable,
             is_main: w.is_main,
             pr: row_pr(app, &w.id, &project.id, &w.branch),
             cards,
@@ -2251,12 +2313,14 @@ mod tests {
                 name: "api".into(),
                 path: "/tmp/pilot/api".into(),
                 branch: "main".into(),
+                changed_files: Some(2),
             },
             nebula_core::ProjectRepository {
                 project_id: ProjectId("p1".into()),
                 name: "web".into(),
                 path: "/tmp/pilot/web".into(),
                 branch: "master".into(),
+                changed_files: Some(0),
             },
         ];
         let bands = super::bands(&app);
@@ -2265,6 +2329,112 @@ mod tests {
         assert_eq!(bands[0].repositories, ["api", "web"]);
         assert!(bands[0].cards.is_empty());
         assert_eq!(super::band_cursor(&app, &bands), Some(0));
+    }
+
+    #[test]
+    fn workspace_bands_keep_each_repository_branch_and_change_count() {
+        use nebula_core::{SessionWorkspace, WorkspaceRepository, WorkspaceState};
+        let mut app = App::new();
+        app.tree.projects.push(project("p1", "Pilot"));
+        app.tree.repositories = vec![
+            nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "api".into(),
+                path: "/tmp/Pilot/api".into(),
+                branch: "feature/api".into(),
+                changed_files: Some(2),
+            },
+            nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "web".into(),
+                path: "/tmp/Pilot/web".into(),
+                branch: "main".into(),
+                changed_files: Some(0),
+            },
+        ];
+        app.tree
+            .worktrees
+            .push(worktree("main", "p1", "feature/api", true));
+        let main = super::bands(&app);
+        assert_eq!(main[0].repository_states[0].branch, "feature/api");
+        assert_eq!(main[0].repository_states[0].changed_files, Some(2));
+        assert_eq!(main[0].repository_states[1].branch, "main");
+
+        app.tree.worktrees.extend([
+            worktree("workspace", "p1", "pilot/task", false),
+            worktree("member-api", "p1", "pilot/task", false),
+            worktree("member-web", "p1", "pilot/task", false),
+        ]);
+        app.tree.session_workspaces.push(SessionWorkspace {
+            worktree_id: WorktreeId("workspace".into()),
+            name: "task".into(),
+            state: WorkspaceState::Ready,
+            failure: None,
+            repositories: vec![
+                WorkspaceRepository {
+                    id: WorktreeId("member-api".into()),
+                    name: "api".into(),
+                    path: "/tmp/Pilot/worktrees/task/api".into(),
+                    base: Some("origin/main".into()),
+                    fetch_succeeded: true,
+                    warning: None,
+                    branch: Some("pilot/task".into()),
+                    changed_files: Some(1),
+                },
+                WorkspaceRepository {
+                    id: WorktreeId("member-web".into()),
+                    name: "web".into(),
+                    path: "/tmp/Pilot/worktrees/task/web".into(),
+                    base: Some("origin/master".into()),
+                    fetch_succeeded: true,
+                    warning: None,
+                    branch: Some("pilot/task".into()),
+                    changed_files: Some(3),
+                },
+            ],
+        });
+        let session = super::bands(&app)
+            .into_iter()
+            .find(|band| band.worktree == WorktreeId("workspace".into()))
+            .unwrap();
+        assert_eq!(session.repository_states.len(), 2);
+        assert_eq!(session.repository_states[1].name, "web");
+        assert_eq!(session.repository_states[1].changed_files, Some(3));
+    }
+
+    #[test]
+    fn a_missing_session_member_remains_in_workspace_status_as_unavailable() {
+        use nebula_core::{SessionWorkspace, WorkspaceRepository, WorkspaceState};
+        let mut app = App::new();
+        app.tree.projects.push(project("p1", "Pilot"));
+        app.tree.worktrees.extend([
+            worktree("workspace", "p1", "pilot/task", false),
+            worktree("member-api", "p1", "pilot/task", false),
+        ]);
+        app.tree.session_workspaces.push(SessionWorkspace {
+            worktree_id: WorktreeId("workspace".into()),
+            name: "task".into(),
+            state: WorkspaceState::Unavailable,
+            failure: Some("repository checkout unavailable: api".into()),
+            repositories: vec![WorkspaceRepository {
+                id: WorktreeId("member-api".into()),
+                name: "api".into(),
+                path: "/definitely/missing/member".into(),
+                base: Some("origin/main".into()),
+                fetch_succeeded: true,
+                warning: None,
+                branch: Some("pilot/task".into()),
+                changed_files: None,
+            }],
+        });
+        let band = super::bands(&app)
+            .into_iter()
+            .find(|band| band.worktree == WorktreeId("workspace".into()))
+            .unwrap();
+        assert!(band.workspace_unavailable);
+        assert_eq!(band.repository_states.len(), 1);
+        assert_eq!(band.repository_states[0].name, "api");
+        assert_eq!(band.repository_states[0].changed_files, None);
     }
 
     /// The list is the SELECTED PROJECT's sessions, each carrying the
@@ -2738,6 +2908,8 @@ mod tests {
                     base: Some("origin/main".into()),
                     fetch_succeeded: true,
                     warning: None,
+                    branch: Some("pilot/task".into()),
+                    changed_files: Some(1),
                 },
                 WorkspaceRepository {
                     id: WorktreeId("member-web".into()),
@@ -2746,6 +2918,8 @@ mod tests {
                     base: Some("origin/master".into()),
                     fetch_succeeded: true,
                     warning: None,
+                    branch: Some("pilot/task".into()),
+                    changed_files: Some(3),
                 },
             ],
             failure: None,

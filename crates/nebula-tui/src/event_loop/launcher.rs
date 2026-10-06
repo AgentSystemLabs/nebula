@@ -720,6 +720,7 @@ mod main_workspace_tests {
             name: "api".into(),
             path: "/tmp/pilot/api".into(),
             branch: "main".into(),
+            changed_files: None,
         });
         app.tree.worktrees.push(Worktree {
             id: WorktreeId("main".into()),

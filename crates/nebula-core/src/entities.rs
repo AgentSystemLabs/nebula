@@ -155,6 +155,9 @@ pub struct ProjectRepository {
     pub name: String,
     pub path: PathBuf,
     pub branch: String,
+    /// Last branch observed by Git sync.
+    #[serde(default)]
+    pub changed_files: Option<usize>,
 }
 
 /// Persisted membership and lifecycle for a multi-repository session workspace.
@@ -189,6 +192,13 @@ pub struct WorkspaceRepository {
     pub base: Option<String>,
     pub fetch_succeeded: bool,
     pub warning: Option<String>,
+    /// Last branch observed by Git sync.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Changed and untracked files in this member checkout. `None` means
+    /// Git could not inspect it (normally because its folder is missing).
+    #[serde(default)]
+    pub changed_files: Option<usize>,
 }
 
 impl Project {

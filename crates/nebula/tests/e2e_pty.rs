@@ -2250,6 +2250,257 @@ async fn external_worktrees_are_adopted_and_dropped() {
     wait_for_exit(&mut daemon);
 }
 
+/// Multi-repository sync refreshes only registered member checkouts. It
+/// reports member branch changes and retains the workspace when one checkout
+/// disappears, rather than reconciling arbitrary worktrees from each clone.
+#[tokio::test]
+async fn multi_repository_sync_tracks_members_without_adopting_external_worktrees() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let alpha = folder.join("alpha");
+    let beta = folder.join("beta");
+    make_repo_at(&alpha);
+    make_repo_at(&beta);
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 2,
+            folder: folder.clone(),
+            name: "Shared checkout project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let other_registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 2).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(other_project)),
+        ..
+    }) = find_ack(&other_registered, 2)
+    else {
+        panic!("second project registration failed: {other_registered:#?}");
+    };
+
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 3,
+            project: project.clone(),
+            name: "track-state".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let created = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 3, .. }
+            )
+        })
+    })
+    .await;
+    let Some(ServerEvent::SessionWorkspaceCreated {
+        workspace,
+        repositories,
+        ..
+    }) = created.iter().find(|event| {
+        matches!(
+            event,
+            ServerEvent::SessionWorkspaceCreated { req_id: 3, .. }
+        )
+    })
+    else {
+        panic!("workspace creation result missing: {created:#?}");
+    };
+    let workspace = workspace.clone();
+    let alpha_member = repositories
+        .iter()
+        .find(|repository| repository.name == "alpha")
+        .unwrap()
+        .clone();
+
+    // An unrelated worktree in the member clone must not turn into a band
+    // or alter the explicit session workspace membership.
+    let outside = env.tmp.path().join("alpha-worktrees").join("outside");
+    git_run(
+        &alpha,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "outside-worktree",
+            outside.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    let observed = read_events_for(&mut client, Duration::from_millis(350)).await;
+    assert!(
+        observed.iter().all(|event| !matches!(
+            event,
+            ServerEvent::EntityUpserted { entity: Entity::Worktree(worktree) }
+                if worktree.branch == "outside-worktree"
+        )),
+        "member-repository worktrees created outside Nebula are not adopted: {observed:#?}"
+    );
+
+    let alpha_checkout = workspace.path.join("alpha");
+    git_run(&alpha_checkout, &["switch", "--detach"]).unwrap();
+    let changed = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        events.iter().any(|event| matches!(
+            event,
+            ServerEvent::SessionWorkspaceUpserted { workspace: saved }
+                if saved.worktree_id == workspace.id
+                    && saved.repositories.iter().any(|repository| {
+                        repository.id == alpha_member.id
+                            && repository.branch.as_deref().is_some_and(|branch| branch != "pilot/track-state")
+                    })
+        ))
+    })
+    .await;
+    assert!(changed.iter().any(|event| matches!(
+        event,
+        ServerEvent::SessionWorkspaceUpserted { workspace: saved }
+            if saved.worktree_id == workspace.id
+                && saved.repositories.iter().any(|repository| {
+                    repository.id == alpha_member.id
+                        && repository.branch.as_deref().is_some_and(|branch| branch != "pilot/track-state")
+                })
+    )), "the member status follows a branch switch: {changed:#?}");
+
+    std::fs::write(workspace.path.join("beta").join("dirty.txt"), "working\n").unwrap();
+    let dirty = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceUpserted { workspace: saved }
+                    if saved.worktree_id == workspace.id
+                        && saved.repositories.iter().any(|repository| {
+                            repository.name == "beta" && repository.changed_files == Some(1)
+                        })
+            )
+        })
+    })
+    .await;
+    assert!(
+        dirty.iter().any(|event| matches!(
+            event,
+            ServerEvent::SessionWorkspaceUpserted { workspace: saved }
+                if saved.worktree_id == workspace.id
+                    && saved.repositories.iter().any(|repository| {
+                        repository.name == "beta" && repository.changed_files == Some(1)
+                    })
+        )),
+        "member edit is reflected in observed change state: {dirty:#?}"
+    );
+
+    std::fs::remove_dir_all(&alpha_checkout).unwrap();
+    let unavailable = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceUpserted { workspace: saved }
+                    if saved.worktree_id == workspace.id
+                        && saved.state == nebula_core::WorkspaceState::Unavailable
+            )
+        })
+    })
+    .await;
+    let Some(ServerEvent::SessionWorkspaceUpserted { workspace: saved }) =
+        unavailable.iter().find(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceUpserted { workspace: saved }
+                    if saved.worktree_id == workspace.id
+                        && saved.state == nebula_core::WorkspaceState::Unavailable
+            )
+        })
+    else {
+        panic!("missing checkout should mark its workspace unavailable: {unavailable:#?}");
+    };
+    assert!(saved
+        .failure
+        .as_deref()
+        .unwrap_or_default()
+        .contains("alpha"));
+    assert_eq!(
+        saved.repositories.len(),
+        2,
+        "a missing member is never forgotten"
+    );
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+    let mut restarted = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    let after_restart = subscribe(&mut client).await;
+    let Some(ServerEvent::Snapshot {
+        session_workspaces,
+        worktrees,
+        ..
+    }) = after_restart
+        .iter()
+        .find(|event| matches!(event, ServerEvent::Snapshot { .. }))
+    else {
+        panic!("restart snapshot missing: {after_restart:#?}");
+    };
+    let saved = session_workspaces
+        .iter()
+        .find(|saved| saved.worktree_id == workspace.id)
+        .expect("unavailable workspace persists");
+    assert_eq!(saved.state, nebula_core::WorkspaceState::Unavailable);
+    assert_eq!(saved.repositories.len(), 2, "member registration persists");
+    assert!(worktrees
+        .iter()
+        .any(|worktree| worktree.id == alpha_member.id));
+    assert!(
+        worktrees
+            .iter()
+            .filter(|worktree| worktree.project_id == *other_project)
+            .all(|worktree| worktree.is_main),
+        "a shared clone's workspace is not associated with the other project"
+    );
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut restarted);
+}
+
 /// `nebula upgrade` daemon handoff: with a live session the old daemon is
 /// left running (restart is the user's call); once idle, the upgrade shuts
 /// it down so the next launch spawns the new binary.

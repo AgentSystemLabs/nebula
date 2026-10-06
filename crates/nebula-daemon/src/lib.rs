@@ -284,19 +284,18 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                 };
                 seen.retain(|id, _| projects.iter().any(|p| &p.id == id));
                 for project in projects {
-                    if daemon
+                    let explicit_members = daemon
                         .store
                         .project_repositories(&project.id)
-                        .is_ok_and(|repositories| !repositories.is_empty())
-                    {
-                        continue;
-                    }
-                    // An unreadable probe is not a fingerprint: caching it
-                    // would compare equal on every later tick and retire the
-                    // project from syncing for the life of the daemon. Only a
-                    // stamp we actually read can gate the skip.
+                        .is_ok_and(|repositories| !repositories.is_empty());
+                    // Status of a checkout's files does not touch its Git
+                    // metadata. Explicit membership refreshes every tick;
+                    // legacy projects retain the inexpensive worktree probe.
                     let stamp = worktree_probe_stamp(&project.repo_path);
-                    if stamp.is_some() && seen.get(&project.id) == stamp.as_ref() {
+                    if !explicit_members
+                        && stamp.is_some()
+                        && seen.get(&project.id) == stamp.as_ref()
+                    {
                         continue;
                     }
                     // The stamp is only recorded on success, so a failed

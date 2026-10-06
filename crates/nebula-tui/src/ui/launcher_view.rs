@@ -1751,8 +1751,14 @@ fn draw_band_rule(
     // `── ` before, ` ` after the words, ` ` before the right end and
     // ` ──` after it: what the words have to fit between.
     let room = width.saturating_sub(3 + right_w + 5);
-    let changes = (!band.repositories.is_empty())
-        .then_some(0)
+    let workspace_changes = if band.repository_states.is_empty() {
+        None
+    } else if band.workspace_unavailable || !band.repository_state_complete {
+        Some(band.repository_total_changes.max(1))
+    } else {
+        Some(band.repository_total_changes)
+    };
+    let changes = workspace_changes
         .or_else(|| app.worktree_changes(&band.worktree))
         .filter(|n| *n > 0)
         .map(|n| {
@@ -1787,6 +1793,28 @@ fn draw_band_rule(
         format!("{} · {}", label, band.repositories.join(", "))
     } else {
         label
+    };
+    let label = if band.repository_states.is_empty() {
+        label
+    } else {
+        let details = band
+            .repository_states
+            .iter()
+            .map(|repository| {
+                let changes = if band.workspace_unavailable && repository.changed_files.is_none() {
+                    "unavailable".to_string()
+                } else {
+                    match repository.changed_files {
+                        Some(0) => "clean".to_string(),
+                        Some(count) => format!("+{count}"),
+                        None => "unavailable".to_string(),
+                    }
+                };
+                format!("{} {} {changes}", repository.name, repository.branch)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{label}  [{details}]")
     };
     let label = match band.workspace_state {
         Some(nebula_core::WorkspaceState::Creating) => format!("{label} · creating"),
@@ -4991,6 +5019,11 @@ mod tests {
             workspace_state: None,
             workspace_failure: None,
             repositories: Vec::new(),
+            repository_states: Vec::new(),
+            repository_total_changes: 0,
+            repository_known_changes: 0,
+            repository_state_complete: true,
+            workspace_unavailable: false,
             is_main,
             pr: None,
             cards: vec![crate::launcher::Card::Session(LauncherRow {
@@ -5116,6 +5149,43 @@ mod tests {
         let buf = rule_row(&app, &band, 24);
         let text = row_string(&buf, 0);
         assert_eq!(painted(&buf, 0, th.warn).trim(), "+3", "narrow: {text:?}");
+    }
+
+    #[test]
+    fn workspace_band_shows_compact_rollup_and_repository_details() {
+        let mut app = App::new();
+        let mut band = a_band(true, "main");
+        band.workspace_name = Some("Pilot".into());
+        band.repositories = vec!["api".into(), "web".into()];
+        band.repository_states = vec![
+            crate::launcher::RepositoryState {
+                name: "api".into(),
+                branch: "feature/api".into(),
+                changed_files: Some(2),
+            },
+            crate::launcher::RepositoryState {
+                name: "web".into(),
+                branch: "main".into(),
+                changed_files: Some(0),
+            },
+        ];
+        band.repository_total_changes = 2;
+        band.repository_known_changes = 2;
+        band.repository_state_complete = true;
+        let buf = rule_row(&app, &band, 120);
+        let text = row_string(&buf, 0);
+        assert!(
+            text.contains("Pilot · api, web  [api feature/api +2, web main clean] +2 files"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("api feature/api +2, web main clean"),
+            "{text:?}"
+        );
+        assert_eq!(band.repository_states[0].branch, "feature/api");
+        assert_eq!(band.repository_states[0].changed_files, Some(2));
+        assert_eq!(band.repository_states[1].branch, "main");
+        assert_eq!(band.repository_states[1].changed_files, Some(0));
     }
 
     /// The band the keys are on says so, and what Enter does: its rule
