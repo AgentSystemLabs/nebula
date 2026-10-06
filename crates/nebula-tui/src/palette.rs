@@ -467,6 +467,7 @@ mod tests {
         Tree {
             projects: vec![project("p1", "demo"), project("p2", "quiet")],
             repositories: Vec::new(),
+            session_workspaces: Vec::new(),
             worktrees: vec![
                 worktree("w1", "p1", "main"),
                 worktree("w2", "p1", "feat"),

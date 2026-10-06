@@ -1,6 +1,6 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, ProjectRepository, TerminalTab,
-    Worktree,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, ProjectRepository,
+    SessionWorkspace, TerminalTab, WorkspaceRepository, Worktree,
 };
 use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorktreeId};
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 45;
+pub const PROTOCOL_VERSION: u32 = 46;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -92,6 +92,13 @@ pub enum ClientRequest {
         project: ProjectId,
         branch: String,
         base: Option<String>,
+    },
+    /// Create a complete multi-repository session workspace. The daemon
+    /// validates all conflicts before creating any repository worktree.
+    CreateSessionWorkspace {
+        req_id: u64,
+        project: ProjectId,
+        name: String,
     },
     DeleteWorktree {
         req_id: u64,
@@ -466,6 +473,7 @@ pub enum ServerEvent {
     Snapshot {
         projects: Vec<Project>,
         repositories: Vec<ProjectRepository>,
+        session_workspaces: Vec<SessionWorkspace>,
         worktrees: Vec<Worktree>,
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
@@ -498,6 +506,15 @@ pub enum ServerEvent {
     ProjectRepositoriesUpserted {
         project: ProjectId,
         repositories: Vec<ProjectRepository>,
+    },
+    /// Creation acknowledgement and per-repository base/fetch report.
+    SessionWorkspaceCreated {
+        req_id: u64,
+        workspace: Worktree,
+        repositories: Vec<WorkspaceRepository>,
+    },
+    SessionWorkspaceUpserted {
+        workspace: SessionWorkspace,
     },
     EntityRemoved {
         id: EntityId,

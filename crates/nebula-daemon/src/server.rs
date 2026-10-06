@@ -94,6 +94,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let snapshot = daemon.snapshot().unwrap_or(ServerEvent::Snapshot {
                         projects: vec![],
                         repositories: vec![],
+                        session_workspaces: vec![],
                         worktrees: vec![],
                         agents: vec![],
                         terminals: vec![],
@@ -314,7 +315,39 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         .await;
                     });
                 }
+                ClientRequest::CreateSessionWorkspace { req_id, project, name } => {
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        match daemon.create_session_workspace(&project, &name).await {
+                            Ok((workspace, repositories)) => {
+                                let _ = out_tx.send(ServerEvent::SessionWorkspaceCreated {
+                                    req_id,
+                                    workspace,
+                                    repositories,
+                                }).await;
+                            }
+                            Err(error) => {
+                                let _ = out_tx.send(ServerEvent::Error {
+                                    req_id: Some(req_id),
+                                    message: format!("{error:#}"),
+                                }).await;
+                            }
+                        }
+                    });
+                }
                 ClientRequest::DeleteWorktree { req_id, id, force } => {
+                    let grouped = daemon.store.session_workspaces().is_ok_and(|workspaces| {
+                        workspaces.iter().any(|workspace| workspace.worktree_id == id
+                            || workspace.repositories.iter().any(|repository| repository.id == id))
+                    });
+                    if grouped {
+                        let _ = out_tx.send(ServerEvent::Error {
+                            req_id: Some(req_id),
+                            message: "cannot delete a single repository worktree from a session workspace; close the whole workspace instead".into(),
+                        }).await;
+                        continue;
+                    }
                     // `git worktree remove` can take seconds on a large
                     // checkout; run it off the request loop so Input/Attach
                     // frames keep flowing while it grinds. `worktree_ops`

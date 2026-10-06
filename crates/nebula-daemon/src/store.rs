@@ -354,6 +354,26 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX project_repositories_path ON project_repositories (path);
     ",
+    // 30: grouped session workspace membership and its per-repository base
+    // reports. Readiness is durable across daemon restarts.
+    "
+    CREATE TABLE session_workspaces (
+      worktree_id TEXT PRIMARY KEY REFERENCES worktrees(id) ON DELETE CASCADE,
+      name        TEXT NOT NULL,
+      ready       INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE workspace_repositories (
+      worktree_id     TEXT NOT NULL REFERENCES session_workspaces(worktree_id) ON DELETE CASCADE,
+      id              TEXT NOT NULL,
+      name            TEXT NOT NULL,
+      path            TEXT NOT NULL,
+      base            TEXT,
+      fetch_succeeded INTEGER NOT NULL DEFAULT 0,
+      warning         TEXT,
+      PRIMARY KEY (worktree_id, name),
+      UNIQUE (id)
+    );
+    ",
 ];
 
 pub struct Store {
@@ -479,6 +499,93 @@ impl Store {
         Ok(repositories)
     }
 
+    pub fn session_workspaces(&self) -> Result<Vec<nebula_core::SessionWorkspace>> {
+        let conn = self.conn.lock().unwrap();
+        let roots = conn
+            .prepare("SELECT worktree_id, name, ready FROM session_workspaces ORDER BY name")?
+            .query_map([], |row| {
+                Ok((
+                    WorktreeId(row.get(0)?),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        roots
+            .into_iter()
+            .map(|(worktree_id, name, ready)| {
+                let repositories = conn
+                    .prepare("SELECT id, name, path, base, fetch_succeeded, warning FROM workspace_repositories WHERE worktree_id = ?1 ORDER BY name")?
+                    .query_map(params![worktree_id.as_str()], |row| {
+                        Ok(nebula_core::WorkspaceRepository {
+                            id: WorktreeId(row.get(0)?),
+                            name: row.get(1)?,
+                            path: PathBuf::from(row.get::<_, String>(2)?),
+                            base: row.get(3)?,
+                            fetch_succeeded: row.get::<_, i64>(4)? != 0,
+                            warning: row.get(5)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(nebula_core::SessionWorkspace {
+                    worktree_id,
+                    name,
+                    state: if ready { nebula_core::WorkspaceState::Ready } else { nebula_core::WorkspaceState::Unavailable },
+                    repositories,
+                })
+            })
+            .collect()
+    }
+
+    pub fn insert_session_workspace(
+        &self,
+        root: &Worktree,
+        workspace: &nebula_core::SessionWorkspace,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+            params![root.id.as_str(), root.project_id.as_str(), root.path.to_string_lossy(), root.branch, now_ms()],
+        )?;
+        tx.execute(
+            "INSERT INTO session_workspaces (worktree_id, name, ready) VALUES (?1, ?2, ?3)",
+            params![
+                workspace.worktree_id.as_str(),
+                workspace.name,
+                (workspace.state == nebula_core::WorkspaceState::Ready) as i64
+            ],
+        )?;
+        for repository in &workspace.repositories {
+            tx.execute(
+                "INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+                params![repository.id.as_str(), root.project_id.as_str(), repository.path.to_string_lossy(), root.branch, now_ms()],
+            )?;
+            tx.execute(
+                "INSERT INTO workspace_repositories (worktree_id, id, name, path, base, fetch_succeeded, warning) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![workspace.worktree_id.as_str(), repository.id.as_str(), repository.name, repository.path.to_string_lossy(), repository.base, repository.fetch_succeeded as i64, repository.warning],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_session_workspace_ready(&self, id: &WorktreeId, ready: bool) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE session_workspaces SET ready = ?2 WHERE worktree_id = ?1",
+            params![id.as_str(), ready as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_session_workspace(&self, id: &WorktreeId) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_workspaces WHERE worktree_id = ?1) OR EXISTS(SELECT 1 FROM workspace_repositories WHERE id = ?1)",
+            params![id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
     /// Sort slot for a newly added project: after everything else.
     pub fn next_project_sort_order(&self) -> Result<i64> {
         Ok(self.conn.lock().unwrap().query_row(
@@ -558,6 +665,14 @@ impl Store {
         self.delete_by_id("worktrees", id.as_str())
     }
 
+    pub fn next_worktree_sort_order(&self, project_id: &ProjectId) -> Result<i64> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM worktrees WHERE project_id = ?1 AND is_main = 0",
+            params![project_id.as_str()],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn update_worktree_branch(&self, id: &WorktreeId, branch: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE worktrees SET branch = ?2 WHERE id = ?1",
@@ -572,6 +687,14 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE worktrees SET is_main = ?2 WHERE id = ?1",
             params![id.as_str(), is_main as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_worktree_sort_order(&self, id: &WorktreeId, sort_order: i64) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE worktrees SET sort_order = ?2 WHERE id = ?1",
+            params![id.as_str(), sort_order],
         )?;
         Ok(())
     }
@@ -917,6 +1040,14 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE terminals SET name = ?2 WHERE id = ?1",
             params![id.as_str(), name],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_terminal_worktree(&self, id: &TerminalId, worktree_id: &WorktreeId) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE terminals SET worktree_id = ?2 WHERE id = ?1",
+            params![id.as_str(), worktree_id.as_str()],
         )?;
         Ok(())
     }
@@ -1803,8 +1934,10 @@ mod tests {
             "pr_seen",
             "project_repositories",
             "projects",
+            "session_workspaces",
             "terminals",
             "ui_state",
+            "workspace_repositories",
             "worktrees",
         ]
         .map(String::from)

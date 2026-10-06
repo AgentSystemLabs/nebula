@@ -4442,6 +4442,17 @@ fn wait_for_exit(daemon: &mut DaemonProc) {
     }
 }
 
+async fn wait_for_file(path: &Path) {
+    let deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if path.is_file() {
+            return;
+        }
+        tokio::time::sleep(POLL_STEP).await;
+    }
+    panic!("file was not created: {}", path.display());
+}
+
 /// Poll the env dump the fake agent CLI writes on boot, returning the
 /// NEBULA_* variables the real CLI's hooks (and `nebula rename`) would see.
 async fn read_env_file(path: &Path) -> std::collections::HashMap<String, String> {
@@ -4984,6 +4995,80 @@ fn make_repo_at(repo: &Path) {
     git(&["commit", "-m", "init"]);
 }
 
+/// Create a bare remote with a chosen default branch and configure the local
+/// primary checkout to track it.
+fn make_bare_origin(origin: &Path, repo: &Path, branch: &str) -> PathBuf {
+    std::fs::create_dir_all(origin).unwrap();
+    for (cwd, args) in [
+        (origin, vec!["init", "--bare", "-b", branch]),
+        (repo, vec!["branch", "-m", branch]),
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let origin_path = origin.to_string_lossy().into_owned();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "add", "origin", &origin_path])
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["push", "-u", "origin", branch])
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "set-head", "origin", "--auto"])
+        .status()
+        .unwrap()
+        .success());
+    origin.to_path_buf()
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn git_run(repo: &Path, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
 /// Mark a freshly written stub script runnable.
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -4999,6 +5084,427 @@ async fn subscribe(c: &mut UnixStream) -> Vec<ServerEvent> {
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await
+}
+
+/// A successful grouped create builds one real branch/worktree for each
+/// registered repository, reports each independently resolved base, and
+/// leaves dirty primary checkouts alone.
+#[tokio::test]
+async fn session_workspace_creation_builds_all_repository_worktrees() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let first = folder.join("alpha");
+    let second = folder.join("beta");
+    make_repo_at(&first);
+    make_repo_at(&second);
+    let first_origin = make_bare_origin(&env.tmp.path().join("alpha-origin.git"), &first, "main");
+    let second_origin =
+        make_bare_origin(&env.tmp.path().join("beta-origin.git"), &second, "master");
+    let hook = env.tmp.path().join("warn-hook.sh");
+    std::fs::write(&hook, "#!/bin/sh\necho hook-warning >&2\nexit 1\n").unwrap();
+    make_executable(&hook);
+    git_run(
+        &first,
+        &[
+            "config",
+            "nebula.worktreeCreateHook",
+            hook.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    let first_head = git_output(&first, &["rev-parse", "HEAD"]);
+    let second_head = git_output(&second, &["rev-parse", "HEAD"]);
+    std::fs::write(first.join("README.md"), "local edit\n").unwrap();
+    std::fs::write(second.join("untracked.txt"), "keep me\n").unwrap();
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "api-change".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let created = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+            )
+        })
+    })
+    .await;
+    let Some(ServerEvent::SessionWorkspaceCreated {
+        workspace,
+        repositories,
+        ..
+    }) = created.iter().find(|event| {
+        matches!(
+            event,
+            ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+        )
+    })
+    else {
+        panic!("creation result missing: {created:#?}");
+    };
+    assert_eq!(
+        workspace.path,
+        folder.canonicalize().unwrap().join("worktrees/api-change")
+    );
+    assert_eq!(workspace.branch, "pilot/api-change");
+    assert_eq!(repositories.len(), 2);
+    for (name, repo, expected_base, origin, primary_head) in [
+        ("alpha", &first, "origin/main", &first_origin, &first_head),
+        (
+            "beta",
+            &second,
+            "origin/master",
+            &second_origin,
+            &second_head,
+        ),
+    ] {
+        let member = repositories
+            .iter()
+            .find(|member| member.name == name)
+            .unwrap();
+        let destination = workspace.path.join(name);
+        assert_eq!(member.path, destination);
+        assert_eq!(member.base.as_deref(), Some(expected_base));
+        assert!(member.fetch_succeeded);
+        if name == "alpha" {
+            assert!(member
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("hook-warning")));
+        }
+        assert!(destination.is_dir());
+        assert_eq!(
+            git_output(&destination, &["branch", "--show-current"]),
+            "pilot/api-change"
+        );
+        assert_eq!(
+            git_output(&destination, &["rev-parse", "HEAD"]),
+            git_output(
+                origin,
+                &[
+                    "rev-parse",
+                    &format!(
+                        "refs/heads/{}",
+                        if name == "alpha" { "main" } else { "master" }
+                    )
+                ]
+            )
+        );
+        assert_eq!(
+            git_output(repo, &["rev-parse", "HEAD"]),
+            primary_head.trim()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(first.join("README.md")).unwrap(),
+        "local edit\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second.join("untracked.txt")).unwrap(),
+        "keep me\n"
+    );
+
+    let member_id = repositories[0].id.clone();
+    write_frame(
+        &mut client,
+        &ClientRequest::DeleteWorktree {
+            req_id: 3,
+            id: member_id,
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
+    let refused = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 3).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&refused, 3), Some(ServerEvent::Error { message, .. }) if message.contains("single repository worktree"))
+    );
+    assert!(workspace.path.join("alpha").is_dir());
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+    let mut restarted = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    let snapshot = subscribe(&mut client).await;
+    let Some(ServerEvent::Snapshot {
+        session_workspaces,
+        worktrees,
+        ..
+    }) = snapshot
+        .iter()
+        .find(|event| matches!(event, ServerEvent::Snapshot { .. }))
+    else {
+        panic!("snapshot missing after restart: {snapshot:#?}");
+    };
+    assert!(session_workspaces
+        .iter()
+        .any(|saved| saved.worktree_id == workspace.id
+            && saved.state == nebula_core::WorkspaceState::Ready));
+    assert!(worktrees
+        .iter()
+        .any(|saved| saved.path == workspace.path.join("alpha")));
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut restarted);
+}
+
+#[tokio::test]
+async fn session_workspace_branch_conflict_is_checked_across_all_members_first() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let first = folder.join("alpha");
+    let second = folder.join("beta");
+    make_repo_at(&first);
+    make_repo_at(&second);
+    git_run(&second, &["branch", "pilot/reused"]).unwrap();
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("project registration failed: {registered:#?}");
+    };
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "reused".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 2).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 2), Some(ServerEvent::Error { message, .. }) if message.contains("beta") && message.contains("delete the kept branch")),
+        "{events:#?}"
+    );
+    assert!(!folder.join("worktrees/reused").exists());
+    assert!(git_run(&first, &["show-ref", "--verify", "refs/heads/pilot/reused"]).is_err());
+    assert_eq!(git_output(&second, &["branch", "--show-current"]), "main");
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+#[tokio::test]
+async fn session_workspace_agents_and_terminals_start_in_workspace_folder() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let first = folder.join("alpha");
+    let second = folder.join("beta");
+    make_repo_at(&first);
+    make_repo_at(&second);
+    let logs = env.tmp.path().join("starts");
+    std::fs::create_dir_all(&logs).unwrap();
+    let agent_script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &agent_script,
+        format!(
+            "#!/bin/sh\npwd > '{}/'$NEBULA_AGENT_ID\nexec sleep 60\n",
+            logs.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&agent_script);
+    let terminal_script = env.tmp.path().join("shell.sh");
+    std::fs::write(
+        &terminal_script,
+        format!(
+            "#!/bin/sh\npwd > '{}/terminal'\nexec sleep 60\n",
+            logs.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&terminal_script);
+    let mut daemon =
+        env.spawn_daemon_in(&terminal_script, Some(agent_script.to_str().unwrap()), &[]);
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "Project".into(),
+            repositories: vec!["alpha".into(), "beta".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("{registered:#?}");
+    };
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "start-here".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let created = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+            )
+        })
+    })
+    .await;
+    let Some(ServerEvent::SessionWorkspaceCreated { workspace, .. }) =
+        created.iter().find(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+            )
+        })
+    else {
+        panic!("{created:#?}");
+    };
+    let worktree_id = workspace.id.clone();
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateAgent {
+            req_id: 3,
+            worktree: worktree_id.clone(),
+            name: "agent".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        find_ack(events, 3).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent)),
+        ..
+    }) = find_ack(&events, 3)
+    else {
+        panic!("{events:#?}");
+    };
+    wait_for_file(&logs.join(agent.as_str())).await;
+    assert_eq!(
+        std::fs::read_to_string(logs.join(agent.as_str()))
+            .unwrap()
+            .trim(),
+        workspace.path.to_string_lossy()
+    );
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateTerminal {
+            req_id: 4,
+            worktree: worktree_id,
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let terminal_events = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        find_ack(events, 4).is_some()
+    })
+    .await;
+    assert!(matches!(
+        find_ack(&terminal_events, 4),
+        Some(ServerEvent::Ack {
+            created: Some(EntityId::Terminal(_)),
+            ..
+        })
+    ));
+    wait_for_file(&logs.join("terminal")).await;
+    assert_eq!(
+        std::fs::read_to_string(logs.join("terminal"))
+            .unwrap()
+            .trim(),
+        workspace.path.to_string_lossy()
+    );
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
 }
 
 /// `nebula spawn "<task>"` from inside a session, end to end over real

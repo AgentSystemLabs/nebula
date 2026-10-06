@@ -157,6 +157,38 @@ pub struct ProjectRepository {
     pub branch: String,
 }
 
+/// Persisted membership and lifecycle for a multi-repository session workspace.
+/// The corresponding `Worktree` row is the dashboard band and the workspace
+/// folder used as the working directory for agent and terminal sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWorkspace {
+    pub worktree_id: WorktreeId,
+    pub name: String,
+    pub state: WorkspaceState,
+    pub repositories: Vec<WorkspaceRepository>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceState {
+    Creating,
+    Ready,
+    Unavailable,
+    Closing,
+}
+
+/// One repository checkout created inside a session workspace, together with
+/// the base-resolution result shown to the developer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRepository {
+    pub id: WorktreeId,
+    pub name: String,
+    pub path: PathBuf,
+    pub base: Option<String>,
+    pub fetch_succeeded: bool,
+    pub warning: Option<String>,
+}
+
 impl Project {
     /// The name a project takes from disk: the last component of its repo
     /// path. This is the default `name`, and it stays the truth about where

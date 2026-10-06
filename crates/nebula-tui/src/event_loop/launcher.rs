@@ -2684,17 +2684,18 @@ fn open_worktree_picker(app: &mut App, back: QuickReturn) {
         )
     };
     let fresh = match &back.launch.target {
-        QuickTarget::NewWorktree { .. } => back.launch.target.clone(),
+        QuickTarget::NewWorktree { .. } | QuickTarget::NewSessionWorkspace { .. } => {
+            back.launch.target.clone()
+        }
         QuickTarget::Worktree(_) => view::fresh_worktree(app, project.clone(), &back.launch),
     };
-    let QuickTarget::NewWorktree { branch, .. } = &fresh else {
-        unreachable!("fresh_worktree mints a new worktree")
+    let fresh_name = match &fresh {
+        QuickTarget::NewWorktree { branch, .. } => format!("new worktree  {branch}"),
+        QuickTarget::NewSessionWorkspace { name, .. } => format!("new session workspace  {name}"),
+        QuickTarget::Worktree(_) => unreachable!("fresh target is new"),
     };
     let mut items = vec![row(
-        format!(
-            "+ new worktree  {branch}{}",
-            tick(back.launch.is_new_worktree())
-        ),
+        format!("+ {fresh_name}{}", tick(back.launch.is_new_worktree())),
         fresh.clone(),
     )];
     for w in checkouts {

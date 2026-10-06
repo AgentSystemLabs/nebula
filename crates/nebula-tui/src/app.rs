@@ -294,6 +294,7 @@ pub enum MenuAction {
     RenameTerminal(TerminalId),
     CloseTerminal(TerminalId),
     NewWorktree(ProjectId),
+    NewSessionWorkspace(ProjectId),
     /// Hand a link row's URL to the browser.
     OpenLink(String),
     /// Read the selected open pull request's diff in the diff modal. Carries
@@ -710,6 +711,9 @@ pub struct HelpView {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptKind {
     AddProject,
+    NewSessionWorkspace {
+        project: ProjectId,
+    },
     NewWorktree {
         project: ProjectId,
         /// Random `<adj>-<noun>-<verb>` name minted when the prompt
@@ -2065,6 +2069,18 @@ pub enum PendingIntent {
     },
     /// Select the added project and step into its Worktrees panel.
     SelectCreatedProject,
+    CreateSessionWorkspace {
+        project: ProjectId,
+        name: String,
+        focus: Focus,
+        placeholder: WorktreeId,
+    },
+    CreateSessionWorkspaceAndLaunch {
+        launch: crate::quick_prompt::QuickLaunch,
+        text: String,
+        focus: bool,
+        placeholder: WorktreeId,
+    },
     /// The NEW WORKTREE modal's create. The stand-in row `placeholder`
     /// went up and took the cursor when Enter was pressed, exactly as the
     /// Ack used to leave the real row: the Ack only swaps the real id in.
@@ -2164,6 +2180,10 @@ impl PendingIntent {
             PendingIntent::LaunchInCreatedWorktree { placeholder, .. }
             | PendingIntent::AttachCreatedPrSession { placeholder, .. } => {
                 Some(&placeholder.worktree)
+            }
+            PendingIntent::CreateSessionWorkspace { placeholder, .. }
+            | PendingIntent::CreateSessionWorkspaceAndLaunch { placeholder, .. } => {
+                Some(placeholder)
             }
             PendingIntent::SelectCreatedWorktree { placeholder, .. } => Some(placeholder),
             _ => None,
@@ -2584,6 +2604,7 @@ pub fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus
 pub struct Tree {
     pub projects: Vec<Project>,
     pub repositories: Vec<nebula_core::ProjectRepository>,
+    pub session_workspaces: Vec<nebula_core::SessionWorkspace>,
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
@@ -3138,7 +3159,7 @@ pub struct RowsMemo {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct RowsKey {
     cursor: (usize, usize, usize),
-    shape: [usize; 5],
+    shape: [usize; 6],
     show_archived: bool,
 }
 
@@ -4750,6 +4771,7 @@ impl App {
                 self.tree.agents.len(),
                 self.tree.terminals.len(),
                 self.tree.links.len(),
+                self.tree.session_workspaces.len(),
             ],
             show_archived: self.show_archived,
         }
@@ -5084,7 +5106,8 @@ impl App {
     /// sessions list). The stamp is the newest of the checkout's sessions;
     /// a stable sort keeps never-run worktrees in tree order at the bottom.
     pub fn visible_worktrees(&self) -> Vec<&Worktree> {
-        self.rows_memo
+        let mut visible = self
+            .rows_memo
             .with(
                 |m| &m.worktrees,
                 self.rows_key(),
@@ -5093,7 +5116,25 @@ impl App {
             )
             .into_iter()
             .map(|i| &self.tree.worktrees[i])
-            .collect()
+            .collect::<Vec<_>>();
+        let workspace_roots: Vec<WorktreeId> = self
+            .tree
+            .session_workspaces
+            .iter()
+            .map(|workspace| workspace.worktree_id.clone())
+            .collect();
+        let project = self.selected_project().map(|project| project.id.clone());
+        for worktree in &self.tree.worktrees {
+            if workspace_roots.contains(&worktree.id)
+                && project
+                    .as_ref()
+                    .is_some_and(|project| project == &worktree.project_id)
+                && !visible.iter().any(|known| known.id == worktree.id)
+            {
+                visible.push(worktree);
+            }
+        }
+        visible
     }
 
     /// [`App::visible_worktrees`], as indices into `tree.worktrees`.
@@ -5104,7 +5145,15 @@ impl App {
         let now = now_ms();
         let worktrees = &self.tree.worktrees;
         let mut rows: Vec<usize> = (0..worktrees.len())
-            .filter(|&i| worktrees[i].project_id == project.id)
+            .filter(|&i| {
+                worktrees[i].project_id == project.id
+                    && !self.tree.session_workspaces.iter().any(|workspace| {
+                        workspace
+                            .repositories
+                            .iter()
+                            .any(|repository| repository.id == worktrees[i].id)
+                    })
+            })
             .collect();
         // Rolled up once for every checkout rather than re-walked per
         // comparison the sort makes (`worktree_recencies`).

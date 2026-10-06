@@ -43,6 +43,8 @@ pub enum QuickTarget {
     /// (`ClientRequest::CreateWorktree`), and the launch follows into the
     /// checkout the DAEMON made once its Ack lands.
     NewWorktree { project: ProjectId, branch: String },
+    /// A complete session workspace that has not been created yet.
+    NewSessionWorkspace { project: ProjectId, name: String },
 }
 
 /// Everything one QUICK PROMPT will launch with. Resolved from the config
@@ -420,7 +422,7 @@ impl QuickLaunch {
     pub fn worktree_mut(&mut self) -> Option<&mut WorktreeId> {
         match &mut self.target {
             QuickTarget::Worktree(worktree) => Some(worktree),
-            QuickTarget::NewWorktree { .. } => None,
+            QuickTarget::NewWorktree { .. } | QuickTarget::NewSessionWorkspace { .. } => None,
         }
     }
 
@@ -461,6 +463,9 @@ impl QuickLaunch {
         }
         if let QuickTarget::NewWorktree { branch, .. } = &self.target {
             head.push(format!("new worktree {branch}"));
+        }
+        if let QuickTarget::NewSessionWorkspace { name, .. } = &self.target {
+            head.push(format!("new session workspace {name}"));
         }
         format!("{} ({})", head.join(" · "), opts.join(" · "))
     }
@@ -506,6 +511,10 @@ impl QuickLaunch {
                 QuickTarget::NewWorktree { project: a, .. },
                 QuickTarget::NewWorktree { project: b, .. },
             ) => a == b,
+            (
+                QuickTarget::NewSessionWorkspace { project: a, .. },
+                QuickTarget::NewSessionWorkspace { project: b, .. },
+            ) => a == b,
             _ => false,
         };
         same_place && self.issue == other.issue && self.pr == other.pr
@@ -515,7 +524,10 @@ impl QuickLaunch {
     /// turns green and its target row wears a NEW WORKTREE chip while so,
     /// whether the target came from the WORKTREES PANEL or from `Ctrl+N`.
     pub fn is_new_worktree(&self) -> bool {
-        matches!(self.target, QuickTarget::NewWorktree { .. })
+        matches!(
+            self.target,
+            QuickTarget::NewWorktree { .. } | QuickTarget::NewSessionWorkspace { .. }
+        )
     }
 }
 
@@ -659,6 +671,7 @@ pub(crate) fn picker_context(app: &App, launch: &QuickLaunch) -> Option<Worktree
     match &launch.target {
         QuickTarget::Worktree(id) => Some(id.clone()),
         QuickTarget::NewWorktree { project, .. } => app.root_worktree(project),
+        QuickTarget::NewSessionWorkspace { project, .. } => app.root_worktree(project),
     }
 }
 
@@ -706,6 +719,9 @@ pub(crate) fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: Tex
         return;
     }
     let target = match &launch.target {
+        QuickTarget::NewSessionWorkspace { .. } => {
+            Err("quick prompt: a session workspace launch target cannot be toggled")
+        }
         QuickTarget::NewWorktree { .. } => match app.selected_worktree().map(|w| w.id.clone()) {
             None => Err("quick prompt: no worktree under the cursor — keeping the new one"),
             Some(worktree) if app.is_placeholder_worktree(&worktree) => {
@@ -757,6 +773,7 @@ pub(crate) fn target_branch(app: &App, launch: &QuickLaunch) -> Option<String> {
             .find(|w| &w.id == id)
             .map(|w| w.branch.clone()),
         QuickTarget::NewWorktree { branch, .. } => Some(branch.clone()),
+        QuickTarget::NewSessionWorkspace { name, .. } => Some(format!("pilot/{name}")),
     }
 }
 
