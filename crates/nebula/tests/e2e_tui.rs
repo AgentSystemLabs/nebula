@@ -490,6 +490,7 @@ fn host_working_directory_follows_project_switches_and_restores_on_exit() {
     tui.send(b"+");
     tui.type_str("cwd-second");
     tui.send(ENTER);
+    tui.send(ESC);
     assert!(tui.screen_text().contains("cwd-second"));
 
     tui.send(b"q");
@@ -505,7 +506,6 @@ fn tui_restart_restores_the_selected_project_and_agent_card() {
 
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "restore-selection");
-    tui.send(ESC);
     tui.send(b"p");
     tui.wait_for_text("what should the agent do?");
     tui.type_str("keep this card selected");
