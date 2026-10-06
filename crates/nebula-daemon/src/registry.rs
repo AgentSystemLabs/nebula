@@ -1618,31 +1618,6 @@ impl Daemon {
                 }
             }
         }
-        if !unavailable_primary.is_empty() {
-            let reason = format!(
-                "primary checkout unavailable: {}",
-                unavailable_primary.join(", ")
-            );
-            for workspace in session_workspaces.iter().filter(|workspace| {
-                self.store
-                    .get_worktree(&workspace.worktree_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|root| root.project_id == project.id)
-            }) {
-                if workspace.state == WorkspaceState::Ready {
-                    let mut updated = workspace.clone();
-                    updated.state = WorkspaceState::Unavailable;
-                    updated.failure = Some(reason.clone());
-                    self.store.set_session_workspace_state(
-                        &workspace.worktree_id,
-                        WorkspaceState::Unavailable,
-                        Some(&reason),
-                    )?;
-                    self.broadcast(ServerEvent::SessionWorkspaceUpserted { workspace: updated });
-                }
-            }
-        }
         let mut changed_worktrees = Vec::new();
         let mut failed_workspaces = Vec::new();
         let mut refreshed_workspaces = Vec::new();
@@ -1718,8 +1693,6 @@ impl Daemon {
                     Some(&reason),
                 )?;
                 failed_workspaces.push(updated);
-            } else if workspace.state == WorkspaceState::Ready && workspace_changes {
-                refreshed_workspaces.push(updated);
             } else if workspace.state == WorkspaceState::Ready && workspace_changes {
                 refreshed_workspaces.push(updated);
             } else if workspace.state == WorkspaceState::Ready {
