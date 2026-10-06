@@ -192,8 +192,18 @@ fn collect_hook_tree_extras(folder: &Path, dir: &Path, extras: &mut Vec<PathBuf>
 }
 
 fn remove_workspace_hook_files(folder: &Path) -> Result<()> {
-    remove_nebula_groups_from_file(&folder.join(".claude/settings.local.json"), false)?;
-    remove_nebula_groups_from_file(&folder.join(".cursor/hooks.json"), true)?;
+    for (path, cursor) in [
+        (folder.join(".claude/settings.local.json"), false),
+        (folder.join(".cursor/hooks.json"), true),
+    ] {
+        remove_nebula_groups_from_file(&path, cursor)?;
+        if path.exists() {
+            bail!(
+                "preserved non-Nebula settings remain in {}; review or remove this file before retrying",
+                path.display()
+            );
+        }
+    }
     remove_file_if_present(&folder.join(".cursor/rules/nebula-title.mdc"))?;
     for dir in [
         folder.join(".claude"),
@@ -267,11 +277,14 @@ fn remove_nebula_groups_from_file(path: &Path, cursor: bool) -> Result<()> {
             object.remove("hooks");
         }
     }
+    let empty_after_cleanup = root.as_object().is_some_and(|object| object.is_empty());
+    if empty_after_cleanup {
+        return remove_file_if_present(path);
+    }
     let empty = root.as_object().is_some_and(|object| {
-        object.is_empty()
-            || (cursor
-                && object.keys().all(|key| key == "version")
-                && object.get("version").and_then(serde_json::Value::as_i64) == Some(1))
+        cursor
+            && object.keys().all(|key| key == "version")
+            && object.get("version").and_then(serde_json::Value::as_i64) == Some(1)
     });
     if empty {
         return remove_file_if_present(path);
