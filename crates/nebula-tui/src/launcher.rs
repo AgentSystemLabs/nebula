@@ -2748,12 +2748,14 @@ mod tests {
                     warning: None,
                 },
             ],
+            failure: None,
         });
         app.tree.session_workspaces.push(SessionWorkspace {
             worktree_id: WorktreeId("workspace-2".into()),
             name: "another-task".into(),
             state: WorkspaceState::Ready,
             repositories: Vec::new(),
+            failure: None,
         });
         app.tree
             .agents
