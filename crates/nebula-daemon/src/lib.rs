@@ -289,9 +289,8 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                         .project_repositories(&project.id)
                         .is_ok_and(|repositories| !repositories.is_empty());
                     // Status of a checkout's files does not touch its Git
-                    // metadata. Explicit workspace membership therefore
-                    // refreshes every Git-sync tick; legacy projects retain
-                    // the inexpensive worktree-list probe.
+                    // metadata. Explicit membership refreshes every tick;
+                    // legacy projects retain the inexpensive worktree probe.
                     let stamp = worktree_probe_stamp(&project.repo_path);
                     if !explicit_members
                         && stamp.is_some()

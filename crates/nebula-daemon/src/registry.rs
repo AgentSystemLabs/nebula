@@ -1532,8 +1532,8 @@ impl Daemon {
         let session_workspaces = self.store.session_workspaces()?;
         let mut refreshed_members = Vec::with_capacity(members.len());
         let mut main_changed = false;
-        let mut unavailable_primary = Vec::new();
-        let mut observed_primary_branches = Vec::with_capacity(members.len());
+        let mut primary_branches = Vec::with_capacity(members.len());
+        let mut unavailable_primary: Vec<String> = Vec::new();
         for member in members {
             let branch = git::current_branch(&member.path).await.ok();
             let changed_files = if member.path.is_dir() {
@@ -1541,15 +1541,15 @@ impl Daemon {
             } else {
                 None
             };
-            observed_primary_branches.push((member.name.clone(), branch.clone()));
             let observed_branch = branch.as_deref().unwrap_or(&member.branch);
+            primary_branches.push((member.name.clone(), branch.clone()));
+            if !member.path.is_dir() {
+                unavailable_primary.push(member.name.clone());
+            }
             main_changed |= branch
                 .as_deref()
                 .is_some_and(|observed| observed != member.branch)
                 || (branch.is_some() && changed_files != member.changed_files);
-            if !member.path.is_dir() {
-                unavailable_primary.push(member.name.clone());
-            }
             let persisted_changed_files = if branch.is_some() {
                 changed_files
             } else {
@@ -1573,15 +1573,10 @@ impl Daemon {
             .into_iter()
             .find(|worktree| worktree.project_id == project.id && worktree.is_main)
         {
-            let branch = observed_primary_branches
+            let branch = primary_branches
                 .iter()
                 .find(|(name, _)| main.path.ends_with(name))
-                .and_then(|(_, branch)| branch.as_ref())
-                .or_else(|| {
-                    observed_primary_branches
-                        .iter()
-                        .find_map(|(_, branch)| branch.as_ref())
-                });
+                .and_then(|(_, branch)| branch.as_ref());
             if let Some(branch) = branch {
                 if main.branch != *branch {
                     main.branch = branch.clone();
@@ -1597,6 +1592,31 @@ impl Daemon {
                 project: project.id.clone(),
                 repositories: refreshed_members,
             });
+        }
+        if !unavailable_primary.is_empty() {
+            let reason = format!(
+                "primary checkout unavailable: {}",
+                unavailable_primary.join(", ")
+            );
+            for workspace in session_workspaces.iter().filter(|workspace| {
+                self.store
+                    .get_worktree(&workspace.worktree_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|root| root.project_id == project.id)
+            }) {
+                if workspace.state == WorkspaceState::Ready {
+                    let mut updated = workspace.clone();
+                    updated.state = WorkspaceState::Unavailable;
+                    updated.failure = Some(reason.clone());
+                    self.store.set_session_workspace_state(
+                        &workspace.worktree_id,
+                        WorkspaceState::Unavailable,
+                        Some(&reason),
+                    )?;
+                    self.broadcast(ServerEvent::SessionWorkspaceUpserted { workspace: updated });
+                }
+            }
         }
         if !unavailable_primary.is_empty() {
             let reason = format!(

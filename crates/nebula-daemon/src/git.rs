@@ -36,6 +36,7 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
         .arg("-C")
         .arg(repo)
         .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .await
         .map_err(spawn_err)?;
