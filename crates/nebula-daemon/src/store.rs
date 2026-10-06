@@ -537,6 +537,16 @@ impl Store {
             .collect()
     }
 
+    pub fn session_workspace(
+        &self,
+        id: &WorktreeId,
+    ) -> Result<Option<nebula_core::SessionWorkspace>> {
+        Ok(self
+            .session_workspaces()?
+            .into_iter()
+            .find(|workspace| workspace.worktree_id == *id))
+    }
+
     pub fn insert_session_workspace(
         &self,
         root: &Worktree,

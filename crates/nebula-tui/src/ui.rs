@@ -983,6 +983,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[FindFile]), "find file (^y copies path)"),
                         (Act(&[Grep]), "find in files (git grep)"),
                         (Act(&[TreeBrowser]), "file tree browser"),
+                        (Act(&[SelectRepository]), "select Git tools repository"),
                     ],
                 ),
                 (
@@ -999,7 +1000,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[Issues]), "issues: prompt, preset, edit"),
                         (Act(&[PullRequests]), "pull requests: read / launch"),
                         (Act(&[CommentPullRequest]), "comment on the card's PR"),
-                        (Act(&[SwitchBranch]), "switch the ⌂ root's branch"),
+                        (
+                            Act(&[SwitchBranch]),
+                            "switch the selected repository's branch",
+                        ),
                     ],
                 ),
                 (

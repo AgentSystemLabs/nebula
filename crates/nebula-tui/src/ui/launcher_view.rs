@@ -1752,6 +1752,7 @@ fn draw_band_rule(
             })
     });
     let is_session_workspace = !band.is_main && !band.repositories.is_empty();
+    let is_multi_repository = band.repositories.len() > 1;
     let label = if band.repositories.is_empty() || is_session_workspace {
         band.workspace_name
             .as_deref()
@@ -1763,6 +1764,11 @@ fn draw_band_rule(
             band.workspace_name.as_deref().unwrap_or("main workspace"),
             band.repositories.join(", ")
         )
+    };
+    let label = if !band.is_main && !is_session_workspace && is_multi_repository {
+        format!("{} · {}", label, band.repositories.join(", "))
+    } else {
+        label
     };
     let branch = truncate(&label, room.saturating_sub(glyph.chars().count() + taken));
     // The rule's left end: `──` like every other band's, or the CURSOR

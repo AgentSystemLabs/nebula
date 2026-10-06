@@ -1123,6 +1123,30 @@ pub(crate) fn open_branch_switch(app: &mut App) {
         app.focus,
         Focus::Worktrees | Focus::Sessions | Focus::Terminal
     );
+    if let Some(workspace) = app.selected_worktree().filter(|_| on_checkout).cloned() {
+        if let Some((name, path, branch)) = app.selected_repository_checkout(&workspace.id) {
+            let session_member = app.tree.session_workspaces.iter().any(|session| {
+                session
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.path == path)
+            });
+            if session_member {
+                if let Some(id) = app
+                    .tree
+                    .worktrees
+                    .iter()
+                    .find(|checkout| checkout.path == path)
+                    .map(|checkout| checkout.id.clone())
+                {
+                    open_for_named_repository(app, &id, &name, &branch);
+                }
+            } else {
+                open_on_repository(app, &workspace.id, &path, &name, &branch);
+            }
+            return;
+        }
+    }
     let target = match app.selected_worktree().filter(|_| on_checkout) {
         Some(w) if !w.is_main => {
             app.flash = Some(
@@ -1138,6 +1162,51 @@ pub(crate) fn open_branch_switch(app: &mut App) {
         Some(id) => open_for(app, &id),
         None => app.flash = Some("switch branch: the project has no root checkout yet".into()),
     }
+}
+
+fn open_for_named_repository(app: &mut App, worktree: &WorktreeId, repository: &str, branch: &str) {
+    open_for(app, worktree);
+    if let Some(Overlay::BranchSwitch(view)) = &mut app.overlay {
+        view.project_name = format!("{} · {repository}", view.project_name);
+        view.current = branch.to_string();
+    }
+}
+
+fn open_on_repository(
+    app: &mut App,
+    workspace: &WorktreeId,
+    root: &Path,
+    repository: &str,
+    branch: &str,
+) {
+    let Some(worktree) = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|worktree| &worktree.id == workspace)
+    else {
+        return;
+    };
+    let project_name = app
+        .tree
+        .projects
+        .iter()
+        .find(|project| project.id == worktree.project_id)
+        .map(|project| project.name.clone())
+        .unwrap_or_default();
+    let mut view = BranchSwitchView::new(
+        worktree.id.clone(),
+        root.to_path_buf(),
+        format!("{project_name} · {repository}"),
+        branch.to_string(),
+        0,
+    );
+    if let Ok(branches) = list_branches(root) {
+        view.set_branches(branches);
+    }
+    view.changes = changes(root).ok().map(|files| files.len());
+    app.overlay = Some(Overlay::BranchSwitch(view));
+    app.dirty = true;
 }
 
 /// A cached listing with `current` re-derived from the branch the tree

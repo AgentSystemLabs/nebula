@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 46;
+pub const PROTOCOL_VERSION: u32 = 47;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -331,12 +331,14 @@ pub enum ClientRequest {
     StartRun {
         req_id: u64,
         worktree: WorktreeId,
+        repository: Option<String>,
     },
     /// `r` again: kill the worktree's RUN TERMINAL and drop its row.
     /// Nothing running is not an error.
     StopRun {
         req_id: u64,
         worktree: WorktreeId,
+        repository: Option<String>,
     },
 
     /// Fire-and-forget opaque TUI blob (last selection etc.).

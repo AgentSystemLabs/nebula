@@ -172,11 +172,11 @@ pub(crate) fn open_on(app: &mut App, url: Option<&str>) {
         app.flash = Some("pull requests: select a project first".into());
         return;
     };
-    let mut view = PullRequestsView::new(
-        project.id.clone(),
-        project.name.clone(),
-        project.repo_path.clone(),
-    );
+    let repository_path = app
+        .selected_worktree()
+        .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
+        .map_or_else(|| project.repo_path.clone(), |(_, path, _)| path);
+    let mut view = PullRequestsView::new(project.id.clone(), project.name.clone(), repository_path);
     let list = rows(app, &project.id);
     let start = url
         .and_then(|url| list.iter().position(|row| row.url == url))
@@ -200,7 +200,14 @@ pub(crate) fn open_on(app: &mut App, url: Option<&str>) {
 fn close(app: &mut App) {
     app.overlay = None;
     let pending = app.previewed_pr().and_then(|pr| {
-        let dir = app.selected_project()?.repo_path.clone();
+        let dir = app
+            .selected_worktree()
+            .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
+            .map(|(_, path, _)| path)
+            .or_else(|| {
+                app.selected_project()
+                    .map(|project| project.repo_path.clone())
+            })?;
         pending_for(app, pr.url, pr.number, dir)
     });
     app.pending_pr_detail = pending.map(|p| (p, std::time::Instant::now() + DETAIL_DEBOUNCE));

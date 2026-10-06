@@ -798,10 +798,13 @@ fn request_git_changes(app: &mut App, git_tx: &tokio::sync::mpsc::UnboundedSende
     if app.git_changes_inflight.is_some() {
         return;
     }
-    let Some((id, path)) = app
-        .selected_worktree()
-        .map(|w| (w.id.clone(), w.path.clone()))
-    else {
+    let Some((id, path)) = app.selected_worktree().map(|workspace| {
+        let path = app
+            .selected_repository_checkout(&workspace.id)
+            .map(|(_, path, _)| path)
+            .unwrap_or_else(|| workspace.path.clone());
+        (workspace.id.clone(), path)
+    }) else {
         return;
     };
     app.git_changes_inflight = Some(id.clone());
@@ -1139,10 +1142,15 @@ fn lookup_open_prs(
     )>,
     out: &mut Vec<ClientRequest>,
 ) {
-    let Some((id, path)) = app
-        .selected_project()
-        .map(|p| (p.id.clone(), p.repo_path.clone()))
-    else {
+    let Some((id, path)) = app.selected_project().map(|project| {
+        let selected_repo = app
+            .selected_worktree()
+            .and_then(|workspace| app.selected_repository_checkout(&workspace.id));
+        (
+            project.id.clone(),
+            selected_repo.map_or_else(|| project.repo_path.clone(), |(_, path, _)| path),
+        )
+    }) else {
         return;
     };
     if !app.open_prs_lookup_due(&id) {
@@ -1493,9 +1501,14 @@ fn schedule_pr_detail(app: &mut App) {
         if fresh || app.pr_detail_inflight.contains(&url) || app.pr_detail_failed.contains(&url) {
             return None;
         }
-        // Either row lives in the selected project's repo; `gh pr view`
-        // resolves the number from any checkout of it.
-        let dir = app.selected_project().map(|p| p.repo_path.clone())?;
+        let dir = app
+            .selected_worktree()
+            .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
+            .map(|(_, path, _)| path)
+            .or_else(|| {
+                app.selected_project()
+                    .map(|project| project.repo_path.clone())
+            })?;
         Some(crate::app::PendingPrDetail {
             url,
             number: pr.number,
@@ -1640,7 +1653,14 @@ fn post_pr_comment(
     body: String,
     back: Option<Box<crate::pr_modal::PullRequestsView>>,
 ) {
-    let dir = app.selected_project().map(|p| p.repo_path.clone());
+    let dir = app
+        .selected_worktree()
+        .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
+        .map(|(_, path, _)| path)
+        .or_else(|| {
+            app.selected_project()
+                .map(|project| project.repo_path.clone())
+        });
     let refused = if app.pr_comment_inflight.contains(&url) {
         Some(format!("still posting the last comment on #{number}…"))
     } else {
@@ -1771,7 +1791,15 @@ pub(crate) fn request_pr_diff_for(app: &mut App, number: u64, url: String, title
         app.flash = Some(format!("still fetching the diff for #{number}…"));
         return;
     }
-    let Some(dir) = app.selected_project().map(|p| p.repo_path.clone()) else {
+    let Some(dir) = app
+        .selected_worktree()
+        .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
+        .map(|(_, path, _)| path)
+        .or_else(|| {
+            app.selected_project()
+                .map(|project| project.repo_path.clone())
+        })
+    else {
         return;
     };
     if !dir.is_dir() {
@@ -2019,7 +2047,15 @@ fn refetch_pr_detail(app: &mut App) {
     if app.pr_detail_inflight.contains(&pr.url) {
         return;
     }
-    let Some(dir) = app.selected_project().map(|p| p.repo_path.clone()) else {
+    let Some(dir) = app
+        .selected_worktree()
+        .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
+        .map(|(_, path, _)| path)
+        .or_else(|| {
+            app.selected_project()
+                .map(|project| project.repo_path.clone())
+        })
+    else {
         return;
     };
     app.pr_detail_failed.remove(&pr.url);
@@ -2180,6 +2216,11 @@ fn ui_state_json(app: &App) -> String {
     let state = UiState {
         project: app.selected_project().map(|p| p.id.to_string()),
         worktree: app.selected_worktree().map(|w| w.id.to_string()),
+        selected_repositories: app
+            .selected_repositories
+            .iter()
+            .map(|(workspace, repository)| (workspace.to_string(), repository.clone()))
+            .collect(),
         session_agent: app.selected_session().map(|a| a.id.to_string()),
         show_archived: app.show_archived,
         collapsed: app.collapsed,
@@ -2257,6 +2298,17 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
         return false;
     };
     app.show_archived = state.show_archived;
+    app.selected_repositories = state
+        .selected_repositories
+        .into_iter()
+        .filter_map(|(workspace, repository)| {
+            let workspace = WorktreeId(workspace);
+            app.repository_checkouts(&workspace)
+                .iter()
+                .any(|(name, _, _)| name == &repository)
+                .then_some((workspace, repository))
+        })
+        .collect();
     app.open_prs_collapsed = state.open_prs_collapsed;
     app.issues_collapsed = state.issues_collapsed;
     if let Some(w) = state.diff_files_width {
@@ -3229,6 +3281,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Issues => crate::issues::open_issues(app),
         Action::PullRequests => crate::pr_modal::open(app),
         Action::SwitchBranch => crate::branch_switch::open_branch_switch(app),
+        Action::SelectRepository => open_repository_picker(app),
         Action::FocusRight => match app.focus {
             Focus::Sessions => {
                 if double_tapped(app, action, armed, &chord, "enter pane") {
@@ -3836,15 +3889,12 @@ fn in_git_repo(dir: &std::path::Path) -> bool {
 /// cursor's worktree decides, falling back to the project's own clone when
 /// it has no worktrees yet or the one selected is gone from disk.
 fn open_repo_in_browser(app: &mut App) {
-    let root = app
-        .selected_worktree()
-        .map(|w| w.path.clone())
-        .filter(|path| path.is_dir())
-        .or_else(|| app.selected_project().map(|p| p.repo_path.clone()));
-    let Some(root) = root else {
-        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+    let Some((root, _branch, repository)) = selected_git_checkout(app) else {
         return;
     };
+    let multiple_repositories = app
+        .selected_worktree()
+        .is_some_and(|workspace| app.repository_checkouts(&workspace.id).len() > 1);
     // Not open_link: this is a repo page, never a PR row to mark read.
     let open = move || match crate::remote::repo_url(&root) {
         Ok(url) if open_url(&url) => format!("opened {}", crate::app::pretty_url(&url)),
@@ -3855,10 +3905,17 @@ fn open_repo_in_browser(app: &mut App) {
     // loop, with the outcome flashed when it lands.
     match app.view_jobs.clone() {
         Some(jobs) => {
-            app.flash = Some("opening the repository's page…".into());
+            app.flash = Some(format!("opening {repository}'s repository page…"));
             jobs.run(move || Some(crate::view_jobs::Answer::Flash(open())));
         }
-        None => app.flash = Some(open()),
+        None => {
+            let message = open();
+            app.flash = Some(if multiple_repositories {
+                format!("{repository}: {message}")
+            } else {
+                message
+            });
+        }
     }
 }
 
@@ -3931,35 +3988,94 @@ fn toggle_run(app: &mut App, out: &mut Vec<ClientRequest>) {
         app.flash = Some("a pull request has no checkout to run — pick a worktree".into());
         return;
     }
-    let Some(w) = app.selected_worktree().cloned() else {
+    let Some(workspace) = app.selected_worktree().cloned() else {
         app.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
-    toggle_run_in(app, &w, out);
+    if let Some((name, path, branch)) = app.selected_repository_checkout(&workspace.id) {
+        let Some(mut checkout) = app
+            .tree
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == path)
+            .cloned()
+        else {
+            if app
+                .tree
+                .session_workspaces
+                .iter()
+                .any(|session| session.worktree_id == workspace.id)
+            {
+                app.flash = Some(format!(
+                    "repository `{name}` has no checkout in this workspace"
+                ));
+                return;
+            }
+            toggle_run_in(app, &workspace, Some(&name), &branch, out);
+            return;
+        };
+        checkout.branch = branch;
+        toggle_run_in(app, &workspace, Some(&name), &checkout.branch, out);
+    } else if app.repository_checkouts(&workspace.id).len() > 1 {
+        app.flash = Some("select a repository before running a command".into());
+    } else {
+        toggle_run_in(app, &workspace, None, &workspace.branch, out);
+    }
 }
 
 /// Ask the DAEMON to start `worktree`'s run, or to stop it while it runs.
-fn toggle_run_in(app: &mut App, worktree: &nebula_core::Worktree, out: &mut Vec<ClientRequest>) {
-    if app.is_placeholder_worktree(&worktree.id) {
+fn toggle_run_in(
+    app: &mut App,
+    workspace: &nebula_core::Worktree,
+    repository: Option<&str>,
+    branch: &str,
+    out: &mut Vec<ClientRequest>,
+) {
+    if app.is_placeholder_worktree(&workspace.id) {
         app.flash = Some(WORKTREE_STILL_CREATING.into());
         return;
     }
-    let start = !app.worktree_running(&worktree.id);
+    let run_id = repository
+        .and_then(|name| {
+            app.tree
+                .session_workspaces
+                .iter()
+                .find(|session| session.worktree_id == workspace.id)
+                .and_then(|session| {
+                    session
+                        .repositories
+                        .iter()
+                        .find(|member| member.name == name)
+                })
+                .map(|member| member.id.clone())
+        })
+        .unwrap_or_else(|| workspace.id.clone());
+    let run_name = repository.map_or("run".to_string(), |name| format!("run:{name}"));
+    let start = !app.tree.terminals.iter().any(|terminal| {
+        terminal.worktree_id == run_id
+            && terminal.name == run_name
+            && terminal.alive
+            && terminal.run_command.is_some()
+    });
     let intent = PendingIntent::RunToggled {
-        branch: worktree.branch.clone(),
+        branch: repository.map_or_else(|| branch.to_string(), |name| format!("{name} · {branch}")),
         started: start,
     };
-    let id = worktree.id.clone();
+    let id = workspace.id.clone();
+    let repository = repository.map(str::to_string);
+    let request_repository = repository.clone();
     send_with(app, out, intent, |req_id| {
         if start {
             ClientRequest::StartRun {
                 req_id,
                 worktree: id,
+                repository: request_repository,
             }
         } else {
             ClientRequest::StopRun {
                 req_id,
                 worktree: id,
+                repository: request_repository,
             }
         }
     });
@@ -3975,7 +4091,32 @@ fn open_selected_worktree(app: &mut App) {
         app.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
-    open_worktree(app, &w);
+    // Open the whole workspace folder so external applications can see all
+    // member repositories together.
+    open_workspace(app, &w);
+}
+
+fn open_workspace(app: &mut App, workspace: &nebula_core::Worktree) {
+    let main = app
+        .tree
+        .projects
+        .iter()
+        .find(|project| project.id == workspace.project_id)
+        .map_or_else(
+            || workspace.path.clone(),
+            |project| project.repo_path.clone(),
+        );
+    let command = match open_command_for(&workspace.path, &main) {
+        Ok(command) => command,
+        Err(message) => {
+            app.flash = Some(message);
+            return;
+        }
+    };
+    app.flash = Some(match spawn_open_command(&command, &workspace.path) {
+        Ok(()) => format!("↗ {command}"),
+        Err(error) => format!("couldn't run {command}: {error}"),
+    });
 }
 
 /// Why `Shift+Enter` has nothing to run, naming both places to put one —
@@ -4079,6 +4220,100 @@ fn selected_checkout(app: &mut App) -> Option<(std::path::PathBuf, String)> {
     Some((path, branch))
 }
 
+/// Selected repository checkout in the current workspace, with its visible
+/// identity. Single-repository projects keep their original Git tools path.
+fn selected_git_checkout(app: &mut App) -> Option<(std::path::PathBuf, String, String)> {
+    let Some(worktree) = app.selected_worktree().cloned() else {
+        let (path, branch) = selected_checkout(app)?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repository".into());
+        return Some((path, branch, name));
+    };
+    let workspace = worktree.id.clone();
+    if let Some((name, path, branch)) = app.selected_repository_checkout(&workspace) {
+        if !path.is_dir() {
+            app.flash = Some(format!(
+                "repository `{name}` is missing: {}",
+                path.display()
+            ));
+            return None;
+        }
+        return Some((path, branch, name));
+    }
+    if app.repository_checkouts(&workspace).len() > 1 {
+        app.flash = Some("select a repository before using Git tools".into());
+        return None;
+    }
+    if !worktree.path.is_dir() {
+        app.flash = Some(format!(
+            "worktree path missing on disk: {}",
+            worktree.path.display()
+        ));
+        return None;
+    }
+    Some((
+        worktree.path,
+        worktree.branch,
+        app.selected_project()
+            .map_or_else(|| "repository".into(), |project| project.name.clone()),
+    ))
+}
+
+/// Open the repository picker for the selected workspace. Repository choice
+/// is kept separately from workspace/session selection.
+fn open_repository_picker(app: &mut App) {
+    let Some(workspace) = app.selected_worktree().map(|worktree| worktree.id.clone()) else {
+        app.flash = Some("select a workspace first".into());
+        return;
+    };
+    open_repository_picker_for(app, &workspace);
+}
+
+fn open_repository_picker_for(app: &mut App, workspace: &WorktreeId) {
+    let workspace = workspace.clone();
+    let repositories = app.repository_checkouts(&workspace);
+    if repositories.is_empty() {
+        app.flash = Some("the selected workspace has no registered repositories".into());
+        return;
+    }
+    let selected = app.selected_repositories.get(&workspace).cloned();
+    let items = repositories
+        .into_iter()
+        .map(|(name, _path, branch)| {
+            let label = if selected.as_deref() == Some(name.as_str()) {
+                format!("{name} · {branch} ✓")
+            } else {
+                format!("{name} · {branch}")
+            };
+            MenuItem::new(
+                label,
+                MenuAction::PickRepository {
+                    workspace: workspace.clone(),
+                    repository: name,
+                },
+            )
+        })
+        .collect();
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("Select repository".into()),
+        items,
+        at: None,
+        hover: selected
+            .as_deref()
+            .and_then(|selected| {
+                app.repository_checkouts(&workspace)
+                    .iter()
+                    .position(|r| r.0 == selected)
+            })
+            .unwrap_or(0),
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+        filter: None,
+    }));
+}
+
 /// Every tracked + untracked file of a checkout, plus the configured editor
 /// command, for the finder and tree modals. Flashes and returns None when
 /// git fails or the checkout has no files.
@@ -4118,8 +4353,16 @@ fn load_worktree_files(
 /// can be two seconds behind an agent, so git is still asked, and the
 /// modal opens after all if it disagrees (`App::diff_probe`).
 fn open_diff_view(app: &mut App) {
-    let Some((path, branch)) = selected_checkout(app) else {
+    let Some((path, branch, repository)) = selected_git_checkout(app) else {
         return;
+    };
+    let multiple_repositories = app
+        .selected_worktree()
+        .is_some_and(|workspace| app.repository_checkouts(&workspace.id).len() > 1);
+    let branch = if !multiple_repositories {
+        branch
+    } else {
+        format!("{repository} · {branch}")
     };
     let Some(jobs) = app.view_jobs.clone() else {
         // No loop to land an answer on (unit tests): read inline.
@@ -4137,7 +4380,7 @@ fn open_diff_view(app: &mut App) {
         app.flash = Some(format!("no changes in {branch}"));
         app.diff_probe = Some((ticket, path.clone(), branch));
     } else {
-        let mut view = DiffView::opening(path.clone(), branch, jobs.clone(), ticket);
+        let mut view = DiffView::opening(path.clone(), branch.clone(), jobs.clone(), ticket);
         view.files_width = app.diff_files_width;
         if app.diff_tree {
             view.toggle_tree();
@@ -4199,23 +4442,27 @@ fn open_hosts_picker(app: &mut App) {
 }
 
 fn open_file_finder(app: &mut App) {
-    let Some((path, branch)) = selected_checkout(app) else {
+    let Some((path, branch, repository)) = selected_git_checkout(app) else {
         return;
     };
+    let label = repository_label(app, &path, &repository, &branch);
     // The modal is up on this keypress, taking what is typed; the list
     // lands when `git ls-files` answers (`land_view_answer`).
     if let Some(jobs) = app.view_jobs.clone() {
         let editor = crate::config::Config::load().editor_command();
         let ticket = request_worktree_files(&jobs, &path);
         app.overlay = Some(Overlay::Files(FileFinder::opening(
-            path, branch, editor, ticket,
+            path,
+            label.clone(),
+            editor,
+            ticket,
         )));
         return;
     }
     let Some((files, editor)) = load_worktree_files(app, &path, &branch) else {
         return;
     };
-    app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
+    app.overlay = Some(Overlay::Files(FileFinder::new(path, label, editor, files)));
 }
 
 /// Ask for a checkout's file listing off the loop; the ticket is what the
@@ -4237,34 +4484,52 @@ fn request_worktree_files(jobs: &crate::view_jobs::Jobs, path: &std::path::Path)
 /// flash instead of opening when there's no worktree, the path is gone, or
 /// git fails.
 fn open_tree_browser(app: &mut App) {
-    let Some((path, branch)) = selected_checkout(app) else {
+    let Some((path, branch, repository)) = selected_git_checkout(app) else {
         return;
     };
+    let label = repository_label(app, &path, &repository, &branch);
     // Up on this keypress; the tree lands when `git ls-files` answers.
     if let Some(jobs) = app.view_jobs.clone() {
         let editor = crate::config::Config::load().editor_command();
         let ticket = request_worktree_files(&jobs, &path);
         app.overlay = Some(Overlay::Tree(TreeBrowser::opening(
-            path, branch, editor, jobs, ticket,
+            path,
+            label.clone(),
+            editor,
+            jobs,
+            ticket,
         )));
         return;
     }
     let Some((files, editor)) = load_worktree_files(app, &path, &branch) else {
         return;
     };
-    app.overlay = Some(Overlay::Tree(TreeBrowser::new(path, branch, editor, files)));
+    app.overlay = Some(Overlay::Tree(TreeBrowser::new(path, label, editor, files)));
 }
 
 /// Find-in-files (`F`): live `git grep` over the selected worktree; Enter
 /// on a hit opens it in the editor modal. Same shell as `open_diff_view`.
 fn open_grep_view(app: &mut App) {
-    let Some((path, branch)) = selected_checkout(app) else {
+    let Some((path, branch, repository)) = selected_git_checkout(app) else {
         return;
     };
     let editor = crate::config::Config::load().editor_command();
-    let mut view = GrepView::new(path, branch, editor);
+    let label = repository_label(app, &path, &repository, &branch);
+    let mut view = GrepView::new(path, label, editor);
     view.jobs = app.view_jobs.clone();
     app.overlay = Some(Overlay::Grep(view));
+}
+
+fn repository_label(app: &App, path: &std::path::Path, repository: &str, branch: &str) -> String {
+    let multi_repository = app
+        .selected_worktree()
+        .is_some_and(|workspace| app.repository_checkouts(&workspace.id).len() > 1);
+    if multi_repository {
+        format!("{repository} · {branch}")
+    } else {
+        let _ = path;
+        branch.to_string()
+    }
 }
 
 /// A BACKGROUND READ came back (`view_jobs`): hand it to the view that
@@ -5191,6 +5456,18 @@ fn menu_items_for_session_in(app: &App, a: &nebula_core::Agent) -> Vec<MenuItem>
     else {
         return items;
     };
+    if !app.repository_checkouts(&w.id).is_empty() {
+        items.push(MenuItem::new(
+            "Select repository…",
+            MenuAction::SelectRepository(w.id.clone()),
+        ));
+    }
+    if !app.repository_checkouts(&w.id).is_empty() {
+        items.push(MenuItem::new(
+            "Select repository…",
+            MenuAction::SelectRepository(w.id.clone()),
+        ));
+    }
     items.push(MenuItem::new(
         if app.worktree_running(&w.id) {
             "Stop run"
@@ -5416,6 +5693,9 @@ pub(crate) fn menu_quick_return(menu: &ContextMenu) -> Option<crate::quick_promp
 
 /// A checkout's context menu: what a right-click on an EMPTY BAND opens.
 fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
+    let selected_repository = app
+        .selected_repository_checkout(&w.id)
+        .map(|(name, _, _)| name);
     let run = if app.worktree_running(&w.id) {
         "Stop run"
     } else {
@@ -5424,9 +5704,24 @@ fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
     let mut items = vec![
         MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
         MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
-        MenuItem::new(run, MenuAction::ToggleRun(w.id.clone())),
+        MenuItem::new(
+            selected_repository.as_ref().map_or_else(
+                || run.to_string(),
+                |repository| format!("{run} · {repository}"),
+            ),
+            MenuAction::ToggleRun(w.id.clone()),
+        ),
         MenuItem::new("Open", MenuAction::OpenWorktree(w.id.clone())),
     ];
+    if !app.repository_checkouts(&w.id).is_empty() {
+        items.insert(
+            0,
+            MenuItem::new(
+                "Select repository…",
+                MenuAction::SelectRepository(w.id.clone()),
+            ),
+        );
+    }
     // The ROOT WORKTREE moves between branches; a linked worktree, named
     // for its branch, is deleted instead.
     if w.is_main {
@@ -7482,7 +7777,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::ToggleRun(id) => {
             if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
-                toggle_run_in(app, &w, out);
+                toggle_run_in(app, &w, None, &w.branch, out);
             }
         }
         MenuAction::OpenWorktree(id) => {
@@ -7492,6 +7787,14 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::DeleteWorktree(id) => activate::delete_worktree(app, &id),
         MenuAction::SwitchBranch(id) => crate::branch_switch::open_for(app, &id),
+        MenuAction::SelectRepository(workspace) => open_repository_picker_for(app, &workspace),
+        MenuAction::PickRepository {
+            workspace,
+            repository,
+        } => {
+            app.selected_repositories.insert(workspace, repository);
+            app.dirty = true;
+        }
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
         MenuAction::RenameProject(id) => open_prompt(app, PromptKind::RenameProject { id }),
         MenuAction::OpenProject(id) => launcher::open_project(app, &id, out),
@@ -18050,7 +18353,9 @@ diff --git a/src/c.rs b/src/c.rs
         let req_id = out
             .iter()
             .find_map(|r| match r {
-                ClientRequest::StartRun { req_id, worktree } if worktree.0 == "w1" => Some(*req_id),
+                ClientRequest::StartRun {
+                    req_id, worktree, ..
+                } if worktree.0 == "w1" => Some(*req_id),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("r sends StartRun: {out:?}"));
@@ -30571,6 +30876,272 @@ diff --git a/src/c.rs b/src/c.rs
         select_worktree_row(&mut app, root, &mut out);
         app.sel_worktree = root;
         app
+    }
+
+    #[test]
+    fn repository_selector_targets_the_named_checkout_by_keyboard_and_mouse() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().join("pilot");
+        std::fs::create_dir(&project_dir).unwrap();
+        let api = project_dir.join("api");
+        let web = project_dir.join("web");
+        for (repo, branch, file) in [(&api, "main", "api.txt"), (&web, "master", "web.txt")] {
+            std::fs::create_dir(repo).unwrap();
+            run_git(repo, &["init", "-b", branch]);
+            run_git(repo, &["config", "user.email", "t@t"]);
+            run_git(repo, &["config", "user.name", "t"]);
+            std::fs::write(repo.join(file), "committed\n").unwrap();
+            run_git(repo, &["add", "."]);
+            run_git(repo, &["commit", "-m", "init"]);
+        }
+        std::fs::write(web.join("web.txt"), "changed\n").unwrap();
+
+        let feature_api = temp.path().join("worktrees/feature/api");
+        let feature_web = temp.path().join("worktrees/feature/web");
+        std::fs::create_dir_all(feature_api.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(feature_web.parent().unwrap()).unwrap();
+        run_git(
+            &api,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "pilot/feature",
+                feature_api.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &web,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "pilot/feature",
+                feature_web.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(feature_web.join("web.txt"), "workspace change\n").unwrap();
+        let workspace_folder = temp.path().join("worktrees/feature");
+
+        let main = WorktreeId("workspace-main".into());
+        let app_with_workspace = || {
+            let mut app = App::new();
+            app.tree.projects = vec![nebula_core::Project {
+                id: ProjectId("p1".into()),
+                name: "Pilot".into(),
+                repo_path: project_dir.clone(),
+                sort_order: 0,
+            }];
+            app.tree.worktrees = vec![
+                nebula_core::Worktree {
+                    id: main.clone(),
+                    project_id: ProjectId("p1".into()),
+                    path: project_dir.clone(),
+                    branch: "main workspace".into(),
+                    is_main: true,
+                    sort_order: 0,
+                },
+                nebula_core::Worktree {
+                    id: WorktreeId("workspace-feature".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: workspace_folder.clone(),
+                    branch: "pilot/feature".into(),
+                    is_main: false,
+                    sort_order: 1,
+                },
+                nebula_core::Worktree {
+                    id: WorktreeId("w-api".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: feature_api.clone(),
+                    branch: "pilot/feature".into(),
+                    is_main: false,
+                    sort_order: 2,
+                },
+                nebula_core::Worktree {
+                    id: WorktreeId("w-web".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: feature_web.clone(),
+                    branch: "pilot/feature".into(),
+                    is_main: false,
+                    sort_order: 3,
+                },
+            ];
+            app.tree.repositories = vec![
+                nebula_core::ProjectRepository {
+                    project_id: ProjectId("p1".into()),
+                    name: "api".into(),
+                    path: api.clone(),
+                    branch: "main".into(),
+                },
+                nebula_core::ProjectRepository {
+                    project_id: ProjectId("p1".into()),
+                    name: "web".into(),
+                    path: web.clone(),
+                    branch: "master".into(),
+                },
+            ];
+            app.tree
+                .session_workspaces
+                .push(nebula_core::SessionWorkspace {
+                    worktree_id: WorktreeId("workspace-feature".into()),
+                    name: "feature".into(),
+                    state: nebula_core::WorkspaceState::Ready,
+                    repositories: vec![
+                        nebula_core::WorkspaceRepository {
+                            id: WorktreeId("w-api".into()),
+                            name: "api".into(),
+                            path: feature_api.clone(),
+                            base: Some("main".into()),
+                            fetch_succeeded: true,
+                            warning: None,
+                        },
+                        nebula_core::WorkspaceRepository {
+                            id: WorktreeId("w-web".into()),
+                            name: "web".into(),
+                            path: feature_web.clone(),
+                            base: Some("master".into()),
+                            fetch_succeeded: true,
+                            warning: None,
+                        },
+                    ],
+                });
+            app.tree.agents.push(nebula_core::Agent {
+                id: AgentId("workspace-agent".into()),
+                worktree_id: WorktreeId("workspace-feature".into()),
+                name: "feature-agent".into(),
+                status: nebula_core::AgentStatus::Running,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                status_changed_at: 1,
+                kind: AgentKind::OpenCode,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                issue_url: None,
+                sort_order: 0,
+                alive: true,
+                recent_prompts: Vec::new(),
+            });
+            app.sel_project = 0;
+            app.sel_worktree = 0;
+            app.focus = Focus::Worktrees;
+            app
+        };
+
+        for (workspace_index, use_mouse) in [(0, false), (0, true), (1, false), (1, true)] {
+            let mut selected = app_with_workspace();
+            let mut out = Vec::new();
+            if workspace_index == 1 {
+                press(&mut selected, KeyCode::Down, KeyModifiers::NONE, &mut out);
+                assert_eq!(
+                    selected.selected_worktree().map(|w| w.id.as_str()),
+                    Some("workspace-feature")
+                );
+                out.clear();
+            }
+            let workspace = selected.selected_worktree().unwrap().id.clone();
+            let agent_worktree_before = selected.tree.agents[0].worktree_id.clone();
+            press(
+                &mut selected,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                &mut out,
+            );
+            if use_mouse {
+                let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+                terminal.draw(|f| ui::draw(f, &mut selected)).unwrap();
+                let Some(Overlay::Menu(menu)) = &selected.overlay else {
+                    panic!(
+                        "repository selector is a visible menu: {:?}",
+                        selected.overlay
+                    );
+                };
+                assert_eq!(
+                    menu.items.len(),
+                    2,
+                    "the repository menu has both repositories"
+                );
+                let (x, y) = (menu.area.x + 2, menu.area.y + 2);
+                handle_mouse(
+                    &mut selected,
+                    mev(MouseEventKind::Down(MouseButton::Left), x, y),
+                    &mut out,
+                );
+                assert_eq!(
+                    selected
+                        .selected_worktree()
+                        .map(|worktree| worktree.id.as_str()),
+                    Some(workspace.as_str())
+                );
+            } else {
+                press(&mut selected, KeyCode::Down, KeyModifiers::NONE, &mut out);
+                press(&mut selected, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            }
+            assert!(selected.overlay.is_none(), "selection closes the menu");
+            assert_eq!(
+                selected.selected_worktree().map(|w| &w.id),
+                Some(&workspace),
+                "workspace remains selected: workspace_index={workspace_index} use_mouse={use_mouse}"
+            );
+            assert_eq!(selected.tree.agents[0].worktree_id, agent_worktree_before);
+
+            selected.focus = Focus::Worktrees;
+            press(
+                &mut selected,
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                &mut out,
+            );
+            assert!(
+                out.iter().any(|request| matches!(
+                    request,
+                    ClientRequest::StartRun { worktree: id, repository: Some(name), .. }
+                        if id == &workspace && name == "web"
+                )),
+                "run command names its repository while retaining workspace identity: {out:?}"
+            );
+            out.clear();
+
+            press(
+                &mut selected,
+                KeyCode::Char('g'),
+                KeyModifiers::NONE,
+                &mut out,
+            );
+            let Some(Overlay::Diff(diff)) = &selected.overlay else {
+                panic!(
+                    "git diff opens for the selected repository: {:?}",
+                    selected.overlay
+                );
+            };
+            assert_eq!(
+                diff.root,
+                if workspace_index == 0 {
+                    web.clone()
+                } else {
+                    feature_web.clone()
+                }
+            );
+            assert_eq!(
+                diff.branch,
+                if workspace_index == 0 {
+                    "web · master"
+                } else {
+                    "web · pilot/feature"
+                }
+            );
+            assert!(diff.files.iter().any(|file| file.path == "web.txt"));
+            assert!(
+                out.iter().all(|request| !matches!(
+                    request,
+                    ClientRequest::CreateAgent { .. } | ClientRequest::CreateTerminal { .. }
+                )),
+                "repository selection does not launch a session: {out:?}"
+            );
+        }
     }
 
     /// A CONTEXT MENU row is its hotkey: **Delete worktree** is `d` on the

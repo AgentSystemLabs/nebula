@@ -69,6 +69,13 @@ const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 type FinishedRun = (Arc<PtySession>, Option<i32>);
 /// What a RUN TERMINAL's row is called in the Sessions panel.
 const RUN_TERMINAL_NAME: &str = "run";
+
+fn run_terminal_name(repository: Option<&str>) -> String {
+    repository.map_or_else(
+        || RUN_TERMINAL_NAME.to_string(),
+        |name| format!("run:{name}"),
+    )
+}
 /// `r` on a worktree with nothing to run: the footer line naming both
 /// places a RUN COMMAND can come from.
 const NO_RUN_COMMAND: &str =
@@ -2539,7 +2546,19 @@ impl Daemon {
     /// exited lends its row; one still going is the answer as it stands,
     /// so a second client's `r` never starts a second server.
     pub fn start_run(self: &Arc<Self>, worktree_id: &WorktreeId) -> Result<EntityId> {
-        self.start_run_with(worktree_id, &crate::config::Config::load())
+        self.start_run_for_repository(worktree_id, None)
+    }
+
+    pub fn start_run_for_repository(
+        self: &Arc<Self>,
+        workspace_id: &WorktreeId,
+        repository_name: Option<&str>,
+    ) -> Result<EntityId> {
+        self.start_run_with_repository(
+            workspace_id,
+            repository_name,
+            &crate::config::Config::load(),
+        )
     }
 
     /// [`Daemon::start_run`] against a given config, for the tests that
@@ -2547,6 +2566,15 @@ impl Daemon {
     pub fn start_run_with(
         self: &Arc<Self>,
         worktree_id: &WorktreeId,
+        config: &crate::config::Config,
+    ) -> Result<EntityId> {
+        self.start_run_with_repository(worktree_id, None, config)
+    }
+
+    pub fn start_run_with_repository(
+        self: &Arc<Self>,
+        worktree_id: &WorktreeId,
+        repository_name: Option<&str>,
         config: &crate::config::Config,
     ) -> Result<EntityId> {
         let requested = self
@@ -2580,19 +2608,32 @@ impl Daemon {
         // Held across the check and the spawn, like `ensure_session`: two
         // presses racing must produce one run, not two.
         let _gate = self.spawn_gate.lock().unwrap();
-        let existing = self.store.run_terminals_in(worktree_id)?.into_iter().next();
+        let run_repo = self.selected_workspace_repository(worktree_id, repository_name)?;
+        let run_id = run_repo
+            .as_ref()
+            .map(|repository| repository.id.clone())
+            .unwrap_or_else(|| worktree_id.clone());
+        let terminal_name = run_terminal_name(repository_name);
+        let existing = self
+            .store
+            .run_terminals_in(&run_id)?
+            .into_iter()
+            .find(|terminal| terminal.name == terminal_name);
         if let Some(term) = &existing {
             if self.is_alive(&SessionRef::Terminal(term.id.clone())) {
                 return Ok(EntityId::Terminal(term.id.clone()));
             }
         }
-        let main = self
+        let project_folder = self
             .store
             .get_project(&worktree.project_id)?
             .map_or_else(|| worktree.path.clone(), |p| p.repo_path);
-        let command = match config.run_command(&main) {
+        let (run_root, settings_root) = run_repo
+            .map(|repository| (repository.path.clone(), repository.path))
+            .unwrap_or_else(|| (worktree.path.clone(), project_folder.clone()));
+        let command = match config.run_command(&run_root) {
             Some(command) => command.to_string(),
-            None => project_file::lookup(&worktree.path, &main, ProjectCommand::Run)
+            None => project_file::lookup(&run_root, &settings_root, ProjectCommand::Run)
                 .map_err(anyhow::Error::msg)?
                 .context(NO_RUN_COMMAND)?,
         };
@@ -2605,8 +2646,8 @@ impl Daemon {
             None => {
                 let term = TerminalTab {
                     id: TerminalId::generate(),
-                    worktree_id: worktree_id.clone(),
-                    name: RUN_TERMINAL_NAME.into(),
+                    worktree_id: run_id.clone(),
+                    name: terminal_name,
                     sort_order: 0,
                     alive: false,
                     run_command: Some(command.clone()),
@@ -2616,8 +2657,10 @@ impl Daemon {
             }
         };
         self.finished_runs.lock().unwrap().remove(&term.id);
-        let spawned = self.spawn_terminal_session(&term, &worktree, DEFAULT_COLS, DEFAULT_ROWS);
-        tracing::info!(worktree = %worktree_id, %command, ok = spawned.is_ok(), "run started");
+        let mut run_worktree = worktree.clone();
+        run_worktree.path = run_root;
+        let spawned = self.spawn_terminal_session(&term, &run_worktree, DEFAULT_COLS, DEFAULT_ROWS);
+        tracing::info!(worktree = %run_id, %command, ok = spawned.is_ok(), "run started");
         let id = term.id.clone();
         {
             // Stamped and sent under the sessions lock: a command that exits
@@ -2638,20 +2681,73 @@ impl Daemon {
     /// a stopped run leaves nothing behind. Nothing running is not an
     /// error — two clients may both have pressed it.
     pub fn stop_run(self: &Arc<Self>, worktree_id: &WorktreeId) -> Result<()> {
-        for term in self.store.run_terminals_in(worktree_id)? {
-            tracing::info!(worktree = %worktree_id, "run stopped");
+        self.stop_run_for_repository(worktree_id, None)
+    }
+
+    pub fn stop_run_for_repository(
+        self: &Arc<Self>,
+        worktree_id: &WorktreeId,
+        repository_name: Option<&str>,
+    ) -> Result<()> {
+        let run_id = self
+            .selected_workspace_repository(worktree_id, repository_name)?
+            .map(|repository| repository.id)
+            .unwrap_or_else(|| worktree_id.clone());
+        let terminal_name = run_terminal_name(repository_name);
+        for term in self
+            .store
+            .run_terminals_in(&run_id)?
+            .into_iter()
+            .filter(|terminal| terminal.name == terminal_name)
+        {
+            tracing::info!(worktree = %run_id, %terminal_name, "run stopped");
             self.close_terminal(&term.id)?;
         }
         Ok(())
     }
 
+    fn selected_workspace_repository(
+        &self,
+        workspace_id: &WorktreeId,
+        repository_name: Option<&str>,
+    ) -> Result<Option<nebula_core::WorkspaceRepository>> {
+        let Some(name) = repository_name else {
+            return Ok(None);
+        };
+        let workspace = self.store.session_workspace(workspace_id)?;
+        if let Some(workspace) = workspace {
+            return workspace
+                .repositories
+                .into_iter()
+                .find(|repository| repository.name == name)
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("repository `{name}` is not in this workspace"));
+        }
+        let root = self
+            .store
+            .get_worktree(workspace_id)?
+            .context("selected workspace not found")?;
+        let repository = self
+            .store
+            .project_repositories(&root.project_id)?
+            .into_iter()
+            .find(|repository| repository.name == name)
+            .ok_or_else(|| anyhow::anyhow!("repository `{name}` is not in this workspace"))?;
+        Ok(Some(nebula_core::WorkspaceRepository {
+            id: workspace_id.clone(),
+            name: repository.name,
+            path: repository.path,
+            base: Some(repository.branch),
+            fetch_succeeded: true,
+            warning: None,
+        }))
+    }
+
     /// Whether `id` is a RUN TERMINAL's row.
     fn is_run_terminal(&self, id: &TerminalId) -> bool {
-        self.store
-            .get_terminal(id)
-            .ok()
-            .flatten()
-            .is_some_and(|t| t.run_command.is_some())
+        self.store.get_terminal(id).ok().flatten().is_some_and(|t| {
+            t.run_command.is_some() && (t.name == RUN_TERMINAL_NAME || t.name.starts_with("run:"))
+        })
     }
 
     /// A RUN TERMINAL that exited on its own: its exit code (None when the
@@ -2763,7 +2859,9 @@ impl Daemon {
                 // the prewarm sweep walking past, must never run a command
                 // that exited again. What it can show is how the run ended,
                 // while the DAEMON still holds that PTY.
-                if term.run_command.is_some() {
+                if term.run_command.is_some()
+                    && (term.name == RUN_TERMINAL_NAME || term.name.starts_with("run:"))
+                {
                     if let Some((session, _)) = self.finished_runs.lock().unwrap().get(id) {
                         return Ok(session.clone());
                     }
@@ -5396,6 +5494,68 @@ mod tests {
             .is_empty());
         // Nothing left to stop is not an error.
         daemon.stop_run(&worktree.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_workspace_run_uses_the_selected_repository_file_and_has_its_own_terminal() {
+        let daemon = test_daemon();
+        let root = tempfile::tempdir().unwrap();
+        let project = Project {
+            id: ProjectId::generate(),
+            name: "Pilot".into(),
+            repo_path: root.path().into(),
+            sort_order: 0,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        let workspace_id = WorktreeId::generate();
+        let workspace_path = root.path().join("worktrees/feature");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        let workspace = Worktree {
+            id: workspace_id.clone(),
+            project_id: project.id.clone(),
+            path: workspace_path.clone(),
+            branch: "pilot/feature".into(),
+            is_main: false,
+            sort_order: 0,
+        };
+        let api_id = WorktreeId::generate();
+        let api_path = workspace_path.join("api");
+        std::fs::create_dir_all(&api_path).unwrap();
+        std::fs::write(api_path.join(".nebula.json"), r#"{"run":"sleep 34"}"#).unwrap();
+        let repository = nebula_core::WorkspaceRepository {
+            id: api_id.clone(),
+            name: "api".into(),
+            path: api_path.clone(),
+            base: Some("main".into()),
+            fetch_succeeded: true,
+            warning: None,
+        };
+        let session = nebula_core::SessionWorkspace {
+            worktree_id: workspace_id.clone(),
+            name: "feature".into(),
+            state: nebula_core::WorkspaceState::Ready,
+            repositories: vec![repository],
+        };
+        daemon
+            .store
+            .insert_session_workspace(&workspace, &session)
+            .unwrap();
+
+        let EntityId::Terminal(run) = daemon
+            .start_run_for_repository(&workspace_id, Some("api"))
+            .unwrap()
+        else {
+            panic!("repository run creates a terminal");
+        };
+        let row = daemon.store.get_terminal(&run).unwrap().unwrap();
+        assert_eq!(row.worktree_id, api_id);
+        assert_eq!(row.name, "run:api");
+        assert_eq!(row.run_command.as_deref(), Some("sleep 34"));
+        assert!(daemon.is_alive(&SessionRef::Terminal(run.clone())));
+        daemon
+            .stop_run_for_repository(&workspace_id, Some("api"))
+            .unwrap();
+        assert!(daemon.store.run_terminals_in(&api_id).unwrap().is_empty());
     }
 
     /// The project's `run_command` setting (Settings → Project) is what

@@ -101,6 +101,8 @@ pub enum Action {
     /// `c`: the BRANCH SWITCHER — move the project's ROOT WORKTREE onto
     /// another branch, asking what to do with uncommitted changes.
     SwitchBranch,
+    /// Choose which member checkout repository-specific Git tools target.
+    SelectRepository,
     /// `Shift+Enter` / `Shift+O` / `Alt+Enter`, on the grid: fire the
     /// selected worktree's OPEN COMMAND — the project's **Open command**
     /// setting, else its `.nebula.json` `open` (`open http://localhost:3000`,
@@ -445,6 +447,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["c"],
+    },
+    ActionSpec {
+        action: Action::SelectRepository,
+        id: "select_repository",
+        label: "Select repository",
+        hint: "Choose the repository Git tools target inside this workspace; agents stay in the workspace",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["ctrl+shift+r", "f3"],
     },
     ActionSpec {
         action: Action::OpenWorktree,

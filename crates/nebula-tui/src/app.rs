@@ -319,6 +319,13 @@ pub enum MenuAction {
     DeleteWorktree(WorktreeId),
     /// The ROOT WORKTREE row's menu: open the BRANCH SWITCHER on it.
     SwitchBranch(WorktreeId),
+    /// Select the repository Git tools target inside a workspace.
+    SelectRepository(WorktreeId),
+    /// Repository selected from the workspace's repository menu.
+    PickRepository {
+        workspace: WorktreeId,
+        repository: String,
+    },
     /// Start the worktree's RUN COMMAND, or stop it while it runs (`r`).
     ToggleRun(WorktreeId),
     /// Fire the worktree's OPEN COMMAND (`Shift+Enter`).
@@ -2865,6 +2872,9 @@ impl AttachedTerm {
 pub struct UiState {
     pub project: Option<String>,
     pub worktree: Option<String>,
+    /// Last repository chosen for Git tools in each workspace.
+    #[serde(default)]
+    pub selected_repositories: HashMap<String, String>,
     pub session_agent: Option<String>,
     pub show_archived: bool,
     pub collapsed: bool,
@@ -3521,6 +3531,9 @@ pub struct App {
     /// Last selected worktree per project — switching back to a project
     /// returns to the worktree the user left it on.
     pub last_worktree_for_project: HashMap<ProjectId, WorktreeId>,
+    /// Repository Git tools target in each workspace. This is independent
+    /// from the selected workspace and from every session's launch context.
+    pub selected_repositories: HashMap<WorktreeId, String>,
     /// Last selected session per worktree — switching back to a worktree
     /// re-shows the session the user left it on.
     pub last_session_for_worktree: HashMap<WorktreeId, SessionRef>,
@@ -3971,6 +3984,7 @@ impl App {
             select_worktree_when_seen: None,
             run_flash_when_seen: None,
             last_worktree_for_project: HashMap::new(),
+            selected_repositories: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             pending_prewarm: None,
             parked_pr_prompt: None,
@@ -4824,6 +4838,86 @@ impl App {
         self.worktree_rows()
             .get(self.sel_worktree)
             .and_then(|row| row.checkout())
+    }
+
+    /// Names available in the selected workspace's repository picker.
+    pub fn selected_repository_names(&self) -> Vec<String> {
+        self.selected_worktree()
+            .map(|worktree| self.repository_checkouts(&worktree.id))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    /// Registered checkouts inside `workspace`, in their declared order.
+    pub fn repository_checkouts(&self, workspace: &WorktreeId) -> Vec<(String, PathBuf, String)> {
+        let Some(project) = self
+            .tree
+            .worktrees
+            .iter()
+            .find(|worktree| &worktree.id == workspace)
+            .map(|worktree| &worktree.project_id)
+        else {
+            return Vec::new();
+        };
+        if let Some(session) = self
+            .tree
+            .session_workspaces
+            .iter()
+            .find(|item| &item.worktree_id == workspace)
+        {
+            return session
+                .repositories
+                .iter()
+                .filter_map(|repository| {
+                    self.tree
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.id == repository.id)
+                        .map(|worktree| {
+                            (
+                                repository.name.clone(),
+                                worktree.path.clone(),
+                                worktree.branch.clone(),
+                            )
+                        })
+                })
+                .collect();
+        }
+        self.tree
+            .repositories
+            .iter()
+            .filter(|repository| &repository.project_id == project)
+            .map(|repository| {
+                (
+                    repository.name.clone(),
+                    repository.path.clone(),
+                    repository.branch.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The chosen repository checkout within a workspace. Selecting one
+    /// never changes the workspace or the sessions associated with it.
+    pub fn selected_repository_checkout(
+        &self,
+        workspace: &WorktreeId,
+    ) -> Option<(String, PathBuf, String)> {
+        let checkouts = self.repository_checkouts(workspace);
+        let name = self
+            .selected_repositories
+            .get(workspace)
+            .map(String::as_str);
+        let selected = checkouts
+            .into_iter()
+            .find(|(repository, _, _)| Some(repository.as_str()) == name);
+        selected.or_else(|| {
+            let mut available = self.repository_checkouts(workspace).into_iter();
+            let first = available.next()?;
+            available.next().is_none().then_some(first)
+        })
     }
 
     /// A checkout's last-read changed-file count, for its cards: None until

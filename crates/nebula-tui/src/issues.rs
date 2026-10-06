@@ -660,17 +660,21 @@ pub(crate) fn open_issues(app: &mut App) {
         app.flash = Some("issues: select a project first".into());
         return;
     };
+    let repository_path = app
+        .selected_worktree()
+        .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
+        .map_or_else(|| project.repo_path.clone(), |(_, path, _)| path);
     let mut view = IssuesView::new(
         project.id.clone(),
         project.name.clone(),
-        project.repo_path.clone(),
+        repository_path.clone(),
     );
     view.selected = clamp_selection(0, list_len(app, &project.id));
     app.overlay = Some(Overlay::Issues(view));
     // A list the prefetch landed moments ago is the answer; an older one
     // paints now while a fresh copy lands underneath.
     if !is_fresh(app, &project.id) {
-        request_list(app, project.id, project.repo_path);
+        request_list(app, project.id, repository_path);
     }
     schedule_detail(app);
     app.dirty = true;
@@ -786,10 +790,14 @@ pub(crate) fn refresh_selected(app: &mut App) {
 /// project's open issues now, past the beat and a miss already
 /// remembered — the modal's `Ctrl+r` for the list, from outside it.
 pub(crate) fn reload_selected(app: &mut App) {
-    let Some((project, dir)) = app
-        .selected_project()
-        .map(|p| (p.id.clone(), p.repo_path.clone()))
-    else {
+    let Some((project, dir)) = app.selected_project().map(|project| {
+        let path = app
+            .selected_worktree()
+            .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
+            .map(|(_, path, _)| path)
+            .unwrap_or_else(|| project.repo_path.clone());
+        (project.id.clone(), path)
+    }) else {
         return;
     };
     app.issues_failed.remove(&project);
@@ -797,10 +805,14 @@ pub(crate) fn reload_selected(app: &mut App) {
 }
 
 fn ask_selected_if_due(app: &mut App) {
-    let Some((project, dir)) = app
-        .selected_project()
-        .map(|p| (p.id.clone(), p.repo_path.clone()))
-    else {
+    let Some((project, dir)) = app.selected_project().map(|project| {
+        let path = app
+            .selected_worktree()
+            .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
+            .map(|(_, path, _)| path)
+            .unwrap_or_else(|| project.repo_path.clone());
+        (project.id.clone(), path)
+    }) else {
         return;
     };
     if prefetch_due(app, &project) {
