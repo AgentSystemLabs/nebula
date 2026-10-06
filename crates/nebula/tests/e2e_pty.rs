@@ -5396,6 +5396,17 @@ async fn session_workspace_close_checks_cleanliness_and_keeps_branches() {
         .find(|repo| repo.name == "beta")
         .unwrap();
     let clean_readme = std::fs::read(alpha_worktree.path.join("README.md")).unwrap();
+    for repository in [&alpha, &beta] {
+        git_run(
+            repository,
+            &[
+                "update-ref",
+                "refs/remotes/origin/pilot/close-me",
+                "refs/heads/pilot/close-me",
+            ],
+        )
+        .unwrap();
+    }
 
     // A live terminal can be stopped as part of a successful close.
     write_frame(
@@ -5575,6 +5586,21 @@ async fn session_workspace_close_checks_cleanliness_and_keeps_branches() {
         .len(),
         40
     );
+    for repository in [&alpha, &beta] {
+        assert_eq!(
+            git_output(
+                repository,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--hash",
+                    "refs/remotes/origin/pilot/close-me",
+                ],
+            )
+            .len(),
+            40
+        );
+    }
     assert_eq!(git_output(&alpha, &["rev-parse", "HEAD"]), alpha_head);
     assert_eq!(git_output(&beta, &["rev-parse", "HEAD"]), beta_head);
 
