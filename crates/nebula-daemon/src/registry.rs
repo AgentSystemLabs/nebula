@@ -2614,7 +2614,7 @@ impl Daemon {
         let (program, args) = if cmd_override.is_some() {
             (program, args)
         } else {
-            login_shell_wrap(&nebula_core::shell::user_shell(), &program, &args)
+            login_shell_agent_wrap(&nebula_core::shell::user_shell(), &program, &args)?
         };
 
         let spec = SpawnSpec {
@@ -2622,6 +2622,14 @@ impl Daemon {
             args,
             cwd: worktree.path.clone(),
             env: vec![
+                // The child agent's shell may resolve `nebula` to an
+                // installed upstream binary after loading its login config.
+                // Carry this daemon's socket location so any compatible CLI
+                // reaches this fork even when PATH order changes.
+                (
+                    env::RUNTIME_DIR.into(),
+                    nebula_core::paths::runtime_dir().display().to_string(),
+                ),
                 (env::AGENT_ID.into(), agent.id.to_string()),
                 (
                     env::API_URL.into(),
@@ -3553,6 +3561,26 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
         line.push_str(&nebula_core::shell::single_quote(arg));
     }
     login_shell_line(shell, &line)
+}
+
+/// Agent commands run inside a login shell whose startup files can put an
+/// installed upstream Nebula before this binary on PATH. Re-prepend the
+/// running fork's directory after those files load so its `nebula` commands
+/// route to the matching daemon.
+fn login_shell_agent_wrap(
+    shell: &str,
+    program: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>)> {
+    let (shell, mut args) = login_shell_wrap(shell, program, args);
+    let line = args.last_mut().expect("login shell command line");
+    let executable = std::env::current_exe().context("resolve current Nebula executable")?;
+    let binary_dir = executable
+        .parent()
+        .context("Nebula executable has no parent directory")?;
+    let path = nebula_core::shell::single_quote(&binary_dir.display().to_string());
+    line.insert_str(0, &format!("PATH={path}:\"$PATH\"; export PATH; "));
+    Ok((shell, args))
 }
 
 /// [`login_shell_wrap`] for a line that is already shell syntax — a RUN
@@ -4631,6 +4659,20 @@ mod tests {
         assert_eq!(args[3], format!("{PANE_ENV} 'my tool'"));
     }
 
+    #[test]
+    fn login_shell_agent_wrap_puts_fork_binary_first_on_path() {
+        let executable = std::env::current_exe().unwrap();
+        let bin_dir = executable.parent().unwrap();
+        let (shell, args) = login_shell_agent_wrap("/bin/sh", "claude", &[]).unwrap();
+        assert_eq!(shell, "/bin/sh");
+        let line = &args[3];
+        assert!(line.starts_with(&format!(
+            "PATH='{}':\"$PATH\"; export PATH; ",
+            bin_dir.display()
+        )));
+        assert!(line.ends_with(&format!("{PANE_ENV} claude")));
+    }
+
     /// The command word resolves through the shell, so an alias or function
     /// from the rc files takes precedence over the binary on PATH — the
     /// reason a launch goes through the login shell at all. A function
@@ -4657,6 +4699,44 @@ mod tests {
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn fork_cli_directory_precedes_upstream_after_login_shell_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        let upstream = home.path().join("upstream");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        let marker = home.path().join("upstream-used");
+        let fork_cli = bin.join("nebula");
+        let upstream_cli = upstream.join("nebula");
+        std::fs::write(&fork_cli, "#!/bin/sh\nprintf fork\n").unwrap();
+        std::fs::write(
+            &upstream_cli,
+            format!(
+                "#!/bin/sh\nprintf upstream > '{}'\nprintf upstream\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&fork_cli, &upstream_cli] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let profile_path = format!("{}:/usr/bin:/bin", upstream.display());
+        let fork_path = nebula_core::shell::single_quote(&bin.display().to_string());
+        let line = format!("PATH={fork_path}:\"$PATH\"; export PATH; nebula rename");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &line])
+            .env("PATH", profile_path)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "fork");
+        assert!(!marker.exists(), "upstream binary was not selected");
     }
 
     /// The shape of the report itself: zsh, `-l -i -c`, and an alias in

@@ -43,6 +43,7 @@ struct TuiHarness {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     runtime_dir: PathBuf,
     data_dir: PathBuf,
+    harness_config: PathBuf,
     _repos: tempfile::TempDir,
 }
 
@@ -63,8 +64,10 @@ impl TuiHarness {
         let pid = std::process::id();
         let runtime_dir = PathBuf::from(format!("/tmp/nebtui-rt-{pid}-{seq}"));
         let data_dir = PathBuf::from(format!("/tmp/nebtui-data-{pid}-{seq}"));
+        let harness_config = PathBuf::from(format!("/tmp/nebtui-config-{pid}-{seq}"));
         let _ = std::fs::remove_dir_all(&runtime_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&harness_config);
         let repos = tempfile::tempdir().unwrap();
 
         let pty = native_pty_system()
@@ -78,6 +81,11 @@ impl TuiHarness {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_nebula"));
         cmd.env(nebula_core::env::RUNTIME_DIR, &runtime_dir);
         cmd.env(nebula_core::env::DATA_DIR, &data_dir);
+        cmd.env("HOME", &harness_config);
+        cmd.env("XDG_CONFIG_HOME", harness_config.join("xdg"));
+        cmd.env("CODEX_HOME", harness_config.join("codex"));
+        cmd.env("PI_CODING_AGENT_DIR", harness_config.join("pi"));
+        cmd.env("CLAUDE_CONFIG_DIR", harness_config.join("claude"));
         cmd.env(nebula_core::env::AGENT_CMD, "/bin/sh"); // stand-in for claude
         cmd.env(nebula_core::env::WORKTREE_SYNC_MS, "100"); // fast external-change pickup
         cmd.env(nebula_core::env::UPDATE_CHECK_SECS, "0"); // the footer must not depend on GitHub
@@ -125,6 +133,7 @@ impl TuiHarness {
             child,
             runtime_dir,
             data_dir,
+            harness_config,
             _repos: repos,
         }
     }
@@ -252,6 +261,7 @@ impl Drop for TuiHarness {
             .status();
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
         let _ = std::fs::remove_dir_all(&self.data_dir);
+        let _ = std::fs::remove_dir_all(&self.harness_config);
     }
 }
 

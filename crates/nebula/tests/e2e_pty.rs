@@ -40,8 +40,14 @@ impl TestEnv {
     /// data dirs — the base every daemon spawn and one-shot CLI run shares.
     fn cli(&self) -> std::process::Command {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        let harness_config = self.tmp.path().join("harness-config");
         cmd.env(env::RUNTIME_DIR, &self.runtime_dir)
-            .env(env::DATA_DIR, self.tmp.path().join("data"));
+            .env(env::DATA_DIR, self.tmp.path().join("data"))
+            .env("HOME", self.tmp.path())
+            .env("XDG_CONFIG_HOME", harness_config.join("xdg"))
+            .env("CODEX_HOME", harness_config.join("codex"))
+            .env("PI_CODING_AGENT_DIR", harness_config.join("pi"))
+            .env("CLAUDE_CONFIG_DIR", harness_config.join("claude"));
         cmd
     }
 
@@ -2287,17 +2293,23 @@ async fn reload_keeps_an_agent_of_every_harness() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     env.write_config(r#"{"custom_harnesses": [{"id": "agy", "program": "agy"}]}"#);
-    let homes = ["codex-home", "pi-home", "xdg-config"].map(|d| {
+    let xdg_config = env.tmp.path().join("isolated-xdg-config");
+    std::fs::create_dir_all(&xdg_config).unwrap();
+    let homes = ["codex-home", "pi-home"].map(|d| {
         let dir = env.tmp.path().join(d);
         std::fs::create_dir_all(&dir).unwrap();
         dir.to_str().unwrap().to_string()
     });
+    let claude_home = env.tmp.path().join("claude-home");
+    std::fs::create_dir_all(&claude_home).unwrap();
+    let claude_home = claude_home.to_string_lossy().to_string();
     let mut daemon = env.spawn_daemon_with(
         "/bin/sh",
         &[
             ("CODEX_HOME", &homes[0]),
             ("PI_CODING_AGENT_DIR", &homes[1]),
-            ("XDG_CONFIG_HOME", &homes[2]),
+            ("XDG_CONFIG_HOME", xdg_config.to_str().unwrap()),
+            ("CLAUDE_CONFIG_DIR", &claude_home),
         ],
     );
 
@@ -2337,6 +2349,25 @@ async fn reload_keeps_an_agent_of_every_harness() {
         };
         agents.push((kind, id.clone()));
     }
+
+    assert!(
+        std::path::Path::new(&homes[0]).join("hooks.json").exists(),
+        "Codex hooks use the isolated CODEX_HOME even under the agent-command override"
+    );
+    assert!(
+        std::path::Path::new(&homes[1])
+            .join("extensions/nebula.ts")
+            .exists(),
+        "Pi extension uses the isolated agent directory"
+    );
+    assert!(
+        xdg_config.join("opencode/plugins/nebula.ts").exists(),
+        "OpenCode plugin uses the isolated XDG config home"
+    );
+    assert!(
+        std::path::Path::new(&claude_home).exists(),
+        "Claude config location is isolated for test daemons"
+    );
 
     let hooked = |kind: AgentKind| {
         matches!(
@@ -3939,7 +3970,20 @@ async fn auto_title_instruction_and_rename_flow() {
     let repo = env.make_repo();
     let env_dir = env.tmp.path().join("agent-env");
     std::fs::create_dir_all(&env_dir).unwrap();
-    // Stand-in CLI: capture the NEBULA_* env its hooks would use, then park.
+    let upstream_bin = env.tmp.path().join("upstream-bin");
+    std::fs::create_dir_all(&upstream_bin).unwrap();
+    let upstream_marker = env.tmp.path().join("upstream-nebula-used");
+    let upstream_cli = upstream_bin.join("nebula");
+    std::fs::write(
+        &upstream_cli,
+        format!(
+            "#!/bin/sh\nprintf upstream > '{}'\nexec '{}' \"$@\"\n",
+            upstream_marker.display(),
+            env!("CARGO_BIN_EXE_nebula")
+        ),
+    )
+    .unwrap();
+    make_executable(&upstream_cli);
     let script = env.tmp.path().join("agent.sh");
     std::fs::write(
         &script,
@@ -4003,9 +4047,25 @@ async fn auto_title_instruction_and_rename_flow() {
     assert_eq!(status, 200);
     assert_eq!(body, nebula_daemon::hooks::auto_title_injection());
 
-    // The model obeys — `nebula rename` runs with the session's env.
-    let out = agent_cli(&env, &agent_id, &["rename", "Fix", "Login", "Redirect"]);
+    // A shell with an upstream-first PATH runs `nebula rename` using the
+    // exact environment supplied by the fork's login-shell wrapper.
+    assert_eq!(
+        agent_env[env::RUNTIME_DIR],
+        env.runtime_dir.display().to_string()
+    );
+    let path = format!("{}:/usr/bin:/bin", upstream_bin.display());
+    let out = agent_cli_with_path(
+        &env,
+        &agent_id,
+        &agent_env,
+        &path,
+        &["rename", "Fix", "Login", "Redirect"],
+    );
     assert!(out.status.success(), "rename failed: {out:?}");
+    assert!(
+        !upstream_marker.exists(),
+        "agent invoked the upstream nebula CLI"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Fix Login Redirect"), "stdout: {stdout}");
     read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
@@ -4031,7 +4091,13 @@ async fn auto_title_instruction_and_rename_flow() {
     );
 
     // A repeat attempt is declined as a settled answer (exit 0), not a fault.
-    let out = agent_cli(&env, &agent_id, &["rename", "Another", "Title"]);
+    let out = agent_cli_with_path(
+        &env,
+        &agent_id,
+        &agent_env,
+        &path,
+        &["rename", "Another", "Title"],
+    );
     assert!(out.status.success(), "declined rename must exit 0: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already has a title"), "stdout: {stdout}");
@@ -4541,12 +4607,39 @@ fn agent_cli(
     agent_id: &nebula_core::AgentId,
     args: &[&str],
 ) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(args)
-        .env(env::RUNTIME_DIR, &env.runtime_dir)
+    let mut command = env.cli();
+    command.args(args).env(env::AGENT_ID, &agent_id.0);
+    command.output().unwrap()
+}
+
+fn agent_cli_with_path(
+    env: &TestEnv,
+    agent_id: &nebula_core::AgentId,
+    agent_env: &std::collections::HashMap<String, String>,
+    path: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = std::process::Command::new("/bin/sh");
+    let fork_bin = Path::new(env!("CARGO_BIN_EXE_nebula")).parent().unwrap();
+    let path = format!("{}:{path}", fork_bin.display());
+    command
+        .args(["-c", &format!("exec nebula {}", args.join(" "))])
+        .env(env::DATA_DIR, env.tmp.path().join("data"))
         .env(env::AGENT_ID, &agent_id.0)
-        .output()
-        .unwrap()
+        .env(env::RUNTIME_DIR, &agent_env[env::RUNTIME_DIR])
+        .env("HOME", env.tmp.path())
+        .env("XDG_CONFIG_HOME", env.tmp.path().join("harness-config/xdg"))
+        .env("CODEX_HOME", env.tmp.path().join("harness-config/codex"))
+        .env(
+            "PI_CODING_AGENT_DIR",
+            env.tmp.path().join("harness-config/pi"),
+        )
+        .env(
+            "CLAUDE_CONFIG_DIR",
+            env.tmp.path().join("harness-config/claude"),
+        )
+        .env("PATH", path);
+    command.output().unwrap()
 }
 
 /// `nebula add <dir>` and the bare `nebula <dir>` shorthand: the one-shot CLI

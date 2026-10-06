@@ -11,6 +11,7 @@ pub const SSH_HOSTS_FILE_NAME: &str = "ssh_hosts.json";
 /// Where the runtime dir lands when neither override nor `XDG_RUNTIME_DIR`
 /// is set. World-writable, so the per-uid subdir is what carries mode 0700.
 const FALLBACK_RUNTIME_ROOT: &str = "/tmp";
+const APP_DIR_NAME: &str = "nebula-pilot";
 
 /// Runtime dir holding the socket + pidfile. Mode 0700 — this is the auth
 /// boundary, same model as tmux. `NEBULA_RUNTIME_DIR` overrides (tests,
@@ -20,10 +21,10 @@ pub fn runtime_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     if let Some(dir) = env::non_empty("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("nebula");
+        return PathBuf::from(dir).join(APP_DIR_NAME);
     }
     let uid = libc_geteuid();
-    Path::new(FALLBACK_RUNTIME_ROOT).join(format!("nebula-{uid}"))
+    Path::new(FALLBACK_RUNTIME_ROOT).join(format!("{APP_DIR_NAME}-{uid}"))
 }
 
 // Avoid a libc dependency in this dep-light crate for one call.
@@ -74,10 +75,9 @@ pub fn restart_state_path() -> PathBuf {
     runtime_dir().join("restart.state")
 }
 
-/// The platform's per-user dirs for this app (`~/Library/Application
-/// Support/dev.nebula.nebula` on macOS, `~/.local/share/nebula` on Linux).
+/// The platform's per-user dirs for this fork, separate from installed Nebula.
 fn project_dirs() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("dev", "nebula", "nebula")
+    directories::ProjectDirs::from("dev", "nebula", APP_DIR_NAME)
 }
 
 pub fn data_dir() -> PathBuf {
@@ -86,7 +86,7 @@ pub fn data_dir() -> PathBuf {
     }
     project_dirs()
         .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| env::home_dir().unwrap_or_default().join(".nebula"))
+        .unwrap_or_else(|| env::home_dir().unwrap_or_default().join(".nebula-pilot"))
 }
 
 pub fn db_path() -> PathBuf {
@@ -147,6 +147,9 @@ pub fn tui_log_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Restores an env var to what it was when the guard was made, so a
     /// failed assertion can't leak an override into the next test.
@@ -169,6 +172,7 @@ mod tests {
     // this into several `#[test]`s would race them across threads.
     #[test]
     fn overrides_win_only_when_non_empty() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let _restore = (
             EnvRestore::new(crate::env::RUNTIME_DIR),
             EnvRestore::new(crate::env::DATA_DIR),
@@ -222,6 +226,45 @@ mod tests {
             "defaults are absolute: {} / {}",
             runtime_dir().display(),
             data_dir().display()
+        );
+    }
+
+    #[test]
+    fn defaults_are_isolated_from_upstream_nebula() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = (
+            EnvRestore::new(crate::env::RUNTIME_DIR),
+            EnvRestore::new(crate::env::DATA_DIR),
+            EnvRestore::new("XDG_RUNTIME_DIR"),
+        );
+        for var in [
+            crate::env::RUNTIME_DIR,
+            crate::env::DATA_DIR,
+            "XDG_RUNTIME_DIR",
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let runtime = runtime_dir();
+        let data = data_dir();
+        let logs = log_dir();
+
+        assert!(
+            runtime.to_string_lossy().contains(APP_DIR_NAME),
+            "{runtime:?}"
+        );
+        assert!(data.to_string_lossy().contains(APP_DIR_NAME), "{data:?}");
+        assert!(logs.to_string_lossy().contains(APP_DIR_NAME), "{logs:?}");
+        assert_ne!(
+            runtime,
+            Path::new(FALLBACK_RUNTIME_ROOT).join(format!("nebula-{}", libc_geteuid()))
+        );
+        let upstream_data = directories::ProjectDirs::from("dev", "nebula", "nebula")
+            .map(|d| d.data_dir().to_path_buf());
+        assert_ne!(
+            upstream_data,
+            Some(data),
+            "the fork must not reuse upstream Nebula's data directory"
         );
     }
 }
