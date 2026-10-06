@@ -1659,6 +1659,11 @@ impl Daemon {
                     .context("worktree not found")?
             }
         };
+        // A row whose checkout is gone (removed outside nebula, kept because
+        // sessions hang off it) is no place to move to, and not one this
+        // command can recreate: refuse before the row moves, so the agent is
+        // never killed at turn end for a respawn that refuses.
+        require_checkout(&target)?;
         if target.id == current.id {
             return Ok((target, EnterOutcome::AlreadyThere));
         }
@@ -1741,6 +1746,12 @@ impl Daemon {
         if self.session(&sref).is_none() {
             // Died since (or the user closed it): the next launch boots in
             // the target on its own, only without the relocation notice.
+            return false;
+        }
+        // The target can vanish between `enter_worktree` and the turn end:
+        // keep the running session rather than kill it for a boot that refuses.
+        if let Err(e) = require_checkout(target) {
+            tracing::warn!(agent = %id, error = %e, "relocation target gone; session left running");
             return false;
         }
         tracing::info!(agent = %id, to = %target.branch, "relocating session into its worktree");
@@ -1993,6 +2004,9 @@ impl Daemon {
             .store
             .get_worktree(&agent.worktree_id)?
             .context("worktree not found")?;
+        // Before the kill: a session still running in a deleted checkout
+        // would otherwise be stopped for a boot that refuses.
+        require_checkout(&worktree)?;
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
         let mut broadcast_agent = agent.clone();
@@ -2463,6 +2477,10 @@ impl Daemon {
         initial_prompt: Option<&str>,
         attach: Option<&str>,
     ) -> Result<Arc<PtySession>> {
+        // Before anything touches the path: the hook install below creates
+        // its directories, so a spawn into a deleted checkout would recreate
+        // it as an empty folder and resume the agent there.
+        require_checkout(worktree)?;
         // Whatever spawns this agent, it runs in `worktree` from here: a
         // relocation still pending for it has been overtaken.
         self.pending_moves.lock().unwrap().remove(&agent.id);
@@ -2804,6 +2822,7 @@ impl Daemon {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<PtySession>> {
+        require_checkout(worktree)?;
         let (program, args) = match &terminal.run_command {
             // A RUN TERMINAL runs its command line through the login +
             // interactive shell an agent launch uses, so `npm` or `bun`
@@ -3324,6 +3343,27 @@ fn validate_starting_prompt(raw: &str) -> Result<String> {
 
 /// Why a Cloud row's restart and attach are refused: the agent has no
 /// local session, and the pane's panel already says where it does run.
+/// Refuse to start a session in a worktree whose checkout is gone from disk
+/// (removed with `git worktree remove` or `rm -rf` outside nebula). The PTY
+/// layer would quietly run the process in `$HOME` instead (portable-pty drops
+/// a cwd that isn't a directory), and an agent's hook install would recreate
+/// the path as an empty folder that is not a git checkout; either way the
+/// session would look like it runs in its worktree and doesn't. The row is
+/// kept while sessions hang off it and the WORKTREE SYNC matches rows by
+/// path, so recreating the checkout where it was brings them back.
+fn require_checkout(worktree: &Worktree) -> Result<()> {
+    if worktree.path.is_dir() {
+        return Ok(());
+    }
+    bail!(
+        "the checkout for '{branch}' is gone from disk ({path}). Recreate it where it was and \
+         its sessions pick it up: `git worktree prune && git worktree add {path} {branch}` \
+         (`add -b {branch} {path}` if the branch is gone too). Or delete the worktree",
+        branch = worktree.branch,
+        path = worktree.path.display(),
+    );
+}
+
 const CLOUD_ROW_NO_LOCAL_SESSION: &str =
     "this session runs in Claude Cloud — open it in the browser";
 
@@ -4558,6 +4598,118 @@ mod tests {
         assert!(!daemon.is_alive(&SessionRef::Agent(id)));
     }
 
+    /// A worktree whose checkout was removed outside nebula (`git worktree
+    /// remove` by an agent, `rm -rf`) keeps its row while sessions hang off
+    /// it. Booting one of those sessions must refuse with the reason, not
+    /// run in `$HOME` and not recreate the path: a Claude spawn installs its
+    /// hooks into `<worktree>/.claude/` first, which used to create the
+    /// whole directory again, empty and outside git.
+    #[tokio::test]
+    async fn sessions_in_a_deleted_checkout_refuse_and_create_nothing() {
+        // `/bin/cat` stands in for the CLI, so a regression boots nothing real.
+        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
+        let daemon = test_daemon();
+        let gone = tempfile::tempdir().unwrap();
+        let path = gone.path().join("feature");
+        std::fs::create_dir(&path).unwrap();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", path.to_str().unwrap(), false);
+        seed_agent(&daemon, "a", "w", Some("sid-1"));
+        daemon
+            .store
+            .insert_terminal(&TerminalTab {
+                id: TerminalId("t".into()),
+                worktree_id: WorktreeId("w".into()),
+                name: "shell".into(),
+                sort_order: 0,
+                alive: false,
+                run_command: None,
+            })
+            .unwrap();
+        std::fs::remove_dir(&path).unwrap();
+
+        for sref in [
+            SessionRef::Agent(AgentId("a".into())),
+            SessionRef::Terminal(TerminalId("t".into())),
+        ] {
+            let err = daemon
+                .ensure_session(&sref, 80, 24)
+                .err()
+                .expect("a session in a deleted checkout is refused");
+            assert!(err.to_string().contains("gone from disk"), "{err}");
+            assert!(!daemon.is_alive(&sref));
+        }
+        let err = daemon
+            .restart_agent(&AgentId("a".into()))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("gone from disk"), "{err:#}");
+        assert!(!path.exists(), "the deleted checkout was recreated");
+
+        // What the refusal tells the user to do: the checkout back where it
+        // was, and the same rows start again.
+        std::fs::create_dir(&path).unwrap();
+        let term = SessionRef::Terminal(TerminalId("t".into()));
+        daemon.ensure_session(&term, 80, 24).unwrap();
+        assert!(daemon.is_alive(&term));
+        daemon.kill_session(&term);
+    }
+
+    /// A session still running in a checkout that has since been deleted
+    /// keeps running through a restart that refuses: the check comes before
+    /// the kill, so the restart never turns a live session into a dead one.
+    #[tokio::test]
+    async fn restart_in_a_deleted_checkout_keeps_the_live_session() {
+        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
+        let daemon = test_daemon();
+        let gone = tempfile::tempdir().unwrap();
+        let path = gone.path().join("feature");
+        std::fs::create_dir(&path).unwrap();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", path.to_str().unwrap(), false);
+        seed_agent(&daemon, "a", "w", None);
+        let sref = SessionRef::Agent(AgentId("a".into()));
+        daemon.ensure_session(&sref, 80, 24).unwrap();
+        // The boot installed its hooks in the checkout: remove the lot, as
+        // `git worktree remove` does.
+        std::fs::remove_dir_all(&path).unwrap();
+
+        let err = daemon
+            .restart_agent(&AgentId("a".into()))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("gone from disk"), "{err:#}");
+        assert!(
+            daemon.is_alive(&sref),
+            "the restart killed the live session"
+        );
+        daemon.kill_session(&sref);
+    }
+
+    /// `nebula worktree <branch>` onto a row whose checkout is gone refuses
+    /// before anything moves: the agent's row stays where it was and no
+    /// relocation is queued, so the turn end never kills it for a respawn
+    /// that would refuse.
+    #[tokio::test]
+    async fn entering_a_deleted_checkout_refuses_and_moves_nothing() {
+        let daemon = test_daemon();
+        let root = tempfile::tempdir().unwrap();
+        let here = root.path().join("here");
+        let there = root.path().join("there");
+        std::fs::create_dir(&here).unwrap();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "here", here.to_str().unwrap(), false);
+        seed_worktree(&daemon, "p", "there", there.to_str().unwrap(), false);
+        seed_agent(&daemon, "a", "here", None);
+        let id = AgentId("a".into());
+
+        let err = daemon.enter_worktree(&id, "there", None).await.unwrap_err();
+        assert!(err.to_string().contains("gone from disk"), "{err}");
+        let agent = daemon.store.get_agent(&id).unwrap().unwrap();
+        assert_eq!(agent.worktree_id, WorktreeId("here".into()));
+        assert!(!daemon.relocation_pending(&id));
+    }
+
     #[test]
     fn cloud_text_is_trimmed_and_bounded() {
         assert_eq!(
@@ -5499,9 +5651,14 @@ mod tests {
     #[tokio::test]
     async fn enter_worktree_takes_an_existing_branch_and_moves_the_row_now() {
         let daemon = test_daemon();
+        // Real directories: entering refuses a checkout that is not on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let (root, feat) = (dir.path().join("p"), dir.path().join("p-feat"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&feat).unwrap();
         seed_projects(&daemon, &["p"]);
-        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_worktree(&daemon, "p", "root", root.to_str().unwrap(), true);
+        seed_worktree(&daemon, "p", "feat", feat.to_str().unwrap(), false);
         seed_agent(&daemon, "a1", "root", Some("s1"));
         let a1 = AgentId("a1".into());
         let mut rx = daemon.events.subscribe();
