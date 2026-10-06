@@ -110,6 +110,10 @@ pub fn run_add_project(path: String) -> Result<()> {
     runtime()?.block_on(ipc::add_project(&path))
 }
 
+pub fn run_register_project(folder: String, name: String, repositories: Vec<String>) -> Result<()> {
+    runtime()?.block_on(ipc::register_project(&folder, &name, &repositories))
+}
+
 pub use ipc::RenameMode;
 
 /// `nebula kill`.

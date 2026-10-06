@@ -283,6 +283,13 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                 };
                 seen.retain(|id, _| projects.iter().any(|p| &p.id == id));
                 for project in projects {
+                    if daemon
+                        .store
+                        .project_repositories(&project.id)
+                        .is_ok_and(|repositories| !repositories.is_empty())
+                    {
+                        continue;
+                    }
                     // An unreadable probe is not a fingerprint: caching it
                     // would compare equal on every later tick and retire the
                     // project from syncing for the life of the daemon. Only a

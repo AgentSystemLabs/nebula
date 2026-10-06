@@ -25,6 +25,11 @@ fn main() -> Result<()> {
         }
         Some(Command::Reload) => upgrade::run_reload(),
         Some(Command::Add { path }) => nebula_tui::run_add_project(path),
+        Some(Command::Register {
+            folder,
+            name,
+            repositories,
+        }) => nebula_tui::run_register_project(folder, name, repositories),
         Some(Command::Config { command }) => nebula_tui::run_config(match command {
             ConfigCommand::Path => nebula_tui::ConfigOp::Path,
             ConfigCommand::Export { path } => nebula_tui::ConfigOp::Export { path },

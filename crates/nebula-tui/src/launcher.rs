@@ -231,6 +231,8 @@ impl Card {
 pub struct Band {
     pub worktree: WorktreeId,
     pub branch: String,
+    pub workspace_name: Option<String>,
+    pub repositories: Vec<String>,
     /// The checkout is the project's ROOT WORKTREE (`⌂`).
     pub is_main: bool,
     pub pr: Option<RowPr>,
@@ -287,12 +289,31 @@ pub fn bands(app: &App) -> Vec<Band> {
                     .map(Card::Terminal),
             );
         }
-        if cards.is_empty() && (app.show_archived || !app.show_all_worktrees) {
+        let registered_main_workspace = w.is_main
+            && app
+                .tree
+                .repositories
+                .iter()
+                .any(|repository| repository.project_id == project.id);
+        if cards.is_empty()
+            && (app.show_archived || (!app.show_all_worktrees && !registered_main_workspace))
+        {
             continue;
         }
         out.push(Band {
             worktree: w.id.clone(),
             branch: w.branch.clone(),
+            workspace_name: registered_main_workspace.then(|| project.name.clone()),
+            repositories: if w.is_main {
+                app.tree
+                    .repositories
+                    .iter()
+                    .filter(|repository| repository.project_id == project.id)
+                    .map(|repository| repository.name.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            },
             is_main: w.is_main,
             pr: row_pr(app, &w.id, &project.id, &w.branch),
             cards,
@@ -301,7 +322,13 @@ pub fn bands(app: &App) -> Vec<Band> {
     // The root checkout's empty band alone is a project with nothing left
     // in it: the grid's welcome says what to do there, and the band would
     // only say it smaller.
-    if out.iter().all(|band| band.is_main && band.cards.is_empty()) {
+    if out.iter().all(|band| band.is_main && band.cards.is_empty())
+        && !app
+            .tree
+            .repositories
+            .iter()
+            .any(|r| app.selected_project().is_some_and(|p| p.id == r.project_id))
+    {
         out.clear();
     }
     // The NESTED layout is a list of threads, the one that moved last on
@@ -2152,6 +2179,40 @@ mod tests {
             !branches(&app).contains(&"idle".to_string()),
             "archived view"
         );
+    }
+
+    #[test]
+    fn a_registered_main_workspace_is_an_empty_selectable_band_with_repository_names() {
+        let mut app = App::new();
+        app.tree.projects = vec![project("p1", "Pilot")];
+        app.tree.worktrees = vec![Worktree {
+            id: WorktreeId("w1".into()),
+            project_id: ProjectId("p1".into()),
+            path: "/tmp/pilot".into(),
+            branch: "main workspace".into(),
+            is_main: true,
+            sort_order: 0,
+        }];
+        app.tree.repositories = vec![
+            nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "api".into(),
+                path: "/tmp/pilot/api".into(),
+                branch: "main".into(),
+            },
+            nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "web".into(),
+                path: "/tmp/pilot/web".into(),
+                branch: "master".into(),
+            },
+        ];
+        let bands = super::bands(&app);
+        assert_eq!(bands.len(), 1);
+        assert_eq!(bands[0].workspace_name.as_deref(), Some("Pilot"));
+        assert_eq!(bands[0].repositories, ["api", "web"]);
+        assert!(bands[0].cards.is_empty());
+        assert_eq!(super::band_cursor(&app, &bands), Some(0));
     }
 
     /// The list is the SELECTED PROJECT's sessions, each carrying the

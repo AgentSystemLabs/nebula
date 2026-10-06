@@ -607,6 +607,324 @@ async fn full_crud_attach_and_restart_persistence() {
     wait_for_exit(&mut daemon2);
 }
 
+/// Multi-repository registration preserves the primary checkouts, publishes
+/// membership and the project-folder main workspace, and remains visible
+/// after a daemon restart. A shell opened on the main workspace starts in the
+/// project folder rather than inside either repository.
+#[tokio::test]
+async fn register_multi_repository_project_and_launch_from_main_workspace() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("pilot");
+    let api = folder.join("api");
+    let web = folder.join("web");
+    make_repo_at(&api);
+    make_repo_at(&web);
+    let rename_branch = std::process::Command::new("git")
+        .args(["-C", web.to_str().unwrap(), "branch", "-m", "master"])
+        .status()
+        .unwrap();
+    assert!(rename_branch.success());
+    let folder = std::fs::canonicalize(folder).unwrap();
+    let api = folder.join("api");
+    std::fs::write(api.join("dirty.txt"), "leave this alone").unwrap();
+    let api_head = std::process::Command::new("git")
+        .args(["-C", api.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+    let agent_cwd = env.tmp.path().join("agent-cwd.txt");
+    let fake_agent = env.tmp.path().join("fake-agent.sh");
+    std::fs::write(
+        &fake_agent,
+        format!(
+            "#!/bin/sh\npwd > '{}'\nexec sleep 600\n",
+            agent_cwd.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&fake_agent);
+    let mut daemon = env.spawn_daemon_with_agent_cmd(fake_agent.to_str().unwrap());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+
+    let registration = env
+        .cli()
+        .args([
+            "register",
+            "--dir",
+            folder.to_str().unwrap(),
+            "--as",
+            "Pilot",
+            "--repo",
+            "api",
+            "--repo",
+            "web",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        registration.status.success(),
+        "CLI registration failed: {}",
+        String::from_utf8_lossy(&registration.stderr)
+    );
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::ProjectRepositoriesUpserted { .. }))
+    })
+    .await;
+    let project = events
+        .iter()
+        .find_map(|event| match event {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(project),
+            } if project.name == "Pilot" => Some(project.id.clone()),
+            _ => None,
+        })
+        .expect("CLI project registration is broadcast");
+    let invalid = env
+        .cli()
+        .args([
+            "register",
+            "--dir",
+            folder.to_str().unwrap(),
+            "--as",
+            "Invalid",
+            "--repo",
+            "missing-repository",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("missing-repository"));
+    let shared_result = env
+        .cli()
+        .args([
+            "register",
+            "--dir",
+            folder.to_str().unwrap(),
+            "--as",
+            "Pilot shared",
+            "--repo",
+            "api",
+            "--repo",
+            "web",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        shared_result.status.success(),
+        "shared-folder registration failed: {}",
+        String::from_utf8_lossy(&shared_result.stderr)
+    );
+    let shared_events = read_events_until(&mut c, EVENT_TIMEOUT, |events| {
+        events.iter().any(|event| matches!(event,
+            ServerEvent::EntityUpserted { entity: Entity::Project(project) } if project.name == "Pilot shared"
+        ))
+    })
+    .await;
+    let shared_project = shared_events
+        .iter()
+        .find_map(|event| match event {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(project),
+            } if project.name == "Pilot shared" => Some(project.id.clone()),
+            _ => None,
+        })
+        .expect("shared project registration is broadcast");
+    let repositories = events
+        .iter()
+        .find_map(|event| match event {
+            ServerEvent::ProjectRepositoriesUpserted {
+                project: id,
+                repositories,
+            } if id == &project => Some(repositories),
+            _ => None,
+        })
+        .expect("registered repositories are broadcast");
+    assert_eq!(
+        repositories
+            .iter()
+            .map(|r| (r.name.as_str(), r.branch.as_str()))
+            .collect::<Vec<_>>(),
+        [("api", "main"), ("web", "master")]
+    );
+    let main = events
+        .iter()
+        .find_map(|event| match event {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.project_id == project && w.is_main => Some(w.clone()),
+            _ => None,
+        })
+        .expect("main workspace is broadcast");
+    assert_eq!(main.path, folder);
+    assert_eq!(
+        std::fs::read_to_string(api.join("dirty.txt")).unwrap(),
+        "leave this alone"
+    );
+    assert_eq!(
+        std::process::Command::new("git")
+            .args(["-C", api.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+        api_head,
+    );
+    assert_eq!(
+        std::process::Command::new("git")
+            .args(["-C", web.to_str().unwrap(), "branch", "--show-current"])
+            .output()
+            .unwrap()
+            .stdout,
+        b"master\n",
+    );
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 901,
+            worktree: main.id.clone(),
+            name: Some("main-folder".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |events| {
+        find_ack(events, 901).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Terminal(id)),
+        ..
+    }) = find_ack(&events, 901)
+    else {
+        panic!("terminal creation failed: {events:#?}");
+    };
+    let sref = SessionRef::Terminal(id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref,
+            data: b"pwd\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    let output = read_events_until(&mut c, EVENT_TIMEOUT, |events| {
+        String::from_utf8_lossy(&collected_output(events)).contains(folder.to_str().unwrap())
+    })
+    .await;
+    let output_bytes = collected_output(&output);
+    let output = String::from_utf8_lossy(&output_bytes);
+    assert!(
+        output.contains(folder.to_str().unwrap()),
+        "terminal did not start in project folder: {output}"
+    );
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 902,
+            worktree: main.id.clone(),
+            name: "main workspace agent".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |events| {
+        find_ack(events, 902).is_some()
+    })
+    .await;
+    assert!(matches!(
+        find_ack(&events, 902),
+        Some(ServerEvent::Ack {
+            created: Some(EntityId::Agent(_)),
+            ..
+        })
+    ));
+    tokio::time::timeout(SLOW_TIMEOUT, async {
+        loop {
+            if agent_cwd.exists() {
+                return;
+            }
+            tokio::time::sleep(POLL_STEP).await;
+        }
+    })
+    .await
+    .expect("fake agent reported its working directory");
+    assert_eq!(
+        std::fs::read_to_string(&agent_cwd).unwrap().trim(),
+        folder.to_str().unwrap(),
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let snapshot = subscribe(&mut c).await;
+    let ServerEvent::Snapshot {
+        projects,
+        repositories,
+        worktrees,
+        ..
+    } = &snapshot[0]
+    else {
+        panic!("expected snapshot: {snapshot:#?}");
+    };
+    assert!(projects
+        .iter()
+        .any(|p| p.id == project && p.name == "Pilot"));
+    assert!(projects
+        .iter()
+        .any(|p| p.id == shared_project && p.name == "Pilot shared"));
+    assert_eq!(
+        repositories
+            .iter()
+            .filter(|r| r.project_id == project)
+            .count()
+            + repositories
+                .iter()
+                .filter(|r| r.project_id == shared_project)
+                .count(),
+        4
+    );
+    assert!(
+        worktrees
+            .iter()
+            .filter(|w| {
+                (w.project_id == project || w.project_id == shared_project)
+                    && w.is_main
+                    && w.path == folder
+            })
+            .count()
+            == 2
+    );
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// The daemon must answer a child's kitty-keyboard support query (nothing
 /// else ever would — the child talks to a virtual terminal), track pushed
 /// flags, and tell attached clients so they switch key encodings. This is

@@ -523,6 +523,33 @@ pub async fn add_project(path: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn register_project(folder: &str, name: &str, repositories: &[String]) -> Result<()> {
+    let expanded = match (folder.strip_prefix("~/"), env::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => std::path::PathBuf::from(folder),
+    };
+    let folder = std::fs::canonicalize(&expanded)
+        .with_context(|| format!("{} does not exist", expanded.display()))?;
+    if !folder.is_dir() {
+        bail!("{} is not a directory", folder.display());
+    }
+    let mut conn = connect_or_spawn().await?;
+    let req_id = ONE_SHOT_REQ_ID;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::RegisterProject {
+            req_id,
+            folder: folder.clone(),
+            name: name.to_string(),
+            repositories: repositories.to_vec(),
+        },
+    )
+    .await?;
+    await_ack(&mut conn, req_id).await?;
+    println!("registered project {name} in {}", folder.display());
+    Ok(())
+}
+
 /// Ask a running daemon to shut down. Ok(false) when none is running.
 ///
 /// A daemon on a different protocol version closes the socket right after

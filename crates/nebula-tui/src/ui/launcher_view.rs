@@ -1733,8 +1733,9 @@ fn draw_band_rule(
     // `── ` before, ` ` after the words, ` ` before the right end and
     // ` ──` after it: what the words have to fit between.
     let room = width.saturating_sub(3 + right_w + 5);
-    let changes = app
-        .worktree_changes(&band.worktree)
+    let changes = (!band.repositories.is_empty())
+        .then_some(0)
+        .or_else(|| app.worktree_changes(&band.worktree))
         .filter(|n| *n > 0)
         .map(|n| {
             change_labels(
@@ -1750,10 +1751,19 @@ fn draw_band_rule(
                 added.chars().count() + removed.chars().count()
             })
     });
-    let branch = truncate(
-        &band.branch,
-        room.saturating_sub(glyph.chars().count() + taken),
-    );
+    let label = if band.repositories.is_empty() {
+        band.workspace_name
+            .as_deref()
+            .unwrap_or(&band.branch)
+            .to_string()
+    } else {
+        format!(
+            "{} · {}",
+            band.workspace_name.as_deref().unwrap_or("main workspace"),
+            band.repositories.join(", ")
+        )
+    };
+    let branch = truncate(&label, room.saturating_sub(glyph.chars().count() + taken));
     // The rule's left end: `──` like every other band's, or the CURSOR
     // MARK `❯` on the one the keys are on — the mark a prompt puts before
     // the line that takes the keys, so a rule that looks like a divider
@@ -4940,6 +4950,8 @@ mod tests {
         crate::launcher::Band {
             worktree: WorktreeId("w1".into()),
             branch: branch.into(),
+            workspace_name: None,
+            repositories: Vec::new(),
             is_main,
             pr: None,
             cards: vec![crate::launcher::Card::Session(LauncherRow {

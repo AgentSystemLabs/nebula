@@ -93,6 +93,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::Subscribe => {
                     let snapshot = daemon.snapshot().unwrap_or(ServerEvent::Snapshot {
                         projects: vec![],
+                        repositories: vec![],
                         worktrees: vec![],
                         agents: vec![],
                         terminals: vec![],
@@ -257,6 +258,22 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         req_id,
                         daemon
                             .add_project(&path, name, create_missing)
+                            .await
+                            .map(Some),
+                    )
+                    .await;
+                }
+                ClientRequest::RegisterProject {
+                    req_id,
+                    folder,
+                    name,
+                    repositories,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon
+                            .register_project(&folder, &name, &repositories)
                             .await
                             .map(Some),
                     )
