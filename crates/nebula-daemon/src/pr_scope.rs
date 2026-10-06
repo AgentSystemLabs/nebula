@@ -287,6 +287,9 @@ impl Daemon {
             head,
             starting_prompt,
         } = spec;
+        if !self.store.project_repositories(&project)?.is_empty() {
+            bail!("pull-request agent sessions are not available in multi-repository projects");
+        }
         let pr_url = validate_pr_url(&pr_url)?;
         let number = pr_number(&pr_url)?;
         let head = validate_head(&head)?;

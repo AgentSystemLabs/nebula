@@ -2007,18 +2007,25 @@ impl Daemon {
         branch: &str,
         base: Option<&str>,
     ) -> Result<(Worktree, EnterOutcome)> {
-        let branch = branch.trim();
-        if branch.is_empty() {
-            bail!("branch name is empty");
-        }
         let agent = self.store.get_agent(id)?.context("agent not found")?;
-        if agent.archived {
-            bail!("agent is archived");
-        }
         let current = self
             .store
             .get_worktree(&agent.worktree_id)?
             .context("worktree not found")?;
+        if !self
+            .store
+            .project_repositories(&current.project_id)?
+            .is_empty()
+        {
+            bail!("agent-requested worktrees are not available in multi-repository projects");
+        }
+        if agent.archived {
+            bail!("agent is archived");
+        }
+        let branch = branch.trim();
+        if branch.is_empty() {
+            bail!("branch name is empty");
+        }
         let (_, worktrees, _, _) = self.store.load_tree()?;
         let existing = worktrees
             .into_iter()

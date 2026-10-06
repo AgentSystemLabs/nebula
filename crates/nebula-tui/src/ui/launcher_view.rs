@@ -689,6 +689,7 @@ fn head_count(
     // same modal. A second column of air sets them off from the count.
     let badge: Part = app
         .selected_project()
+        .filter(|project| !app.tree.uses_workspace_layout(&project.id))
         .and_then(|project| crate::ui::open_counts_badge(app.project_open_counts(&project.id), th))
         .map(|(parts, _)| {
             let parts = parts.into_iter().map(|(text, mut style, hit)| {
@@ -1813,7 +1814,11 @@ fn draw_band_rule(
                 spare,
                 Some((format!(" {}", pr.badge()), look.badge)),
             );
-            let hovered = app.hover_crumb == Some(HitTarget::LauncherBandPr(band.worktree.clone()));
+            let available = app
+                .selected_project()
+                .is_none_or(|project| !app.tree.uses_workspace_layout(&project.id));
+            let hovered = available
+                && app.hover_crumb == Some(HitTarget::LauncherBandPr(band.worktree.clone()));
             if hovered {
                 if let Some(label) = spans.get_mut(1) {
                     label.style = label.style.add_modifier(Modifier::UNDERLINED);
@@ -1822,17 +1827,19 @@ fn draw_band_rule(
             let pr_w: usize = spans.iter().map(|s| s.width()).sum();
             left.push(Span::raw("  "));
             let x = r.x + u16::try_from(used + 2).unwrap_or(u16::MAX);
-            hits.push((
-                Rect {
-                    x,
-                    width: u16::try_from(pr_w)
-                        .unwrap_or(u16::MAX)
-                        .min(r.width.saturating_sub(x - r.x)),
-                    height: 1,
-                    ..r
-                },
-                HitTarget::LauncherBandPr(band.worktree.clone()),
-            ));
+            if available {
+                hits.push((
+                    Rect {
+                        x,
+                        width: u16::try_from(pr_w)
+                            .unwrap_or(u16::MAX)
+                            .min(r.width.saturating_sub(x - r.x)),
+                        height: 1,
+                        ..r
+                    },
+                    HitTarget::LauncherBandPr(band.worktree.clone()),
+                ));
+            }
             left.extend(spans);
         }
     }

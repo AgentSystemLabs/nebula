@@ -664,6 +664,10 @@ pub(crate) fn open_issues(app: &mut App) {
         .selected_worktree()
         .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
         .map_or_else(|| project.repo_path.clone(), |(_, path, _)| path);
+    if app.tree.uses_workspace_layout(&project.id) {
+        app.flash = Some("issues are not available in multi-repository projects".into());
+        return;
+    }
     let mut view = IssuesView::new(
         project.id.clone(),
         project.name.clone(),
