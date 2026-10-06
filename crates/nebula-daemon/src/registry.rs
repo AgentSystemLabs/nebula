@@ -13,8 +13,8 @@ use nebula_core::env;
 use nebula_core::project_file::{self, ProjectCommand};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, LinkId, PrewarmInfo,
-    Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Worktree, WorktreeId,
-    MAX_CLOUD_PROMPT_BYTES,
+    Project, ProjectId, ProjectRepository, ServerEvent, SessionRef, TerminalId, TerminalTab,
+    Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -658,6 +658,13 @@ impl Daemon {
 
     pub fn snapshot(&self) -> Result<ServerEvent> {
         let (projects, worktrees, mut agents, mut terminals) = self.store.load_tree()?;
+        let repositories = projects
+            .iter()
+            .map(|project| self.store.project_repositories(&project.id))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         {
             let sessions = self.sessions.lock().unwrap();
             for a in &mut agents {
@@ -669,6 +676,7 @@ impl Daemon {
         }
         Ok(ServerEvent::Snapshot {
             projects,
+            repositories,
             worktrees,
             agents,
             terminals,
@@ -792,6 +800,115 @@ impl Daemon {
                 entity: Entity::Worktree(worktree),
             });
         }
+        Ok(EntityId::Project(project.id))
+    }
+
+    /// Register an existing project folder and its direct-child repository
+    /// checkouts without changing any checkout on disk.
+    pub async fn register_project(
+        self: &Arc<Self>,
+        folder: &Path,
+        name: &str,
+        repositories: &[String],
+    ) -> Result<EntityId> {
+        use std::collections::HashSet;
+
+        if repositories.is_empty() {
+            bail!("at least one repository folder name is required");
+        }
+        let folder = tokio::fs::canonicalize(folder)
+            .await
+            .with_context(|| format!("project folder {} does not exist", folder.display()))?;
+        if !folder.is_dir() {
+            bail!("{} is not a project folder", folder.display());
+        }
+
+        let mut seen = HashSet::new();
+        let mut members = Vec::with_capacity(repositories.len());
+        for name in repositories {
+            let member = Path::new(name);
+            if member.components().count() != 1
+                || !matches!(
+                    member.components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                bail!("repository `{name}` must be a direct child folder name");
+            }
+            if name == "worktrees" {
+                bail!("repository name `worktrees` is reserved for session workspaces");
+            }
+            if !seen.insert(name) {
+                bail!("repository `{name}` is listed more than once");
+            }
+            let path = tokio::fs::canonicalize(folder.join(name))
+                .await
+                .with_context(|| {
+                    format!("repository `{name}` is missing from {}", folder.display())
+                })?;
+            if path.parent() != Some(folder.as_path()) {
+                bail!(
+                    "repository `{name}` must be a direct child of {}",
+                    folder.display()
+                );
+            }
+            let toplevel = git::repo_toplevel(&path)
+                .await
+                .with_context(|| format!("repository `{name}` is not a Git checkout"))?;
+            if toplevel != path {
+                bail!(
+                    "repository `{name}` is not a Git checkout directly inside {}",
+                    folder.display()
+                );
+            }
+            let branch = git::current_branch(&path).await?;
+            members.push(ProjectRepository {
+                project_id: ProjectId::generate(),
+                name: name.clone(),
+                path,
+                branch,
+            });
+        }
+
+        let project = Project {
+            id: ProjectId::generate(),
+            name: if name.trim().is_empty() {
+                Project::folder_name(&folder)
+            } else {
+                name.trim().to_string()
+            },
+            repo_path: folder.clone(),
+            sort_order: self.store.next_project_sort_order()?,
+        };
+        let mut members = members;
+        for member in &mut members {
+            member.project_id = project.id.clone();
+        }
+
+        let worktree = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: folder.clone(),
+            branch: "main workspace".into(),
+            is_main: true,
+            sort_order: 0,
+        };
+        self.store
+            .insert_project_with_repositories(&project, &members)?;
+        if let Err(error) = self.store.insert_worktree(&worktree) {
+            let _ = self.store.delete_project(&project.id);
+            return Err(error);
+        }
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Project(project.clone()),
+        });
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Worktree(worktree),
+        });
+        self.broadcast(ServerEvent::ProjectRepositoriesUpserted {
+            project: project.id.clone(),
+            repositories: members,
+        });
         Ok(EntityId::Project(project.id))
     }
 
@@ -1017,6 +1134,9 @@ impl Daemon {
     /// The reconcile half of `sync_project_worktrees`. Returns whether any
     /// checkout was newly adopted.
     async fn reconcile_project_worktrees(self: &Arc<Self>, project: &Project) -> Result<bool> {
+        if !self.store.project_repositories(&project.id)?.is_empty() {
+            return Ok(false);
+        }
         let mut adopted = false;
         let entries = git::list_worktrees(&project.repo_path).await?;
         // git lists the main checkout first, and that — not the order rows

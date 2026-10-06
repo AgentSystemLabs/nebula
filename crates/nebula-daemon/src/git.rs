@@ -57,6 +57,19 @@ pub async fn repo_toplevel(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(out.trim()))
 }
 
+/// Current branch of an existing checkout; detached HEADs are represented
+/// by their short object id so project snapshots still describe reality.
+pub async fn current_branch(path: &Path) -> Result<String> {
+    let symbolic = git(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await;
+    match symbolic {
+        Ok(branch) => Ok(branch.trim().to_string()),
+        Err(_) => Ok(git(path, &["rev-parse", "--short", "HEAD"])
+            .await?
+            .trim()
+            .to_string()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeEntry {
     pub path: PathBuf,

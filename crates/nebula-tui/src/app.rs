@@ -2583,6 +2583,7 @@ pub fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
     pub projects: Vec<Project>,
+    pub repositories: Vec<nebula_core::ProjectRepository>,
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
@@ -2607,6 +2608,10 @@ impl Tree {
                     .worktrees
                     .iter()
                     .any(|w| w.project_id == p.id && w.path == path)
+                || self
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.project_id == p.id && repository.path == path)
         })
     }
 }

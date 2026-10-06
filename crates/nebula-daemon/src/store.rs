@@ -6,10 +6,11 @@ use crate::session_title::TitleState;
 use anyhow::{Context, Result};
 use nebula_core::clock::now_ms;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, PromptEntry,
-    TerminalId, TerminalTab, Worktree, WorktreeId, RECENT_PROMPTS_KEPT,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId,
+    ProjectRepository, PromptEntry, TerminalId, TerminalTab, Worktree, WorktreeId,
+    RECENT_PROMPTS_KEPT,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -328,6 +329,31 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE temp.worktree_home;
     DROP TABLE temp.worktree_merge;
     ",
+    // 29: projects now identify a project folder, not an exclusively-owned
+    // repository. Repository membership is project-scoped and reusable.
+    // Rebuild with foreign keys disabled so worktree ownership is preserved.
+    "
+    CREATE TABLE projects_new (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      repo_path   TEXT NOT NULL,
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL
+    );
+    INSERT INTO projects_new (id, name, repo_path, sort_order, created_at)
+      SELECT id, name, repo_path, sort_order, created_at FROM projects;
+    DROP TABLE projects;
+    ALTER TABLE projects_new RENAME TO projects;
+    CREATE INDEX projects_folder ON projects (repo_path);
+    CREATE TABLE project_repositories (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name       TEXT NOT NULL,
+      path       TEXT NOT NULL,
+      branch     TEXT NOT NULL,
+      PRIMARY KEY (project_id, name)
+    );
+    CREATE INDEX project_repositories_path ON project_repositories (path);
+    ",
 ];
 
 pub struct Store {
@@ -404,6 +430,55 @@ impl Store {
         Ok(())
     }
 
+    pub fn insert_project_with_repositories(
+        &self,
+        project: &Project,
+        repositories: &[ProjectRepository],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project.id.as_str(), project.name, project.repo_path.to_string_lossy(), project.sort_order, now_ms()],
+        )?;
+        for repository in repositories {
+            tx.execute(
+                "INSERT INTO project_repositories (project_id, name, path, branch) VALUES (?1, ?2, ?3, ?4)",
+                params![project.id.as_str(), repository.name, repository.path.to_string_lossy(), repository.branch],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_project_repository(
+        &self,
+        project: &ProjectId,
+        repository: &ProjectRepository,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO project_repositories (project_id, name, path, branch) VALUES (?1, ?2, ?3, ?4)",
+            params![project.as_str(), repository.name, repository.path.to_string_lossy(), repository.branch],
+        )?;
+        Ok(())
+    }
+
+    pub fn project_repositories(&self, project: &ProjectId) -> Result<Vec<ProjectRepository>> {
+        let conn = self.conn.lock().unwrap();
+        let repositories = conn
+            .prepare("SELECT name, path, branch FROM project_repositories WHERE project_id = ?1 ORDER BY name")?
+            .query_map(params![project.as_str()], |r| {
+                Ok(ProjectRepository {
+                    project_id: project.clone(),
+                    name: r.get(0)?,
+                    path: PathBuf::from(r.get::<_, String>(1)?),
+                    branch: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(repositories)
+    }
+
     /// Sort slot for a newly added project: after everything else.
     pub fn next_project_sort_order(&self) -> Result<i64> {
         Ok(self.conn.lock().unwrap().query_row(
@@ -425,8 +500,7 @@ impl Store {
         self.delete_by_id("projects", id.as_str())
     }
 
-    /// The project row registered for the repo at `path`, if any — one
-    /// repo is one project (`repo_path` is UNIQUE).
+    /// Legacy project registration lookup for its root repository.
     pub fn project_by_path(&self, path: &Path) -> Result<Option<ProjectId>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id FROM projects WHERE repo_path = ?1")?;
@@ -436,6 +510,29 @@ impl Store {
             .map(|r| r.get::<_, String>(0))
             .transpose()?
             .map(ProjectId))
+    }
+
+    pub fn project_by_folder(&self, path: &Path) -> Result<Option<ProjectId>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM projects WHERE repo_path = ?1 LIMIT 1",
+                params![path.to_string_lossy()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map(|id| id.map(ProjectId))?)
+    }
+
+    pub fn project_by_folder_or_repository(&self, path: &Path) -> Result<Option<ProjectId>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT id FROM projects WHERE repo_path = ?1 UNION ALL SELECT project_id FROM project_repositories WHERE path = ?1 LIMIT 1",
+            params![path.to_string_lossy()],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map(|id| id.map(ProjectId))?)
     }
 
     // ---- worktrees ----
@@ -1327,6 +1424,46 @@ mod tests {
         assert_eq!(agents[3].issue_url.as_deref(), Some(issue_url));
     }
 
+    #[test]
+    fn registered_repositories_round_trip_and_can_be_shared_by_projects() {
+        let store = Store::open_in_memory().unwrap();
+        let first = Project {
+            id: ProjectId("first".into()),
+            name: "first".into(),
+            repo_path: "/tmp/shared-project-folder".into(),
+            sort_order: 0,
+        };
+        let second = Project {
+            id: ProjectId("second".into()),
+            name: "second".into(),
+            repo_path: "/tmp/shared-project-folder".into(),
+            sort_order: 1,
+        };
+        let first_repo = ProjectRepository {
+            project_id: first.id.clone(),
+            name: "api".into(),
+            path: "/tmp/shared-project-folder/api".into(),
+            branch: "main".into(),
+        };
+        let second_repo = ProjectRepository {
+            project_id: second.id.clone(),
+            ..first_repo.clone()
+        };
+        store
+            .insert_project_with_repositories(&first, &[first_repo.clone()])
+            .unwrap();
+        store
+            .insert_project_with_repositories(&second, &[second_repo.clone()])
+            .unwrap();
+
+        assert_eq!(store.project_repositories(&first.id).unwrap(), [first_repo]);
+        assert_eq!(
+            store.project_repositories(&second.id).unwrap(),
+            [second_repo]
+        );
+        assert_eq!(store.load_tree().unwrap().0.len(), 2);
+    }
+
     /// Read marks are keyed by PR URL and outlive the worktree they were
     /// noticed on, so they live in their own table with no foreign key: no
     /// row here is ever cascaded away by a checkout being deleted.
@@ -1623,14 +1760,14 @@ mod tests {
         assert_eq!(worktrees.len(), 1, "worktrees must survive the rebuild");
         assert_eq!(agents.len(), 1, "agents must survive the rebuild");
 
-        // One repo is one project again: a second row for it is refused.
+        // Legacy repo roots can now be registered in another project.
         let dup = Project {
             id: ProjectId("p2".into()),
             name: "p".into(),
             repo_path: PathBuf::from("/tmp/p"),
             sort_order: 1,
         };
-        assert!(store.insert_project(&dup).is_err());
+        assert!(store.insert_project(&dup).is_ok());
 
         // Path lookups need no scope.
         assert_eq!(
@@ -1664,6 +1801,7 @@ mod tests {
             "agents",
             "links",
             "pr_seen",
+            "project_repositories",
             "projects",
             "terminals",
             "ui_state",

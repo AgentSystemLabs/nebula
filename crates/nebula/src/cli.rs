@@ -83,6 +83,22 @@ pub(crate) enum Command {
         #[arg(default_value = ".")]
         path: String,
     },
+    /// Register repositories together.
+    ///
+    /// The named folders must be direct children of the project folder and
+    /// existing Git checkouts. Registration never changes those checkouts.
+    #[command(after_help = REGISTER_EXAMPLES)]
+    Register {
+        /// Project folder.
+        #[arg(short, long = "dir", value_name = "PATH")]
+        folder: String,
+        /// Project name shown in Nebula.
+        #[arg(short, long = "as", value_name = "NAME")]
+        name: String,
+        /// Repository folder name.
+        #[arg(short = 'r', long = "repo", required = true, value_name = "DIR")]
+        repositories: Vec<String>,
+    },
     /// Run the daemon that owns every session.
     ///
     /// The daemon holds every PTY, the store, git and agent status. The TUI
@@ -327,6 +343,10 @@ Examples:
   nebula add .                     add the repo you are standing in
   nebula add ~/code/my-app         add one by path
   nebula ~/code/my-app             the same, without the subcommand";
+
+const REGISTER_EXAMPLES: &str = "\
+Examples:
+  nebula register --dir ~/pilot --as Pilot -r api -r web";
 
 const DAEMON_EXAMPLES: &str = "\
 Examples:

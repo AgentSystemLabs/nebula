@@ -10133,6 +10133,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
     match event {
         ServerEvent::Snapshot {
             projects,
+            repositories,
             worktrees,
             agents,
             terminals,
@@ -10141,6 +10142,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             ui_state,
         } => {
             app.tree.projects = projects;
+            app.tree.repositories = repositories;
             app.tree.worktrees = worktrees;
             app.tree.agents = agents;
             app.tree.terminals = terminals;
@@ -10172,6 +10174,16 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if session_restored || app.launcher_grid() {
                 preview_selected_now(app, out);
             }
+            app.dirty = true;
+        }
+        ServerEvent::ProjectRepositoriesUpserted {
+            project,
+            repositories,
+        } => {
+            app.tree
+                .repositories
+                .retain(|repository| repository.project_id != project);
+            app.tree.repositories.extend(repositories);
             app.dirty = true;
         }
         ServerEvent::Scrollback {
@@ -10840,6 +10852,7 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.open_prs_failed.remove(id);
             app.pr_cache_dirty = true;
             app.tree.worktrees.retain(|w| &w.project_id != id);
+            app.tree.repositories.retain(|r| &r.project_id != id);
             app.tree.projects.retain(|p| &p.id != id);
         }
         EntityId::Worktree(id) => {
@@ -14656,6 +14669,7 @@ diff --git a/docs/keys.md b/docs/keys.md
             &mut fresh,
             ServerEvent::Snapshot {
                 projects: tree.projects,
+                repositories: tree.repositories,
                 worktrees: tree.worktrees,
                 agents: tree.agents,
                 terminals: tree.terminals,
@@ -15596,6 +15610,7 @@ diff --git a/src/c.rs b/src/c.rs
             &mut fresh,
             ServerEvent::Snapshot {
                 projects: tree.projects,
+                repositories: tree.repositories,
                 worktrees: tree.worktrees,
                 agents: tree.agents,
                 terminals: tree.terminals,
@@ -15619,6 +15634,7 @@ diff --git a/src/c.rs b/src/c.rs
         let tree = app.tree.clone();
         let snapshot = |ui_state: Option<String>| ServerEvent::Snapshot {
             projects: tree.projects.clone(),
+            repositories: tree.repositories.clone(),
             worktrees: tree.worktrees.clone(),
             agents: tree.agents.clone(),
             terminals: tree.terminals.clone(),

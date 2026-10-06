@@ -1,5 +1,6 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, TerminalTab, Worktree,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, ProjectRepository, TerminalTab,
+    Worktree,
 };
 use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorktreeId};
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -65,6 +66,14 @@ pub enum ClientRequest {
         /// inside a repository. Set only after the user confirmed in the
         /// client.
         create_missing: bool,
+    },
+    /// Register existing direct-child Git checkouts under one project
+    /// folder. This operation never creates or modifies a checkout.
+    RegisterProject {
+        req_id: u64,
+        folder: PathBuf,
+        name: String,
+        repositories: Vec<String>,
     },
     RemoveProject {
         req_id: u64,
@@ -456,6 +465,7 @@ pub enum ServerEvent {
     },
     Snapshot {
         projects: Vec<Project>,
+        repositories: Vec<ProjectRepository>,
         worktrees: Vec<Worktree>,
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
@@ -484,6 +494,10 @@ pub enum ServerEvent {
     // -- deltas (pushed to all subscribers) --
     EntityUpserted {
         entity: Entity,
+    },
+    ProjectRepositoriesUpserted {
+        project: ProjectId,
+        repositories: Vec<ProjectRepository>,
     },
     EntityRemoved {
         id: EntityId,

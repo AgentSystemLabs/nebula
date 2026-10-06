@@ -14,6 +14,7 @@ use std::process::Command;
 /// The hidden `_stale-daemon-note` is deliberately absent.
 const VISIBLE: &[&[&str]] = &[
     &["add"],
+    &["register"],
     &["daemon"],
     &["kill"],
     &["reload"],
@@ -87,6 +88,7 @@ fn a_subcommand_page_is_about_that_subcommand_only() {
         "Open nebula on a remote host over ssh",
         "Install the latest published nebula over this one",
         "Register a git checkout as a project",
+        "Register repositories together",
     ] {
         assert!(
             !help.contains(summary),
@@ -119,8 +121,8 @@ fn the_root_help_lists_one_line_per_command() {
     }
     assert_eq!(
         commands.lines().count(),
-        14,
-        "thirteen commands plus `help`:\n{commands}"
+        15,
+        "fourteen commands plus `help`:\n{commands}"
     );
 }
 

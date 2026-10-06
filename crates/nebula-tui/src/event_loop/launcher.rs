@@ -657,6 +657,58 @@ pub(super) fn new_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.flash = Some(TERMINAL_ON_ROOT.into());
 }
 
+#[cfg(test)]
+mod main_workspace_tests {
+    use super::*;
+    use crate::app::{Focus, Overlay};
+    use nebula_core::{Project, ProjectRepository, Worktree};
+
+    #[test]
+    fn keyboard_and_band_click_launch_a_terminal_in_the_main_workspace() {
+        let mut app = App::new();
+        app.tree.projects.push(Project {
+            id: ProjectId("multi".into()),
+            name: "Pilot".into(),
+            repo_path: "/tmp/pilot".into(),
+            sort_order: 0,
+        });
+        app.tree.repositories.push(ProjectRepository {
+            project_id: ProjectId("multi".into()),
+            name: "api".into(),
+            path: "/tmp/pilot/api".into(),
+            branch: "main".into(),
+        });
+        app.tree.worktrees.push(Worktree {
+            id: WorktreeId("main".into()),
+            project_id: ProjectId("multi".into()),
+            path: "/tmp/pilot".into(),
+            branch: "main workspace".into(),
+            is_main: true,
+            sort_order: 0,
+        });
+        app.launcher_tabs.push(ProjectId("multi".into()));
+        let mut keyboard_requests = Vec::new();
+        new_terminal(&mut app, &mut keyboard_requests);
+        assert!(matches!(
+            keyboard_requests.as_slice(),
+            [ClientRequest::CreateTerminal { worktree, .. }] if worktree == &WorktreeId("main".into())
+        ));
+
+        let mut clicked = App::new();
+        clicked.tree = app.tree.clone();
+        clicked.launcher_tabs.push(ProjectId("multi".into()));
+        let mut click_requests = Vec::new();
+        assert!(select_band_row(&mut clicked, 0, &mut click_requests));
+        assert_eq!(clicked.focus, Focus::Sessions);
+        new_terminal(&mut clicked, &mut click_requests);
+        assert!(matches!(
+            click_requests.last(),
+            Some(ClientRequest::CreateTerminal { worktree, .. }) if worktree == &WorktreeId("main".into())
+        ));
+        assert!(!matches!(clicked.overlay, Some(Overlay::Prompt(_))));
+    }
+}
+
 /// `` ` `` on the grid: the next TERMINAL chip in the cursor's checkout —
 /// inside it, from the band level as from a card — and back round to
 /// the first, so the shells of one checkout are a loop the key walks

@@ -149,6 +149,14 @@ pub struct Project {
     pub sort_order: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRepository {
+    pub project_id: ProjectId,
+    pub name: String,
+    pub path: PathBuf,
+    pub branch: String,
+}
+
 impl Project {
     /// The name a project takes from disk: the last component of its repo
     /// path. This is the default `name`, and it stays the truth about where
