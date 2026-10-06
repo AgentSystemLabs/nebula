@@ -862,7 +862,7 @@ pub(crate) fn open_agent_preset_task(
     // Flipped onto a fresh worktree: only the QUICK PROMPT's launch cuts
     // one first, so the preset goes on that box — sent at once for a
     // `skip`-task preset, as the task box would be.
-    if let Some(target @ QuickTarget::NewWorktree { .. }) = view.aim.clone() {
+    if let Some(target @ QuickTarget::NewSessionWorkspace { .. }) = view.aim.clone() {
         let launch = crate::quick_prompt::QuickLaunch::of_preset(
             target,
             preset,
@@ -1052,9 +1052,9 @@ pub(crate) fn toggle_new_worktree(app: &mut App) {
             .find(|w| w.id == view.worktree)
             .map(|w| {
                 let taken = app.project_branches(&w.project_id);
-                QuickTarget::NewWorktree {
+                QuickTarget::NewSessionWorkspace {
                     project: w.project_id.clone(),
-                    branch: crate::branch_name::random_name(&taken),
+                    name: crate::branch_name::random_name(&taken),
                 }
             })
             .ok_or("worktree no longer exists"),

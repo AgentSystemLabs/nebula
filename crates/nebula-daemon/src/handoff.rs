@@ -21,7 +21,7 @@ use crate::lifecycle::PidfileLock;
 use crate::pty::Carried;
 use crate::registry::Daemon;
 use anyhow::{bail, Context, Result};
-use nebula_core::{paths, AgentId, Worktree};
+use nebula_core::{paths, AgentId};
 use serde::{Deserialize, Serialize};
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ use std::time::Duration;
 /// The state-file format this build writes, and the newest it reads. A
 /// daemon only restarts onto a binary whose `_restart-version` is at least
 /// its own, so a change that an older reader could misread bumps this.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// A request older than this is a leftover, not a client still waiting.
 const REQUEST_MAX_AGE_MS: i64 = 60_000;
@@ -80,8 +80,6 @@ struct State {
     hook_token: String,
     #[serde(default)]
     sessions: Vec<CarriedSession>,
-    #[serde(default)]
-    pending_moves: Vec<(AgentId, Worktree)>,
 }
 
 /// The running image's handles a restart passes on.
@@ -105,7 +103,6 @@ pub struct Inherited {
 pub struct Carry {
     pub nonce: String,
     pub sessions: Vec<CarriedSession>,
-    pub pending_moves: Vec<(AgentId, Worktree)>,
 }
 
 impl Carry {
@@ -177,7 +174,6 @@ pub fn restart(daemon: &Arc<Daemon>, handles: &Handles, request: &Request) -> Re
         hook_fd: handles.hook_fd,
         hook_token: daemon.hook_env.token.clone(),
         sessions,
-        pending_moves: daemon.pending_moves(),
     };
     let state_path = paths::restart_state_path();
     let kept = [state.pidfile_fd, state.socket_fd, state.hook_fd];
@@ -265,7 +261,6 @@ pub fn inherit(state_path: &Path) -> Result<Inherited> {
         carry: Carry {
             nonce: state.nonce,
             sessions: state.sessions,
-            pending_moves: state.pending_moves,
         },
     })
 }
@@ -422,7 +417,6 @@ mod tests {
                 spare: false,
                 launching: true,
             }],
-            pending_moves: vec![],
         };
         let bytes = rmp_serde::to_vec_named(&state).unwrap();
         let back: State = rmp_serde::from_slice(&bytes).unwrap();
@@ -474,7 +468,6 @@ mod tests {
                     launching: false,
                 },
             ],
-            pending_moves: vec![],
         };
         assert_eq!(
             carry.agents(),

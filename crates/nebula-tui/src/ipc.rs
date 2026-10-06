@@ -490,39 +490,6 @@ pub async fn enter_worktree_for_current_agent(name: &str, base: Option<String>) 
     }
 }
 
-/// One-shot client for `nebula add <dir>` (and bare `nebula <dir>`): resolve
-/// the path locally — the daemon's cwd is not ours, so relative paths must be
-/// absolutized here — and ask the daemon to register it as a project. The
-/// daemon owns the rest: normalizing to the repo toplevel, naming the project
-/// after the directory, rejecting non-repos and duplicates. Spawns a daemon
-/// when none is running, same as launching the TUI would.
-pub async fn add_project(path: &str) -> Result<()> {
-    let expanded = match (path.strip_prefix("~/"), env::home_dir()) {
-        (Some(rest), Some(home)) => home.join(rest),
-        _ => std::path::PathBuf::from(path),
-    };
-    let dir = std::fs::canonicalize(&expanded)
-        .with_context(|| format!("{} does not exist", expanded.display()))?;
-    if !dir.is_dir() {
-        bail!("{} is not a directory", dir.display());
-    }
-    let mut conn = connect_or_spawn().await?;
-    let req_id = ONE_SHOT_REQ_ID;
-    write_frame(
-        &mut conn.stream,
-        &ClientRequest::AddProject {
-            req_id,
-            path: dir.clone(),
-            name: None,
-            create_missing: false,
-        },
-    )
-    .await?;
-    await_ack(&mut conn, req_id).await?;
-    println!("added project {}", dir.display());
-    Ok(())
-}
-
 pub async fn register_project(folder: &str, name: &str, repositories: &[String]) -> Result<()> {
     let expanded = match (folder.strip_prefix("~/"), env::home_dir()) {
         (Some(rest), Some(home)) => home.join(rest),

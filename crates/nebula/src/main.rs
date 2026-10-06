@@ -24,7 +24,6 @@ fn main() -> Result<()> {
             )
         }
         Some(Command::Reload) => upgrade::run_reload(),
-        Some(Command::Add { path }) => nebula_tui::run_add_project(path),
         Some(Command::Register {
             folder,
             name,
@@ -104,24 +103,20 @@ fn main() -> Result<()> {
             println!("{}", nebula_daemon::handoff::VERSION);
             Ok(())
         }
-        None => match cli.dir {
-            Some(dir) => nebula_tui::run_add_project(dir),
-            None => {
-                init_tui_logging()?;
-                let handoff =
-                    log_fatal(nebula_tui::run_tui(), &nebula_core::paths::tui_log_path())?;
-                match handoff {
-                    // Hosts-picker handoff: the TUI quit and restored the
-                    // terminal so a fresh `nebula ssh` can exec over us (the
-                    // local daemon and its sessions stay up).
-                    Some(entry) => {
-                        eprintln!("nebula: connecting to {}…", entry.host);
-                        ssh::run_ssh(&entry.host, entry.path.as_deref(), true)
-                    }
-                    None => Ok(()),
+        None => {
+            init_tui_logging()?;
+            let handoff = log_fatal(nebula_tui::run_tui(), &nebula_core::paths::tui_log_path())?;
+            match handoff {
+                // Hosts-picker handoff: the TUI quit and restored the
+                // terminal so a fresh `nebula ssh` can exec over us (the
+                // local daemon and its sessions stay up).
+                Some(entry) => {
+                    eprintln!("nebula: connecting to {}…", entry.host);
+                    ssh::run_ssh(&entry.host, entry.path.as_deref(), true)
                 }
+                None => Ok(()),
             }
-        },
+        }
     }
 }
 

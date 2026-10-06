@@ -3,10 +3,8 @@
 //! its launch — the worktree it runs in and the scope rule it carries —
 //! and the shape that rule takes for each AGENT KIND's CLI.
 //!
-//! A PR SESSION never runs in the ROOT WORKTREE. `Daemon::create_pr_agent`
-//! finds the PROJECT's worktree checked out on the PR's head branch, or
-//! creates one, and every PR SESSION for that PR shares it; the rule names
-//! that checkout so the agent works there and nowhere else.
+//! Pull-request URL and launch-rule helpers. PR session creation is disabled
+//! in the Nebula Pilot workspace fork.
 //!
 //! The rule is regenerated from the persisted URL and the row's current
 //! worktree for every fresh process, so a RESUME cannot silently lose the
@@ -24,12 +22,8 @@
 //! folded into the same launch prompts on every spawn.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use nebula_core::{AgentKind, EntityId, ProjectId};
-
-use crate::registry::{CreateAgentSpec, Daemon};
 
 /// Everything the rule says about where a PR SESSION works: the PR, the
 /// checkout it runs in, and the main checkout it must leave alone.
@@ -198,11 +192,6 @@ pub(crate) fn validate_pr_url(raw: &str) -> Result<String> {
 
 /// The pull request's number, read off its validated URL (`…/pull/42`,
 /// with or without a trailing path).
-pub(crate) fn pr_number(url: &str) -> Result<u64> {
-    nebula_core::url_number_after(url, "/pull/")
-        .with_context(|| format!("no pull request number in {url}"))
-}
-
 /// Validate an ISSUE SESSION's URL the way [`validate_pr_url`] validates a
 /// PR SESSION's: HTTP(S), bounded, and an issue path — the TUI only ever
 /// sends what `gh issue list` returned, but the DAEMON rechecks at the IPC
@@ -229,88 +218,6 @@ pub(crate) fn issue_number(url: &str) -> Option<u64> {
 /// The PR's head branch as `gh` reports it, checked before it becomes a
 /// git argument and a directory name: one line, no shell-ish characters,
 /// not an option.
-pub(crate) fn validate_head(raw: &str) -> Result<String> {
-    const MAX_HEAD_BYTES: usize = 256;
-    let head = raw.trim();
-    if head.is_empty() {
-        bail!("the pull request has no head branch");
-    }
-    if head.len() > MAX_HEAD_BYTES {
-        bail!("head branch name is too long (max {MAX_HEAD_BYTES} bytes)");
-    }
-    if head.starts_with('-')
-        || head
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '~' | '^' | ':' | '\\'))
-    {
-        bail!("not a branch name: {head:?}");
-    }
-    Ok(head.to_string())
-}
-
-/// What `ClientRequest::CreatePrAgent` carries: `CreateAgentSpec` minus
-/// the worktree the daemon picks itself, plus the PR the rule is for.
-pub(crate) struct CreatePrAgentSpec {
-    pub project: ProjectId,
-    pub name: String,
-    pub kind: AgentKind,
-    /// Registry id of the custom harness, when `kind` is
-    /// [`AgentKind::Custom`].
-    pub custom_harness: Option<String>,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-    pub auto_title: bool,
-    pub pr_url: String,
-    pub head: String,
-    /// The CLI's positional first prompt (an AGENT PRESET launched on the
-    /// row); checked and sent exactly as `CreateAgentSpec`'s is.
-    pub starting_prompt: Option<String>,
-}
-
-impl Daemon {
-    /// Create a PR SESSION: put a checkout of the PR's head branch under
-    /// the PROJECT (or find the one already there), then create the AGENT
-    /// in it with the PR URL as its launch context.
-    pub(crate) async fn create_pr_agent(
-        self: &Arc<Self>,
-        spec: CreatePrAgentSpec,
-    ) -> Result<EntityId> {
-        let CreatePrAgentSpec {
-            project,
-            name,
-            kind,
-            custom_harness,
-            model,
-            effort,
-            auto_title,
-            pr_url,
-            head,
-            starting_prompt,
-        } = spec;
-        if !self.store.project_repositories(&project)?.is_empty() {
-            bail!("pull-request agent sessions are not available in multi-repository projects");
-        }
-        let pr_url = validate_pr_url(&pr_url)?;
-        let number = pr_number(&pr_url)?;
-        let head = validate_head(&head)?;
-        let worktree = self.pr_worktree(&project, number, &head).await?;
-        self.create_agent(CreateAgentSpec {
-            worktree: worktree.id,
-            name,
-            kind,
-            custom_harness,
-            model,
-            effort,
-            auto_title,
-            cloud_prompt: None,
-            starting_prompt,
-            pr_url: Some(pr_url),
-            issue_url: None,
-        })
-        .await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,38 +386,5 @@ mod tests {
         );
         assert_eq!(issue_number("https://github.com/o/r/issues/0"), None);
         assert_eq!(issue_number("https://github.com/o/r/pull/7"), None);
-    }
-
-    #[test]
-    fn pr_number_reads_the_url_tail() {
-        assert_eq!(pr_number("https://github.com/o/r/pull/7").unwrap(), 7);
-        assert_eq!(
-            pr_number("https://github.com/o/r/pull/42/files").unwrap(),
-            42
-        );
-        assert_eq!(
-            pr_number("https://github.com/o/r/pull/9?diff=split").unwrap(),
-            9
-        );
-        assert!(pr_number("https://github.com/o/r/pull/").is_err());
-        assert!(pr_number("https://github.com/o/r/pull/0").is_err());
-        assert!(pr_number("https://github.com/o/r/pull/abc").is_err());
-    }
-
-    #[test]
-    fn validate_head_takes_branch_names_and_refuses_options_and_spaces() {
-        assert_eq!(validate_head(" feat/login ").unwrap(), "feat/login");
-        assert_eq!(validate_head("their-fix.v2").unwrap(), "their-fix.v2");
-        for bad in [
-            "",
-            "  ",
-            "-b",
-            "a b",
-            "a\nb",
-            "a:b",
-            "x".repeat(300).as_str(),
-        ] {
-            assert!(validate_head(bad).is_err(), "{bad:?}");
-        }
     }
 }

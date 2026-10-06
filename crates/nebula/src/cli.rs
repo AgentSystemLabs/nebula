@@ -38,17 +38,12 @@ use clap::{Parser, Subcommand};
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
-    /// Directory to add as a project — shorthand for `nebula add <dir>`.
-    ///
-    /// A directory whose name collides with a subcommand needs the long form
-    /// (`nebula add browser`) or a `./` prefix.
-    pub(crate) dir: Option<String>,
 }
 
 const ROOT_EXAMPLES: &str = "\
 Examples:
   nebula                            open the TUI (auto-starts the daemon)
-  nebula add ~/code/my-app          register a project
+  nebula register --dir ~/pilot --as Pilot --repo api
   nebula browser --port 8080        serve this TUI in a browser tab
 
 Run `nebula <command> --help` for a command's flags and examples.";
@@ -72,17 +67,6 @@ fn parse_agent_kind(s: &str) -> Result<nebula_core::AgentKind, String> {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// Register a git checkout as a project.
-    ///
-    /// Adds a directory to the project list, named after the repository's
-    /// root directory. Bare `nebula <dir>` is the same
-    /// command, so `nebula .` and `nebula add .` do the same thing.
-    #[command(after_help = ADD_EXAMPLES)]
-    Add {
-        /// Path to a git repository (default: the current directory).
-        #[arg(default_value = ".")]
-        path: String,
-    },
     /// Register repositories together.
     ///
     /// The named folders must be direct children of the project folder and
@@ -337,12 +321,6 @@ pub(crate) enum Command {
     #[command(hide = true, name = "_restart-version")]
     RestartVersion,
 }
-
-const ADD_EXAMPLES: &str = "\
-Examples:
-  nebula add .                     add the repo you are standing in
-  nebula add ~/code/my-app         add one by path
-  nebula ~/code/my-app             the same, without the subcommand";
 
 const REGISTER_EXAMPLES: &str = "\
 Examples:

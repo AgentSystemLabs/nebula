@@ -665,7 +665,7 @@ pub(crate) fn open_issues(app: &mut App) {
         .and_then(|workspace| app.selected_repository_checkout(&workspace.id))
         .map_or_else(|| project.repo_path.clone(), |(_, path, _)| path);
     if app.tree.uses_workspace_layout(&project.id) {
-        app.flash = Some("issues are not available in multi-repository projects".into());
+        app.flash = Some("issues are disabled in Nebula Pilot workspaces".into());
         return;
     }
     let mut view = IssuesView::new(
@@ -1451,9 +1451,9 @@ pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
 fn launch_target(app: &App, project: &ProjectId, issue: &IssueRef) -> Option<QuickTarget> {
     if crate::config::Config::load().quick_prompt_new_worktree {
         let taken = app.project_branches(project);
-        return Some(QuickTarget::NewWorktree {
+        return Some(QuickTarget::NewSessionWorkspace {
             project: project.clone(),
-            branch: crate::branch_name::issue_name(issue.number, &issue.title, &taken),
+            name: crate::branch_name::issue_name(issue.number, &issue.title, &taken),
         });
     }
     app.root_worktree(project).map(QuickTarget::Worktree)

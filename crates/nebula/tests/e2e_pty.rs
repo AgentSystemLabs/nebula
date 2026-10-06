@@ -283,14 +283,14 @@ async fn full_crud_attach_and_restart_persistence() {
         other => panic!("expected snapshot first, got {other:?}"),
     }
 
-    // ---- AddProject: creates project + main worktree row ----
+    // ---- RegisterProject: creates project + main workspace row ----
     write_frame(
         &mut c,
-        &ClientRequest::AddProject {
+        &ClientRequest::RegisterProject {
             req_id: 1,
-            path: repo.clone(),
-            name: None,
-            create_missing: false,
+            folder: repo.parent().unwrap().to_path_buf(),
+            name: repo.file_name().unwrap().to_string_lossy().into_owned(),
+            repositories: vec![repo.file_name().unwrap().to_string_lossy().into_owned()],
         },
     )
     .await
@@ -312,7 +312,7 @@ async fn full_crud_attach_and_restart_persistence() {
         ..
     } = find_ack(&events, 1).unwrap()
     else {
-        panic!("AddProject failed: {events:#?}");
+        panic!("RegisterProject failed: {events:#?}");
     };
     let project_id = project_id.clone();
     let main_worktree = events
@@ -324,9 +324,9 @@ async fn full_crud_attach_and_restart_persistence() {
             _ => None,
         })
         .expect("main worktree upsert");
-    assert_eq!(main_worktree.branch, "main");
+    assert_eq!(main_worktree.branch, "main workspace");
 
-    // ---- CreateTerminal + attach + echo through the PTY ----
+    // ---- Main-workspace terminal + attach + echo through the PTY ----
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
@@ -374,11 +374,11 @@ async fn full_crud_attach_and_restart_persistence() {
         text.matches(marker).count() >= 2
     })
     .await;
-    // The shell runs in the worktree directory.
+    // The shell runs in the project folder workspace.
     let text = String::from_utf8_lossy(&collected_output(&events)).into_owned();
     assert!(
-        text.contains("repo"),
-        "terminal cwd should be the worktree: {text}"
+        text.contains(env.tmp.path().to_str().unwrap()),
+        "terminal cwd should be the project folder: {text}"
     );
 
     // ---- TailOutput: the end of the ring, for the grid's terminal card ----
@@ -482,61 +482,53 @@ async fn full_crud_attach_and_restart_persistence() {
         "CreateAgent failed: {events:#?}"
     );
 
-    // ---- CreateWorktree: real `git worktree add` on disk ----
+    // ---- One repository follows the session-workspace lifecycle ----
     write_frame(
         &mut c,
-        &ClientRequest::CreateWorktree {
+        &ClientRequest::CreateSessionWorkspace {
             req_id: 4,
             project: project_id.clone(),
-            branch: "feature-x".into(),
-            base: None,
+            name: "feature-x".into(),
         },
     )
     .await
     .unwrap();
     let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
-        find_ack(evs, 4).is_some()
-            && evs.iter().any(|e| {
-                matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.branch == "feature-x")
-            })
+        evs.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 4, .. }
+            )
+        })
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Worktree(feature_wt_id)),
-        ..
-    } = find_ack(&events, 4).unwrap()
-    else {
-        panic!("CreateWorktree failed: {events:#?}");
-    };
-    let feature_wt_id = feature_wt_id.clone();
-    let feature_wt_path = events
-        .iter()
-        .find_map(|e| match e {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(w),
-            } if w.id == feature_wt_id => Some(w.path.clone()),
-            _ => None,
+    let Some(ServerEvent::SessionWorkspaceCreated { workspace, .. }) =
+        events.iter().find(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 4, .. }
+            )
         })
-        .expect("worktree upsert carries its path");
-    assert!(feature_wt_path.exists(), "worktree dir created on disk");
-
-    // ---- DeleteWorktree removes it from disk ----
+    else {
+        panic!("session workspace creation failed: {events:#?}");
+    };
+    let feature_workspace = workspace.clone();
+    assert!(feature_workspace.path.join("repo").is_dir());
     write_frame(
         &mut c,
-        &ClientRequest::DeleteWorktree {
+        &ClientRequest::CloseSessionWorkspace {
             req_id: 5,
-            id: feature_wt_id.clone(),
-            force: true,
+            id: feature_workspace.id.clone(),
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| find_ack(evs, 5).is_some()).await;
+    let closed = read_events_until(&mut c, SLOW_TIMEOUT, |evs| find_ack(evs, 5).is_some()).await;
     assert!(
-        matches!(find_ack(&events, 5), Some(ServerEvent::Ack { .. })),
-        "DeleteWorktree failed: {events:#?}"
+        matches!(find_ack(&closed, 5), Some(ServerEvent::Ack { .. })),
+        "{closed:#?}"
     );
-    assert!(!feature_wt_path.exists(), "worktree dir removed from disk");
+    assert!(!feature_workspace.path.exists());
 
     // ---- restart: tree persists, boot sweep marks nothing (agents fresh) ----
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
@@ -937,28 +929,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(
-        &mut c,
-        &ClientRequest::AddProject {
-            req_id: 1,
-            path: repo.clone(),
-            name: None,
-            create_missing: false,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 1).is_some()).await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Project(_)),
-        ..
-    } = find_ack(&events, 1).unwrap()
-    else {
-        panic!("AddProject failed: {events:#?}");
-    };
-    // AddProject's worktree upsert goes to subscribers only; fetch it via the DB
-    // snapshot path instead: create the terminal against the main worktree id
-    // that Subscribe would report. Simplest: subscribe now.
+    let _main = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let events = subscribe(&mut c).await;
     let worktree_id = events
         .iter()
@@ -1096,7 +1067,7 @@ async fn cursor_position_query_is_answered_at_the_pty_size() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
@@ -1171,17 +1142,7 @@ async fn hook_post_from_agent_pty_drives_status() {
     handshake(&mut c).await;
     subscribe(&mut c).await;
 
-    write_frame(
-        &mut c,
-        &ClientRequest::AddProject {
-            req_id: 1,
-            path: repo.clone(),
-            name: None,
-            create_missing: false,
-        },
-    )
-    .await
-    .unwrap();
+    let _main = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
@@ -1231,9 +1192,13 @@ async fn hook_post_from_agent_pty_drives_status() {
     };
     let agent_id = agent_id.clone();
 
-    // Hook install happened at spawn: managed hooks exist in the worktree.
-    let settings_path = repo.join(".claude/settings.local.json");
-    assert!(settings_path.exists(), "hooks installed into worktree");
+    // Hook install happened at spawn: managed hooks exist in Claude's
+    // isolated global configuration directory for this test.
+    let settings_path = env.tmp.path().join(".claude/settings.local.json");
+    assert!(
+        settings_path.exists(),
+        "hooks installed into workspace folder"
+    );
     let settings: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
     assert!(settings["hooks"]["Stop"][0]["_nebulaManaged"]
@@ -1406,7 +1371,7 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let agent_id = create_agent_get_id(&mut c, &worktree.id, "cancelled", 2).await;
 
     let sref = SessionRef::Agent(agent_id.clone());
@@ -1469,165 +1434,6 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
 }
 
 #[tokio::test]
-async fn hook_cwd_rehomes_agent_to_other_worktree() {
-    let env = TestEnv::new();
-    let repo = env.make_repo();
-    let mut daemon = env.spawn_daemon();
-
-    let mut c = connect(&env.sock()).await;
-    handshake(&mut c).await;
-    subscribe(&mut c).await;
-
-    write_frame(
-        &mut c,
-        &ClientRequest::AddProject {
-            req_id: 1,
-            path: repo.clone(),
-            name: None,
-            create_missing: false,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(
-                e,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Worktree(_)
-                }
-            )
-        })
-    })
-    .await;
-    let main_worktree = events
-        .iter()
-        .find_map(|e| match e {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(w),
-            } => Some(w.clone()),
-            _ => None,
-        })
-        .unwrap();
-
-    // A second worktree — the one the agent will "enter".
-    write_frame(
-        &mut c,
-        &ClientRequest::CreateWorktree {
-            req_id: 2,
-            project: main_worktree.project_id.clone(),
-            branch: "feat".into(),
-            base: None,
-        },
-    )
-    .await
-    .unwrap();
-    // The upsert broadcast and the Ack ride different channels — wait for
-    // the upsert itself.
-    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
-                if w.branch == "feat")
-        })
-    })
-    .await;
-    let feat_worktree = events
-        .iter()
-        .find_map(|e| match e {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(w),
-            } if w.branch == "feat" => Some(w.clone()),
-            _ => None,
-        })
-        .expect("feat worktree upsert");
-
-    // Agent lives in the main checkout.
-    write_frame(
-        &mut c,
-        &ClientRequest::CreateAgent {
-            req_id: 3,
-            worktree: main_worktree.id.clone(),
-            name: "mover".into(),
-            kind: AgentKind::Claude,
-            custom_harness: None,
-            model: None,
-            effort: None,
-            auto_title: false,
-            cloud_prompt: None,
-            starting_prompt: None,
-            issue_url: None,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
-        ..
-    } = find_ack(&events, 3).unwrap()
-    else {
-        panic!("CreateAgent failed: {events:#?}");
-    };
-    let agent_id = agent_id.clone();
-
-    // POST a hook from inside the agent PTY whose payload reports the feat
-    // worktree as cwd — exactly what claude sends after entering it.
-    let sref = SessionRef::Agent(agent_id.clone());
-    write_frame(
-        &mut c,
-        &ClientRequest::Attach {
-            session: sref.clone(),
-            from_seq: None,
-            cols: 120,
-            rows: 30,
-        },
-    )
-    .await
-    .unwrap();
-    let body = format!(
-        r#"{{"session_id":"sess-1","cwd":"{}"}}"#,
-        feat_worktree.path.display()
-    );
-    let curl = format!(
-        "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
-         -H 'Content-Type: application/json' -d '{body}' \
-         \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\"\n"
-    );
-    write_frame(
-        &mut c,
-        &ClientRequest::Input {
-            session: sref.clone(),
-            data: curl.into_bytes(),
-        },
-    )
-    .await
-    .unwrap();
-
-    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == agent_id && a.worktree_id == feat_worktree.id)
-        })
-    })
-    .await;
-    assert!(
-        events.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == agent_id && a.worktree_id == feat_worktree.id)
-        }),
-        "agent re-homed to the worktree its hook cwd reported: {events:#?}"
-    );
-
-    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
-    wait_for_exit(&mut daemon);
-}
-
-/// CLAUDE TITLE SYNC end to end, with a /bin/sh standing in for claude:
-/// the row's name reaches the CLI as the `UserPromptSubmit` reply's
-/// `sessionTitle`, and a `/rename` inside the CLI — which fires no hook,
-/// only rewrites the window title and the `custom-title.json` beside the
-/// transcript the hooks named — retitles the row.
-#[tokio::test]
 async fn claude_session_title_and_row_name_stay_tied() {
     let env = TestEnv::new();
     let repo = env.make_repo();
@@ -1637,17 +1443,7 @@ async fn claude_session_title_and_row_name_stay_tied() {
     handshake(&mut c).await;
     subscribe(&mut c).await;
 
-    write_frame(
-        &mut c,
-        &ClientRequest::AddProject {
-            req_id: 1,
-            path: repo.clone(),
-            name: None,
-            create_missing: false,
-        },
-    )
-    .await
-    .unwrap();
+    let _main = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
@@ -1833,7 +1629,7 @@ async fn restart_rebinds_an_attached_client_to_the_new_pty() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let main_worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     write_frame(
         &mut c,
@@ -1939,17 +1735,7 @@ async fn codex_hooks_install_and_drive_status() {
     handshake(&mut c).await;
     subscribe(&mut c).await;
 
-    write_frame(
-        &mut c,
-        &ClientRequest::AddProject {
-            req_id: 1,
-            path: repo.clone(),
-            name: None,
-            create_missing: false,
-        },
-    )
-    .await
-    .unwrap();
+    let _main = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
@@ -2015,12 +1801,17 @@ async fn codex_hooks_install_and_drive_status() {
     assert!(hooks["hooks"].get("Notification").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
 
-    // The stale worktree copy lost our group and kept the foreign one.
+    // Project registration did not rewrite the old worktree-local copy.
     let stale_hooks: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(stale.join("hooks.json")).unwrap()).unwrap();
     let stop = stale_hooks["hooks"]["Stop"].as_array().unwrap();
-    assert_eq!(stop.len(), 1, "only the foreign group survives: {stop:#?}");
-    assert!(stop[0]["_mcManaged"].as_bool().unwrap());
+    assert_eq!(stop.len(), 2, "the pre-existing groups remain: {stop:#?}");
+    assert!(stop
+        .iter()
+        .any(|group| group["_mcManaged"].as_bool() == Some(true)));
+    assert!(stop
+        .iter()
+        .any(|group| group["_nebulaManaged"].as_bool() == Some(true)));
 
     // Drive the shell inside the agent PTY to POST codex hooks with its env.
     let sref = SessionRef::Agent(agent_id.clone());
@@ -2124,130 +1915,6 @@ async fn codex_hooks_install_and_drive_status() {
         .await
         .unwrap();
     wait_for_exit(&mut daemon2);
-}
-
-#[tokio::test]
-async fn external_worktrees_are_adopted_and_dropped() {
-    let env = TestEnv::new();
-    let repo = env.make_repo();
-    let mut daemon = env.spawn_daemon();
-
-    let mut c = connect(&env.sock()).await;
-    handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    write_frame(
-        &mut c,
-        &ClientRequest::AddProject {
-            req_id: 1,
-            path: repo.clone(),
-            name: None,
-            create_missing: false,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 1).is_some()).await;
-    assert!(
-        matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })),
-        "AddProject failed: {events:#?}"
-    );
-
-    // A worktree created behind nebula's back — exactly what an agent (or a
-    // human in another shell) does.
-    let wt_path = env.tmp.path().join("repo-worktrees").join("agent-branch");
-    let git_worktree = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .arg("worktree")
-            .args(args)
-            .arg(&wt_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    };
-    assert!(
-        git_worktree(&["add", "-b", "agent-branch"]),
-        "external git worktree add failed"
-    );
-
-    // The auto-sync adopts it without any client request.
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
-        evs.iter().any(|e| matches!(
-            e,
-            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.branch == "agent-branch"
-        ))
-    })
-    .await;
-    let adopted = events
-        .iter()
-        .find_map(|e| match e {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(w),
-            } if w.branch == "agent-branch" => Some(w.clone()),
-            _ => None,
-        })
-        .unwrap();
-    assert!(!adopted.is_main, "adopted checkout is not the main row");
-    assert!(
-        adopted.path.exists(),
-        "adopted row points at the real checkout"
-    );
-
-    // Removing it externally drops the row too (nothing lives there).
-    assert!(
-        git_worktree(&["remove", "--force"]),
-        "external git worktree remove failed"
-    );
-    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(
-                e,
-                ServerEvent::EntityRemoved { id: EntityId::Worktree(id) } if *id == adopted.id
-            )
-        })
-    })
-    .await;
-
-    // Switching branches on the root checkout renames the main row in place
-    // (the probe watches .git/HEAD, not just the worktrees registry).
-    assert!(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["checkout", "-b", "renamed-root"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success(),
-        "git checkout -b renamed-root failed"
-    );
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(
-                e,
-                ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
-                    if w.is_main && w.branch == "renamed-root"
-            )
-        })
-    })
-    .await;
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
-                if w.is_main && w.branch == "renamed-root"
-        )),
-        "main row should refresh to the new branch: {events:#?}"
-    );
-
-    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
-    wait_for_exit(&mut daemon);
 }
 
 /// Multi-repository sync refreshes only registered member checkouts. It
@@ -2515,38 +2182,7 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     write_frame(&mut c, &ClientRequest::Subscribe)
         .await
         .unwrap();
-    write_frame(
-        &mut c,
-        &ClientRequest::AddProject {
-            req_id: 1,
-            path: repo.clone(),
-            name: None,
-            create_missing: false,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
-        find_ack(evs, 1).is_some()
-            && evs.iter().any(|e| {
-                matches!(
-                    e,
-                    ServerEvent::EntityUpserted {
-                        entity: Entity::Worktree(_)
-                    }
-                )
-            })
-    })
-    .await;
-    let main_worktree = events
-        .iter()
-        .find_map(|e| match e {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(w),
-            } if w.is_main => Some(w.clone()),
-            _ => None,
-        })
-        .expect("main worktree upsert");
+    let main_worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     write_frame(
         &mut c,
@@ -2685,7 +2321,7 @@ async fn reload_and_upgrade_restart_the_daemon_without_stopping_sessions() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let agent_id = create_agent_get_id(&mut c, &worktree.id, "kept", 2).await;
     write_frame(
         &mut c,
@@ -2884,7 +2520,7 @@ async fn reload_keeps_an_agent_of_every_harness() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let mut agents = Vec::new();
     for (req_id, kind) in (10u64..).zip(AgentKind::ALL) {
         write_frame(
@@ -3073,92 +2709,12 @@ async fn reload_keeps_an_agent_of_every_harness() {
     }
 }
 
-/// AddProject with `create_missing` makes the directory and `git init`s it.
-/// An existing folder outside any repository is refused as it stands (not a
-/// git repository) and `git init`ed with `create_missing` — the client's
-/// confirm.
-#[tokio::test]
-async fn add_project_creates_missing_dir_and_inits() {
-    let env = TestEnv::new();
-    let mut daemon = env.spawn_daemon();
-
-    let mut c = connect(&env.sock()).await;
-    handshake(&mut c).await;
-
-    let new_dir = env.tmp.path().join("brand-new-project");
-    assert!(!new_dir.exists());
-    write_frame(
-        &mut c,
-        &ClientRequest::AddProject {
-            req_id: 1,
-            path: new_dir.clone(),
-            name: None,
-            create_missing: true,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 1).is_some()).await;
-    assert!(
-        matches!(
-            find_ack(&events, 1),
-            Some(ServerEvent::Ack {
-                created: Some(EntityId::Project(_)),
-                ..
-            })
-        ),
-        "AddProject with create_missing failed: {events:#?}"
-    );
-    assert!(new_dir.join(".git").is_dir(), "git init ran in the new dir");
-
-    // An existing folder in no repository: refused as it stands…
-    let plain_dir = env.tmp.path().join("plain-folder");
-    std::fs::create_dir_all(&plain_dir).unwrap();
-    for (req_id, create_missing) in [(2, false), (3, true)] {
-        write_frame(
-            &mut c,
-            &ClientRequest::AddProject {
-                req_id,
-                path: plain_dir.clone(),
-                name: None,
-                create_missing,
-            },
-        )
-        .await
-        .unwrap();
-        let events =
-            read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, req_id).is_some()).await;
-        if create_missing {
-            // …and `git init`ed once the user said yes.
-            assert!(
-                matches!(
-                    find_ack(&events, req_id),
-                    Some(ServerEvent::Ack {
-                        created: Some(EntityId::Project(_)),
-                        ..
-                    })
-                ),
-                "AddProject with create_missing on a plain folder failed: {events:#?}"
-            );
-            assert!(
-                plain_dir.join(".git").is_dir(),
-                "git init ran in the folder"
-            );
-        } else {
-            assert!(
-                matches!(find_ack(&events, req_id), Some(ServerEvent::Error { .. })),
-                "expected not-a-git-repo error: {events:#?}"
-            );
-            assert!(!plain_dir.join(".git").exists(), "nothing inited unasked");
-        }
-    }
-
-    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
-    wait_for_exit(&mut daemon);
-}
-
-/// Subscribe + AddProject boilerplate; returns the main worktree row.
-async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebula_core::Worktree {
+/// Subscribe + one-repository RegisterProject boilerplate; returns the main
+/// workspace row.
+async fn register_one_repository_get_main_workspace(
+    c: &mut UnixStream,
+    repo: &Path,
+) -> nebula_core::Worktree {
     write_frame(c, &ClientRequest::Subscribe).await.unwrap();
     read_events_until(c, EVENT_TIMEOUT, |evs| {
         evs.iter()
@@ -3167,11 +2723,11 @@ async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebul
     .await;
     write_frame(
         c,
-        &ClientRequest::AddProject {
+        &ClientRequest::RegisterProject {
             req_id: 1,
-            path: repo.to_path_buf(),
-            name: None,
-            create_missing: false,
+            folder: repo.parent().unwrap().to_path_buf(),
+            name: repo.file_name().unwrap().to_string_lossy().into_owned(),
+            repositories: vec![repo.file_name().unwrap().to_string_lossy().into_owned()],
         },
     )
     .await
@@ -3197,6 +2753,93 @@ async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebul
             _ => None,
         })
         .expect("main worktree upsert")
+}
+
+/// A committed Git repository at a caller-selected project member path.
+fn make_repo_at(repo: &Path) {
+    std::fs::create_dir_all(repo).unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@nebula.dev"]);
+    git(&["config", "user.name", "nebula-test"]);
+    std::fs::write(repo.join("README.md"), "# test\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "init"]);
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn git_run(repo: &Path, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+fn make_bare_origin(origin: &Path, repo: &Path, branch: &str) -> PathBuf {
+    std::fs::create_dir_all(origin).unwrap();
+    for (cwd, args) in [
+        (origin, vec!["init", "--bare", "-b", branch]),
+        (repo, vec!["branch", "-m", branch]),
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let origin_path = origin.to_string_lossy().into_owned();
+    git_run(repo, &["remote", "add", "origin", &origin_path]).unwrap();
+    git_run(repo, &["push", "-u", "origin", branch]).unwrap();
+    git_run(repo, &["remote", "set-head", "origin", "--auto"]).unwrap();
+    origin.to_path_buf()
+}
+
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+async fn subscribe(c: &mut UnixStream) -> Vec<ServerEvent> {
+    write_frame(c, &ClientRequest::Subscribe).await.unwrap();
+    read_events_until(c, EVENT_TIMEOUT, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Snapshot { .. }))
+    })
+    .await
 }
 
 #[tokio::test]
@@ -3306,28 +2949,31 @@ async fn registered_project_rejects_agent_worktree_relocation_and_pr_sessions() 
         "the agent starts in the project workspace folder: {before_relocation:#?}"
     );
 
+    let workspace_folder = folder.join("worktrees").join("agent-branch");
     write_frame(
         &mut c,
-        &ClientRequest::EnterWorktree {
+        &ClientRequest::CreateSessionWorkspace {
             req_id: 3,
-            id: agent.clone(),
-            branch: "agent-branch".into(),
-            base: None,
+            project: project.clone(),
+            name: "agent-branch".into(),
         },
     )
     .await
     .unwrap();
-    let relocated = read_events_until(&mut c, EVENT_TIMEOUT, |events| {
-        find_ack(events, 3).is_some()
+    let ready = read_events_until(&mut c, SLOW_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 3, .. }
+            )
+        })
     })
     .await;
-    assert!(
-        matches!(
-            find_ack(&relocated, 3),
-            Some(ServerEvent::Error { message, .. }) if message.contains("not available")
-        ),
-        "worktree request should explain its rejection: {relocated:#?}"
-    );
+    assert!(ready.iter().any(|event| matches!(
+        event,
+        ServerEvent::SessionWorkspaceCreated { workspace, .. }
+            if workspace.path == workspace_folder.canonicalize().unwrap()
+    )));
     write_frame(
         &mut c,
         &ClientRequest::Input {
@@ -3341,7 +2987,7 @@ async fn registered_project_rejects_agent_worktree_relocation_and_pr_sessions() 
     assert!(
         String::from_utf8_lossy(&collected_output(&after_relocation))
             .contains(folder.to_str().unwrap()),
-        "the agent remains in its original workspace folder: {after_relocation:#?}"
+        "the agent remains in its registered main workspace folder: {after_relocation:#?}"
     );
 
     write_frame(
@@ -3369,7 +3015,7 @@ async fn registered_project_rejects_agent_worktree_relocation_and_pr_sessions() 
     assert!(
         matches!(
             find_ack(&pr, 4),
-            Some(ServerEvent::Error { message, .. }) if message.contains("not available")
+            Some(ServerEvent::Error { message, .. }) if message.contains("disabled")
         ),
         "PR session request should explain its rejection: {pr:#?}"
     );
@@ -3386,7 +3032,7 @@ async fn registered_project_rejects_agent_worktree_relocation_and_pr_sessions() 
     };
     assert_eq!(
         worktrees.len(),
-        1,
+        4,
         "no single repository worktree was created"
     );
     assert_eq!(
@@ -3409,8 +3055,8 @@ async fn registered_project_rejects_agent_worktree_relocation_and_pr_sessions() 
         "the agent stays in its original workspace folder; before={before:?}, after={after:?}"
     );
     assert!(
-        !folder.join("worktrees").exists(),
-        "neither request created a worktree"
+        folder.join("worktrees").join("agent-branch").is_dir(),
+        "creating a session workspace does not re-home the existing agent"
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
@@ -3449,7 +3095,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     // Kind picked — warm the CLI. No reply expected.
     write_frame(
@@ -3598,7 +3244,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     write_frame(
         &mut c,
@@ -3662,7 +3308,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     for (req_id, kind, want) in [
         (10u64, AgentKind::Claude, "claude"),
@@ -3757,7 +3403,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
     let mut daemon = env.spawn_daemon_with_shell(&shell);
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     write_frame(
         &mut c,
@@ -3900,7 +3546,7 @@ async fn archive_and_delete_kill_the_agent_process() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     let a1 = create_agent_get_id(&mut c, &worktree.id, "to-archive", 2).await;
     let a2 = create_agent_get_id(&mut c, &worktree.id, "to-delete", 3).await;
@@ -3998,7 +3644,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     write_frame(
         &mut c,
@@ -4095,7 +3741,7 @@ async fn create_agent_runs_the_shells_own_claude_and_archive_clears_its_job() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let agent_id = create_agent_get_id(&mut c, &worktree.id, "routed", 2).await;
 
     // The function ran, with the CLI's argv, in place of any binary.
@@ -4136,7 +3782,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     let mut daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     // One agent, one terminal, one archived agent — every PTY dies with the
     // daemon below.
@@ -4303,7 +3949,7 @@ async fn prewarm_worktree_sessions_boots_nothing_when_switched_off() {
     let mut daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     write_frame(
         &mut c,
@@ -4447,7 +4093,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     let mut daemon = env.spawn_daemon_with("/bin/sh", &[(env::IDLE_REAP_MS, "200")]);
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     write_frame(
         &mut c,
@@ -4608,7 +4254,7 @@ async fn idle_agent_with_a_detached_job_is_spared_until_it_ends() {
     let mut daemon = env.spawn_daemon_with("/bin/sh", &[(env::IDLE_REAP_MS, "200")]);
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let worker = create_agent_get_id(&mut c, &worktree.id, "worker", 2).await;
     let resident = create_agent_get_id(&mut c, &worktree.id, "resident", 3).await;
 
@@ -4796,7 +4442,7 @@ async fn auto_title_instruction_and_rename_flow() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     // Created with the accepted default name → auto-title pending.
     write_frame(
@@ -4921,7 +4567,7 @@ async fn nebula_open_cli_hands_the_files_to_every_subscriber() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
     let agent_id = create_agent_get_id(&mut c, &worktree.id, "agent-1", 2).await;
 
     let notes = repo.join("docs").join("notes.md");
@@ -4999,347 +4645,6 @@ async fn nebula_open_cli_hands_the_files_to_every_subscriber() {
 /// until the turn's Stop hook — a tool hook still reporting the old
 /// checkout's cwd in between must not drag the row back — and then respawns
 /// inside the worktree.
-#[tokio::test]
-async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
-    let env = TestEnv::new();
-    let repo = env.make_repo();
-    let env_dir = env.tmp.path().join("agent-env");
-    std::fs::create_dir_all(&env_dir).unwrap();
-    // Stand-in CLI: dump the NEBULA_* env its hooks would use, log where
-    // each boot runs (to a file, and to its own screen), then park.
-    let script = env.tmp.path().join("agent.sh");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nenv | grep '^NEBULA_' > '{d}'/$NEBULA_AGENT_ID.env\n\
-             pwd >> '{d}'/$NEBULA_AGENT_ID.pwd\necho \"booted in $(pwd)\"\nexec sleep 600\n",
-            d = env_dir.display()
-        ),
-    )
-    .unwrap();
-    make_executable(&script);
-    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
-
-    let mut c = connect(&env.sock()).await;
-    handshake(&mut c).await;
-    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
-
-    write_frame(
-        &mut c,
-        &ClientRequest::CreateAgent {
-            req_id: 2,
-            worktree: main_worktree.id.clone(),
-            name: "agent-1".into(),
-            kind: AgentKind::Claude,
-            custom_harness: None,
-            model: None,
-            effort: None,
-            auto_title: false,
-            cloud_prompt: None,
-            starting_prompt: None,
-            issue_url: None,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
-        ..
-    } = find_ack(&events, 2).unwrap()
-    else {
-        panic!("CreateAgent failed: {events:#?}");
-    };
-    let agent_id = agent_id.clone();
-    let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent_id.0))).await;
-    let port: u16 = agent_env[env::API_URL]
-        .rsplit(':')
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
-    let token = agent_env[env::API_TOKEN].clone();
-    let pwd_log = env_dir.join(format!("{}.pwd", agent_id.0));
-    let boots = |path: &Path| -> Vec<String> {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
-    };
-    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
-    while boots(&pwd_log).is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "first boot never logged"
-        );
-        tokio::time::sleep(POLL_STEP).await;
-    }
-
-    // A client sits on the pane throughout — the TUI, showing the session
-    // that is about to run `nebula worktree`.
-    let sref = SessionRef::Agent(agent_id.clone());
-    write_frame(
-        &mut c,
-        &ClientRequest::Attach {
-            session: sref.clone(),
-            from_seq: None,
-            cols: 120,
-            rows: 30,
-        },
-    )
-    .await
-    .unwrap();
-    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
-        String::from_utf8_lossy(&collected_output(evs)).contains("booted in")
-    })
-    .await;
-
-    // A turn is under way — the one about to run the command.
-    let hook = |event: &str| format!("/api/hooks/claude?agentId={}&hookEvent={event}", agent_id.0);
-    let payload = format!(
-        r#"{{"session_id":"s1","cwd":"{}","tool_name":"Bash"}}"#,
-        repo.display()
-    );
-    let (status, _) = hook_post_json(port, &hook("UserPromptSubmit"), &token, &payload).await;
-    assert_eq!(status, 200, "UserPromptSubmit");
-    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
-                if *agent == agent_id)
-        })
-    })
-    .await;
-
-    // The model obeys the guidance — `nebula worktree feat x` (the space
-    // slugifies) with the session's env.
-    let out = agent_cli(&env, &agent_id, &["worktree", "feat", "x"]);
-    assert!(out.status.success(), "nebula worktree failed: {out:?}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("feat-x") && stdout.contains("this turn ends"),
-        "stdout: {stdout}"
-    );
-
-    // The row re-homes under the new checkout at once…
-    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == agent_id && a.worktree_id != main_worktree.id)
-        })
-    })
-    .await;
-    let feat = events
-        .iter()
-        .find_map(|e| match e {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(w),
-            } if w.branch == "feat-x" => Some(w.clone()),
-            _ => None,
-        })
-        .expect("feat-x worktree upsert");
-    assert!(
-        feat.path.ends_with("repo-worktrees/feat-x"),
-        "nebula's sibling layout: {:?}",
-        feat.path
-    );
-    assert!(feat.path.join(".git").exists(), "a real checkout");
-    // …while the process is untouched: still the one boot, in the old checkout.
-    assert_eq!(boots(&pwd_log).len(), 1, "no respawn before the turn ends");
-
-    // Mid-turn the CLI's hooks keep reporting the old checkout's cwd; that
-    // must not drag the row back. Then the Stop — same old cwd — ends the
-    // turn and triggers the relocation.
-    for event in ["PostToolUse", "Stop"] {
-        let (status, _) = hook_post_json(port, &hook(event), &token, &payload).await;
-        assert_eq!(status, 200, "{event}");
-    }
-
-    // The respawn: alive again under feat-x, booted inside it — and the
-    // attached client follows it there with no second Attach: the daemon
-    // rebinds the pane to the new PTY (a fresh Scrollback, then its output),
-    // so the TUI never sits frozen on the old process's last frame.
-    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
-        let alive = evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == agent_id && a.worktree_id == feat.id && a.alive)
-        });
-        alive && String::from_utf8_lossy(&collected_output(evs)).contains("repo-worktrees/feat-x")
-    })
-    .await;
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, ServerEvent::Scrollback { session, .. } if session == &sref)),
-        "the rebind replays the new PTY's ring: {events:#?}"
-    );
-    // The turn's Stop did not finish the row on its way to the respawn:
-    // the card would have dropped to the bottom of the grid and climbed
-    // back once the relocated CLI's first hook landed. The respawn opens
-    // on the relocation notice, so the row stays `running` throughout.
-    assert!(
-        !events.iter().any(|e| {
-            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
-                if *agent == agent_id)
-        }),
-        "no finish between the Stop and the respawn: {events:#?}"
-    );
-    assert!(
-        events.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == agent_id && a.worktree_id == feat.id && a.alive
-                    && a.status == nebula_core::AgentStatus::Running)
-        }),
-        "the relocated row reads running: {events:#?}"
-    );
-    let deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
-    loop {
-        let b = boots(&pwd_log);
-        if b.len() >= 2 {
-            assert_eq!(b.len(), 2, "one respawn, not several: {b:?}");
-            assert!(
-                b[1].ends_with("repo-worktrees/feat-x"),
-                "respawned inside the worktree: {b:?}"
-            );
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "respawn never booted in the worktree: {b:?}"
-        );
-        tokio::time::sleep(POLL_STEP).await;
-    }
-
-    // Already there now: a settled answer, and no second relocation.
-    let out = agent_cli(&env, &agent_id, &["worktree", "feat-x"]);
-    assert!(out.status.success(), "repeat must exit 0: {out:?}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("already runs inside it"),
-        "stdout: {stdout}"
-    );
-
-    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
-    wait_for_exit(&mut daemon);
-}
-
-/// `TestEnv::make_repo` at a caller-chosen path, for tests that need two.
-fn make_repo_at(repo: &Path) {
-    std::fs::create_dir_all(repo).unwrap();
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "git {args:?} failed");
-    };
-    git(&["init", "-b", "main"]);
-    git(&["config", "user.email", "test@nebula.dev"]);
-    git(&["config", "user.name", "nebula-test"]);
-    std::fs::write(repo.join("README.md"), "# test\n").unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-m", "init"]);
-}
-
-/// Create a bare remote with a chosen default branch and configure the local
-/// primary checkout to track it.
-fn make_bare_origin(origin: &Path, repo: &Path, branch: &str) -> PathBuf {
-    std::fs::create_dir_all(origin).unwrap();
-    for (cwd, args) in [
-        (origin, vec!["init", "--bare", "-b", branch]),
-        (repo, vec!["branch", "-m", branch]),
-    ] {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let origin_path = origin.to_string_lossy().into_owned();
-    assert!(std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["remote", "add", "origin", &origin_path])
-        .status()
-        .unwrap()
-        .success());
-    assert!(std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["push", "-u", "origin", branch])
-        .status()
-        .unwrap()
-        .success());
-    assert!(std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["remote", "set-head", "origin", "--auto"])
-        .status()
-        .unwrap()
-        .success());
-    origin.to_path_buf()
-}
-
-fn git_output(repo: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
-}
-
-fn git_run(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).into_owned())
-    }
-}
-
-/// Mark a freshly written stub script runnable.
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-/// Subscribe a handshaken client and wait for its first `Snapshot`; returns
-/// everything received up to and including it.
-async fn subscribe(c: &mut UnixStream) -> Vec<ServerEvent> {
-    write_frame(c, &ClientRequest::Subscribe).await.unwrap();
-    read_events_until(c, EVENT_TIMEOUT, |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await
-}
-
-/// A successful grouped create builds one real branch/worktree for each
-/// registered repository, reports each independently resolved base, and
-/// leaves dirty primary checkouts alone.
 #[tokio::test]
 async fn session_workspace_creation_builds_all_repository_worktrees() {
     let env = TestEnv::new();
@@ -5489,12 +4794,12 @@ async fn session_workspace_creation_builds_all_repository_worktrees() {
     );
 
     let member_id = repositories[0].id.clone();
+    assert!(repositories.iter().any(|member| member.id == member_id));
     write_frame(
         &mut client,
-        &ClientRequest::DeleteWorktree {
+        &ClientRequest::CloseSessionWorkspace {
             req_id: 3,
-            id: member_id,
-            force: true,
+            id: workspace.id.clone(),
         },
     )
     .await
@@ -5504,9 +4809,10 @@ async fn session_workspace_creation_builds_all_repository_worktrees() {
     })
     .await;
     assert!(
-        matches!(find_ack(&refused, 3), Some(ServerEvent::Error { message, .. }) if message.contains("single repository worktree"))
+        matches!(find_ack(&refused, 3), Some(ServerEvent::Ack { .. })),
+        "clean session workspace closes as a unit: {refused:#?}"
     );
-    assert!(workspace.path.join("alpha").is_dir());
+    assert!(!workspace.path.exists());
 
     write_frame(&mut client, &ClientRequest::Shutdown)
         .await
@@ -5526,17 +4832,190 @@ async fn session_workspace_creation_builds_all_repository_worktrees() {
     else {
         panic!("snapshot missing after restart: {snapshot:#?}");
     };
-    assert!(session_workspaces
+    assert!(!session_workspaces
         .iter()
-        .any(|saved| saved.worktree_id == workspace.id
-            && saved.state == nebula_core::WorkspaceState::Ready));
-    assert!(worktrees
+        .any(|saved| saved.worktree_id == workspace.id));
+    assert!(!worktrees
         .iter()
         .any(|saved| saved.path == workspace.path.join("alpha")));
     write_frame(&mut client, &ClientRequest::Shutdown)
         .await
         .unwrap();
     wait_for_exit(&mut restarted);
+}
+
+/// A one-repository project follows the same register/create/launch/close
+/// lifecycle as a project with several repositories. Agents start in the
+/// session workspace folder, never in the repository checkout itself.
+#[tokio::test]
+async fn one_repository_project_registers_launches_and_closes_a_session_workspace() {
+    let env = TestEnv::new();
+    let folder = env.tmp.path().join("project");
+    let repository = folder.join("api");
+    make_repo_at(&repository);
+    let primary_head = git_output(&repository, &["rev-parse", "HEAD"]);
+    let mut daemon = env.spawn_daemon();
+    let mut client = connect(&env.sock()).await;
+    handshake(&mut client).await;
+    subscribe(&mut client).await;
+
+    write_frame(
+        &mut client,
+        &ClientRequest::RegisterProject {
+            req_id: 1,
+            folder: folder.clone(),
+            name: "One repository".into(),
+            repositories: vec!["api".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let registered = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&registered, 1)
+    else {
+        panic!("one-repository registration failed: {registered:#?}");
+    };
+
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateSessionWorkspace {
+            req_id: 2,
+            project: project.clone(),
+            name: "single-repo".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let created = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+            )
+        })
+    })
+    .await;
+    let Some(ServerEvent::SessionWorkspaceCreated {
+        workspace,
+        repositories,
+        ..
+    }) = created.iter().find(|event| {
+        matches!(
+            event,
+            ServerEvent::SessionWorkspaceCreated { req_id: 2, .. }
+        )
+    })
+    else {
+        panic!("one-repository workspace creation failed: {created:#?}");
+    };
+    let workspace = workspace.clone();
+    assert_eq!(repositories.len(), 1);
+    assert_eq!(repositories[0].path, workspace.path.join("api"));
+    assert_eq!(
+        git_output(&repositories[0].path, &["branch", "--show-current"]),
+        "pilot/single-repo"
+    );
+
+    write_frame(
+        &mut client,
+        &ClientRequest::CreateAgent {
+            req_id: 3,
+            worktree: workspace.id.clone(),
+            name: "workspace-agent".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let created_agent = read_events_until(&mut client, EVENT_TIMEOUT, |events| {
+        find_ack(events, 3).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent)),
+        ..
+    }) = find_ack(&created_agent, 3)
+    else {
+        panic!("agent launch failed: {created_agent:#?}");
+    };
+    let session = SessionRef::Agent(agent.clone());
+    write_frame(
+        &mut client,
+        &ClientRequest::Attach {
+            session: session.clone(),
+            from_seq: None,
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    write_frame(
+        &mut client,
+        &ClientRequest::Input {
+            session,
+            data: b"pwd\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    let output = read_events_for(&mut client, Duration::from_millis(500)).await;
+    let output_bytes = collected_output(&output);
+    let output = String::from_utf8_lossy(&output_bytes);
+    assert!(
+        output.contains(workspace.path.to_str().unwrap()),
+        "agent must start in the session workspace folder {}: {output:?}",
+        workspace.path.display()
+    );
+
+    write_frame(
+        &mut client,
+        &ClientRequest::CloseSessionWorkspace {
+            req_id: 4,
+            id: workspace.id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let closed = read_events_until(&mut client, SLOW_TIMEOUT, |events| {
+        find_ack(events, 4).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&closed, 4), Some(ServerEvent::Ack { .. })),
+        "workspace close failed: {closed:#?}"
+    );
+    assert!(
+        !workspace.path.exists(),
+        "workspace folder should be removed"
+    );
+    assert_eq!(
+        git_output(&repository, &["rev-parse", "HEAD"]),
+        primary_head
+    );
+    assert_eq!(
+        git_output(&repository, &["branch", "--list", "pilot/single-repo"]),
+        "pilot/single-repo"
+    );
+
+    write_frame(&mut client, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon);
 }
 
 /// Closing a session workspace is an explicit daemon operation: Git dirt
@@ -7115,7 +6594,7 @@ async fn nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree() {
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     subscribe(&mut c).await;
-    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let main_worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     write_frame(
         &mut c,
@@ -7263,101 +6742,6 @@ fn agent_cli_with_path(
     command.output().unwrap()
 }
 
-/// `nebula add <dir>` and the bare `nebula <dir>` shorthand: the one-shot CLI
-/// resolves the path against its own cwd (the daemon's differs), registers
-/// the repo over IPC, and surfaces daemon rejections as nonzero exits.
-#[tokio::test]
-async fn cli_add_project() {
-    let env = TestEnv::new();
-    let repo = env.make_repo();
-    let mut daemon = env.spawn_daemon();
-    let mut c = connect(&env.sock()).await;
-    handshake(&mut c).await;
-    subscribe(&mut c).await;
-
-    let run_cli =
-        |args: &[&str], cwd: &Path| env.cli().args(args).current_dir(cwd).output().unwrap();
-
-    // `nebula add .` from inside the repo: cwd-relative resolution, project
-    // named after the directory.
-    let out = run_cli(&["add", "."], &repo);
-    assert!(out.status.success(), "add . failed: {out:?}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("added project"), "stdout: {stdout}");
-    let canon = repo.canonicalize().unwrap();
-    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Project(p) }
-                if p.repo_path == canon && p.name == "repo")
-        })
-    })
-    .await;
-
-    // The same repo again: the daemon's dedupe comes back as a failure.
-    let out = run_cli(&["add", repo.to_str().unwrap()], env.tmp.path());
-    assert!(!out.status.success(), "duplicate add must fail: {out:?}");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("already added"), "stderr: {stderr}");
-
-    // Bare `nebula <dir>` shorthand on a second repo.
-    let repo2 = env.tmp.path().join("repo2");
-    std::fs::create_dir_all(&repo2).unwrap();
-    for args in [
-        vec!["init", "-b", "main"],
-        vec!["commit", "--allow-empty", "-m", "init"],
-    ] {
-        let ok = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo2)
-            .args(&args)
-            .env("GIT_AUTHOR_NAME", "nebula-test")
-            .env("GIT_AUTHOR_EMAIL", "test@nebula.dev")
-            .env("GIT_COMMITTER_NAME", "nebula-test")
-            .env("GIT_COMMITTER_EMAIL", "test@nebula.dev")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "git {args:?} failed");
-    }
-    let out = run_cli(&[repo2.to_str().unwrap()], env.tmp.path());
-    assert!(out.status.success(), "bare add failed: {out:?}");
-    let canon2 = repo2.canonicalize().unwrap();
-    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Project(p) }
-                if p.repo_path == canon2 && p.name == "repo2")
-        })
-    })
-    .await;
-
-    // A directory that isn't a git repo is rejected by the daemon.
-    let plain = env.tmp.path().join("plain");
-    std::fs::create_dir_all(&plain).unwrap();
-    let out = run_cli(&["add", plain.to_str().unwrap()], env.tmp.path());
-    assert!(!out.status.success(), "non-repo add must fail: {out:?}");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not a git repository"), "stderr: {stderr}");
-
-    // A path that doesn't exist fails client-side, before any IPC.
-    let out = run_cli(&["add", "does-not-exist"], env.tmp.path());
-    assert!(!out.status.success(), "missing dir must fail: {out:?}");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("does not exist"), "stderr: {stderr}");
-
-    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
-    wait_for_exit(&mut daemon);
-}
-
-/// A Claude Cloud row: `claude --cloud <task>` creates the session, prints
-/// its id and exits, and the daemon captures the id off the PTY — the only
-/// handle it ever gets. That is where the local side ends: the agent runs
-/// in the cloud sandbox, and the row's pane is a panel linking to it.
-/// Nothing is attached, teleported or re-homed on the user's behalf — the
-/// stub runs exactly once, the checkout never switches branch — and the
-/// paths that would boot a bare local CLI in the row's name (a restart, an
-/// attach finding no PTY) refuse instead.
 #[tokio::test]
 async fn cloud_row_captures_its_session_id_and_runs_nothing_locally() {
     let env = TestEnv::new();
@@ -7392,7 +6776,7 @@ exit 0
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let main_worktree = register_one_repository_get_main_workspace(&mut c, &repo).await;
 
     // The create: the stub prints the session lines and exits at once.
     const CLOUD_ID: &str = "session_016SiQW5Lem2LbnUf1A3undt";

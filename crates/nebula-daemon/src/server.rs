@@ -2,7 +2,6 @@
 //! PTY plane of a connection (attach replay, forwarding) lives in `attach`.
 
 use crate::attach::{self, PaneSize};
-use crate::pr_scope::CreatePrAgentSpec;
 use crate::registry::{CreateAgentSpec, Daemon};
 use anyhow::Result;
 use nebula_core::codec::{read_frame, write_frame};
@@ -120,6 +119,39 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             }
                         }
                     });
+                }
+                ClientRequest::AddProject { req_id, .. } => {
+                    let _ = out_tx
+                        .send(ServerEvent::Error {
+                            req_id: Some(req_id),
+                            message: "single-repository registration is disabled; use `nebula register`".into(),
+                        })
+                        .await;
+                }
+                ClientRequest::CreateWorktree { req_id, .. } => {
+                    let _ = out_tx
+                        .send(ServerEvent::Error {
+                            req_id: Some(req_id),
+                            message: "single-repository worktree creation is disabled; create a session workspace instead".into(),
+                        })
+                        .await;
+                }
+                ClientRequest::DeleteWorktree { req_id, .. } => {
+                    let _ = out_tx
+                        .send(ServerEvent::Error {
+                            req_id: Some(req_id),
+                            message: "single-repository worktree deletion is disabled; close the session workspace instead".into(),
+                        })
+                        .await;
+                }
+                ClientRequest::EnterWorktree { req_id, .. }
+                | ClientRequest::CreatePrAgent { req_id, .. } => {
+                    let _ = out_tx
+                        .send(ServerEvent::Error {
+                            req_id: Some(req_id),
+                            message: "single-worktree features are disabled in Nebula Pilot workspaces".into(),
+                        })
+                        .await;
                 }
                 ClientRequest::Attach {
                     session: sref,
@@ -248,22 +280,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         .await;
                 }
                 // ---- entity CRUD: run the op, reply Ack/Error ----
-                ClientRequest::AddProject {
-                    req_id,
-                    path,
-                    name,
-                    create_missing,
-                } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon
-                            .add_project(&path, name, create_missing)
-                            .await
-                            .map(Some),
-                    )
-                    .await;
-                }
                 ClientRequest::RegisterProject {
                     req_id,
                     folder,
@@ -291,30 +307,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
-                ClientRequest::CreateWorktree {
-                    req_id,
-                    project,
-                    branch,
-                    base,
-                } => {
-                    // A create fetches `origin` and then runs the WORKTREE
-                    // HOOK, each bounded by a 30 s timeout; off the request
-                    // loop, like the delete below, so Input/Attach frames on
-                    // this connection never wait on either.
-                    let daemon = daemon.clone();
-                    let out_tx = out_tx.clone();
-                    tokio::spawn(async move {
-                        reply(
-                            &out_tx,
-                            req_id,
-                            daemon
-                                .create_worktree(&project, &branch, base.as_deref())
-                                .await
-                                .map(Some),
-                        )
-                        .await;
-                    });
-                }
                 ClientRequest::CreateSessionWorkspace { req_id, project, name } => {
                     let daemon = daemon.clone();
                     let out_tx = out_tx.clone();
@@ -341,28 +333,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let out_tx = out_tx.clone();
                     tokio::spawn(async move {
                         reply_done(&out_tx, req_id, daemon.close_session_workspace(&id).await).await;
-                    });
-                }
-                ClientRequest::DeleteWorktree { req_id, id, force } => {
-                    let grouped = daemon.store.session_workspaces().is_ok_and(|workspaces| {
-                        workspaces.iter().any(|workspace| workspace.worktree_id == id
-                            || workspace.repositories.iter().any(|repository| repository.id == id))
-                    });
-                    if grouped {
-                        let _ = out_tx.send(ServerEvent::Error {
-                            req_id: Some(req_id),
-                            message: "cannot delete a single repository worktree from a session workspace; close the whole workspace instead".into(),
-                        }).await;
-                        continue;
-                    }
-                    // `git worktree remove` can take seconds on a large
-                    // checkout; run it off the request loop so Input/Attach
-                    // frames keep flowing while it grinds. `worktree_ops`
-                    // still serializes it against create/sync.
-                    let daemon = daemon.clone();
-                    let out_tx = out_tx.clone();
-                    tokio::spawn(async move {
-                        reply_done(&out_tx, req_id, daemon.delete_worktree(&id, force).await).await;
                     });
                 }
                 ClientRequest::CreateAgent {
@@ -423,84 +393,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         }
                     }
                     reply(&out_tx, req_id, result.map(Some)).await;
-                }
-                ClientRequest::CreatePrAgent {
-                    req_id,
-                    project,
-                    name,
-                    kind,
-                    custom_harness,
-                    model,
-                    effort,
-                    auto_title,
-                    pr_url,
-                    head,
-                    starting_prompt,
-                } => {
-                    if daemon
-                        .store
-                        .project_repositories(&project)
-                        .is_ok_and(|repositories| !repositories.is_empty())
-                    {
-                        let _ = out_tx
-                            .send(ServerEvent::Error {
-                                req_id: Some(req_id),
-                                message: "pull-request agent sessions are not available in multi-repository projects".into(),
-                            })
-                            .await;
-                        continue;
-                    }
-                    // A PR SESSION whose checkout does not exist yet is a
-                    // fetch, a `git worktree add` and the WORKTREE HOOK
-                    // before the CLI spawns — seconds, each step bounded by
-                    // its own timeout. Off the request loop, like
-                    // `CreateWorktree` above: the client put stand-in rows
-                    // up precisely so the user keeps working meanwhile, and
-                    // run inline every Attach, Input and Resize on this
-                    // connection queued behind it — moving to another
-                    // session showed nothing until the Ack. `worktree_ops`
-                    // still serializes the checkout against every other
-                    // worktree op.
-                    let daemon = daemon.clone();
-                    let out_tx = out_tx.clone();
-                    tokio::spawn(async move {
-                        let result = daemon
-                            .create_pr_agent(CreatePrAgentSpec {
-                                project: project.clone(),
-                                name,
-                                kind,
-                                custom_harness,
-                                model,
-                                effort,
-                                auto_title,
-                                pr_url: pr_url.clone(),
-                                head,
-                                starting_prompt,
-                            })
-                            .await;
-                        match &result {
-                            Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
-                                req_id,
-                                agent = %agent,
-                                kind = kind.as_str(),
-                                project = %project,
-                                pr_url = %pr_url,
-                                launch_mode = "pull_request",
-                                "agent session spawned"
-                            ),
-                            Err(error) => tracing::warn!(
-                                req_id,
-                                error = %error,
-                                kind = kind.as_str(),
-                                project = %project,
-                                pr_url = %pr_url,
-                                launch_mode = "pull_request",
-                                "agent session spawn failed"
-                            ),
-                            Ok(_) => unreachable!("CreatePrAgent returned a non-agent id"),
-                        }
-                        reply(&out_tx, req_id, result.map(Some)).await;
-                    });
                 }
                 ClientRequest::PrewarmAgent {
                     worktree,
@@ -567,25 +459,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::OpenFiles { req_id, id, paths } => {
                     reply_done(&out_tx, req_id, daemon.open_files(&id, paths)).await;
-                }
-                ClientRequest::EnterWorktree {
-                    req_id,
-                    id,
-                    branch,
-                    base,
-                } => {
-                    let ev = match daemon.enter_worktree(&id, &branch, base.as_deref()).await {
-                        Ok((worktree, outcome)) => ServerEvent::WorktreeEntered {
-                            req_id,
-                            worktree,
-                            outcome,
-                        },
-                        Err(e) => ServerEvent::Error {
-                            req_id: Some(req_id),
-                            message: format!("{e:#}"),
-                        },
-                    };
-                    let _ = out_tx.send(ev).await;
                 }
                 ClientRequest::ArchiveAgent { req_id, id } => {
                     reply_done(&out_tx, req_id, daemon.archive_agent(&id)).await;

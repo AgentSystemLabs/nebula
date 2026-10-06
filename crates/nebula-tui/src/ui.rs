@@ -973,7 +973,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Act(&[ProjectDropdown, CloseProjectTab]),
                             "project list / close tab",
                         ),
-                        (Act(&[AddProject]), "open a folder as a project"),
                         (Act(&[Palette]), "fuzzy jump to anything"),
                         (Lit("^o / ^f"), "jump pick: open / focus row"),
                         (
@@ -4012,16 +4011,8 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(
             {
                 let k = |a| key_hint(app, a);
-                // Launched inside a repo: Enter opens it, and `o` is for
-                // any other folder.
-                let here = app
-                    .launch_repo_name()
-                    .map(|name| format!("{}: open {name}  ", k(Action::Activate)))
-                    .unwrap_or_default();
                 format!(
-                    "{here}{}: open {}folder  {}: ssh host  {}: settings  {}: help  {}: quit",
-                    k(Action::AddProject),
-                    if here.is_empty() { "a " } else { "another " },
+                    "register with `nebula register`  {}: ssh host  {}: settings  {}: help  {}: quit",
                     k(Action::Hosts),
                     k(Action::Settings),
                     k(Action::Help),
@@ -4165,9 +4156,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Focus::Terminal => "select a session and press Enter to attach".to_string(),
             Focus::Projects => format!(
-                "{}/{}: add  {}: rename  {}: remove  {}: search  {}: help",
-                k(Action::New),
-                k(Action::AddProject),
+                "n: new session  {}: rename  {}: remove  {}: search  {}: help",
                 k(Action::Rename),
                 k(Action::Delete),
                 k(Action::Palette),

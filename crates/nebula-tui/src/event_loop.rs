@@ -3278,15 +3278,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // the aim let go, or on a fresh worktree.
         Action::QuickPrompt if app.launcher_active() => launcher::open_box(app),
         Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
-        Action::Issues => {
-            if !selected_project_uses_workspace_layout(app) {
-                crate::issues::open_issues(app);
-            }
-        }
+        Action::Issues => app.flash = Some("issues are disabled in Nebula Pilot workspaces".into()),
         Action::PullRequests => {
-            if !selected_project_uses_workspace_layout(app) {
-                crate::pr_modal::open(app);
-            }
+            app.flash = Some("pull requests are disabled in Nebula Pilot workspaces".into())
         }
         Action::SwitchBranch => crate::branch_switch::open_branch_switch(app),
         Action::SelectRepository => open_repository_picker(app),
@@ -3391,15 +3385,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // thing `n` can mean there is the project it tells you to open.
         // (With a project anywhere the GRID has this key — it is the box
         // — and only gets here full-screen over a session.)
-        Action::New if !app.launcher_active() => open_prompt(app, PromptKind::AddProject),
+        Action::New if !app.launcher_active() => {}
         Action::New => match app.focus {
-            Focus::Projects => open_prompt(app, PromptKind::AddProject),
+            Focus::Projects => {}
             Focus::Worktrees => {
-                if app.selected_worktree_pr().is_some() {
-                    open_pr_agent_picker(app);
-                } else if let Some(p) = app.selected_project() {
+                if let Some(p) = app.selected_project() {
                     let project = p.id.clone();
-                    open_new_worktree_prompt(app, project);
+                    open_prompt(app, PromptKind::NewSessionWorkspace { project });
                 }
             }
             Focus::Sessions => {
@@ -3550,9 +3542,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // cursor stands, as it is for `g`, `f` and `b`, so the key is never
         // quietly dropped on Sessions.
         Action::OpenWorktree => open_selected_worktree(app),
-        // AddProject adds a project from ANY panel — unlike New it never
-        // changes meaning with focus, matching the "open a repo" instinct.
-        Action::AddProject => open_prompt(app, PromptKind::AddProject),
         Action::FindFile => open_file_finder(app),
         Action::Grep => open_grep_view(app),
         Action::TreeBrowser => open_tree_browser(app),
@@ -3601,11 +3590,6 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
         // the repos beside it — or at "~/" with the home listing showing.
         // Typing a leading '/' or '~' replaces the prefill (see the Char
         // arm), and Ctrl+u clears it.
-        PromptKind::AddProject => (
-            "Open project".into(),
-            "a folder with a git repository — Enter opens it".into(),
-            add_project_prefill(app),
-        ),
         PromptKind::NewWorktree { suggestion, .. } => (
             "New worktree".into(),
             format!("branch name (empty = {suggestion})").into(),
@@ -3767,36 +3751,8 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
             ("Edit link".into(), "URL".into(), current)
         }
     };
-    let highlight = matches!(kind, PromptKind::AddProject)
-        .then(|| app.launch_repo_name())
-        .flatten();
-    let mut dialog = PromptDialog::new(title, label, input, kind);
-    // The folder nebula was started in, lit in its parent's listing.
-    if let Some(name) = highlight {
-        dialog.hover = dialog.dirs.iter().position(|d| d.name == name);
-    }
+    let dialog = PromptDialog::new(title, label, input, kind);
     app.overlay = Some(Overlay::Prompt(dialog));
-}
-
-/// Where the open-project prompt starts: the parent of the repo nebula was
-/// started in (`~`-relative, trailing slash, so its listing is what shows)
-/// while that repo is not a project yet, else the home directory.
-fn add_project_prefill(app: &App) -> String {
-    let home = nebula_core::env::home_dir();
-    let parent = app
-        .launch_repo_name()
-        .and(app.launch_repo.as_deref())
-        .and_then(std::path::Path::parent);
-    match (parent, home.as_deref()) {
-        (Some(parent), Some(home)) => match parent.strip_prefix(home) {
-            Ok(rest) if rest.as_os_str().is_empty() => "~/".to_string(),
-            Ok(rest) => format!("~/{}/", rest.display()),
-            Err(_) => format!("{}/", parent.display()),
-        },
-        (Some(parent), None) => format!("{}/", parent.display()),
-        (None, Some(_)) => "~/".to_string(),
-        (None, None) => String::new(),
-    }
 }
 
 /// The keys the all-tabs-closed SPLASH answers ([`App::projects_closed`]):
@@ -3808,7 +3764,6 @@ fn opens_from_closed_splash(action: crate::keymap::Action) -> bool {
         action,
         Action::Activate
             | Action::New
-            | Action::AddProject
             | Action::ProjectDropdown
             | Action::Palette
             | Action::NextAttention
@@ -3822,74 +3777,9 @@ fn opens_from_closed_splash(action: crate::keymap::Action) -> bool {
     )
 }
 
-/// Enter on the first-run SPLASH: open the repo nebula was started in —
-/// the request the open-project prompt's Enter sends, so the view lands on
-/// the new project as it would from there. Started outside a repository,
-/// there is nothing to open by name, so Enter opens the prompt instead.
-fn open_launch_repo(app: &mut App, out: &mut Vec<ClientRequest>) {
-    match app.launch_repo.clone() {
-        Some(path) => open_folder(app, path, out),
-        None => open_prompt(app, PromptKind::AddProject),
-    }
-}
-
-/// Open the folder at `path` as a project — the open-project prompt's
-/// Enter and the SPLASH's. A folder that is already a project (it, a
-/// checkout of it, or a folder inside either) opens that project instead
-/// of asking the daemon to register it twice; one that does not exist yet
-/// asks first whether to create it, and one in no git repository asks
-/// whether to `git init` it.
-fn open_folder(app: &mut App, path: std::path::PathBuf, out: &mut Vec<ClientRequest>) {
-    if !path.exists() {
-        app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-            title: "Create directory".into(),
-            message: format!(
-                "{} doesn't exist, would you like to create it?",
-                path.display()
-            ),
-            action: PendingAction::CreateProjectDir(path),
-            area: ratatui::layout::Rect::default(),
-        }));
-        return;
-    }
-    let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-    let known = canon
-        .ancestors()
-        .find_map(|dir| app.tree.project_at_path(dir))
-        .map(|p| (p.id.clone(), p.name.clone()));
-    if let Some((id, name)) = known {
-        launcher::open_project(app, &id, out);
-        app.flash = Some(format!("{name} is already a project — opened it"));
-        return;
-    }
-    if canon.is_dir() && !in_git_repo(&canon) {
-        app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-            title: "Not a git repository".into(),
-            message: format!(
-                "{} isn't a git repository — nebula projects are. Run git init in it?",
-                path.display()
-            ),
-            action: PendingAction::InitProjectRepo(path),
-            area: ratatui::layout::Rect::default(),
-        }));
-        return;
-    }
-    send_with(app, out, PendingIntent::SelectCreatedProject, |req_id| {
-        ClientRequest::AddProject {
-            req_id,
-            path,
-            name: None,
-            create_missing: false,
-        }
-    });
-}
-
-/// Whether `dir` sits in a git repository — a `.git` (a directory, or the
-/// file a linked worktree carries) in it or above it, as git itself looks.
-/// A stat per ancestor, so it is cheap enough for a keypress; the daemon
-/// asks git itself before it runs `git init`.
-fn in_git_repo(dir: &std::path::Path) -> bool {
-    dir.ancestors().any(|d| d.join(".git").exists())
+/// Enter on the first-run SPLASH points the user to explicit CLI registration.
+fn open_launch_repo(app: &mut App, _out: &mut Vec<ClientRequest>) {
+    app.flash = Some("Register projects with `nebula register`".into());
 }
 
 /// Open the selected repo's page on its git host (`G`). Any worktree
@@ -5507,28 +5397,17 @@ fn menu_items_for_session_in(app: &App, a: &nebula_core::Agent) -> Vec<MenuItem>
         MenuAction::OpenWorktree(w.id.clone()),
     ));
     items.extend(links);
-    if w.is_main {
-        items.push(MenuItem::new(
-            "Switch branch…",
-            MenuAction::SwitchBranch(w.id.clone()),
-        ));
-    } else {
-        if app
+    if !w.is_main
+        && app
             .tree
             .session_workspaces
             .iter()
             .any(|ws| ws.worktree_id == w.id)
-        {
-            items.push(MenuItem::destructive(
-                "Close session workspace…",
-                MenuAction::CloseSessionWorkspace(w.id.clone()),
-            ));
-        } else {
-            items.push(MenuItem::destructive(
-                "Delete worktree",
-                MenuAction::DeleteWorktree(w.id.clone()),
-            ));
-        }
+    {
+        items.push(MenuItem::destructive(
+            "Close session workspace…",
+            MenuAction::CloseSessionWorkspace(w.id.clone()),
+        ));
     }
     items
 }
@@ -5580,31 +5459,6 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
     agent_picker::open_kind_picker(app, KindPicker::new_session(worktree));
 }
 
-/// ROOT WORKTREE used by PROJECT-scoped actions. An OPEN PRS row has no
-/// checkout of its own, so PR-created AGENTS follow the same established
-/// fallback as PROJECT-scoped TERMINAL SESSION and LINK creation.
-fn selected_project_main_worktree(app: &App) -> Option<WorktreeId> {
-    let project = app.selected_project()?;
-    app.root_worktree(&project.id)
-}
-
-/// `n` on a PROJECT OPEN PRS GROUP row: the NEW SESSION PICKER's harness
-/// rows, every one carrying the PR's URL and — through the same MODEL /
-/// EFFORT submenus, and as directly on Enter — launching a PR SESSION.
-pub(super) fn open_pr_agent_picker(app: &mut App) {
-    if selected_project_uses_workspace_layout(app) {
-        return;
-    }
-    let Some(pr) = app.selected_worktree_pr().cloned() else {
-        return;
-    };
-    let Some(worktree) = selected_project_main_worktree(app) else {
-        app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
-        return;
-    };
-    agent_picker::open_kind_picker(app, KindPicker::pr_session(worktree, &pr));
-}
-
 /// The CONTEXT MENU for a PROJECT ISSUES GROUP row: the browser. The
 /// launches are the row's keys (`p`, `e`), as the footer says.
 fn issue_row_menu_items(issue: &crate::issues::Issue) -> Vec<MenuItem> {
@@ -5614,23 +5468,13 @@ fn issue_row_menu_items(issue: &crate::issues::Issue) -> Vec<MenuItem> {
     )]
 }
 
-/// The CONTEXT MENU for a PROJECT OPEN PRS GROUP row: a PR SESSION row per
-/// enabled harness (none when the PROJECT has no ROOT WORKTREE to launch
-/// in), then the row's browser and diff verbs.
-fn pr_row_menu_items(app: &App, pr: &crate::pull_request::OpenPr) -> Vec<MenuItem> {
-    let mut items = if selected_project_uses_workspace_layout(app) {
-        Vec::new()
-    } else {
-        match selected_project_main_worktree(app) {
-            Some(worktree) => agent_picker::pr_session_menu_rows(worktree, pr),
-            None => Vec::new(),
-        }
-    };
-    items.extend([
+/// The CONTEXT MENU for a PROJECT OPEN PRS GROUP row: browser and diff verbs.
+fn pr_row_menu_items(_app: &App, pr: &crate::pull_request::OpenPr) -> Vec<MenuItem> {
+    let items = vec![
         MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url.clone())),
         MenuItem::new("View diff", MenuAction::ViewPrDiff),
         MenuItem::new("Comment…", MenuAction::CommentPullRequest),
-    ]);
+    ];
     items
 }
 
@@ -5767,30 +5611,19 @@ fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
             ),
         );
     }
-    // The ROOT WORKTREE moves between branches; a linked worktree, named
-    // for its branch, is deleted instead.
-    if w.is_main {
-        items.push(MenuItem::new(
-            "Switch branch…",
-            MenuAction::SwitchBranch(w.id.clone()),
-        ));
-    } else {
-        if app
+    // Only a session workspace has a close action. Main-workspace branch
+    // selection is a repository-scoped Git tool, not a workspace action.
+    if !w.is_main
+        && app
             .tree
             .session_workspaces
             .iter()
             .any(|workspace| workspace.worktree_id == w.id)
-        {
-            items.push(MenuItem::destructive(
-                "Close session workspace…",
-                MenuAction::CloseSessionWorkspace(w.id.clone()),
-            ));
-        } else {
-            items.push(MenuItem::destructive(
-                "Delete worktree",
-                MenuAction::DeleteWorktree(w.id.clone()),
-            ));
-        }
+    {
+        items.push(MenuItem::destructive(
+            "Close session workspace…",
+            MenuAction::CloseSessionWorkspace(w.id.clone()),
+        ));
     }
     items
 }
@@ -5802,14 +5635,13 @@ fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
 fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
     match focus {
         Focus::Projects => {
-            let mut items = vec![MenuItem::new("Add project", MenuAction::AddProject)];
+            let mut items = vec![MenuItem::new(
+                "Register projects with `nebula register`",
+                MenuAction::RegisterProjectHelp,
+            )];
             if let Some(p) = app.selected_project() {
                 items.insert(
                     0,
-                    MenuItem::new("New worktree", MenuAction::NewWorktree(p.id.clone())),
-                );
-                items.insert(
-                    1,
                     MenuItem::new(
                         "New session workspace",
                         MenuAction::NewSessionWorkspace(p.id.clone()),
@@ -5857,17 +5689,17 @@ fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
 /// verbs by its own key (`n`, `A`, the OPEN PRS fold, the draft toggle).
 fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
     match focus {
-        Focus::Projects => vec![MenuItem::new("Add project", MenuAction::AddProject)],
+        Focus::Projects => vec![MenuItem::new(
+            "Register projects with `nebula register`",
+            MenuAction::RegisterProjectHelp,
+        )],
         Focus::Worktrees => app
             .selected_project()
             .map(|p| {
-                let mut items = vec![
-                    MenuItem::new("New worktree", MenuAction::NewWorktree(p.id.clone())),
-                    MenuItem::new(
-                        "New session workspace",
-                        MenuAction::NewSessionWorkspace(p.id.clone()),
-                    ),
-                ];
+                let mut items = vec![MenuItem::new(
+                    "New session workspace",
+                    MenuAction::NewSessionWorkspace(p.id.clone()),
+                )];
                 let workspace_layout = app.tree.uses_workspace_layout(&p.id);
                 if !workspace_layout {
                     // Only once there is a group to fold.
@@ -5905,11 +5737,6 @@ fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
             .unwrap_or_default(),
         Focus::Terminal => vec![],
     }
-}
-
-fn selected_project_uses_workspace_layout(app: &App) -> bool {
-    app.selected_project()
-        .is_some_and(|project| app.tree.uses_workspace_layout(&project.id))
 }
 
 /// A click landed on a panel row: the cursor goes there exactly as the
@@ -7239,7 +7066,6 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         return;
     }
     match prompt.kind {
-        PromptKind::AddProject => open_folder(app, shellexpand_home(&value), out),
         PromptKind::NewWorktree {
             project,
             suggestion,
@@ -7452,16 +7278,6 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
 
 fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<ClientRequest>) {
     match action {
-        PendingAction::CreateProjectDir(path) | PendingAction::InitProjectRepo(path) => {
-            send_with(app, out, PendingIntent::SelectCreatedProject, |req_id| {
-                ClientRequest::AddProject {
-                    req_id,
-                    path,
-                    name: None,
-                    create_missing: true,
-                }
-            });
-        }
         PendingAction::ArchiveAgent(id) => archive_agent_now(app, id, out),
         PendingAction::ArchiveThread { agents, terminals } => {
             for id in agents {
@@ -7568,22 +7384,6 @@ fn delete_worktree_and_settle(app: &mut App, id: WorktreeId, out: &mut Vec<Clien
     reconcile_selection(app, before, out);
 }
 
-/// Live cards a worktree still holds: its unarchived agents and its
-/// terminals — what its band on the grid shows.
-fn live_cards_in(app: &App, id: &WorktreeId) -> usize {
-    app.tree
-        .agents
-        .iter()
-        .filter(|a| &a.worktree_id == id && !a.archived)
-        .count()
-        + app
-            .tree
-            .terminals
-            .iter()
-            .filter(|t| &t.worktree_id == id)
-            .count()
-}
-
 /// A row delete's confirm, with the checkout's fate folded in when the
 /// delete would empty a linked worktree. `dialog` is the row's ordinary
 /// confirm; `live_taken` how many live cards it removes from `worktree`
@@ -7604,47 +7404,11 @@ fn live_cards_in(app: &App, id: &WorktreeId) -> usize {
 /// kept a band for it. Anything else leaves the dialog as it came.
 fn with_worktree_offer(
     app: &App,
-    mut dialog: ConfirmDialog,
-    worktree: &WorktreeId,
-    live_taken: usize,
+    dialog: ConfirmDialog,
+    _worktree: &WorktreeId,
+    _live_taken: usize,
 ) -> ConfirmDialog {
-    let Some(w) = app.tree.worktrees.iter().find(|w| &w.id == worktree) else {
-        return dialog;
-    };
-    if app.tree.uses_workspace_layout(&w.project_id) {
-        return dialog;
-    }
-    if w.is_main
-        || app.is_placeholder_worktree(worktree)
-        || live_cards_in(app, worktree) != live_taken
-    {
-        return dialog;
-    }
-    let force = crate::config::Config::load().delete_empty_worktree;
-    if app.show_all_worktrees && !force {
-        return dialog;
-    }
-    let archived = app
-        .tree
-        .agents
-        .iter()
-        .filter(|a| &a.worktree_id == worktree && a.archived)
-        .count();
-    let offered = !(force && archived == 0);
-    let branch = &w.branch;
-    dialog.message.push('\n');
-    dialog.message.push_str(&match (offered, archived) {
-        (false, _) => format!("Worktree '{branch}' goes with it: nothing else is left there."),
-        (true, 0) => format!("Nothing else is left in worktree '{branch}': delete it from disk too?"),
-        (true, n) => format!(
-            "Nothing live is left in worktree '{branch}': delete it from disk too?\nIts {n} archived session(s) would go with it."
-        ),
-    });
-    dialog.action = PendingAction::ThenDeleteWorktree {
-        first: Box::new(dialog.action),
-        worktree: worktree.clone(),
-        offered,
-    };
+    let _ = app;
     dialog
 }
 
@@ -7871,8 +7635,10 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             app.selected_repositories.insert(workspace, repository);
             app.dirty = true;
         }
-        MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
         MenuAction::RenameProject(id) => open_prompt(app, PromptKind::RenameProject { id }),
+        MenuAction::RegisterProjectHelp => {
+            app.flash = Some("Register projects with `nebula register`".into())
+        }
         MenuAction::OpenProject(id) => launcher::open_project(app, &id, out),
         MenuAction::RemoveProject(id) => {
             if let Some(p) = app.tree.projects.iter().find(|p| p.id == id).cloned() {
@@ -7915,15 +7681,6 @@ fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec<ClientRequ
     // Archived, deleted or killed: whatever comes back under this ref is
     // a new process, so its kept screen is stale.
     app.term_cache.retain(|t| &t.sref != sref);
-}
-
-fn shellexpand_home(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = nebula_core::env::home_dir() {
-            return home.join(rest);
-        }
-    }
-    std::path::PathBuf::from(path)
 }
 
 /// Snapshot the context being left — which worktree row the project was
@@ -13099,19 +12856,14 @@ mod tests {
         );
     }
 
-    /// While the tree is empty, `n` opens the add-project prompt from any
-    /// focus — the splash hides the panels, so the per-panel meanings of
-    /// `n` would just dead-end.
     #[test]
     fn n_adds_project_from_any_focus_while_tree_empty() {
         let mut app = App::new();
         app.focus = Focus::Sessions;
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("expected add-project prompt, got {:?}", app.overlay);
-        };
-        assert_eq!(p.kind, crate::app::PromptKind::AddProject);
+        assert!(app.overlay.is_none());
+        assert!(out.is_empty());
     }
 
     /// The splash hides the panels, so the footer drops the panel keymap
@@ -13124,7 +12876,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("o: open a folder"), "{text}");
+        assert!(
+            text.contains("o: register with `nebula register`"),
+            "{text}"
+        );
         assert!(!text.contains("workspace"), "{text}");
         assert!(text.contains("q: quit"), "{text}");
         for dead in ["d: remove", "m: menu", "/: search"] {
@@ -13141,7 +12896,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("new session"), "{text}");
-        assert!(!text.contains("open a folder"), "{text}");
+        assert!(!text.contains("register with `nebula register`"), "{text}");
     }
 
     /// A tempdir holding `ws/alpha` (a git repo) and `ws/beta` (not one),
@@ -13157,173 +12912,7 @@ mod tests {
     /// First run, started inside a repo: the SPLASH names the folder, and
     /// Enter opens it as a project — the one key between a fresh install
     /// and a project on screen, whichever focus the app booted with.
-    #[test]
-    fn enter_on_the_first_run_splash_opens_the_folder_nebula_started_in() {
-        let mut app = App::new();
-        let tmp = launched_in_alpha(&mut app);
-        app.focus = Focus::Terminal;
-        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("Enter: open alpha"), "{text}");
-        assert!(!text.contains("workspace"), "{text}");
 
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(
-                out.as_slice(),
-                [ClientRequest::AddProject { path, create_missing: false, .. }]
-                    if path == &tmp.path().join("ws/alpha")
-            ),
-            "{out:?}"
-        );
-    }
-
-    /// Started outside a repo there is no folder to name: the splash says
-    /// `o` opens one, and Enter opens the prompt rather than nothing.
-    #[test]
-    fn enter_on_the_first_run_splash_elsewhere_opens_the_prompt() {
-        let mut app = App::new();
-        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("o: open a folder"), "{text}");
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("expected the open-project prompt, got {:?}", app.overlay);
-        };
-        assert_eq!(p.kind, crate::app::PromptKind::AddProject);
-        assert!(out.is_empty(), "{out:?}");
-    }
-
-    /// A project is a git repository: opening a folder in none asks to
-    /// `git init` it — `y` sends the add with `create_missing`, which is
-    /// the daemon's cue to init, and `n` sends nothing. A folder inside a
-    /// repository opens without asking.
-    #[test]
-    fn opening_a_folder_outside_git_asks_to_git_init_it() {
-        let mut app = App::new();
-        let tmp = launched_in_alpha(&mut app);
-        let beta = tmp.path().join("ws/beta");
-        let mut out = Vec::new();
-
-        open_folder(&mut app, beta.clone(), &mut out);
-        assert!(out.is_empty(), "{out:?}");
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Confirm(c))
-                if c.title == "Not a git repository"
-                    && c.action == PendingAction::InitProjectRepo(beta.clone())),
-            "{:?}",
-            app.overlay
-        );
-        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-        assert!(app.overlay.is_none());
-        assert!(out.is_empty(), "{out:?}");
-
-        open_folder(&mut app, beta.clone(), &mut out);
-        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(
-                out.as_slice(),
-                [ClientRequest::AddProject { path, create_missing: true, .. }] if path == &beta
-            ),
-            "{out:?}"
-        );
-
-        out.clear();
-        let inner = tmp.path().join("ws/alpha/src");
-        std::fs::create_dir_all(&inner).unwrap();
-        open_folder(&mut app, inner.clone(), &mut out);
-        assert!(
-            matches!(
-                out.as_slice(),
-                [ClientRequest::AddProject { path, create_missing: false, .. }] if path == &inner
-            ),
-            "{out:?}"
-        );
-    }
-
-    /// The open-project prompt starts on the folder nebula was started in:
-    /// its parent listed, the folder itself highlighted — so Enter opens
-    /// it and ↑/↓ reach the folders beside it.
-    #[test]
-    fn the_open_project_prompt_starts_on_the_launch_folder() {
-        let mut app = App::new();
-        let tmp = launched_in_alpha(&mut app);
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE, &mut out);
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("expected the open-project prompt, got {:?}", app.overlay);
-        };
-        assert_eq!(p.title, "Open project");
-        assert_eq!(dir_names(p), vec!["alpha", "beta"]);
-        assert_eq!(
-            p.hovered_path(),
-            Some(format!("{}/ws/alpha", tmp.path().display()))
-        );
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(
-                out.as_slice(),
-                [ClientRequest::AddProject { path, .. }] if path == &tmp.path().join("ws/alpha")
-            ),
-            "{out:?}"
-        );
-    }
-
-    /// A folder that already is a project — its root, or a folder inside
-    /// it — opens that project instead of asking the daemon to register it
-    /// a second time, which would only come back refused.
-    #[test]
-    fn opening_a_known_folder_opens_its_project() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        std::fs::create_dir_all(root.join("demo/src")).unwrap();
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.tree.projects[0].repo_path = root.join("demo");
-        let mut out = Vec::new();
-        open_folder(&mut app, root.join("demo/src"), &mut out);
-        assert!(
-            !out.iter()
-                .any(|r| matches!(r, ClientRequest::AddProject { .. })),
-            "{out:?}"
-        );
-        assert_eq!(
-            app.flash.as_deref(),
-            Some("demo is already a project — opened it")
-        );
-        assert_eq!(
-            app.selected_project().map(|p| p.name.as_str()),
-            Some("demo")
-        );
-    }
-
-    /// `o` opens the add-project prompt regardless of focus or tree state —
-    /// unlike `n` it never takes on a per-panel meaning.
-    #[test]
-    fn o_adds_project_from_any_focus() {
-        for focus in [Focus::Projects, Focus::Worktrees, Focus::Sessions] {
-            let mut app = App::new();
-            seed_tree(&mut app);
-            app.focus = focus;
-            let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE, &mut out);
-            let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!(
-                    "expected add-project prompt at {focus:?}, got {:?}",
-                    app.overlay
-                );
-            };
-            assert_eq!(p.kind, crate::app::PromptKind::AddProject);
-        }
-    }
-
-    // ---- worktree links ----
-
-    /// `seed_tree` plus one saved link on w1, cursor parked on it.
     fn seed_link(app: &mut App, url: &str) {
         hse(
             app,
@@ -16919,171 +16508,6 @@ diff --git a/src/c.rs b/src/c.rs
 
     fn dir_names(p: &crate::app::PromptDialog) -> Vec<&str> {
         p.dirs.iter().map(|d| d.name.as_str()).collect()
-    }
-
-    #[test]
-    fn tab_in_add_project_prompt_completes_paths() {
-        use crate::app::{Overlay, PromptDialog, PromptKind};
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("workspace/nebula")).unwrap();
-        std::fs::create_dir_all(tmp.path().join("workspace/herdr")).unwrap();
-
-        let mut app = App::new();
-        let mut out = Vec::new();
-        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
-            "Add project",
-            "path",
-            format!("{}/work", tmp.path().display()),
-            PromptKind::AddProject,
-        )));
-
-        // Unambiguous: work → workspace/, and the listing follows it in.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            &mut out,
-        );
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("prompt closed")
-        };
-        assert_eq!(p.input, format!("{}/workspace/", tmp.path().display()));
-        assert_eq!(dir_names(p), vec!["herdr", "nebula"]);
-
-        // Ambiguous: Tab makes no progress, the listing already shows both.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            &mut out,
-        );
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("prompt closed")
-        };
-        assert_eq!(p.input, format!("{}/workspace/", tmp.path().display()));
-        assert_eq!(dir_names(p), vec!["herdr", "nebula"]);
-
-        // Typing narrows the listing; the next Tab completes fully.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-            &mut out,
-        );
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("prompt closed")
-        };
-        assert_eq!(dir_names(p), vec!["nebula"]);
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            &mut out,
-        );
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("prompt closed")
-        };
-        assert_eq!(
-            p.input,
-            format!("{}/workspace/nebula/", tmp.path().display())
-        );
-    }
-
-    #[test]
-    fn add_project_prompt_browses_with_arrows_and_submits_hovered() {
-        use crate::app::{Overlay, PromptDialog, PromptKind};
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("ws/beta/inner")).unwrap();
-        std::fs::create_dir_all(tmp.path().join("ws/alpha/.git")).unwrap();
-
-        let mut app = App::new();
-        let mut out = Vec::new();
-        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
-            "Add project",
-            "path",
-            format!("{}/ws/", tmp.path().display()),
-            PromptKind::AddProject,
-        )));
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("prompt closed")
-        };
-        assert_eq!(dir_names(p), vec!["alpha", "beta"]);
-        assert!(p.dirs[0].is_repo && !p.dirs[1].is_repo);
-        assert_eq!(p.hover, None, "opens on the input row");
-
-        // ↓↓ highlights beta; → dives into it and lists its children.
-        for _ in 0..2 {
-            handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-                &mut out,
-            );
-        }
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("prompt closed")
-        };
-        assert_eq!(
-            p.hovered_path(),
-            Some(format!("{}/ws/beta", tmp.path().display()))
-        );
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
-            &mut out,
-        );
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("prompt closed")
-        };
-        assert_eq!(p.input, format!("{}/ws/beta/", tmp.path().display()));
-        assert_eq!(dir_names(p), vec!["inner"]);
-        assert_eq!(p.hover, None, "diving resets the highlight");
-
-        // ← steps back up to ws/.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
-            &mut out,
-        );
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("prompt closed")
-        };
-        assert_eq!(p.input, format!("{}/ws/", tmp.path().display()));
-
-        // ↓ + Enter adds the highlighted directory, not the typed parent.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-            &mut out,
-        );
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut out,
-        );
-        assert!(app.overlay.is_none());
-        assert!(matches!(
-            out.as_slice(),
-            [ClientRequest::AddProject { path, create_missing: false, .. }]
-                if path == &tmp.path().join("ws/alpha")
-        ));
-    }
-
-    #[test]
-    fn add_project_prefill_yields_to_absolute_paths() {
-        use crate::app::{Overlay, PromptDialog, PromptKind};
-        let mut app = App::new();
-        let mut out = Vec::new();
-        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
-            "Add project",
-            "path",
-            "~/",
-            PromptKind::AddProject,
-        )));
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-            &mut out,
-        );
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("prompt closed")
-        };
-        assert_eq!(p.input, "/", "leading '/' replaces the untouched prefill");
     }
 
     #[test]
@@ -21878,8 +21302,9 @@ diff --git a/src/c.rs b/src/c.rs
     #[test]
     fn c_opens_the_branch_switcher_on_the_root_and_refuses_a_linked_worktree() {
         let mut app = App::new();
-        let mut out = Vec::new();
+        let mut out: Vec<ClientRequest> = Vec::new();
         seed_tree(&mut app);
+        app.tree.repositories.clear();
         seed_linked_worktree(&mut app);
         let root = WorktreeId("w1".into());
         let mains: Vec<bool> = app.visible_worktrees().iter().map(|w| w.is_main).collect();
@@ -21888,36 +21313,35 @@ diff --git a/src/c.rs b/src/c.rs
         app.focus = Focus::Worktrees;
         app.sel_worktree = 1;
         press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
-        assert!(app.overlay.is_none(), "{:?}", app.overlay);
         assert!(
             app.flash
                 .as_deref()
-                .is_some_and(|f| f.contains("root checkout")),
+                .is_some_and(|f| f.contains("not available in Nebula Pilot")),
             "{:?}",
             app.flash
         );
 
         app.focus = Focus::Projects;
         press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
-        assert_eq!(
-            branch_switch_target(&app),
-            Some(root.clone()),
-            "the Projects panel means the project's root"
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("not available in Nebula Pilot")),
+            "linked-worktree feature is disabled globally"
         );
         app.overlay = None;
 
         app.focus = Focus::Worktrees;
         app.sel_worktree = 0;
         press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
-        assert_eq!(branch_switch_target(&app), Some(root));
+        assert!(branch_switch_target(&app).is_some());
     }
 
     /// The root row's menu is where the mouse finds the switcher, in the
     /// seat a linked worktree's Delete takes.
     #[test]
-    fn the_root_rows_menu_offers_switch_branch_and_a_worktree_row_offers_delete() {
+    fn repository_rows_do_not_offer_branch_switch_or_worktree_delete() {
         let mut app = App::new();
-        let mut out = Vec::new();
         seed_tree(&mut app);
         seed_linked_worktree(&mut app);
         app.focus = Focus::Worktrees;
@@ -21933,7 +21357,7 @@ diff --git a/src/c.rs b/src/c.rs
         app.sel_worktree = 1;
         open_row_menu(&mut app);
         let linked = labels(&app);
-        assert!(linked.iter().any(|l| l == "Delete worktree"), "{linked:?}");
+        assert!(!linked.iter().any(|l| l == "Delete worktree"), "{linked:?}");
         assert!(!linked.iter().any(|l| l == "Switch branch…"), "{linked:?}");
         app.overlay = None;
 
@@ -21941,15 +21365,7 @@ diff --git a/src/c.rs b/src/c.rs
         open_row_menu(&mut app);
         let root = labels(&app);
         assert!(!root.iter().any(|l| l == "Delete worktree"), "{root:?}");
-        let at = root
-            .iter()
-            .position(|l| l == "Switch branch…")
-            .expect("the root row offers it");
-        if let Some(Overlay::Menu(menu)) = &mut app.overlay {
-            menu.hover = at;
-        }
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert_eq!(branch_switch_target(&app), Some(WorktreeId("w1".into())));
+        assert!(!root.iter().any(|l| l == "Switch branch…"), "{root:?}");
     }
 
     /// Through the real key path — the KEYMAP's `c`, a query typed into the
@@ -31858,26 +31274,6 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     #[test]
-    fn prompt_click_outside_abandons_it() {
-        let mut app = App::new();
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(app.overlay, Some(Overlay::Prompt(_))),
-            "{:?}",
-            app.overlay
-        );
-        let area = drawn_modal_area(&mut app);
-        click(&mut app, area.x + 2, area.y + 1, &mut out);
-        assert!(
-            matches!(app.overlay, Some(Overlay::Prompt(_))),
-            "inside click keeps it"
-        );
-        click(&mut app, 0, 0, &mut out);
-        assert!(app.overlay.is_none(), "outside click abandons the prompt");
-    }
-
-    #[test]
     fn diff_click_outside_closes_and_inside_stays() {
         let mut app = App::new();
         seed_tree(&mut app);
@@ -31962,7 +31358,11 @@ diff --git a/src/c.rs b/src/c.rs
             ),
             (
                 "Prompt",
-                |app| press(app, KeyCode::Char('n'), KeyModifiers::NONE, &mut Vec::new()),
+                |app| {
+                    seed_tree(app);
+                    let id = app.tree.projects[0].id.clone();
+                    open_prompt(app, PromptKind::RenameProject { id });
+                },
                 None,
             ),
             (
@@ -32825,7 +32225,7 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     #[test]
-    fn multi_repository_projects_do_not_offer_pull_request_or_issue_modals() {
+    fn registered_projects_do_not_offer_pull_request_or_issue_modals() {
         let mut app = App::new();
         seed_tree(&mut app);
         mark_project_as_registered_multi_repository(&mut app);
@@ -32938,15 +32338,22 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     #[test]
-    fn legacy_projects_keep_the_pull_request_and_issue_modals() {
+    fn single_repository_projects_do_not_offer_pull_request_or_issue_modals() {
         let mut app = App::new();
         seed_tree(&mut app);
+        app.tree.repositories = vec![nebula_core::ProjectRepository {
+            project_id: ProjectId("p1".into()),
+            name: "demo".into(),
+            path: "/tmp/demo/demo".into(),
+            branch: "main".into(),
+            changed_files: None,
+        }];
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE, &mut out);
-        assert!(matches!(app.overlay, Some(Overlay::PullRequests(_))));
-        app.overlay = None;
+        assert!(app.overlay.is_none());
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE, &mut out);
-        assert!(matches!(app.overlay, Some(Overlay::Issues(_))));
+        assert!(app.overlay.is_none());
+        assert!(out.is_empty());
     }
 
     fn delete_worktree_requests(out: &[ClientRequest]) -> Vec<&str> {

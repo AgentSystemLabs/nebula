@@ -76,55 +76,18 @@ pub(super) fn submit(
     // the pane, as a picker-walked launch (`n`) does.
     let focus_pane = !stay && cfg.quick_prompt_focus;
     match launch.target.clone() {
+        QuickTarget::NewWorktree { .. } => {
+            app.flash = Some(
+                "single-repository worktrees are disabled; create a session workspace instead"
+                    .into(),
+            );
+        }
         QuickTarget::Worktree(worktree) => {
             let draft = AgentLaunchDraft {
                 follow: !stay,
                 ..draft(launch, worktree, text, focus_pane, None)
             };
             create_agent(app, draft, out)
-        }
-        QuickTarget::NewWorktree { project, branch } => {
-            // Its tab to the far left now, as `create_agent` does for a
-            // launch into a checkout that exists: the create it rides
-            // goes out seconds from now and does not count again.
-            app.bring_tab_forward(&project);
-            // The rows first, so the panels never wait on git.
-            // The composed task the create will carry (`draft`), asked
-            // here so the row goes up the way it will come back: working.
-            let first_prompt = !launch.compose(&text).is_empty();
-            let placeholder = placeholder::stage(
-                app,
-                project.clone(),
-                branch.clone(),
-                launch.kind,
-                launch.custom.clone(),
-                launch.model.clone(),
-                launch.effort.clone(),
-                first_prompt,
-                !stay,
-                out,
-            );
-
-            // `base: None` is the DAEMON's `worktree_base_branch` SETTING,
-            // else its fetched `origin/HEAD` (`git::add_worktree_off_default`)
-            // — never this checkout's HEAD.
-            send_with_follow(
-                app,
-                out,
-                PendingIntent::LaunchInCreatedWorktree {
-                    launch,
-                    text,
-                    placeholder,
-                    focus: focus_pane,
-                },
-                !stay,
-                |req_id| ClientRequest::CreateWorktree {
-                    req_id,
-                    project,
-                    branch,
-                    base: None,
-                },
-            );
         }
         QuickTarget::NewSessionWorkspace { project, name } => {
             app.bring_tab_forward(&project);

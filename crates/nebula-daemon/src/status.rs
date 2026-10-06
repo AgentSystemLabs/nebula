@@ -47,7 +47,7 @@
 //!   notification cannot arrive inside the grace.
 //! - A `nebula worktree` relocation waits on the turn's end, and then the
 //!   daemon kills the CLI and resumes it in the target with a prompt that
-//!   carries the work straight on (`Daemon::complete_pending_move`). The
+//!   carries the work straight on. The
 //!   end of that turn is not the end of the work: while the daemon says a
 //!   relocation is pending (`set_relocating`), a `Stop`, an `idle_prompt`
 //!   or a progress-clear holds the row at `running` instead of finishing

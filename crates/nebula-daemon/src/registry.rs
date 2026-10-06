@@ -12,9 +12,9 @@ use anyhow::{bail, Context, Result};
 use nebula_core::env;
 use nebula_core::project_file::{self, ProjectCommand};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, LinkId, PrewarmInfo,
-    Project, ProjectId, ProjectRepository, ServerEvent, SessionRef, TerminalId, TerminalTab,
-    WorkspaceState, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, LinkId, PrewarmInfo, Project,
+    ProjectId, ProjectRepository, ServerEvent, SessionRef, TerminalId, TerminalTab, WorkspaceState,
+    Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -399,23 +399,11 @@ pub struct Daemon {
     /// attached, or covered by the in-view sweep refresh. The idle reaper
     /// kills sessions whose stamp ages past `session_idle_timeout`.
     session_interest: Mutex<HashMap<SessionRef, Instant>>,
-    /// Last hook-reported cwd per agent, recorded only for payloads that
-    /// passed the foreign-session gate. An agent that walks into a checkout
-    /// nebula hasn't adopted yet leaves its cwd here, so the worktree sync
-    /// can finish the re-home once the row exists.
-    last_cwd: Mutex<HashMap<AgentId, PathBuf>>,
     /// Where each Claude agent's transcript (and beside it, the session
     /// title `/rename` persists) lives, from its hook payloads. Read by
     /// the CLAUDE TITLE SYNC (`session_title.rs`) when the PTY's window
     /// title changes, which no hook reports.
     pub(crate) transcripts: Mutex<HashMap<AgentId, crate::session_title::TranscriptRef>>,
-    /// Agents that ran `nebula worktree` and are waiting for their turn to
-    /// end: the row already sits under the target worktree while the PTY
-    /// still runs in the old checkout. Drained by `complete_pending_move`
-    /// on the turn-end hook (kill + respawn resumed in the target), cleared
-    /// by any other spawn of the agent, and consulted by the cwd reparent so
-    /// the old checkout's cwd can't drag the row back in the meantime.
-    pending_moves: Mutex<HashMap<AgentId, Worktree>>,
     /// Serializes the check-and-spawn inside [`Daemon::ensure_session`].
     /// Attach (the request loop) and the worktree prewarm sweep (its own
     /// task) can both reach for the same dead session; without this they
@@ -453,9 +441,7 @@ impl Daemon {
             cli_probes: Mutex::new(HashMap::new()),
             attach_counts: Mutex::new(HashMap::new()),
             session_interest: Mutex::new(HashMap::new()),
-            last_cwd: Mutex::new(HashMap::new()),
             transcripts: Mutex::new(HashMap::new()),
-            pending_moves: Mutex::new(HashMap::new()),
             spawn_gate: Mutex::new(()),
             prewarm_sweep: Mutex::new(None),
             resumes: Mutex::new(HashMap::new()),
@@ -477,12 +463,7 @@ impl Daemon {
             Effects(Vec<Effect>),
             UnknownAgent(HookEvent, Option<String>),
         }
-        // A `nebula worktree` relocation waiting on this agent's turn end
-        // holds that end at `running` (`AgentStatusMachine::set_relocating`;
-        // `complete_pending_move` drains it). Read off the daemon's own
-        // record before every event, so the machine's copy cannot go stale
-        // — and before the machines lock, so the two are never nested.
-        let relocating = self.pending_moves.lock().unwrap().contains_key(agent_id);
+        let relocating = false;
         let outcome = {
             let mut machines = self.status_machines.lock().unwrap();
             match machines.entry(agent_id.clone()) {
@@ -744,19 +725,6 @@ impl Daemon {
 
     /// Relocations still waiting on their turn to end (`nebula worktree`),
     /// for an IN-PLACE RESTART to carry.
-    pub fn pending_moves(&self) -> Vec<(AgentId, Worktree)> {
-        self.pending_moves
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(id, wt)| (id.clone(), wt.clone()))
-            .collect()
-    }
-
-    pub fn restore_pending_moves(&self, moves: Vec<(AgentId, Worktree)>) {
-        self.pending_moves.lock().unwrap().extend(moves);
-    }
-
     // ---- attach tracking & idle reaping ----
 
     /// A client attached to `sref` (the server dedupes re-attaches per
@@ -973,91 +941,6 @@ impl Daemon {
 
     // ---- projects ----
 
-    /// Register a repo as a project. One repo is one project: a path that
-    /// resolves to a repo already registered — its root or any checkout of
-    /// it — is refused.
-    pub async fn add_project(
-        self: &Arc<Self>,
-        path: &Path,
-        name: Option<String>,
-        create_missing: bool,
-    ) -> Result<EntityId> {
-        if create_missing {
-            if !path.exists() {
-                tokio::fs::create_dir_all(path)
-                    .await
-                    .with_context(|| format!("create {}", path.display()))?;
-            }
-            // A project is a repository, so the confirmed folder becomes
-            // one — unless it already sits inside one, or git is missing
-            // and the check below should say so.
-            match git::repo_toplevel(path).await {
-                Err(e) if !git::is_missing(&e) => git::init(path).await?,
-                _ => {}
-            }
-        }
-        // "not a git repository" is the right explanation only when git ran and
-        // said no — if git itself is missing, that message blames the wrong
-        // thing, so let git.rs's own diagnosis through untouched.
-        let toplevel = git::repo_toplevel(path).await.map_err(|e| {
-            if git::is_missing(&e) {
-                e
-            } else {
-                e.context(format!("{} is not a git repository", path.display()))
-            }
-        })?;
-        // `--show-toplevel` answers with the checkout it was run in, so inside a
-        // linked worktree it names the worktree rather than the repo. A project
-        // is the repo: root it at the main checkout, which `git worktree list`
-        // always puts first. Adding from inside a worktree used to name the
-        // project after that worktree and leave its ⌂ root row pointing at a
-        // directory the project did not own.
-        let entries = git::list_worktrees(&toplevel)
-            .await
-            .with_context(|| format!("list checkouts of {}", toplevel.display()))?;
-        let repo_path = match entries.first() {
-            Some(main) => main.path.clone(),
-            // git listing no checkout at all for a path it just called a work
-            // tree would leave the root unknowable; refuse rather than seed a
-            // project with no rows, which is how a project loses its root row.
-            None => bail!("git listed no checkout for {}", toplevel.display()),
-        };
-        if self.store.project_by_path(&repo_path)?.is_some() {
-            bail!("project already added: {}", repo_path.display());
-        }
-        let name = name.unwrap_or_else(|| Project::folder_name(&repo_path));
-        let project = Project {
-            id: ProjectId::generate(),
-            name,
-            repo_path: repo_path.clone(),
-            sort_order: self.store.next_project_sort_order()?,
-        };
-        self.store.insert_project(&project)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Project(project.clone()),
-        });
-
-        // Main checkout is modeled as a worktree row; adopt pre-existing
-        // worktrees too so `nebula` matches reality on day one. Root-ness is
-        // the path test the reconcile uses, not insert order — the two agreeing
-        // is what keeps `repo_path` and the ⌂ root row the same directory.
-        for entry in entries {
-            let worktree = Worktree {
-                id: WorktreeId::generate(),
-                project_id: project.id.clone(),
-                is_main: entry.path == repo_path,
-                path: entry.path.clone(),
-                branch: entry.branch,
-                sort_order: 0,
-            };
-            self.store.insert_worktree(&worktree)?;
-            self.broadcast(ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(worktree),
-            });
-        }
-        Ok(EntityId::Project(project.id))
-    }
-
     /// Register an existing project folder and its direct-child repository
     /// checkouts without changing any checkout on disk.
     pub async fn register_project(
@@ -1205,49 +1088,6 @@ impl Daemon {
     }
 
     // ---- worktrees ----
-
-    pub async fn create_worktree(
-        self: &Arc<Self>,
-        project_id: &ProjectId,
-        branch: &str,
-        base: Option<&str>,
-    ) -> Result<EntityId> {
-        if branch.trim().is_empty() {
-            bail!("branch name is empty");
-        }
-        let ops = self.worktree_ops.lock().await;
-        let project = self
-            .store
-            .get_project(project_id)?
-            .context("project not found")?;
-        // A base the caller named (`nebula worktree --base`) is resolved
-        // against the fetched origin — `main` means `origin/main`, never
-        // this checkout's local branch; every other new WORKTREE — `n` in
-        // the WORKTREES PANEL, a bare `nebula worktree`, the QUICK PROMPT's
-        // auto-created one — starts at the `worktree_base_branch` SETTING
-        // when one is set (`master`, resolved the same way), else at the
-        // fetched `origin/HEAD`; never at this checkout's HEAD.
-        let path = match base {
-            Some(base) => git::add_worktree_off_ref(&project.repo_path, branch, base).await?,
-            None => match crate::config::Config::load().worktree_base_branch() {
-                Some(configured) => {
-                    git::add_worktree_off_configured(&project.repo_path, branch, configured).await?
-                }
-                None => git::add_worktree_off_default(&project.repo_path, branch).await?,
-            },
-        };
-        let worktree = self.register_worktree(project_id, path, branch)?;
-        // The row is out; the WORKTREE HOOK runs still under the lock, so
-        // it is ordered with the operation it belongs to — a delete of
-        // this path waits for it, two hooks never overlap — and the Ack
-        // waits for it, so whatever it provisions is in place before
-        // anything is launched in the checkout. The hook timeout bounds
-        // what that holds the lock for.
-        self.run_worktree_hook(WorktreeHook::Create, &project.repo_path, &worktree)
-            .await;
-        drop(ops);
-        Ok(EntityId::Worktree(worktree.id))
-    }
 
     /// Create one branch/worktree per registered repository under the
     /// project's shared workspace folder. Conflicts and path safety are
@@ -1820,122 +1660,6 @@ impl Daemon {
             .is_none_or(|workspace| workspace.state == WorkspaceState::Ready))
     }
 
-    /// The checkout every PR SESSION for pull request `number` runs in: the
-    /// PROJECT's worktree already on its head branch `head` (the ROOT
-    /// WORKTREE only when the branch is checked out there — git allows a
-    /// branch in one checkout at a time), or a new one under the WORKTREE
-    /// DIR with the branch fetched from `origin` (`git::add_pr_worktree`).
-    /// `head` is the checkout's branch as the client names it: a fork's
-    /// arrives under its owner's name (`givemeurhats/main`), so a
-    /// contributor's `main` never matches the ROOT WORKTREE on ours.
-    /// Serialized with the other worktree ops, so two PR SESSIONS launched
-    /// together get one checkout, not a race to create it.
-    pub(crate) async fn pr_worktree(
-        self: &Arc<Self>,
-        project_id: &ProjectId,
-        number: u64,
-        head: &str,
-    ) -> Result<Worktree> {
-        let ops = self.worktree_ops.lock().await;
-        let project = self
-            .store
-            .get_project(project_id)?
-            .context("project not found")?;
-        let (_, worktrees, _, _) = self.store.load_tree()?;
-        if let Some(existing) = worktrees
-            .into_iter()
-            .find(|w| &w.project_id == project_id && w.branch == head)
-        {
-            return Ok(existing);
-        }
-        let path = git::add_pr_worktree(&project.repo_path, number, head).await?;
-        let worktree = self.register_worktree(project_id, path, head)?;
-        self.run_worktree_hook(WorktreeHook::Create, &project.repo_path, &worktree)
-            .await;
-        drop(ops);
-        Ok(worktree)
-    }
-
-    /// Record a checkout git just made as a worktree row and tell every
-    /// client. Callers hold `worktree_ops`.
-    fn register_worktree(
-        &self,
-        project_id: &ProjectId,
-        path: PathBuf,
-        branch: &str,
-    ) -> Result<Worktree> {
-        let worktree = Worktree {
-            id: WorktreeId::generate(),
-            project_id: project_id.clone(),
-            path,
-            branch: branch.to_string(),
-            is_main: false,
-            sort_order: 0,
-        };
-        self.store.insert_worktree(&worktree)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Worktree(worktree.clone()),
-        });
-        Ok(worktree)
-    }
-
-    pub async fn delete_worktree(self: &Arc<Self>, id: &WorktreeId, force: bool) -> Result<()> {
-        let ops = self.worktree_ops.lock().await;
-        let worktree = self.store.get_worktree(id)?.context("worktree not found")?;
-        let session_workspaces = self.store.session_workspaces()?;
-        if session_workspaces.iter().any(|workspace| {
-            workspace.worktree_id == *id
-                || workspace
-                    .repositories
-                    .iter()
-                    .any(|repository| repository.id == *id)
-        }) {
-            bail!("cannot delete a single repository worktree from a session workspace; close the whole workspace instead");
-        }
-        if worktree.is_main {
-            bail!("cannot delete the main checkout — remove the project instead");
-        }
-        let project = self
-            .store
-            .get_project(&worktree.project_id)?
-            .context("project not found")?;
-        // Kill sessions living in this worktree.
-        let (_, _, agents, terminals) = self.store.load_tree()?;
-        self.kill_sessions_in(std::slice::from_ref(id), &agents, &terminals);
-
-        git::remove_worktree(&project.repo_path, &worktree.path, force).await?;
-        self.store.delete_worktree(id)?;
-        self.broadcast(ServerEvent::EntityRemoved {
-            id: EntityId::Worktree(id.clone()),
-        });
-        // The delete has happened as far as git and every client are
-        // concerned; the WORKTREE HOOK only releases what the checkout
-        // owned elsewhere, so it runs after, and its failure is a warning
-        // — never an Error for this request, which would put the rows
-        // back in the TUI. Still under the lock: a create of the same path
-        // waits until the hook has released what it is about to claim,
-        // and the hook's "still on disk" check sees the delete's result,
-        // not a recreate's.
-        self.run_worktree_hook(WorktreeHook::Delete, &project.repo_path, &worktree)
-            .await;
-        drop(ops);
-        Ok(())
-    }
-
-    /// Run the repository's WORKTREE HOOK for `hook`, if it configures
-    /// one, and turn anything it has to say into a client warning.
-    async fn run_worktree_hook(&self, hook: WorktreeHook, repo: &Path, worktree: &Worktree) {
-        let ctx = HookContext {
-            repo,
-            worktree: &worktree.path,
-            branch: &worktree.branch,
-            id: &worktree.id,
-        };
-        if let Err(e) = worktree_hooks::run(hook, ctx).await {
-            self.warn_clients(format!("{e:#}"));
-        }
-    }
-
     /// Tell every client about something that went wrong after a request
     /// had already succeeded. Rides `ServerEvent::Error` with no `req_id`,
     /// which the TUI shows as a flash and ties to no pending intent.
@@ -1947,26 +1671,45 @@ impl Daemon {
         });
     }
 
-    /// Reconcile legacy single-repository projects with `git worktree list`
-    /// and refresh explicit member checkout observations. Grouped workspace
-    /// membership is authoritative: unknown worktrees are never adopted and
-    /// missing members remain recorded while their workspace becomes unavailable.
+    /// Refresh explicit project member checkouts and session workspace
+    /// observations. Unknown repository worktrees are never adopted.
     pub async fn sync_project_worktrees(self: &Arc<Self>, project: &Project) -> Result<()> {
         let members = self.store.project_repositories(&project.id)?;
-        if !members.is_empty() {
-            return self.sync_project_repositories(project, &members).await;
+        if members.is_empty() {
+            bail!("project has no registered repositories");
         }
-        let adopted = {
-            let _ops = self.worktree_ops.lock().await;
-            self.reconcile_project_worktrees(project).await?
-        };
-        // Outside the ops lock: the replay only touches agent rows, and a
-        // just-adopted checkout is exactly where a session that ran
-        // `git worktree add` itself already lives.
-        if adopted {
-            self.reparent_agents_by_last_cwd(project);
+        self.sync_project_repositories(project, &members).await
+    }
+
+    /// Resolve a selected repository's checkout from a workspace identity.
+    pub fn workspace_repository_path(
+        &self,
+        workspace: &WorktreeId,
+        repository: Option<&str>,
+    ) -> Result<PathBuf> {
+        let root = self
+            .store
+            .get_worktree(workspace)?
+            .context("workspace not found")?;
+        let members = self.store.project_repositories(&root.project_id)?;
+        let selected = repository
+            .and_then(|name| members.iter().find(|member| member.name == name))
+            .or_else(|| members.first())
+            .context("workspace has no registered repositories")?;
+        if root.is_main {
+            Ok(selected.path.clone())
+        } else {
+            let session = self
+                .store
+                .session_workspace(workspace)?
+                .context("session workspace metadata missing")?;
+            session
+                .repositories
+                .iter()
+                .find(|member| member.name == selected.name)
+                .map(|member| member.path.clone())
+                .context("selected repository is not a workspace member")
         }
-        Ok(())
     }
 
     async fn sync_project_repositories(
@@ -2186,84 +1929,6 @@ impl Daemon {
             }
         }
         Ok(())
-    }
-
-    /// The reconcile half of `sync_project_worktrees`. Returns whether any
-    /// checkout was newly adopted.
-    async fn reconcile_project_worktrees(self: &Arc<Self>, project: &Project) -> Result<bool> {
-        if !self.store.project_repositories(&project.id)?.is_empty() {
-            return Ok(false);
-        }
-        let mut adopted = false;
-        let entries = git::list_worktrees(&project.repo_path).await?;
-        // git lists the main checkout first, and that — not the order rows
-        // happened to be inserted in — is what makes a row the ⌂ root row.
-        // Deriving it here every pass repairs a project whose rows were seeded
-        // before the root was known, and keeps root-ness following the repo
-        // when the checkouts underneath it change.
-        let main_path = entries.first().map(|e| e.path.clone());
-        let is_root = |path: &Path| main_path.as_deref() == Some(path);
-        let (_, worktrees, agents, terminals) = self.store.load_tree()?;
-        let ours: Vec<&Worktree> = worktrees
-            .iter()
-            .filter(|w| w.project_id == project.id)
-            .collect();
-        for entry in &entries {
-            if let Some(known) = ours.iter().find(|w| w.path == entry.path) {
-                // Branch switched in place (checkout on the root or inside a
-                // linked worktree): refresh the stored name so the row tracks
-                // reality instead of the branch at adoption time.
-                let root = is_root(&entry.path);
-                if known.branch != entry.branch || known.is_main != root {
-                    if known.branch != entry.branch {
-                        self.store
-                            .update_worktree_branch(&known.id, &entry.branch)?;
-                    }
-                    if known.is_main != root {
-                        self.store.set_worktree_main(&known.id, root)?;
-                    }
-                    let mut updated = (*known).clone();
-                    updated.branch = entry.branch.clone();
-                    updated.is_main = root;
-                    self.broadcast(ServerEvent::EntityUpserted {
-                        entity: Entity::Worktree(updated),
-                    });
-                }
-                continue;
-            }
-            let worktree = Worktree {
-                id: WorktreeId::generate(),
-                project_id: project.id.clone(),
-                is_main: is_root(&entry.path),
-                path: entry.path.clone(),
-                branch: entry.branch.clone(),
-                sort_order: 0,
-            };
-            self.store.insert_worktree(&worktree)?;
-            adopted = true;
-            self.broadcast(ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(worktree),
-            });
-        }
-        for w in ours {
-            // The main checkout is always somewhere in git's list, so a row
-            // that isn't there is a linked checkout that went away — including
-            // one still carrying an `is_main` from before root-ness was
-            // derived, which no longer earns the row a reprieve.
-            if entries.iter().any(|e| e.path == w.path) {
-                continue;
-            }
-            let occupied = agents.iter().any(|a| a.worktree_id == w.id)
-                || terminals.iter().any(|t| t.worktree_id == w.id);
-            if occupied {
-                continue;
-            }
-            self.store.delete_worktree(&w.id)?;
-            self.broadcast(ServerEvent::EntityRemoved {
-                id: EntityId::Worktree(w.id.clone()),
-            });
-        }
-        Ok(adopted)
     }
 
     // ---- agents ----
@@ -2854,355 +2519,11 @@ impl Daemon {
         Ok(())
     }
 
-    /// `nebula worktree <branch>`, run by the agent inside its own session.
-    /// The row moves under `branch`'s worktree of the same project now —
-    /// created when the project has no checkout for that branch yet — and
-    /// a live PTY follows once its turn ends (`complete_pending_move`),
-    /// because the CLI running this command *is* that PTY's foreground
-    /// tool call: killing it here would cut the turn off mid-answer.
-    pub async fn enter_worktree(
-        self: &Arc<Self>,
-        id: &AgentId,
-        branch: &str,
-        base: Option<&str>,
-    ) -> Result<(Worktree, EnterOutcome)> {
-        let agent = self.store.get_agent(id)?.context("agent not found")?;
-        let current = self
-            .store
-            .get_worktree(&agent.worktree_id)?
-            .context("worktree not found")?;
-        if !self
-            .store
-            .project_repositories(&current.project_id)?
-            .is_empty()
-        {
-            bail!("agent-requested worktrees are not available in multi-repository projects");
-        }
-        if agent.archived {
-            bail!("agent is archived");
-        }
-        let branch = branch.trim();
-        if branch.is_empty() {
-            bail!("branch name is empty");
-        }
-        let (_, worktrees, _, _) = self.store.load_tree()?;
-        let existing = worktrees
-            .into_iter()
-            .find(|w| w.project_id == current.project_id && w.branch == branch);
-        let target = match existing {
-            Some(w) => w,
-            None => {
-                let created = self
-                    .create_worktree(&current.project_id, branch, base)
-                    .await?;
-                let EntityId::Worktree(new_id) = created else {
-                    bail!("worktree creation returned a non-worktree entity");
-                };
-                self.store
-                    .get_worktree(&new_id)?
-                    .context("worktree not found")?
-            }
-        };
-        if target.id == current.id {
-            return Ok((target, EnterOutcome::AlreadyThere));
-        }
-        let alive = self.session(&SessionRef::Agent(id.clone())).is_some();
-        // Same invalidation as `relocate_into`: every cwd this process
-        // reports until it respawns is the old checkout's.
-        self.last_cwd.lock().unwrap().remove(id);
-        if alive {
-            self.pending_moves
-                .lock()
-                .unwrap()
-                .insert(id.clone(), target.clone());
-        }
-        self.store.set_agent_worktree(id, &target.id)?;
-        self.broadcast_agent(id)?;
-        let outcome = if alive {
-            EnterOutcome::Relocating
-        } else {
-            EnterOutcome::NextLaunch
-        };
-        Ok((target, outcome))
-    }
-
-    /// The turn an agent ran `nebula worktree` in has ended: make the
-    /// process match its row. Kill it and respawn it resumed in the target,
-    /// with a prompt naming the checkout it now runs in so the conversation
-    /// carries straight on (Claude, codex and pi take that prompt as an
-    /// argument; cursor resumes silent and waits for the user — see
-    /// `relocation_prompt`). Gated on the turn-end signals — Stop, the idle
-    /// notification a Stop-less end still fires, and the progress clear
-    /// that is the only word of a cancelled turn — so a Bash hook from the
-    /// same turn never triggers it.
-    ///
-    /// The status machine held that turn end at `running` for the
-    /// relocation (`AgentStatusMachine::set_relocating`), so the card never
-    /// drops to the bottom of the grid for the seconds until the respawned
-    /// CLI's first hook: a respawn that opens on the notice is seeded as a
-    /// launch, the way a create with a task is, and any other outcome — a
-    /// silent respawn, a failed one, nothing left to respawn — lets the
-    /// held end finish the turn after all.
-    pub fn complete_pending_move(self: &Arc<Self>, id: &AgentId, event: &HookEvent) {
-        let turn_over = match event {
-            HookEvent::Stop => true,
-            HookEvent::Notification { notification_type } => {
-                notification_type.as_deref() == Some("idle_prompt")
-            }
-            HookEvent::Progress { busy } => !busy,
-            _ => false,
-        };
-        if !turn_over {
-            return;
-        }
-        let Some(target) = self.pending_moves.lock().unwrap().remove(id) else {
-            return;
-        };
-        if self.relocate_into(id, &target) {
-            // Working from the moment it boots, on the notice: seeded with
-            // the launch reprieve so its startup progress-clear cannot
-            // green it out before that turn begins (see `create_agent`).
-            self.status_machines
-                .lock()
-                .unwrap()
-                .insert(id.clone(), AgentStatusMachine::launching());
-        } else {
-            self.release_relocation_hold(id);
-        }
-    }
-
-    /// The kill-and-respawn of [`Self::complete_pending_move`]. True when
-    /// the respawn opened on the relocation notice — the one outcome that
-    /// carries on the turn the status machine held.
-    fn relocate_into(self: &Arc<Self>, id: &AgentId, target: &Worktree) -> bool {
-        let agent = match self.store.get_agent(id) {
-            Ok(Some(agent)) if !agent.archived && agent.worktree_id == target.id => agent,
-            // Archived, deleted, or moved elsewhere by hand since: the
-            // row's current home wins, nothing to relocate into.
-            _ => return false,
-        };
-        let sref = SessionRef::Agent(id.clone());
-        if self.session(&sref).is_none() {
-            // Died since (or the user closed it): the next launch boots in
-            // the target on its own, only without the relocation notice.
-            return false;
-        }
-        tracing::info!(agent = %id, to = %target.branch, "relocating session into its worktree");
-        self.kill_session(&sref);
-        self.last_cwd.lock().unwrap().remove(id);
-        // A row whose entry went missing since still relocates; the boot
-        // itself refuses with the entry's reason, so the notice degrades
-        // to none rather than failing the move.
-        let prompt = resolve_harness(agent.kind, agent.custom_harness.as_deref())
-            .map(|harness| relocation_prompt(harness.relocation_prompt, target))
-            .unwrap_or(None);
-        let spawned = self.spawn_agent_session_with(
-            &agent,
-            target,
-            DEFAULT_COLS,
-            DEFAULT_ROWS,
-            None,
-            prompt.as_deref(),
-        );
-        let continued = match spawned {
-            Ok(_) => prompt.is_some(),
-            Err(e) => {
-                tracing::warn!(agent = %id, error = %e, "respawn after worktree relocation failed");
-                false
-            }
-        };
-        self.try_broadcast_agent(id);
-        continued
-    }
-
-    /// No respawn is carrying the held turn on: the end the status machine
-    /// held for the relocation lands now, as the Stop it was. A machine not
-    /// mid-turn held nothing — the row finished or died the ordinary way —
-    /// and is left alone.
-    fn release_relocation_hold(&self, id: &AgentId) {
-        let effects = {
-            let mut machines = self.status_machines.lock().unwrap();
-            let Some(machine) = machines.get_mut(id) else {
-                return;
-            };
-            if !matches!(
-                machine.status(),
-                AgentStatus::Running | AgentStatus::NeedsFeedback
-            ) {
-                return;
-            }
-            machine.set_relocating(false);
-            machine.handle(HookEvent::Stop, None, Instant::now())
-        };
-        self.apply_status_effects(id, effects);
-    }
-
-    /// Whether `id` is between `enter_worktree` and its respawn.
-    #[cfg(test)]
-    fn relocation_pending(&self, id: &AgentId) -> bool {
-        self.pending_moves.lock().unwrap().contains_key(id)
-    }
-
-    /// Row-only re-home: store update plus broadcast, never the PTY. The
-    /// hook-cwd reparent uses this — there the process already runs in the
-    /// target checkout and only the row is stale, so killing it would
-    /// interrupt a live conversation for nothing.
-    fn move_agent_row(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
-        self.store.set_agent_worktree(id, worktree_id)?;
-        self.broadcast_agent(id)?;
-        Ok(())
-    }
-
     /// A hook payload reported the agent CLI's working directory. When that
     /// directory sits inside a *different* worktree of the same project (the
     /// session entered a worktree it created mid-conversation), re-home the
     /// agent row so the tree reflects where the work actually happens.
     /// Fail-soft: any error leaves the row where it is.
-    pub fn reparent_agent_by_cwd(
-        self: &Arc<Self>,
-        agent_id: &AgentId,
-        cwd: &str,
-        payload_session_id: Option<&str>,
-        captures_session: bool,
-    ) {
-        if let Err(e) =
-            self.try_reparent_agent_by_cwd(agent_id, cwd, payload_session_id, captures_session)
-        {
-            tracing::warn!(agent = %agent_id, error = %e, "cwd reparent failed");
-        }
-    }
-
-    fn try_reparent_agent_by_cwd(
-        self: &Arc<Self>,
-        agent_id: &AgentId,
-        cwd: &str,
-        payload_session_id: Option<&str>,
-        captures_session: bool,
-    ) -> Result<()> {
-        let Some(agent) = self.store.get_agent(agent_id)? else {
-            self.last_cwd.lock().unwrap().remove(agent_id);
-            return Ok(());
-        };
-        if agent.archived {
-            self.last_cwd.lock().unwrap().remove(agent_id);
-            return Ok(());
-        }
-        // Mid-relocation the row already sits under the target while the
-        // process still reports the old checkout — ignore it until the
-        // respawn lands there.
-        if self.pending_moves.lock().unwrap().contains_key(agent_id) {
-            return Ok(());
-        }
-        let Some(worktree) = self.store.get_worktree(&agent.worktree_id)? else {
-            return Ok(());
-        };
-        // A multi-repository project's worktree rows describe either its
-        // workspace folders or the repositories inside them. A hook cwd is
-        // navigation within that workspace, never a change of session owner.
-        // Do not remember it either: a later Git sync must not replay it as
-        // an ownership change after adopting another checkout.
-        if !self
-            .store
-            .project_repositories(&worktree.project_id)?
-            .is_empty()
-        {
-            self.last_cwd.lock().unwrap().remove(agent_id);
-            return Ok(());
-        }
-        // Same foreign-session rule as the status machine: a payload from a
-        // different CLI session only counts when the event (re)establishes
-        // session ownership (UserPromptSubmit / SessionStart).
-        if !captures_session {
-            if let (Some(mine), Some(theirs)) = (agent.session_id.as_deref(), payload_session_id) {
-                if mine != theirs {
-                    return Ok(());
-                }
-            }
-        }
-        let cwd = canonical_or_raw(Path::new(cwd));
-        // Remembered even when it resolves to nothing: an agent that just ran
-        // `git worktree add` and stepped into the result reports a cwd nebula
-        // has no row for yet, and the worktree sync replays this to finish the
-        // re-home the moment that row is adopted.
-        self.last_cwd
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone(), cwd.clone());
-        self.reparent_agent_to_cwd(&agent, &cwd)
-    }
-
-    /// Move `agent`'s row under the worktree owning `cwd` when that is a
-    /// different worktree of the same project. `cwd` must already be
-    /// canonicalized.
-    fn reparent_agent_to_cwd(self: &Arc<Self>, agent: &Agent, cwd: &Path) -> Result<()> {
-        let Some(current) = self.store.get_worktree(&agent.worktree_id)? else {
-            return Ok(());
-        };
-        let (_, worktrees, _, _) = self.store.load_tree()?;
-        // Deepest worktree of the same project containing cwd — nested
-        // layouts (checkouts under the repo root) must not resolve to the
-        // root row just because the root path is also a prefix.
-        let target = worktrees
-            .into_iter()
-            .filter(|w| w.project_id == current.project_id)
-            .map(|w| {
-                let canonical = canonical_or_raw(&w.path);
-                (w, canonical)
-            })
-            .filter(|(_, canonical)| cwd.starts_with(canonical))
-            .max_by_key(|(_, canonical)| canonical.components().count());
-        if let Some((worktree, _)) = target {
-            if worktree.id != agent.worktree_id {
-                tracing::info!(
-                    agent = %agent.id,
-                    from = %current.branch,
-                    to = %worktree.branch,
-                    "agent re-homed by hook cwd"
-                );
-                self.move_agent_row(&agent.id, &worktree.id)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Replay remembered hook cwds for `project`'s agents. Runs after the
-    /// worktree sync adopts checkouts: a session that creates a worktree and
-    /// enters it reports the new cwd (often on the very next `Stop`) before
-    /// the row exists, and without this replay its row would sit under the
-    /// old checkout until the user's next prompt.
-    fn reparent_agents_by_last_cwd(self: &Arc<Self>, project: &Project) {
-        let known: Vec<(AgentId, PathBuf)> = {
-            let map = self.last_cwd.lock().unwrap();
-            map.iter().map(|(id, p)| (id.clone(), p.clone())).collect()
-        };
-        for (agent_id, cwd) in known {
-            let agent = match self.store.get_agent(&agent_id) {
-                Ok(Some(agent)) => agent,
-                Ok(None) => {
-                    self.last_cwd.lock().unwrap().remove(&agent_id);
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(agent = %agent_id, error = %e, "cwd replay lookup failed");
-                    continue;
-                }
-            };
-            if agent.archived {
-                continue;
-            }
-            let in_project = matches!(
-                self.store.get_worktree(&agent.worktree_id),
-                Ok(Some(w)) if w.project_id == project.id
-            );
-            if !in_project {
-                continue;
-            }
-            if let Err(e) = self.reparent_agent_to_cwd(&agent, &cwd) {
-                tracing::warn!(agent = %agent_id, error = %e, "cwd replay reparent failed");
-            }
-        }
-    }
-
     pub fn archive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.store.set_agent_archived(id, true)?;
@@ -3229,8 +2550,6 @@ impl Daemon {
 
     pub fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.kill_session(&SessionRef::Agent(id.clone()));
-        self.last_cwd.lock().unwrap().remove(id);
-        self.pending_moves.lock().unwrap().remove(id);
         self.store.delete_agent(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Agent(id.clone()),
@@ -3913,8 +3232,7 @@ impl Daemon {
     /// The general spawn: `cloud_task` makes it a Claude Cloud dispatch
     /// (`claude --cloud <task>`, which creates the session, prints its id
     /// and exits), `initial_prompt` a first turn the CLI submits on its own
-    /// (the relocation notice a `nebula worktree` respawn opens with, or the
-    /// prefix + task + postfix an AGENT PRESET launch composes). Both
+    /// (the prefix + task + postfix an AGENT PRESET launch composes). Both
     /// are intentionally transient: later restarts/resumes follow the
     /// persisted Agent fields — a Cloud row's `cloud_session_id` makes
     /// `restart_agent` and `ensure_session` refuse to boot a local CLI for
@@ -3962,9 +3280,6 @@ impl Daemon {
         initial_prompt: Option<&str>,
         attach: Option<&str>,
     ) -> Result<Arc<PtySession>> {
-        // Whatever spawns this agent, it runs in `worktree` from here: a
-        // relocation still pending for it has been overtaken.
-        self.pending_moves.lock().unwrap().remove(&agent.id);
         // Every row resolves its registry descriptor once, up front: a row
         // whose entry was deleted or broken since refuses the boot with
         // its reason rather than launching the wrong CLI, and the same
@@ -4429,10 +3744,6 @@ impl Daemon {
                         if let SessionRef::Agent(id) = &sref {
                             if daemon.owns_session(&sref, &session) {
                                 daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
-                                // A cancelled turn's only word: a relocation
-                                // waiting on this turn's end goes now, not
-                                // at the end of the next one.
-                                daemon.complete_pending_move(id, &HookEvent::Progress { busy });
                             }
                         }
                     }
@@ -4496,7 +3807,6 @@ impl Daemon {
                         {
                             if daemon.owns_session(&sref, &session) {
                                 daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
-                                daemon.complete_pending_move(id, &HookEvent::Progress { busy });
                             }
                         }
                         continue;
@@ -4891,13 +4201,6 @@ pub(crate) fn sanitize_title(raw: &str) -> String {
         title.truncate(title.trim_end().len());
     }
     title
-}
-
-/// Canonicalize for path containment tests, falling back to the raw path
-/// when it doesn't resolve (deleted checkout, not-yet-created dir). macOS
-/// symlinks (`/tmp` → `/private/tmp`) otherwise break `starts_with`.
-fn canonical_or_raw(path: &Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Does this agent still have a backgrounded tool call running — a job it
@@ -6701,122 +6004,6 @@ mod tests {
     /// WORKTREE — and every later launch for that PR finds the same row.
     /// Only a PR whose branch the root itself has checked out runs there.
     #[tokio::test]
-    async fn pr_worktree_is_created_once_and_shared_by_later_launches() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = root.join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-b", "main"]);
-        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
-        let origin = root.join("origin.git");
-        std::fs::create_dir(&origin).unwrap();
-        git_in(&origin, &["init", "--bare", "-b", "main"]);
-        git_in(
-            &repo,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
-        git_in(&repo, &["push", "-u", "origin", "main"]);
-        git_in(&repo, &["branch", "feat-x", "main"]);
-        git_in(&repo, &["push", "origin", "feat-x"]);
-        git_in(&repo, &["branch", "-D", "feat-x"]);
-
-        let daemon = test_daemon();
-        let EntityId::Project(project) = daemon.add_project(&repo, None, false).await.unwrap()
-        else {
-            panic!("expected a project id");
-        };
-        let mut events = daemon.events.subscribe();
-
-        let first = daemon.pr_worktree(&project, 7, "feat-x").await.unwrap();
-        assert!(!first.is_main, "never the ROOT WORKTREE");
-        assert_eq!(first.branch, "feat-x");
-        assert_eq!(first.path, git::worktree_dir(&repo, "feat-x"));
-        assert!(first.path.join(".git").exists(), "a real checkout");
-        assert!(
-            matches!(
-                events.try_recv(),
-                Ok(ServerEvent::EntityUpserted {
-                    entity: Entity::Worktree(w)
-                }) if w.id == first.id
-            ),
-            "clients hear about the new row before the agent lands in it"
-        );
-
-        let again = daemon.pr_worktree(&project, 7, "feat-x").await.unwrap();
-        assert_eq!(
-            again.id, first.id,
-            "one checkout per PR, shared by every launch"
-        );
-        assert!(events.try_recv().is_err(), "nothing new to broadcast");
-
-        let on_main = daemon.pr_worktree(&project, 8, "main").await.unwrap();
-        assert!(
-            on_main.is_main,
-            "a PR whose branch the root has checked out is already there"
-        );
-
-        // A fork's `main` is not that branch: the client names its checkout
-        // for the fork's owner, so the root is no match — the contributor's
-        // commit gets a checkout of its own, shared like any other.
-        git_in(&repo, &["commit", "--allow-empty", "-m", "fork work"]);
-        git_in(&repo, &["push", "origin", "HEAD:refs/pull/129/head"]);
-        git_in(&repo, &["reset", "--hard", "origin/main"]);
-        let fork = daemon
-            .pr_worktree(&project, 129, "someone/main")
-            .await
-            .unwrap();
-        assert!(!fork.is_main, "a fork's main is never the ROOT WORKTREE");
-        assert_eq!(fork.branch, "someone/main");
-        assert_eq!(fork.path, git::worktree_dir(&repo, "someone/main"));
-        let again = daemon
-            .pr_worktree(&project, 129, "someone/main")
-            .await
-            .unwrap();
-        assert_eq!(again.id, fork.id, "and later launches share it");
-
-        // A bad head never reaches git — it is refused ahead of the lookup.
-        let err = daemon
-            .create_pr_agent(crate::pr_scope::CreatePrAgentSpec {
-                project: project.clone(),
-                name: "pr".into(),
-                kind: AgentKind::Claude,
-                custom_harness: None,
-                model: None,
-                effort: None,
-                auto_title: false,
-                pr_url: "https://github.com/o/r/pull/7".into(),
-                head: "--force".into(),
-                starting_prompt: None,
-            })
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("not a branch name"), "{err}");
-
-        // A preset's composed prompt rides the same create, and is held to
-        // `CreateAgent`'s rules once the checkout is found: it reaches the
-        // agent create, where the NUL is refused.
-        let err = daemon
-            .create_pr_agent(crate::pr_scope::CreatePrAgentSpec {
-                project: project.clone(),
-                name: "pr".into(),
-                kind: AgentKind::Claude,
-                custom_harness: None,
-                model: None,
-                effort: None,
-                auto_title: true,
-                pr_url: "https://github.com/o/r/pull/7".into(),
-                head: "feat-x".into(),
-                starting_prompt: Some("fix\0auth".into()),
-            })
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("NUL"), "{err}");
-    }
-
-    /// The ISSUE SESSION's URL is checked at the boundary like the PR
-    /// SESSION's: every harness may carry one, a PR URL is not an issue,
-    /// and Claude Cloud takes no launch context at all.
-    #[tokio::test]
     async fn issue_launch_context_is_accepted_for_every_kind_but_never_with_cloud() {
         let daemon = test_daemon();
         let spec = |kind: AgentKind, cloud: Option<&str>| CreateAgentSpec {
@@ -7128,283 +6315,35 @@ mod tests {
             .to_string()
     }
 
-    #[tokio::test]
-    async fn enter_worktree_takes_an_existing_branch_and_moves_the_row_now() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p"]);
-        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
-        seed_agent(&daemon, "a1", "root", Some("s1"));
-        let a1 = AgentId("a1".into());
-        let mut rx = daemon.events.subscribe();
-
-        let (target, outcome) = daemon.enter_worktree(&a1, "feat", None).await.unwrap();
-        assert_eq!(target.id.to_string(), "feat");
-        // No PTY runs here, so nothing waits on a turn end.
-        assert_eq!(outcome, EnterOutcome::NextLaunch);
-        assert!(!daemon.relocation_pending(&a1));
-        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
-        match rx.try_recv().unwrap() {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(a),
-            } => assert_eq!(a.worktree_id.to_string(), "feat"),
-            other => panic!("expected agent upsert, got {other:?}"),
-        }
-
-        // Already there: a settled answer, no broadcast.
-        let (again, outcome) = daemon.enter_worktree(&a1, "feat", None).await.unwrap();
-        assert_eq!(again.id, target.id);
-        assert_eq!(outcome, EnterOutcome::AlreadyThere);
-        assert!(rx.try_recv().is_err(), "no broadcast for a no-op enter");
-
-        // Blank names are refused before anything is touched.
-        assert!(daemon.enter_worktree(&a1, "  ", None).await.is_err());
-    }
-
-    /// Between `nebula worktree` and the turn's Stop the row already sits
-    /// under the target while the process still reports the old checkout:
-    /// that cwd must not drag it back, and only a turn-end hook drains the
-    /// pending relocation.
-    #[test]
-    fn pending_relocation_ignores_the_old_cwd_until_the_turn_ends() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p"]);
-        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
-        seed_agent(&daemon, "a1", "feat", Some("s1"));
-        let a1 = AgentId("a1".into());
-        let feat = daemon
-            .store
-            .get_worktree(&WorktreeId("feat".into()))
-            .unwrap()
-            .unwrap();
-        daemon
-            .pending_moves
-            .lock()
-            .unwrap()
-            .insert(a1.clone(), feat);
-
-        daemon.reparent_agent_by_cwd(&a1, "/nebula-test/p", Some("s1"), false);
-        assert_eq!(
-            agent_worktree(&daemon, "a1"),
-            "feat",
-            "the old checkout's cwd is ignored mid-relocation"
-        );
-
-        daemon.complete_pending_move(
-            &a1,
-            &HookEvent::PostToolUse {
-                tool_name: Some("Bash".into()),
-                subagent_id: None,
-            },
-        );
-        assert!(
-            daemon.relocation_pending(&a1),
-            "a tool hook is not a turn end"
-        );
-        daemon.complete_pending_move(&a1, &HookEvent::Stop);
-        assert!(!daemon.relocation_pending(&a1));
-
-        // Drained, the reparent is live again.
-        daemon.reparent_agent_by_cwd(&a1, "/nebula-test/p", Some("s1"), false);
-        assert_eq!(agent_worktree(&daemon, "a1"), "root");
-    }
-
-    /// `nebula worktree` from a live session: the turn end that triggers
-    /// the relocation must not finish the row for the seconds until the
-    /// respawned CLI's first hook — the card would drop to the bottom of
-    /// the grid and climb back — so the Stop is held at `running`, the
-    /// respawn is seeded as a launch (its startup progress-clear swallowed),
-    /// and only the relocated turn's own end finishes it.
-    #[tokio::test]
-    async fn a_relocation_keeps_the_row_running_through_the_respawn() {
-        let daemon = test_daemon();
-        let (dir, main) = run_worktree(&daemon);
-        let feat_dir = tempfile::tempdir().unwrap();
-        let feat = Worktree {
-            id: WorktreeId::generate(),
-            project_id: main.project_id.clone(),
-            path: feat_dir.path().to_path_buf(),
-            branch: "feat".into(),
-            is_main: false,
-            sort_order: 1,
-        };
-        daemon.store.insert_worktree(&feat).unwrap();
-        // `/bin/cat` stands in for the CLI, on the first boot and the
-        // respawn alike (an override takes no argv, notice included).
-        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
-        let EntityId::Agent(id) = daemon
-            .create_agent(CreateAgentSpec {
-                worktree: main.id.clone(),
-                name: "a".into(),
-                kind: AgentKind::Claude,
-                custom_harness: None,
-                model: None,
-                effort: None,
-                auto_title: false,
-                cloud_prompt: None,
-                starting_prompt: None,
-                pr_url: None,
-                issue_url: None,
-            })
-            .await
-            .unwrap()
-        else {
-            panic!("a create makes an agent");
-        };
-        let sref = SessionRef::Agent(id.clone());
-        let status = |id: &AgentId| daemon.store.get_agent(id).unwrap().unwrap().status;
-        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("s1".into()));
-        assert_eq!(status(&id), AgentStatus::Running);
-
-        // The turn runs `nebula worktree feat`: the row moves now, the PTY
-        // waits for the turn's end.
-        let (_, outcome) = daemon.enter_worktree(&id, "feat", None).await.unwrap();
-        assert_eq!(outcome, EnterOutcome::Relocating);
-        let first = daemon.session(&sref).expect("still the first PTY");
-        let mut rx = daemon.events.subscribe();
-
-        // The turn's Stop lands as the hook loop delivers it: through the
-        // status machine first, then the relocation.
-        daemon.apply_hook_event(&id, HookEvent::Stop, Some("s1".into()));
-        assert_eq!(
-            status(&id),
-            AgentStatus::Running,
-            "the Stop is held for the relocation"
-        );
-        daemon.complete_pending_move(&id, &HookEvent::Stop);
-        assert!(!daemon.relocation_pending(&id));
-        let second = daemon.session(&sref).expect("respawned in the worktree");
-        assert!(!Arc::ptr_eq(&first, &second), "a new PTY");
-        assert_eq!(status(&id), AgentStatus::Running);
-        // The respawned CLI's startup progress-clear is its boot, not a
-        // turn ending.
-        daemon.apply_hook_event(&id, HookEvent::Progress { busy: false }, None);
-        assert_eq!(status(&id), AgentStatus::Running);
-        while let Ok(ev) = rx.try_recv() {
-            assert!(
-                !matches!(
-                    ev,
-                    ServerEvent::StatusChanged {
-                        status: AgentStatus::Finished,
-                        ..
-                    }
-                ),
-                "nothing in between said finished: {ev:?}"
-            );
-        }
-        // The relocated turn's own end does.
-        daemon.apply_hook_event(&id, HookEvent::Stop, Some("s1".into()));
-        assert_eq!(status(&id), AgentStatus::Finished);
-        drop(dir);
-    }
-
-    /// The same relocation when the respawn carries no notice (cursor
-    /// resumes silent and waits for the user) or nothing is left to
-    /// respawn: the held turn end finishes the row after all, since no
-    /// prompt is carrying the work on.
-    #[test]
-    fn a_relocation_with_no_respawn_lets_the_held_turn_end_finish() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p"]);
-        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
-        seed_agent(&daemon, "a1", "feat", Some("s1"));
-        let a1 = AgentId("a1".into());
-        let feat = daemon
-            .store
-            .get_worktree(&WorktreeId("feat".into()))
-            .unwrap()
-            .unwrap();
-        daemon
-            .pending_moves
-            .lock()
-            .unwrap()
-            .insert(a1.clone(), feat);
-        let status = |id: &AgentId| daemon.store.get_agent(id).unwrap().unwrap().status;
-
-        daemon.apply_hook_event(&a1, HookEvent::Stop, Some("s1".into()));
-        assert_eq!(status(&a1), AgentStatus::Running, "held while pending");
-        // No PTY to relocate: the hold is released and the Stop finishes it.
-        daemon.complete_pending_move(&a1, &HookEvent::Stop);
-        assert!(!daemon.relocation_pending(&a1));
-        assert_eq!(status(&a1), AgentStatus::Finished);
-    }
-
-    #[tokio::test]
-    async fn enter_worktree_creates_the_checkout_in_nebulas_layout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = root.join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-b", "main"]);
-        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
-        let daemon = test_daemon();
-        daemon
-            .store
-            .insert_project(&Project {
-                id: ProjectId("p".into()),
-                name: "p".into(),
-                repo_path: repo.clone(),
-                sort_order: 0,
-            })
-            .unwrap();
-        seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
-        seed_agent(&daemon, "a1", "root", Some("s1"));
-        let a1 = AgentId("a1".into());
-        let mut rx = daemon.events.subscribe();
-
-        let (target, _) = daemon.enter_worktree(&a1, "feat", None).await.unwrap();
-        assert_eq!(target.branch, "feat");
-        assert_eq!(target.path, root.join("repo-worktrees").join("feat"));
-        assert!(target.path.join(".git").exists(), "a real checkout");
-        assert_eq!(agent_worktree(&daemon, "a1"), target.id.to_string());
-        // The worktree's upsert lands first, then the agent's.
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.id == target.id
-        ));
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            ServerEvent::EntityUpserted { entity: Entity::Agent(a) } if a.worktree_id == target.id
-        ));
-    }
-
-    fn seed_pending_agent(daemon: &Daemon, id: &str, worktree: &str) {
-        daemon
-            .store
-            .insert_agent_with_auto_title(
-                &Agent {
-                    id: AgentId(id.into()),
-                    worktree_id: WorktreeId(worktree.into()),
-                    name: format!("{id}-default"),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    unseen: false,
-                    kind: AgentKind::Claude,
-                    custom_harness: None,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    cloud_session_id: None,
-                    sort_order: 0,
-                    status_changed_at: 0,
-                    alive: false,
-                    issue_url: None,
-                    recent_prompts: Vec::new(),
-                },
-                true,
-            )
-            .unwrap();
-    }
-
     #[test]
     fn auto_rename_applies_once_and_defers_to_user_titles() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p"]);
         seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_pending_agent(&daemon, "a1", "root");
+        let pending_a1 = Agent {
+            id: AgentId("a1".into()),
+            worktree_id: WorktreeId("root".into()),
+            name: "a1".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            status_changed_at: 0,
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 0,
+            alive: false,
+            issue_url: None,
+            recent_prompts: Vec::new(),
+        };
+        daemon
+            .store
+            .insert_agent_with_auto_title(&pending_a1, true)
+            .unwrap();
         let mut rx = daemon.events.subscribe();
 
         // First agent attempt lands, sanitized, and is broadcast.
@@ -7435,7 +6374,15 @@ mod tests {
 
         // A user rename beats a pending auto-title: the CLI's later attempt
         // must not clobber it.
-        seed_pending_agent(&daemon, "a2", "root");
+        let pending_a2 = Agent {
+            id: AgentId("a2".into()),
+            name: "a2".into(),
+            ..pending_a1
+        };
+        daemon
+            .store
+            .insert_agent_with_auto_title(&pending_a2, true)
+            .unwrap();
         daemon
             .rename_agent(&AgentId("a2".into()), "my session")
             .unwrap();
@@ -7466,613 +6413,6 @@ mod tests {
         let long = "word ".repeat(30);
         assert!(sanitize_title(&long).chars().count() <= 60);
         assert!(!sanitize_title(&long).ends_with(' '));
-    }
-
-    #[test]
-    fn reparent_by_cwd_picks_deepest_matching_worktree() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p"]);
-        // Nested layout: the linked checkout lives under the repo root, so
-        // both paths are prefixes of a cwd inside it — deepest must win.
-        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "p", "feat", "/nebula-test/p/.wt/feat", false);
-        seed_agent(&daemon, "a1", "root", None);
-
-        // cwd inside the root checkout (but outside the nested worktree)
-        // keeps the agent where it is.
-        daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/nebula-test/p/src", None, false);
-        assert_eq!(agent_worktree(&daemon, "a1"), "root");
-
-        // cwd inside the nested worktree re-homes it there.
-        daemon.reparent_agent_by_cwd(
-            &AgentId("a1".into()),
-            "/nebula-test/p/.wt/feat/src",
-            None,
-            false,
-        );
-        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
-
-        // cwd outside every worktree is ignored.
-        daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/elsewhere", None, false);
-        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
-    }
-
-    /// Regression: a session that creates a worktree and steps into it
-    /// reports the new cwd *before* the sync has adopted a row for it (the
-    /// `Stop` hook fires long before the next 2s sync tick). The cwd must be
-    /// remembered and replayed on adoption, or the row sits under the old
-    /// checkout until the user's next prompt.
-    #[tokio::test]
-    async fn worktree_sync_replays_a_cwd_reported_before_adoption() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = root.join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-b", "main"]);
-        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
-
-        let daemon = test_daemon();
-        let project = Project {
-            id: ProjectId("p".into()),
-            name: "p".into(),
-            repo_path: repo.clone(),
-            sort_order: 0,
-        };
-        daemon.store.insert_project(&project).unwrap();
-        seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
-        seed_agent(&daemon, "a1", "root", Some("s1"));
-
-        // The agent creates a sibling worktree and walks into it. The hook
-        // lands first: no row exists yet, so nothing moves.
-        let feat = root.join("repo-worktrees").join("feat");
-        git_in(
-            &repo,
-            &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
-        );
-        daemon.reparent_agent_by_cwd(
-            &AgentId("a1".into()),
-            &feat.to_string_lossy(),
-            Some("s1"),
-            false,
-        );
-        assert_eq!(agent_worktree(&daemon, "a1"), "root");
-
-        // The sync adopts the checkout and replays the remembered cwd.
-        daemon.sync_project_worktrees(&project).await.unwrap();
-        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
-        let adopted = worktrees
-            .iter()
-            .find(|w| w.branch == "feat")
-            .expect("feat worktree adopted");
-        assert_eq!(agent_worktree(&daemon, "a1"), adopted.id.to_string());
-    }
-
-    /// The replay is scoped to the synced project and skips archived rows.
-    #[test]
-    fn cwd_replay_skips_other_projects_and_archived_agents() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p", "q"]);
-        seed_worktree(&daemon, "p", "p-root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "q", "q-root", "/nebula-test/q", true);
-        seed_worktree(&daemon, "q", "q-feat", "/nebula-test/q-feat", false);
-        seed_agent(&daemon, "a1", "q-root", None);
-        seed_agent(&daemon, "a2", "q-root", None);
-
-        // Both agents report a cwd inside q-feat before it exists...
-        daemon
-            .store
-            .delete_worktree(&WorktreeId("q-feat".into()))
-            .unwrap();
-        daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/nebula-test/q-feat", None, false);
-        daemon.reparent_agent_by_cwd(&AgentId("a2".into()), "/nebula-test/q-feat", None, false);
-        seed_worktree(&daemon, "q", "q-feat", "/nebula-test/q-feat", false);
-
-        // ...but a replay for project p touches neither.
-        let p = daemon
-            .store
-            .get_project(&ProjectId("p".into()))
-            .unwrap()
-            .unwrap();
-        daemon.reparent_agents_by_last_cwd(&p);
-        assert_eq!(agent_worktree(&daemon, "a1"), "q-root");
-
-        // Archived agents stay put; live ones re-home.
-        daemon
-            .store
-            .set_agent_archived(&AgentId("a2".into()), true)
-            .unwrap();
-        let q = daemon
-            .store
-            .get_project(&ProjectId("q".into()))
-            .unwrap()
-            .unwrap();
-        daemon.reparent_agents_by_last_cwd(&q);
-        assert_eq!(agent_worktree(&daemon, "a1"), "q-feat");
-        assert_eq!(agent_worktree(&daemon, "a2"), "q-root");
-    }
-
-    /// Renaming a project relabels its row and nothing else: the checkout on
-    /// disk keeps its name, `repo_path` keeps pointing at it, and an empty
-    /// name puts the row back on the folder's own name — the only way back
-    /// once a project has been renamed.
-    #[tokio::test]
-    async fn rename_project_relabels_the_row_and_leaves_the_folder_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = root.join("acme-api");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-b", "main"]);
-        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
-
-        let daemon = test_daemon();
-        let id = match daemon.add_project(&repo, None, false).await.unwrap() {
-            EntityId::Project(id) => id,
-            other => panic!("expected a project id, got {other:?}"),
-        };
-        let named = |daemon: &Arc<Daemon>| daemon.store.get_project(&id).unwrap().unwrap();
-        assert_eq!(named(&daemon).name, "acme-api", "named after the folder");
-
-        daemon.rename_project(&id, "  Acme API  ").unwrap();
-        let project = named(&daemon);
-        assert_eq!(project.name, "Acme API", "trimmed and stored");
-        assert_eq!(project.repo_path, repo, "the folder is untouched");
-        assert!(repo.exists(), "and still on disk under its own name");
-        assert_eq!(
-            project.folder_subtitle().as_deref(),
-            Some("acme-api"),
-            "a renamed row still shows where it lives"
-        );
-
-        daemon.rename_project(&id, "   ").unwrap();
-        let project = named(&daemon);
-        assert_eq!(project.name, "acme-api", "empty resets to the folder name");
-        assert_eq!(project.folder_subtitle(), None, "nothing left to show");
-    }
-
-    /// `git rev-parse --show-toplevel` answers with the checkout it ran in, so
-    /// `nebula add .` from inside a linked worktree used to make the worktree
-    /// the project: named after the branch directory, `repo_path` pointing at
-    /// it, and a ⌂ root row for a directory the project did not own. The repo
-    /// is the project no matter which of its checkouts you add it from.
-    #[tokio::test]
-    async fn add_project_from_inside_a_worktree_roots_at_the_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = root.join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-b", "main"]);
-        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
-        let feat = root.join("repo-worktrees").join("gentle-narwhal-files");
-        git_in(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                &feat.to_string_lossy(),
-                "-b",
-                "gentle-narwhal-files",
-            ],
-        );
-
-        let daemon = test_daemon();
-        daemon.add_project(&feat, None, false).await.unwrap();
-
-        let (projects, worktrees, _, _) = daemon.store.load_tree().unwrap();
-        let project = projects.first().expect("project added");
-        assert_eq!(project.repo_path, repo, "project is rooted at the repo");
-        assert_eq!(project.name, "repo", "named after the repo, not the branch");
-
-        let main: Vec<&Worktree> = worktrees.iter().filter(|w| w.is_main).collect();
-        assert_eq!(main.len(), 1, "exactly one root row: {worktrees:#?}");
-        assert_eq!(
-            main[0].path, repo,
-            "the ⌂ root row is the project's own dir"
-        );
-        assert_eq!(main[0].branch, "main");
-        let linked = worktrees
-            .iter()
-            .find(|w| !w.is_main)
-            .expect("the worktree we added from is a plain row");
-        assert_eq!(linked.path, feat);
-        assert_eq!(linked.branch, "gentle-narwhal-files");
-    }
-
-    /// Adding the repo from a worktree of one already registered is the
-    /// same repo, so it collides instead of arriving as a second project.
-    #[tokio::test]
-    async fn adding_a_worktree_of_a_known_repo_is_a_duplicate() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = root.join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-b", "main"]);
-        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
-        let feat = root.join("repo-worktrees").join("feat");
-        git_in(
-            &repo,
-            &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
-        );
-
-        let daemon = test_daemon();
-        daemon.add_project(&repo, None, false).await.unwrap();
-        let err = daemon.add_project(&feat, None, false).await.unwrap_err();
-        assert!(
-            err.to_string().contains("already added"),
-            "expected a duplicate error, got: {err}"
-        );
-    }
-
-    /// Root-ness is derived from git's checkout list on every pass, not frozen
-    /// at insert time: a project whose rows were seeded before the root was
-    /// known (or seeded wrong) has its ⌂ root row repaired in place, and the
-    /// stale one loses the reprieve that kept it undeletable.
-    #[tokio::test]
-    async fn reconcile_moves_root_ness_onto_the_checkout_git_lists_first() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = root.join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-b", "main"]);
-        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
-        let feat = root.join("repo-worktrees").join("feat");
-        git_in(
-            &repo,
-            &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
-        );
-
-        let daemon = test_daemon();
-        let project = Project {
-            id: ProjectId("p".into()),
-            name: "p".into(),
-            repo_path: repo.clone(),
-            sort_order: 0,
-        };
-        daemon.store.insert_project(&project).unwrap();
-        // The wrong way round: the linked checkout wears the root badge and
-        // the repo's own checkout is a plain row.
-        seed_worktree(&daemon, "p", "wt", &feat.to_string_lossy(), true);
-        seed_worktree(&daemon, "p", "rt", &repo.to_string_lossy(), false);
-
-        daemon.sync_project_worktrees(&project).await.unwrap();
-
-        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
-        let by = |id: &str| worktrees.iter().find(|w| w.id.as_str() == id).unwrap();
-        assert!(by("rt").is_main, "the repo's checkout is the root row");
-        assert!(!by("wt").is_main, "the linked checkout gave the badge back");
-        assert_eq!(by("rt").branch, "main");
-        assert_eq!(by("wt").branch, "feat");
-    }
-
-    /// A row still carrying a stale `is_main` no longer survives its checkout
-    /// going away — the real root is always in git's list, so anything missing
-    /// from it is a linked checkout, whatever flag it happens to hold.
-    #[tokio::test]
-    async fn reconcile_drops_a_vanished_row_that_still_claims_to_be_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = root.join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-b", "main"]);
-        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
-
-        let daemon = test_daemon();
-        let project = Project {
-            id: ProjectId("p".into()),
-            name: "p".into(),
-            repo_path: repo.clone(),
-            sort_order: 0,
-        };
-        daemon.store.insert_project(&project).unwrap();
-        seed_worktree(&daemon, "p", "rt", &repo.to_string_lossy(), true);
-        seed_worktree(
-            &daemon,
-            "p",
-            "ghost",
-            &root.join("repo-worktrees").join("gone").to_string_lossy(),
-            true,
-        );
-
-        daemon.sync_project_worktrees(&project).await.unwrap();
-
-        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
-        assert!(
-            worktrees.iter().all(|w| w.id.as_str() != "ghost"),
-            "the ghost row is gone: {worktrees:#?}"
-        );
-        let rt = worktrees.iter().find(|w| w.id.as_str() == "rt").unwrap();
-        assert!(rt.is_main, "the surviving root row keeps the badge");
-    }
-
-    /// A fresh repo with one commit, at a canonical path (the macOS
-    /// tempdir is a symlink, and git reports worktrees canonically).
-    fn init_repo(root: &Path) -> PathBuf {
-        let repo = root.join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-b", "main"]);
-        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
-        repo
-    }
-
-    fn hook_script(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("hook.sh");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
-    fn project_at(daemon: &Daemon, repo: &Path) -> Project {
-        let project = Project {
-            id: ProjectId("p".into()),
-            name: "p".into(),
-            repo_path: repo.to_path_buf(),
-            sort_order: 0,
-        };
-        daemon.store.insert_project(&project).unwrap();
-        seed_worktree(daemon, "p", "rt", &repo.to_string_lossy(), true);
-        project
-    }
-
-    /// Every `Error` a daemon broadcast with no `req_id` — the warnings a
-    /// WORKTREE HOOK raises after its request already succeeded.
-    fn drain_warnings(events: &mut broadcast::Receiver<ServerEvent>) -> Vec<String> {
-        let mut warnings = Vec::new();
-        while let Ok(ev) = events.try_recv() {
-            if let ServerEvent::Error {
-                req_id: None,
-                message,
-            } = ev
-            {
-                warnings.push(message);
-            }
-        }
-        warnings
-    }
-
-    /// The create hook runs once the checkout exists and its row is out,
-    /// with the main repo and the new checkout as its arguments and the
-    /// branch in its environment.
-    #[tokio::test]
-    async fn create_worktree_runs_the_create_hook() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = init_repo(&root);
-        let log = root.join("hook.log");
-        let hook = hook_script(
-            &root,
-            &format!(
-                "printf '%s %s %s %s\\n' \"$NEBULA_HOOK\" \"$1\" \"$2\" \"$NEBULA_WORKTREE_BRANCH\" > '{}'",
-                log.display()
-            ),
-        );
-        git_in(
-            &repo,
-            &[
-                "config",
-                "nebula.worktreeCreateHook",
-                &hook.to_string_lossy(),
-            ],
-        );
-        let daemon = test_daemon();
-        let project = project_at(&daemon, &repo);
-        let mut events = daemon.events.subscribe();
-
-        let created = daemon
-            .create_worktree(&project.id, "feat", None)
-            .await
-            .unwrap();
-        let EntityId::Worktree(id) = created else {
-            panic!("a worktree id: {created:?}");
-        };
-        let worktree = daemon.store.get_worktree(&id).unwrap().unwrap();
-        assert!(worktree.path.exists(), "the checkout is real");
-        assert_eq!(
-            std::fs::read_to_string(&log).unwrap(),
-            format!(
-                "worktree-create {} {} feat\n",
-                repo.display(),
-                worktree.path.display()
-            )
-        );
-        assert!(
-            drain_warnings(&mut events).is_empty(),
-            "a clean run warns nobody"
-        );
-    }
-
-    /// The delete hook runs after the checkout is gone and the row is
-    /// dropped, sees the deleted path, and its failure is a broadcast
-    /// warning: the request still succeeds and the row stays gone.
-    #[tokio::test]
-    async fn delete_worktree_runs_the_delete_hook_and_survives_its_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = init_repo(&root);
-        let wt = root.join("repo-worktrees").join("feat");
-        git_in(
-            &repo,
-            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
-        );
-        let log = root.join("hook.log");
-        let hook = hook_script(
-            &root,
-            &format!(
-                "printf '%s %s %s\\n' \"$NEBULA_HOOK\" \"$1\" \"$2\" > '{}'\n\
-                 [ -e \"$2\" ] && echo 'still there' >&2\n\
-                 echo 'slot 7 was not ours' >&2\n\
-                 exit 2",
-                log.display()
-            ),
-        );
-        git_in(
-            &repo,
-            &[
-                "config",
-                "nebula.worktreeDeleteHook",
-                &hook.to_string_lossy(),
-            ],
-        );
-        let daemon = test_daemon();
-        project_at(&daemon, &repo);
-        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
-        let mut events = daemon.events.subscribe();
-
-        daemon
-            .delete_worktree(&WorktreeId("feat".into()), false)
-            .await
-            .unwrap();
-
-        assert!(!wt.exists(), "the checkout is gone");
-        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
-        assert!(
-            worktrees.iter().all(|w| w.id.as_str() != "feat"),
-            "the row stays deleted despite the hook: {worktrees:#?}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&log).unwrap(),
-            format!("worktree-delete {} {}\n", repo.display(), wt.display())
-        );
-        let warnings = drain_warnings(&mut events);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("worktree-delete hook")
-                && warnings[0].contains("exited 2: slot 7 was not ours"),
-            "{}",
-            warnings[0]
-        );
-    }
-
-    /// A create of the path a delete hook is still releasing waits for
-    /// that hook: the delete hook sees the checkout gone (no "still on
-    /// disk" skip), then the create hook runs, in that order.
-    #[tokio::test]
-    async fn recreating_a_path_waits_for_its_delete_hook() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = init_repo(&root);
-        let wt = root.join("repo-worktrees").join("feat");
-        git_in(
-            &repo,
-            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
-        );
-        let log = root.join("hook.log");
-        let hook = hook_script(
-            &root,
-            &format!(
-                "[ \"$NEBULA_HOOK\" = worktree-delete ] && sleep 0.5\n\
-                 echo \"$NEBULA_HOOK $2\" >> '{}'",
-                log.display()
-            ),
-        );
-        for key in ["nebula.worktreeCreateHook", "nebula.worktreeDeleteHook"] {
-            git_in(&repo, &["config", key, &hook.to_string_lossy()]);
-        }
-        let daemon = test_daemon();
-        let project = project_at(&daemon, &repo);
-        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
-        let mut events = daemon.events.subscribe();
-
-        let deleting = {
-            let daemon = daemon.clone();
-            tokio::spawn(async move {
-                daemon
-                    .delete_worktree(&WorktreeId("feat".into()), false)
-                    .await
-            })
-        };
-        // Let the delete get into its hook, then ask for the same path back.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        daemon
-            .create_worktree(&project.id, "feat", None)
-            .await
-            .unwrap();
-        deleting.await.unwrap().unwrap();
-
-        let got = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(
-            got,
-            format!(
-                "worktree-delete {wt}\nworktree-create {wt}\n",
-                wt = wt.display()
-            ),
-            "delete hook first, create hook second"
-        );
-        assert!(wt.exists(), "the recreated checkout is there");
-        assert!(
-            drain_warnings(&mut events).is_empty(),
-            "neither hook was skipped or failed"
-        );
-    }
-
-    /// No hook configured: a delete is exactly what it was.
-    #[tokio::test]
-    async fn delete_worktree_without_a_hook_warns_nobody() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let repo = init_repo(&root);
-        let wt = root.join("repo-worktrees").join("feat");
-        git_in(
-            &repo,
-            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
-        );
-        let daemon = test_daemon();
-        project_at(&daemon, &repo);
-        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
-        let mut events = daemon.events.subscribe();
-
-        daemon
-            .delete_worktree(&WorktreeId("feat".into()), false)
-            .await
-            .unwrap();
-
-        assert!(!wt.exists());
-        assert!(drain_warnings(&mut events).is_empty());
-    }
-
-    fn git_in(repo: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@example.com")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    #[test]
-    fn reparent_by_cwd_ignores_foreign_sessions_unless_capturing() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p"]);
-        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
-        seed_agent(&daemon, "a1", "root", Some("s1"));
-
-        // A different session id on a non-capturing event (a nested claude
-        // launched inside the agent's PTY) must not move the row.
-        daemon.reparent_agent_by_cwd(
-            &AgentId("a1".into()),
-            "/nebula-test/p-feat",
-            Some("s2"),
-            false,
-        );
-        assert_eq!(agent_worktree(&daemon, "a1"), "root");
-
-        // A capturing event (re)establishes ownership, so it may move it.
-        daemon.reparent_agent_by_cwd(
-            &AgentId("a1".into()),
-            "/nebula-test/p-feat",
-            Some("s2"),
-            true,
-        );
-        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
     }
 
     #[test]
@@ -8281,25 +6621,6 @@ mod tests {
         assert_eq!(pool.len(), 1);
         assert!(pool.contains_key(&(WorktreeId("w2".into()), AgentKind::Codex)));
     }
-
-    #[test]
-    fn reparent_by_cwd_skips_archived_agents() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p"]);
-        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
-        seed_agent(&daemon, "a1", "root", None);
-        daemon
-            .store
-            .set_agent_archived(&AgentId("a1".into()), true)
-            .unwrap();
-
-        daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/nebula-test/p-feat", None, false);
-        assert_eq!(agent_worktree(&daemon, "a1"), "root");
-    }
-
-    /// The status broadcast carries the flag it persisted: a live turn
-    /// landing on finished says `unseen`, the next prompt says not.
     #[test]
     fn status_broadcast_carries_the_unseen_flag() {
         let daemon = test_daemon();

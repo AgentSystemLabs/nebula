@@ -293,8 +293,8 @@ pub enum MenuAction {
     NewTerminal(WorktreeId),
     RenameTerminal(TerminalId),
     CloseTerminal(TerminalId),
-    NewWorktree(ProjectId),
     NewSessionWorkspace(ProjectId),
+    NewWorktree(ProjectId),
     /// Hand a link row's URL to the browser.
     OpenLink(String),
     /// Read the selected open pull request's diff in the diff modal. Carries
@@ -316,8 +316,8 @@ pub enum MenuAction {
     DuplicateAgent(AgentId),
     EditLink(LinkId),
     DeleteLink(LinkId),
-    DeleteWorktree(WorktreeId),
     CloseSessionWorkspace(WorktreeId),
+    DeleteWorktree(WorktreeId),
     /// The ROOT WORKTREE row's menu: open the BRANCH SWITCHER on it.
     SwitchBranch(WorktreeId),
     /// Select the repository Git tools target inside a workspace.
@@ -331,7 +331,7 @@ pub enum MenuAction {
     ToggleRun(WorktreeId),
     /// Fire the worktree's OPEN COMMAND (`Shift+Enter`).
     OpenWorktree(WorktreeId),
-    AddProject,
+    RegisterProjectHelp,
     RemoveProject(ProjectId),
     /// Retitle a project's row. Display only — the folder keeps its name and
     /// stays visible under the new one.
@@ -637,13 +637,6 @@ pub(crate) const CLOUD_LABEL: &str = " · cloud";
 /// Destructive action waiting behind a confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingAction {
-    /// AddProject aimed at a path that doesn't exist yet: create the
-    /// directory, `git init` it (both daemon-side) and add it.
-    CreateProjectDir(std::path::PathBuf),
-    /// AddProject aimed at a folder that is in no git repository: `git
-    /// init` it (daemon-side) and add it. A project is a repository, so
-    /// the folder is never added as it stands.
-    InitProjectRepo(std::path::PathBuf),
     /// `a` (or the row menu's Archive): archive the agent once the dialog
     /// is answered.
     ArchiveAgent(AgentId),
@@ -719,7 +712,6 @@ pub struct HelpView {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptKind {
-    AddProject,
     NewSessionWorkspace {
         project: ProjectId,
     },
@@ -923,7 +915,7 @@ impl PromptDialog {
 
     /// Does Tab complete filesystem paths in this prompt?
     pub fn completes_paths(&self) -> bool {
-        matches!(self.kind, PromptKind::AddProject)
+        false
     }
 
     /// The task prompts — the Claude Cloud launch task, a message to a live
@@ -2646,8 +2638,8 @@ impl Tree {
         })
     }
 
-    /// A project registered with explicit repository membership uses the
-    /// workspace layout and cannot use single-worktree features.
+    /// Every registered project uses the workspace layout, including one-repo
+    /// projects. Single-worktree features are disabled throughout this fork.
     pub fn uses_workspace_layout(&self, project: &ProjectId) -> bool {
         self.repositories
             .iter()
@@ -4924,11 +4916,7 @@ impl App {
         let selected = checkouts
             .into_iter()
             .find(|(repository, _, _)| Some(repository.as_str()) == name);
-        selected.or_else(|| {
-            let mut available = self.repository_checkouts(workspace).into_iter();
-            let first = available.next()?;
-            available.next().is_none().then_some(first)
-        })
+        selected.or_else(|| self.repository_checkouts(workspace).into_iter().next())
     }
 
     /// A checkout's last-read changed-file count, for its cards: None until
