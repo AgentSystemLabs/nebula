@@ -31030,12 +31030,14 @@ diff --git a/src/c.rs b/src/c.rs
                     name: "api".into(),
                     path: api.clone(),
                     branch: "main".into(),
+                    changed_files: None,
                 },
                 nebula_core::ProjectRepository {
                     project_id: ProjectId("p1".into()),
                     name: "web".into(),
                     path: web.clone(),
                     branch: "master".into(),
+                    changed_files: None,
                 },
             ];
             app.tree
@@ -31053,6 +31055,8 @@ diff --git a/src/c.rs b/src/c.rs
                             base: Some("main".into()),
                             fetch_succeeded: true,
                             warning: None,
+                            branch: Some("pilot/task".into()),
+                            changed_files: Some(0),
                         },
                         nebula_core::WorkspaceRepository {
                             id: WorktreeId("w-web".into()),
@@ -31061,6 +31065,8 @@ diff --git a/src/c.rs b/src/c.rs
                             base: Some("master".into()),
                             fetch_succeeded: true,
                             warning: None,
+                            branch: Some("pilot/task".into()),
+                            changed_files: Some(0),
                         },
                     ],
                 });
@@ -32573,6 +32579,7 @@ diff --git a/src/c.rs b/src/c.rs
                 name: name.into(),
                 path: format!("/tmp/demo/{name}").into(),
                 branch: "main".into(),
+                changed_files: None,
             })
             .collect();
     }

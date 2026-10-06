@@ -221,8 +221,17 @@ pub(super) fn draw_bands(
 /// column the roots use, saying what can be done there.
 fn draw_empty(buf: &mut Buffer, app: &App, r: Rect, band: &Band, lit: bool) {
     let th = app.theme;
-    let mut text = String::from(EMPTY_BAND_HINT);
-    if !band.is_main {
+    let mut text = if band.workspace_unavailable {
+        format!(
+            "unavailable · {}",
+            band.workspace_failure
+                .as_deref()
+                .unwrap_or("member checkout missing")
+        )
+    } else {
+        EMPTY_BAND_HINT.to_string()
+    };
+    if !band.is_main && !band.workspace_unavailable {
         text.push_str(EMPTY_BAND_DELETE);
     }
     let fg = if lit { th.accent } else { gray::DIM };

@@ -70,6 +70,33 @@ pub async fn current_branch(path: &Path) -> Result<String> {
     }
 }
 
+/// Number of tracked and untracked paths changed in a checkout. Ignored files
+/// are excluded by Git's default porcelain status behavior.
+pub async fn changed_file_count(path: &Path) -> Result<usize> {
+    let out = git(
+        path,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    )
+    .await?;
+    let entries: Vec<&[u8]> = out
+        .as_bytes()
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let mut changed = 0;
+    let mut index = 0;
+    while index < entries.len() {
+        changed += 1;
+        let status = entries[index].get(..2).unwrap_or_default();
+        index += if status.contains(&b'R') || status.contains(&b'C') {
+            2
+        } else {
+            1
+        };
+    }
+    Ok(changed)
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeEntry {
     pub path: PathBuf,
@@ -804,6 +831,29 @@ mod tests {
         // A real git that says "not a repository" must keep saying so.
         let err = repo_toplevel(tmp.path()).await.unwrap_err();
         assert!(!is_missing(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn changed_file_count_counts_status_entries_once_including_renames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        std::fs::write(repo.join("tracked.txt"), "before\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]).await.unwrap();
+        git(&repo, &["commit", "-m", "tracked"]).await.unwrap();
+        git(&repo, &["mv", "tracked.txt", "renamed.txt"])
+            .await
+            .unwrap();
+        std::fs::write(repo.join("untracked.txt"), "new\n").unwrap();
+
+        assert_eq!(changed_file_count(&repo).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn changed_file_count_reports_a_missing_member_checkout_as_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(changed_file_count(&tmp.path().join("gone")).await.is_err());
     }
 
     /// A rebase parks HEAD on the commits it replays, so for as long as it

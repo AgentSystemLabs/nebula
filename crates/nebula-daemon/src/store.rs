@@ -390,6 +390,15 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE session_workspaces ADD COLUMN failure TEXT;
     UPDATE session_workspaces SET state = CASE WHEN ready != 0 THEN 'ready' ELSE 'unavailable' END;
     ",
+    // 32: retain Git's latest observation for each registered member.
+    "
+    ALTER TABLE project_repositories ADD COLUMN changed_files INTEGER;
+    ALTER TABLE workspace_repositories ADD COLUMN branch TEXT;
+    ALTER TABLE workspace_repositories ADD COLUMN changed_files INTEGER;
+    UPDATE workspace_repositories SET branch = (
+      SELECT branch FROM worktrees WHERE worktrees.id = workspace_repositories.id
+    );
+    ",
 ];
 
 pub struct Store {
@@ -502,13 +511,14 @@ impl Store {
     pub fn project_repositories(&self, project: &ProjectId) -> Result<Vec<ProjectRepository>> {
         let conn = self.conn.lock().unwrap();
         let repositories = conn
-            .prepare("SELECT name, path, branch FROM project_repositories WHERE project_id = ?1 ORDER BY name")?
+            .prepare("SELECT name, path, branch, changed_files FROM project_repositories WHERE project_id = ?1 ORDER BY name")?
             .query_map(params![project.as_str()], |r| {
                 Ok(ProjectRepository {
                     project_id: project.clone(),
                     name: r.get(0)?,
                     path: PathBuf::from(r.get::<_, String>(1)?),
                     branch: r.get(2)?,
+                    changed_files: r.get::<_, Option<i64>>(3)?.map(|count| count as usize),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -534,7 +544,7 @@ impl Store {
             .into_iter()
             .map(|(worktree_id, name, state, failure)| {
                 let repositories = conn
-                    .prepare("SELECT id, name, path, base, fetch_succeeded, warning FROM workspace_repositories WHERE worktree_id = ?1 ORDER BY name")?
+                    .prepare("SELECT id, name, path, base, fetch_succeeded, warning, branch, changed_files FROM workspace_repositories WHERE worktree_id = ?1 ORDER BY name")?
                     .query_map(params![worktree_id.as_str()], |row| {
                         Ok(nebula_core::WorkspaceRepository {
                             id: WorktreeId(row.get(0)?),
@@ -543,6 +553,8 @@ impl Store {
                             base: row.get(3)?,
                             fetch_succeeded: row.get::<_, i64>(4)? != 0,
                             warning: row.get(5)?,
+                            branch: row.get(6)?,
+                            changed_files: row.get::<_, Option<i64>>(7)?.map(|count| count as usize),
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -598,8 +610,8 @@ impl Store {
                 params![repository.id.as_str(), root.project_id.as_str(), repository.path.to_string_lossy(), root.branch, now_ms()],
             )?;
             tx.execute(
-                "INSERT INTO workspace_repositories (worktree_id, id, name, path, base, fetch_succeeded, warning) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![workspace.worktree_id.as_str(), repository.id.as_str(), repository.name, repository.path.to_string_lossy(), repository.base, repository.fetch_succeeded as i64, repository.warning],
+                "INSERT INTO workspace_repositories (worktree_id, id, name, path, base, fetch_succeeded, warning, branch, changed_files) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![workspace.worktree_id.as_str(), repository.id.as_str(), repository.name, repository.path.to_string_lossy(), repository.base, repository.fetch_succeeded as i64, repository.warning, repository.branch, repository.changed_files.map(|count| count as i64)],
             )?;
         }
         tx.commit()?;
@@ -659,8 +671,8 @@ impl Store {
             params![repository.id.as_str(), project_id.as_str(), repository.path.to_string_lossy(), branch, now_ms()],
         )?;
         tx.execute(
-            "INSERT INTO workspace_repositories (worktree_id, id, name, path, base, fetch_succeeded, warning) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![workspace_id.as_str(), repository.id.as_str(), repository.name, repository.path.to_string_lossy(), repository.base, repository.fetch_succeeded as i64, repository.warning],
+            "INSERT INTO workspace_repositories (worktree_id, id, name, path, base, fetch_succeeded, warning, branch, changed_files) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![workspace_id.as_str(), repository.id.as_str(), repository.name, repository.path.to_string_lossy(), repository.base, repository.fetch_succeeded as i64, repository.warning, repository.branch.as_deref().unwrap_or(branch), repository.changed_files.map(|count| count as i64)],
         )?;
         tx.commit()?;
         Ok(())
@@ -675,6 +687,46 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE workspace_repositories SET warning = ?3 WHERE worktree_id = ?1 AND id = ?2",
             params![workspace_id.as_str(), repository_id.as_str(), warning],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_project_repository_state(
+        &self,
+        project: &ProjectId,
+        name: &str,
+        branch: &str,
+        changed_files: Option<usize>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE project_repositories SET branch = ?3, changed_files = ?4 WHERE project_id = ?1 AND name = ?2",
+            params![project.as_str(), name, branch, changed_files.map(|count| count as i64)],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_workspace_repository_state(
+        &self,
+        id: &WorktreeId,
+        branch: Option<&str>,
+        changed_files: Option<usize>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE workspace_repositories SET branch = ?2, changed_files = ?3 WHERE id = ?1",
+            params![id.as_str(), branch, changed_files.map(|count| count as i64)],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_project_repository_branch(
+        &self,
+        project: &ProjectId,
+        name: &str,
+        branch: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE project_repositories SET branch = ?3 WHERE project_id = ?1 AND name = ?2",
+            params![project.as_str(), name, branch],
         )?;
         Ok(())
     }
@@ -1703,6 +1755,7 @@ mod tests {
             name: "api".into(),
             path: "/tmp/shared-project-folder/api".into(),
             branch: "main".into(),
+            changed_files: None,
         };
         let second_repo = ProjectRepository {
             project_id: second.id.clone(),

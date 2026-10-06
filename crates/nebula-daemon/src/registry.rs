@@ -905,6 +905,7 @@ impl Daemon {
                 name: name.clone(),
                 path,
                 branch,
+                changed_files: None,
             });
         }
 
@@ -1123,6 +1124,8 @@ impl Daemon {
                         base: None,
                         fetch_succeeded: false,
                         warning: None,
+                        branch: None,
+                        changed_files: None,
                     });
                     let (leftovers, remaining) = self
                         .rollback_session_workspace(&workspace, &attempted)
@@ -1181,6 +1184,8 @@ impl Daemon {
                 base: creation.base,
                 fetch_succeeded: creation.fetch_succeeded,
                 warning: None,
+                branch: Some(branch.clone()),
+                changed_files: git::changed_file_count(&destination).await.ok(),
             };
             // Persist the new member before running hooks, so a daemon
             // interruption during a slow hook can still diagnose and gate it.
@@ -1497,13 +1502,15 @@ impl Daemon {
         });
     }
 
-    /// Reconcile a project's worktree rows with `git worktree list` so
-    /// checkouts made outside nebula (an agent running `git worktree add`,
-    /// manual CLI use) appear without a restart. Adopts unknown checkouts;
-    /// refreshes the branch on known rows after an in-place checkout;
-    /// drops rows whose checkout vanished — except the main row and rows
-    /// that still have sessions, which the user must delete deliberately.
+    /// Reconcile legacy single-repository projects with `git worktree list`
+    /// and refresh explicit member checkout observations. Grouped workspace
+    /// membership is authoritative: unknown worktrees are never adopted and
+    /// missing members remain recorded while their workspace becomes unavailable.
     pub async fn sync_project_worktrees(self: &Arc<Self>, project: &Project) -> Result<()> {
+        let members = self.store.project_repositories(&project.id)?;
+        if !members.is_empty() {
+            return self.sync_project_repositories(project, &members).await;
+        }
         let adopted = {
             let _ops = self.worktree_ops.lock().await;
             self.reconcile_project_worktrees(project).await?
@@ -1513,6 +1520,232 @@ impl Daemon {
         // `git worktree add` itself already lives.
         if adopted {
             self.reparent_agents_by_last_cwd(project);
+        }
+        Ok(())
+    }
+
+    async fn sync_project_repositories(
+        &self,
+        project: &Project,
+        members: &[ProjectRepository],
+    ) -> Result<()> {
+        let session_workspaces = self.store.session_workspaces()?;
+        let mut refreshed_members = Vec::with_capacity(members.len());
+        let mut main_changed = false;
+        let mut unavailable_primary = Vec::new();
+        let mut observed_primary_branches = Vec::with_capacity(members.len());
+        for member in members {
+            let branch = git::current_branch(&member.path).await.ok();
+            let changed_files = if member.path.is_dir() {
+                git::changed_file_count(&member.path).await.ok()
+            } else {
+                None
+            };
+            observed_primary_branches.push((member.name.clone(), branch.clone()));
+            let observed_branch = branch.as_deref().unwrap_or(&member.branch);
+            main_changed |= branch
+                .as_deref()
+                .is_some_and(|observed| observed != member.branch)
+                || (branch.is_some() && changed_files != member.changed_files);
+            if !member.path.is_dir() {
+                unavailable_primary.push(member.name.clone());
+            }
+            let persisted_changed_files = if branch.is_some() {
+                changed_files
+            } else {
+                None
+            };
+            self.store.update_project_repository_state(
+                &project.id,
+                &member.name,
+                observed_branch,
+                persisted_changed_files,
+            )?;
+            let mut refreshed = member.clone();
+            refreshed.branch = observed_branch.to_string();
+            refreshed.changed_files = persisted_changed_files;
+            refreshed_members.push(refreshed);
+        }
+        if let Some(mut main) = self
+            .store
+            .load_tree()?
+            .1
+            .into_iter()
+            .find(|worktree| worktree.project_id == project.id && worktree.is_main)
+        {
+            let branch = observed_primary_branches
+                .iter()
+                .find(|(name, _)| main.path.ends_with(name))
+                .and_then(|(_, branch)| branch.as_ref())
+                .or_else(|| {
+                    observed_primary_branches
+                        .iter()
+                        .find_map(|(_, branch)| branch.as_ref())
+                });
+            if let Some(branch) = branch {
+                if main.branch != *branch {
+                    main.branch = branch.clone();
+                    self.store.update_worktree_branch(&main.id, branch)?;
+                    self.broadcast(ServerEvent::EntityUpserted {
+                        entity: Entity::Worktree(main),
+                    });
+                }
+            }
+        }
+        if main_changed {
+            self.broadcast(ServerEvent::ProjectRepositoriesUpserted {
+                project: project.id.clone(),
+                repositories: refreshed_members,
+            });
+        }
+        if !unavailable_primary.is_empty() {
+            let reason = format!(
+                "primary checkout unavailable: {}",
+                unavailable_primary.join(", ")
+            );
+            for workspace in session_workspaces.iter().filter(|workspace| {
+                self.store
+                    .get_worktree(&workspace.worktree_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|root| root.project_id == project.id)
+            }) {
+                if workspace.state == WorkspaceState::Ready {
+                    let mut updated = workspace.clone();
+                    updated.state = WorkspaceState::Unavailable;
+                    updated.failure = Some(reason.clone());
+                    self.store.set_session_workspace_state(
+                        &workspace.worktree_id,
+                        WorkspaceState::Unavailable,
+                        Some(&reason),
+                    )?;
+                    self.broadcast(ServerEvent::SessionWorkspaceUpserted { workspace: updated });
+                }
+            }
+        }
+        let mut changed_worktrees = Vec::new();
+        let mut failed_workspaces = Vec::new();
+        let mut refreshed_workspaces = Vec::new();
+        let mut workspace_changes = false;
+        for workspace in session_workspaces.iter().filter(|workspace| {
+            matches!(
+                workspace.state,
+                WorkspaceState::Ready | WorkspaceState::Unavailable
+            ) && (workspace.state == WorkspaceState::Ready
+                || workspace
+                    .failure
+                    .as_deref()
+                    .is_some_and(|failure| failure.starts_with("repository checkout unavailable:")))
+                && self
+                    .store
+                    .get_worktree(&workspace.worktree_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|root| root.project_id == project.id)
+        }) {
+            let mut missing = Vec::new();
+            let mut updated = workspace.clone();
+            for repository in &mut updated.repositories {
+                let previous_branch = repository.branch.clone();
+                let previous_changes = repository.changed_files;
+                let checkout_exists = repository.path.is_dir();
+                let branch = if checkout_exists {
+                    git::current_branch(&repository.path).await.ok()
+                } else {
+                    None
+                };
+                let changed_files = if checkout_exists {
+                    git::changed_file_count(&repository.path).await.ok()
+                } else {
+                    None
+                };
+                if !checkout_exists || branch.is_none() || changed_files.is_none() {
+                    missing.push(repository.name.clone());
+                }
+                let observed_branch = branch.clone();
+                repository.branch = branch.or_else(|| previous_branch.clone());
+                repository.changed_files = if checkout_exists { changed_files } else { None };
+                if checkout_exists {
+                    if let Some(branch) = repository.branch.as_deref() {
+                        self.store.update_worktree_branch(&repository.id, branch)?;
+                    }
+                }
+                self.store.update_workspace_repository_state(
+                    &repository.id,
+                    observed_branch.as_deref(),
+                    repository.changed_files,
+                )?;
+                if let (Some(branch), Some(mut row)) = (
+                    repository.branch.as_ref(),
+                    self.store.get_worktree(&repository.id)?,
+                ) {
+                    if row.branch != *branch {
+                        row.branch = branch.clone();
+                        self.store.update_worktree_branch(&row.id, branch)?;
+                        changed_worktrees.push(row);
+                    }
+                }
+                workspace_changes |= previous_branch != repository.branch
+                    || previous_changes != repository.changed_files;
+            }
+            if !missing.is_empty() {
+                let reason = format!("repository checkout unavailable: {}", missing.join(", "));
+                updated.state = WorkspaceState::Unavailable;
+                updated.failure = Some(reason.clone());
+                self.store.set_session_workspace_state(
+                    &workspace.worktree_id,
+                    WorkspaceState::Unavailable,
+                    Some(&reason),
+                )?;
+                failed_workspaces.push(updated);
+            } else if workspace.state == WorkspaceState::Ready && workspace_changes {
+                refreshed_workspaces.push(updated);
+            } else if workspace.state == WorkspaceState::Ready && workspace_changes {
+                refreshed_workspaces.push(updated);
+            } else if workspace.state == WorkspaceState::Ready {
+                // No changes, no wire traffic; persistence is already current.
+            } else if workspace.state == WorkspaceState::Unavailable
+                && workspace
+                    .failure
+                    .as_deref()
+                    .is_some_and(|failure| failure.starts_with("repository checkout unavailable:"))
+            {
+                updated.state = WorkspaceState::Ready;
+                updated.failure = None;
+                self.store.set_session_workspace_state(
+                    &workspace.worktree_id,
+                    WorkspaceState::Ready,
+                    None,
+                )?;
+                for repository in &updated.repositories {
+                    if let Some(mut row) = self.store.get_worktree(&repository.id)? {
+                        let branch = repository.branch.as_deref().unwrap_or("unknown");
+                        if row.branch != branch {
+                            row.branch = branch.to_string();
+                            self.store.update_worktree_branch(&row.id, branch)?;
+                            changed_worktrees.push(row);
+                        }
+                    }
+                }
+                refreshed_workspaces.push(updated);
+            }
+        }
+        for worktree in changed_worktrees {
+            self.broadcast(ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(worktree),
+            });
+        }
+        for workspace in failed_workspaces {
+            self.broadcast(ServerEvent::SessionWorkspaceUpserted { workspace });
+        }
+        for workspace in refreshed_workspaces {
+            let unchanged = session_workspaces
+                .iter()
+                .find(|known| known.worktree_id == workspace.worktree_id)
+                .is_some_and(|known| known == &workspace);
+            if !unchanged {
+                self.broadcast(ServerEvent::SessionWorkspaceUpserted { workspace });
+            }
         }
         Ok(())
     }
@@ -2957,9 +3190,11 @@ impl Daemon {
             id: workspace_id.clone(),
             name: repository.name,
             path: repository.path,
-            base: Some(repository.branch),
+            base: Some(repository.branch.clone()),
             fetch_succeeded: true,
             warning: None,
+            branch: Some(repository.branch.clone()),
+            changed_files: repository.changed_files,
         }))
     }
 
@@ -5771,6 +6006,8 @@ mod tests {
             base: Some("main".into()),
             fetch_succeeded: true,
             warning: None,
+            branch: Some("pilot/feature".into()),
+            changed_files: Some(0),
         };
         let session = nebula_core::SessionWorkspace {
             worktree_id: workspace_id.clone(),
