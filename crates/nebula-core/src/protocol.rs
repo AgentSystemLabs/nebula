@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 49;
+pub const PROTOCOL_VERSION: u32 = 50;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -54,19 +54,29 @@ pub enum ClientRequest {
         rows: u16,
     },
 
-    // -- entity CRUD (RPC-style; answered by Ack/Error with matching req_id) --
-    /// Register a repo as a project. Refused when `path` resolves to a
-    /// repo this machine already knows — one repo is one project.
+    /// Retired single-repository registration. Kept only so stale IPC clients
+    /// receive an actionable daemon error; current clients use RegisterProject.
     AddProject {
         req_id: u64,
         path: PathBuf,
         name: Option<String>,
-        /// Make `path` a repository if it isn't one: create the directory
-        /// when it doesn't exist on disk, and `git init` it when it isn't
-        /// inside a repository. Set only after the user confirmed in the
-        /// client.
         create_missing: bool,
     },
+    /// Retired single-repository worktree creation request.
+    CreateWorktree {
+        req_id: u64,
+        project: ProjectId,
+        branch: String,
+        base: Option<String>,
+    },
+    /// Retired single-repository worktree deletion request.
+    DeleteWorktree {
+        req_id: u64,
+        id: WorktreeId,
+        force: bool,
+    },
+
+    // -- entity CRUD (RPC-style; answered by Ack/Error with matching req_id) --
     /// Register existing direct-child Git checkouts under one project
     /// folder. This operation never creates or modifies a checkout.
     RegisterProject {
@@ -87,12 +97,6 @@ pub enum ClientRequest {
         id: ProjectId,
         name: String,
     },
-    CreateWorktree {
-        req_id: u64,
-        project: ProjectId,
-        branch: String,
-        base: Option<String>,
-    },
     /// Create a complete multi-repository session workspace. The daemon
     /// validates all conflicts before creating any repository worktree.
     CreateSessionWorkspace {
@@ -105,11 +109,6 @@ pub enum ClientRequest {
     CloseSessionWorkspace {
         req_id: u64,
         id: WorktreeId,
-    },
-    DeleteWorktree {
-        req_id: u64,
-        id: WorktreeId,
-        force: bool,
     },
     CreateAgent {
         req_id: u64,
@@ -150,6 +149,21 @@ pub enum ClientRequest {
         #[serde(default)]
         issue_url: Option<String>,
     },
+    CreatePrAgent {
+        req_id: u64,
+        project: ProjectId,
+        name: String,
+        kind: AgentKind,
+        #[serde(default)]
+        custom_harness: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        auto_title: bool,
+        pr_url: String,
+        head: String,
+        #[serde(default)]
+        starting_prompt: Option<String>,
+    },
     /// Create a local AGENT of any kind from an OPEN PRS row — a PR
     /// SESSION. It never runs in the ROOT WORKTREE: the daemon finds the
     /// PROJECT's worktree checked out on the PR's head branch, or creates
@@ -161,39 +175,6 @@ pub enum ClientRequest {
     /// Separate from CreateAgent so ordinary callers cannot accidentally
     /// opt into a partial PR launch. The reply's `created` is the AGENT;
     /// a created worktree arrives as its own `EntityUpserted` first.
-    CreatePrAgent {
-        req_id: u64,
-        /// The PROJECT whose repo the pull request is open on.
-        project: ProjectId,
-        name: String,
-        kind: AgentKind,
-        /// Registry id of the custom harness, when `kind` is
-        /// [`AgentKind::Custom`]. Persisted with the row like `model`.
-        #[serde(default)]
-        custom_harness: Option<String>,
-        /// Model the CLI launches with; None = the CLI's own default.
-        model: Option<String>,
-        /// Reasoning effort the CLI launches with; None = default.
-        effort: Option<String>,
-        auto_title: bool,
-        pr_url: String,
-        /// The branch the PR SESSION's worktree is checked out on: the
-        /// pull request's head branch (`gh`'s `headRefName`) for a
-        /// same-repo pull request, and `<owner>/<headRefName>` for a
-        /// fork's — a fork's `main` is not ours, and must match neither
-        /// the ROOT WORKTREE nor a branch on `origin`. The client names
-        /// it; the daemon fetches `origin`'s branch of that name and,
-        /// finding none, seeds it from `refs/pull/N/head`.
-        head: String,
-        /// The CLI's positional first prompt — an AGENT PRESET picked on
-        /// the OPEN PRS row composes one, under `CreateAgent`'s rules for
-        /// `starting_prompt`. It rides beside the PR rule, which stays
-        /// Claude's appended system prompt (or the opening of a Codex /
-        /// Cursor cold spawn's first prompt). None: the CLI's own input
-        /// is the first prompt. Request-only, never persisted.
-        #[serde(default)]
-        starting_prompt: Option<String>,
-    },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the
     /// moment the user picks the kind, before they type the name. No reply;
@@ -234,18 +215,18 @@ pub enum ClientRequest {
         id: AgentId,
         name: String,
     },
-    /// `nebula worktree <name>`, run by the agent from inside its own
-    /// session: create the worktree `branch` under the agent's project (or
-    /// take the existing one with that branch), re-home the agent row under
-    /// it at once, and relocate the live session into it when its current
-    /// turn ends — killed and respawned resumed there, with a prompt that
-    /// tells the CLI where it now is. Replies with `WorktreeEntered`.
     EnterWorktree {
         req_id: u64,
         id: AgentId,
         branch: String,
         base: Option<String>,
     },
+    /// `nebula worktree <name>`, run by the agent from inside its own
+    /// session: create the worktree `branch` under the agent's project (or
+    /// take the existing one with that branch), re-home the agent row under
+    /// it at once, and relocate the live session into it when its current
+    /// turn ends — killed and respawned resumed there, with a prompt that
+    /// tells the CLI where it now is. Replies with `WorktreeEntered`.
     /// `nebula spawn "<task>"`, run by the agent from inside its own
     /// session: start a new AGENT beside it — same WORKTREE, and the same
     /// AGENT KIND / MODEL / EFFORT unless `kind` names another harness —
@@ -457,15 +438,10 @@ pub struct MetricsSnapshot {
     pub sessions: Vec<SessionMetrics>,
 }
 
-/// What `EnterWorktree` did to the agent's live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnterOutcome {
-    /// The agent already lived in that worktree; nothing changed.
     AlreadyThere,
-    /// The row moved; the live session respawns inside the worktree, resumed,
-    /// once its current turn ends.
     Relocating,
-    /// The row moved and nothing was running: the next launch lands there.
     NextLaunch,
 }
 
@@ -495,8 +471,6 @@ pub enum ServerEvent {
         req_id: u64,
         created: Option<EntityId>,
     },
-    /// Reply to `EnterWorktree`: the worktree the agent now belongs to, and
-    /// what that meant for its process.
     WorktreeEntered {
         req_id: u64,
         worktree: Worktree,

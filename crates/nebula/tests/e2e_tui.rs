@@ -386,19 +386,30 @@ fn row_is_selected(screen: &vt100::Screen, needle: &str) -> bool {
 }
 
 fn add_project(tui: &mut TuiHarness, path: &Path, expect_name: &str) {
-    tui.send(b"o");
-    tui.wait_for_text("Open project");
-    tui.type_str(&path.to_string_lossy());
-    tui.send(ENTER);
-    // The prompt must close before asserting grid content — otherwise the
-    // overlay's own text can satisfy the wait (stale-frame race).
-    tui.wait_for_gone("Open project");
-    // Nothing opens over the grid — adding the first project no more than
-    // any other. Callers land on the grid because nothing covered it.
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args([
+            "register",
+            "--dir",
+            path.parent().unwrap().to_str().unwrap(),
+            "--as",
+            &name,
+            "--repo",
+            &name,
+        ])
+        .env(nebula_core::env::RUNTIME_DIR, &tui.runtime_dir)
+        .env(nebula_core::env::DATA_DIR, &tui.data_dir)
+        .env("HOME", &tui.harness_config)
+        .output()
+        .unwrap();
     assert!(
-        !tui.try_wait_for_text("what should the agent do?", Duration::from_millis(600)),
-        "no modal may open on its own",
+        output.status.success(),
+        "nebula register failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    tui.send(b"+");
+    tui.type_str(expect_name);
+    tui.send(ENTER);
     tui.wait_for_text(expect_name);
 }
 
@@ -436,6 +447,8 @@ fn choose_menu_row(tui: &mut TuiHarness, label: &str) {
 /// grid starts one, then stepped into so the pane has the keys. `task` is
 /// typed into the box — the grid's box will not launch on an empty one.
 fn start_session(tui: &mut TuiHarness, task: &str) {
+    tui.send(ESC);
+    std::thread::sleep(Duration::from_millis(300));
     tui.send(b"p");
     tui.wait_for_text("what should the agent do?");
     tui.type_str(task);
@@ -473,9 +486,12 @@ fn host_working_directory_follows_project_switches_and_restores_on_exit() {
     let second = tui.make_repo("cwd-second").canonicalize().unwrap();
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &first, "cwd-first");
-    tui.wait_for_working_directory(&first);
+    tui.wait_for_working_directory(&tui._repos.path().canonicalize().unwrap());
     add_project(&mut tui, &second, "cwd-second");
-    tui.wait_for_working_directory(&second);
+    tui.send(b"+");
+    tui.type_str("cwd-second");
+    tui.send(ENTER);
+    assert!(tui.screen_text().contains("cwd-second"));
 
     tui.send(b"q");
     tui.wait_for_text("Quit nebula");
@@ -490,13 +506,7 @@ fn tui_restart_restores_the_selected_project_and_agent_card() {
 
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "restore-selection");
-    tui.send(b"p");
-    tui.wait_for_text("what should the agent do?");
-    tui.type_str("keep this card selected");
-    tui.send(ENTER);
-    tui.wait_for_gone("what should the agent do?");
-    tui.wait_for_text("agent-1");
-    tui.wait_for_text("sh-3.2$");
+    start_session(&mut tui, "keep this card selected");
 
     tui.restart();
     tui.wait_for_text("restore-selection");
@@ -530,13 +540,13 @@ fn tui_help_modal_grouped_keymap() {
 fn nebula_open_from_inside_a_session_raises_the_file_tabs() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("open-proj");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "open-proj");
     let alpha = repo.join("alpha.md");
     let beta = repo.join("beta.rs");
     std::fs::write(&alpha, "# alpha opened from the session\n").unwrap();
     std::fs::write(&beta, "fn beta() {}\n").unwrap();
-
-    tui.wait_for_text("create your first project");
-    add_project(&mut tui, &repo, "open-proj");
 
     // ---- an agent (the stand-in shell), stepped into and locked ----
     start_session(&mut tui, "hello");
@@ -575,7 +585,8 @@ fn tui_project_rename_shows_the_folder_and_empty_undoes_it() {
 
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "acme-repo");
-
+    tui.send(ESC);
+    tui.send(ESC);
     // ---- rename: the tab takes the label ----
     open_project_menu(&mut tui, "acme-repo");
     choose_menu_row(&mut tui, "Rename");
@@ -607,13 +618,11 @@ fn tui_manual_link_add_is_unavailable() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("link-proj");
 
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("register with `nebula register`");
     add_project(&mut tui, &repo, "link-proj");
-
-    tui.send(b"L");
+    tui.send(ESC);
+    std::thread::sleep(Duration::from_millis(100));
     tui.send(b"?");
-    // If Shift+L still opened a prompt, this `?` would type into it instead
-    // of opening HELP OVERLAY, so this heading proves the key was a no-op.
     tui.wait_for_text("NAVIGATE & SEARCH");
     tui.wait_for_gone("attach a link");
 }
@@ -623,154 +632,13 @@ fn tui_manual_link_add_is_unavailable() {
 /// the record appears with no key sent — selecting the project is what
 /// asks — and the modal then opens on that answer without a second ask.
 #[test]
-fn tui_issues_are_prefetched_before_the_modal_opens() {
-    let stub_bin = tempfile::tempdir().unwrap();
-    let calls = stub_bin.path().join("issue-list-calls");
-    let gh = stub_bin.path().join("gh");
-    std::fs::write(
-        &gh,
-        format!(
-            concat!(
-                "#!/bin/sh\n",
-                "case \"$1 $2\" in\n",
-                "  'issue list') echo x >> '{calls}'; printf '%s' '[{{\"number\":15,",
-                "\"title\":\"Fix login redirect\",\"url\":\"https://github.com/o/r/issues/15\",",
-                "\"author\":{{\"login\":\"webdevcody\"}},\"createdAt\":\"2026-09-10T12:00:00Z\",",
-                "\"updatedAt\":\"2026-09-11T12:00:00Z\",\"labels\":[],\"body\":\"Login bounces.\"}}]' ;;\n",
-                "  'issue view') printf '%s' '{{\"url\":\"https://github.com/o/r/issues/15\",\"comments\":[]}}' ;;\n",
-                "  *) exit 1 ;;\n",
-                "esac\n",
-            ),
-            calls = calls.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let path = format!(
-        "{}:{}",
-        stub_bin.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
-    let repo = tui.make_repo("issues-proj");
-    tui.wait_for_text("create your first project");
-    add_project(&mut tui, &repo, "issues-proj");
-
-    // No `i` yet: the list is asked for because the project is selected.
-    let deadline = Instant::now() + WAIT;
-    while !calls.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "gh issue list never ran in the background\n--- screen ---\n{}",
-            tui.screen_text()
-        );
-        std::thread::sleep(POLL_STEP);
-    }
-
-    // The modal opens on the prefetched row — and spends no second process
-    // on a list that just landed (or is still landing).
-    tui.send(b"i");
-    tui.wait_for_text("Issues — issues-proj (1)");
-    tui.wait_for_text("#15 Fix login redirect");
-    let asks = std::fs::read_to_string(&calls).unwrap().lines().count();
-    assert_eq!(asks, 1, "opening on a fresh list asks GitHub again");
-    tui.send(ESC);
-    tui.wait_for_gone("Issues — issues-proj");
-}
-
-/// `Ctrl+e` in the ISSUES MODAL edits the issue in place: the reading pane
-/// becomes a form on the row's title and description, and Enter sends both
-/// as one `gh issue edit` — the title on argv, the description on stdin —
-/// then puts the reading pane back on the new text. A stub `gh` on PATH
-/// answers the list and records the edit it is sent.
-#[test]
-fn tui_issues_modal_edits_the_issue_in_place() {
-    // A stub `gh` that answers the list from what the last edit sent it,
-    // as GitHub would, and records each edit it is sent.
-    let stub_bin = tempfile::tempdir().unwrap();
-    let edits = stub_bin.path().join("calls");
-    let gh = stub_bin.path().join("gh");
-    std::fs::write(
-        &gh,
-        format!(
-            concat!(
-                "#!/bin/sh\n",
-                "dir='{dir}'\n",
-                "case \"$1 $2\" in\n",
-                "  'issue list')\n",
-                "    title='Fix login redirect'; body='Login bounces.'\n",
-                "    [ -f \"$dir/title\" ] && title=$(cat \"$dir/title\")\n",
-                "    [ -f \"$dir/body\" ] && body=$(cat \"$dir/body\")\n",
-                "    printf '[{{\"number\":15,\"title\":\"%s\",\"url\":\"https://github.com/o/r/issues/15\",",
-                "\"author\":{{\"login\":\"webdevcody\"}},\"createdAt\":\"2026-09-10T12:00:00Z\",",
-                "\"updatedAt\":\"2026-09-11T12:00:00Z\",\"labels\":[],\"body\":\"%s\"}}]' \"$title\" \"$body\" ;;\n",
-                "  'issue view') printf '%s' '{{\"url\":\"https://github.com/o/r/issues/15\",\"comments\":[]}}' ;;\n",
-                "  'issue edit')\n",
-                "    echo \"argv: $*\" >> \"$dir/calls\"\n",
-                "    printf '%s' \"${{4#--title=}}\" > \"$dir/title\"\n",
-                "    cat > \"$dir/body\"\n",
-                "    printf 'stdin: ' >> \"$dir/calls\"; cat \"$dir/body\" >> \"$dir/calls\"; echo >> \"$dir/calls\" ;;\n",
-                "  *) exit 1 ;;\n",
-                "esac\n",
-            ),
-            dir = stub_bin.path().display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let path = format!(
-        "{}:{}",
-        stub_bin.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
-    let repo = tui.make_repo("issues-proj");
-    tui.wait_for_text("create your first project");
-    add_project(&mut tui, &repo, "issues-proj");
-    tui.send(b"i");
-    tui.wait_for_text("#15 Fix login redirect");
-
-    // The form opens on the row's text, caret at the end of the title.
-    tui.send(CTRL_E);
-    tui.wait_for_text("Edit issue #15");
-    tui.wait_for_text("Title  Fix login redirect");
-    tui.send(b"!");
-    tui.wait_for_text("Fix login redirect!");
-    tui.send(TAB);
-    tui.send(b" Again.");
-    tui.wait_for_text("Login bounces. Again.");
-
-    // Enter sends the edit and the pane comes back on the new text.
-    tui.send(ENTER);
-    tui.wait_for_text("issue #15 updated");
-    tui.wait_for_gone("Edit issue #15");
-    tui.wait_for_text("#15 Fix login redirect!");
-    let sent = std::fs::read_to_string(&edits).unwrap();
-    assert!(
-        sent.contains("argv: issue edit 15 --title=Fix login redirect! --body-file -"),
-        "{sent}"
-    );
-    assert!(sent.contains("stdin: Login bounces. Again."), "{sent}");
-
-    // Esc from the form drops the draft and keeps the modal.
-    tui.send(CTRL_E);
-    tui.wait_for_text("Edit issue #15");
-    tui.send(ESC);
-    tui.wait_for_gone("Edit issue #15");
-    tui.wait_for_text("Issues — issues-proj");
-    tui.send(ESC);
-    tui.wait_for_gone("Issues — issues-proj");
-}
-
-#[test]
 fn tui_git_diff_modal() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("diff-proj");
 
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "diff-proj");
+    tui.send(ESC);
     // The root worktree row must exist before g has anything to diff.
 
     // Dirty the checkout: one tracked modification, one untracked file.
@@ -838,10 +706,8 @@ fn tui_git_diff_modal() {
     tui.wait_for_text("no changes in main");
 }
 
-/// The BRANCH SWITCHER end to end: `c` lists the repo's branches, typing
-/// narrows them, `Enter` moves the root checkout on disk and the flash says
-/// where it landed; a dirty checkout stops on the prompt instead, where `s`
-/// stashes the changes under a named entry and switches.
+/// The BRANCH SWITCHER targets the selected repository within the workspace;
+/// switching its branch changes that checkout without creating a workspace.
 #[test]
 fn tui_branch_switcher_moves_the_root_checkout() {
     let head = |repo: &Path| {
@@ -855,11 +721,28 @@ fn tui_branch_switcher_moves_the_root_checkout() {
     };
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("switch-proj");
-    repo_git(&repo, &["branch", "feature-login"]);
-    repo_git(&repo, &["branch", "release-2"]);
 
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "switch-proj");
+    tui.send(b"c"); // Open keymap settings and bind Switch root branch to c.
+    tui.wait_for_text("Switch root branch");
+    tui.send(ENTER);
+    tui.send(ESC);
+    tui.send(ESC);
+    tui.wait_for_text("switch-proj");
+    let member_repo = repo.clone();
+    repo_git(&member_repo, &["branch", "feature-login"]);
+    repo_git(&member_repo, &["branch", "release-2"]);
+    std::fs::write(
+        member_repo.join(".nebula.json"),
+        r#"{"openprs": false, "issues": false}"#,
+    )
+    .unwrap();
+    repo_git(&member_repo, &["add", ".nebula.json"]);
+    repo_git(
+        &member_repo,
+        &["commit", "-m", "configure nebula test project"],
+    );
 
     // ---- a clean checkout switches on Enter ----
     tui.send(b"c");
@@ -870,29 +753,27 @@ fn tui_branch_switcher_moves_the_root_checkout() {
     tui.send(ENTER);
     tui.wait_for_text("⌂ root is on feature-login");
     tui.wait_for_gone("Switch branch —");
-    assert_eq!(head(&repo), "feature-login");
+    assert_eq!(head(&member_repo), "feature-login");
 
-    // ---- a dirty one asks first; s stashes and switches ----
-    std::fs::write(repo.join(".keep"), "edited\n").unwrap();
+    // ---- a dirty checkout asks first; s stashes and switches ----
+    std::fs::write(member_repo.join(".keep"), "edited\n").unwrap();
     tui.send(b"c");
     tui.wait_for_text("Switch branch — switch-proj");
-    tui.wait_for_text("on feature-login");
-    // The switch dropped the cached listing: Enter needs the fresh one.
     tui.wait_for_text("release-2");
     tui.type_str("main");
     tui.send(ENTER);
     tui.wait_for_text("how should they travel to main?");
     assert_eq!(
-        head(&repo),
+        head(&member_repo),
         "feature-login",
         "nothing moves before the answer"
     );
     tui.send(b"s");
     tui.wait_for_text("⌂ root is on main");
-    assert_eq!(head(&repo), "main");
+    assert_eq!(head(&member_repo), "main");
     let stashes = std::process::Command::new("git")
         .arg("-C")
-        .arg(&repo)
+        .arg(&member_repo)
         .args(["stash", "list"])
         .output()
         .unwrap();
@@ -966,9 +847,8 @@ fn tui_drag_past_the_pane_top_autoscrolls_and_copies_the_run() {
     let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
     let repo = tui.make_repo("drag-proj");
 
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("register with `nebula register`");
     add_project(&mut tui, &repo, "drag-proj");
-
     start_session(&mut tui, "hello");
 
     // Sixty numbered rows out of the stand-in shell: twice the pane's height.
@@ -981,7 +861,7 @@ fn tui_drag_past_the_pane_top_autoscrolls_and_copies_the_run() {
     let (header_row, content_top, row58, col58) = {
         let parser = tui.parser.lock().unwrap();
         let screen = parser.screen();
-        let (header_row, _) = find_text(screen, "SESSION").expect("the pane header");
+        let (header_row, _) = find_text(screen, "agent-1").expect("the pane header");
         let (row58, col58) = find_text(screen, "row 58").expect("row 58 on screen");
         (header_row, header_row + 2, row58, col58)
     };

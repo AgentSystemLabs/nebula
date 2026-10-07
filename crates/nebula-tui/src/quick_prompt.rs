@@ -538,7 +538,7 @@ impl QuickLaunch {
 /// selected flashes instead.
 ///
 /// The one exception is the WORKTREES PANEL: `p` there means "a fresh
-/// worktree, then this task in it", whatever checkout the cursor is
+/// session workspace, then this task in it", whatever workspace the cursor is
 /// parked on (the root, another checkout) — the checkout does not exist
 /// yet, so only the PROJECT has to be selected. Its branch is the same
 /// random name the `n` prompt would have offered.
@@ -569,8 +569,8 @@ pub(crate) fn open_quick_prompt(app: &mut App) {
             app.flash = Some("quick prompt: select a project first".into());
             return;
         };
-        let branch = crate::branch_name::random_name(&app.project_branches(&project));
-        open_for(app, QuickTarget::NewWorktree { project, branch });
+        let name = crate::branch_name::random_name(&app.project_branches(&project));
+        open_for(app, QuickTarget::NewSessionWorkspace { project, name });
         return;
     }
     let Some(worktree) = app.selected_worktree().map(|w| w.id.clone()) else {
@@ -700,18 +700,8 @@ pub(crate) fn backdrop_box(back: &QuickReturn) -> PromptDialog {
     )
 }
 
-/// `Ctrl+N` in the box: flip this one launch between the selected
-/// WORKTREE and a fresh one, from whichever panel `p` was pressed in —
-/// the WORKTREES PANEL's "cut a worktree first" without walking over to
-/// it, and the way back into the checkout under the cursor from there.
-/// Flipping on mints the same random branch `n` would offer — or, for an
-/// ISSUE SESSION, one named after the issue (`issue-15-fix-login`); flipping off
-/// needs a real checkout under the cursor (not an OPEN PRS row, not a
-/// stand-in git is still cutting) and says so while keeping the fresh one
-/// otherwise. A PR SESSION's box has nothing to flip: the DAEMON picks
-/// its checkout (the PR head branch's own), so the key only says so. The
-/// box is rebuilt so its title and frame follow the target, with the
-/// typed text and the caret exactly where they were.
+/// `Ctrl+N` in the box: flip this launch between the selected workspace and
+/// a new session workspace. The box is rebuilt with its text and caret.
 pub(crate) fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
     if launch.pr.is_some() {
         app.flash =
@@ -719,9 +709,10 @@ pub(crate) fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: Tex
         return;
     }
     let target = match &launch.target {
-        QuickTarget::NewSessionWorkspace { .. } => {
-            Err("quick prompt: a session workspace launch target cannot be toggled")
-        }
+        QuickTarget::NewSessionWorkspace { project, .. } => app
+            .root_worktree(project)
+            .map(QuickTarget::Worktree)
+            .ok_or("quick prompt: main workspace is unavailable"),
         QuickTarget::NewWorktree { .. } => match app.selected_worktree().map(|w| w.id.clone()) {
             None => Err("quick prompt: no worktree under the cursor — keeping the new one"),
             Some(worktree) if app.is_placeholder_worktree(&worktree) => {
@@ -745,7 +736,10 @@ pub(crate) fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: Tex
                     }
                     None => crate::branch_name::random_name(&taken),
                 };
-                Ok(QuickTarget::NewWorktree { project, branch })
+                Ok(QuickTarget::NewSessionWorkspace {
+                    project,
+                    name: branch,
+                })
             }
         },
     };

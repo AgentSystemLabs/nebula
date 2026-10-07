@@ -116,7 +116,10 @@ impl AgentPresetsView {
 
     /// Does Enter cut a fresh worktree first?
     pub fn is_new_worktree(&self) -> bool {
-        matches!(self.target(), QuickTarget::NewWorktree { .. })
+        matches!(
+            self.target(),
+            QuickTarget::NewWorktree { .. } | QuickTarget::NewSessionWorkspace { .. }
+        )
     }
 
     /// The picker's box with the flipped `aim` applied — what Enter hands
@@ -862,7 +865,7 @@ pub(crate) fn open_agent_preset_task(
     // Flipped onto a fresh worktree: only the QUICK PROMPT's launch cuts
     // one first, so the preset goes on that box — sent at once for a
     // `skip`-task preset, as the task box would be.
-    if let Some(target @ QuickTarget::NewWorktree { .. }) = view.aim.clone() {
+    if let Some(target @ QuickTarget::NewSessionWorkspace { .. }) = view.aim.clone() {
         let launch = crate::quick_prompt::QuickLaunch::of_preset(
             target,
             preset,
@@ -1052,9 +1055,9 @@ pub(crate) fn toggle_new_worktree(app: &mut App) {
             .find(|w| w.id == view.worktree)
             .map(|w| {
                 let taken = app.project_branches(&w.project_id);
-                QuickTarget::NewWorktree {
+                QuickTarget::NewSessionWorkspace {
                     project: w.project_id.clone(),
-                    branch: crate::branch_name::random_name(&taken),
+                    name: crate::branch_name::random_name(&taken),
                 }
             })
             .ok_or("worktree no longer exists"),
@@ -1356,11 +1359,11 @@ fn worktree_line(app: &App, view: &AgentPresetsView, width: u16, th: Theme) -> L
         (
             vec![
                 Span::raw(" "),
-                Span::styled(" NEW WORKTREE ", chip),
+                Span::styled(" NEW SESSION WORKSPACE ", chip),
                 Span::styled(format!(" {branch}"), on),
             ],
             vec![
-                Span::styled("[✓] new worktree", on),
+                Span::styled("[✓] new session workspace", on),
                 Span::styled(" Tab ", Style::default().fg(th.ok)),
             ],
         )
@@ -1371,7 +1374,7 @@ fn worktree_line(app: &App, view: &AgentPresetsView, width: u16, th: Theme) -> L
                 Span::styled(branch, Style::default().fg(th.muted)),
             ],
             vec![
-                Span::styled("[ ] new worktree", dim),
+                Span::styled("[ ] new session workspace", dim),
                 Span::styled(" Tab ", dim),
             ],
         )

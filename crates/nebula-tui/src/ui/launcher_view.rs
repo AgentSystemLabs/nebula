@@ -1057,7 +1057,7 @@ fn draw_bands(
 /// What an EMPTY BAND says under its rule, the root's without the delete
 /// it refuses.
 const EMPTY_BAND_HINT: &str = "nothing running · p: new session · t: terminal";
-const EMPTY_BAND_DELETE: &str = " · d: delete worktree";
+const EMPTY_BAND_DELETE: &str = " · d: close workspace";
 
 /// The line under an EMPTY BAND's rule — a checkout with nothing running
 /// in it, drawn only with **Show all worktrees** on — in place of the row
@@ -1100,7 +1100,7 @@ fn draw_empty_band(
         ),
         None => EMPTY_BAND_HINT.to_string(),
     };
-    if !band.is_main && unavailable.is_none() {
+    if band.workspace_state.is_some() && !band.is_main && unavailable.is_none() {
         text.push_str(EMPTY_BAND_DELETE);
     }
     let fg = if lit { th.accent } else { th.dim };
@@ -3398,7 +3398,7 @@ pub(super) fn target_line(launch: &QuickLaunch, label: &str, width: u16, th: The
         let on = Style::default().fg(th.ok).add_modifier(Modifier::BOLD);
         (
             vec![
-                Span::styled("[✓] new worktree", on),
+                Span::styled("[✓] new session workspace", on),
                 Span::styled(" ^N", Style::default().fg(th.ok)),
             ],
             true,
@@ -3406,7 +3406,7 @@ pub(super) fn target_line(launch: &QuickLaunch, label: &str, width: u16, th: The
     } else {
         (
             vec![
-                Span::styled("[ ] new worktree", dim),
+                Span::styled("[ ] new session workspace", dim),
                 Span::styled(" ^N", dim),
             ],
             true,
@@ -5153,7 +5153,7 @@ mod tests {
 
     #[test]
     fn workspace_band_shows_compact_rollup_and_repository_details() {
-        let mut app = App::new();
+        let app = App::new();
         let mut band = a_band(true, "main");
         band.workspace_name = Some("Pilot".into());
         band.repositories = vec!["api".into(), "web".into()];

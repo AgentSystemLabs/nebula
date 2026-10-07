@@ -214,25 +214,6 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
     }));
 }
 
-/// The PR SESSION rows a CONTEXT MENU on a PROJECT OPEN PRS GROUP row
-/// offers — `New Claude session`, `New Codex session`, … — one per enabled
-/// harness, and none (no FLASH: the menu's other verbs still apply) when
-/// every harness is off.
-pub(crate) fn pr_session_menu_rows(worktree: WorktreeId, pr: &OpenPr) -> Vec<MenuItem> {
-    let rows: Vec<HarnessRow> = Config::load()
-        .offered_harnesses()
-        .into_iter()
-        .map(|(kind, custom)| HarnessRow { kind, custom })
-        .collect();
-    kind_rows(
-        &rows,
-        &worktree,
-        Some(&PrLaunch::of(pr)),
-        None,
-        |kind, custom| format!("New {} session", harness_label(kind, custom)),
-    )
-}
-
 /// The same badge against a config already in hand.
 pub(crate) fn session_harness_badge_in(agent: &Agent, cfg: &Config) -> String {
     match (agent.kind, agent.custom_harness.as_deref()) {
@@ -508,14 +489,6 @@ mod tests {
                 MenuAction::NewAgentOfKind { pr: None, quick: Some(back), .. }
                     if !back.from_box && back.text.is_empty()
             )));
-
-            let rows = pr_session_menu_rows(worktree, &open_pr());
-            let names: Vec<String> = rows.iter().map(|row| row.label.clone()).collect();
-            let expected: Vec<String> = offered
-                .iter()
-                .map(|label| format!("New {label} session"))
-                .collect();
-            assert_eq!(names, expected);
         });
     }
 
@@ -647,7 +620,7 @@ mod tests {
     }
 
     /// Only a hand-edited config reaches an empty list: the picker flashes
-    /// instead of opening, and a CONTEXT MENU just has no PR SESSION rows.
+    /// instead of opening.
     #[test]
     fn no_harness_flashes_the_picker_and_empties_the_menu_rows() {
         pinned(
@@ -658,7 +631,6 @@ mod tests {
                 open_kind_picker(&mut app, KindPicker::new_session(worktree.clone()));
                 assert!(app.overlay.is_none(), "{:?}", app.overlay);
                 assert_eq!(app.flash.as_deref(), Some(NO_HARNESS_FLASH));
-                assert!(pr_session_menu_rows(worktree, &open_pr()).is_empty());
             },
         );
     }

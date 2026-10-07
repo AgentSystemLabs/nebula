@@ -132,7 +132,6 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
 
     if let Some(carry) = carry {
         let sessions = daemon.adopt_sessions(carry.sessions);
-        daemon.restore_pending_moves(carry.pending_moves);
         tracing::info!(sessions, "restarted in place");
         handoff::report(&carry.nonce, Ok(sessions));
     }
@@ -184,12 +183,11 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                 agent_id,
                 event,
                 session_id,
-                cwd,
+                cwd: _,
                 transcript,
                 prompt,
             }) = hook_rx.recv().await
             {
-                let captures_session = event.captures_session();
                 daemon.apply_hook_event(&agent_id, event.clone(), session_id.clone());
                 // The prompt itself, for the row's RECENT PROMPTS. After
                 // the status step so the row it upserts already reads
@@ -204,19 +202,6 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                     daemon.note_transcript(&agent_id, transcript);
                     daemon.sync_claude_title(&agent_id);
                 }
-                if let Some(cwd) = &cwd {
-                    daemon.reparent_agent_by_cwd(
-                        &agent_id,
-                        cwd,
-                        session_id.as_deref(),
-                        captures_session,
-                    );
-                }
-                // A `nebula worktree` relocation waits for the turn to end.
-                // After the reparent on purpose: this turn's final payload
-                // still carries the old checkout's cwd, which must be seen
-                // (and ignored) while the relocation is still pending.
-                daemon.complete_pending_move(&agent_id, &event);
             }
         });
     }
@@ -263,11 +248,8 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
         });
     }
 
-    // Worktrees created, removed, or re-checked-out outside nebula (an agent
-    // running `git worktree add`, a manual `git checkout` on the root) should
-    // show up without a restart. Multi-repository projects have explicit
-    // workspace membership and are never reconciled this way. A cheap mtime
-    // probe gates the full `git worktree list` reconcile.
+    // Refresh explicit repository state and session-workspace health without
+    // adopting arbitrary Git worktrees into registered projects.
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {
@@ -284,18 +266,11 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                 };
                 seen.retain(|id, _| projects.iter().any(|p| &p.id == id));
                 for project in projects {
-                    let explicit_members = daemon
-                        .store
-                        .project_repositories(&project.id)
-                        .is_ok_and(|repositories| !repositories.is_empty());
                     // Status of a checkout's files does not touch its Git
                     // metadata. Explicit membership refreshes every tick;
                     // legacy projects retain the inexpensive worktree probe.
                     let stamp = worktree_probe_stamp(&project.repo_path);
-                    if !explicit_members
-                        && stamp.is_some()
-                        && seen.get(&project.id) == stamp.as_ref()
-                    {
+                    if stamp.is_some() && seen.get(&project.id) == stamp.as_ref() {
                         continue;
                     }
                     // The stamp is only recorded on success, so a failed

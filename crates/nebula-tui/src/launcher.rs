@@ -1897,23 +1897,22 @@ pub fn checkout_for(app: &App, project: &ProjectId) -> Option<WorktreeId> {
         .find(|id| usable(id))
 }
 
-/// Where a launch from the box lands for `project`: a fresh worktree off
-/// the project's default base (`new_worktree` — the
-/// `quick_prompt_new_worktree` SETTING, or `^N` in the box), or an
-/// existing checkout ([`launch_checkout`]): the worktree under the grid's
-/// cursor, else the project's ROOT BRANCH. A project with no usable
-/// checkout — still being cut, or none at all — gets a fresh worktree
-/// either way.
+/// Where a launch from the box lands for `project`: the main workspace, or
+/// a fresh session workspace when the launch asks for isolation. The old
+/// single-repository worktree option is not available in this fork.
 pub fn target_for(app: &App, project: &ProjectId, new_worktree: bool) -> QuickTarget {
-    let existing = (!new_worktree)
-        .then(|| launch_checkout(app, project))
-        .flatten();
-    match existing {
-        Some(worktree) => QuickTarget::Worktree(worktree),
-        None => QuickTarget::NewWorktree {
+    if new_worktree {
+        QuickTarget::NewSessionWorkspace {
             project: project.clone(),
-            branch: crate::branch_name::random_name(&app.project_branches(project)),
-        },
+            name: crate::branch_name::random_name(&app.project_branches(project)),
+        }
+    } else {
+        launch_checkout(app, project)
+            .map(QuickTarget::Worktree)
+            .unwrap_or_else(|| QuickTarget::NewSessionWorkspace {
+                project: project.clone(),
+                name: crate::branch_name::random_name(&app.project_branches(project)),
+            })
     }
 }
 
@@ -1979,9 +1978,8 @@ pub fn project_of(app: &App, target: &QuickTarget) -> Option<ProjectId> {
     }
 }
 
-/// A fresh worktree for `launch` in `project`, on a branch nobody has
-/// yet: named after the issue for an ISSUE SESSION, the random name `n`
-/// would offer otherwise.
+/// A fresh session workspace for `launch` in `project`, named after the
+/// issue when present or with a random workspace name otherwise.
 pub fn fresh_worktree(
     app: &App,
     project: ProjectId,
@@ -1992,7 +1990,10 @@ pub fn fresh_worktree(
         Some(issue) => crate::branch_name::issue_name(issue.number, &issue.title, &taken),
         None => crate::branch_name::random_name(&taken),
     };
-    QuickTarget::NewWorktree { project, branch }
+    QuickTarget::NewSessionWorkspace {
+        project,
+        name: branch,
+    }
 }
 
 /// Where `launch` lands with its NEW WORKTREE toggle flipped: a fresh
@@ -2763,7 +2764,7 @@ mod tests {
         app.launcher_unaimed = false;
         assert!(matches!(
             target_for(&app, &api, true),
-            QuickTarget::NewWorktree { ref project, .. } if *project == api
+            QuickTarget::NewSessionWorkspace { ref project, .. } if *project == api
         ));
     }
 

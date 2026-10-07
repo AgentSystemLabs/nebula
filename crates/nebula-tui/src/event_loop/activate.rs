@@ -265,25 +265,10 @@ pub(super) fn delete_worktree(app: &mut App, id: &WorktreeId) {
         app.flash = Some(WORKTREE_STILL_CREATING.into());
         return;
     }
-    let live_here = app
-        .tree
-        .agents
-        .iter()
-        .filter(|a| &a.worktree_id == id && !a.archived)
-        .count()
-        + app
-            .tree
-            .terminals
-            .iter()
-            .filter(|t| &t.worktree_id == id)
-            .count();
     app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-        title: "Delete worktree".into(),
-        message: format!(
-            "Delete worktree '{}' from disk? {live_here} session(s) will be killed.",
-            w.branch
-        ),
-        action: PendingAction::DeleteWorktree(id.clone()),
+        title: "Disabled".into(),
+        message: "Single repository worktrees are not available in Nebula Pilot. Close a session workspace as a whole.".into(),
+        action: PendingAction::CloseSessionWorkspace(id.clone()),
         area: ratatui::layout::Rect::default(),
     }));
 }

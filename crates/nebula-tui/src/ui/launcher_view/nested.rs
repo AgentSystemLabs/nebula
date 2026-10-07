@@ -231,7 +231,7 @@ fn draw_empty(buf: &mut Buffer, app: &App, r: Rect, band: &Band, lit: bool) {
     } else {
         EMPTY_BAND_HINT.to_string()
     };
-    if !band.is_main && !band.workspace_unavailable {
+    if band.workspace_state.is_some() && !band.is_main && !band.workspace_unavailable {
         text.push_str(EMPTY_BAND_DELETE);
     }
     let fg = if lit { th.accent } else { gray::DIM };

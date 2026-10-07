@@ -360,8 +360,8 @@ pub const AGENTS_HEAD: &[SettingSpec] = &[
     },
     SettingSpec {
         kind: SettingKind::QuickPromptNewWorktree,
-        label: "New worktree",
-        hint: "Each new session's box starts on a fresh worktree (off = the project's root branch; ^N flips one box)",
+        label: "New session workspace",
+        hint: "Each new session starts in an isolated session workspace (off = the main workspace; ^N flips one box)",
         group: "Quick prompt",
     },
     SettingSpec {
@@ -5097,7 +5097,7 @@ mod tests {
                             "Agent".to_string(),
                             "Focus".to_string(),
                             "Follow new".to_string(),
-                            "New worktree".to_string(),
+                            "New session workspace".to_string(),
                             "Hide missing CLIs".to_string()
                         ]
                     ),

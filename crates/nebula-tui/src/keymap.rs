@@ -67,7 +67,6 @@ pub enum Action {
     /// or a click opens the project.
     ProjectDropdown,
     // projects & worktrees
-    AddProject,
     New,
     GitDiff,
     OpenRepo,
@@ -349,15 +348,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         defaults: &["+", "cmd+p"],
     },
     // ---- PROJECTS & WORKTREES ----
-    ActionSpec {
-        action: Action::AddProject,
-        id: "add_project",
-        label: "Open a folder as a project",
-        hint: "Open a folder as a project in nebula, from anywhere; ⇧O opens a checkout outside it, in your editor",
-        group: "PROJECTS & WORKTREES",
-        scope: Scope::Global,
-        defaults: &["o"],
-    },
     ActionSpec {
         action: Action::New,
         id: "new",

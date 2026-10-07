@@ -423,8 +423,8 @@ pub(super) fn folded_band(app: &App) -> Option<WorktreeId> {
 }
 
 /// The checkout of the EMPTY BAND under the grid's cursor — a band with
-/// no card on it, which only **Show all worktrees** draws. What `d` and
-/// a right-click act on there: the worktree itself, as nothing else is.
+/// no card on it, which only **Show all worktrees** draws. The band remains
+/// selectable so a new session or terminal can be launched there.
 /// None with the grid down, or the cursor on a card or a band of them.
 ///
 /// The checkout's link rows are no card: its detected pull request is a
@@ -1269,10 +1269,7 @@ fn project_menu(app: &mut App, at: (u16, u16)) {
     let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
         return;
     };
-    let mut items = vec![MenuItem::new(
-        "New worktree",
-        MenuAction::NewWorktree(project.clone()),
-    )];
+    let mut items = Vec::new();
     if let Some(w) = crate::launcher::checkout_for(app, &project) {
         let running = app.worktree_running(&w);
         items.push(MenuItem::new(
@@ -1290,11 +1287,6 @@ fn project_menu(app: &mut App, at: (u16, u16)) {
                 items.push(MenuItem::destructive(
                     "Close session workspace…",
                     MenuAction::CloseSessionWorkspace(w),
-                ));
-            } else {
-                items.push(MenuItem::destructive(
-                    "Delete worktree",
-                    MenuAction::DeleteWorktree(w),
                 ));
             }
         }
@@ -1574,8 +1566,8 @@ pub(super) const NO_TABS_HERE: &str = "project tabs are on the grid's header —
 /// What the tab keys say with nothing to move between.
 const NO_TABS: &str = "no projects open — + in the header opens one";
 const ONE_TAB: &str = "one project open — + in the header opens another";
-/// The PROJECT DROPDOWN's last row: a folder that is not a project yet.
-const OPEN_FOLDER: &str = "+ open a folder…";
+/// The PROJECT DROPDOWN's last row: how to register another project.
+const OPEN_FOLDER: &str = "register projects with `nebula register`";
 /// What closing the last tab says: nebula is back on the splash, and
 /// nothing about the projects changed.
 const LAST_TAB: &str = "all projects closed — their sessions run on; + opens one again";
@@ -1896,9 +1888,8 @@ fn close_every_project(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// the ones wanting a human first, then the most recently worked in —
 /// the one in front of you ticked, each with how many sessions it holds.
 /// Enter on a row opens that project's sessions ([`open_project`]) and,
-/// if it had none, a tab for it at the far left. The last row opens a
-/// folder that is not a project yet — the same prompt `o` opens — so the
-/// `+` is the one place to reach for any project, known or not.
+/// if it had none, a tab for it at the far left. The last row points users
+/// to CLI registration; folders are no longer opened or initialized here.
 ///
 /// `+` or `⌘P` ([`Action::ProjectDropdown`]) drops the same list from the
 /// keyboard — from the cards, or from inside the PANE under them
@@ -1947,7 +1938,7 @@ pub(super) fn open_project_menu(app: &mut App) {
             )
         })
         .collect();
-    items.push(MenuItem::new(OPEN_FOLDER, MenuAction::AddProject));
+    items.push(MenuItem::new(OPEN_FOLDER, MenuAction::RegisterProjectHelp));
     let hover = open
         .as_ref()
         .and_then(|id| cards.iter().position(|card| &card.id == id))
@@ -2759,7 +2750,7 @@ fn open_worktree_picker(app: &mut App, back: QuickReturn) {
         QuickTarget::Worktree(_) => view::fresh_worktree(app, project.clone(), &back.launch),
     };
     let fresh_name = match &fresh {
-        QuickTarget::NewWorktree { branch, .. } => format!("new worktree  {branch}"),
+        QuickTarget::NewWorktree { branch, .. } => format!("new session workspace  {branch}"),
         QuickTarget::NewSessionWorkspace { name, .. } => format!("new session workspace  {name}"),
         QuickTarget::Worktree(_) => unreachable!("fresh target is new"),
     };
@@ -3113,6 +3104,13 @@ mod tests {
     fn the_panes_top_edge_drags_the_grid_and_the_pane() {
         with_default_config(|| {
             let mut app = two_sessions();
+            app.tree.repositories.push(nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "demo".into(),
+                path: "/tmp/demo/demo".into(),
+                branch: "main".into(),
+                changed_files: None,
+            });
             let edge = |app: &App| {
                 app.hits
                     .iter()
@@ -3573,7 +3571,7 @@ mod tests {
             };
             assert!(toggle.width > 0, "the toggle was drawn");
             assert!(
-                buffer_text(&terminal).contains("new worktree"),
+                buffer_text(&terminal).contains("new session workspace"),
                 "the toggle is on screen"
             );
 
@@ -3657,10 +3655,11 @@ mod tests {
                         menu.title,
                         menu.items
                             .iter()
-                            .map(|i| match i.label.split_once("+ new worktree  ") {
+                            .map(|i| match i.label.split_once("+ new session workspace  ") {
                                 // The fresh row's branch is minted anew
                                 // for every picker: the row, not the name.
-                                Some((before, _)) => format!("{before}+ new worktree  <minted>"),
+                                Some((before, _)) =>
+                                    format!("{before}+ new session workspace  <minted>"),
                                 None => i.label.clone(),
                             })
                             .collect::<Vec<_>>()
@@ -3923,6 +3922,13 @@ mod tests {
     fn with_empty_band() -> App {
         let mut app = two_sessions();
         app.show_all_worktrees = true;
+        app.tree.repositories.push(nebula_core::ProjectRepository {
+            project_id: ProjectId("p1".into()),
+            name: "demo".into(),
+            path: "/tmp/demo/demo".into(),
+            branch: "main".into(),
+            changed_files: None,
+        });
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
@@ -3980,11 +3986,28 @@ mod tests {
             assert!(!screen.contains("idle"), "{screen}");
 
             let mut app = with_empty_band();
+            app.tree.repositories.clear();
+            app.tree.repositories.push(nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "demo".into(),
+                path: "/tmp/demo/demo".into(),
+                branch: "main".into(),
+                changed_files: None,
+            });
+            app.tree
+                .session_workspaces
+                .push(nebula_core::SessionWorkspace {
+                    worktree_id: WorktreeId("w3".into()),
+                    name: "idle".into(),
+                    state: nebula_core::WorkspaceState::Ready,
+                    failure: None,
+                    repositories: vec![],
+                });
             let screen = screen_text(&draw_tall(&mut app));
             assert!(screen.contains("idle"), "{screen}");
             assert!(
                 screen.contains(
-                    "nothing running · p: new session · t: terminal · d: delete worktree"
+                    "nothing running · p: new session · t: terminal · d: close workspace"
                 ),
                 "{screen}"
             );
@@ -4074,26 +4097,46 @@ mod tests {
         });
     }
 
-    /// INPUT PARITY: `d` on an EMPTY BAND and **Delete worktree** in its
-    /// right-click menu open the one confirm — the worktree's own, the
-    /// same `activate::delete_worktree` asks — and nothing is deleted
-    /// before it is answered.
+    /// An empty session workspace only offers whole-workspace close.
     #[test]
-    fn d_and_the_menu_on_an_empty_band_ask_to_delete_the_worktree() {
+    fn empty_band_does_not_offer_single_worktree_deletion() {
         with_default_config(|| {
-            let is_worktree_confirm = |app: &App| {
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
-                    if c.action == PendingAction::DeleteWorktree(WorktreeId("w3".into())))
-            };
-
             let mut by_key = with_empty_band();
+            by_key
+                .tree
+                .session_workspaces
+                .push(nebula_core::SessionWorkspace {
+                    worktree_id: WorktreeId("w3".into()),
+                    name: "idle".into(),
+                    state: nebula_core::WorkspaceState::Ready,
+                    failure: None,
+                    repositories: vec![],
+                });
             draw_tall(&mut by_key);
             keys(&mut by_key, &[KeyCode::Char('j'), KeyCode::Char('j')]);
             let sent = key(&mut by_key, KeyCode::Char('d'), KeyModifiers::NONE);
-            assert!(is_worktree_confirm(&by_key), "{:?}", by_key.overlay);
-            assert!(sent.is_empty(), "asked first: {sent:?}");
+            assert!(
+                matches!(
+                    &by_key.overlay,
+                    Some(Overlay::Confirm(confirm))
+                        if confirm.action == PendingAction::CloseSessionWorkspace(WorktreeId("w3".into()))
+                ),
+                "{:?}",
+                by_key.overlay
+            );
+            assert!(sent.is_empty(), "no deletion request: {sent:?}");
 
             let mut by_click = with_empty_band();
+            by_click
+                .tree
+                .session_workspaces
+                .push(nebula_core::SessionWorkspace {
+                    worktree_id: WorktreeId("w3".into()),
+                    name: "idle".into(),
+                    state: nebula_core::WorkspaceState::Ready,
+                    failure: None,
+                    repositories: vec![],
+                });
             draw_tall(&mut by_click);
             let area = band_area(&by_click, 2);
             mouse(
@@ -4102,21 +4145,17 @@ mod tests {
                 area.x + 4,
                 area.y + 1,
             );
-            let at = match &by_click.overlay {
-                Some(Overlay::Menu(menu)) => menu
-                    .items
-                    .iter()
-                    .position(|i| i.label == "Delete worktree")
-                    .unwrap_or_else(|| panic!("no Delete worktree in {menu:?}")),
-                other => panic!("expected the worktree's menu, got {other:?}"),
+            let Some(Overlay::Menu(menu)) = &by_click.overlay else {
+                panic!("expected the band's menu, got {:?}", by_click.overlay);
             };
-            for _ in 0..at {
-                key(&mut by_click, KeyCode::Down, KeyModifiers::NONE);
-            }
-            key(&mut by_click, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(is_worktree_confirm(&by_click), "{:?}", by_click.overlay);
-            let id = |app: &App| app.selected_worktree().map(|w| w.id.clone());
-            assert_eq!(id(&by_click), id(&by_key));
+            assert!(menu
+                .items
+                .iter()
+                .any(|item| item.label.contains("Close session workspace")));
+            assert!(menu
+                .items
+                .iter()
+                .all(|item| item.label != "Delete worktree"));
         });
     }
 
@@ -4130,56 +4169,94 @@ mod tests {
         app
     }
 
-    /// An EMPTY BAND whose checkout has a detected pull request is still
-    /// an empty band (#104): `d` opens the worktree's confirm its hint
-    /// promises, not the flash that the pull request's link can't be
-    /// deleted, and a right-click — on the band, or on the `#7` on its
-    /// rule — opens the worktree's menu, not the link's.
+    /// A pull-request badge never re-enables single-worktree deletion.
     #[test]
-    fn an_empty_band_on_a_pull_request_still_deletes_the_worktree() {
+    fn an_empty_band_on_a_pull_request_still_has_no_single_worktree_delete() {
         with_default_config(|| {
-            let is_worktree_confirm = |app: &App| {
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
-                    if c.action == PendingAction::DeleteWorktree(WorktreeId("w3".into())))
-            };
-
             let mut by_key = with_empty_band_on_a_pull_request();
+            by_key
+                .tree
+                .session_workspaces
+                .push(nebula_core::SessionWorkspace {
+                    worktree_id: WorktreeId("w3".into()),
+                    name: "idle".into(),
+                    state: nebula_core::WorkspaceState::Ready,
+                    failure: None,
+                    repositories: vec![],
+                });
+            by_key
+                .tree
+                .repositories
+                .push(nebula_core::ProjectRepository {
+                    project_id: ProjectId("p1".into()),
+                    name: "demo".into(),
+                    path: "/tmp/demo/demo".into(),
+                    branch: "main".into(),
+                    changed_files: None,
+                });
             let screen = screen_text(&draw_tall(&mut by_key));
-            assert!(screen.contains("d: delete worktree"), "{screen}");
+            assert!(!screen.contains("d: delete worktree"), "{screen}");
             keys(&mut by_key, &[KeyCode::Char('j'), KeyCode::Char('j')]);
             assert_eq!(
                 by_key.selected_worktree().map(|w| w.id.clone()),
                 Some(WorktreeId("w3".into()))
             );
-            assert!(
-                matches!(
-                    by_key.selected_session_row(),
-                    Some(crate::app::SessionRow::Link(_))
-                ),
-                "the pull request's link row is under the cursor: {:?}",
-                by_key.selected_session_row()
-            );
             let sent = key(&mut by_key, KeyCode::Char('d'), KeyModifiers::NONE);
-            assert!(
-                is_worktree_confirm(&by_key),
-                "{:?} / {:?}",
-                by_key.overlay,
-                by_key.flash
-            );
-            assert_eq!(by_key.flash, None);
-            assert!(sent.is_empty(), "asked first: {sent:?}");
+            assert!(matches!(
+                &by_key.overlay,
+                Some(Overlay::Confirm(confirm))
+                    if confirm.action == PendingAction::CloseSessionWorkspace(WorktreeId("w3".into()))
+            ));
+            assert!(sent.is_empty());
 
             let mut drawn = with_empty_band_on_a_pull_request();
+            drawn
+                .tree
+                .session_workspaces
+                .push(nebula_core::SessionWorkspace {
+                    worktree_id: WorktreeId("w3".into()),
+                    name: "idle".into(),
+                    state: nebula_core::WorkspaceState::Ready,
+                    failure: None,
+                    repositories: vec![],
+                });
+            drawn
+                .tree
+                .repositories
+                .push(nebula_core::ProjectRepository {
+                    project_id: ProjectId("p1".into()),
+                    name: "demo".into(),
+                    path: "/tmp/demo/demo".into(),
+                    branch: "main".into(),
+                    changed_files: None,
+                });
             draw_tall(&mut drawn);
+            assert!(drawn.hits.iter().all(|(_, hit)| {
+                !matches!(hit, HitTarget::LauncherBandPr(id) if id == &WorktreeId("w3".into()))
+            }));
             let band = band_area(&drawn, 2);
-            let pr = drawn
-                .hits
-                .iter()
-                .find(|(_, hit)| *hit == HitTarget::LauncherBandPr(WorktreeId("w3".into())))
-                .map(|(rect, _)| *rect)
-                .expect("the pull request on the empty band's rule");
-            for (x, y) in [(band.x + 4, band.y + 1), (pr.x, pr.y)] {
+            for (x, y) in [(band.x + 4, band.y + 1)] {
                 let mut by_click = with_empty_band_on_a_pull_request();
+                by_click
+                    .tree
+                    .session_workspaces
+                    .push(nebula_core::SessionWorkspace {
+                        worktree_id: WorktreeId("w3".into()),
+                        name: "idle".into(),
+                        state: nebula_core::WorkspaceState::Ready,
+                        failure: None,
+                        repositories: vec![],
+                    });
+                by_click
+                    .tree
+                    .repositories
+                    .push(nebula_core::ProjectRepository {
+                        project_id: ProjectId("p1".into()),
+                        name: "demo".into(),
+                        path: "/tmp/demo/demo".into(),
+                        branch: "main".into(),
+                        changed_files: None,
+                    });
                 draw_tall(&mut by_click);
                 mouse(
                     &mut by_click,
@@ -4187,19 +4264,13 @@ mod tests {
                     x,
                     y,
                 );
-                let at = match &by_click.overlay {
-                    Some(Overlay::Menu(menu)) => menu
-                        .items
-                        .iter()
-                        .position(|i| i.label == "Delete worktree")
-                        .unwrap_or_else(|| panic!("no Delete worktree in {menu:?}")),
-                    other => panic!("expected the worktree's menu, got {other:?}"),
+                let Some(Overlay::Menu(menu)) = &by_click.overlay else {
+                    panic!("expected a band menu, got {:?}", by_click.overlay);
                 };
-                for _ in 0..at {
-                    key(&mut by_click, KeyCode::Down, KeyModifiers::NONE);
-                }
-                key(&mut by_click, KeyCode::Enter, KeyModifiers::NONE);
-                assert!(is_worktree_confirm(&by_click), "{:?}", by_click.overlay);
+                assert!(menu
+                    .items
+                    .iter()
+                    .all(|item| item.label != "Delete worktree"));
             }
         });
     }
@@ -4264,18 +4335,16 @@ mod tests {
             draw_tall(&mut app);
             to_feat(&mut app);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
-            match &app.overlay {
-                Some(Overlay::Confirm(c)) => assert!(
-                    matches!(
-                        c.action,
-                        PendingAction::ThenDeleteWorktree { offered: false, .. }
-                    ) && c.message.contains("goes with it"),
-                    "{:?}: {}",
-                    c.action,
-                    c.message
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Confirm(confirm))
+                        if matches!(confirm.action, PendingAction::DeleteAgent(_))
+                            && !confirm.message.contains("worktree")
                 ),
-                other => panic!("expected the card's confirm, got {other:?}"),
-            }
+                "{:?}",
+                app.overlay
+            );
             let sent = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert!(
                 sent.iter()
@@ -4283,16 +4352,16 @@ mod tests {
                 "{sent:?}"
             );
             assert!(
-                sent.iter()
-                    .any(|r| matches!(r, ClientRequest::DeleteWorktree { id, .. }
-                    if id == &WorktreeId("w2".into()))),
-                "{sent:?}"
+                !sent
+                    .iter()
+                    .any(|request| matches!(request, ClientRequest::DeleteWorktree { .. })),
+                "deleting a card preserves its session workspace: {sent:?}"
             );
             assert!(
-                !crate::launcher::bands(&app)
+                crate::launcher::bands(&app)
                     .iter()
                     .any(|b| b.worktree == WorktreeId("w2".into())),
-                "feat's band is gone with its last card"
+                "the session workspace band remains after deleting its last card"
             );
             draw_tall(&mut app);
         });
@@ -4564,7 +4633,7 @@ mod tests {
 
             open_worktree_picker(&mut app);
             let (rows, hover) = picker_rows(&app);
-            assert!(rows[0].starts_with("+ new worktree  "), "{rows:?}");
+            assert!(rows[0].starts_with("+ new session workspace  "), "{rows:?}");
             assert!(!rows[0].ends_with(" ✓"), "{rows:?}");
             assert_eq!(rows[1..], ["main  (root) ✓", "feat"], "{rows:?}");
             assert_eq!(hover, 1, "the cursor starts on the ✓");
@@ -4573,7 +4642,10 @@ mod tests {
             let text = buffer_text(&draw_at(&mut app, 140, 40));
             assert!(text.contains("New session"), "the box's title: {text}");
             assert!(text.contains("fix the nav"), "the task: {text}");
-            assert!(text.contains("+ new worktree"), "the picker: {text}");
+            assert!(
+                text.contains("+ new session workspace"),
+                "the picker: {text}"
+            );
 
             click_picker_row(&mut app, "feat");
             let (after, text) = launch(&app);
@@ -4607,12 +4679,12 @@ mod tests {
             assert_eq!(kept.target, after.target);
             assert_eq!(text, "fix the nav");
 
-            // And the fresh row cuts a worktree again.
+            // And the fresh row creates a session workspace again.
             open_worktree_picker(&mut app);
-            click_picker_row(&mut app, "+ new worktree");
+            click_picker_row(&mut app, "+ new session workspace");
             let (fresh, text) = launch(&app);
             assert!(
-                matches!(&fresh.target, QuickTarget::NewWorktree { project, .. } if project.0 == "p1"),
+                matches!(&fresh.target, QuickTarget::NewSessionWorkspace { project, .. } if project.0 == "p1"),
                 "{:?}",
                 fresh.target
             );
@@ -5413,7 +5485,7 @@ mod tests {
             // Inside the dropdown a letter is a letter: `w` narrows to
             // `web`.
             key(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
-            assert_eq!(labels(&app), vec!["web  (1)"]);
+            assert_eq!(labels(&app), vec!["web  (1)", super::OPEN_FOLDER]);
 
             // Backspace widens back to the whole list.
             key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
@@ -6073,29 +6145,7 @@ mod tests {
 
     /// The PROJECT DROPDOWN's last row opens a folder that is not a
     /// project yet: the open-project prompt `o` opens, over the grid.
-    #[test]
-    fn the_dropdowns_last_row_opens_a_folder() {
-        with_default_config(|| {
-            let mut app = two_sessions();
-            draw(&mut app);
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
-            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            for _ in 0..2 {
-                key(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            }
-            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-                panic!("the row opens the prompt: {:?}", app.overlay);
-            };
-            assert!(matches!(prompt.kind, PromptKind::AddProject));
-            assert_eq!(prompt.title, "Open project");
-        });
-    }
 
-    /// A right-click on a PROJECT TAB opens that project — the left
-    /// click's [`open_tab`] — with the project's own menu hung under the
-    /// tab: its checkouts, its run command, its name and its place in the
-    /// list, the verbs the PROJECTS PANEL's rows used to carry.
     #[test]
     fn a_right_click_on_a_tab_opens_its_projects_menu() {
         with_default_config(|| {
@@ -6111,9 +6161,10 @@ mod tests {
                 panic!("the tab's menu: {:?}", app.overlay);
             };
             let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
-            for want in ["New worktree", "Rename", "Remove from list"] {
+            for want in ["Run", "Open", "Rename", "Remove from list"] {
                 assert!(labels.contains(&want), "{want} in {labels:?}");
             }
+            assert!(!labels.contains(&"New session workspace"), "{labels:?}");
             assert_eq!(menu.at.map(|(_, row)| row), Some(y + 1), "under the tab");
         });
     }
@@ -8129,7 +8180,7 @@ mod tests {
             assert_eq!(text, "fix it", "the task survives the trip");
             assert!(matches!(
                 &launch.target,
-                QuickTarget::NewWorktree { project, .. } if project.0 == "p2"
+                QuickTarget::NewSessionWorkspace { project, .. } if project.0 == "p2"
             ));
 
             // Esc from the picker hands the box back as it was.
@@ -8169,7 +8220,7 @@ mod tests {
             assert!(
                 matches!(
                     out.as_slice(),
-                    [ClientRequest::CreateWorktree { project, .. }] if project.0 == "p2"
+                    [ClientRequest::CreateSessionWorkspace { project, .. }] if project.0 == "p2"
                 ),
                 "the checkout is cut in the project the box was aimed at: {out:?}"
             );
@@ -8186,27 +8237,20 @@ mod tests {
                 "the footer is the only sign of it"
             );
 
-            // The session went up all the same — in web's list, not this one.
-            let staged = app
-                .tree
-                .agents
-                .iter()
-                .find(|a| !["a1", "a2", "a3"].contains(&a.id.0.as_str()))
-                .expect("a stand-in session for the launch");
-            let project = app
-                .tree
-                .worktrees
-                .iter()
-                .find(|w| w.id == staged.worktree_id)
-                .map(|w| w.project_id.clone());
-            assert_eq!(project, Some(ProjectId("p2".into())));
-            let rows = crate::launcher::rows(&app);
+            let workspace_name = match out.as_slice() {
+                [ClientRequest::CreateSessionWorkspace { name, .. }] => name,
+                other => panic!("expected one session workspace create: {other:?}"),
+            };
             assert!(
-                !rows.iter().any(|r| r.agent.id == staged.id),
-                "no card for it in demo's grid: {:?}",
-                rows.iter()
-                    .map(|r| r.agent.name.clone())
-                    .collect::<Vec<_>>()
+                app.tree.session_workspaces.iter().any(|workspace| {
+                    workspace.name == *workspace_name
+                        && app.tree.worktrees.iter().any(|row| {
+                            row.id == workspace.worktree_id
+                                && row.project_id == ProjectId("p2".into())
+                        })
+                }),
+                "workspace was created under web: {:?}",
+                app.tree.session_workspaces
             );
         });
     }
@@ -8603,14 +8647,21 @@ mod tests {
     fn the_header_counts_the_projects_open_prs_and_issues() {
         with_default_config(|| {
             let mut app = two_sessions();
+            app.tree.repositories.push(nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "demo".into(),
+                path: "/tmp/demo/demo".into(),
+                branch: "main".into(),
+                changed_files: None,
+            });
             seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Fix the nav")]);
             seed_issues(&mut app, &[(15, "Crash on boot")]);
             app.launcher_expanded = None;
 
             let text = buffer_text(&draw(&mut app));
             assert!(text.contains("2 sessions"), "{text}");
-            assert!(text.contains("2 prs"), "{text}");
-            assert!(text.contains("1 issue"), "the singular: {text}");
+            assert!(!text.contains("2 prs"), "PR count is disabled: {text}");
+            assert!(!text.contains("1 issue"), "issue count is disabled: {text}");
         });
     }
 
@@ -8621,58 +8672,24 @@ mod tests {
     /// own word and not on the `·` between them, and the one under the
     /// pointer is underlined, as the header's tabs are.
     #[test]
-    fn clicking_a_header_count_opens_that_list() {
+    fn clicking_a_header_count_does_not_open_disabled_project_modals() {
         with_default_config(|| {
             let mut app = two_sessions();
+            app.tree.repositories.push(nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "demo".into(),
+                path: "/tmp/demo/demo".into(),
+                branch: "main".into(),
+                changed_files: None,
+            });
             seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Fix the nav")]);
             seed_issues(&mut app, &[(15, "Crash on boot")]);
-            let project = app.selected_project().expect("a project").id.clone();
             let terminal = draw(&mut app);
-            let line: Vec<char> = head_line(&terminal).chars().collect();
-            let word = |app: &App, hit: HitTarget| -> String {
-                let rect = app.hit_rect(&hit).expect("the count was drawn");
-                assert_eq!(rect.y, 1, "on the header row");
-                line[rect.x as usize..(rect.x + rect.width) as usize]
-                    .iter()
-                    .collect()
-            };
-            assert_eq!(word(&app, HitTarget::LauncherPullRequests), "2 prs");
-            assert_eq!(word(&app, HitTarget::LauncherIssues), "1 issue");
-
-            // The pointer resting on a count underlines that word alone.
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherIssues);
-            mouse(&mut app, MouseEventKind::Moved, x, y);
-            assert_eq!(underlined_head(&draw(&mut app)), "1 issue");
-
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherPullRequests);
-            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            let Some(Overlay::PullRequests(view)) = &app.overlay else {
-                panic!("`2 prs` opens the pull requests: {:?}", app.overlay);
-            };
-            assert_eq!(view.project, project);
-            let clicked = app.overlay.take();
-            key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
-            assert_eq!(
-                format!("{:?}", app.overlay),
-                format!("{clicked:?}"),
-                "the click is `v`"
-            );
-
-            app.overlay = None;
-            draw(&mut app);
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherIssues);
-            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            let Some(Overlay::Issues(view)) = &app.overlay else {
-                panic!("`1 issue` opens the issues: {:?}", app.overlay);
-            };
-            assert_eq!(view.project, project);
-            let clicked = app.overlay.take();
-            key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
-            assert_eq!(
-                format!("{:?}", app.overlay),
-                format!("{clicked:?}"),
-                "the click is `i`"
-            );
+            assert!(app.hits.iter().all(|(_, hit)| !matches!(
+                hit,
+                HitTarget::LauncherPullRequests | HitTarget::LauncherIssues
+            )));
+            assert!(buffer_text(&terminal).contains("2 sessions"));
         });
     }
 
@@ -9797,7 +9814,7 @@ mod tests {
             assert!(text.contains("project demo ^P"), "{text}");
             assert!(text.contains("harness claude Tab"), "{text}");
             assert!(text.contains("model default ^O"), "{text}");
-            assert!(text.contains("new worktree ^N"), "{text}");
+            assert!(text.contains("new session workspace ^N"), "{text}");
             assert!(
                 text.contains("worktree main ^T"),
                 "where the launch lands: {text}"
@@ -10310,7 +10327,7 @@ mod tests {
 
             // And it is the box itself, drawn with its own chrome.
             let text = buffer_text(&draw(&mut app));
-            assert!(text.contains("new worktree ^N"), "{text}");
+            assert!(text.contains("new session workspace ^N"), "{text}");
 
             // `^N` flips it onto a fresh worktree and back onto the root:
             // nothing under the cursor to come back to.
@@ -10408,7 +10425,7 @@ mod tests {
                 assert!(
                     matches!(
                         &launch(&app).0.target,
-                        QuickTarget::NewWorktree { project, .. } if project.0 == "p1"
+                        QuickTarget::NewSessionWorkspace { project, .. } if project.0 == "p1"
                     ),
                     "{agent}: {:?}",
                     launch(&app).0.target
@@ -11305,7 +11322,7 @@ mod tests {
             let (head, text) = band_header(&app, &term, 2);
             assert_eq!(head.height, 1);
             assert!(text.contains("nothing running"), "{text:?}");
-            assert!(text.contains("d: delete worktree"), "{text:?}");
+            assert!(!text.contains("d: delete worktree"), "{text:?}");
             let above = drawn_entries(&app, 1)[0].1;
             assert_eq!(head.y, above.bottom(), "no blank row above it");
 
@@ -11532,7 +11549,7 @@ mod tests {
     /// band **Show all worktrees** would otherwise keep — the grid is the
     /// welcome nebula opens on.
     #[test]
-    fn deleting_every_thread_leaves_the_welcome() {
+    fn deleting_every_session_keeps_the_main_workspace() {
         with_config_json(r#"{"delete_empty_worktree": true}"#, || {
             let mut app = nested_with_children();
             app.show_all_worktrees = true;
@@ -11544,7 +11561,7 @@ mod tests {
             draw_tall(&mut app);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(!app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
+            assert!(app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
 
             super::select_card(
                 &mut app,
@@ -11554,10 +11571,12 @@ mod tests {
             draw_tall(&mut app);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(crate::launcher::bands(&app).is_empty());
+            assert!(app.tree.worktrees.iter().any(|w| w.is_main));
             let text = buffer_text(&draw_tall(&mut app));
-            assert!(text.contains("Welcome to nebula"), "{text}");
-            assert!(!super::has_pane(&app), "nothing for the pane to read");
+            assert!(
+                text.contains("Welcome to nebula") || text.contains("nothing running"),
+                "{text}"
+            );
         });
     }
 

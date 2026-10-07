@@ -1,5 +1,5 @@
 //! Managed-hook installation into the agent CLI's config:
-//! `<worktree>/.claude/settings.local.json` (Claude Code),
+//! `<workspace>/.claude/settings.local.json` (Claude Code),
 //! `~/.codex/hooks.json` (Codex CLI), or `<worktree>/.cursor/hooks.json`
 //! (Cursor CLI). Pi and OpenCode have no hook file — their managed
 //! TypeScript extension and plugin are `pi_extension.rs` and
@@ -71,11 +71,8 @@ const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
     // prompt, which fires no hook of its own — the gated tool simply runs,
     // and its PostToolUse is the first word that the user said yes, for
     // Edit and WebFetch as much as for Bash (see status.rs); and the
-    // session's position — Claude reports its working directory on every
-    // payload, and EnterWorktree/ExitWorktree (what "do this in a
-    // worktree" actually runs) or a Bash `cd` move it, so the row re-homes
-    // seconds after the move instead of at the turn's Stop, which can be
-    // many minutes later (see registry::reparent_agent_by_cwd).
+    // session's reported cwd is deliberately not used for ownership: agents
+    // remain attached to their registered workspace as they navigate repos.
     ("PostToolUse", None),
     ("SubagentStart", None),
     ("SubagentStop", None),

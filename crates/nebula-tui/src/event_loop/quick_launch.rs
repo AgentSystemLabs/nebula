@@ -76,55 +76,18 @@ pub(super) fn submit(
     // the pane, as a picker-walked launch (`n`) does.
     let focus_pane = !stay && cfg.quick_prompt_focus;
     match launch.target.clone() {
+        QuickTarget::NewWorktree { .. } => {
+            app.flash = Some(
+                "single-repository worktrees are disabled; create a session workspace instead"
+                    .into(),
+            );
+        }
         QuickTarget::Worktree(worktree) => {
             let draft = AgentLaunchDraft {
                 follow: !stay,
                 ..draft(launch, worktree, text, focus_pane, None)
             };
             create_agent(app, draft, out)
-        }
-        QuickTarget::NewWorktree { project, branch } => {
-            // Its tab to the far left now, as `create_agent` does for a
-            // launch into a checkout that exists: the create it rides
-            // goes out seconds from now and does not count again.
-            app.bring_tab_forward(&project);
-            // The rows first, so the panels never wait on git.
-            // The composed task the create will carry (`draft`), asked
-            // here so the row goes up the way it will come back: working.
-            let first_prompt = !launch.compose(&text).is_empty();
-            let placeholder = placeholder::stage(
-                app,
-                project.clone(),
-                branch.clone(),
-                launch.kind,
-                launch.custom.clone(),
-                launch.model.clone(),
-                launch.effort.clone(),
-                first_prompt,
-                !stay,
-                out,
-            );
-
-            // `base: None` is the DAEMON's `worktree_base_branch` SETTING,
-            // else its fetched `origin/HEAD` (`git::add_worktree_off_default`)
-            // — never this checkout's HEAD.
-            send_with_follow(
-                app,
-                out,
-                PendingIntent::LaunchInCreatedWorktree {
-                    launch,
-                    text,
-                    placeholder,
-                    focus: focus_pane,
-                },
-                !stay,
-                |req_id| ClientRequest::CreateWorktree {
-                    req_id,
-                    project,
-                    branch,
-                    base: None,
-                },
-            );
         }
         QuickTarget::NewSessionWorkspace { project, name } => {
             app.bring_tab_forward(&project);
@@ -562,57 +525,62 @@ mod tests {
             key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
             let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             let (req_id, branch) = match out.as_slice() {
-                [ClientRequest::CreateWorktree { req_id, branch, .. }] => (*req_id, branch.clone()),
-                other => panic!("one CreateWorktree: {other:?}"),
+                [ClientRequest::CreateSessionWorkspace { req_id, name, .. }] => {
+                    (*req_id, name.clone())
+                }
+                other => panic!("one CreateSessionWorkspace: {other:?}"),
             };
             assert!(app.left_behind.contains(&req_id));
             assert_eq!(
                 app.flash.as_deref(),
-                Some(format!("started a session in {branch}").as_str())
+                Some(format!("started a session in pilot/{branch}").as_str())
             );
             assert!(
                 app.tree.worktrees.iter().any(|w| w.branch == branch),
-                "the stand-in checkout is up"
+                "the stand-in workspace is up"
             );
             assert_eq!(app.tree.agents.len(), 2, "and its session");
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(cursor(&app), Some(AgentId("a1".into())));
             assert_eq!(pane(&app), card);
 
-            let real = WorktreeId("w3".into());
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Worktree(Worktree {
-                        id: real.clone(),
-                        project_id: ProjectId("p1".into()),
-                        path: "/tmp/demo-w3".into(),
-                        branch,
-                        is_main: false,
-                        sort_order: 0,
-                    }),
-                },
-            );
             let mut out = Vec::new();
             handle_server_event(
                 &mut app,
-                ServerEvent::Ack {
+                ServerEvent::SessionWorkspaceCreated {
                     req_id,
-                    created: Some(EntityId::Worktree(real.clone())),
+                    workspace: Worktree {
+                        id: WorktreeId("w3".into()),
+                        project_id: ProjectId("p1".into()),
+                        path: format!("/tmp/demo/worktrees/{branch}").into(),
+                        branch: format!("pilot/{branch}"),
+                        is_main: false,
+                        sort_order: 0,
+                    },
+                    repositories: vec![nebula_core::WorkspaceRepository {
+                        id: WorktreeId("w4".into()),
+                        name: "repo".into(),
+                        path: format!("/tmp/demo/worktrees/{branch}/repo").into(),
+                        base: Some("main".into()),
+                        fetch_succeeded: true,
+                        warning: None,
+                        branch: Some(format!("pilot/{branch}")),
+                        changed_files: Some(0),
+                    }],
                 },
                 &mut out,
             );
             let create = match out.as_slice() {
                 [ClientRequest::CreateAgent {
                     req_id, worktree, ..
-                }] if *worktree == real => *req_id,
+                }] if worktree.0 == "w3" => *req_id,
                 other => panic!("the create goes into the new checkout: {other:?}"),
             };
             assert!(app.left_behind.contains(&create), "born left behind too");
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(cursor(&app), Some(AgentId("a1".into())));
 
-            acked(&mut app, create, &real);
+            acked(&mut app, create, &WorktreeId("w3".into()));
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(cursor(&app), Some(AgentId("a1".into())));
             assert_eq!(pane(&app), card);

@@ -173,7 +173,7 @@ pub(crate) fn open_on(app: &mut App, url: Option<&str>) {
         return;
     };
     if app.tree.uses_workspace_layout(&project.id) {
-        app.flash = Some("pull requests are not available in multi-repository projects".into());
+        app.flash = Some("pull requests are disabled in Nebula Pilot workspaces".into());
         return;
     }
     let repository_path = app

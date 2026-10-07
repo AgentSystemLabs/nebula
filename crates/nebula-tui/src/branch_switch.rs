@@ -50,7 +50,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{clamp_selection, window_start, App, Focus, Overlay};
+use crate::app::{clamp_selection, window_start, App, Overlay};
 use crate::git_diff::{git_command, DiffFile};
 use crate::text_input::TextInput;
 use crate::theme::Theme;
@@ -1119,11 +1119,26 @@ pub(crate) fn open_branch_switch(app: &mut App) {
         app.flash = Some("switch branch: select a project first".into());
         return;
     };
-    let on_checkout = matches!(
-        app.focus,
-        Focus::Worktrees | Focus::Sessions | Focus::Terminal
-    );
-    if let Some(workspace) = app.selected_worktree().filter(|_| on_checkout).cloned() {
+    if let Some(workspace) = app.selected_worktree().cloned() {
+        if !workspace.is_main
+            && !app
+                .tree
+                .repositories
+                .iter()
+                .any(|repository| repository.project_id == project)
+            && !app.tree.session_workspaces.iter().any(|session| {
+                session.worktree_id == workspace.id
+                    || session
+                        .repositories
+                        .iter()
+                        .any(|repository| repository.id == workspace.id)
+            })
+        {
+            app.flash = Some(
+                "single repository worktrees are not available in Nebula Pilot; select a repository in a workspace".into(),
+            );
+            return;
+        }
         if let Some((name, path, branch)) = app.selected_repository_checkout(&workspace.id) {
             let session_member = app.tree.session_workspaces.iter().any(|session| {
                 session
@@ -1147,17 +1162,10 @@ pub(crate) fn open_branch_switch(app: &mut App) {
             return;
         }
     }
-    let target = match app.selected_worktree().filter(|_| on_checkout) {
-        Some(w) if !w.is_main => {
-            app.flash = Some(
-                "switch branch is for the ⌂ root checkout — a worktree stays on the branch it was cut for"
-                    .into(),
-            );
-            return;
-        }
-        Some(w) => Some(w.id.clone()),
-        None => app.root_worktree(&project),
-    };
+    let target = app
+        .selected_worktree()
+        .map(|worktree| worktree.id.clone())
+        .or_else(|| app.root_worktree(&project));
     match target {
         Some(id) => open_for(app, &id),
         None => app.flash = Some("switch branch: the project has no root checkout yet".into()),
@@ -1432,11 +1440,39 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
     );
     match outcome {
         Outcome::Switched { branch, note } => {
+            let root = view_for(app, &worktree).map(|view| view.root.clone());
             // The row renames now rather than on the DAEMON's next sync,
             // and everything cached about the old branch goes: the listing
             // (its `current` mark), the changed-file badge, the PR row.
             if let Some(w) = app.tree.worktrees.iter_mut().find(|w| w.id == worktree) {
                 w.branch = branch.clone();
+            }
+            if let Some(root) = root {
+                let canonical_root = root.canonicalize().ok();
+                let project_id = app
+                    .tree
+                    .worktrees
+                    .iter()
+                    .find(|checkout| checkout.id == worktree)
+                    .map(|checkout| checkout.project_id.clone());
+                if let Some(repository) = app.tree.repositories.iter_mut().find(|repository| {
+                    repository.path == root
+                        || (canonical_root.is_some()
+                            && repository.path.canonicalize().ok() == canonical_root)
+                        || project_id.as_ref() == Some(&repository.project_id)
+                }) {
+                    repository.branch = branch.clone();
+                }
+                for session in &mut app.tree.session_workspaces {
+                    for repository in &mut session.repositories {
+                        if repository.path == root
+                            || (canonical_root.is_some()
+                                && repository.path.canonicalize().ok() == canonical_root)
+                        {
+                            repository.branch = Some(branch.clone());
+                        }
+                    }
+                }
             }
             app.branch_switch.lists.remove(&worktree);
             if app
