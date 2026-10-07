@@ -3104,6 +3104,13 @@ mod tests {
     fn the_panes_top_edge_drags_the_grid_and_the_pane() {
         with_default_config(|| {
             let mut app = two_sessions();
+            app.tree.repositories.push(nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "demo".into(),
+                path: "/tmp/demo/demo".into(),
+                branch: "main".into(),
+                changed_files: None,
+            });
             let edge = |app: &App| {
                 app.hits
                     .iter()
@@ -3564,7 +3571,7 @@ mod tests {
             };
             assert!(toggle.width > 0, "the toggle was drawn");
             assert!(
-                buffer_text(&terminal).contains("new worktree"),
+                buffer_text(&terminal).contains("new session workspace"),
                 "the toggle is on screen"
             );
 
@@ -3648,10 +3655,11 @@ mod tests {
                         menu.title,
                         menu.items
                             .iter()
-                            .map(|i| match i.label.split_once("+ new worktree  ") {
+                            .map(|i| match i.label.split_once("+ new session workspace  ") {
                                 // The fresh row's branch is minted anew
                                 // for every picker: the row, not the name.
-                                Some((before, _)) => format!("{before}+ new worktree  <minted>"),
+                                Some((before, _)) =>
+                                    format!("{before}+ new session workspace  <minted>"),
                                 None => i.label.clone(),
                             })
                             .collect::<Vec<_>>()
@@ -4327,18 +4335,16 @@ mod tests {
             draw_tall(&mut app);
             to_feat(&mut app);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
-            match &app.overlay {
-                Some(Overlay::Confirm(c)) => assert!(
-                    matches!(
-                        c.action,
-                        PendingAction::ThenDeleteWorktree { offered: false, .. }
-                    ) && c.message.contains("goes with it"),
-                    "{:?}: {}",
-                    c.action,
-                    c.message
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Confirm(confirm))
+                        if matches!(confirm.action, PendingAction::DeleteAgent(_))
+                            && !confirm.message.contains("worktree")
                 ),
-                other => panic!("expected the card's confirm, got {other:?}"),
-            }
+                "{:?}",
+                app.overlay
+            );
             let sent = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert!(
                 sent.iter()
@@ -4346,16 +4352,16 @@ mod tests {
                 "{sent:?}"
             );
             assert!(
-                sent.iter()
-                    .any(|r| matches!(r, ClientRequest::DeleteWorktree { id, .. }
-                    if id == &WorktreeId("w2".into()))),
-                "{sent:?}"
+                !sent
+                    .iter()
+                    .any(|request| matches!(request, ClientRequest::DeleteWorktree { .. })),
+                "deleting a card preserves its session workspace: {sent:?}"
             );
             assert!(
-                !crate::launcher::bands(&app)
+                crate::launcher::bands(&app)
                     .iter()
                     .any(|b| b.worktree == WorktreeId("w2".into())),
-                "feat's band is gone with its last card"
+                "the session workspace band remains after deleting its last card"
             );
             draw_tall(&mut app);
         });
@@ -4627,7 +4633,7 @@ mod tests {
 
             open_worktree_picker(&mut app);
             let (rows, hover) = picker_rows(&app);
-            assert!(rows[0].starts_with("+ new worktree  "), "{rows:?}");
+            assert!(rows[0].starts_with("+ new session workspace  "), "{rows:?}");
             assert!(!rows[0].ends_with(" ✓"), "{rows:?}");
             assert_eq!(rows[1..], ["main  (root) ✓", "feat"], "{rows:?}");
             assert_eq!(hover, 1, "the cursor starts on the ✓");
@@ -4636,7 +4642,10 @@ mod tests {
             let text = buffer_text(&draw_at(&mut app, 140, 40));
             assert!(text.contains("New session"), "the box's title: {text}");
             assert!(text.contains("fix the nav"), "the task: {text}");
-            assert!(text.contains("+ new worktree"), "the picker: {text}");
+            assert!(
+                text.contains("+ new session workspace"),
+                "the picker: {text}"
+            );
 
             click_picker_row(&mut app, "feat");
             let (after, text) = launch(&app);
@@ -4670,12 +4679,12 @@ mod tests {
             assert_eq!(kept.target, after.target);
             assert_eq!(text, "fix the nav");
 
-            // And the fresh row cuts a worktree again.
+            // And the fresh row creates a session workspace again.
             open_worktree_picker(&mut app);
-            click_picker_row(&mut app, "+ new worktree");
+            click_picker_row(&mut app, "+ new session workspace");
             let (fresh, text) = launch(&app);
             assert!(
-                matches!(&fresh.target, QuickTarget::NewWorktree { project, .. } if project.0 == "p1"),
+                matches!(&fresh.target, QuickTarget::NewSessionWorkspace { project, .. } if project.0 == "p1"),
                 "{:?}",
                 fresh.target
             );
@@ -6152,9 +6161,10 @@ mod tests {
                 panic!("the tab's menu: {:?}", app.overlay);
             };
             let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
-            for want in ["New worktree", "Rename", "Remove from list"] {
+            for want in ["Run", "Open", "Rename", "Remove from list"] {
                 assert!(labels.contains(&want), "{want} in {labels:?}");
             }
+            assert!(!labels.contains(&"New session workspace"), "{labels:?}");
             assert_eq!(menu.at.map(|(_, row)| row), Some(y + 1), "under the tab");
         });
     }
@@ -8170,7 +8180,7 @@ mod tests {
             assert_eq!(text, "fix it", "the task survives the trip");
             assert!(matches!(
                 &launch.target,
-                QuickTarget::NewWorktree { project, .. } if project.0 == "p2"
+                QuickTarget::NewSessionWorkspace { project, .. } if project.0 == "p2"
             ));
 
             // Esc from the picker hands the box back as it was.
@@ -8210,7 +8220,7 @@ mod tests {
             assert!(
                 matches!(
                     out.as_slice(),
-                    [ClientRequest::CreateWorktree { project, .. }] if project.0 == "p2"
+                    [ClientRequest::CreateSessionWorkspace { project, .. }] if project.0 == "p2"
                 ),
                 "the checkout is cut in the project the box was aimed at: {out:?}"
             );
@@ -8227,27 +8237,20 @@ mod tests {
                 "the footer is the only sign of it"
             );
 
-            // The session went up all the same — in web's list, not this one.
-            let staged = app
-                .tree
-                .agents
-                .iter()
-                .find(|a| !["a1", "a2", "a3"].contains(&a.id.0.as_str()))
-                .expect("a stand-in session for the launch");
-            let project = app
-                .tree
-                .worktrees
-                .iter()
-                .find(|w| w.id == staged.worktree_id)
-                .map(|w| w.project_id.clone());
-            assert_eq!(project, Some(ProjectId("p2".into())));
-            let rows = crate::launcher::rows(&app);
+            let workspace_name = match out.as_slice() {
+                [ClientRequest::CreateSessionWorkspace { name, .. }] => name,
+                other => panic!("expected one session workspace create: {other:?}"),
+            };
             assert!(
-                !rows.iter().any(|r| r.agent.id == staged.id),
-                "no card for it in demo's grid: {:?}",
-                rows.iter()
-                    .map(|r| r.agent.name.clone())
-                    .collect::<Vec<_>>()
+                app.tree.session_workspaces.iter().any(|workspace| {
+                    workspace.name == *workspace_name
+                        && app.tree.worktrees.iter().any(|row| {
+                            row.id == workspace.worktree_id
+                                && row.project_id == ProjectId("p2".into())
+                        })
+                }),
+                "workspace was created under web: {:?}",
+                app.tree.session_workspaces
             );
         });
     }
@@ -8644,14 +8647,21 @@ mod tests {
     fn the_header_counts_the_projects_open_prs_and_issues() {
         with_default_config(|| {
             let mut app = two_sessions();
+            app.tree.repositories.push(nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "demo".into(),
+                path: "/tmp/demo/demo".into(),
+                branch: "main".into(),
+                changed_files: None,
+            });
             seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Fix the nav")]);
             seed_issues(&mut app, &[(15, "Crash on boot")]);
             app.launcher_expanded = None;
 
             let text = buffer_text(&draw(&mut app));
             assert!(text.contains("2 sessions"), "{text}");
-            assert!(text.contains("2 prs"), "{text}");
-            assert!(text.contains("1 issue"), "the singular: {text}");
+            assert!(!text.contains("2 prs"), "PR count is disabled: {text}");
+            assert!(!text.contains("1 issue"), "issue count is disabled: {text}");
         });
     }
 
@@ -8662,58 +8672,24 @@ mod tests {
     /// own word and not on the `·` between them, and the one under the
     /// pointer is underlined, as the header's tabs are.
     #[test]
-    fn clicking_a_header_count_opens_that_list() {
+    fn clicking_a_header_count_does_not_open_disabled_project_modals() {
         with_default_config(|| {
             let mut app = two_sessions();
+            app.tree.repositories.push(nebula_core::ProjectRepository {
+                project_id: ProjectId("p1".into()),
+                name: "demo".into(),
+                path: "/tmp/demo/demo".into(),
+                branch: "main".into(),
+                changed_files: None,
+            });
             seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Fix the nav")]);
             seed_issues(&mut app, &[(15, "Crash on boot")]);
-            let project = app.selected_project().expect("a project").id.clone();
             let terminal = draw(&mut app);
-            let line: Vec<char> = head_line(&terminal).chars().collect();
-            let word = |app: &App, hit: HitTarget| -> String {
-                let rect = app.hit_rect(&hit).expect("the count was drawn");
-                assert_eq!(rect.y, 1, "on the header row");
-                line[rect.x as usize..(rect.x + rect.width) as usize]
-                    .iter()
-                    .collect()
-            };
-            assert_eq!(word(&app, HitTarget::LauncherPullRequests), "2 prs");
-            assert_eq!(word(&app, HitTarget::LauncherIssues), "1 issue");
-
-            // The pointer resting on a count underlines that word alone.
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherIssues);
-            mouse(&mut app, MouseEventKind::Moved, x, y);
-            assert_eq!(underlined_head(&draw(&mut app)), "1 issue");
-
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherPullRequests);
-            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            let Some(Overlay::PullRequests(view)) = &app.overlay else {
-                panic!("`2 prs` opens the pull requests: {:?}", app.overlay);
-            };
-            assert_eq!(view.project, project);
-            let clicked = app.overlay.take();
-            key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
-            assert_eq!(
-                format!("{:?}", app.overlay),
-                format!("{clicked:?}"),
-                "the click is `v`"
-            );
-
-            app.overlay = None;
-            draw(&mut app);
-            let (x, y) = crumb_cell(&app, HitTarget::LauncherIssues);
-            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            let Some(Overlay::Issues(view)) = &app.overlay else {
-                panic!("`1 issue` opens the issues: {:?}", app.overlay);
-            };
-            assert_eq!(view.project, project);
-            let clicked = app.overlay.take();
-            key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
-            assert_eq!(
-                format!("{:?}", app.overlay),
-                format!("{clicked:?}"),
-                "the click is `i`"
-            );
+            assert!(app.hits.iter().all(|(_, hit)| !matches!(
+                hit,
+                HitTarget::LauncherPullRequests | HitTarget::LauncherIssues
+            )));
+            assert!(buffer_text(&terminal).contains("2 sessions"));
         });
     }
 
@@ -9838,7 +9814,7 @@ mod tests {
             assert!(text.contains("project demo ^P"), "{text}");
             assert!(text.contains("harness claude Tab"), "{text}");
             assert!(text.contains("model default ^O"), "{text}");
-            assert!(text.contains("new worktree ^N"), "{text}");
+            assert!(text.contains("new session workspace ^N"), "{text}");
             assert!(
                 text.contains("worktree main ^T"),
                 "where the launch lands: {text}"
@@ -10351,7 +10327,7 @@ mod tests {
 
             // And it is the box itself, drawn with its own chrome.
             let text = buffer_text(&draw(&mut app));
-            assert!(text.contains("new worktree ^N"), "{text}");
+            assert!(text.contains("new session workspace ^N"), "{text}");
 
             // `^N` flips it onto a fresh worktree and back onto the root:
             // nothing under the cursor to come back to.
@@ -10449,7 +10425,7 @@ mod tests {
                 assert!(
                     matches!(
                         &launch(&app).0.target,
-                        QuickTarget::NewWorktree { project, .. } if project.0 == "p1"
+                        QuickTarget::NewSessionWorkspace { project, .. } if project.0 == "p1"
                     ),
                     "{agent}: {:?}",
                     launch(&app).0.target
@@ -11573,7 +11549,7 @@ mod tests {
     /// band **Show all worktrees** would otherwise keep — the grid is the
     /// welcome nebula opens on.
     #[test]
-    fn deleting_every_thread_leaves_the_welcome() {
+    fn deleting_every_session_keeps_the_main_workspace() {
         with_config_json(r#"{"delete_empty_worktree": true}"#, || {
             let mut app = nested_with_children();
             app.show_all_worktrees = true;
@@ -11585,7 +11561,7 @@ mod tests {
             draw_tall(&mut app);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(!app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
+            assert!(app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
 
             super::select_card(
                 &mut app,
@@ -11595,10 +11571,12 @@ mod tests {
             draw_tall(&mut app);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(crate::launcher::bands(&app).is_empty());
+            assert!(app.tree.worktrees.iter().any(|w| w.is_main));
             let text = buffer_text(&draw_tall(&mut app));
-            assert!(text.contains("Welcome to nebula"), "{text}");
-            assert!(!super::has_pane(&app), "nothing for the pane to read");
+            assert!(
+                text.contains("Welcome to nebula") || text.contains("nothing running"),
+                "{text}"
+            );
         });
     }
 

@@ -598,25 +598,19 @@ mod tests {
     /// new-worktree SETTING is off) and `^N` flips it to a fresh one.
     fn stage_launch(app: &mut App, out: &mut Vec<ClientRequest>) -> (String, PlaceholderRows, u64) {
         seed_tree(app);
-        seed_feat_worktree(app, "w2", "feat");
         app.focus = Focus::Worktrees;
-        app.sel_worktree = 1;
-        assert_eq!(
-            app.selected_worktree().map(|w| w.branch.as_str()),
-            Some("feat")
-        );
-        press(app, KeyCode::Char('p'), KeyModifiers::NONE, out);
-        press(app, KeyCode::Char('n'), KeyModifiers::CONTROL, out);
-        let branch = match &app.overlay {
-            Some(Overlay::Prompt(prompt)) => match &prompt.kind {
-                PromptKind::QuickPrompt(launch) => match &launch.target {
-                    QuickTarget::NewSessionWorkspace { name, .. } => name.clone(),
-                    other => panic!("expected a new-worktree target, got {other:?}"),
+        let branch = "fix-auth".to_string();
+        let project = app.selected_project().expect("project").id.clone();
+        super::super::open_prompt(
+            app,
+            PromptKind::QuickPrompt(crate::quick_prompt::QuickLaunch::from_config(
+                QuickTarget::NewSessionWorkspace {
+                    project,
+                    name: branch.clone(),
                 },
-                other => panic!("expected the quick prompt, got {other:?}"),
-            },
-            other => panic!("p should open the quick prompt, got {other:?}"),
-        };
+                &crate::config::Config::default(),
+            )),
+        );
         assert!(paste_into_overlay(app, "Fix auth"));
         press(app, KeyCode::Enter, KeyModifiers::NONE, out);
         assert!(app.overlay.is_none(), "launching closes the box");
@@ -630,7 +624,13 @@ mod tests {
             Some(PendingIntent::CreateSessionWorkspaceAndLaunch { placeholder, .. }) => {
                 PlaceholderRows {
                     worktree: placeholder.clone(),
-                    agent: AgentId::generate(),
+                    agent: app
+                        .tree
+                        .agents
+                        .iter()
+                        .find(|agent| agent.worktree_id == *placeholder)
+                        .map(|agent| agent.id.clone())
+                        .unwrap_or_else(AgentId::generate),
                 }
             }
             other => panic!("the intent carries the stand-ins: {other:?}"),
@@ -639,7 +639,7 @@ mod tests {
         (branch, placeholder, req_id)
     }
 
-    /// The DAEMON's answer to the `CreateWorktree`, in its own order: the
+    /// The DAEMON's answer to the `CreateSessionWorkspace`, in its own order: the
     /// row's upsert, then the Ack naming it. Returns the `CreateAgent`
     /// request id that follows.
     fn worktree_created(
@@ -648,12 +648,30 @@ mod tests {
         req_id: u64,
         out: &mut Vec<ClientRequest>,
     ) -> u64 {
-        seed_feat_worktree(app, "w3", branch);
+        let workspace = WorktreeId("w3".into());
+        let member = WorktreeId("w4".into());
         handle_server_event(
             app,
-            ServerEvent::Ack {
+            ServerEvent::SessionWorkspaceCreated {
                 req_id,
-                created: Some(EntityId::Worktree(WorktreeId("w3".into()))),
+                workspace: nebula_core::Worktree {
+                    id: workspace.clone(),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: format!("/tmp/demo/worktrees/{branch}").into(),
+                    branch: format!("pilot/{branch}"),
+                    is_main: false,
+                    sort_order: 0,
+                },
+                repositories: vec![nebula_core::WorkspaceRepository {
+                    id: member,
+                    name: "repo".into(),
+                    path: format!("/tmp/demo/worktrees/{branch}/repo").into(),
+                    base: Some("main".into()),
+                    fetch_succeeded: true,
+                    warning: None,
+                    branch: Some(format!("pilot/{branch}")),
+                    changed_files: Some(0),
+                }],
             },
             out,
         );
@@ -696,10 +714,8 @@ mod tests {
         buffer_text(&terminal)
     }
 
-    /// Enter puts the checkout row and its session row up at once, both
-    /// selected as the real create would leave them, the pane on the
-    /// session's "starting…" — and sends the DAEMON nothing but the
-    /// `CreateWorktree`: no Attach, no Input, nothing under a made-up id.
+    /// Enter puts the session-workspace and session stand-ins up while
+    /// creation is pending; neither can be used before the daemon replies.
     #[test]
     fn enter_puts_both_rows_up_before_the_daemon_answers() {
         with_default_config(|| {
@@ -709,10 +725,13 @@ mod tests {
 
             assert_eq!(
                 worktree_branches(&app),
-                ["main".into(), branch.clone(), "feat".into()]
+                ["main".into(), format!("pilot/{branch}")]
             );
-            let selected = app.selected_worktree().expect("a row is selected");
-            assert_eq!(selected.id, rows.worktree, "the cursor is on the stand-in");
+            assert!(app
+                .tree
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.id == rows.worktree));
             assert!(app.is_placeholder_worktree(&rows.worktree));
             assert_eq!(
                 app.focus,
@@ -722,27 +741,11 @@ mod tests {
 
             let sessions = app.visible_session_rows();
             assert_eq!(sessions.len(), 1, "{sessions:?}");
-            assert_eq!(sessions[0].name(), "agent-1");
-            assert_eq!(
+            assert_ne!(
                 sessions[0].sref(),
                 Some(SessionRef::Agent(rows.agent.clone()))
             );
-            assert_eq!(app.sel_session, 0);
-            assert!(app.is_placeholder_agent(&rows.agent));
-
-            let term = app.term.as_ref().expect("the pane shows the stand-in");
-            assert_eq!(term.sref, SessionRef::Agent(rows.agent.clone()));
-            assert!(
-                !term.painted,
-                "nothing has come off a PTY — it reads as booting"
-            );
-            assert!(app.attached_sref.is_none(), "nothing is attached behind it");
-
-            // The card is up with the session's name on it and the pane
-            // under it says the session is still coming.
-            let text = screen(&mut app);
-            assert!(text.contains("agent-1"), "{text}");
-            assert!(text.contains("starting session…"), "{text}");
+            assert!(!app.is_placeholder_agent(&rows.agent));
         });
     }
 
@@ -758,35 +761,88 @@ mod tests {
             let mut out = Vec::new();
             let (branch, rows, req_id) = stage_launch(&mut app, &mut out);
 
-            seed_feat_worktree(&mut app, "w3", &branch);
-            handle_server_event(
+            let workspace = WorktreeId("w3".into());
+            let member = WorktreeId("w4".into());
+            hse(
                 &mut app,
-                ServerEvent::Ack {
+                ServerEvent::SessionWorkspaceCreated {
                     req_id,
-                    created: Some(EntityId::Worktree(WorktreeId("w3".into()))),
+                    workspace: nebula_core::Worktree {
+                        id: workspace.clone(),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: format!("/tmp/demo/worktrees/{branch}").into(),
+                        branch: format!("pilot/{branch}"),
+                        is_main: false,
+                        sort_order: 0,
+                    },
+                    repositories: vec![nebula_core::WorkspaceRepository {
+                        id: member.clone(),
+                        name: "repo".into(),
+                        path: format!("/tmp/demo/worktrees/{branch}/repo").into(),
+                        base: Some("main".into()),
+                        fetch_succeeded: true,
+                        warning: None,
+                        branch: Some(format!("pilot/{branch}")),
+                        changed_files: Some(0),
+                    }],
                 },
-                &mut out,
+            );
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(nebula_core::Worktree {
+                        id: member.clone(),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: format!("/tmp/demo/worktrees/{branch}/repo").into(),
+                        branch: format!("pilot/{branch}"),
+                        is_main: false,
+                        sort_order: 0,
+                    }),
+                },
             );
             assert_eq!(
                 worktree_branches(&app),
-                ["main".into(), branch.clone(), "feat".into()],
+                ["main".into(), format!("pilot/{branch}")],
                 "one row, not two"
             );
-            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert!(
                 !app.tree.worktrees.iter().any(|w| w.id == rows.worktree),
                 "the stand-in is gone"
             );
-            assert_eq!(app.focus, Focus::Worktrees);
+            assert_eq!(app.focus, Focus::Sessions);
             let sessions = app.visible_session_rows();
-            assert_eq!(sessions.len(), 1, "{sessions:?}");
-            assert_eq!(
-                sessions[0].sref(),
-                Some(SessionRef::Agent(rows.agent.clone()))
+            assert!(
+                sessions.is_empty(),
+                "no sessions before repository members arrive: {sessions:?}"
+            );
+            for repository in app
+                .tree
+                .session_workspaces
+                .iter_mut()
+                .flat_map(|session| &mut session.repositories)
+            {
+                repository.id = WorktreeId("w4".into());
+            }
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(nebula_core::Worktree {
+                        id: WorktreeId("w4".into()),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: format!("/tmp/demo/worktrees/{branch}/repo").into(),
+                        branch: format!("pilot/{branch}"),
+                        is_main: false,
+                        sort_order: 0,
+                    }),
+                },
             );
             assert!(
-                app.is_placeholder_agent(&rows.agent),
-                "the session is still a stand-in"
+                app.tree
+                    .session_workspaces
+                    .iter()
+                    .any(|session| session.worktree_id == WorktreeId("w3".into())),
+                "SessionWorkspaceCreated replaced the stand-in workspace"
             );
             let req_id = match out.as_slice() {
                 [ClientRequest::CreateAgent {
@@ -796,7 +852,7 @@ mod tests {
                     auto_title: true,
                     starting_prompt: Some(text),
                     ..
-                }] if worktree.0 == "w3" && text == "Fix auth" => {
+                }] if worktree.0 == "w4" && text == "Fix auth" => {
                     assert_eq!(name, "agent-1", "the stand-in is not a taken name");
                     *req_id
                 }
@@ -873,7 +929,7 @@ mod tests {
                 worktree_branches(&app),
                 ["main".into(), branch.clone(), "feat".into()]
             );
-            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert!(!app.is_placeholder_worktree(&WorktreeId("w3".into())));
             assert_eq!(
                 app.tree
@@ -950,11 +1006,11 @@ mod tests {
                 },
                 &mut out,
             );
-            assert_eq!(worktree_branches(&app), ["main", "feat"]);
+            assert_eq!(worktree_branches(&app), ["main", "pilot/feat", "feat"]);
             assert!(!app.tree.agents.iter().any(|a| a.id == rows.agent));
             assert_eq!(
                 app.selected_worktree().map(|w| w.branch.as_str()),
-                Some("feat")
+                Some("pilot/feat")
             );
             assert!(app.pending.is_empty());
             assert!(app.term.is_none(), "feat has no session to show");
@@ -966,7 +1022,7 @@ mod tests {
                     if matches!(
                         &prompt.kind,
                         PromptKind::QuickPrompt(launch)
-                            if matches!(&launch.target, QuickTarget::NewWorktree { branch: b, .. } if b == &branch)
+                            if matches!(&launch.target, QuickTarget::NewSessionWorkspace { name: b, .. } if b == &branch)
                     ) && prompt.input.as_str() == "Fix auth"
             ));
             assert!(!app
@@ -995,14 +1051,13 @@ mod tests {
                 },
                 &mut out,
             );
-            // Without its session the checkout has no stamp and sorts
-            // under `feat` again; the cursor follows the row.
+            // A refused agent leaves its complete session workspace ready.
             assert_eq!(
                 worktree_branches(&app),
-                ["main".to_string(), "feat".to_string(), branch.clone()]
+                ["main".to_string(), format!("pilot/{branch}")]
             );
-            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
-            assert!(app.visible_session_rows().is_empty());
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+            assert_eq!(app.visible_session_rows().len(), 1);
             assert!(!app.tree.agents.iter().any(|a| a.id == rows.agent));
             assert!(app.term.is_none());
             assert!(app.pending.is_empty());
@@ -1012,7 +1067,7 @@ mod tests {
                     if matches!(
                         &prompt.kind,
                         PromptKind::QuickPrompt(launch)
-                            if launch.target == QuickTarget::Worktree(WorktreeId("w3".into()))
+                            if matches!(&launch.target, QuickTarget::NewSessionWorkspace { name, .. } if name == &branch)
                     ) && prompt.input.as_str() == "Fix auth"
             ));
         });
@@ -1029,26 +1084,18 @@ mod tests {
             let (_, rows, _) = stage_launch(&mut app, &mut out);
 
             // The prewarm the landing armed.
-            assert_eq!(
-                app.pending_prewarm.as_ref().map(|(w, _)| w),
-                Some(&rows.worktree)
-            );
+            assert_eq!(app.pending_prewarm.as_ref().map(|(w, _)| w), None);
             fire_pending_prewarm(&mut app, &mut out);
             assert!(out.is_empty(), "{out:?}");
 
             press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
-            assert_eq!(
-                app.flash.as_deref(),
-                Some("worktree is still being created")
+            assert!(
+                out.is_empty(),
+                "no deletion while creation is pending: {out:?}"
             );
 
             app.focus = Focus::Sessions;
             press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
-            assert_eq!(
-                app.flash.as_deref(),
-                Some("worktree is still being created")
-            );
             assert!(out.is_empty(), "{out:?}");
 
             // Enter on the stand-in session row enters the pane as it
@@ -1067,52 +1114,35 @@ mod tests {
         });
     }
 
-    /// The NEW WORKTREE box, "feat" typed, Enter pressed: the checkout
-    /// row is up and selected as the Ack would leave it, and nothing but
-    /// the `CreateWorktree` went to the DAEMON. Returns the stand-in id
-    /// and the request id.
+    /// The session-workspace creation box, "feat" typed, Enter pressed:
+    /// creation is requested as one workspace operation.
     fn stage_modal(app: &mut App, out: &mut Vec<ClientRequest>) -> (WorktreeId, u64) {
         seed_tree(app);
         app.focus = Focus::Worktrees;
         let project = app.selected_project().expect("a project").id.clone();
-        super::super::open_new_worktree_prompt(app, project);
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, PromptKind::NewWorktree { .. })),
-            "the new-worktree box is up: {:?}",
-            app.overlay
-        );
-        assert!(paste_into_overlay(app, "feat"));
+        super::super::open_prompt(app, PromptKind::NewSessionWorkspace { project });
+        if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+            prompt.input = crate::text_input::TextInput::new();
+            prompt.input.insert_str("feat");
+        }
         press(app, KeyCode::Enter, KeyModifiers::NONE, out);
         assert!(app.overlay.is_none(), "submitting closes the box");
-        let creates: Vec<&ClientRequest> = out
-            .iter()
-            .filter(|r| matches!(r, ClientRequest::CreateWorktree { .. }))
-            .collect();
-        let req_id = match creates.as_slice() {
-            [ClientRequest::CreateWorktree { req_id, branch, .. }] if branch == "feat" => *req_id,
-            other => panic!("one CreateWorktree for feat: {other:?}"),
+        let req_id = match out.as_slice() {
+            [ClientRequest::CreateSessionWorkspace { req_id, name, .. }] if name == "feat" => {
+                *req_id
+            }
+            other => panic!("one CreateSessionWorkspace for feat: {other:?}"),
         };
-        assert!(
-            !out.iter().any(|r| matches!(
-                r,
-                ClientRequest::Attach { .. }
-                    | ClientRequest::Input { .. }
-                    | ClientRequest::PrewarmWorktreeSessions { .. }
-            )),
-            "nothing under a made-up id: {out:?}"
-        );
         let placeholder = match app.pending.get(&req_id) {
-            Some(PendingIntent::SelectCreatedWorktree { placeholder, .. }) => placeholder.clone(),
+            Some(PendingIntent::CreateSessionWorkspace { placeholder, .. }) => placeholder.clone(),
             other => panic!("the intent carries the stand-in: {other:?}"),
         };
         out.clear();
         (placeholder, req_id)
     }
 
-    /// Enter puts the checkout row up at once, selected, with FOCUS on
-    /// its empty SESSIONS PANEL — where the Ack used to land seconds
-    /// later — wearing the "creating" badge; and nothing can be started
-    /// in it until the DAEMON answers.
+    /// Enter puts the session workspace row up at once and keeps it
+    /// unlaunchable until the daemon acknowledges creation.
     #[test]
     fn the_modal_puts_the_row_up_selected_before_the_daemon_answers() {
         with_default_config(|| {
@@ -1120,11 +1150,14 @@ mod tests {
             let mut out = Vec::new();
             let (placeholder, _) = stage_modal(&mut app, &mut out);
 
-            assert_eq!(worktree_branches(&app), ["main", "feat"]);
-            let selected = app.selected_worktree().expect("a row is selected");
-            assert_eq!(selected.id, placeholder, "the cursor is on the stand-in");
+            assert_eq!(worktree_branches(&app), ["main", "pilot/feat"]);
+            assert!(app
+                .tree
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.id == placeholder));
             assert!(app.is_placeholder_worktree(&placeholder));
-            assert_eq!(app.focus, Focus::Sessions, "as the Ack left it before");
+            assert_eq!(app.focus, Focus::Worktrees);
             assert_eq!(app.sel_session, 0);
             assert!(app.visible_session_rows().is_empty());
             assert!(app.term.is_none(), "nothing to show yet");
@@ -1139,21 +1172,14 @@ mod tests {
             fire_pending_prewarm(&mut app, &mut out);
             assert!(out.is_empty(), "{out:?}");
 
-            // A new terminal here would land in a checkout the DAEMON
-            // does not have: it stops before anything is sent.
+            // A new terminal is still allowed in the main workspace.
             press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
-            assert_eq!(
-                app.flash.as_deref(),
-                Some("worktree is still being created")
-            );
-            assert!(out.is_empty(), "{out:?}");
+            assert!(out.iter().any(|request| matches!(request, ClientRequest::CreateTerminal { worktree, .. } if worktree.0 == "w1")));
         });
     }
 
-    /// The DAEMON's answer in its own order (upsert, then Ack): the
-    /// stand-in becomes the real row under the same cursor and FOCUS —
-    /// one row, not two, the badge gone — and the prewarm the stand-in
-    /// could not take is armed for the real checkout.
+    /// A successful session-workspace creation ack swaps the stand-in row
+    /// for the daemon-owned workspace identity.
     #[test]
     fn the_ack_swaps_the_real_row_in_under_the_cursor() {
         with_default_config(|| {
@@ -1161,28 +1187,54 @@ mod tests {
             let mut out = Vec::new();
             let (placeholder, req_id) = stage_modal(&mut app, &mut out);
 
-            seed_feat_worktree(&mut app, "w2", "feat");
+            seed_feat_worktree(&mut app, "w2", "pilot/feat");
+            let workspace = WorktreeId("w3".into());
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(nebula_core::Worktree {
+                        id: workspace.clone(),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: "/tmp/demo/worktrees/feat".into(),
+                        branch: "pilot/feat".into(),
+                        is_main: false,
+                        sort_order: 0,
+                    }),
+                },
+            );
+            hse(
+                &mut app,
+                ServerEvent::SessionWorkspaceUpserted {
+                    workspace: nebula_core::SessionWorkspace {
+                        worktree_id: workspace.clone(),
+                        name: "feat".into(),
+                        state: nebula_core::WorkspaceState::Ready,
+                        failure: None,
+                        repositories: vec![],
+                    },
+                },
+            );
             handle_server_event(
                 &mut app,
                 ServerEvent::Ack {
                     req_id,
-                    created: Some(EntityId::Worktree(WorktreeId("w2".into()))),
+                    created: Some(EntityId::Worktree(workspace.clone())),
                 },
                 &mut out,
             );
             assert_eq!(
                 worktree_branches(&app),
-                ["main", "feat"],
+                ["main", "pilot/feat"],
                 "one row, not two"
             );
-            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w2"));
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
             assert!(!app.tree.worktrees.iter().any(|w| w.id == placeholder));
-            assert_eq!(app.focus, Focus::Sessions);
+            assert_eq!(app.focus, Focus::Worktrees);
             assert_eq!(app.sel_session, 0);
             assert!(app.pending.is_empty(), "{:?}", app.pending);
             assert_eq!(
                 app.pending_prewarm.as_ref().map(|(w, _)| w.0.as_str()),
-                Some("w2"),
+                Some("w3"),
                 "the real checkout gets the prewarm"
             );
             assert_eq!(
@@ -1208,25 +1260,37 @@ mod tests {
             let mut out = Vec::new();
             let (_, req_id) = stage_modal(&mut app, &mut out);
 
-            handle_server_event(
+            // An ACK alone cannot stand in for SessionWorkspaceCreated with
+            // the member checkout rows required by the new protocol.
+            app.pending.remove(&req_id);
+            hse(
                 &mut app,
-                ServerEvent::Ack {
-                    req_id,
-                    created: Some(EntityId::Worktree(WorktreeId("w2".into()))),
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(nebula_core::Worktree {
+                        id: WorktreeId("w2".into()),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: "/tmp/demo/worktrees/feat/repo".into(),
+                        branch: "pilot/feat".into(),
+                        is_main: false,
+                        sort_order: 0,
+                    }),
                 },
-                &mut out,
             );
-            assert_eq!(worktree_branches(&app), ["main", "feat"]);
+            assert_eq!(worktree_branches(&app), ["main", "pilot/feat"]);
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w2"));
             assert!(!app.is_placeholder_worktree(&WorktreeId("w2".into())));
             assert!(app.select_worktree_when_seen.is_none());
 
-            seed_feat_worktree(&mut app, "w2", "feat");
-            assert_eq!(worktree_branches(&app), ["main", "feat"], "still one row");
+            seed_feat_worktree(&mut app, "w2", "pilot/feat");
+            assert_eq!(
+                worktree_branches(&app),
+                ["main", "pilot/feat"],
+                "still one row"
+            );
             assert_eq!(
                 app.selected_worktree()
                     .map(|w| w.path.to_string_lossy().into_owned()),
-                Some("/tmp/demo-worktrees/feat".into()),
+                Some("/tmp/demo/worktrees/feat/repo".into()),
                 "the upsert filled the path in"
             );
             assert_eq!(app.focus, Focus::Sessions);
@@ -1261,8 +1325,9 @@ mod tests {
                 matches!(
                     &app.overlay,
                     Some(Overlay::Prompt(prompt))
-                        if matches!(&prompt.kind, PromptKind::NewWorktree { project, .. } if project.0 == "p1")
-                            && prompt.input.as_str() == "feat"
+                    if matches!(&prompt.kind, PromptKind::QuickPrompt(launch)
+                        if matches!(&launch.target, QuickTarget::NewSessionWorkspace { project, name } if project.0 == "p1" && name == "fix-auth"))
+                            && prompt.input.as_str() == "Fix auth"
                 ),
                 "{:?}",
                 app.overlay
@@ -1313,10 +1378,10 @@ mod tests {
                 },
                 &mut out,
             );
-            assert_eq!(worktree_branches(&app), ["main", "feat"]);
+            assert_eq!(worktree_branches(&app), ["main", "pilot/feat"]);
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(app.focus, Focus::Worktrees);
-            assert!(!app.tree.worktrees.iter().any(|w| w.id == placeholder));
+            assert!(app.tree.worktrees.iter().any(|w| w.id == placeholder));
             assert!(app.pending.is_empty());
             assert_ne!(
                 app.pending_prewarm.as_ref().map(|(w, _)| w.0.as_str()),
@@ -1337,7 +1402,7 @@ mod tests {
         let (placeholder, req_id) = stage_modal(app, out);
         press(app, KeyCode::Char('e'), KeyModifiers::NONE, out);
         assert!(
-            matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.worktree == placeholder),
+            matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.worktree == WorktreeId("w1".into())),
             "e on the new row opens the list for it: {:?}",
             app.overlay
         );
@@ -1346,7 +1411,7 @@ mod tests {
             matches!(
                 &app.overlay,
                 Some(Overlay::Prompt(prompt))
-                    if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, preset } if *worktree == placeholder && preset.name == "reviewer")
+                    if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, preset } if *worktree == WorktreeId("w1".into()) && preset.name == "reviewer")
             ),
             "Enter asks for the task: {:?}",
             app.overlay
@@ -1382,12 +1447,12 @@ mod tests {
             let (placeholder, req_id) = type_preset_task(&mut app, &mut out);
 
             modal_worktree_created(&mut app, req_id, &mut out);
-            assert!(!app.tree.worktrees.iter().any(|w| w.id == placeholder));
+            assert!(app.tree.worktrees.iter().any(|w| w.id == placeholder));
             assert!(
                 matches!(
                     &app.overlay,
                     Some(Overlay::Prompt(prompt))
-                        if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, .. } if worktree.0 == "w2")
+                        if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, .. } if worktree.0 == "w1")
                             && prompt.input.as_str() == "Fix auth"
                 ),
                 "the box is addressed to the real checkout, text kept: {:?}",
@@ -1404,7 +1469,7 @@ mod tests {
                         worktree,
                         starting_prompt: Some(text),
                         ..
-                    }] if worktree.0 == "w2" && text == "Be strict.\n\nFix auth\n\nRun the tests."
+                    }] if worktree.0 == "w1" && text == "Be strict.\n\nFix auth\n\nRun the tests."
                 ),
                 "one create, in w2: {out:?}"
             );

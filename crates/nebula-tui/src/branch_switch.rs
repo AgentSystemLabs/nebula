@@ -1121,6 +1121,11 @@ pub(crate) fn open_branch_switch(app: &mut App) {
     };
     if let Some(workspace) = app.selected_worktree().cloned() {
         if !workspace.is_main
+            && !app
+                .tree
+                .repositories
+                .iter()
+                .any(|repository| repository.project_id == project)
             && !app.tree.session_workspaces.iter().any(|session| {
                 session.worktree_id == workspace.id
                     || session
@@ -1435,11 +1440,39 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
     );
     match outcome {
         Outcome::Switched { branch, note } => {
+            let root = view_for(app, &worktree).map(|view| view.root.clone());
             // The row renames now rather than on the DAEMON's next sync,
             // and everything cached about the old branch goes: the listing
             // (its `current` mark), the changed-file badge, the PR row.
             if let Some(w) = app.tree.worktrees.iter_mut().find(|w| w.id == worktree) {
                 w.branch = branch.clone();
+            }
+            if let Some(root) = root {
+                let canonical_root = root.canonicalize().ok();
+                let project_id = app
+                    .tree
+                    .worktrees
+                    .iter()
+                    .find(|checkout| checkout.id == worktree)
+                    .map(|checkout| checkout.project_id.clone());
+                if let Some(repository) = app.tree.repositories.iter_mut().find(|repository| {
+                    repository.path == root
+                        || (canonical_root.is_some()
+                            && repository.path.canonicalize().ok() == canonical_root)
+                        || project_id.as_ref() == Some(&repository.project_id)
+                }) {
+                    repository.branch = branch.clone();
+                }
+                for session in &mut app.tree.session_workspaces {
+                    for repository in &mut session.repositories {
+                        if repository.path == root
+                            || (canonical_root.is_some()
+                                && repository.path.canonicalize().ok() == canonical_root)
+                        {
+                            repository.branch = Some(branch.clone());
+                        }
+                    }
+                }
             }
             app.branch_switch.lists.remove(&worktree);
             if app

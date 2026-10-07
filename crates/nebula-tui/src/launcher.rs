@@ -2764,7 +2764,7 @@ mod tests {
         app.launcher_unaimed = false;
         assert!(matches!(
             target_for(&app, &api, true),
-            QuickTarget::NewWorktree { ref project, .. } if *project == api
+            QuickTarget::NewSessionWorkspace { ref project, .. } if *project == api
         ));
     }
 

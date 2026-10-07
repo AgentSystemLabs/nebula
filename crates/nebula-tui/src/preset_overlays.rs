@@ -116,7 +116,10 @@ impl AgentPresetsView {
 
     /// Does Enter cut a fresh worktree first?
     pub fn is_new_worktree(&self) -> bool {
-        matches!(self.target(), QuickTarget::NewWorktree { .. })
+        matches!(
+            self.target(),
+            QuickTarget::NewWorktree { .. } | QuickTarget::NewSessionWorkspace { .. }
+        )
     }
 
     /// The picker's box with the flipped `aim` applied — what Enter hands
@@ -1356,11 +1359,11 @@ fn worktree_line(app: &App, view: &AgentPresetsView, width: u16, th: Theme) -> L
         (
             vec![
                 Span::raw(" "),
-                Span::styled(" NEW WORKTREE ", chip),
+                Span::styled(" NEW SESSION WORKSPACE ", chip),
                 Span::styled(format!(" {branch}"), on),
             ],
             vec![
-                Span::styled("[✓] new worktree", on),
+                Span::styled("[✓] new session workspace", on),
                 Span::styled(" Tab ", Style::default().fg(th.ok)),
             ],
         )
@@ -1371,7 +1374,7 @@ fn worktree_line(app: &App, view: &AgentPresetsView, width: u16, th: Theme) -> L
                 Span::styled(branch, Style::default().fg(th.muted)),
             ],
             vec![
-                Span::styled("[ ] new worktree", dim),
+                Span::styled("[ ] new session workspace", dim),
                 Span::styled(" Tab ", dim),
             ],
         )

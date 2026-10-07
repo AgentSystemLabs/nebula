@@ -3398,7 +3398,7 @@ pub(super) fn target_line(launch: &QuickLaunch, label: &str, width: u16, th: The
         let on = Style::default().fg(th.ok).add_modifier(Modifier::BOLD);
         (
             vec![
-                Span::styled("[✓] new worktree", on),
+                Span::styled("[✓] new session workspace", on),
                 Span::styled(" ^N", Style::default().fg(th.ok)),
             ],
             true,
@@ -3406,7 +3406,7 @@ pub(super) fn target_line(launch: &QuickLaunch, label: &str, width: u16, th: The
     } else {
         (
             vec![
-                Span::styled("[ ] new worktree", dim),
+                Span::styled("[ ] new session workspace", dim),
                 Span::styled(" ^N", dim),
             ],
             true,

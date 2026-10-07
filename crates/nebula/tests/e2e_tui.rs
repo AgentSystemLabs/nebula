@@ -448,6 +448,7 @@ fn choose_menu_row(tui: &mut TuiHarness, label: &str) {
 /// typed into the box — the grid's box will not launch on an empty one.
 fn start_session(tui: &mut TuiHarness, task: &str) {
     tui.send(ESC);
+    std::thread::sleep(Duration::from_millis(300));
     tui.send(b"p");
     tui.wait_for_text("what should the agent do?");
     tui.type_str(task);
@@ -490,7 +491,6 @@ fn host_working_directory_follows_project_switches_and_restores_on_exit() {
     tui.send(b"+");
     tui.type_str("cwd-second");
     tui.send(ENTER);
-    tui.send(ESC);
     assert!(tui.screen_text().contains("cwd-second"));
 
     tui.send(b"q");
@@ -506,13 +506,7 @@ fn tui_restart_restores_the_selected_project_and_agent_card() {
 
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "restore-selection");
-    tui.send(b"p");
-    tui.wait_for_text("what should the agent do?");
-    tui.type_str("keep this card selected");
-    tui.send(ENTER);
-    tui.wait_for_gone("what should the agent do?");
-    tui.wait_for_text("agent-1");
-    tui.wait_for_text("sh-3.2$");
+    start_session(&mut tui, "keep this card selected");
 
     tui.restart();
     tui.wait_for_text("restore-selection");
@@ -624,8 +618,10 @@ fn tui_manual_link_add_is_unavailable() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("link-proj");
 
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("register with `nebula register`");
     add_project(&mut tui, &repo, "link-proj");
+    tui.send(ESC);
+    std::thread::sleep(Duration::from_millis(100));
     tui.send(b"?");
     tui.wait_for_text("NAVIGATE & SEARCH");
     tui.wait_for_gone("attach a link");
@@ -728,6 +724,12 @@ fn tui_branch_switcher_moves_the_root_checkout() {
 
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "switch-proj");
+    tui.send(b"c"); // Open keymap settings and bind Switch root branch to c.
+    tui.wait_for_text("Switch root branch");
+    tui.send(ENTER);
+    tui.send(ESC);
+    tui.send(ESC);
+    tui.wait_for_text("switch-proj");
     let member_repo = repo.clone();
     repo_git(&member_repo, &["branch", "feature-login"]);
     repo_git(&member_repo, &["branch", "release-2"]);
@@ -845,7 +847,7 @@ fn tui_drag_past_the_pane_top_autoscrolls_and_copies_the_run() {
     let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
     let repo = tui.make_repo("drag-proj");
 
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("register with `nebula register`");
     add_project(&mut tui, &repo, "drag-proj");
     start_session(&mut tui, "hello");
 

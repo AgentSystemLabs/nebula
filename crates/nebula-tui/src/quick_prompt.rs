@@ -538,7 +538,7 @@ impl QuickLaunch {
 /// selected flashes instead.
 ///
 /// The one exception is the WORKTREES PANEL: `p` there means "a fresh
-/// worktree, then this task in it", whatever checkout the cursor is
+/// session workspace, then this task in it", whatever workspace the cursor is
 /// parked on (the root, another checkout) — the checkout does not exist
 /// yet, so only the PROJECT has to be selected. Its branch is the same
 /// random name the `n` prompt would have offered.
@@ -569,8 +569,8 @@ pub(crate) fn open_quick_prompt(app: &mut App) {
             app.flash = Some("quick prompt: select a project first".into());
             return;
         };
-        let branch = crate::branch_name::random_name(&app.project_branches(&project));
-        open_for(app, QuickTarget::NewWorktree { project, branch });
+        let name = crate::branch_name::random_name(&app.project_branches(&project));
+        open_for(app, QuickTarget::NewSessionWorkspace { project, name });
         return;
     }
     let Some(worktree) = app.selected_worktree().map(|w| w.id.clone()) else {

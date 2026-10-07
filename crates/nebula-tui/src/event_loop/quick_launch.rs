@@ -525,57 +525,62 @@ mod tests {
             key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
             let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             let (req_id, branch) = match out.as_slice() {
-                [ClientRequest::CreateWorktree { req_id, branch, .. }] => (*req_id, branch.clone()),
-                other => panic!("one CreateWorktree: {other:?}"),
+                [ClientRequest::CreateSessionWorkspace { req_id, name, .. }] => {
+                    (*req_id, name.clone())
+                }
+                other => panic!("one CreateSessionWorkspace: {other:?}"),
             };
             assert!(app.left_behind.contains(&req_id));
             assert_eq!(
                 app.flash.as_deref(),
-                Some(format!("started a session in {branch}").as_str())
+                Some(format!("started a session in pilot/{branch}").as_str())
             );
             assert!(
                 app.tree.worktrees.iter().any(|w| w.branch == branch),
-                "the stand-in checkout is up"
+                "the stand-in workspace is up"
             );
             assert_eq!(app.tree.agents.len(), 2, "and its session");
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(cursor(&app), Some(AgentId("a1".into())));
             assert_eq!(pane(&app), card);
 
-            let real = WorktreeId("w3".into());
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Worktree(Worktree {
-                        id: real.clone(),
-                        project_id: ProjectId("p1".into()),
-                        path: "/tmp/demo-w3".into(),
-                        branch,
-                        is_main: false,
-                        sort_order: 0,
-                    }),
-                },
-            );
             let mut out = Vec::new();
             handle_server_event(
                 &mut app,
-                ServerEvent::Ack {
+                ServerEvent::SessionWorkspaceCreated {
                     req_id,
-                    created: Some(EntityId::Worktree(real.clone())),
+                    workspace: Worktree {
+                        id: WorktreeId("w3".into()),
+                        project_id: ProjectId("p1".into()),
+                        path: format!("/tmp/demo/worktrees/{branch}").into(),
+                        branch: format!("pilot/{branch}"),
+                        is_main: false,
+                        sort_order: 0,
+                    },
+                    repositories: vec![nebula_core::WorkspaceRepository {
+                        id: WorktreeId("w4".into()),
+                        name: "repo".into(),
+                        path: format!("/tmp/demo/worktrees/{branch}/repo").into(),
+                        base: Some("main".into()),
+                        fetch_succeeded: true,
+                        warning: None,
+                        branch: Some(format!("pilot/{branch}")),
+                        changed_files: Some(0),
+                    }],
                 },
                 &mut out,
             );
             let create = match out.as_slice() {
                 [ClientRequest::CreateAgent {
                     req_id, worktree, ..
-                }] if *worktree == real => *req_id,
+                }] if worktree.0 == "w3" => *req_id,
                 other => panic!("the create goes into the new checkout: {other:?}"),
             };
             assert!(app.left_behind.contains(&create), "born left behind too");
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(cursor(&app), Some(AgentId("a1".into())));
 
-            acked(&mut app, create, &real);
+            acked(&mut app, create, &WorktreeId("w3".into()));
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(cursor(&app), Some(AgentId("a1".into())));
             assert_eq!(pane(&app), card);

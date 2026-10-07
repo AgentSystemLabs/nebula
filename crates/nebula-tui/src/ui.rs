@@ -141,11 +141,11 @@ fn quick_target_line(
         let on = Style::default().fg(th.ok).add_modifier(Modifier::BOLD);
         (
             vec![
-                Span::styled(" NEW WORKTREE ", chip),
+                Span::styled(" NEW SESSION WORKSPACE ", chip),
                 Span::styled(format!(" {branch}"), on),
             ],
             vec![
-                Span::styled("[✓] new worktree", on),
+                Span::styled("[✓] new session workspace", on),
                 Span::styled(" ^N ", Style::default().fg(th.dim)),
             ],
         )
@@ -157,7 +157,7 @@ fn quick_target_line(
                 Span::styled(branch, Style::default().fg(th.muted)),
             ],
             vec![
-                Span::styled("[ ] new worktree", dim),
+                Span::styled("[ ] new session workspace", dim),
                 Span::styled(" ^N ", dim),
             ],
         )
