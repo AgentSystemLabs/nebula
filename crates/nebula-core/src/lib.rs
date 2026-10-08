@@ -3,6 +3,7 @@ pub mod codec;
 pub mod crashlog;
 pub mod entities;
 pub mod env;
+pub mod git_status;
 pub mod github_url;
 pub mod harness;
 pub mod host;

@@ -6,7 +6,9 @@ use crate::pr_scope::CreatePrAgentSpec;
 use crate::registry::{CreateAgentSpec, Daemon};
 use anyhow::{Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION};
+use nebula_core::{
+    ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION, SIBLING_SPAWNED_PROTOCOL,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -89,6 +91,10 @@ struct ClientConnection {
     handshaken: bool,
     /// The client process, when the socket's credentials name it.
     peer_pid: Option<u32>,
+    /// The protocol the client said it speaks in `Hello`, so a reply kind
+    /// it may not know (`SiblingSpawned`, since 52) is sent only to a
+    /// client that does, and an older one still gets the `Ack` it expects.
+    peer_protocol: u32,
 }
 
 impl ClientConnection {
@@ -100,6 +106,7 @@ impl ClientConnection {
             subscription: None,
             handshaken: false,
             peer_pid: None,
+            peer_protocol: 0,
         }
     }
 
@@ -345,13 +352,16 @@ impl ClientConnection {
                 starting_prompt,
                 worktree,
                 base,
+                share_worktree,
             } => {
+                // `base` only means anything beside a `worktree` branch.
+                let worktree = worktree.map(|branch| (branch, base));
                 self.handle_spawn_sibling(
                     req_id,
                     id,
                     kind,
                     starting_prompt,
-                    (worktree, base),
+                    (worktree, share_worktree),
                     (model, effort),
                 )
                 .await;
@@ -649,6 +659,7 @@ impl ClientConnection {
 
     async fn handle_hello(&mut self, protocol_version: u32) -> bool {
         self.handshaken = nebula_core::protocol_compatible_with(protocol_version);
+        self.peer_protocol = protocol_version;
         let reply = if self.handshaken {
             ServerEvent::HelloOk {
                 protocol_version: PROTOCOL_VERSION,
@@ -1013,13 +1024,13 @@ impl ClientConnection {
         id: nebula_core::AgentId,
         kind: Option<nebula_core::AgentKind>,
         starting_prompt: String,
-        (worktree, base): (Option<String>, Option<String>),
+        (worktree, share_worktree): (Option<(String, Option<String>)>, bool),
         (model, effort): (Option<String>, Option<String>),
     ) {
         // Logged by mode only — never the prompt text.
         let worktree = worktree
-            .as_deref()
-            .map(|branch| crate::sibling::SiblingWorktree {
+            .as_ref()
+            .map(|(branch, base)| crate::sibling::SiblingWorktree {
                 branch,
                 base: base.as_deref(),
             });
@@ -1029,29 +1040,50 @@ impl ClientConnection {
                 &id,
                 kind,
                 worktree,
+                share_worktree,
                 &starting_prompt,
-                model,
-                effort,
+                (model, effort),
             )
             .await;
-        match &result {
-            Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
-                req_id,
-                agent = %agent,
-                spawned_by = %id,
-                launch_mode = "sibling",
-                "agent session spawned"
-            ),
-            Err(error) => tracing::warn!(
-                req_id,
-                error = %error,
-                spawned_by = %id,
-                launch_mode = "sibling",
-                "agent session spawn failed"
-            ),
-            Ok(_) => unreachable!("SpawnSiblingAgent returned a non-agent id"),
-        }
-        reply(&self.out_tx, req_id, result.map(Some)).await;
+        let ev = match result {
+            Ok(spawned) => {
+                tracing::info!(
+                    req_id,
+                    agent = %spawned.agent,
+                    spawned_by = %id,
+                    launch_mode = "sibling",
+                    shared_with = spawned.shared_with.len(),
+                    "agent session spawned"
+                );
+                if self.peer_protocol >= SIBLING_SPAWNED_PROTOCOL {
+                    ServerEvent::SiblingSpawned {
+                        req_id,
+                        agent: spawned.agent,
+                        worktree: spawned.worktree,
+                        shared_with: spawned.shared_with,
+                    }
+                } else {
+                    ServerEvent::Ack {
+                        req_id,
+                        created: Some(nebula_core::EntityId::Agent(spawned.agent)),
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    req_id,
+                    error = %error,
+                    spawned_by = %id,
+                    launch_mode = "sibling",
+                    "agent session spawn failed"
+                );
+                ServerEvent::Error {
+                    req_id: Some(req_id),
+                    message: format!("{error:#}"),
+                }
+            }
+        };
+        self.send(ev).await;
     }
 
     async fn handle_enter_worktree(
