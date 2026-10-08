@@ -421,6 +421,32 @@ impl Store {
         Ok(())
     }
 
+    /// Re-point a project at `repo_path`, retitled `name`, with each
+    /// `(worktree, path)` pair's row moved to its new path — one transaction,
+    /// so a failure leaves the project wholly where it was.
+    pub fn set_project_path(
+        &self,
+        id: &ProjectId,
+        repo_path: &Path,
+        name: &str,
+        worktrees: &[(WorktreeId, PathBuf)],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE projects SET repo_path = ?2, name = ?3 WHERE id = ?1",
+            params![id.as_str(), repo_path.to_string_lossy(), name],
+        )?;
+        for (wt, path) in worktrees {
+            tx.execute(
+                "UPDATE worktrees SET path = ?2 WHERE id = ?1",
+                params![wt.as_str(), path.to_string_lossy()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_project(&self, id: &ProjectId) -> Result<()> {
         self.delete_by_id("projects", id.as_str())
     }
