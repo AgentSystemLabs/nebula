@@ -6,7 +6,7 @@ use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
     env, paths, Agent, AgentId, AgentKind, ClientRequest, EnterOutcome, Link, Project, ProjectId,
     ReviewTabKind, ServerEvent, SessionRef, SessionSummary, TerminalId, TerminalTab, Worktree,
-    WorktreeId, PROTOCOL_VERSION,
+    WorktreeId, PROTOCOL_VERSION, SIBLING_SPAWNED_PROTOCOL,
 };
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -279,19 +279,27 @@ enum Reply {
     Error(String),
 }
 
-/// Read events until the daemon answers `req_id` — an Ack or an Error —
-/// skipping anything else it broadcasts meanwhile. Only the hang-up is an
-/// `Err`; the daemon's refusal comes back as a [`Reply::Error`] so each
-/// caller can decide whether that is a failure.
-async fn await_reply(conn: &mut Connection, req_id: u64) -> Result<Reply> {
+/// Read events until the daemon answers `req_id` — with the reply
+/// `answer` picks out (`Some`), or an Error for it — skipping anything else
+/// it broadcasts meanwhile. Only the hang-up is an `Err`; the daemon's
+/// refusal comes back as the inner `Err` so each caller can decide whether
+/// that is a failure.
+async fn await_answer<T>(
+    conn: &mut Connection,
+    req_id: u64,
+    answer: impl Fn(&ServerEvent) -> Option<T>,
+) -> Result<std::result::Result<T, String>> {
     loop {
         match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => return Ok(Reply::Ack),
             Some(ServerEvent::Error {
                 req_id: Some(r),
                 message,
-            }) if r == req_id => return Ok(Reply::Error(message)),
-            Some(_) => continue,
+            }) if r == req_id => return Ok(Err(message)),
+            Some(event) => {
+                if let Some(found) = answer(&event) {
+                    return Ok(Ok(found));
+                }
+            }
             None => bail!("{CLOSED_BEFORE_REPLY}"),
         }
     }
@@ -305,6 +313,18 @@ fn require_protocol(conn: &Connection, needed: u32, command: &str) -> Result<()>
         );
     }
     Ok(())
+}
+
+/// [`await_answer`] for the requests the daemon answers with a plain Ack.
+async fn await_reply(conn: &mut Connection, req_id: u64) -> Result<Reply> {
+    let answer = await_answer(conn, req_id, |event| {
+        matches!(event, ServerEvent::Ack { req_id: r, .. } if *r == req_id).then_some(())
+    })
+    .await?;
+    Ok(match answer {
+        Ok(()) => Reply::Ack,
+        Err(message) => Reply::Error(message),
+    })
 }
 
 /// [`await_reply`] for the callers where the daemon declining *is* the
@@ -354,29 +374,113 @@ pub async fn rename_current_agent(title: &str, mode: RenameMode) -> Result<()> {
     Ok(())
 }
 
-/// CLI: `nebula spawn "<task>" [--kind <claude|codex|cursor>] [--worktree
-/// <branch> [--base <ref>]]` from inside an agent session — ask the daemon
-/// to start a new agent beside this one, in the same worktree or in the
-/// project's worktree on `worktree` (created when the branch has none),
-/// opening on `task` as its first prompt. The caller is untouched: no
-/// relocation, no turn-end wait. Never spawns a daemon: no daemon means no
-/// session to sit beside.
-///
-/// What this prints is read by the model that ran it, so it says what
-/// happened and that this session carries on. A daemon-side refusal (a
-/// blank task, a missing CLI, a worktree git could not create) is a
-/// nonzero exit the model reports.
-pub async fn spawn_sibling_for_current_agent(
-    task: &str,
-    kind: Option<AgentKind>,
-    worktree: Option<String>,
-    base: Option<String>,
-) -> Result<()> {
-    let agent_id = current_agent_id("spawn")?;
+/// `nebula spawn`'s arguments, as the CLI parsed them.
+#[derive(Debug, Default)]
+pub struct SpawnArgs {
+    /// The task's words; empty when it comes from `prompt_file`.
+    pub task: Vec<String>,
+    /// `--prompt-file <path>`: the task is this file's contents (`-` is
+    /// standard input).
+    pub prompt_file: Option<std::path::PathBuf>,
+    pub kind: Option<AgentKind>,
+    pub worktree: Option<String>,
+    pub base: Option<String>,
+    /// `--same-worktree`: share a worktree that has live sessions and
+    /// uncommitted changes rather than be refused.
+    pub same_worktree: bool,
+}
+
+/// The new session's first prompt: the task words joined, or the
+/// `--prompt-file`'s contents, read here, where the path is relative to the
+/// agent's own cwd. Refused when blank either way.
+fn spawn_task(words: &[String], prompt_file: Option<&std::path::Path>) -> Result<String> {
+    let task = match prompt_file {
+        None => words.join(" "),
+        Some(path) if path.as_os_str() == "-" => std::io::read_to_string(std::io::stdin())
+            .context("could not read the task from standard input")?,
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("could not read the prompt file {}", path.display()))?,
+    };
     let task = task.trim();
     if task.is_empty() {
-        bail!("the task is empty — `nebula spawn \"<task>\"` needs the work the new session starts on");
+        match prompt_file {
+            Some(path) => bail!(
+                "the prompt file {} is empty — it needs the work the new session starts on",
+                path.display()
+            ),
+            None => bail!(
+                "the task is empty — `nebula spawn \"<task>\"` needs the work the new session starts on"
+            ),
+        }
     }
+    Ok(task.to_string())
+}
+
+/// What `nebula spawn` prints once the daemon started the session — read by
+/// the model that ran it. A worktree it shares with live sessions is said
+/// first-hand, with who is in it, since two sessions in one checkout take
+/// in each other's edits.
+fn spawned_message(
+    kind: Option<AgentKind>,
+    named_branch: bool,
+    worktree: &nebula_core::Worktree,
+    shared_with: &[String],
+) -> String {
+    let harness = kind.map(|k| format!("{} ", k.as_str())).unwrap_or_default();
+    let place = if named_branch {
+        format!("the worktree on branch \"{}\"", worktree.branch)
+    } else {
+        "this worktree".to_string()
+    };
+    let mut out = format!(
+        "started a new {harness}session in {place}; it is working on that task now and shows in \
+         the sessions list. This session is unaffected — carry on."
+    );
+    if !shared_with.is_empty() {
+        let n = shared_with.len();
+        out.push_str(&format!(
+            "\nNote: it shares that checkout ({}) with {n} other live session{} ({}): the same \
+             files, index and branch. Tell the user, and keep commits and builds from taking in \
+             each other's half-done work.",
+            worktree.path.display(),
+            if n == 1 { "" } else { "s" },
+            shared_with.join(", "),
+        ));
+    }
+    out
+}
+
+/// [`spawned_message`] for a daemon older than [`SIBLING_SPAWNED_PROTOCOL`],
+/// whose bare Ack says only that the session started.
+fn spawned_message_without_detail(kind: Option<AgentKind>) -> String {
+    let harness = kind.map(|k| format!("{} ", k.as_str())).unwrap_or_default();
+    format!(
+        "started a new {harness}session; it is working on that task now and shows in the \
+         sessions list. This session is unaffected — carry on."
+    )
+}
+
+/// One-shot client for `nebula spawn`, run from inside an agent session's
+/// CLI: start a new session beside it — or, with `--worktree`, in its
+/// project's worktree on that branch — on the task as its first prompt.
+/// Never spawns a daemon: no daemon means no session to start beside.
+///
+/// What this prints is read by the model that ran it, so it says what
+/// happened, who else is live in that worktree, and that this session
+/// carries on. A daemon-side refusal (a blank task, a missing CLI, a
+/// worktree git could not create, one shared with live sessions while it
+/// has uncommitted changes) is a nonzero exit the model reports.
+pub async fn spawn_sibling_for_current_agent(args: SpawnArgs) -> Result<()> {
+    let SpawnArgs {
+        task,
+        prompt_file,
+        kind,
+        worktree,
+        base,
+        same_worktree,
+    } = args;
+    let agent_id = current_agent_id("spawn")?;
+    let task = spawn_task(&task, prompt_file.as_deref())?;
     // The words become a branch as `nebula worktree`'s do, so both
     // commands land on the same branch for the same words. Unlike there, no
     // name is invented for a blank one: a spawn names where its work goes.
@@ -396,28 +500,43 @@ pub async fn spawn_sibling_for_current_agent(
     };
     let mut conn = handshake(stream).await?;
     let req_id = ONE_SHOT_REQ_ID;
+    let named_branch = worktree.is_some();
+    // A daemon older than SIBLING_SPAWNED_PROTOCOL has no shared-worktree
+    // check to waive, cannot decode the flag, and answers with a bare Ack.
+    let knows_sharing = conn.protocol_version >= SIBLING_SPAWNED_PROTOCOL;
     write_frame(
         &mut conn.stream,
         &ClientRequest::SpawnSiblingAgent {
             req_id,
             id: AgentId(agent_id),
             kind,
-            starting_prompt: task.to_string(),
-            worktree: worktree.clone(),
+            starting_prompt: task,
+            worktree,
             base,
+            share_worktree: same_worktree && knows_sharing,
         },
     )
     .await?;
-    await_ack(&mut conn, req_id).await?;
-    let harness = kind.map(|k| format!("{} ", k.as_str())).unwrap_or_default();
-    let place = match &worktree {
-        Some(branch) => format!("the worktree on branch \"{branch}\""),
-        None => "this worktree".to_string(),
+    let answer = await_answer(&mut conn, req_id, |event| match event {
+        ServerEvent::SiblingSpawned {
+            req_id: r,
+            worktree,
+            shared_with,
+            ..
+        } if *r == req_id => Some(Some((worktree.clone(), shared_with.clone()))),
+        ServerEvent::Ack { req_id: r, .. } if *r == req_id => Some(None),
+        _ => None,
+    })
+    .await?
+    .map_err(|message| anyhow::anyhow!("{message}"))?;
+    let message = match answer {
+        Some((worktree, shared_with)) => {
+            spawned_message(kind, named_branch, &worktree, &shared_with)
+        }
+        // An older daemon names neither the worktree nor who shares it.
+        None => spawned_message_without_detail(kind),
     };
-    println!(
-        "started a new {harness}session in {place}; it is working on that task now and \
-         shows in the sessions list. This session is unaffected — carry on."
-    );
+    println!("{message}");
     Ok(())
 }
 
@@ -1207,6 +1326,69 @@ fn send_signal(pid: i32, sig: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_task_joins_words_or_reads_the_prompt_file() {
+        let words = ["fix", "the", "login"].map(String::from);
+        assert_eq!(spawn_task(&words, None).unwrap(), "fix the login");
+
+        let dir = tempfile::tempdir().unwrap();
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, "\n# Brief\n\nPort the \"tests\" — all of them.\n\n").unwrap();
+        assert_eq!(
+            spawn_task(&[], Some(&brief)).unwrap(),
+            "# Brief\n\nPort the \"tests\" — all of them."
+        );
+
+        let blank = dir.path().join("blank.md");
+        std::fs::write(&blank, " \n\t\n").unwrap();
+        let err = spawn_task(&[], Some(&blank)).unwrap_err().to_string();
+        assert!(err.contains("blank.md is empty"), "{err}");
+        let err = spawn_task(&[" ".into()], None).unwrap_err().to_string();
+        assert!(err.contains("the task is empty"), "{err}");
+        let err = spawn_task(&[], Some(&dir.path().join("missing.md")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not read the prompt file"), "{err}");
+    }
+
+    #[test]
+    fn spawned_message_names_who_shares_the_worktree() {
+        let worktree = nebula_core::Worktree {
+            id: nebula_core::WorktreeId("w".into()),
+            project_id: nebula_core::ProjectId("p".into()),
+            path: "/repo-worktrees/feat".into(),
+            branch: "feat".into(),
+            is_main: false,
+            sort_order: 0,
+        };
+        let alone = spawned_message(None, false, &worktree, &[]);
+        assert!(
+            alone.starts_with("started a new session in this worktree"),
+            "{alone}"
+        );
+        assert!(!alone.contains("shares"), "{alone}");
+
+        let named = spawned_message(Some(AgentKind::Codex), true, &worktree, &[]);
+        assert!(
+            named.starts_with("started a new codex session in the worktree on branch \"feat\""),
+            "{named}"
+        );
+
+        let shared = spawned_message(
+            None,
+            false,
+            &worktree,
+            &["agent-1".into(), "Fix Login".into()],
+        );
+        assert!(
+            shared.contains(
+                "shares that checkout (/repo-worktrees/feat) with 2 other live sessions \
+                 (agent-1, Fix Login)"
+            ),
+            "{shared}"
+        );
+    }
 
     // Unset and empty are the same miss, and the error has to name the
     // command the model just ran so it knows why it can't work here.

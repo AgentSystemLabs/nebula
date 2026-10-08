@@ -320,6 +320,9 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   `↗ #42 Polish the nav  ready` in the colors the PR rows wear (red for conflicts or failing checks,
   purple once merged), a link while the pointer rests on it — and, at its right end, how many
   sessions and terminals are under it and how many cards the row had no room for (`▸ 2 more`).
+  A SHARED WORKTREE — a checkout with more than one live session in it — says so ahead of that
+  count in the warning color (`2 live, shared · 3 sessions`): those agents edit one set of files,
+  one index and one branch, so one's commit or build can take in another's half-done work.
   The band the keys are on opens on `❯` where the rest open on `──`, and past its counts says
   what Tab does there — `Tab: see all 8` with cards past the edge, `Tab: expand` when the row
   showed them all, `Tab: collapse` on the one band open as an accordion, every card of it wrapped

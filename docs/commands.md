@@ -69,14 +69,18 @@ nebula worktree [name] [--base <ref>]  # move the current session into a worktre
                           # a branch name meaning origin's fetched copy — main is origin/main —
                           # but is ignored when the branch already exists; without it the
                           # worktree_base_branch setting applies, else origin's default)
-nebula spawn <task> [--kind <claude|codex|cursor|pi|muse|grok|opencode>] [--worktree <branch> [--base <ref>]]
+nebula spawn <task> [--kind <claude|codex|cursor|pi|muse|grok|opencode>] [--worktree <branch> [--base <ref>]] [--same-worktree]
+nebula spawn --prompt-file <path> […]
                           # start a new agent session beside the current one, in the same worktree,
                           # opening on <task> (agents run this when you ask for a new nebula session;
                           # --kind defaults to this session's harness; custom harnesses launch from
                           # the TUI picker and presets, not --kind); --worktree starts it in the
                           # project's worktree on <branch> instead, creating it when the branch has
                           # none (--base picks a new branch's start point and is refused when the
-                          # branch already exists), and leaves this session where it is
+                          # branch already exists), and leaves this session where it is. A worktree
+                          # that already has a live session is said in the reply, with who is in it;
+                          # one that also has uncommitted changes is refused unless --same-worktree.
+                          # --prompt-file reads the task from a file (- for stdin) instead of words
 nebula open <file>…       # show the files in this nebula's FILE TABS — a modal with one tab per
                           # file, the focused one previewed, Enter editing it (agents run this only
                           # when you ask to see a file, image, mockup or diagram; text files,
