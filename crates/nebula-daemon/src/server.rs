@@ -273,6 +273,14 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
+                ClientRequest::SetProjectPath { req_id, id, path } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.set_project_path(&id, &path).await.map(|_| None),
+                    )
+                    .await;
+                }
                 ClientRequest::CreateWorktree {
                     req_id,
                     project,

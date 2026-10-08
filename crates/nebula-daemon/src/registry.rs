@@ -814,6 +814,110 @@ impl Daemon {
         Ok(())
     }
 
+    /// Point a project at the folder its repo now lives in, after the user
+    /// renamed or moved it on disk. Without this a moved repo is stranded:
+    /// the row keeps the old path, and adding the new one makes a second
+    /// project that shares none of the first one's sessions.
+    ///
+    /// `path` must be the repo's main checkout and not another project's.
+    /// Every worktree row inside the old folder (the ⌂ root row, and any
+    /// checkout nested in it) moves with it; a checkout outside it, such as
+    /// a sibling `<repo>-worktrees/` one, keeps its path. git's own links
+    /// are repaired both ways first, so a failed repair changes nothing. A
+    /// row still named after the old folder takes the new folder's name; a
+    /// renamed one keeps its name. Sessions follow their worktree rows, and
+    /// one already running keeps running: its working directory moved with
+    /// the folder.
+    pub async fn set_project_path(self: &Arc<Self>, id: &ProjectId, path: &Path) -> Result<()> {
+        let mut project = self.store.get_project(id)?.context("project not found")?;
+        let toplevel = git::repo_toplevel(path).await.map_err(|e| {
+            if git::is_missing(&e) {
+                e
+            } else {
+                e.context(format!("{} is not a git repository", path.display()))
+            }
+        })?;
+        // The same rooting `add_project` does, except that a linked checkout
+        // is refused rather than followed to its repo: the user named the
+        // project's new home, and a worktree of it is not that.
+        let entries = git::list_worktrees(&toplevel)
+            .await
+            .with_context(|| format!("list checkouts of {}", toplevel.display()))?;
+        match entries.first() {
+            Some(main) if main.path == toplevel => {}
+            Some(main) => bail!(
+                "{} is a worktree of {}; choose the repo's main checkout",
+                toplevel.display(),
+                main.path.display()
+            ),
+            None => bail!("git listed no checkout for {}", toplevel.display()),
+        }
+        let old = project.repo_path.clone();
+        if toplevel == old {
+            return Ok(());
+        }
+        if let Some(other) = self.store.project_by_path(&toplevel)? {
+            if &other != id {
+                let name = self
+                    .store
+                    .get_project(&other)?
+                    .map(|p| p.name)
+                    .unwrap_or_default();
+                bail!(
+                    "{} is already the project \"{name}\"; remove that one first",
+                    toplevel.display()
+                );
+            }
+        }
+
+        // Held across the repair and the write, so the WORKTREE SYNC never
+        // reconciles this project against half-moved rows.
+        let ops = self.worktree_ops.lock().await;
+        let (_, worktrees, _, _) = self.store.load_tree()?;
+        let moved: Vec<(WorktreeId, PathBuf)> = worktrees
+            .iter()
+            .filter(|w| &w.project_id == id)
+            .filter_map(|w| {
+                let rest = w.path.strip_prefix(&old).ok()?;
+                Some((w.id.clone(), toplevel.join(rest)))
+            })
+            .collect();
+        // git rejects a path that isn't there, so a nested checkout already
+        // gone from disk is left for the sync to drop, as it would have been.
+        let linked: Vec<PathBuf> = moved
+            .iter()
+            .map(|(_, p)| p.clone())
+            .filter(|p| p != &toplevel && p.is_dir())
+            .collect();
+        git::repair_worktrees(&toplevel, &linked)
+            .await
+            .context("repair git's worktree links")?;
+        if project.name == Project::folder_name(&old) {
+            project.name = Project::folder_name(&toplevel);
+        }
+        project.repo_path = toplevel;
+        self.store
+            .set_project_path(id, &project.repo_path, &project.name, &moved)?;
+        drop(ops);
+
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Project(project.clone()),
+        });
+        for (wt, _) in &moved {
+            if let Some(worktree) = self.store.get_worktree(wt)? {
+                self.broadcast(ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(worktree),
+                });
+            }
+        }
+        // Branch names and checkouts that changed while the project was
+        // stranded: reconcile now rather than on the sync's next pass.
+        if let Err(e) = self.sync_project_worktrees(&project).await {
+            tracing::warn!(project = %project.name, error = %e, "worktree sync after a move failed");
+        }
+        Ok(())
+    }
+
     pub fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
         // Kill any live sessions under this project first.
         let (_, worktrees, agents, terminals) = self.store.load_tree()?;
@@ -5995,6 +6099,139 @@ mod tests {
         let project = named(&daemon);
         assert_eq!(project.name, "acme-api", "empty resets to the folder name");
         assert_eq!(project.folder_subtitle(), None, "nothing left to show");
+    }
+
+    /// A repo with a sibling checkout (`acme-worktrees/feat`, where nebula
+    /// puts new worktrees) and one nested inside it (`acme/.wt/nested`),
+    /// added as a project. Returns the temp dir (held for the test's life),
+    /// the root dir in it, the repo and the project id.
+    async fn project_with_checkouts(
+        daemon: &Arc<Daemon>,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, ProjectId) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("acme");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let feat = root.join("acme-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
+        );
+        git_in(&repo, &["worktree", "add", ".wt/nested", "-b", "nested"]);
+        let id = match daemon.add_project(&repo, None, false).await.unwrap() {
+            EntityId::Project(id) => id,
+            other => panic!("expected a project id, got {other:?}"),
+        };
+        (tmp, root, repo, id)
+    }
+
+    /// Renaming a project's folder on disk used to strand it: the row kept
+    /// the old path, and adding the new one made a second project. Pointing
+    /// the project at the new folder moves the rows inside it, leaves the
+    /// sibling checkout where it is, repairs git's links both ways, and
+    /// gives the row the new folder's name.
+    #[tokio::test]
+    async fn set_project_path_follows_a_renamed_folder() {
+        let daemon = test_daemon();
+        let (_tmp, root, repo, id) = project_with_checkouts(&daemon).await;
+        let moved = root.join("acme-web");
+        std::fs::rename(&repo, &moved).unwrap();
+
+        daemon.set_project_path(&id, &moved).await.unwrap();
+
+        let (projects, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        assert_eq!(projects.len(), 1, "still one project: {projects:#?}");
+        assert_eq!(projects[0].repo_path, moved);
+        assert_eq!(projects[0].name, "acme-web", "named after the new folder");
+        let path_of = |branch: &str| {
+            let row = worktrees.iter().find(|w| w.branch == branch);
+            row.unwrap_or_else(|| panic!("no {branch} row: {worktrees:#?}"))
+                .path
+                .clone()
+        };
+        assert_eq!(path_of("main"), moved, "the ⌂ root row moved");
+        assert_eq!(
+            path_of("nested"),
+            moved.join(".wt/nested"),
+            "so did the nested one"
+        );
+        let feat = root.join("acme-worktrees").join("feat");
+        assert_eq!(path_of("feat"), feat, "the sibling checkout stayed put");
+        assert_eq!(worktrees.len(), 3, "no row added or lost: {worktrees:#?}");
+        // git's links: each checkout finds the repo again, and the repo
+        // lists each checkout where it now is.
+        git_in(&feat, &["status"]);
+        git_in(&moved.join(".wt/nested"), &["status"]);
+        let mut listed: Vec<PathBuf> = git::list_worktrees(&moved)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        listed.sort();
+        let mut want = [moved.clone(), feat, moved.join(".wt/nested")];
+        want.sort();
+        assert_eq!(listed, want);
+    }
+
+    /// A row the user retitled keeps its title when its folder moves; only
+    /// a row still named after the old folder follows the new one.
+    #[tokio::test]
+    async fn set_project_path_keeps_a_chosen_name() {
+        let daemon = test_daemon();
+        let (_tmp, root, repo, id) = project_with_checkouts(&daemon).await;
+        daemon.rename_project(&id, "Acme").unwrap();
+        let moved = root.join("acme-web");
+        std::fs::rename(&repo, &moved).unwrap();
+
+        daemon.set_project_path(&id, &moved).await.unwrap();
+
+        let project = daemon.store.get_project(&id).unwrap().unwrap();
+        assert_eq!(project.name, "Acme");
+        assert_eq!(project.folder_subtitle().as_deref(), Some("acme-web"));
+    }
+
+    /// The new path has to be the repo's main checkout, and nobody else's
+    /// project; a refused move changes nothing.
+    #[tokio::test]
+    async fn set_project_path_refuses_what_is_not_the_moved_repo() {
+        let daemon = test_daemon();
+        let (_tmp, root, repo, id) = project_with_checkouts(&daemon).await;
+        let other = root.join("other");
+        std::fs::create_dir(&other).unwrap();
+        git_in(&other, &["init", "-b", "main"]);
+        git_in(&other, &["commit", "--allow-empty", "-m", "init"]);
+        daemon.add_project(&other, None, false).await.unwrap();
+        let plain = root.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let before = daemon.store.load_tree().unwrap();
+
+        for (path, why) in [
+            (plain, "not a git repository"),
+            (root.join("acme-worktrees").join("feat"), "is a worktree of"),
+            (other, "is already the project \"other\""),
+        ] {
+            let err = daemon.set_project_path(&id, &path).await.unwrap_err();
+            assert!(format!("{err:#}").contains(why), "{path:?}: {err:#}");
+        }
+
+        let after = daemon.store.load_tree().unwrap();
+        assert_eq!(
+            format!("{:?}", after.0),
+            format!("{:?}", before.0),
+            "projects untouched"
+        );
+        assert_eq!(
+            format!("{:?}", after.1),
+            format!("{:?}", before.1),
+            "worktrees untouched"
+        );
+        assert_eq!(
+            daemon.store.get_project(&id).unwrap().unwrap().repo_path,
+            repo
+        );
     }
 
     /// `git rev-parse --show-toplevel` answers with the checkout it ran in, so

@@ -57,6 +57,22 @@ pub async fn repo_toplevel(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(out.trim()))
 }
 
+/// `git worktree repair` from a repo whose main checkout moved, naming the
+/// new paths of linked checkouts that moved with it. git then rewrites the
+/// links both ways: each checkout's `.git` file back to the repo, and the
+/// repo's record of where each checkout lives. A checkout that stayed put
+/// (a sibling `<repo>-worktrees/` one) is repaired without being named.
+pub async fn repair_worktrees(repo: &Path, moved: &[PathBuf]) -> Result<()> {
+    let moved: Vec<String> = moved
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let mut args = vec!["worktree", "repair"];
+    args.extend(moved.iter().map(String::as_str));
+    git(repo, &args).await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeEntry {
     pub path: PathBuf,
