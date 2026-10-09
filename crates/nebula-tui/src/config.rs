@@ -3833,7 +3833,7 @@ mod tests {
     /// CARD LINE COUNTS: retired with every card counting its lines. The
     /// key an older build wrote (`card_line_changes`, off by default) still
     /// loads to what it wrote and is written back as stored, but no tab
-    /// shows it any more — Appearance ends on DRAFT PULL REQUESTS.
+    /// shows it any more — Appearance carries later source-control settings.
     #[test]
     fn card_line_counts_is_retired_but_still_round_trips() {
         assert!(
@@ -3861,8 +3861,8 @@ mod tests {
         );
         assert_eq!(
             rows.last().map(|r| r.kind),
-            Some(SettingKind::HideDraftPrs),
-            "Appearance ends on DRAFT PULL REQUESTS"
+            Some(SettingKind::SourceControlGraph),
+            "Appearance ends on SOURCE CONTROL GRAPH"
         );
     }
 
