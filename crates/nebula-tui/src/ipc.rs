@@ -30,6 +30,18 @@ pub async fn connect_or_spawn() -> Result<Connection> {
         return handshake(conn).await;
     }
 
+    if matches!(
+        nebula_core::host::wsl_flavor(),
+        Some(nebula_core::host::WslFlavor::Wsl1)
+    ) {
+        bail!(
+            "nebula supports WSL2, but this looks like WSL1. \
+             WSL1 does not provide the Linux kernel features the daemon needs \
+             for its Unix socket, pidfile lock, and PTYs. Convert the distro \
+             with `wsl.exe --set-version <distro> 2`, then run `nebula` again."
+        );
+    }
+
     spawn_daemon()?;
 
     // Poll-connect while the daemon boots.

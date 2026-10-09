@@ -21,12 +21,50 @@ pub fn is_remote_session() -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WslFlavor {
+    Wsl1,
+    Wsl2,
+}
+
+/// Detect Windows Subsystem for Linux and whether it is backed by the real
+/// Linux kernel (WSL2). WSL1 reports "Microsoft" in the kernel strings but
+/// not the WSL2-specific "microsoft-standard" marker.
+#[cfg(target_os = "linux")]
+pub fn wsl_flavor() -> Option<WslFlavor> {
+    wsl_flavor_from(
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .as_deref(),
+        std::fs::read_to_string("/proc/version").ok().as_deref(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn wsl_flavor() -> Option<WslFlavor> {
+    None
+}
+
 fn short_name(full: &str) -> &str {
     full.split('.').next().unwrap_or(full)
 }
 
 fn is_remote_from(conn: Option<&str>, tty: Option<&str>) -> bool {
     conn.is_some_and(|v| !v.is_empty()) || tty.is_some_and(|v| !v.is_empty())
+}
+
+fn wsl_flavor_from(osrelease: Option<&str>, version: Option<&str>) -> Option<WslFlavor> {
+    let osrelease = osrelease.unwrap_or_default().to_ascii_lowercase();
+    let version = version.unwrap_or_default().to_ascii_lowercase();
+    let text = format!("{osrelease}\n{version}");
+    if !text.contains("microsoft") {
+        return None;
+    }
+    if text.contains("wsl2") || text.contains("microsoft-standard") {
+        Some(WslFlavor::Wsl2)
+    } else {
+        Some(WslFlavor::Wsl1)
+    }
 }
 
 // Avoid a libc dependency in this dep-light crate for one call.
@@ -62,6 +100,22 @@ mod tests {
         assert!(!is_remote_from(Some(""), Some("")));
         assert!(is_remote_from(Some("1.2.3.4 50000 5.6.7.8 22"), None));
         assert!(is_remote_from(None, Some("/dev/pts/3")));
+    }
+
+    #[test]
+    fn wsl_detection_classifies_kernel_strings() {
+        assert_eq!(
+            wsl_flavor_from(Some("5.15.167.4-microsoft-standard-WSL2"), None),
+            Some(WslFlavor::Wsl2)
+        );
+        assert_eq!(
+            wsl_flavor_from(
+                Some("4.4.0-19041-Microsoft"),
+                Some("Linux version 4.4.0-19041-Microsoft")
+            ),
+            Some(WslFlavor::Wsl1)
+        );
+        assert_eq!(wsl_flavor_from(Some("6.12.94+"), None), None);
     }
 
     #[test]

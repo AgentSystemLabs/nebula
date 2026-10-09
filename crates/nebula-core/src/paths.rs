@@ -19,9 +19,23 @@ pub fn runtime_dir() -> PathBuf {
     if let Some(dir) = env::non_empty(env::RUNTIME_DIR) {
         return PathBuf::from(dir);
     }
-    if let Some(dir) = env::non_empty("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("nebula");
+    if let Some(dir) = xdg_runtime_dir() {
+        return dir.join("nebula");
     }
+    fallback_runtime_dir()
+}
+
+fn xdg_runtime_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(env::non_empty("XDG_RUNTIME_DIR")?);
+    // XDG_RUNTIME_DIR is supposed to be created by the login manager before
+    // applications start. WSL shells can inherit `/run/user/$UID` without
+    // systemd/PAM having made it, and an unprivileged daemon cannot create
+    // that parent under `/run`; use the same private /tmp fallback tmux-style
+    // tools use when the XDG dir is absent.
+    dir.is_dir().then_some(dir)
+}
+
+fn fallback_runtime_dir() -> PathBuf {
     let uid = libc_geteuid();
     Path::new(FALLBACK_RUNTIME_ROOT).join(format!("nebula-{uid}"))
 }
@@ -173,7 +187,9 @@ mod tests {
             EnvRestore::new(crate::env::RUNTIME_DIR),
             EnvRestore::new(crate::env::DATA_DIR),
             EnvRestore::new(crate::env::CONFIG_FILE),
+            EnvRestore::new("XDG_RUNTIME_DIR"),
         );
+        std::env::remove_var("XDG_RUNTIME_DIR");
         std::env::remove_var(crate::env::CONFIG_FILE);
         let runtime = std::env::temp_dir().join(format!("nebula-paths-rt-{}", std::process::id()));
         let data = std::env::temp_dir().join(format!("nebula-paths-data-{}", std::process::id()));
@@ -223,5 +239,13 @@ mod tests {
             runtime_dir().display(),
             data_dir().display()
         );
+
+        let xdg = std::env::temp_dir().join(format!("nebula-paths-xdg-{}", std::process::id()));
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &xdg);
+        assert_eq!(runtime_dir(), xdg.join("nebula"));
+
+        std::fs::remove_dir_all(&xdg).unwrap();
+        assert_eq!(runtime_dir(), fallback_runtime_dir());
     }
 }

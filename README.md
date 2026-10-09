@@ -108,6 +108,10 @@ restarted in place onto the new binary: every agent keeps running, mid-turn or n
 `nebula kill` and relaunch — and when the new build speaks a different protocol, `nebula upgrade` says
 so and offers that restart for you. `nebula --version` (`-V`) says which binary you are on.
 
+WSL2 is supported as Linux. WSL1 is not: it lacks the Linux kernel behavior nebula's DAEMON relies on
+for its Unix socket, pidfile lock, and PTYs, so nebula reports that directly and tells you to convert
+the distro with `wsl.exe --set-version <distro> 2`.
+
 > **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, or `opencode`.
 > nebula spawns them; it doesn't ship them.
 >
