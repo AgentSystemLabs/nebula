@@ -1481,6 +1481,41 @@ fn titled_frame(
     }
 }
 
+/// Give the host terminal back the OSC 8 hyperlinks the program printed
+/// (claude's markdown links, `ls --hyperlink`), so Cmd-click opens them in
+/// Ghostty, iTerm2, kitty or WezTerm. `PseudoTerminal` copies only text and
+/// looks into the buffer, so each linked cell is re-wrapped in its own
+/// open/close pair: ratatui redraws single changed cells, and a cell that
+/// carried only the open or the close would lose its link on its own.
+/// `ForcedWidth` keeps the diff counting the columns the text covers, not
+/// the bytes of the escape around it.
+fn stamp_hyperlinks(screen: &vt100::Screen, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    use unicode_width::UnicodeWidthStr as _;
+    for row in 0..area.height {
+        for col in 0..area.width {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            let Some(uri) = screen.hyperlink(cell) else {
+                continue;
+            };
+            if !cell.has_contents() {
+                continue;
+            }
+            let text = cell.contents();
+            let width = u16::try_from(text.width()).unwrap_or(1);
+            let Some(width) = std::num::NonZeroU16::new(width) else {
+                continue;
+            };
+            let Some(out) = buf.cell_mut((area.x + col, area.y + row)) else {
+                continue;
+            };
+            out.set_symbol(&format!("\x1b]8;;{uri}\x1b\\{text}\x1b]8;;\x1b\\"))
+                .set_diff_option(ratatui::buffer::CellDiffOption::ForcedWidth(width));
+        }
+    }
+}
+
 /// The buffer cell under a PTY's cursor when its screen is drawn at
 /// `area`, by the same arithmetic `PseudoTerminal` paints it with: the
 /// row shifted down by however far the pane is scrolled back, and None
@@ -1613,6 +1648,7 @@ fn draw_terminal_body(
             let screen = term.parser.screen();
             let widget = tui_term::widget::PseudoTerminal::new(screen);
             f.render_widget(widget, inner);
+            stamp_hyperlinks(screen, inner, f.buffer_mut());
             app.pane.host_cursor = pty_cursor_cell(screen, inner);
             draw_terminal_selection(f, app, screen, inner);
             (
@@ -2279,6 +2315,37 @@ pub fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// OSC 8 links the program printed reach the buffer wrapped per cell,
+    /// whether ST- or BEL-terminated, across an SGR reset inside the link,
+    /// and with a `;` in the URI; text after the close and a URI carrying a
+    /// control character stay plain.
+    #[test]
+    fn osc8_hyperlinks_are_handed_to_the_host_terminal() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b]8;id=1;https://a.dev/x;y\x1b\\a\x1b[1mb\x1b[0m\x1b]8;;\x1b\\c ");
+        parser.process(b"\x1b]8;;file:///r/x.html\x07d\x1b]8;;\x07\r\n");
+        // U+009C is a C1 ST: vte passes it through, a host could end on it.
+        parser.process("\x1b]8;;https://e\u{9c}vil\x1b\\e\x1b]8;;\x1b\\".as_bytes());
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        f_render(parser.screen(), area, &mut buf);
+        let link = |uri: &str, text: &str| format!("\x1b]8;;{uri}\x1b\\{text}\x1b]8;;\x1b\\");
+        assert_eq!(buf[(0, 0)].symbol(), link("https://a.dev/x;y", "a"));
+        assert_eq!(buf[(1, 0)].symbol(), link("https://a.dev/x;y", "b"));
+        assert_eq!(buf[(2, 0)].symbol(), "c");
+        assert_eq!(buf[(4, 0)].symbol(), link("file:///r/x.html", "d"));
+        assert_eq!(buf[(0, 1)].symbol(), "e");
+
+        fn f_render(screen: &vt100::Screen, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+            ratatui::widgets::Widget::render(
+                tui_term::widget::PseudoTerminal::new(screen),
+                area,
+                buf,
+            );
+            stamp_hyperlinks(screen, area, buf);
+        }
+    }
 
     /// The selection highlight paints the part of the selection on screen
     /// at the current scroll: its endpoints are history lines, and the

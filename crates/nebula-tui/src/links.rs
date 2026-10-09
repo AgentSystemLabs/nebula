@@ -1,9 +1,10 @@
 //! URL and file-path detection over the visible vt100 screen, for
 //! underlining links in the terminal pane and opening them on ⌥click (URLs
-//! in the browser, paths in the editor modal). vt100 0.15 drops OSC 8
-//! hyperlinks, so links are found by scanning the rendered cell text —
-//! which also catches the plain `path:line` references agent CLIs print
-//! (claude, cursor, codex) that never were hyperlinks to begin with.
+//! in the browser, paths in the editor modal). Links are found by scanning
+//! the rendered cell text, which catches the plain URLs and `path:line`
+//! references agent CLIs print (claude, cursor, codex) that never were
+//! hyperlinks to begin with. OSC 8 hyperlinks are kept per cell by the
+//! vendored vt100 and handed to the host terminal by `ui::stamp_hyperlinks`.
 
 /// A detected http(s) URL and the screen cells it occupies, as inclusive
 /// `(row, col_start, col_end)` segments — one per screen row, so a link

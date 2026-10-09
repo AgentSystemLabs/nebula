@@ -1,9 +1,11 @@
 # Vendored from crates.io vt100 0.16.2 (MIT, https://github.com/doy/vt100-rust)
-# with one Nebula patch — see src/grid.rs `scroll_up`: lines scrolled out of a
+# with Nebula patches. First, see src/grid.rs `scroll_up`: lines scrolled out of a
 # TOP-ANCHORED DECSTBM region on the primary screen are pushed into scrollback
 # (upstream discards them). Ratatui inline-viewport apps (codex) insert chat
 # history that way, and real terminals keep those lines; without the patch the
-# TUI's codex scrollback stays empty. Wired in via [patch.crates-io] in the
+# TUI's codex scrollback stays empty. Second patch: OSC 8 hyperlinks are kept
+# per cell (`Cell::link`, `Screen::hyperlink`; upstream drops them) so the TUI
+# can hand them to the host terminal. Wired in via [patch.crates-io] in the
 # workspace Cargo.toml. Dev-dependencies dropped; version must stay 0.16.2 so
 # the patch satisfies the crates' `vt100 = "0.16"` requirement.
 
