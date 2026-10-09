@@ -57,9 +57,17 @@ struct ResumeWatch {
 }
 /// `$SHELL -l -i -c <cmd>`: a login *and* interactive shell, so zsh sources
 /// ~/.zprofile and ~/.zshrc both and the child sees the PATH the user's
-/// terminal has. The CLI probe and the spawn wrapper share it so they can
-/// never disagree about what "on the user's PATH" means.
+/// terminal has. CLI probes use it directly, and PTY launches wrap it through
+/// [`LOGIN_SHELL_STDIN_SHIM`] below so rc-file startup sees stdin as non-TTY
+/// until nebula's command is about to run.
 const LOGIN_SHELL_ARGS: [&str; 3] = ["-l", "-i", "-c"];
+/// Tiny POSIX wrapper for PTY launches: keep stdout/stderr on the PTY, but
+/// give the login shell `/dev/null` as stdin while it sources rc files.
+/// Shell startup tools that auto-`exec` only when stdin is a TTY (Iris-style
+/// autocomplete launchers) then leave the `-c` payload alone. The payload
+/// reopens `/dev/tty` before starting the agent, so the CLI itself remains
+/// fully interactive.
+const LOGIN_SHELL_STDIN_SHIM: &str = "exec </dev/null; exec \"$@\"";
 /// Cap on one CLI probe. A heavy rc file costs ~1s; a hung one must not
 /// stall a create forever, so on timeout the CLI is assumed present and
 /// the spawn itself gets to report.
@@ -3573,8 +3581,9 @@ fn resolve_harness_in(
 }
 
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
-/// 'unset …; export …; prog args'`) so the child gets the user's real
-/// environment — ~/.zprofile and ~/.zshrc on zsh — rather than the daemon's.
+/// 'exec </dev/tty; unset …; export …; prog args'`) so the child gets the
+/// user's real environment — ~/.zprofile and ~/.zshrc on zsh — rather than
+/// the daemon's.
 ///
 /// The command word goes in bare, so the shell resolves it the way a typed
 /// command line would: an alias or function from the rc files wins over the
@@ -3589,7 +3598,9 @@ fn resolve_harness_in(
 /// its own — which is why `PtySession::kill` sweeps the whole tree rather
 /// than one group.
 ///
-/// The prelude restates what the pane is *after* those files have run:
+/// The wrapper process feeds `/dev/null` to the shell while those files run,
+/// then the prelude reopens `/dev/tty` and restates what the pane is *after*
+/// startup:
 /// `TERM` and `COLORTERM` name nebula's own grid — 24-bit colour whatever
 /// the host terminal — and `NO_COLOR` / `FORCE_COLOR` are dropped. A
 /// login-only profile that exports `NO_COLOR` reaches a session here and
@@ -3611,7 +3622,7 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
 /// TERMINAL's `.nebula.json` `run`, pipes and `&&` and all — behind the
 /// same prelude.
 fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
-    let mut cmdline = String::from("unset");
+    let mut cmdline = String::from("exec </dev/tty; unset");
     for name in env::PANE_COLOR_OVERRIDES {
         cmdline.push(' ');
         cmdline.push_str(name);
@@ -3622,12 +3633,12 @@ fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
     cmdline.push_str(env::PANE_COLORTERM);
     cmdline.push_str("; ");
     cmdline.push_str(line);
-    let args = LOGIN_SHELL_ARGS
-        .iter()
-        .map(|s| s.to_string())
-        .chain([cmdline])
-        .collect();
-    (shell.to_string(), args)
+    let mut args = vec!["-c".to_string(), LOGIN_SHELL_STDIN_SHIM.to_string()];
+    args.push("nebula-login-shell".to_string());
+    args.push(shell.to_string());
+    args.extend(LOGIN_SHELL_ARGS.iter().map(|s| s.to_string()));
+    args.push(cmdline);
+    ("/bin/sh".to_string(), args)
 }
 
 /// `program` as the command word of a shell line: bare when it is a plain
@@ -4777,22 +4788,29 @@ mod tests {
             "claude",
             &["--resume".to_string(), "sid-1".to_string()],
         );
-        assert_eq!(program, "/bin/zsh");
+        assert_eq!(program, "/bin/sh");
         assert_eq!(
             args,
             vec![
+                "-c",
+                LOGIN_SHELL_STDIN_SHIM,
+                "nebula-login-shell",
+                "/bin/zsh",
                 "-l",
                 "-i",
                 "-c",
-                &format!("{PANE_ENV} claude '--resume' 'sid-1'")
+                &format!("exec </dev/tty; {PANE_ENV} claude '--resume' 'sid-1'")
             ]
         );
         // Single quotes in an arg survive the wrapping.
         let (_, args) = login_shell_wrap("/bin/zsh", "echo", &["it's".to_string()]);
-        assert_eq!(args[3], format!(r"{PANE_ENV} echo 'it'\''s'"));
+        assert_eq!(
+            args[7],
+            format!(r"exec </dev/tty; {PANE_ENV} echo 'it'\''s'")
+        );
         // A command word that isn't a plain name is quoted like an argument.
         let (_, args) = login_shell_wrap("/bin/zsh", "my tool", &[]);
-        assert_eq!(args[3], format!("{PANE_ENV} 'my tool'"));
+        assert_eq!(args[7], format!("exec </dev/tty; {PANE_ENV} 'my tool'"));
     }
 
     /// The command word resolves through the shell, so an alias or function
@@ -4811,7 +4829,9 @@ mod tests {
             .arg("-c")
             .arg(format!(
                 "claude() {{ printf 'routed %s' \"$*\"; }}; {}",
-                args[3]
+                args[7]
+                    .strip_prefix("exec </dev/tty; ")
+                    .expect("launch line restores the PTY before the command")
             ))
             .output()
             .unwrap();
@@ -4838,13 +4858,20 @@ mod tests {
         }
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join(".zshrc"), "alias claude='echo routed'\n").unwrap();
-        let (program, args) = login_shell_wrap(
+        let (_program, args) = login_shell_wrap(
             "zsh",
             "claude",
             &["--resume".to_string(), "sid-1".to_string()],
         );
-        let mut cmd = std::process::Command::new(program);
-        cmd.args(&args)
+        let mut cmd = std::process::Command::new(args[3].as_str());
+        let mut zsh_args = args[4..7].to_vec();
+        zsh_args.push(
+            args[7]
+                .strip_prefix("exec </dev/tty; ")
+                .expect("launch line restores the PTY before the command")
+                .to_string(),
+        );
+        cmd.args(&zsh_args)
             .env("ZDOTDIR", home.path())
             .stdin(std::process::Stdio::null());
         // Own session, as the daemon's CLI probe does: an interactive zsh
@@ -4879,7 +4906,11 @@ mod tests {
         );
         let out = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(&args[3])
+            .arg(
+                args[7]
+                    .strip_prefix("exec </dev/tty; ")
+                    .expect("launch line restores the PTY before the command"),
+            )
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0")
             .env("TERM", "foot")
