@@ -957,6 +957,18 @@ pub(crate) fn select_clicked_row(
     out: &mut Vec<ClientRequest>,
 ) -> bool {
     match *target {
+        HitTarget::ProjectRow(i) => {
+            select_project_row(app, i, out);
+            true
+        }
+        HitTarget::WorktreeRow(i) => {
+            select_worktree_row(app, i, out);
+            true
+        }
+        HitTarget::SessionRow(i) => {
+            select_session_row(app, i, ATTACH_DEBOUNCE, out);
+            true
+        }
         HitTarget::LauncherCard(at) => launcher::select_card_row(app, at, out),
         HitTarget::LauncherBand(i)
         | HitTarget::LauncherBandMore(i)

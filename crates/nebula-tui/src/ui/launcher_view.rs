@@ -23,6 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use ratatui::Frame;
 
+mod columns;
 mod nested;
 
 /// Width of the view's QUICK PROMPT, and its height: wider and taller than
@@ -65,6 +66,10 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     // The project the grid is on gets its tab, whichever way it was
     // opened, before the header lays the tabs out.
     app.settle_project_tabs();
+    if app.launcher.launcher_columns {
+        columns::draw(f, app, body);
+        return;
+    }
     // Threads nobody has opened or folded yet: the one under the cursor
     // starts open, the rest collapsed. Before the layout, so this frame
     // draws what `j`/`k` will walk.
@@ -4327,6 +4332,30 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn columns_layout_draws_the_three_existing_row_lists() {
+        let mut app = a_tree();
+        app.launcher.launcher_columns = true;
+        app.launcher.columns_recent_prompts = true;
+        app.tree.agents[0].recent_prompts = vec![nebula_core::PromptEntry {
+            text: "fix the columns layout".into(),
+            submitted_at: 0,
+        }];
+        app.nav.focus = Focus::Projects;
+
+        let lines = drawn_lines(&mut app, Rect::new(0, 0, 96, 12)).join("\n");
+        assert!(lines.contains("PROJECTS"), "{lines}");
+        assert!(lines.contains("WORKTREES"), "{lines}");
+        assert!(lines.contains("SESSIONS"), "{lines}");
+        assert!(lines.contains("api"), "{lines}");
+        assert!(lines.contains("feat"), "{lines}");
+        assert!(lines.contains("s0"), "{lines}");
+        assert!(lines.contains("fix the columns"), "{lines}");
+        assert!(app.hit_rect(&HitTarget::ProjectRow(0)).is_some());
+        assert!(app.hit_rect(&HitTarget::WorktreeRow(0)).is_some());
+        assert!(app.hit_rect(&HitTarget::SessionRow(0)).is_some());
     }
 
     /// `a_tree` with `count` checkouts in `api` instead of one, a session

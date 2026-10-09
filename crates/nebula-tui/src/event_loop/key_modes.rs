@@ -232,7 +232,11 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
     // (`launcher::escape`). Esc is the modal grammar's key and bound to no
     // action, so the lookup above found nothing and the `else` below would
     // drop it.
-    if action.is_none() && app.launcher_grid() && key.code == KeyCode::Esc {
+    if action.is_none()
+        && app.launcher_grid()
+        && !app.launcher.launcher_columns
+        && key.code == KeyCode::Esc
+    {
         if app.launcher.launcher_tab_cursor.is_some() {
             crate::key_combo::note(app, &[chord], Some("Back to the cards"));
         } else if !app.launcher.launcher_unaimed {
@@ -255,7 +259,10 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
     // card; the rest keep their panel meaning. Only the grid: over a
     // full-screen session the keys are the PTY's, and the ones that get
     // past it (an exited pane unlocks) are the pane's own.
-    if app.launcher_grid() && launcher::handle_action(app, action, armed, &chord, out) {
+    if app.launcher_grid()
+        && !app.launcher.launcher_columns
+        && launcher::handle_action(app, action, armed, &chord, out)
+    {
         return;
     }
     handle_global_action(app, action, armed, chord, out);

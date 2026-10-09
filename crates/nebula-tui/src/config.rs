@@ -42,8 +42,9 @@ pub const PANE_SIDES: &[&str] = &[
 /// the most recent few shown until Tab opens the rest
 /// ([`crate::launcher::LIST_RECENT`]) — then the NESTED layout: each
 /// worktree a header, and under it, along a rail, a full-width card per
-/// session and terminal, every worktree open until Tab folds it.
-pub const WORKTREE_LAYOUTS: &[&str] = &["cards", "list", "nested"];
+/// session and terminal, every worktree open until Tab folds it — then
+/// COLUMNS: projects, worktrees and sessions beside the pane.
+pub const WORKTREE_LAYOUTS: &[&str] = &["cards", "list", "nested", "columns"];
 
 /// The **Preset text** choices (Settings → Sessions), in the order the row
 /// cycles them: the [`PresetText`] sides by label.
@@ -1645,6 +1646,11 @@ impl Config {
     /// `worktree_layout` says the NESTED layout rather than the cards.
     pub fn nested_layout(&self) -> bool {
         self.worktree_layout_word() == "nested"
+    }
+
+    /// `worktree_layout` says the three-column layout rather than the cards.
+    pub fn columns_layout(&self) -> bool {
+        self.worktree_layout_word() == "columns"
     }
 
     /// The **Worktree layout** in force, as one of [`WORKTREE_LAYOUTS`]:
@@ -3981,14 +3987,15 @@ mod tests {
     }
 
     /// The **Worktree layout**: the cards out of the box, cycled from its
-    /// Appearance row to the compact list, on to the nested layout and
-    /// round to the cards again, persisted under `worktree_layout`. A
+    /// Appearance row to the compact list, on to the nested layout, then
+    /// columns, and round to the cards again, persisted under `worktree_layout`. A
     /// config predating the key, or holding a word off the list, reads as
     /// the cards.
     #[test]
     fn worktree_layout_defaults_to_cards_cycles_and_persists() {
         let mut cfg = Config::default();
         assert!(!cfg.list_layout());
+        assert!(!cfg.columns_layout());
         let (tab, row) = locate(SettingKind::WorktreeLayout).unwrap();
         assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
         assert_eq!(cfg.value_label(SettingKind::WorktreeLayout), "cards");
@@ -4014,19 +4021,24 @@ mod tests {
         assert!(!odd.list_layout(), "a word off the list");
         assert_eq!(odd.value_label(SettingKind::WorktreeLayout), "cards");
 
-        // The third choice: one step on from the list, and one more wraps
-        // round to the cards.
+        // The third and fourth choices: one step on from the list reaches
+        // nested, another reaches columns, and one more wraps to cards.
         let mut cfg = Config::default();
         cfg.cycle(tab, row, 1);
         cfg.cycle(tab, row, 1);
-        assert!(cfg.nested_layout() && !cfg.list_layout());
+        assert!(cfg.nested_layout() && !cfg.list_layout() && !cfg.columns_layout());
         assert_eq!(cfg.value_label(SettingKind::WorktreeLayout), "nested");
         cfg.save_to(&path).unwrap();
         assert!(load_from(&path).nested_layout());
         cfg.cycle(tab, row, 1);
+        assert!(cfg.columns_layout());
+        assert_eq!(cfg.value_label(SettingKind::WorktreeLayout), "columns");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).columns_layout());
+        cfg.cycle(tab, row, 1);
         assert_eq!(cfg.value_label(SettingKind::WorktreeLayout), "cards");
         cfg.cycle(tab, row, -1);
-        assert!(cfg.nested_layout(), "and back from the cards");
+        assert!(cfg.columns_layout(), "and back from the cards");
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,

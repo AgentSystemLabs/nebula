@@ -388,6 +388,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   time, as with the cards. A band that already lists everything has nothing to open, and `Tab`
   there says so. `j` and `k` walk the lines as one column, off a band's last line onto the next
   band's first; `Enter` and a click work on a line as on a card.
+- **The columns layout.** **Worktree layout** → `columns` brings back the project/worktree/session shape as one of the existing worktree layouts, not a separate Layout setting. The body is three row lists beside the same session pane: PROJECTS on the left, WORKTREES in the middle, SESSIONS on the right. `Tab`/`Shift+Tab` (or left/right focus keys) move between columns, `j`/`k` walk the focused column, and `Enter` uses the same project, worktree, PR/issue, session, link and terminal actions as the rest of nebula. PR and issue rows still read in the pane, missing project folders still use the locate flow, AskQuestion/needs-feedback rows keep the red status dot, and moving a session uses the `m` picker; card drag is a grid-only gesture and is disabled in columns. The old `hide_projects`, `hide_worktrees`, `hide_sessions`, `recent_prompts` and `recent_prompts_count` config keys are read only for this layout.
 - **The nested layout.** **Worktree layout** → `nested` draws the grid as a list of threads, one
   per worktree, with no header, no card border and no blank line between threads. Threads are
   sorted by their latest prompt, the one that moved last on top. The first prompt run in a
