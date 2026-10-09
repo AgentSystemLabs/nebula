@@ -545,6 +545,34 @@ pub async fn config_get(repo: &Path, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+pub async fn head_sha(repo: &Path) -> Result<String> {
+    Ok(git(repo, &["rev-parse", "HEAD"]).await?.trim().to_string())
+}
+
+pub async fn default_branch_name(repo: &Path) -> Option<String> {
+    git(
+        repo,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .await
+    .ok()
+    .and_then(|out| out.trim().strip_prefix("origin/").map(str::to_string))
+    .filter(|branch| !branch.is_empty())
+}
+
+pub async fn status_porcelain(repo: &Path) -> Result<String> {
+    git(
+        repo,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    )
+    .await
+}
+
 pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> Result<()> {
     // Checkout already gone (manual rm -rf): `git worktree remove` would fail,
     // but the user's intent is already satisfied — just drop git's stale

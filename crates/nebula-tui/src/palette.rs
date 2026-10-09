@@ -602,6 +602,7 @@ mod tests {
             is_draft,
             health: Default::default(),
             head: format!("pr-{number}"),
+            base: "main".into(),
         };
         let now = std::time::Instant::now();
         let mut open_prs = HashMap::new();
@@ -662,6 +663,7 @@ mod tests {
             is_draft: false,
             health,
             head: format!("pr-{number}"),
+            base: "main".into(),
         };
         let now = std::time::Instant::now();
         let mut open_prs = HashMap::new();
@@ -734,6 +736,7 @@ mod tests {
             is_draft,
             health: Default::default(),
             head: format!("pr-{number}"),
+            base: "main".into(),
         };
         let now = std::time::Instant::now();
         let mut open_prs = HashMap::new();

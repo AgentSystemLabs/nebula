@@ -353,8 +353,11 @@ quit, and why a machine with no `gh` — or one that is unauthenticated, or poin
 remote — just shows no rows instead of an error. The selected project is asked about most: its
 selected worktree's pull request and its open list on every tick, one process each, and its other
 checkouts on a sweep that takes one of them per tick — so every band learns whether its branch
-has merged without the cursor ever visiting it (the ROOT WORKTREE is left out; nobody deletes it over a
-merge). Nothing is stacked while a call is in flight, and each is abandoned after 20 s. The other
+has merged without the cursor ever visiting it. A merged or closed answer is kept only when it still
+belongs to that checkout: the PR head branch must match the checkout branch, the repo's default branch
+never wears a merged PR, and the checkout must have no commits beyond the PR's recorded head SHA. That
+keeps an old PR from `main` into `dev` from turning today's `main` purple. Nothing is stacked while a
+call is in flight, and each is abandoned after 20 s. The other
 projects' open pull requests and open issues are swept too, one project per tick on the five-minute
 beat, so a project switched to shows lists minutes old at worst. The selected
 worktree and the open list settle onto a steady 15 s beat; the swept checkouts onto 5 min, since a

@@ -342,6 +342,72 @@ pub(crate) fn land_pull_request(app: &mut App, worktree: WorktreeId, answer: Loo
     app.github.pr_cache_dirty |= changed;
 }
 
+pub(crate) fn maybe_auto_cleanup_merged(
+    app: &mut App,
+    worktree_id: &WorktreeId,
+    out: &mut Vec<ClientRequest>,
+) {
+    if !app.launcher.auto_cleanup_merged || app.github.auto_cleanup_requested.contains(worktree_id)
+    {
+        return;
+    }
+    let Some(worktree) = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|worktree| &worktree.id == worktree_id)
+        .cloned()
+    else {
+        return;
+    };
+    if worktree.is_main {
+        return;
+    }
+    let Some(pr) = app
+        .github
+        .pull_requests
+        .get(worktree_id)
+        .and_then(Option::as_ref)
+        .filter(|pr| pr.standing() == crate::pull_request::Standing::Merged)
+        .cloned()
+    else {
+        return;
+    };
+    if pr.head != worktree.branch || pr.head_sha.is_empty() {
+        return;
+    }
+    if app
+        .github
+        .open_prs
+        .values()
+        .flat_map(|open| &open.list)
+        .any(|open| open.base == worktree.branch)
+    {
+        return;
+    }
+    app.github
+        .auto_cleanup_requested
+        .insert(worktree.id.clone());
+    let branch = worktree.branch.clone();
+    let pr_number = pr.number;
+    let pr_url = pr.url.clone();
+    let head_sha = pr.head_sha.clone();
+    tracing::info!(
+        branch,
+        pr_number,
+        pr_url = %pr_url,
+        "requesting merged worktree cleanup"
+    );
+    send(app, out, |req_id| ClientRequest::CleanupMergedWorktree {
+        req_id,
+        id: worktree.id,
+        branch,
+        pr_number,
+        pr_url,
+        head_sha,
+    });
+}
+
 /// Ask `gh` for every pull request open on the selected project's repo, off
 /// the loop. Only the selected project is ever asked — the group only shows
 /// for the project on screen, and a machine with thirty repos must not

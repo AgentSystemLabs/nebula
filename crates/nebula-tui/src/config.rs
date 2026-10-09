@@ -399,6 +399,7 @@ pub enum SettingKind {
     FeedbackSound,
     PresetText,
     DeleteEmptyWorktree,
+    AutoCleanupMerged,
     ShowAllWorktrees,
     Theme,
     Animations,
@@ -507,6 +508,7 @@ impl SettingKind {
             | SettingKind::QuickPromptNewWorktree => (2026, 9, 22),
             // v0.38.0, then rows not yet in a release
             SettingKind::DeleteEmptyWorktree
+            | SettingKind::AutoCleanupMerged
             | SettingKind::ShowAllWorktrees
             | SettingKind::HideCardMarks
             | SettingKind::WorktreeLayout
@@ -634,6 +636,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::DeleteEmptyWorktree,
                 label: "Delete emptied worktree",
                 hint: "Deleting a worktree's last session or terminal deletes the worktree with it, no question asked (off = that delete's confirm asks first)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::AutoCleanupMerged,
+                label: "Auto-clean merged worktrees",
+                hint: "When a linked worktree's PR is safely detected as merged, archive idle sessions and remove the worktree (root/default/base branches are never touched)",
                 group: "",
             },
             SettingSpec {
@@ -1062,6 +1070,12 @@ pub struct Config {
     /// [`Config::show_all_worktrees`] on too: only the question is that
     /// setting's to drop.
     pub delete_empty_worktree: bool,
+    /// AUTO-CLEAN MERGED WORKTREES: when the PR row for a linked worktree is
+    /// a trustworthy merge, ask the daemon to archive idle sessions there
+    /// and remove the checkout from disk. Off by default; root/default/base
+    /// branches, dirty checkouts, active sessions and mismatched heads are
+    /// skipped.
+    pub auto_cleanup_merged: bool,
     /// SHOW ALL WORKTREES: every checkout of the project gets a BAND on
     /// the grid, one with nothing running in it too — an overview of the
     /// checkouts, any of them a place to aim `p`/`n` at. On by default.
@@ -1483,6 +1497,7 @@ impl Default for Config {
             feedback_sound: "Sosumi".into(),
             preset_text: PresetText::DEFAULT.as_str().into(),
             delete_empty_worktree: false,
+            auto_cleanup_merged: false,
             show_all_worktrees: true,
             theme: "default".into(),
             animations: true,
@@ -2335,6 +2350,7 @@ impl Config {
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::DeleteEmptyWorktree => on_off(self.delete_empty_worktree).into(),
+            SettingKind::AutoCleanupMerged => on_off(self.auto_cleanup_merged).into(),
             SettingKind::ShowAllWorktrees => on_off(self.show_all_worktrees).into(),
             SettingKind::AskBeforeArchive => on_off(self.ask_before_archive).into(),
             SettingKind::Theme => self.theme.clone(),
@@ -2428,6 +2444,9 @@ impl Config {
             }
             SettingKind::DeleteEmptyWorktree => {
                 self.delete_empty_worktree = !self.delete_empty_worktree;
+            }
+            SettingKind::AutoCleanupMerged => {
+                self.auto_cleanup_merged = !self.auto_cleanup_merged;
             }
             SettingKind::ShowAllWorktrees => {
                 self.show_all_worktrees = !self.show_all_worktrees;
@@ -3592,6 +3611,27 @@ mod tests {
         assert!(!cfg.delete_empty_worktree, "a missing key reads as off");
         let cfg: Config = serde_json::from_str(r#"{"delete_empty_worktree": true}"#).unwrap();
         assert!(cfg.delete_empty_worktree);
+    }
+
+    /// AUTO-CLEAN MERGED WORKTREES is opt-in, sits on the Sessions tab, and
+    /// persists under its own key.
+    #[test]
+    fn auto_cleanup_merged_is_off_by_default_and_toggles() {
+        let mut cfg = Config::default();
+        assert!(!cfg.auto_cleanup_merged);
+        let (tab, row) = locate(SettingKind::AutoCleanupMerged).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        assert_eq!(cfg.value_label(SettingKind::AutoCleanupMerged), "off");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.auto_cleanup_merged);
+        assert_eq!(cfg.value_label(SettingKind::AutoCleanupMerged), "on");
+        cfg.cycle(tab, row, -1);
+        assert!(!cfg.auto_cleanup_merged, "←/→ toggle it like Enter does");
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.auto_cleanup_merged, "a missing key reads as off");
+        let cfg: Config = serde_json::from_str(r#"{"auto_cleanup_merged": true}"#).unwrap();
+        assert!(cfg.auto_cleanup_merged);
     }
 
     /// SHOW ALL WORKTREES starts on — every checkout gets a band — sits

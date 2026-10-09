@@ -9057,6 +9057,9 @@ mod tests {
                     title: "Polish the nav".into(),
                     state: crate::pull_request::STATE_OPEN.into(),
                     is_draft: false,
+                    head: "feat".into(),
+                    head_sha: "42".repeat(20),
+                    base: "main".into(),
                     health: Default::default(),
                     activity: Vec::new(),
                 }),
@@ -9099,6 +9102,9 @@ mod tests {
             title: "Polish the nav".into(),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            head: "feat".into(),
+            head_sha: format!("{number:040x}"),
+            base: "main".into(),
             health: Default::default(),
             activity: Vec::new(),
         }
@@ -12352,6 +12358,7 @@ mod tests {
             is_draft: false,
             health: Default::default(),
             head: "feat".into(),
+            base: "main".into(),
         };
         let at = std::time::Instant::now();
         app.github.open_prs.insert(

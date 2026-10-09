@@ -409,6 +409,7 @@ pub(crate) fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.chrome.black_background = cfg.black_background;
     app.launcher.card_issue_number = cfg.card_issue_number;
     app.launcher.show_all_worktrees = cfg.show_all_worktrees;
+    app.launcher.auto_cleanup_merged = cfg.auto_cleanup_merged;
     app.launcher.hide_card_marks = cfg.hide_card_marks;
     app.launcher.highlight_current_card = cfg.highlight_current_card;
     app.launcher.launcher_pane_at = cfg.pane_side();

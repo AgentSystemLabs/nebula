@@ -983,6 +983,7 @@ mod tests {
             is_draft,
             health: Health::default(),
             head: format!("branch-{number}"),
+            base: "main".into(),
         }
     }
 

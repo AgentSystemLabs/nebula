@@ -338,7 +338,11 @@ macro_rules! main_loop_body {
             answer = pr_rx.recv() => {
                 // Never None: `pr_tx` lives as long as the loop.
                 if let Some((worktree, answer)) = answer {
-                    land_pull_request(&mut app, worktree, answer);
+                    let found = matches!(answer, Lookup::Found(_));
+                    land_pull_request(&mut app, worktree.clone(), answer);
+                    if found {
+                        maybe_auto_cleanup_merged(&mut app, &worktree, &mut out);
+                    }
                 }
             }
             answer = git_rx.recv() => {

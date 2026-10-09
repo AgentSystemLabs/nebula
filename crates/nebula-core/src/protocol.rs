@@ -9,14 +9,14 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 47;
+pub const PROTOCOL_VERSION: u32 = 48;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
 /// Compatibility is a range overlap: two peers can talk when each peer's
 /// `[MIN_COMPATIBLE_PROTOCOL, PROTOCOL_VERSION]` range includes at least one
 /// version the other peer also supports.
-pub const MIN_COMPATIBLE_PROTOCOL: u32 = 47;
+pub const MIN_COMPATIBLE_PROTOCOL: u32 = 48;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -121,6 +121,18 @@ pub enum ClientRequest {
         req_id: u64,
         id: WorktreeId,
         force: bool,
+    },
+    /// Opt-in cleanup for a linked worktree whose PR was detected as merged.
+    /// The daemon re-checks the safety invariants before touching disk:
+    /// never the root/default branch, branch and HEAD must still match the
+    /// trusted PR row, the checkout must be clean, and sessions must be idle.
+    CleanupMergedWorktree {
+        req_id: u64,
+        id: WorktreeId,
+        branch: String,
+        pr_number: u64,
+        pr_url: String,
+        head_sha: String,
     },
     CreateAgent {
         req_id: u64,
