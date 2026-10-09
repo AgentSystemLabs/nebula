@@ -42,7 +42,56 @@ impl Overlay {
             Overlay::BranchSwitch(view) => draw_branch_switch_overlay(f, app, view),
             Overlay::FileTabs(view) => draw_file_tabs_overlay(f, app, view),
             Overlay::Tree(view) => draw_tree_overlay(f, app, view),
+            Overlay::Review(view) => draw_review_overlay(f, app, view),
         }
+    }
+}
+
+fn draw_review_overlay(f: &mut Frame, app: &mut App, mut view: crate::review_modal::ReviewView) {
+    let th = app.chrome.theme;
+    let area = centered_rect_pct(f.area(), 98, 96);
+    let title = match view.selected_session() {
+        Some(SessionRef::Agent(id)) => format!(" Review · {id} "),
+        Some(SessionRef::Terminal(id)) => format!(" Review · terminal {id} "),
+        None => " Review ".to_string(),
+    };
+    let inner = render_modal_frame(f, area, title, th);
+    let (strip, hits) = tab_strip(
+        inner.x,
+        view.tabs
+            .iter()
+            .map(|tab| crate::review_modal::tab_label(*tab)),
+        view.tab,
+        true,
+        th,
+    );
+    if let Some(row) = row_rect(inner, 0) {
+        f.render_widget(Paragraph::new(Line::from(strip)), row);
+    }
+    let body = Rect {
+        y: inner.y.saturating_add(2),
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    let text = match view.selected_tab() {
+        Some(nebula_core::ReviewTabKind::Terminal) => {
+            "Terminal output is available in the session pane and scrollback."
+        }
+        Some(nebula_core::ReviewTabKind::Diff) => "Diff review is planned for this tab.",
+        Some(nebula_core::ReviewTabKind::History) => {
+            "Recent session history is available through `nebula orchestrator read <session-id>`."
+        }
+        Some(nebula_core::ReviewTabKind::PullRequest) => {
+            "Pull request review is planned for this tab."
+        }
+        None => "No session selected.",
+    };
+    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), body);
+    if let Some(Overlay::Review(v)) = &mut app.modals.overlay {
+        view.area = area;
+        view.body_area = body;
+        view.tab_hits = hits;
+        *v = view;
     }
 }
 

@@ -29,6 +29,7 @@ fn seed_agent_in(app: &mut App, id: &str, worktree: &nebula_core::WorktreeId) {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -58,6 +59,7 @@ fn seed_second_agent(app: &mut App, status: nebula_core::AgentStatus) {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -851,6 +853,7 @@ pub(super) fn seed_tree(app: &mut App) {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -5191,6 +5194,7 @@ fn working_sessions_head_the_list_regardless_of_age() {
                 status_changed_at: changed_at,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         };
@@ -5245,6 +5249,7 @@ fn sessions_order_by_last_interaction() {
             status_changed_at: at,
             alive: true,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         }),
     };
@@ -5327,6 +5332,7 @@ fn a_session_created_running_leads_the_working_ones() {
             status_changed_at: at,
             alive: true,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         }),
     };
@@ -5387,6 +5393,7 @@ fn status_change_resorts_and_selection_follows() {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -5455,6 +5462,7 @@ fn worktree_delete_is_optimistic_and_rolls_back_on_error() {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -7739,6 +7747,7 @@ fn walking_onto_a_reaped_session_still_waits_out_the_debounce() {
                 status_changed_at: 0,
                 alive: false,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -8342,6 +8351,7 @@ fn archived_agent(id: &str, name: &str, archived_at: i64, sort: i64) -> nebula_c
         status_changed_at: 0,
         alive: false,
         issue_url: None,
+        role: nebula_core::AgentRole::Worker,
         recent_prompts: Vec::new(),
     })
 }
@@ -9941,6 +9951,7 @@ fn selection_follows_the_selected_agent_when_the_daemon_rehomes_it() {
         status_changed_at: 0,
         alive: true,
         issue_url: None,
+        role: nebula_core::AgentRole::Worker,
         recent_prompts: Vec::new(),
     };
 
@@ -10135,6 +10146,7 @@ fn agent_stamped(id: &str, wt: &str, at: i64) -> nebula_core::Entity {
         status_changed_at: at,
         alive: true,
         issue_url: None,
+        role: nebula_core::AgentRole::Worker,
         recent_prompts: Vec::new(),
     })
 }
@@ -11886,6 +11898,7 @@ fn seed_second_project(app: &mut App) {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -11911,6 +11924,7 @@ fn seed_second_project(app: &mut App) {
                 status_changed_at: 0,
                 alive: false,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -12241,6 +12255,7 @@ fn seed_attention_ring(app: &mut App) {
         status_changed_at: 500,
         alive: true,
         issue_url: None,
+        role: nebula_core::AgentRole::Worker,
         recent_prompts: Vec::new(),
     };
     for a in [
@@ -12705,6 +12720,7 @@ fn palette_rows_take_their_status_color_and_sweep() {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -14978,6 +14994,7 @@ fn shift_d_bulk_deletes_the_visible_sessions() {
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -15051,6 +15068,7 @@ fn agent_entity(id: &str, wt: &str, name: &str, archived: bool) -> nebula_core::
         status_changed_at: 0,
         alive: true,
         issue_url: None,
+        role: nebula_core::AgentRole::Worker,
         recent_prompts: Vec::new(),
     })
 }
@@ -15746,6 +15764,7 @@ fn a_cross_project_session_jump_attaches_only_the_session_picked() {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -15813,6 +15832,7 @@ fn seed_background_run(app: &mut App) {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -16634,6 +16654,7 @@ fn the_issue_quick_prompt_stands_on_the_modal() {
                     status_changed_at: crate::app::now_ms(),
                     alive: true,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -18103,6 +18124,7 @@ fn a_quick_prompt_lands_the_row_without_taking_the_pane() {
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -20094,6 +20116,7 @@ fn parity_tree() -> App {
                 status_changed_at: 1,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -20922,6 +20945,7 @@ fn overlay_label(overlay: &Overlay) -> &'static str {
         Overlay::Issues(_) => "Issues",
         Overlay::PullRequests(_) => "PullRequests",
         Overlay::BranchSwitch(_) => "BranchSwitch",
+        Overlay::Review(_) => "Review",
         Overlay::ProjectPicker(_) => "ProjectPicker",
     }
 }

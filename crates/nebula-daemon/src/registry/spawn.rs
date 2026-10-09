@@ -37,6 +37,7 @@ impl Daemon {
             starting_prompt,
             pr_url,
             issue_url,
+            role,
         } = spec;
         let cloud_prompt = match cloud_prompt {
             Some(_) if kind != AgentKind::Claude => {
@@ -144,6 +145,7 @@ impl Daemon {
             status_changed_at: nebula_core::clock::now_ms(),
             alive: false,
             issue_url: issue_url.clone(),
+            role,
             recent_prompts: Vec::new(),
         };
         // A cloud task is the session's first prompt, and the only one

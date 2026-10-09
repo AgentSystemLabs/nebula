@@ -1120,6 +1120,7 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         cloud_session_id: r.get(13)?,
         alive: false,
         issue_url: r.get(16)?,
+        role: nebula_core::AgentRole::Worker,
         recent_prompts: parse_prompts(r.get::<_, Option<String>>(14)?.as_deref()),
         custom_harness: r.get(15)?,
     })
@@ -1218,6 +1219,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
         let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
@@ -1242,6 +1244,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&codex_agent).unwrap();
@@ -1263,6 +1266,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&cursor_agent).unwrap();
@@ -1285,6 +1289,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
         store
@@ -1327,6 +1332,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&custom).unwrap();
@@ -1832,6 +1838,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
 
@@ -1920,6 +1927,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 },
                 true,
@@ -2049,6 +2057,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 })
                 .unwrap();
@@ -2113,6 +2122,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 })
                 .unwrap();
@@ -2174,6 +2184,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             };
             store.insert_agent(&agent).unwrap();
@@ -2274,6 +2285,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             })
             .unwrap();

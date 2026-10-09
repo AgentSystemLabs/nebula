@@ -2117,6 +2117,7 @@ mod tests {
             status_changed_at: 0,
             alive: true,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         }
     }

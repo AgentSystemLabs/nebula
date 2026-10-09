@@ -358,6 +358,7 @@ mod tests {
                     status_changed_at: crate::app::now_ms(),
                     alive: true,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 }),
             },

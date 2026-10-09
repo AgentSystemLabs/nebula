@@ -14,6 +14,7 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
         event @ ServerEvent::EntityUpserted { .. }
         | event @ ServerEvent::EntityRemoved { .. }
         | event @ ServerEvent::FilesOpened { .. }
+        | event @ ServerEvent::ReviewOpened { .. }
         | event @ ServerEvent::Metrics { .. }
         | event @ ServerEvent::OutputTail { .. }
         | event @ ServerEvent::AttachRefused { .. } => handle_tree_event(app, event, out),
@@ -484,6 +485,9 @@ fn handle_tree_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequ
         // `nebula open` in a session: the user asked to see these files.
         ServerEvent::FilesOpened { root, paths, .. } => {
             crate::file_tabs::open(app, root, paths);
+        }
+        ServerEvent::ReviewOpened { sessions, tabs, .. } => {
+            crate::review_modal::open(app, sessions, tabs);
         }
         ServerEvent::Metrics { req_id, snapshot } => {
             // Answered with Metrics, not Ack — clear the pending slot by hand.

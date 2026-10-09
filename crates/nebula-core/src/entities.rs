@@ -141,6 +141,35 @@ impl AgentKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    #[default]
+    Worker,
+    Orchestrator,
+}
+
+impl AgentRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentRole::Worker => "worker",
+            AgentRole::Orchestrator => "orchestrator",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "worker" => AgentRole::Worker,
+            "orchestrator" => AgentRole::Orchestrator,
+            _ => return None,
+        })
+    }
+
+    pub fn is_orchestrator(&self) -> bool {
+        matches!(self, AgentRole::Orchestrator)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
@@ -232,6 +261,10 @@ pub struct Agent {
     /// issue in the browser.
     #[serde(default)]
     pub issue_url: Option<String>,
+    /// Privileged session role. Only the persisted orchestrator row may use
+    /// the orchestrator-only socket commands.
+    #[serde(default)]
+    pub role: AgentRole,
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,

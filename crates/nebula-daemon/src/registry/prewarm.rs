@@ -72,6 +72,7 @@ impl Daemon {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
         self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;

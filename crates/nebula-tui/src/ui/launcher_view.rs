@@ -3835,6 +3835,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             })
             .collect();
@@ -5052,6 +5053,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 },
                 project: "nebula".into(),
@@ -5287,6 +5289,7 @@ mod tests {
             status_changed_at: 0,
             alive: true,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
         let th = Theme::by_name("amber");
@@ -5395,6 +5398,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             },
             project: "nebula".into(),
@@ -5450,6 +5454,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             },
             project: "nebula".into(),
@@ -5600,6 +5605,7 @@ mod tests {
                     status_changed_at: crate::app::now_ms() - 60_000,
                     alive: true,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 },
                 project: "nebula".into(),

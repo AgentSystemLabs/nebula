@@ -147,6 +147,8 @@ pub enum Action {
     /// whole body, or bring it back. Folding it also unselects the card
     /// under the cursor, so nothing is selected and nothing is read.
     ToggleLauncherPane,
+    /// `F10`: toggle between the ORCHESTRATOR chat view and the grid.
+    ToggleOrchestratorView,
     /// `^F`: FULL-SCREEN the session in the PANE — the grid and its header
     /// give way to the PTY — or bring it back down to the pane beside the
     /// cards. From the cards it full-screens the one under the cursor.
@@ -630,6 +632,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         // beside them — the shift of the `` ` `` that walks the pane's
         // tabs, which is the key everything else about the pane is on.
         defaults: &["ctrl+`", "ctrl+~", "~"],
+    },
+    ActionSpec {
+        action: Action::ToggleOrchestratorView,
+        id: "toggle_orchestrator_view",
+        label: "Orchestrator view",
+        hint: "Toggle between the chat-first orchestrator view and the grid",
+        group: "GENERAL",
+        scope: Scope::Global,
+        defaults: &["f10"],
     },
     ActionSpec {
         action: Action::ToggleFullScreen,
