@@ -172,12 +172,12 @@ fn fingerprint_file(path: &Path) -> Option<String> {
     const PRIME: u64 = 0x100_0000_01b3;
     let bytes = fs::read(path).ok()?;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut words = bytes.chunks_exact(8);
-    for word in &mut words {
-        hash = (hash ^ u64::from_le_bytes(word.try_into().unwrap())).wrapping_mul(PRIME);
+    let (words, remainder) = bytes.as_chunks::<8>();
+    for word in words {
+        hash = (hash ^ u64::from_le_bytes(*word)).wrapping_mul(PRIME);
     }
     let mut tail = [0u8; 8];
-    tail[..words.remainder().len()].copy_from_slice(words.remainder());
+    tail[..remainder.len()].copy_from_slice(remainder);
     hash = (hash ^ u64::from_le_bytes(tail)).wrapping_mul(PRIME);
     hash = (hash ^ bytes.len() as u64).wrapping_mul(PRIME);
     Some(format!("{hash:016x}"))

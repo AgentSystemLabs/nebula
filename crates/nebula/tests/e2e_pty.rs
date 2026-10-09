@@ -2615,17 +2615,22 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     // adoption works, the marker is in scrollback the moment we attach; a
     // cold spawn at CreateAgent time couldn't print it for another 3s.
     let script = env.tmp.path().join("slow-agent.sh");
+    let ready = env.tmp.path().join("prewarm-ready");
     std::fs::write(
         &script,
-        concat!(
+        format!(
+            concat!(
             "#!/bin/sh\n",
             "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \\\n",
-            "  -H 'Content-Type: application/json' -d '{\"session_id\":\"warm-sid-99\"}' \\\n",
+            "  -H 'Content-Type: application/json' -d '{{\"session_id\":\"warm-sid-99\"}}' \\\n",
             "  \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=SessionStart\" \\\n",
             "  >/dev/null 2>&1\n",
             "sleep 3\n",
+            ": > '{}'\n",
             "echo PREWARM_READY\n",
             "exec /bin/sh\n",
+            ),
+            ready.display(),
         ),
     )
     .unwrap();
@@ -2648,8 +2653,8 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     )
     .await
     .unwrap();
-    // "User types the name": long enough for the warm boot to finish.
-    tokio::time::sleep(Duration::from_millis(4500)).await;
+    // "User types the name": wait until the warm boot has reached the shell.
+    wait_for_file(&ready, "prewarm-ready marker").await;
 
     write_frame(
         &mut c,
@@ -2777,7 +2782,12 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     let script = env.tmp.path().join("dying-agent.sh");
-    std::fs::write(&script, "#!/bin/sh\nexit 127\n").unwrap();
+    let started = env.tmp.path().join("dying-agent-started");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\n: > '{}'\nexit 127\n", started.display()),
+    )
+    .unwrap();
     make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
@@ -2796,8 +2806,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
     )
     .await
     .unwrap();
-    // Give the warm spawn time to die.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    wait_for_file(&started, "dying prewarm marker").await;
 
     write_frame(
         &mut c,
@@ -3057,6 +3066,20 @@ async fn read_pidfile(path: &Path) -> i32 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "pidfile {path:?} never appeared"
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
+}
+
+async fn wait_for_file(path: &Path, what: &str) {
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if path.exists() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what} never appeared"
         );
         tokio::time::sleep(POLL_STEP).await;
     }

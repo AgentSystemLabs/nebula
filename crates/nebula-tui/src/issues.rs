@@ -2237,8 +2237,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script = |name: &str, sh: &str| {
             let path = dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{sh}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let tmp = dir.path().join(format!("{name}.tmp"));
+            std::fs::write(&tmp, format!("#!/bin/sh\n{sh}\n")).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
             path
         };
         let records = script(

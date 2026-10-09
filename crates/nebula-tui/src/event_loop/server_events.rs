@@ -23,7 +23,6 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
 }
 
 fn handle_snapshot_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
-    let _ = &mut *out;
     match event {
         ServerEvent::Snapshot {
             projects,
@@ -34,6 +33,9 @@ fn handle_snapshot_event(app: &mut App, event: ServerEvent, out: &mut Vec<Client
             pr_seen,
             ui_state,
         } => {
+            let first_snapshot = !app.snapshot_loaded;
+            app.snapshot_loaded = true;
+            let before = (!first_snapshot).then(|| selection_snapshot(app));
             app.tree.projects = projects;
             app.tree.worktrees = worktrees;
             app.tree.agents = agents;
@@ -44,10 +46,15 @@ fn handle_snapshot_event(app: &mut App, event: ServerEvent, out: &mut Vec<Client
             // the ones this tree no longer has go, before they could be
             // written back.
             prune_pull_requests_to_tree(app);
-            let session_restored = ui_state
-                .as_deref()
-                .is_some_and(|json| restore_ui_state(app, json));
-            clamp_selections(app);
+            let session_restored = first_snapshot
+                && ui_state
+                    .as_deref()
+                    .is_some_and(|json| restore_ui_state(app, json));
+            if let Some(before) = before {
+                reconcile_selection(app, before, out);
+            } else {
+                clamp_selections(app);
+            }
             refresh_palette(app);
             // Boot the restored worktree's sessions right away — the first
             // thing the user does after launch is walk into one of them.
@@ -63,7 +70,7 @@ fn handle_snapshot_event(app: &mut App, event: ServerEvent, out: &mut Vec<Client
             // the card its cursor is on, so a boot that remembered no
             // session fills it from the grid's own cursor rather than
             // sitting empty under a grid full of cards.
-            if session_restored || app.launcher_grid() {
+            if first_snapshot && (session_restored || app.launcher_grid()) {
                 preview_selected_now(app, out);
             }
             app.dirty = true;

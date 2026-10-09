@@ -298,10 +298,8 @@ fn handle_diff_mouse(
                     app.dirty = true;
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if view.files_drag.take().is_some() {
-                    app.dirty = true;
-                }
+            MouseEventKind::Up(MouseButton::Left) if view.files_drag.take().is_some() => {
+                app.dirty = true;
             }
             _ => {}
         }
@@ -473,10 +471,8 @@ fn handle_tree_mouse(
                     app.dirty = true;
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if view.files_drag.take().is_some() {
-                    app.dirty = true;
-                }
+            MouseEventKind::Up(MouseButton::Left) if view.files_drag.take().is_some() => {
+                app.dirty = true;
             }
             _ => {}
         }
@@ -1058,13 +1054,12 @@ fn handle_right_click(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequ
             let items = panel_menu_items(app, focus);
             open_menu(app, items, at);
         }
-        Some(target) => {
-            if select_clicked_row(app, &target, out) {
-                if let Some(items) = context_menu_items(app, app.focus) {
-                    open_menu(app, items, at);
-                }
+        Some(target) if select_clicked_row(app, &target, out) => {
+            if let Some(items) = context_menu_items(app, app.focus) {
+                open_menu(app, items, at);
             }
         }
+        Some(_) => {}
         None => {}
     }
     app.dirty = true;

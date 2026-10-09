@@ -1025,13 +1025,7 @@ fn column_widths(natural: &[usize], minimum: &[usize], avail: usize) -> Vec<usiz
         let mut widths: Vec<usize> = natural
             .iter()
             .zip(&minimum)
-            .map(|(n, m)| {
-                m + if wants == 0 {
-                    0
-                } else {
-                    slack * (n - m) / wants
-                }
-            })
+            .map(|(n, m)| m + (slack * (n - m)).checked_div(wants).unwrap_or(0))
             .collect();
         // Integer shares leave a column or two of slack over: the columns
         // that wanted the most take it, one each.

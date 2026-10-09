@@ -53,6 +53,7 @@ fn is_remote_from(conn: Option<&str>, tty: Option<&str>) -> bool {
     conn.is_some_and(|v| !v.is_empty()) || tty.is_some_and(|v| !v.is_empty())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn wsl_flavor_from(osrelease: Option<&str>, version: Option<&str>) -> Option<WslFlavor> {
     let osrelease = osrelease.unwrap_or_default().to_ascii_lowercase();
     let version = version.unwrap_or_default().to_ascii_lowercase();

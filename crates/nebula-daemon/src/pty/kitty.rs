@@ -227,13 +227,13 @@ impl KittyScanner {
                 }
             }
             // DA1 (CSI c / CSI 0 c): claim VT102 so detection loops terminate.
-            b'c' if params.is_empty() || params == [b'0'] => {
+            b'c' if params.is_empty() || params == *b"0" => {
                 actions.reply_bytes(b"\x1b[?6c");
             }
             // DSR 5 (device status): always OK.
-            b'n' if params == [b'5'] => actions.reply_bytes(b"\x1b[0n"),
+            b'n' if params == *b"5" => actions.reply_bytes(b"\x1b[0n"),
             // DSR 6 (cursor position): the pump reads it off a screen.
-            b'n' if params == [b'6'] => actions.replies.push(Reply::CursorPosition { at: end }),
+            b'n' if params == *b"6" => actions.replies.push(Reply::CursorPosition { at: end }),
             _ => {}
         }
     }

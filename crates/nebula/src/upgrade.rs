@@ -5,7 +5,7 @@
 //! from remembering the curl one-liner.
 
 use anyhow::{bail, Context, Result};
-use nebula_core::PROTOCOL_VERSION;
+use nebula_core::{protocol_ranges_overlap, MIN_COMPATIBLE_PROTOCOL, PROTOCOL_VERSION};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,11 +94,10 @@ fn finish_daemon_handoff() {
             }
             let plural = if count == 1 { "" } else { "s" };
             println!("note: the old daemon is still running with {count} live session{plural}.");
-            let installed = std::env::var_os("PATH").and_then(|path| {
-                protocol_version_on_path(&path, &nebula_core::paths::runtime_dir())
-            });
-            match installed.filter(|v| *v != PROTOCOL_VERSION) {
-                Some(new) => {
+            let installed = std::env::var_os("PATH")
+                .and_then(|path| protocol_range_on_path(&path, &nebula_core::paths::runtime_dir()));
+            match installed.filter(|range| !protocol_range_is_compatible(*range)) {
+                Some((_, new)) => {
                     println!("{}", protocol_change_note(new));
                     if !offer_restart(count) {
                         println!("{KILL_HINT}");
@@ -157,6 +156,15 @@ fn protocol_change_note(installed: u32) -> String {
     )
 }
 
+fn protocol_range_is_compatible((installed_min, installed): (u32, u32)) -> bool {
+    protocol_ranges_overlap(
+        MIN_COMPATIBLE_PROTOCOL,
+        PROTOCOL_VERSION,
+        installed_min,
+        installed,
+    )
+}
+
 /// Offer that restart when someone is at the terminal to answer. No is still
 /// the default — a restart takes every session with it. True once the daemon
 /// is down.
@@ -194,13 +202,21 @@ fn is_yes(answer: &str) -> bool {
 /// `_protocol-version`: such a build reads the word as `nebula <dir>`, so it
 /// runs from `cwd` — the runtime dir, where no directory by that name will
 /// ever sit to be registered as a project.
+#[cfg(test)]
 fn protocol_version_on_path(path: &OsStr, cwd: &Path) -> Option<u32> {
     let exe = nebula_on_path(path)?;
-    let out = Command::new(exe)
-        .arg("_protocol-version")
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    protocol_probe(&exe, "_protocol-version", cwd)
+}
+
+fn protocol_range_on_path(path: &OsStr, cwd: &Path) -> Option<(u32, u32)> {
+    let exe = nebula_on_path(path)?;
+    let version = protocol_probe(&exe, "_protocol-version", cwd)?;
+    let min = protocol_probe(&exe, "_protocol-min-compatible-version", cwd).unwrap_or(version);
+    Some((min, version))
+}
+
+fn protocol_probe(exe: &Path, arg: &str, cwd: &Path) -> Option<u32> {
+    let out = Command::new(exe).arg(arg).current_dir(cwd).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -388,6 +404,41 @@ mod tests {
         let path = std::env::join_paths([empty.path(), newer.path(), shadowed.path()]).unwrap();
 
         assert_eq!(protocol_version_on_path(&path, empty.path()), Some(44));
+    }
+
+    #[test]
+    fn reads_the_protocol_range_when_the_installed_binary_advertises_one() {
+        let empty = tempfile::tempdir().unwrap();
+        let newer = tempfile::tempdir().unwrap();
+        fake_nebula(
+            newer.path(),
+            "#!/bin/sh\ncase \"$1\" in\n  _protocol-version) echo 48 ;;\n  _protocol-min-compatible-version) echo 47 ;;\n  *) exit 1 ;;\nesac\n",
+        );
+        let path = std::env::join_paths([newer.path()]).unwrap();
+
+        assert_eq!(protocol_range_on_path(&path, empty.path()), Some((47, 48)));
+        assert!(protocol_range_is_compatible((
+            MIN_COMPATIBLE_PROTOCOL,
+            PROTOCOL_VERSION
+        )));
+        assert!(protocol_range_is_compatible((47, 48)));
+        assert!(!protocol_range_is_compatible((
+            PROTOCOL_VERSION + 1,
+            PROTOCOL_VERSION + 1
+        )));
+    }
+
+    #[test]
+    fn protocol_range_falls_back_to_exact_for_old_hooks() {
+        let empty = tempfile::tempdir().unwrap();
+        let newer = tempfile::tempdir().unwrap();
+        fake_nebula(
+            newer.path(),
+            "#!/bin/sh\n[ \"$1\" = _protocol-version ] && echo 44\n",
+        );
+        let path = std::env::join_paths([newer.path()]).unwrap();
+
+        assert_eq!(protocol_range_on_path(&path, empty.path()), Some((44, 44)));
     }
 
     // Every build released before `_protocol-version` reads the word as

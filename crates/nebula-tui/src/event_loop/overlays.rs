@@ -133,12 +133,12 @@ fn handle_hosts_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) 
                 }
                 // Forget the entry — no confirm, the next `nebula ssh` to it
                 // just re-adds it.
-                KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
-                    if view.selected < view.hosts.len() {
-                        let entry = view.hosts.remove(view.selected);
-                        view.selected = clamp_selection(view.selected as i64, view.hosts.len());
-                        crate::hosts::remove(&entry);
-                    }
+                KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete
+                    if view.selected < view.hosts.len() =>
+                {
+                    let entry = view.hosts.remove(view.selected);
+                    view.selected = clamp_selection(view.selected as i64, view.hosts.len());
+                    crate::hosts::remove(&entry);
                 }
                 _ => {}
             }
