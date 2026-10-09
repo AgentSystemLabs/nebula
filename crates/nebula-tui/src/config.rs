@@ -3839,8 +3839,13 @@ mod tests {
         assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
         assert_eq!(
             locate(SettingKind::WorktreeLayout),
-            Some((tab, row - 1)),
+            Some((tab, row - 2)),
             "under the layout it opens"
+        );
+        assert_eq!(
+            locate(SettingKind::InlineGraphics),
+            Some((tab, row - 1)),
+            "after the graphics row"
         );
         cfg.cycle(tab, row, 0);
         assert!(cfg.expand_all_worktrees);
@@ -3858,6 +3863,33 @@ mod tests {
 
         let legacy: Config = serde_json::from_str("{}").unwrap();
         assert!(!legacy.expand_all_worktrees, "a missing key reads as off");
+    }
+
+    #[test]
+    fn inline_graphics_defaults_to_auto_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.inline_graphics_label(), "auto");
+        assert_eq!(cfg.value_label(SettingKind::InlineGraphics), "auto");
+        assert_eq!(
+            cfg.graphics_mode(),
+            crate::graphics::GraphicsMode::Halfblocks
+        );
+
+        let (tab, row) = locate(SettingKind::InlineGraphics).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.inline_graphics, "kitty");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.inline_graphics, "auto");
+        cfg.inline_graphics = "off".into();
+        assert_eq!(cfg.graphics_mode(), crate::graphics::GraphicsMode::Off);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""inline_graphics": "off""#), "{raw}");
+        assert_eq!(load_from(&path).inline_graphics, "off");
     }
 
     /// CARD LINE COUNTS: retired with every card counting its lines. The
