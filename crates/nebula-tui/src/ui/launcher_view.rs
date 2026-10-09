@@ -1667,12 +1667,9 @@ fn draw_band_rule(
     } = rule;
     // A session card dragged over this band: the rule lights and says
     // the release moves the card here.
-    let drop = app
-        .card_drag
-        .as_ref()
-        .is_some_and(|d| {
-            d.active && d.over_tab.is_none() && d.over.as_ref() == Some(&band.worktree)
-        });
+    let drop = app.card_drag.as_ref().is_some_and(|d| {
+        d.active && d.over_tab.is_none() && d.over.as_ref() == Some(&band.worktree)
+    });
     let edge = if lit || drop { th.accent } else { th.edge };
     let dash = |n: usize| Span::styled("─".repeat(n), Style::default().fg(edge));
 

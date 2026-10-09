@@ -2147,7 +2147,11 @@ fn move_plan(app: &App, id: &AgentId, worktree: &WorktreeId) -> Option<(String, 
         return None;
     }
     let target = app.tree.worktrees.iter().find(|w| &w.id == worktree)?;
-    let home = app.tree.worktrees.iter().find(|w| w.id == agent.worktree_id);
+    let home = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.id == agent.worktree_id);
     let dest = match app.tree.projects.iter().find(|p| p.id == target.project_id) {
         Some(p) if home.is_none_or(|h| h.project_id != p.id) => {
             format!("{} ▸ {}", p.name, target.branch)
