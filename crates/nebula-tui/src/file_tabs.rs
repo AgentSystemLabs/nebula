@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::{Position, Rect};
 
 use crate::app::{App, Overlay};
+use crate::graphics::{MermaidDiagram, VisualPreview};
 use crate::markdown::Rendered;
 use crate::syntax::{Highlighter, TokenKind};
 use crate::tree_browser::Preview;
@@ -67,6 +68,8 @@ pub struct FileTabsView {
     /// The page flowed for the last drawn width, written back during draw
     /// (see [`Rendered`]).
     pub rendered: Option<Rendered>,
+    pub visual: Option<VisualPreview>,
+    pub mermaid_diagrams: Vec<MermaidDiagram>,
     /// Top visible preview line.
     pub scroll: u16,
     /// Inner height of the preview, written back during draw so paging
@@ -120,6 +123,8 @@ impl FileTabsView {
             markdown: false,
             pretty: true,
             rendered: None,
+            visual: None,
+            mermaid_diagrams: Vec::new(),
             scroll: 0,
             view_height: 0,
             area: Rect::default(),
@@ -182,6 +187,8 @@ impl FileTabsView {
         self.preview_is_file = preview.is_file;
         self.markdown = preview.markdown;
         self.rendered = None;
+        self.visual = preview.visual;
+        self.mermaid_diagrams = preview.mermaid_diagrams;
         self.preview_line_count = preview.lines.len();
         self.preview_lines = preview.lines;
         self.preview_text = preview.text;
@@ -253,6 +260,8 @@ fn placeholder(text: &str) -> Preview {
         text: text.to_string(),
         is_file: false,
         markdown: false,
+        visual: None,
+        mermaid_diagrams: Vec::new(),
     }
 }
 

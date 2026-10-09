@@ -2,11 +2,10 @@
 //! every attached TUI as FILE TABS — one tab per file, previewed, editable —
 //! so when the user asks to see a file the agent puts it in front of them
 //! instead of pasting it into the reply. Only when asked: the guidance
-//! below forbids opening anything unprompted. And text only: the CLI
-//! refuses an image or any other binary, since a tab of a PNG's bytes shows
-//! nobody anything in a terminal. Like `nebula spawn`, nothing here touches
-//! the caller's process: the model runs it, says what it opened, and
-//! carries on.
+//! below forbids opening anything unprompted. The CLI accepts text files,
+//! local images and Mermaid diagrams, and refuses other binaries before
+//! IPC. Like `nebula spawn`, nothing here touches the caller's process:
+//! the model runs it, says what it opened, and carries on.
 
 use std::path::PathBuf;
 
@@ -23,16 +22,18 @@ use crate::registry::Daemon;
 /// `--append-system-prompt`): codex and cursor have no such flag.
 pub const CLAUDE_OPEN_GUIDANCE: &str =
     "[nebula] Only when the user explicitly asks you to open or \
-show a file in nebula (\"open it\", \"show me the file\", \"open these in nebula\") — and never on \
-your own initiative — run this shell command, exactly once per set of files:\n\n  nebula open \
+show a file, image, mockup or diagram in nebula (\"open it\", \"show me the file\", \"show the \
+diagram\", \"open these in nebula\") — and never on \
+your own initiative — save it to a local file when needed, then run this shell command, exactly \
+once per set of files:\n\n  nebula open \
 <file> [<file>…]\n\nwith paths relative to your working directory or absolute. A file you wrote or \
 changed, a report, options for the user to pick from: none of these is a reason to open anything \
-unasked — name the path in your reply and let the user ask. nebula is a terminal app and shows \
-text files only; it refuses images, PDFs and other binary files, so name those paths instead of \
-opening them. nebula shows the files to the user at once, inside this app, as a tabbed modal — one \
-tab per file, previewed, editable on Enter — so do not paste the files' contents into your reply \
-as well: say in one line what you opened and carry on. If the command fails, report the error and \
-name the paths instead.";
+unasked — name the path in your reply and let the user ask. For diagrams, write a `.mmd` file or a \
+```mermaid fenced block in Markdown; for mockups, write an image file (png, jpg, gif, webp, or svg). \
+nebula shows text, images and Mermaid diagrams to the user at once, inside this app, as a tabbed \
+modal — one tab per file, previewed, editable on Enter — so do not paste the files' contents into \
+your reply as well: say in one line what you opened and carry on. If the command fails, report the \
+error and name the paths instead.";
 
 impl Daemon {
     /// `nebula open`, run by the agent inside its own session: the caller
@@ -64,13 +65,14 @@ mod tests {
 
     /// The guidance is all that stands between an agent and an unasked-for
     /// modal, so its two rules are pinned: opening is for explicit asks
-    /// only, and for text files only.
+    /// only, and for previewable local files only.
     #[test]
-    fn the_open_guidance_is_explicit_ask_and_text_only() {
+    fn the_open_guidance_is_explicit_ask_and_previewable_files_only() {
         assert!(GUIDANCE.starts_with("[nebula] Only when the user explicitly asks"));
         assert!(GUIDANCE.contains("never on your own initiative"));
         assert!(GUIDANCE.contains("name the path in your reply and let the user ask"));
-        assert!(GUIDANCE.contains("text files only"));
+        assert!(GUIDANCE.contains("image, mockup or diagram"));
+        assert!(GUIDANCE.contains("```mermaid fenced block"));
         assert!(GUIDANCE.contains("nebula open <file> [<file>…]"));
         assert!(!GUIDANCE.contains("When you want the user to look at a file"));
     }

@@ -420,15 +420,14 @@ pub async fn open_files_for_current_agent(files: &[String]) -> Result<()> {
         if !path.is_file() {
             bail!("can't open {file}: not a file");
         }
-        // A terminal shows text: a tab of a PNG's bytes shows nobody
-        // anything, so the file is refused here — the model names the
-        // path in its reply instead — by git's NUL-in-the-head test.
-        let text = crate::tree_browser::is_text_file(&path)
+        // The preview pane can render text, local images and Mermaid
+        // diagrams. Other binaries are refused here, before IPC.
+        let openable = crate::tree_browser::is_openable_file(&path)
             .with_context(|| format!("can't open {file}: unreadable"))?;
-        if !text {
+        if !openable {
             bail!(
-                "can't open {file}: not a text file — nebula shows text only (no images, PDFs or \
-                 other binaries); name the path in your reply instead"
+                "can't open {file}: unsupported binary file — nebula opens text, images and \
+                 Mermaid diagrams; name this path in your reply instead"
             );
         }
         resolved.push(path);

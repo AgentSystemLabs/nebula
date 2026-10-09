@@ -187,8 +187,9 @@ pub(crate) enum Command {
     /// Show files to the user inside this nebula.
     ///
     /// Run from inside a nebula agent session; agents run it only when you
-    /// ask to see a file, never unprompted. Text files only: an image or any
-    /// other binary is refused, since a terminal has nothing to show for it.
+    /// ask to see a file, image, mockup or diagram, never unprompted.
+    /// Opens text, supported local images and Mermaid diagrams; other
+    /// binaries are refused.
     /// The files open in nebula's file tabs — a modal with one tab per file,
     /// the focused one previewed, Enter editing it — in every nebula
     /// attached to this daemon, and this session carries on untouched.
@@ -384,6 +385,7 @@ Examples:
 const OPEN_EXAMPLES: &str = "\
 Examples:
   nebula open README.md                one tab
+  nebula open mockup.png flow.mmd      image and diagram previews
   nebula open src/main.rs docs/keys.md a tab each, in this order";
 
 const BROWSER_EXAMPLES: &str = "\

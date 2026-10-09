@@ -18,7 +18,7 @@ nebula reload               move the daemon onto the installed binary, keeping e
 nebula rename <title>       title the session this runs inside          (agents run this)
 nebula worktree [name]      move this session into a worktree           (agents run this)
 nebula spawn <task>         start another agent session beside it       (agents run this)
-nebula open <file>…         show files in this nebula's file tabs       (agents run this)
+nebula open <file>…         show files/images/diagrams in file tabs     (agents run this)
 nebula config <cmd>         back up, restore or locate this machine's settings
 nebula browser              serve this TUI in a web browser via ttyd
 nebula ssh <host>           open nebula on a remote host over ssh
@@ -76,8 +76,9 @@ nebula spawn <task> [--kind <claude|codex|cursor|pi|muse|grok|opencode>] [--work
                           # branch already exists), and leaves this session where it is
 nebula open <file>…       # show the files in this nebula's FILE TABS — a modal with one tab per
                           # file, the focused one previewed, Enter editing it (agents run this only
-                          # when you ask to see a file; text files only — an image or any other
-                          # binary is refused, and the agent names the path instead)
+                          # when you ask to see a file, image, mockup or diagram; text files,
+                          # supported local images and Mermaid diagrams render inline, other
+                          # binaries are refused and the agent names the path instead)
 ```
 
 ## Settings

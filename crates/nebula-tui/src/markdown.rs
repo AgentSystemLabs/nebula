@@ -25,6 +25,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::graphics::{GraphicsMode, MermaidDiagram};
 use crate::syntax::Highlighter;
 use crate::theme::Theme;
 
@@ -71,13 +72,45 @@ pub fn render(
     base: Style,
     th: Theme,
 ) -> Vec<Line<'static>> {
+    render_inner(
+        text,
+        width,
+        breaks,
+        base,
+        th,
+        None,
+        GraphicsMode::Halfblocks,
+    )
+}
+
+pub fn render_with_diagrams(
+    text: &str,
+    width: usize,
+    breaks: Breaks,
+    base: Style,
+    th: Theme,
+    diagrams: &mut [MermaidDiagram],
+    mode: GraphicsMode,
+) -> Vec<Line<'static>> {
+    render_inner(text, width, breaks, base, th, Some(diagrams), mode)
+}
+
+fn render_inner(
+    text: &str,
+    width: usize,
+    breaks: Breaks,
+    base: Style,
+    th: Theme,
+    diagrams: Option<&mut [MermaidDiagram]>,
+    mode: GraphicsMode,
+) -> Vec<Line<'static>> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_GFM);
     opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
-    let mut r = Renderer::new(width, breaks, base, th);
+    let mut r = Renderer::new(width, breaks, base, th, diagrams, mode);
     for event in Parser::new_ext(text, opts) {
         r.event(event);
     }
@@ -108,6 +141,32 @@ impl Rendered {
             _ => Rendered {
                 width,
                 lines: render(text, width as usize, breaks, Style::default(), th),
+            },
+        }
+    }
+
+    pub fn for_width_with_diagrams(
+        cached: Option<Rendered>,
+        text: &str,
+        width: u16,
+        breaks: Breaks,
+        th: Theme,
+        diagrams: &mut [MermaidDiagram],
+        mode: GraphicsMode,
+    ) -> Rendered {
+        match cached {
+            Some(r) if r.width == width => r,
+            _ => Rendered {
+                width,
+                lines: render_with_diagrams(
+                    text,
+                    width as usize,
+                    breaks,
+                    Style::default(),
+                    th,
+                    diagrams,
+                    mode,
+                ),
             },
         }
     }
@@ -181,11 +240,13 @@ struct Table {
     head_rows: usize,
 }
 
-struct Renderer {
+struct Renderer<'a> {
     th: Theme,
     base: Style,
     breaks: Breaks,
     width: usize,
+    diagrams: Option<&'a mut [MermaidDiagram]>,
+    graphics_mode: GraphicsMode,
     out: Vec<Line<'static>>,
     /// Left gutter, innermost last.
     gutter: Vec<Gutter>,
@@ -216,13 +277,22 @@ struct Renderer {
     images: Vec<usize>,
 }
 
-impl Renderer {
-    fn new(width: usize, breaks: Breaks, base: Style, th: Theme) -> Self {
+impl<'a> Renderer<'a> {
+    fn new(
+        width: usize,
+        breaks: Breaks,
+        base: Style,
+        th: Theme,
+        diagrams: Option<&'a mut [MermaidDiagram]>,
+        graphics_mode: GraphicsMode,
+    ) -> Self {
         Self {
             th,
             base,
             breaks,
             width: width.max(1),
+            diagrams,
+            graphics_mode,
             out: Vec::new(),
             gutter: Vec::new(),
             marker: None,
@@ -442,6 +512,19 @@ impl Renderer {
     /// by the fence's language, broken at the edge rather than reflowed
     /// (code has no words to wrap on), never numbered.
     fn code_block(&mut self, lang: &str, text: &str) {
+        if lang
+            .split_whitespace()
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("mermaid"))
+        {
+            if let Some(lines) = self.mermaid_block(text) {
+                self.need_blank = true;
+                for line in lines {
+                    self.emit(line.spans);
+                }
+                return;
+            }
+        }
         let avail = self.avail();
         let inner = avail.saturating_sub(CODE_PAD.width()).max(1);
         let surface = Style::default().bg(self.th.sel_bg_dim);
@@ -477,6 +560,18 @@ impl Renderer {
                 self.emit(spans);
             }
         }
+    }
+
+    fn mermaid_block(&mut self, text: &str) -> Option<Vec<Line<'static>>> {
+        let width = self.avail().min(u16::MAX as usize) as u16;
+        let diagrams = self.diagrams.as_deref_mut()?;
+        crate::graphics::markdown_diagram_lines(
+            text.trim_end(),
+            diagrams,
+            width,
+            self.graphics_mode.clone(),
+            self.th,
+        )
     }
 
     /// Raw HTML or front matter: as written, dim, each source line its
@@ -1460,6 +1555,43 @@ mod tests {
             80,
         );
         assert_eq!(plain(&out), ["[b] [c] docs (https://d.example)"]);
+    }
+
+    #[test]
+    fn mermaid_fences_use_pre_rendered_diagram_fallbacks_when_provided() {
+        let source = "flowchart LR\nA-->B";
+        let mut diagrams = vec![MermaidDiagram {
+            source: source.to_string(),
+            visual: crate::graphics::VisualPreview {
+                title: "Mermaid diagram".into(),
+                raster: None,
+                message: Some("install mmdc".into()),
+                source: Some(source.to_string()),
+                rendered: None,
+            },
+        }];
+        let out = render_with_diagrams(
+            "before\n\n```mermaid\nflowchart LR\nA-->B\n```\n\nafter",
+            80,
+            Breaks::Reflow,
+            Style::default(),
+            th(),
+            &mut diagrams,
+            GraphicsMode::Halfblocks,
+        );
+        assert_eq!(
+            plain(&out),
+            [
+                "before",
+                "",
+                "install mmdc",
+                "",
+                "flowchart LR",
+                "A-->B",
+                "",
+                "after"
+            ]
+        );
     }
 
     #[test]

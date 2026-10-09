@@ -5,6 +5,7 @@
 use crate::app::{clamp_files_width, max_scroll, scrolled_by, DEFAULT_DIFF_FILES_W};
 use crate::filter_list::{FilterList, FilterMatch};
 use crate::git_diff::cap_lines;
+use crate::graphics::{MermaidDiagram, VisualPreview};
 use crate::markdown::{self, Rendered};
 use crate::syntax::{Highlighter, TokenKind};
 use ratatui::layout::Rect;
@@ -43,6 +44,8 @@ pub struct Preview {
     /// directory listing or a placeholder message.
     pub is_file: bool,
     pub markdown: bool,
+    pub visual: Option<VisualPreview>,
+    pub mermaid_diagrams: Vec<MermaidDiagram>,
 }
 
 impl Preview {
@@ -54,6 +57,8 @@ impl Preview {
             text,
             is_file: false,
             markdown: false,
+            visual: None,
+            mermaid_diagrams: Vec::new(),
         }
     }
 }
@@ -67,19 +72,49 @@ pub(crate) fn file_preview(
     path: &str,
     cancel: Option<&crate::view_jobs::Cancel>,
 ) -> Option<Preview> {
-    let text = match read_preview(&root.join(path)) {
+    let full_path = root.join(path);
+    if crate::graphics::is_image_path(&full_path) {
+        return Some(Preview {
+            text: String::new(),
+            lines: Vec::new(),
+            is_file: true,
+            markdown: false,
+            visual: Some(VisualPreview::image(&full_path)),
+            mermaid_diagrams: Vec::new(),
+        });
+    }
+    let text = match read_preview(&full_path) {
         Ok(text) => text,
         Err(message) => return Some(Preview::plain(message)),
     };
     if cancel.is_some_and(|c| c.is_cancelled()) {
         return None;
     }
+    if crate::graphics::is_mermaid_path(&full_path) {
+        let mut hl = Highlighter::for_lang("mermaid");
+        return Some(Preview {
+            lines: text.lines().map(|l| hl.line(l)).collect(),
+            text: text.clone(),
+            is_file: true,
+            markdown: false,
+            visual: Some(VisualPreview::mermaid(text)),
+            mermaid_diagrams: Vec::new(),
+        });
+    }
     let mut hl = Highlighter::for_path(path);
+    let markdown = markdown::is_markdown_path(path);
+    let mermaid_diagrams = if markdown {
+        crate::graphics::render_mermaid_blocks(&text)
+    } else {
+        Vec::new()
+    };
     Some(Preview {
         lines: text.lines().map(|l| hl.line(l)).collect(),
         text,
         is_file: true,
-        markdown: markdown::is_markdown_path(path),
+        markdown,
+        visual: None,
+        mermaid_diagrams,
     })
 }
 
@@ -135,6 +170,8 @@ pub struct TreeBrowser {
     /// The page flowed for the last drawn width, written back during draw
     /// (see [`Rendered`]).
     pub rendered: Option<Rendered>,
+    pub visual: Option<VisualPreview>,
+    pub mermaid_diagrams: Vec<MermaidDiagram>,
     /// Top visible preview line.
     pub scroll: u16,
     /// Inner height of the preview pane, written back during draw (the
@@ -221,6 +258,8 @@ impl TreeBrowser {
             markdown: false,
             pretty: true,
             rendered: None,
+            visual: None,
+            mermaid_diagrams: Vec::new(),
             scroll: 0,
             view_height: 0,
             preview_area: Rect::default(),
@@ -445,6 +484,8 @@ impl TreeBrowser {
         self.preview_is_file = preview.is_file;
         self.markdown = preview.markdown;
         self.rendered = None;
+        self.visual = preview.visual;
+        self.mermaid_diagrams = preview.mermaid_diagrams;
         self.preview_line_count = preview.lines.len();
         self.preview_lines = preview.lines;
         self.preview = preview.text;
@@ -502,6 +543,15 @@ pub(crate) fn is_text_file(path: &std::path::Path) -> std::io::Result<bool> {
         .take(BINARY_SNIFF_BYTES as u64)
         .read_to_end(&mut head)?;
     Ok(!looks_binary(&head))
+}
+
+/// `nebula open` accepts ordinary text plus visual files the preview pane
+/// knows how to render. Other binaries are still refused before IPC.
+pub(crate) fn is_openable_file(path: &std::path::Path) -> std::io::Result<bool> {
+    if crate::graphics::is_image_path(path) || crate::graphics::is_mermaid_path(path) {
+        return Ok(true);
+    }
+    is_text_file(path)
 }
 
 /// File contents for a preview pane (this browser's, or the FILE TABS'),
@@ -876,6 +926,36 @@ mod tests {
     }
 
     #[test]
+    fn image_files_preview_as_visuals_instead_of_binary_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, tiny_png()).unwrap();
+        let b = TreeBrowser::new(
+            dir.path().to_path_buf(),
+            "main".into(),
+            "vim".into(),
+            vec!["shot.png".into()],
+        );
+        assert!(b.preview.is_empty());
+        assert!(b.visual.is_some(), "the image carries a visual preview");
+        assert!(b.preview_is_file);
+    }
+
+    #[test]
+    fn mermaid_files_keep_source_and_carry_a_visual_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("flow.mmd"), "flowchart LR\nA-->B\n").unwrap();
+        let b = TreeBrowser::new(
+            dir.path().to_path_buf(),
+            "main".into(),
+            "vim".into(),
+            vec!["flow.mmd".into()],
+        );
+        assert_eq!(b.preview, "flowchart LR\nA-->B");
+        assert!(b.visual.is_some(), "the .mmd tab can render as a diagram");
+    }
+
+    #[test]
     fn binary_files_show_a_placeholder() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("blob.bin"), b"\x00\x01\x02").unwrap();
@@ -888,9 +968,9 @@ mod tests {
         assert_eq!(b.preview, "(binary file)");
     }
 
-    /// The test `nebula open` refuses a file on, shared with the preview:
-    /// git's NUL in the first 8 KiB. A PNG's header has one; text, however
-    /// odd its characters, has none; an empty file is not binary.
+    /// The legacy text test is git's NUL in the first 8 KiB. A PNG's
+    /// header has one; text, however odd its characters, has none; an
+    /// empty file is not binary.
     #[test]
     fn is_text_file_is_gits_nul_test() {
         let dir = tempfile::tempdir().unwrap();
@@ -906,5 +986,27 @@ mod tests {
         assert!(is_text_file(&dir.path().join("missing")).is_err());
         assert!(!looks_binary(b"plain"));
         assert!(looks_binary(b"a\0b"));
+    }
+
+    #[test]
+    fn openable_files_include_images_and_mermaid_diagrams() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        let diagram = dir.path().join("flow.mmd");
+        std::fs::write(&diagram, "flowchart LR\nA-->B\n").unwrap();
+        let bin = dir.path().join("blob.bin");
+        std::fs::write(&bin, b"a\0b").unwrap();
+        assert!(is_openable_file(&png).unwrap());
+        assert!(is_openable_file(&diagram).unwrap());
+        assert!(!is_openable_file(&bin).unwrap());
+    }
+
+    fn tiny_png() -> &'static [u8] {
+        &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 15, 4,
+            0, 9, 251, 3, 253, 167, 137, 129, 129, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ]
     }
 }

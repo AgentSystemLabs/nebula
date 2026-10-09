@@ -2203,36 +2203,53 @@ fn draw_file_tabs_overlay(f: &mut Frame, app: &mut App, mut view: crate::file_ta
         height: inner.height.saturating_sub(3),
     };
     let editing = app.pane.vim.as_ref().is_some_and(|v| v.embedded);
+    let graphics_mode = crate::config::Config::load().graphics_mode();
+    let visual_lines = (!editing)
+        .then(|| {
+            view.visual
+                .as_mut()
+                .map(|visual| visual.render(body, graphics_mode.clone(), th))
+        })
+        .flatten();
     // A markdown tab shows the rendered page — flowed for this
     // width, kept on the view between draws — unless `m` asked
     // for the source. No gutter: rendered rows aren't source lines.
-    let rendered = (view.renders_markdown() && !editing).then(|| {
-        crate::markdown::Rendered::for_width(
+    let rendered = (view.renders_markdown() && !editing && visual_lines.is_none()).then(|| {
+        crate::markdown::Rendered::for_width_with_diagrams(
             view.rendered.take(),
             &view.preview_text,
             body.width,
             crate::markdown::Breaks::Reflow,
             th,
+            &mut view.mermaid_diagrams,
+            graphics_mode.clone(),
         )
     });
-    let line_count = match &rendered {
-        Some(r) => r.lines.len(),
-        None => view.preview_lines.len(),
+    let line_count = match (&visual_lines, &rendered) {
+        (Some(lines), _) => lines.len(),
+        (None, Some(r)) => r.lines.len(),
+        (None, None) => view.preview_lines.len(),
     };
     let max_scroll = line_count
         .saturating_sub(body.height as usize)
         .min(u16::MAX as usize) as u16;
     let scroll = view.scroll.min(max_scroll);
     if !editing && body.height > 0 {
-        let lines = match &rendered {
-            Some(r) => r
+        let lines = match (&visual_lines, &rendered) {
+            (Some(lines), _) => lines
+                .iter()
+                .skip(scroll as usize)
+                .take(body.height as usize)
+                .cloned()
+                .collect(),
+            (None, Some(r)) => r
                 .lines
                 .iter()
                 .skip(scroll as usize)
                 .take(body.height as usize)
                 .cloned()
                 .collect(),
-            None => preview_window(
+            (None, None) => preview_window(
                 &view.preview_lines,
                 line_count,
                 view.preview_is_file,
@@ -2272,6 +2289,8 @@ fn draw_file_tabs_overlay(f: &mut Frame, app: &mut App, mut view: crate::file_ta
         if rendered.is_some() {
             v.rendered = rendered;
         }
+        v.visual = view.visual;
+        v.mermaid_diagrams = view.mermaid_diagrams;
     }
 }
 
@@ -2366,21 +2385,32 @@ fn draw_tree_overlay(f: &mut Frame, app: &mut App, mut view: crate::tree_browser
     };
     let mut block = panel_block(&title, true, th);
     let preview_inner = block.inner(preview_a);
+    let graphics_mode = crate::config::Config::load().graphics_mode();
+    let visual_lines = (!editing)
+        .then(|| {
+            view.visual
+                .as_mut()
+                .map(|visual| visual.render(preview_inner, graphics_mode.clone(), th))
+        })
+        .flatten();
     // A markdown file shows the rendered page (the FILE TABS'
     // rule), flowed for this width and kept between draws, unless
     // Ctrl+r asked for the source.
-    let rendered = (view.renders_markdown() && !editing).then(|| {
-        crate::markdown::Rendered::for_width(
+    let rendered = (view.renders_markdown() && !editing && visual_lines.is_none()).then(|| {
+        crate::markdown::Rendered::for_width_with_diagrams(
             view.rendered.take(),
             &view.preview,
             preview_inner.width,
             crate::markdown::Breaks::Reflow,
             th,
+            &mut view.mermaid_diagrams,
+            graphics_mode.clone(),
         )
     });
-    let line_count = match &rendered {
-        Some(r) => r.lines.len(),
-        None => view.preview_lines.len(),
+    let line_count = match (&visual_lines, &rendered) {
+        (Some(lines), _) => lines.len(),
+        (None, Some(r)) => r.lines.len(),
+        (None, None) => view.preview_lines.len(),
     };
     let max_scroll =
         (line_count.min(u16::MAX as usize) as u16).saturating_sub(preview_inner.height.max(1));
@@ -2401,15 +2431,21 @@ fn draw_tree_overlay(f: &mut Frame, app: &mut App, mut view: crate::tree_browser
         // number, and a rendered page's rows aren't source lines.
         // Dropped entirely when the pane is too narrow to leave
         // room for the code itself.
-        let lines = match &rendered {
-            Some(r) => r
+        let lines = match (&visual_lines, &rendered) {
+            (Some(lines), _) => lines
+                .iter()
+                .skip(scroll as usize)
+                .take(preview_inner.height as usize)
+                .cloned()
+                .collect(),
+            (None, Some(r)) => r
                 .lines
                 .iter()
                 .skip(scroll as usize)
                 .take(preview_inner.height as usize)
                 .cloned()
                 .collect(),
-            None => preview_window(
+            (None, None) => preview_window(
                 &view.preview_lines,
                 line_count,
                 view.preview_is_file,
@@ -2431,6 +2467,8 @@ fn draw_tree_overlay(f: &mut Frame, app: &mut App, mut view: crate::tree_browser
         if rendered.is_some() {
             v.rendered = rendered;
         }
+        v.visual = view.visual;
+        v.mermaid_diagrams = view.mermaid_diagrams;
         v.list.list_area = list_inner;
         v.list.sync_scroll(list_inner.height as usize);
         v.preview_area = preview_inner;
