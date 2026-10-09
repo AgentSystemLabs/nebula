@@ -107,6 +107,9 @@ pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut V
             | HitTarget::LauncherThreadPr(_),
         ) => app.nav.focus = Focus::Sessions,
         Some(HitTarget::PanelBg(focus)) => app.nav.focus = focus,
+        Some(HitTarget::ProjectRow(_)) => app.nav.focus = Focus::Projects,
+        Some(HitTarget::WorktreeRow(_)) => app.nav.focus = Focus::Worktrees,
+        Some(HitTarget::SessionRow(_)) => app.nav.focus = Focus::Sessions,
         Some(HitTarget::TerminalPane | HitTarget::CloudSessionLink) => {
             enter_terminal_pane(app, out)
         }

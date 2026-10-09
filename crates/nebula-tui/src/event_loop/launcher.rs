@@ -11472,6 +11472,29 @@ mod tests {
         });
     }
 
+    #[test]
+    fn the_worktree_layout_setting_turns_the_columns_layout_on_and_off() {
+        with_config_json(r#"{"worktree_layout": "columns"}"#, || {
+            let mut app = two_sessions();
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(app.launcher.launcher_columns);
+            assert!(!app.launcher.launcher_list);
+            assert!(!app.launcher.launcher_nested);
+        });
+        with_config_json(r#"{"worktree_layout": "nested"}"#, || {
+            let mut app = two_sessions();
+            app.launcher.launcher_columns = true;
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(app.launcher.launcher_nested && !app.launcher.launcher_columns);
+        });
+        with_default_config(|| {
+            let mut app = two_sessions();
+            app.launcher.launcher_columns = true;
+            super::super::apply_config(&mut app, &crate::config::Config::load());
+            assert!(!app.launcher.launcher_columns, "the cards out of the box");
+        });
+    }
+
     /// One thread per worktree, every row one line: the earliest session
     /// is the root, later prompts and terminals are children under it, and
     /// the next thread starts on the very next row. No header, no border,

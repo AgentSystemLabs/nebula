@@ -178,9 +178,10 @@ pub(crate) fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec
                 ..
             })
         );
-    let launcher_before = (pressed && app.launcher_grid() && !app.pane.term_locked)
-        .then(|| launcher::cursor_entry(app))
-        .flatten();
+    let launcher_before =
+        (pressed && app.launcher_grid() && !app.launcher.launcher_columns && !app.pane.term_locked)
+            .then(|| launcher::cursor_entry(app))
+            .flatten();
     dispatch_input(app, event, out);
     if let Some(before) = launcher_before {
         launcher::keep_cursor(app, before, out);

@@ -414,6 +414,12 @@ pub(crate) fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.launcher.launcher_pane_at = cfg.pane_side();
     app.launcher.launcher_list = cfg.list_layout();
     app.launcher.launcher_nested = cfg.nested_layout();
+    app.launcher.launcher_columns = cfg.columns_layout();
+    app.launcher.columns_hide_projects = cfg.hide_projects;
+    app.launcher.columns_hide_worktrees = cfg.hide_worktrees;
+    app.launcher.columns_hide_sessions = cfg.hide_sessions;
+    app.launcher.columns_recent_prompts = cfg.recent_prompts;
+    app.launcher.columns_recent_prompts_count = cfg.recent_prompts_count;
     app.launcher.launcher_all_open = cfg.expand_all_worktrees;
     set_hide_draft_prs(app, cfg.hide_draft_prs);
 }

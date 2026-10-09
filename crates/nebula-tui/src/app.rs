@@ -69,6 +69,9 @@ pub enum Focus {
 pub enum HitTarget {
     /// The GRID's background (registered after the cards, so they win).
     PanelBg(Focus),
+    ProjectRow(usize),
+    WorktreeRow(usize),
+    SessionRow(usize),
     TerminalPane,
     /// The session URL on the CLOUD SESSION PANEL; a click opens it in the
     /// browser. Registered ahead of the pane it sits on, so it wins.
@@ -3412,6 +3415,18 @@ pub struct LauncherState {
     /// [`App::launcher_list`]. What a frame lays out is
     /// [`App::panel_layout`].
     pub launcher_nested: bool,
+    /// The launcher is the three-column layout: projects, worktrees and
+    /// sessions side by side, backed by the same panel row models and
+    /// terminal pane as the card grid.
+    pub launcher_columns: bool,
+    pub columns_hide_projects: bool,
+    pub columns_hide_worktrees: bool,
+    pub columns_hide_sessions: bool,
+    pub columns_recent_prompts: bool,
+    pub columns_recent_prompts_count: usize,
+    pub columns_projects_scroll: u16,
+    pub columns_worktrees_scroll: u16,
+    pub columns_sessions_scroll: u16,
     /// The worktrees the NESTED layout has folded to their root row
     /// (`h` / `Tab`, `event_loop::launcher::toggle_band_expand`). A thread
     /// starts collapsed unless it holds the selection or the user has
@@ -4061,7 +4076,7 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
-        Self {
+        let mut app = Self {
             tree: Tree::default(),
             nav: NavigationState::default(),
             modals: ModalState::default(),
@@ -4071,7 +4086,9 @@ impl App {
             requests: RequestState::default(),
             jobs: JobState::default(),
             github: GithubState::default(),
-        }
+        };
+        app.launcher.columns_recent_prompts_count = 3;
+        app
     }
 
     /// Remembered cursor row for a settings tab, clamped to what that tab
@@ -5704,11 +5721,21 @@ impl App {
         project_unseen(&self.tree, project_id)
     }
 
-    /// The two places FOCUS can rest: the LAUNCHER VIEW's GRID of cards
-    /// and the PANE under them. The three columns the other variants name
-    /// are no longer drawn.
+    /// The places FOCUS can rest in the active launcher layout.
     pub fn focus_visible(&self, focus: Focus) -> bool {
-        matches!(focus, Focus::Sessions | Focus::Terminal)
+        if self.launcher.launcher_columns && self.launcher_grid() {
+            let all_hidden = self.launcher.columns_hide_projects
+                && self.launcher.columns_hide_worktrees
+                && self.launcher.columns_hide_sessions;
+            match focus {
+                Focus::Projects => !self.launcher.columns_hide_projects,
+                Focus::Worktrees => !self.launcher.columns_hide_worktrees,
+                Focus::Sessions => all_hidden || !self.launcher.columns_hide_sessions,
+                Focus::Terminal => true,
+            }
+        } else {
+            matches!(focus, Focus::Sessions | Focus::Terminal)
+        }
     }
 
     fn focus_rank(focus: Focus) -> u8 {

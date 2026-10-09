@@ -1,0 +1,45 @@
+# Same launches as nested-layout; the setup switches the final view to columns.
+p
+C-t
+rate
+Enter
+F12
+Review the rate limit pull request and merge it once the checks pass
+Enter
+F12
+p
+C-t
+auth
+Enter
+F12
+Do one last review to check for major security issues, fix anything you find and push it
+Enter
+F12
+p
+C-t
+main
+Enter
+F12
+Add a label of screenshots requested to any pr that seems to be missing its screenshots
+Enter
+F12
+t
+C-q
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12

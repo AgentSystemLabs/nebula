@@ -801,6 +801,13 @@ fn handle_left_click_target(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clie
         // Never in the hit map: the ISSUES and PULL REQUESTS MODALS route
         // the click on their button themselves, before this is reached.
         Some(HitTarget::ModalBrowser) => {}
+        Some(
+            target @ (HitTarget::ProjectRow(_)
+            | HitTarget::WorktreeRow(_)
+            | HitTarget::SessionRow(_)),
+        ) => {
+            select_clicked_row(app, &target, out);
+        }
         Some(HitTarget::PanelBg(focus)) => {
             // The LAUNCHER VIEW's GRID lies on the same
             // background, and a click on the air between its
@@ -929,6 +936,24 @@ fn handle_left_release(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientReq
 fn handle_wheel(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) {
     let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
     let over = app.hit_at(mouse.column, mouse.row);
+    if app.launcher_grid() && app.launcher.launcher_columns {
+        let column = match over {
+            Some(HitTarget::ProjectRow(_) | HitTarget::PanelBg(Focus::Projects)) => {
+                Some(Focus::Projects)
+            }
+            Some(HitTarget::WorktreeRow(_) | HitTarget::PanelBg(Focus::Worktrees)) => {
+                Some(Focus::Worktrees)
+            }
+            Some(HitTarget::SessionRow(_) | HitTarget::PanelBg(Focus::Sessions)) => {
+                Some(Focus::Sessions)
+            }
+            _ => None,
+        };
+        if let Some(focus) = column {
+            scroll_columns(app, focus, up);
+            return;
+        }
+    }
     // The LAUNCHER VIEW's grid: a notch over the cards scrolls them
     // under a cursor that stays put (`launcher::wheel_grid`). A
     // notch used to walk the cursor, and walking it swaps the pane
@@ -1020,6 +1045,35 @@ fn handle_wheel(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             app.chrome.dirty = true;
         }
+    }
+}
+
+fn scroll_columns(app: &mut App, focus: Focus, up: bool) {
+    const STEP: u16 = 3;
+    let (len, scroll) = match focus {
+        Focus::Projects => (
+            app.project_rows().len(),
+            &mut app.launcher.columns_projects_scroll,
+        ),
+        Focus::Worktrees => (
+            app.worktree_rows().len(),
+            &mut app.launcher.columns_worktrees_scroll,
+        ),
+        Focus::Sessions => (
+            app.visible_session_rows().len(),
+            &mut app.launcher.columns_sessions_scroll,
+        ),
+        Focus::Terminal => return,
+    };
+    let max = len.saturating_sub(1) as u16;
+    let next = if up {
+        scroll.saturating_sub(STEP)
+    } else {
+        scroll.saturating_add(STEP).min(max)
+    };
+    if *scroll != next {
+        *scroll = next;
+        app.chrome.dirty = true;
     }
 }
 
