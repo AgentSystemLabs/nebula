@@ -561,6 +561,98 @@ pub fn diff_slow(view: &mut DiffView, ticket: u64) {
     }
 }
 
+/// One row of a diff laid out side by side: the old file left, the new
+/// one right.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SplitRow {
+    /// A hunk header, or a line about the file (a rename, a mode change),
+    /// across both sides.
+    Note(String, DiffLineKind),
+    /// A line of each side, numbered; `None` is a side with nothing facing
+    /// it (pure add or remove).
+    Pair {
+        left: Option<(u32, String)>,
+        right: Option<(u32, String)>,
+        changed: bool,
+    },
+}
+
+/// Turn a unified diff into rows that can be drawn old-left/new-right.
+/// Removed lines are held until the following additions arrive, so a
+/// replacement reads across one row. The `diff --git` / `index` / `---` /
+/// `+++` headers say nothing the pane's title does not, and are dropped.
+/// `None` for text with no hunk in it (a summary, status, or error), which
+/// is shown as it is.
+pub fn split_rows(diff: &str) -> Option<Vec<SplitRow>> {
+    if !diff.lines().any(|l| l.starts_with("@@")) {
+        return None;
+    }
+    let mut rows = Vec::new();
+    let (mut old, mut new) = (0u32, 0u32);
+    let mut removed: Vec<(u32, String)> = Vec::new();
+    let mut added: Vec<(u32, String)> = Vec::new();
+    let flush = |rows: &mut Vec<SplitRow>, removed: &mut Vec<_>, added: &mut Vec<_>| {
+        let n = removed.len().max(added.len());
+        let mut left = removed.drain(..);
+        let mut right = added.drain(..);
+        for _ in 0..n {
+            rows.push(SplitRow::Pair {
+                left: left.next(),
+                right: right.next(),
+                changed: true,
+            });
+        }
+    };
+    let mut in_hunk = false;
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            flush(&mut rows, &mut removed, &mut added);
+            let mut starts = line.split_whitespace().skip(1).take(2).map(|part| {
+                part.trim_start_matches(['-', '+'])
+                    .split_once(',')
+                    .map(|(n, _)| n)
+                    .unwrap_or(part)
+                    .parse::<u32>()
+                    .unwrap_or(1)
+            });
+            old = starts.next().unwrap_or(1);
+            new = starts.next().unwrap_or(1);
+            rows.push(SplitRow::Note(line.to_string(), DiffLineKind::Hunk));
+            in_hunk = true;
+        } else if line.starts_with("diff --git") {
+            flush(&mut rows, &mut removed, &mut added);
+            in_hunk = false;
+        } else if !in_hunk {
+            const DROPPED: [&str; 3] = ["index ", "--- ", "+++ "];
+            if !DROPPED.iter().any(|d| line.starts_with(d)) {
+                rows.push(SplitRow::Note(line.to_string(), DiffLineKind::Header));
+            }
+        } else if let Some(text) = line.strip_prefix('-') {
+            removed.push((old, text.to_string()));
+            old += 1;
+        } else if let Some(text) = line.strip_prefix('+') {
+            added.push((new, text.to_string()));
+            new += 1;
+        } else if line.starts_with('\\') {
+            // `\ No newline at end of file`
+            flush(&mut rows, &mut removed, &mut added);
+            rows.push(SplitRow::Note(line.to_string(), DiffLineKind::Header));
+        } else {
+            flush(&mut rows, &mut removed, &mut added);
+            let text = line.strip_prefix(' ').unwrap_or(line).to_string();
+            rows.push(SplitRow::Pair {
+                left: Some((old, text.clone())),
+                right: Some((new, text)),
+                changed: false,
+            });
+            old += 1;
+            new += 1;
+        }
+    }
+    flush(&mut rows, &mut removed, &mut added);
+    Some(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +844,36 @@ mod tests {
             DiffLineKind::Header
         );
         assert_eq!(classify_diff_line(" context"), DiffLineKind::Context);
+    }
+
+    #[test]
+    fn split_rows_pairs_removals_with_the_additions_after_them() {
+        let diff = "diff --git a/x b/x\nold mode 100644\nnew mode 100755\nindex 1..2\n--- a/x\n+++ b/x\n\
+                    @@ -10,4 +10,5 @@ fn f\n keep\n-gone one\n-gone two\n+new one\n+new two\n+new three\n tail\n";
+        let rows = split_rows(diff).unwrap();
+        let pair = |l: Option<(u32, &str)>, r: Option<(u32, &str)>, changed| SplitRow::Pair {
+            left: l.map(|(n, t)| (n, t.to_string())),
+            right: r.map(|(n, t)| (n, t.to_string())),
+            changed,
+        };
+        assert_eq!(
+            rows,
+            vec![
+                SplitRow::Note("old mode 100644".into(), DiffLineKind::Header),
+                SplitRow::Note("new mode 100755".into(), DiffLineKind::Header),
+                SplitRow::Note("@@ -10,4 +10,5 @@ fn f".into(), DiffLineKind::Hunk),
+                pair(Some((10, "keep")), Some((10, "keep")), false),
+                pair(Some((11, "gone one")), Some((11, "new one")), true),
+                pair(Some((12, "gone two")), Some((12, "new two")), true),
+                pair(None, Some((13, "new three")), true),
+                pair(Some((13, "tail")), Some((14, "tail")), false),
+            ]
+        );
+        assert_eq!(
+            split_rows("commit abc\n\n    subject"),
+            None,
+            "no hunk: shown as it is"
+        );
     }
 
     fn git(repo: &PathBuf, args: &[&str]) {

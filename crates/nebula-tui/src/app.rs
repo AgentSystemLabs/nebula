@@ -1149,6 +1149,13 @@ pub struct DiffView {
     /// the tree's — `selected` and `matches` stay current underneath, so
     /// toggling back lands on a list that is already right.
     pub tree: Option<crate::diff_tree::DiffTree>,
+    /// Diffs side by side (`Ctrl+s` flips it), remembered across opens.
+    /// A narrow pane falls back to the unified diff.
+    pub split: bool,
+    /// `diff` laid out side by side, while `split` is on and it has hunks.
+    pub split_rows: Option<std::sync::Arc<[crate::git_diff::SplitRow]>>,
+    /// The last draw showed the diff side by side, written back by it.
+    pub split_shown: bool,
 }
 
 /// The most diff text a DIFF VIEWER keeps beyond the one on screen. Two
@@ -1157,6 +1164,9 @@ pub struct DiffView {
 /// cheaper than holding it.
 pub const DIFF_CACHE_BYTES: usize = 2 * 1024 * 1024;
 pub const DIFF_CACHE_ENTRY_MAX: usize = 512 * 1024;
+/// Narrower diff panes show the unified diff: two numbered sides below
+/// this width are too clipped to read.
+pub const MIN_SPLIT_W: u16 = 90;
 
 impl DiffView {
     /// A view up before its file list is: `g` opens this at once and
@@ -1201,8 +1211,33 @@ impl DiffView {
         self.diff_line_count = diff.lines().count();
         self.diff = diff;
         self.shown = path.map(str::to_string);
+        self.refresh_split();
         if !keep_scroll {
             self.scroll = 0;
+        }
+    }
+
+    /// Lay `diff` out side by side again, if `split` wants it.
+    fn refresh_split(&mut self) {
+        self.split_rows = if self.split {
+            crate::git_diff::split_rows(&self.diff).map(Into::into)
+        } else {
+            None
+        };
+    }
+
+    /// `Ctrl+s`: side by side, or unified.
+    pub fn toggle_split(&mut self) {
+        self.split = !self.split;
+        self.refresh_split();
+    }
+
+    /// The rows the diff pane scrolls over, in the layout the last draw
+    /// used.
+    pub fn shown_rows(&self) -> usize {
+        match &self.split_rows {
+            Some(rows) if self.split_shown => rows.len(),
+            _ => self.diff_line_count,
         }
     }
 
@@ -1234,13 +1269,16 @@ impl DiffView {
             shown: None,
             cache: Vec::new(),
             tree: None,
+            split: true,
+            split_rows: None,
+            split_shown: false,
         };
         view.apply_filter();
         view
     }
 
     pub fn max_scroll(&self) -> u16 {
-        max_scroll(self.diff_line_count, self.view_height)
+        max_scroll(self.shown_rows(), self.view_height)
     }
 
     /// Screen x of the files/diff boundary — the column where the diff panel
@@ -2900,6 +2938,10 @@ pub struct UiState {
     /// in older blobs, which keep the flat list.
     #[serde(default)]
     pub diff_tree: bool,
+    /// False means the diff modal opens side by side; absent in older blobs,
+    /// so they keep the new default.
+    #[serde(default)]
+    pub diff_unified: bool,
     /// Height the LAUNCHER VIEW's pane was dragged to; absent in older
     /// blobs, and None in ones written before the edge was ever dragged,
     /// both of which open the pane on its default share.
@@ -3739,6 +3781,9 @@ pub struct ModalState {
     /// The diff modal lists its files as a directory tree (`Ctrl+t` inside
     /// it), remembered across opens and launches like the width.
     pub diff_tree: bool,
+    /// The diff modal shows diffs side by side (`Ctrl+s` inside it),
+    /// remembered the same way.
+    pub diff_split: bool,
     /// Selected tab of the settings modal, remembered across opens.
     pub settings_tab: usize,
     /// Cursor row of the settings modal, one per tab, remembered across
@@ -3780,6 +3825,7 @@ impl Default for ModalState {
             follow_up: None,
             diff_files_width: DEFAULT_DIFF_FILES_W,
             diff_tree: false,
+            diff_split: true,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
             settings_on_tabs: true,

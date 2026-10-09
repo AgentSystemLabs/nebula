@@ -1227,38 +1227,40 @@ fn draw_diff_overlay(f: &mut Frame, app: &mut App, view: crate::app::DiffView) {
         Style::default().fg(th.dim),
     )));
     let diff_inner = block.inner(diff_a);
-    let max_scroll = (view.diff_line_count as u16).saturating_sub(diff_inner.height.max(1));
+    // Side by side when it fits; a narrow pane reads the unified diff
+    // instead.
+    let split = view
+        .split_rows
+        .as_deref()
+        .filter(|_| diff_inner.width >= crate::app::MIN_SPLIT_W);
+    let total = split.map_or(view.diff_line_count, <[_]>::len);
+    let max_scroll = (total as u16).saturating_sub(diff_inner.height.max(1));
     let scroll = view.scroll.min(max_scroll);
     if max_scroll > 0 {
         block = block.title_bottom(
             Line::from(Span::styled(
-                format!(" {}/{} ", scroll + 1, view.diff_line_count),
+                format!(" {}/{} ", scroll + 1, total),
                 Style::default().fg(th.dim),
             ))
             .right_aligned(),
         );
     }
     f.render_widget(block, diff_a);
-    // Only the rows in view are styled: a diff runs to 20 000
-    // lines, and building a `Line` for each of them on every frame
-    // was most of what scrolling a large one cost.
-    let lines: Vec<Line> = view
-        .diff
-        .lines()
-        .skip(scroll as usize)
-        .take(diff_inner.height as usize)
-        .map(|l| {
-            let style = match classify_diff_line(l) {
-                DiffLineKind::Add => Style::default().fg(th.ok),
-                DiffLineKind::Remove => Style::default().fg(th.err),
-                DiffLineKind::Hunk => Style::default().fg(th.accent),
-                DiffLineKind::Header => Style::default().fg(th.dim),
-                DiffLineKind::Context => Style::default(),
-            };
-            Line::from(Span::styled(l.to_string(), style))
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines), diff_inner);
+    if let Some(rows) = split {
+        draw_split_diff(f, rows, scroll, diff_inner, th);
+    } else {
+        // Only the rows in view are styled: a diff runs to 20 000
+        // lines, and building a `Line` for each of them on every frame
+        // was most of what scrolling a large one cost.
+        let lines: Vec<Line> = view
+            .diff
+            .lines()
+            .skip(scroll as usize)
+            .take(diff_inner.height as usize)
+            .map(|l| Line::from(Span::styled(l.to_string(), diff_line_style(l, th))))
+            .collect();
+        f.render_widget(Paragraph::new(lines), diff_inner);
+    }
 
     // Write-back (draw works on a clone): page size for key paging,
     // scroll re-clamped so resizes never strand the view.
@@ -1268,7 +1270,91 @@ fn draw_diff_overlay(f: &mut Frame, app: &mut App, view: crate::app::DiffView) {
         v.list_area = list_inner;
         v.area = area;
         v.files_width = files_w;
+        v.split_shown = split.is_some();
     }
+}
+
+/// A unified diff line's color: added green, removed red, hunk headers in
+/// the accent, file headers dimmed.
+fn diff_line_style(line: &str, th: Theme) -> Style {
+    match classify_diff_line(line) {
+        DiffLineKind::Add => Style::default().fg(th.ok),
+        DiffLineKind::Remove => Style::default().fg(th.err),
+        DiffLineKind::Hunk => Style::default().fg(th.accent),
+        DiffLineKind::Header => Style::default().fg(th.dim),
+        DiffLineKind::Context => Style::default(),
+    }
+}
+
+/// A diff side by side (`git_diff::split_rows`): the old file left and the
+/// new one right, each line numbered, a removed line facing what replaced
+/// it. Only the rows in view are built.
+fn draw_split_diff(
+    f: &mut Frame,
+    rows: &[crate::git_diff::SplitRow],
+    scroll: u16,
+    area: Rect,
+    th: Theme,
+) {
+    use crate::git_diff::SplitRow;
+    let widest = rows
+        .iter()
+        .filter_map(|row| match row {
+            SplitRow::Pair { left, right, .. } => Some(
+                left.as_ref()
+                    .map_or(0, |l| l.0)
+                    .max(right.as_ref().map_or(0, |r| r.0)),
+            ),
+            SplitRow::Note(..) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let num_w = widest.to_string().len();
+    let [left_a, sep_a, right_a] = Layout::horizontal([
+        Constraint::Length(area.width.saturating_sub(1) / 2),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    let dim = Style::default().fg(th.dim);
+    let cell = |side: &Option<(u32, String)>, style: Style| match side {
+        Some((n, text)) => Line::from(vec![
+            Span::styled(format!("{n:>num_w$} "), dim),
+            Span::styled(text.replace('\t', "    "), style),
+        ]),
+        None => Line::default(),
+    };
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    for row in rows.iter().skip(scroll as usize).take(area.height as usize) {
+        match row {
+            SplitRow::Note(text, kind) => {
+                let style = if *kind == DiffLineKind::Hunk {
+                    Style::default().fg(th.accent)
+                } else {
+                    dim
+                };
+                left.push(Line::from(Span::styled(text.clone(), style)));
+                right.push(Line::default());
+            }
+            SplitRow::Pair {
+                left: old,
+                right: new,
+                changed,
+            } => {
+                let (old_style, new_style) = if *changed {
+                    (Style::default().fg(th.err), Style::default().fg(th.ok))
+                } else {
+                    (Style::default(), Style::default())
+                };
+                left.push(cell(old, old_style));
+                right.push(cell(new, new_style));
+            }
+        }
+    }
+    let seam = vec![Line::from(Span::styled("│", dim)); area.height as usize];
+    f.render_widget(Paragraph::new(left), left_a);
+    f.render_widget(Paragraph::new(seam), sep_a);
+    f.render_widget(Paragraph::new(right), right_a);
 }
 
 fn draw_diff_file_list(
