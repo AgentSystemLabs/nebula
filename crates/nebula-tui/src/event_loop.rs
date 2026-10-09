@@ -12623,6 +12623,7 @@ mod tests {
         let gone = tmp.path().join("old");
         let moved = tmp.path().join("new");
         std::fs::create_dir_all(&moved).unwrap();
+        let moved_canon = std::fs::canonicalize(&moved).unwrap();
         let mut app = App::new();
         app.prompt_missing_project_paths = true;
         seed_worktree_at(&mut app, &gone);
@@ -12647,7 +12648,7 @@ mod tests {
             [ClientRequest::SetProjectPath { req_id, path, .. }] => (*req_id, path.clone()),
             other => panic!("expected SetProjectPath, got {other:?}"),
         };
-        assert_eq!(path, moved);
+        assert_eq!(path, moved_canon);
 
         hse(
             &mut app,
@@ -12659,7 +12660,7 @@ mod tests {
         let Some(Overlay::Prompt(prompt)) = &app.overlay else {
             panic!("error reopens the locate prompt, got {:?}", app.overlay);
         };
-        assert_eq!(prompt.input.as_str(), moved.display().to_string());
+        assert_eq!(prompt.input.as_str(), moved_canon.display().to_string());
         assert_eq!(app.flash.as_deref(), Some("not a git repository"));
     }
 
@@ -12669,6 +12670,7 @@ mod tests {
         let gone = tmp.path().join("old");
         let moved = tmp.path().join("new");
         std::fs::create_dir_all(&moved).unwrap();
+        let moved_canon = std::fs::canonicalize(&moved).unwrap();
         let config_path = tmp.path().join("config.json");
         std::fs::write(
             &config_path,
@@ -12712,7 +12714,7 @@ mod tests {
                 ""
             );
             assert_eq!(
-                cfg.project_text_value(&moved, crate::config::SettingKind::RunCommand),
+                cfg.project_text_value(&moved_canon, crate::config::SettingKind::RunCommand),
                 "npm run dev"
             );
         });
