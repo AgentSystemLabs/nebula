@@ -292,17 +292,19 @@
   that branch — cut first, from the same base `nebula worktree` uses, when there is none — while the
   one you asked from stays in its own checkout. Claude learns this from the same appended system
   prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission.
-- **Ask the agent to show you a file and it opens in nebula.** Say "open it" or "show me the examples"
-  and the session runs `nebula open <file>…`; every TUI attached to the daemon raises its file tabs on
-  them — a modal with one tab per file, the focused one previewed with syntax highlighting (a
-  markdown file as a rendered page), `Enter`
+- **Ask the agent to show you a file, image or diagram and it opens in nebula.** Say "open it",
+  "show me the examples" or "show the diagram" and the session runs `nebula open <file>…`; every TUI
+  attached to the daemon raises its file tabs on them — a modal with one tab per file, the focused one
+  previewed with syntax highlighting, rendered Markdown, inline images or Mermaid diagrams, `Enter`
   editing it in place — so the agent puts the file in front of you instead of pasting it into the
   reply. Only when you ask: the appended prompt forbids opening anything unprompted, so an agent that
-  wants you to look at its work names the path and waits. And text only: the CLI resolves the paths
-  against the session's own directory and refuses a path that isn't there or isn't a text file (a NUL
-  byte in its first 8 KiB, git's own test — a terminal has nothing to show for a PNG); the daemon only
-  checks the caller is a known session and passes the agent's checkout along as the editor's working
-  directory. Same appended prompt, plus a `Bash(nebula open:*)` permission.
+  wants you to look at its work names the path and waits. The CLI resolves paths against the session's
+  own directory and accepts text, supported local images and Mermaid diagrams (`.mmd` or `mermaid`
+  fences in Markdown); unrelated binaries are refused before IPC. Images are decoded locally (no remote
+  fetching) and drawn with the inline graphics setting's portable half-block renderer; Mermaid uses a
+  local `mmdc` when one is on PATH and otherwise shows the source plus a one-line install hint. The
+  daemon only checks the caller is a known session and passes the agent's checkout along as the
+  editor's working directory. Same appended prompt, plus a `Bash(nebula open:*)` permission.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
   projects, worktrees, agents (with kind + CLI session ids), links, and your last selection.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI in the selected worktree

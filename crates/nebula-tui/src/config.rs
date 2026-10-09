@@ -46,6 +46,9 @@ pub const PANE_SIDES: &[&str] = &[
 /// COLUMNS: projects, worktrees and sessions beside the pane.
 pub const WORKTREE_LAYOUTS: &[&str] = &["cards", "list", "nested", "columns"];
 
+/// Inline graphics choices (Settings → Appearance).
+pub const INLINE_GRAPHICS: &[&str] = crate::graphics::INLINE_GRAPHICS_MODES;
+
 /// The **Preset text** choices (Settings → Sessions), in the order the row
 /// cycles them: the [`PresetText`] sides by label.
 pub const PRESET_TEXTS: &[&str] = &[
@@ -405,6 +408,7 @@ pub enum SettingKind {
     SourceControlGraph,
     SessionPane,
     WorktreeLayout,
+    InlineGraphics,
     ExpandAllWorktrees,
     CardIssueNumber,
     HideDraftPrs,
@@ -511,7 +515,7 @@ impl SettingKind {
             SettingKind::HighlightCurrentCard => (2026, 9, 28),
             SettingKind::AskBeforeArchive => (2026, 10, 3),
             SettingKind::ConfirmDragMove => (2026, 10, 2),
-            SettingKind::SourceControlGraph => (2026, 10, 9),
+            SettingKind::SourceControlGraph | SettingKind::InlineGraphics => (2026, 10, 9),
         }
     }
 
@@ -683,6 +687,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::WorktreeLayout,
                 label: "Worktree layout",
                 hint: "Each worktree as a row of cards, a compact list, or a thread of prompts",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::InlineGraphics,
+                label: "Inline graphics",
+                hint: "Render images and Mermaid diagrams inline: auto, protocol names, halfblocks, or off",
                 group: "",
             },
             SettingSpec {
@@ -1104,6 +1114,12 @@ pub struct Config {
     /// [`Config::worktree_layout_word`], so a word off the list is the
     /// cards.
     pub worktree_layout: String,
+    /// INLINE GRAPHICS: images and Mermaid diagrams in file previews.
+    /// `off` shows source/hints only; enabled values currently use the
+    /// Unicode half-block renderer, which works in native terminals,
+    /// ttyd/xterm.js and over ssh. Protocol names are accepted as stable
+    /// config values for future native protocol renderers.
+    pub inline_graphics: String,
     /// EXPAND ALL WORKTREES: every BAND on the GRID laid out open at once
     /// — each worktree's sessions and terminals wrapped into rows under
     /// its rule, every entry of the compact LIST listed — so there is no
@@ -1475,6 +1491,7 @@ impl Default for Config {
             highlight_current_card: true,
             session_pane: crate::launcher::PaneSide::default().as_str().into(),
             worktree_layout: WORKTREE_LAYOUTS[0].into(),
+            inline_graphics: crate::graphics::DEFAULT_INLINE_GRAPHICS.into(),
             expand_all_worktrees: false,
             hide_card_prompt: false,
             card_issue_number: true,
@@ -1675,6 +1692,14 @@ impl Config {
             .copied()
             .find(|word| word.eq_ignore_ascii_case(stored))
             .unwrap_or(WORKTREE_LAYOUTS[0])
+    }
+
+    pub fn inline_graphics_label(&self) -> &'static str {
+        crate::graphics::mode_label(&self.inline_graphics)
+    }
+
+    pub fn graphics_mode(&self) -> crate::graphics::GraphicsMode {
+        crate::graphics::graphics_mode(self.inline_graphics_label())
     }
 
     /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
@@ -2319,6 +2344,7 @@ impl Config {
             SettingKind::HighlightCurrentCard => on_off(self.highlight_current_card).into(),
             SettingKind::SessionPane => self.pane_side().as_str().into(),
             SettingKind::WorktreeLayout => self.worktree_layout_word().into(),
+            SettingKind::InlineGraphics => self.inline_graphics_label().into(),
             SettingKind::ExpandAllWorktrees => on_off(self.expand_all_worktrees).into(),
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
@@ -2433,6 +2459,10 @@ impl Config {
             SettingKind::WorktreeLayout => {
                 let now = self.worktree_layout_word();
                 self.worktree_layout = cycle_choice(now, WORKTREE_LAYOUTS, step).into();
+            }
+            SettingKind::InlineGraphics => {
+                self.inline_graphics =
+                    cycle_choice(self.inline_graphics_label(), INLINE_GRAPHICS, step).into();
             }
             SettingKind::ExpandAllWorktrees => {
                 self.expand_all_worktrees = !self.expand_all_worktrees;
@@ -3809,8 +3839,13 @@ mod tests {
         assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
         assert_eq!(
             locate(SettingKind::WorktreeLayout),
-            Some((tab, row - 1)),
+            Some((tab, row - 2)),
             "under the layout it opens"
+        );
+        assert_eq!(
+            locate(SettingKind::InlineGraphics),
+            Some((tab, row - 1)),
+            "after the graphics row"
         );
         cfg.cycle(tab, row, 0);
         assert!(cfg.expand_all_worktrees);
@@ -3828,6 +3863,33 @@ mod tests {
 
         let legacy: Config = serde_json::from_str("{}").unwrap();
         assert!(!legacy.expand_all_worktrees, "a missing key reads as off");
+    }
+
+    #[test]
+    fn inline_graphics_defaults_to_auto_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.inline_graphics_label(), "auto");
+        assert_eq!(cfg.value_label(SettingKind::InlineGraphics), "auto");
+        assert_eq!(
+            cfg.graphics_mode(),
+            crate::graphics::GraphicsMode::Halfblocks
+        );
+
+        let (tab, row) = locate(SettingKind::InlineGraphics).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.inline_graphics, "kitty");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.inline_graphics, "auto");
+        cfg.inline_graphics = "off".into();
+        assert_eq!(cfg.graphics_mode(), crate::graphics::GraphicsMode::Off);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""inline_graphics": "off""#), "{raw}");
+        assert_eq!(load_from(&path).inline_graphics, "off");
     }
 
     /// CARD LINE COUNTS: retired with every card counting its lines. The

@@ -4222,7 +4222,7 @@ async fn auto_title_instruction_and_rename_flow() {
 /// processes: the CLI (what the model runs) resolves the paths against its
 /// own cwd, the daemon checks the caller and fans the files out to every
 /// subscriber as one `FilesOpened` carrying the agent's checkout — and a
-/// path that does not exist, or is not a text file, fails in the CLI
+/// path that does not exist, or is an unsupported binary, fails in the CLI
 /// before anything is sent.
 #[tokio::test]
 async fn nebula_open_cli_hands_the_files_to_every_subscriber() {
@@ -4282,14 +4282,35 @@ async fn nebula_open_cli_hands_the_files_to_every_subscriber() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no such file"), "stderr: {stderr}");
 
-    // So is a binary file: a terminal has nothing to show for a PNG, and
-    // the model is told to name the path instead.
+    // Image and Mermaid files are previewable, so they pass through even
+    // though image bytes fail git's text sniff.
     let png = repo.join("shot.png");
     std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
-    let out = agent_cli(&env, &agent_id, &["open", png.to_str().unwrap()]);
-    assert!(!out.status.success(), "a binary file must fail: {out:?}");
+    let mmd = repo.join("flow.mmd");
+    std::fs::write(&mmd, "flowchart LR\nA-->B\n").unwrap();
+    let out = agent_cli(
+        &env,
+        &agent_id,
+        &["open", png.to_str().unwrap(), mmd.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "previewable visuals must open: {out:?}"
+    );
+
+    // Other binary files are still refused before the daemon hears them.
+    let bin = repo.join("blob.bin");
+    std::fs::write(&bin, b"a\0b").unwrap();
+    let out = agent_cli(&env, &agent_id, &["open", bin.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "an unsupported binary must fail: {out:?}"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not a text file"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported binary file"),
+        "stderr: {stderr}"
+    );
 
     // Outside a session there is no row to open for.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
