@@ -176,9 +176,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         }
                         Err(e) => {
                             let _ = out_tx
-                                .send(ServerEvent::Error {
-                                    req_id: None,
-                                    message: format!("attach: {e:#}"),
+                                .send(ServerEvent::AttachRefused {
+                                    session: sref,
+                                    message: format!("{e:#}"),
                                 })
                                 .await;
                         }
