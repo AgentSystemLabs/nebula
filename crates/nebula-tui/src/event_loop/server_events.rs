@@ -33,8 +33,8 @@ fn handle_snapshot_event(app: &mut App, event: ServerEvent, out: &mut Vec<Client
             pr_seen,
             ui_state,
         } => {
-            let first_snapshot = !app.snapshot_loaded;
-            app.snapshot_loaded = true;
+            let first_snapshot = !app.chrome.snapshot_loaded;
+            app.chrome.snapshot_loaded = true;
             let before = (!first_snapshot).then(|| selection_snapshot(app));
             app.tree.projects = projects;
             app.tree.worktrees = worktrees;

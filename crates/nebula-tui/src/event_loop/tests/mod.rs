@@ -4896,8 +4896,8 @@ fn mid_stream_snapshot_preserves_the_live_selection() {
     let mut app = App::new();
     seed_tree(&mut app);
     seed_second_agent(&mut app, nebula_core::AgentStatus::Finished);
-    app.sel_session = row_of(&app, "a2");
-    app.snapshot_loaded = true;
+    app.nav.sel_session = row_of(&app, "a2");
+    app.chrome.snapshot_loaded = true;
     let tree = app.tree.clone();
     let mut out = Vec::new();
 
