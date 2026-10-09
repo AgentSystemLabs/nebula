@@ -20,11 +20,37 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         app.dirty = true;
         return;
     }
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &app.overlay else {
         return;
     };
     match overlay {
         Overlay::Settings(_) | Overlay::FileTabs(_) => {}
+        Overlay::Help(_) => handle_help_key(app, key, out),
+        Overlay::Metrics(_) => handle_metrics_key(app, key, out),
+        Overlay::Hosts(_) => handle_hosts_key(app, key, out),
+        Overlay::AgentPresets(_) => crate::preset_overlays::handle_list_key(app, key, out),
+        Overlay::AgentPresetEditor(_) => crate::preset_overlays::handle_editor_key(app, key),
+        Overlay::Issues(_) => crate::issues::handle_key(app, key, out),
+        Overlay::PullRequests(_) => crate::pr_modal::handle_key(app, key, out),
+        Overlay::BranchSwitch(_) => crate::branch_switch::handle_key(app, key),
+        Overlay::ProjectPicker(_) => launcher::handle_picker_key(app, key),
+        Overlay::Menu(_) => handle_menu_key(app, key, out),
+        Overlay::Prompt(_) => handle_prompt_key(app, key, out),
+        Overlay::Confirm(_) => handle_confirm_key(app, key, out),
+        Overlay::Diff(_) => handle_diff_key(app, key, out),
+        Overlay::Palette(_) => handle_palette_key(app, key, out),
+        Overlay::Files(_) => handle_files_key(app, key, out),
+        Overlay::Grep(_) => handle_grep_key(app, key, out),
+        Overlay::Tree(_) => handle_tree_key(app, key, out),
+    }
+}
+
+fn handle_help_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Help(_) => {
             if matches!(
                 key.code,
@@ -33,6 +59,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 app.overlay = None;
             }
         }
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_metrics_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Metrics(view) => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => app.overlay = None,
             KeyCode::Char('j') | KeyCode::Down => {
@@ -44,6 +80,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             KeyCode::Enter => activate::metrics_row(app, out),
             _ => {}
         },
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_hosts_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Hosts(view) => {
             // Typing a new destination (`a`): the input owns printable keys.
             if let Some(input) = &mut view.input {
@@ -97,12 +143,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 _ => {}
             }
         }
-        Overlay::AgentPresets(_) => crate::preset_overlays::handle_list_key(app, key, out),
-        Overlay::AgentPresetEditor(_) => crate::preset_overlays::handle_editor_key(app, key),
-        Overlay::Issues(_) => crate::issues::handle_key(app, key, out),
-        Overlay::PullRequests(_) => crate::pr_modal::handle_key(app, key, out),
-        Overlay::BranchSwitch(_) => crate::branch_switch::handle_key(app, key),
-        Overlay::ProjectPicker(_) => launcher::handle_picker_key(app, key),
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Menu(menu) => match key.code {
             // `?` (and `s` where no filter eats letters) on a row that
             // starts a session jumps to that harness's Agents section,
@@ -182,6 +232,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             }
             _ => {}
         },
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Prompt(prompt) => match key.code {
             KeyCode::Esc => {
                 // Abandoning a preset's task goes back to the list it came
@@ -340,6 +400,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 }
             }
         },
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Confirm(confirm) => match key.code {
             // The three-way dialog's "no": the card goes, the emptied
             // worktree stays. Esc below is the "cancel" that keeps both.
@@ -401,6 +471,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             }
             _ => {}
         },
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Diff(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -471,6 +551,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 }
             }
         }
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_palette_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Palette(palette) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
@@ -505,6 +595,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 }
             }
         }
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_files_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Files(finder) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
@@ -542,6 +642,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 }
             }
         }
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_grep_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Grep(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
@@ -569,6 +679,16 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 }
             }
         }
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+fn handle_tree_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    let Some(overlay) = &mut app.overlay else {
+        return;
+    };
+    match overlay {
         Overlay::Tree(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -632,5 +752,6 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 }
             }
         }
+        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
     }
 }

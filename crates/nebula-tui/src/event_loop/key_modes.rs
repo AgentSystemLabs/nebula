@@ -247,6 +247,67 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
     if app.launcher_grid() && launcher::handle_action(app, action, armed, &chord, out) {
         return;
     }
+    handle_global_action(app, action, armed, chord, out);
+}
+
+fn handle_global_action(
+    app: &mut App,
+    action: crate::keymap::Action,
+    armed: Option<(crate::keymap::Action, std::time::Instant)>,
+    chord: crate::keymap::KeyChord,
+    out: &mut Vec<ClientRequest>,
+) {
+    use crate::keymap::Action;
+    match action {
+        Action::Quit
+        | Action::Help
+        | Action::Settings
+        | Action::Metrics
+        | Action::FocusNext
+        | Action::FocusLeft
+        | Action::Hosts
+        | Action::AgentPresets
+        | Action::QuickPrompt
+        | Action::Issues
+        | Action::PullRequests
+        | Action::SwitchBranch
+        | Action::FocusRight
+        | Action::ToggleLauncherPane
+        | Action::ToggleFullScreen
+        | Action::PaneTabs
+        | Action::ProjectDropdown
+        | Action::NextProjectTab
+        | Action::PrevProjectTab
+        | Action::CloseProjectTab
+        | Action::SelectProjectTab(_)
+        | Action::MoveDown
+        | Action::MoveUp
+        | Action::HalfPageDown
+        | Action::HalfPageUp => handle_navigation_action(app, action, armed, chord, out),
+        Action::Activate | Action::New | Action::Rename => {
+            handle_create_or_rename_action(app, action, chord, out)
+        }
+        Action::RefreshPullRequests
+        | Action::Archive
+        | Action::Unarchive
+        | Action::ToggleArchived
+        | Action::Palette
+        | Action::NextAttention
+        | Action::PrevAttention
+        | Action::Delete
+        | Action::DeleteAll
+        | Action::FollowUp => handle_session_state_action(app, action, chord, out),
+        _ => handle_tool_action(app, action, out),
+    }
+}
+
+fn handle_navigation_action(
+    app: &mut App,
+    action: crate::keymap::Action,
+    armed: Option<(crate::keymap::Action, std::time::Instant)>,
+    chord: crate::keymap::KeyChord,
+    out: &mut Vec<ClientRequest>,
+) {
     use crate::keymap::Action;
     match action {
         Action::Quit => app.overlay = Some(Overlay::Confirm(confirm_quit())),
@@ -357,6 +418,18 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
                 move_selection(app, delta, out);
             }
         }
+        _ => unreachable!("global action dispatcher passed the wrong action"),
+    }
+}
+
+fn handle_create_or_rename_action(
+    app: &mut App,
+    action: crate::keymap::Action,
+    chord: crate::keymap::KeyChord,
+    out: &mut Vec<ClientRequest>,
+) {
+    use crate::keymap::Action;
+    match action {
         // The first-run SPLASH, started inside a git repo: Enter opens it —
         // the one-key way from a fresh install to a project.
         Action::Activate if app.splash_showing() => open_launch_repo(app, out),
@@ -431,6 +504,18 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
             }
             Focus::Terminal => {}
         },
+        _ => unreachable!("global action dispatcher passed the wrong action"),
+    }
+}
+
+fn handle_session_state_action(
+    app: &mut App,
+    action: crate::keymap::Action,
+    chord: crate::keymap::KeyChord,
+    out: &mut Vec<ClientRequest>,
+) {
+    use crate::keymap::Action;
+    match action {
         // Its own key rather than another meaning for `r`: the selection it
         // acts on is the selected project and worktree, which every panel
         // has, so it is not scoped to a row.
@@ -518,6 +603,13 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
                 activate::follow_up(app);
             }
         }
+        _ => unreachable!("global action dispatcher passed the wrong action"),
+    }
+}
+
+fn handle_tool_action(app: &mut App, action: crate::keymap::Action, out: &mut Vec<ClientRequest>) {
+    use crate::keymap::Action;
+    match action {
         // On an open-PR row (either list) `g` reads that pull request's
         // diff off GitHub instead of the checkout's — same modal, different
         // source.
@@ -549,5 +641,6 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
         Action::NewTerminal => create_terminal_for_context(app, out),
         // Terminal-scope only; never resolved here.
         Action::UnlockTerminal => {}
+        _ => unreachable!("global action dispatcher passed the wrong action"),
     }
 }
