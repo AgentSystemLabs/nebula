@@ -421,7 +421,7 @@ mod tests {
             MIN_COMPATIBLE_PROTOCOL,
             PROTOCOL_VERSION
         )));
-        assert!(protocol_range_is_compatible((47, 48)));
+        assert!(protocol_range_is_compatible((49, 50)));
         assert!(!protocol_range_is_compatible((
             PROTOCOL_VERSION + 1,
             PROTOCOL_VERSION + 1
