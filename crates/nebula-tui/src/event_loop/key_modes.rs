@@ -84,7 +84,7 @@ fn handle_locked_pane_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequ
             || (app.pane.collapsed && (is_hatch || folds_launcher_pane(app, &chord)));
         if app.launcher_active() && zooms {
             let did = launcher::toggle_full_screen(app, out);
-            crate::key_combo::note(app, &[chord], Some(did));
+            crate::key_combo::note(app, &[chord], did);
             return true;
         }
         if is_hatch {
@@ -130,7 +130,7 @@ fn handle_locked_pane_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequ
         // A stand-in pane (QUICK PROMPT, checkout still being cut) has no
         // PTY behind it: the keystroke has nowhere to go until the real
         // session attaches, and must not land in the previous one.
-        let stand_in = app.pane_shows_placeholder();
+        let unavailable = !app.pane_accepts_input();
         if !exited {
             if let Some(term) = &mut app.pane.term {
                 // Typing changes the content under a persisted selection
@@ -143,7 +143,7 @@ fn handle_locked_pane_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequ
                 if term.scroll_offset() > 0 {
                     term.set_scroll(0);
                 }
-                if stand_in {
+                if unavailable {
                     return true;
                 }
                 if let Some(data) = keys::encode_key(&key, term.kitty_flags) {
@@ -172,7 +172,12 @@ fn handle_preview_scroll_key(app: &mut App, key: KeyEvent) -> bool {
     // move a project, and ↑/↓ have to keep walking the list itself. From
     // either list that can rest on one; a focused pane keeps its keys for
     // the PTY.
-    if app.reading_url().is_some() && matches!(app.nav.focus, Focus::Worktrees | Focus::Sessions) {
+    if app.reading_url().is_some()
+        && matches!(
+            app.nav.focus,
+            Focus::Worktrees | Focus::Sessions | Focus::Terminal
+        )
+    {
         let page = app.pane.term_area.height.max(1);
         let max = app.pr_preview_max_scroll();
         let scrolled = match key.code {

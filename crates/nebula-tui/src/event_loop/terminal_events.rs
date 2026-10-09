@@ -165,7 +165,7 @@ pub(crate) fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec
     // With the pane holding input, whatever this event turns into is headed
     // for the PTY — and the daemon drops Input for a session it hasn't
     // spawned. A still-debounced attach has to land before the keystroke.
-    if app.pane.term_locked {
+    if app.pane.term_locked && app.pane_accepts_input() {
         fire_pending_attach(app, out);
     }
     // The LAUNCHER VIEW's card under the cursor, ahead of a key or a click
@@ -236,9 +236,7 @@ pub(crate) fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRe
         Event::Paste(text) => {
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
-            if app.nav.focus == Focus::Terminal
-                && app.pane.term_locked
-                && !app.pane_shows_placeholder()
+            if app.nav.focus == Focus::Terminal && app.pane.term_locked && app.pane_accepts_input()
             {
                 if let Some(term) = &app.pane.term {
                     let session = term.sref.clone();
@@ -277,7 +275,7 @@ pub(crate) fn typing_into_pane(app: &App) -> bool {
         && app.chrome.flash.is_none()
         && app.pane.term_selection.is_none()
         && app.chrome.key_combo.is_none()
-        && !app.pane_shows_placeholder()
+        && app.pane_accepts_input()
         && app
             .pane
             .term
