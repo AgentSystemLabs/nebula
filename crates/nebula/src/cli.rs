@@ -329,6 +329,10 @@ pub(crate) enum Command {
     /// attach to the daemon left running.
     #[command(hide = true, name = "_protocol-version")]
     ProtocolVersion,
+    /// Upgrade hook: print the oldest protocol version this binary can
+    /// attach to, paired with `_protocol-version` for compatibility checks.
+    #[command(hide = true, name = "_protocol-min-compatible-version")]
+    ProtocolMinCompatibleVersion,
     /// Reload hook: print the newest restart-state version this binary
     /// reads, so a daemon asked to restart onto it knows it can.
     #[command(hide = true, name = "_restart-version")]

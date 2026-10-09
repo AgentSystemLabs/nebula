@@ -115,7 +115,16 @@ async fn handshake(mut stream: UnixStream) -> Result<Connection> {
     )
     .await?;
     match read_frame::<ServerEvent, _>(&mut stream).await? {
-        Some(ServerEvent::HelloOk { daemon_pid, .. }) => Ok(Connection { stream, daemon_pid }),
+        Some(ServerEvent::HelloOk {
+            protocol_version,
+            daemon_pid,
+        }) => {
+            if nebula_core::protocol_compatible_with(protocol_version) {
+                Ok(Connection { stream, daemon_pid })
+            } else {
+                bail!(version_skew_message(protocol_version, listener_pid))
+            }
+        }
         Some(ServerEvent::Incompatible {
             daemon_protocol_version,
         }) => bail!(version_skew_message(daemon_protocol_version, listener_pid)),

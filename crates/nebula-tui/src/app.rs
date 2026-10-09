@@ -3289,6 +3289,11 @@ pub struct App {
     /// pane alone (Tab / arrows) does NOT lock — Enter or a click does.
     pub term_locked: bool,
     pub conn: ConnState,
+    /// Whether this connection has applied its initial Snapshot. Later
+    /// Snapshots are resyncs after daemon-side broadcast lag: they refresh
+    /// the tree but must not replay persisted UI state over what the user is
+    /// doing now.
+    pub snapshot_loaded: bool,
     pub hits: Vec<(Rect, HitTarget)>,
     /// Inner rect of the terminal pane from the last draw.
     pub term_area: Rect,
@@ -3971,6 +3976,7 @@ impl App {
             tail_cards: Vec::new(),
             term_locked: false,
             conn: ConnState::Disconnected,
+            snapshot_loaded: false,
             hits: Vec::new(),
             term_area: Rect::default(),
             host_cursor: None,

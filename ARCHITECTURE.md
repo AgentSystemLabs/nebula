@@ -13,6 +13,17 @@ On launch the TUI connects to a unix socket (`$XDG_RUNTIME_DIR/nebula/daemon.soc
 
 IPC is length-prefixed MessagePack: the client sends `ClientRequest`s (CRUD, attach, keystrokes, resize); the daemon pushes `ServerEvent`s (entity deltas, status, PTY output).
 
+The handshake advertises `PROTOCOL_VERSION` and accepts any peer at or above
+`MIN_COMPATIBLE_PROTOCOL`. Bump `PROTOCOL_VERSION` for every IPC schema
+change. Leave `MIN_COMPATIBLE_PROTOCOL` alone for additive changes that older
+peers can safely ignore or never send: new optional struct fields must carry
+`#[serde(default)]`, and a new request/event kind must be gated so a peer that
+does not know it is never asked to decode it. Bump both constants when a change
+removes or renames a field or variant, changes the meaning of existing data, or
+otherwise requires every connected client and daemon to move together. The
+compact MessagePack enum frames make the handshake itself part of that stable
+surface: do not add fields to `Hello`/`HelloOk` as an additive change.
+
 **In-place restart** (`nebula reload`, and `nebula upgrade` when sessions are live) moves the daemon onto a new binary without stopping a session (`nebula-daemon/src/handoff.rs`). The daemon `exec`s the new binary over itself: the pid stays the same, so every agent CLI is still its child and is reaped as before, and the fds it clears `FD_CLOEXEC` on survive — each PTY master, the client socket (so no client sees "no daemon" and spawns a second one), the hook receiver's socket (every live agent carries its port and token in its environment) and the pidfile with its flock. What lives only in memory goes into a MessagePack state file the new image reads as it boots (`nebula daemon --adopt <file>`): each session's scrollback ring at its original seqs, its size, and the terminal modes and title its scanners had read, plus pending `nebula worktree` relocations. The boot sweep spares the agents it carried, so their status survives; PREWARM POOL spares are carried only to be reaped. The request travels outside the socket protocol, because the asking client is usually the newer build: it writes `restart.request` (the binary to restart onto) into the runtime dir and sends SIGWINCH — ignored by default, so a daemon too old to listen survives being asked — and reads `restart.result`, which the old image writes on a refusal and the new one on success. A daemon advertises that it listens by writing `daemon.restart` (`<pid> <version>`), and only restarts onto a binary whose `nebula _restart-version` is at least its own state-file version. Connected TUIs lose their connection at the exec and are relaunched.
 
 ## Domain tree

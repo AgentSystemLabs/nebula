@@ -107,6 +107,10 @@ fn main() -> Result<()> {
             println!("{}", nebula_core::PROTOCOL_VERSION);
             Ok(())
         }
+        Some(Command::ProtocolMinCompatibleVersion) => {
+            println!("{}", nebula_core::MIN_COMPATIBLE_PROTOCOL);
+            Ok(())
+        }
         Some(Command::RestartVersion) => {
             println!("{}", nebula_daemon::handoff::VERSION);
             Ok(())

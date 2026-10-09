@@ -4712,6 +4712,50 @@ fn snapshot_reattaches_the_remembered_session() {
         }
 }
 
+/// A Snapshot after startup is a daemon resync, not a relaunch. It must
+/// refresh stale entity data without replaying persisted UI state over
+/// the session the user is looking at now.
+#[test]
+fn mid_stream_snapshot_preserves_the_live_selection() {
+    let mut app = App::new();
+    seed_tree(&mut app);
+    seed_second_agent(&mut app, nebula_core::AgentStatus::Finished);
+    app.sel_session = row_of(&app, "a2");
+    app.snapshot_loaded = true;
+    let tree = app.tree.clone();
+    let mut out = Vec::new();
+
+    handle_server_event(
+        &mut app,
+        ServerEvent::Snapshot {
+            projects: tree.projects,
+            worktrees: tree.worktrees,
+            agents: tree.agents,
+            terminals: tree.terminals,
+            links: tree.links,
+            pr_seen: Vec::new(),
+            ui_state: Some(
+                r#"{"project":"p1","worktree":"w1","session_agent":"a1","show_archived":false,"collapsed":false}"#
+                    .into(),
+            ),
+        },
+        &mut out,
+    );
+
+    assert_eq!(
+        app.selected_session_row().and_then(|r| r.sref()),
+        Some(SessionRef::Agent(AgentId("a2".into())))
+    );
+    assert!(
+        !out.iter().any(|r| matches!(
+            r,
+            ClientRequest::Attach { session, .. }
+                if *session == SessionRef::Agent(AgentId("a1".into()))
+        )),
+        "resync must not reattach the persisted startup session: {out:?}"
+    );
+}
+
 /// The footer's far left is a nameplate: which nebula this is, ahead
 /// of every cursor-driven crumb after it. It yields
 /// the columns back to a flash that would otherwise be cut off mid

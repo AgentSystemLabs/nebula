@@ -5,9 +5,31 @@ use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Bump on any breaking change to these enums. The daemon refuses mismatched
-/// clients; the client then offers a kill-and-restart of the old daemon.
+/// Highest IPC protocol this build speaks.
+///
+/// Bump on every protocol change. Additive changes keep
+/// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
 pub const PROTOCOL_VERSION: u32 = 47;
+
+/// Oldest IPC protocol this build can safely talk to.
+///
+/// Compatibility is a range overlap: two peers can talk when each peer's
+/// `[MIN_COMPATIBLE_PROTOCOL, PROTOCOL_VERSION]` range includes at least one
+/// version the other peer also supports.
+pub const MIN_COMPATIBLE_PROTOCOL: u32 = 47;
+
+pub fn protocol_ranges_overlap(
+    local_min: u32,
+    local_current: u32,
+    peer_min: u32,
+    peer_current: u32,
+) -> bool {
+    local_min <= peer_current && peer_min <= local_current
+}
+
+pub fn protocol_compatible_with(peer_version: u32) -> bool {
+    peer_version >= MIN_COMPATIBLE_PROTOCOL
+}
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -592,4 +614,24 @@ pub enum ServerEvent {
         session: SessionRef,
         tail: Option<OutputTail>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_ranges_overlap_when_either_side_is_additive() {
+        assert!(protocol_ranges_overlap(47, 47, 47, 48));
+        assert!(protocol_ranges_overlap(47, 48, 47, 47));
+        assert!(!protocol_ranges_overlap(48, 48, 47, 47));
+        assert!(!protocol_ranges_overlap(47, 47, 48, 48));
+    }
+
+    #[test]
+    fn protocol_compatibility_accepts_current_and_additive_peers() {
+        assert!(protocol_compatible_with(PROTOCOL_VERSION));
+        assert!(protocol_compatible_with(PROTOCOL_VERSION + 1));
+        assert!(!protocol_compatible_with(MIN_COMPATIBLE_PROTOCOL - 1));
+    }
 }
