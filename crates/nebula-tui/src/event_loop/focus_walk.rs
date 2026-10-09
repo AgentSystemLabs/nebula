@@ -19,8 +19,11 @@ use std::time::Duration;
 /// waiting: keystrokes are about to need it.
 pub(super) fn enter_terminal_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.nav.focus = Focus::Terminal;
-    if app.pane.term.as_ref().is_some_and(|t| !t.exited) {
-        app.pane.term_locked = true;
+    // Starting sessions retain their lock and escape hatches while the
+    // daemon is creating the PTY; they cannot accept input yet.
+    app.pane.term_locked =
+        app.pane_accepts_input() || (app.pane_shows_terminal() && app.pane_shows_placeholder());
+    if app.pane_accepts_input() {
         fire_pending_attach(app, out);
     }
 }

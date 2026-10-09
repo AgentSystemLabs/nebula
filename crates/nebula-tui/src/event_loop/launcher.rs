@@ -2511,29 +2511,27 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// session takes the whole screen. The jump attaches the card outright,
 /// so a card the pane's debounce had not reached yet is the one that
 /// comes up.
-pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
+pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) -> bool {
     let Some(sref) = cursor_or_first(app) else {
         app.chrome.flash = Some(nothing_here(app).into());
-        return;
+        return false;
     };
     match sref {
         SessionRef::Terminal(id) => {
             select_card(app, SessionRef::Terminal(id.clone()), out);
             super::attach_now(app, SessionRef::Terminal(id), out);
-            super::zoom_pane(app, out);
+            super::zoom_pane(app, out)
         }
         SessionRef::Agent(id) => {
             if is_archived(app, &id) {
                 app.chrome.flash = Some(super::AGENT_ARCHIVED.into());
-                return;
+                return false;
             }
             take_aim(app);
             jump_to_target(app, PaletteTarget::Session(id), Landing::Attach, out);
             // A Cloud row's Enter is its browser page, not a PTY: the jump
             // has already opened it and there is nothing to full-screen.
-            if app.pane.term.is_some() {
-                super::zoom_pane(app, out);
-            }
+            app.pane.term.is_some() && super::zoom_pane(app, out)
         }
     }
 }
@@ -2546,27 +2544,30 @@ pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// A session full-screened for want of a pane (a body too short to draw
 /// one, the pane folded away) has nothing to come back down to, and
 /// lands on the grid the way the crumb always took it. Returns what it
-/// did, for the KEY COMBO DISPLAY.
+/// did, for the KEY COMBO DISPLAY: nothing when it refused.
 ///
 /// INPUT PARITY: the one function behind the chord (from the grid, or let
 /// through a LOCKED PANE), `^q` and `^`` in a full-screen session, the
 /// `‹ sessions` crumb and the header's button.
-pub(super) fn toggle_full_screen(app: &mut App, out: &mut Vec<ClientRequest>) -> &'static str {
+pub(super) fn toggle_full_screen(
+    app: &mut App,
+    out: &mut Vec<ClientRequest>,
+) -> Option<&'static str> {
     app.chrome.dirty = true;
     if app.pane.collapsed {
         app.pane.collapsed = false;
         if app.launcher.launcher_pane_hidden || !has_pane(app) {
             super::leave_terminal_lock(app);
-            return "Back to the grid";
+            return Some("Back to the grid");
         }
-        return NORMAL_SIZE;
+        return Some(NORMAL_SIZE);
     }
-    if app.nav.focus == Focus::Terminal && app.pane.term.is_some() {
-        super::zoom_pane(app, out);
+    let zoomed = if app.nav.focus == Focus::Terminal && app.pane.term.is_some() {
+        super::zoom_pane(app, out)
     } else {
-        open_session(app, out);
-    }
-    FULL_SCREEN
+        open_session(app, out)
+    };
+    zoomed.then_some(FULL_SCREEN)
 }
 
 /// What [`toggle_full_screen`] says it did, for the KEY COMBO DISPLAY.

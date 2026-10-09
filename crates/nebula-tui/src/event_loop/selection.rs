@@ -736,12 +736,25 @@ pub(crate) fn cloud_session_url_of(app: &App, sref: &SessionRef) -> Option<Strin
 /// (`launcher::enter_pane`); only a body too short to draw that pane
 /// comes here instead (`launcher::open_session`). [`leave_terminal_lock`]
 /// is its undo.
-pub(crate) fn zoom_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
+pub(crate) fn zoom_pane(app: &mut App, out: &mut Vec<ClientRequest>) -> bool {
+    // Readers cover the pane according to focus, so ask as the full-screen
+    // surface would have it.
+    let previous_focus = std::mem::replace(&mut app.nav.focus, Focus::Terminal);
+    if !app.pane_shows_terminal() {
+        app.nav.focus = previous_focus;
+        app.chrome.flash = Some(NOTHING_TO_FULL_SCREEN.into());
+        return false;
+    }
     app.pane.collapsed = true;
-    app.nav.focus = Focus::Terminal;
     app.pane.term_locked = true;
-    fire_pending_attach(app, out);
+    if app.pane_accepts_input() {
+        fire_pending_attach(app, out);
+    }
+    true
 }
+
+/// What `^F` says with nothing in the pane to full-screen.
+pub(crate) const NOTHING_TO_FULL_SCREEN: &str = "no session in the pane — j/k onto one, then ^F";
 
 /// Leave a locked pane for the cards (`Focus::Sessions`). Also ends a
 /// full screen, so there is something on screen to land in — which is

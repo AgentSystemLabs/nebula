@@ -4749,6 +4749,29 @@ impl App {
             .is_some_and(|t| self.is_placeholder_session(&t.sref))
     }
 
+    /// The attachment is the pane's visible content, rather than a PR,
+    /// issue or cloud reader covering it. Exited output and starting
+    /// sessions still belong to this surface and can be full-screened.
+    pub fn pane_shows_terminal(&self) -> bool {
+        self.pane.term.is_some()
+            && self.chrome.rows_memo.hold(|| {
+                self.previewed_pr().is_none()
+                    && self.previewed_issue().is_none()
+                    && self.previewed_cloud().is_none()
+            })
+    }
+
+    /// Whether the visible pane has a live PTY that can receive input.
+    /// A reader can cover a retained attachment without detaching it.
+    pub fn pane_accepts_input(&self) -> bool {
+        self.pane_shows_terminal()
+            && self
+                .pane
+                .term
+                .as_ref()
+                .is_some_and(|term| !term.exited && !self.is_placeholder_session(&term.sref))
+    }
+
     /// The mouse protocol the program in the pane has asked for, and
     /// whether it wants SGR coordinates. `None` when nothing there can take
     /// a report: no session, one whose process has exited (its last screen
@@ -4760,15 +4783,7 @@ impl App {
         let Some(term) = &self.pane.term else {
             return mouseless;
         };
-        // Asked on every wheel notch over the pane: one reading of the
-        // cursor for all four (`RowsMemo`).
-        let reading_something_else = self.chrome.rows_memo.hold(|| {
-            self.pane_shows_placeholder()
-                || self.previewed_pr().is_some()
-                || self.previewed_issue().is_some()
-                || self.previewed_cloud().is_some()
-        });
-        if term.exited || reading_something_else {
+        if !self.pane_accepts_input() {
             return mouseless;
         }
         let screen = term.parser.screen();

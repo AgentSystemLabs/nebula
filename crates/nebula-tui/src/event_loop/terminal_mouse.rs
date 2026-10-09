@@ -62,6 +62,9 @@ pub(crate) fn forward_mouse(
     release: bool,
     mouse: &MouseEvent,
 ) {
+    if !app.pane_accepts_input() {
+        return;
+    }
     if let Some(term) = &app.pane.term {
         let (col, row) = pane_cell(app.pane.term_area, mouse.column, mouse.row);
         out.push(ClientRequest::Input {
