@@ -4,6 +4,27 @@ use super::*;
 
 pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
     match event {
+        event @ ServerEvent::Snapshot { .. } => handle_snapshot_event(app, event, out),
+        event @ ServerEvent::Scrollback { .. }
+        | event @ ServerEvent::Output { .. }
+        | event @ ServerEvent::SessionExited { .. }
+        | event @ ServerEvent::KittyFlags { .. } => handle_terminal_event(app, event, out),
+        event @ ServerEvent::StatusChanged { .. } => handle_status_event(app, event, out),
+        event @ ServerEvent::Ack { .. } => handle_ack_event(app, event, out),
+        event @ ServerEvent::EntityUpserted { .. }
+        | event @ ServerEvent::EntityRemoved { .. }
+        | event @ ServerEvent::FilesOpened { .. }
+        | event @ ServerEvent::Metrics { .. }
+        | event @ ServerEvent::OutputTail { .. }
+        | event @ ServerEvent::AttachRefused { .. } => handle_tree_event(app, event, out),
+        event @ ServerEvent::Error { .. } => handle_error_event(app, event, out),
+        _ => {}
+    }
+}
+
+fn handle_snapshot_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    match event {
         ServerEvent::Snapshot {
             projects,
             worktrees,
@@ -47,6 +68,13 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
             }
             app.dirty = true;
         }
+        _ => unreachable!("server event dispatcher passed the wrong event variant"),
+    }
+}
+
+fn handle_terminal_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    match event {
         ServerEvent::Scrollback {
             session,
             base_seq,
@@ -137,6 +165,13 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
                 }
             }
         }
+        _ => unreachable!("server event dispatcher passed the wrong event variant"),
+    }
+}
+
+fn handle_status_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    match event {
         ServerEvent::StatusChanged {
             agent,
             status,
@@ -201,6 +236,13 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
             // Nothing left any list, so this only re-seats the cursors.
             reconcile_selection_inner(app, before, out);
         }
+        _ => unreachable!("server event dispatcher passed the wrong event variant"),
+    }
+}
+
+fn handle_ack_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    match event {
         ServerEvent::Ack { req_id, created } => {
             // False for a create the user has navigated away from since
             // firing it (`App::left_behind`): the rows still become the
@@ -347,6 +389,13 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
             }
             app.dirty = true;
         }
+        _ => unreachable!("server event dispatcher passed the wrong event variant"),
+    }
+}
+
+fn handle_tree_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    match event {
         // A straggler for a row deleted here a moment ago: the DAEMON sent
         // it before it got to the delete, and the row stays down.
         ServerEvent::EntityUpserted { entity } if optimistic::is_deleting(app, &entity) => {
@@ -462,6 +511,13 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
             }
             app.dirty = true;
         }
+        _ => unreachable!("server event dispatcher passed the wrong event variant"),
+    }
+}
+
+fn handle_error_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
+    let _ = &mut *out;
+    match event {
         ServerEvent::Error { req_id, message } => {
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back. A
@@ -590,6 +646,6 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
             app.flash = Some(message);
             app.dirty = true;
         }
-        _ => {}
+        _ => unreachable!("server event dispatcher passed the wrong event variant"),
     }
 }

@@ -10,6 +10,20 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
     if app.vim.is_some() {
         return;
     }
+
+    if handle_overlay_mouse(app, mouse, mouse_pos, out) {
+        return;
+    }
+
+    handle_grid_or_pane_mouse(app, mouse, out);
+}
+
+fn handle_overlay_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    mouse_pos: ratatui::layout::Position,
+    out: &mut Vec<ClientRequest>,
+) -> bool {
     // A left-click outside any modal dismisses it, exactly as Esc would, and
     // lands its focus — only its focus — on the panel underneath. One
     // hit-test covers all fifteen variants; what each has to unwind on the
@@ -24,7 +38,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
                     land_click_focus(app, mouse.column, mouse.row, out);
                 }
                 app.dirty = true;
-                return;
+                return true;
             }
         }
     }
@@ -56,7 +70,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             }
             app.dirty = true;
         }
-        return;
+        return true;
     }
     // A prompt dialog is modal too: the wheel and clicks drive the
     // Add-project directory listing (click highlights, a second click on
@@ -79,7 +93,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
         if prompt.toggle_area.contains(mouse_pos) {
             launcher::click_new_worktree(app);
             app.dirty = true;
-            return;
+            return true;
         }
         if let Some(field) = prompt
             .detail_areas
@@ -89,7 +103,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
         {
             launcher::click_box_field(app, field);
             app.dirty = true;
-            return;
+            return true;
         }
     }
     if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
@@ -136,7 +150,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             }
             _ => {}
         }
-        return;
+        return true;
     }
     // The PROJECT PICKER: the wheel moves its cursor, a click on a row
     // picks it (Enter on it); everything else is swallowed.
@@ -156,7 +170,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             _ => {}
         }
         app.dirty = true;
-        return;
+        return true;
     }
     // Diff modal: the wheel over the file list walks its cursor a row a
     // notch (↑/↓'s own step), anywhere else it scrolls the diff; a click on
@@ -188,7 +202,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
                 let bx = view.splitter_x();
                 if on_vsplit(bx, view.area, mouse.column, mouse.row) {
                     view.files_drag = Some(bx as i32 - mouse.column as i32);
-                    return;
+                    return true;
                 }
                 let area = view.list_area;
                 let first = view.window_start(area.height as usize);
@@ -213,7 +227,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             }
             _ => {}
         }
-        return;
+        return true;
     }
     // Palette: the wheel moves the selection, a click on a result row jumps
     // there; everything else inside the box is swallowed.
@@ -240,7 +254,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             }
             _ => {}
         }
-        return;
+        return true;
     }
     // File finder: the wheel moves the selection, a click on a result row
     // opens it in the editor (closing the finder unless
@@ -273,7 +287,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             }
             _ => {}
         }
-        return;
+        return true;
     }
     // Find-in-files: the wheel moves the selection, a click on a result row
     // opens it in the editor (closing this overlay unless
@@ -302,7 +316,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             }
             _ => {}
         }
-        return;
+        return true;
     }
     // Tree browser: the wheel scrolls the preview, a click selects a row
     // (folding/unfolding directories), a drag on the tree/preview border
@@ -323,7 +337,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
                 let bx = view.splitter_x();
                 if on_vsplit(bx, view.area, mouse.column, mouse.row) {
                     view.files_drag = Some(bx as i32 - mouse.column as i32);
-                    return;
+                    return true;
                 }
                 let list = view.list_area;
                 let first = view.window_start(list.height as usize);
@@ -348,23 +362,23 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             }
             _ => {}
         }
-        return;
+        return true;
     }
     if matches!(&app.overlay, Some(Overlay::AgentPresets(_))) {
         crate::preset_overlays::handle_list_mouse(app, mouse, mouse_pos, out);
-        return;
+        return true;
     }
     if matches!(&app.overlay, Some(Overlay::Issues(_))) {
         crate::issues::handle_mouse(app, mouse, mouse_pos, out);
-        return;
+        return true;
     }
     if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
         crate::pr_modal::handle_mouse(app, mouse, mouse_pos, out);
-        return;
+        return true;
     }
     if matches!(&app.overlay, Some(Overlay::BranchSwitch(_))) {
         crate::branch_switch::handle_mouse(app, mouse, mouse_pos);
-        return;
+        return true;
     }
     // Hosts picker: the wheel moves the selection, a click on a row connects
     // (the context-menu convention — rows are actions, not editable items);
@@ -393,13 +407,13 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             }
             _ => {}
         }
-        return;
+        return true;
     }
     // FILE TABS: a tab label switches, the body takes the preview cursor,
     // the wheel scrolls it; everything else inside the box is swallowed.
     if matches!(&app.overlay, Some(Overlay::FileTabs(_))) {
         crate::file_tabs::handle_mouse(app, mouse, mouse_pos);
-        return;
+        return true;
     }
     // Settings: click a tab to switch, a row to select (or activate it if
     // it was already selected); everything else inside the box is swallowed.
@@ -408,10 +422,10 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
     if matches!(&app.overlay, Some(Overlay::Settings(_))) {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let Some(view) = settings(app) else {
-                return;
+                return true;
             };
             if view.capture.is_some() {
-                return;
+                return true;
             }
             let (area, tab, selected, body, first_row, hotkeys) = (
                 view.area,
@@ -435,7 +449,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
                     run_settings_cmd(app, SettingsCmd::Tab(next));
                     run_settings_cmd(app, SettingsCmd::EnterList);
                     app.dirty = true;
-                    return;
+                    return true;
                 }
             }
             if body.height > 0 && mouse.row >= body.y && mouse.row < body.y + body.height {
@@ -457,7 +471,7 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
             }
             app.dirty = true;
         }
-        return;
+        return true;
     }
     // Metrics: the wheel moves the selection, a click on a row selects it
     // (a click on the selected row opens it); everything else inside the box
@@ -489,13 +503,16 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clien
         if open {
             activate::metrics_row(app, out);
         }
-        return;
+        return true;
     }
     // Other overlays: keyboard only; ignore mouse.
     if app.overlay.is_some() {
-        return;
+        return true;
     }
+    false
+}
 
+fn handle_grid_or_pane_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) {
     // Motion while nebula holds the left button — the press came, its
     // release has not — is the drag going on, whatever button the host put
     // on the report: a host that lost track of the button between two

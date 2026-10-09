@@ -32,6 +32,26 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         return;
     }
 
+    if handle_locked_pane_key(app, key, out) {
+        return;
+    }
+    // A session card expanded into its FOLLOW-UP COMPOSER: the box owns
+    // every key the SESSIONS PANEL would otherwise act on — they are all
+    // letters, and `a` in a prompt must not archive the session being
+    // prompted. Only the panel walk gets through (Tab / ⇧Tab), and Esc
+    // folds the card back up.
+    if app.focus == Focus::Sessions && app.follow_up_live() && follow_up_key(app, key, out) {
+        return;
+    }
+
+    if handle_preview_scroll_key(app, key) {
+        return;
+    }
+
+    handle_global_key(app, key, out);
+}
+
+fn handle_locked_pane_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) -> bool {
     // Terminal input-locked with a live session: forward everything except
     // the escape hatches. Enter locks; an unlocked pane falls through to
     // the grid's keys, so the user always has a way back that isn't a
@@ -62,7 +82,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         if app.launcher_active() && zooms {
             let did = launcher::toggle_full_screen(app, out);
             crate::key_combo::note(app, &[chord], Some(did));
-            return;
+            return true;
         }
         if is_hatch {
             // The one key in a LOCKED PANE the KEY COMBO DISPLAY shows:
@@ -74,7 +94,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
                 crate::keymap::spec_of(crate::keymap::Action::UnlockTerminal).map(|s| s.label),
             );
             leave_terminal_lock(app);
-            return;
+            return true;
         }
         // `^`` / `^~` are the way out of the LAUNCHER PANE: the first
         // press hands the keys back to the card the pane reads, and the
@@ -86,7 +106,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         if app.launcher_grid() && folds_launcher_pane(app, &chord) {
             let did = launcher::fold_key(app);
             crate::key_combo::note(app, &[chord], Some(did));
-            return;
+            return true;
         }
         // `⌘P` drops the PROJECT DROPDOWN from inside the pane under the
         // cards, as a click on the header's `+` does: no one types a ⌘
@@ -101,7 +121,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
                 crate::keymap::spec_of(crate::keymap::Action::ProjectDropdown).map(|s| s.label),
             );
             launcher::open_project_menu(app);
-            return;
+            return true;
         }
         let exited = app.term.as_ref().is_some_and(|t| t.exited);
         // A stand-in pane (QUICK PROMPT, checkout still being cut) has no
@@ -121,7 +141,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
                     term.set_scroll(0);
                 }
                 if stand_in {
-                    return;
+                    return true;
                 }
                 if let Some(data) = keys::encode_key(&key, term.kitty_flags) {
                     let session = term.sref.clone();
@@ -129,7 +149,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
                     out.push(ClientRequest::Input { session, data });
                 }
             }
-            return;
+            return true;
         }
         // Exited session: there is nothing to type into, so don't swallow
         // keys. Esc/Enter/q go back to the session list; everything else
@@ -137,19 +157,13 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
             crate::key_combo::note(app, &[chord], Some("Back to sessions"));
             leave_terminal_lock(app);
-            return;
+            return true;
         }
     }
+    false
+}
 
-    // A session card expanded into its FOLLOW-UP COMPOSER: the box owns
-    // every key the SESSIONS PANEL would otherwise act on — they are all
-    // letters, and `a` in a prompt must not archive the session being
-    // prompted. Only the panel walk gets through (Tab / ⇧Tab), and Esc
-    // folds the card back up.
-    if app.focus == Focus::Sessions && app.follow_up_live() && follow_up_key(app, key, out) {
-        return;
-    }
-
+fn handle_preview_scroll_key(app: &mut App, key: KeyEvent) -> bool {
     // Reading a pull request or an issue in the pane: the diff modal's
     // scroll keys work here too. Page/Home/End only — shift+↑/↓ already
     // move a project, and ↑/↓ have to keep walking the list itself. From
@@ -178,10 +192,13 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
             );
             app.dirty |= app.pr_preview_scroll != to;
             app.pr_preview_scroll = to;
-            return;
+            return true;
         }
     }
+    false
+}
 
+fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // Panel focus: every key here is a rebindable action (see keymap.rs),
     // so the dispatch is a table lookup rather than a KeyCode match — an
     // unbound press simply falls through.
