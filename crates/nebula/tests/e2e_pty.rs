@@ -5012,7 +5012,7 @@ async fn nebula_ask_cli_round_trips_queues_and_times_out() {
     .await;
 
     let mut queued = env.cli();
-    let mut queued = queued
+    let queued = queued
         .args([
             "ask",
             "research",

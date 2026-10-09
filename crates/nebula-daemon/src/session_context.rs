@@ -192,7 +192,7 @@ impl Daemon {
         let start_seq = session.tail(0, None).end_seq;
         write_prompt(&session, &prompt)?;
 
-        let _finished = wait_for_answer_turn(&mut status_rx, &target_id, deadline).await?;
+        wait_for_answer_turn(&mut status_rx, &target_id, deadline).await?;
         let (_, bytes) = session.snapshot(Some(start_seq));
         let answer = answer_text(&bytes, question);
         Ok((target_id, answer))

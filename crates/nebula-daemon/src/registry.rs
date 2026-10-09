@@ -918,6 +918,7 @@ mod tests {
                 [
                     CLAUDE_WORKTREE_GUIDANCE,
                     crate::sibling::CLAUDE_SPAWN_GUIDANCE,
+                    crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE,
                     crate::open_files::CLAUDE_OPEN_GUIDANCE,
                 ]
                 .join("\n\n"),
