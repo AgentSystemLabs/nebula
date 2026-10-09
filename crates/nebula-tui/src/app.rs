@@ -628,6 +628,12 @@ pub(crate) const CLOUD_LABEL: &str = " · cloud";
 /// Destructive action waiting behind a confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingAction {
+    /// A project's stored `repo_path` is gone from disk. Answering yes
+    /// opens the path-completing prompt that sends `SetProjectPath`.
+    LocateProjectPath {
+        id: ProjectId,
+        old_path: std::path::PathBuf,
+    },
     /// AddProject aimed at a path that doesn't exist yet: create the
     /// directory, `git init` it (both daemon-side) and add it.
     CreateProjectDir(std::path::PathBuf),
@@ -710,6 +716,12 @@ pub struct HelpView {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptKind {
     AddProject,
+    /// Point an existing project at its new main checkout after its
+    /// original `repo_path` disappeared from disk.
+    SetProjectPath {
+        id: ProjectId,
+        old_path: std::path::PathBuf,
+    },
     NewWorktree {
         project: ProjectId,
         /// Random `<adj>-<noun>-<verb>` name minted when the prompt
@@ -910,7 +922,10 @@ impl PromptDialog {
 
     /// Does Tab complete filesystem paths in this prompt?
     pub fn completes_paths(&self) -> bool {
-        matches!(self.kind, PromptKind::AddProject)
+        matches!(
+            self.kind,
+            PromptKind::AddProject | PromptKind::SetProjectPath { .. }
+        )
     }
 
     /// The task prompts — the Claude Cloud launch task, a message to a live
@@ -2056,6 +2071,13 @@ pub enum PendingIntent {
         kind: PromptKind,
         text: String,
         note: String,
+    },
+    /// `SetProjectPath` succeeded: re-key this client's project settings
+    /// from the old path to the new path and tell the user what moved.
+    ProjectPathSet {
+        project: ProjectId,
+        old_path: std::path::PathBuf,
+        new_path: std::path::PathBuf,
     },
     /// A menu's **Run** / **Stop run** (`StartRun` / `StopRun`): once the
     /// DAEMON has done it, flash what happened in `branch`.
@@ -3438,6 +3460,15 @@ pub struct App {
     /// one at a time by `event_loop::launcher::close_tab`, and remembered
     /// across restarts.
     pub launcher_tabs: Vec<ProjectId>,
+    /// Missing-project prompts dismissed in this TUI run. A redraw never
+    /// prompts on its own, but this also keeps a project switch from asking
+    /// again after the user said no.
+    pub dismissed_repath_projects: std::collections::HashSet<ProjectId>,
+    /// Unit tests often seed fake `/tmp/...` projects without backing
+    /// directories. Production always prompts; tests opt into that behavior
+    /// when the missing-path flow is what they are exercising.
+    #[cfg(test)]
+    pub prompt_missing_project_paths: bool,
     /// Every PROJECT TAB has been closed: nebula is back on the SPLASH it
     /// opens on before there is any project, with the projects themselves
     /// and their sessions untouched. Set by closing the last tab
@@ -3943,6 +3974,9 @@ impl App {
             hover_launcher_pane: false,
             hover_crumb: None,
             launcher_tabs: Vec::new(),
+            dismissed_repath_projects: std::collections::HashSet::new(),
+            #[cfg(test)]
+            prompt_missing_project_paths: false,
             projects_closed: false,
             launcher_tab_cursor: None,
             launcher_tabs_more: Vec::new(),

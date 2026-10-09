@@ -42,6 +42,10 @@ nebula add .              # same, for the repo you're in (bare `nebula <dir>` / 
                           # — but a directory whose name collides with a subcommand needs the long
                           # form (`nebula add browser`) or a `./` prefix, or bare `nebula browser`
                           # serves the TUI over ttyd instead of adding the directory
+                          # If an existing project's old folder has gone missing, use the TUI's
+                          # Locate project prompt on that project to relink it; `nebula add` still
+                          # registers the path as a project and does not guess which stranded row
+                          # should move.
 nebula daemon             # run the daemon (normally auto-spawned)
 nebula daemon --foreground  # daemon with logs to stdout, for debugging
 nebula kill               # stop the daemon and all sessions cleanly

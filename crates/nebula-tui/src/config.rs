@@ -2228,6 +2228,16 @@ impl Config {
         }
     }
 
+    /// Move a project's stored settings to its new repo path. Returns true
+    /// only when there was an entry to move.
+    pub fn rekey_project(&mut self, old_path: &Path, new_path: &Path) -> bool {
+        let Some(settings) = self.projects.remove(old_path) else {
+            return false;
+        };
+        self.set_project(new_path, settings);
+        true
+    }
+
     /// The stored text of a typed PROJECT TAB row for the project at
     /// `repo_path` — what [`Config::text_value`] is for a top-level row.
     pub fn project_text_value(&self, repo_path: &Path, kind: SettingKind) -> String {
