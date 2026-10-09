@@ -171,7 +171,6 @@ impl Daemon {
         let known: Vec<(AgentId, PathBuf)> = self
             .transcripts
             .lock()
-            .unwrap()
             .iter()
             .map(|(id, t)| (id.clone(), t.transcript_path.clone()))
             .collect();

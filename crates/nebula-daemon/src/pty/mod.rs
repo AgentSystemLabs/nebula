@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use cloud::CloudScanner;
 use cursor::CursorTracker;
 use nebula_core::SessionRef;
+use parking_lot::Mutex;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use progress::ProgressScanner;
 use question::QuestionScanner;
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 const RING_CAPACITY: usize = 1024 * 1024;
@@ -219,6 +220,11 @@ enum ReaderMsg {
 
 pub struct PtySession {
     pub sref: SessionRef,
+    // PTY lock order: writer/master are independent operation locks; scanner
+    // locks are fed one at a time before appending to `ring`. The only
+    // intentional nested scanner path is cursor/question setup before a ring
+    // snapshot so no bytes are missed; code must not take `ring` and then a
+    // scanner lock.
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     /// Child pid: drives the SIGHUP → SIGKILL escalation (the child is its
@@ -386,53 +392,51 @@ impl PtySession {
     /// reader has read but the pump has not yet added to the ring is lost;
     /// the attach that follows repaints the screen anyway.
     pub fn carry(&self) -> Result<Option<Carried>> {
-        let (Some(pid), Some(master_fd)) =
-            (self.child_pid, self.master.lock().unwrap().as_raw_fd())
-        else {
+        let (Some(pid), Some(master_fd)) = (self.child_pid, self.master.lock().as_raw_fd()) else {
             return Ok(None);
         };
         set_cloexec(master_fd, false)?;
-        let (ring_start_seq, ring) = self.ring.lock().unwrap().snapshot_from(None);
-        let kitty = self.kitty.lock().unwrap();
+        let (ring_start_seq, ring) = self.ring.lock().snapshot_from(None);
+        let kitty = self.kitty.lock();
         Ok(Some(Carried {
             sref: self.sref.clone(),
             master_fd,
             pid,
-            size: *self.last_size.lock().unwrap(),
+            size: *self.last_size.lock(),
             ring_start_seq,
             ring,
             kitty_stack: kitty.stack().to_vec(),
             bracketed_paste: kitty.bracketed_paste(),
-            progress_busy: self.progress.lock().unwrap().busy(),
-            title: self.title.lock().unwrap().title().map(str::to_string),
-            cloud_scan: self.cloud.lock().unwrap().is_some(),
-            question_scan: self.question.lock().unwrap().is_some(),
+            progress_busy: self.progress.lock().busy(),
+            title: self.title.lock().title().map(str::to_string),
+            cloud_scan: self.cloud.lock().is_some(),
+            question_scan: self.question.lock().is_some(),
         }))
     }
 
     /// Undo [`Self::carry`]'s hold on the master fd: the exec it was for
     /// failed, and this image keeps running.
     pub fn uncarry(&self) {
-        if let Some(fd) = self.master.lock().unwrap().as_raw_fd() {
+        if let Some(fd) = self.master.lock().as_raw_fd() {
             let _ = set_cloexec(fd, true);
         }
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self.writer.lock();
         w.write_all(data)?;
         w.flush()?;
         Ok(())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let master = self.master.lock().unwrap();
+        let master = self.master.lock();
         master.resize(pty_size(cols, rows))?;
-        *self.last_size.lock().unwrap() = (cols, rows);
-        if let Some(cursor) = self.cursor.lock().unwrap().as_mut() {
+        *self.last_size.lock() = (cols, rows);
+        if let Some(cursor) = self.cursor.lock().as_mut() {
             cursor.resize(cols, rows);
         }
-        if let Some(question) = self.question.lock().unwrap().as_mut() {
+        if let Some(question) = self.question.lock().as_mut() {
             question.resize(cols, rows);
         }
         Ok(())
@@ -442,9 +446,9 @@ impl PtySession {
     /// when the requested size equals the current one, jiggle (rows-1 then
     /// back) to force a full-screen repaint — the dtach trick.
     pub fn resize_with_jiggle(&self, cols: u16, rows: u16) -> Result<()> {
-        let same = { *self.last_size.lock().unwrap() == (cols, rows) };
+        let same = { *self.last_size.lock() == (cols, rows) };
         if same && rows > 1 {
-            let master = self.master.lock().unwrap();
+            let master = self.master.lock();
             master.resize(pty_size(cols, rows - 1))?;
             master.resize(pty_size(cols, rows))?;
             Ok(())
@@ -557,8 +561,8 @@ impl PtySession {
     /// `base_seq` backs up by their length, so the client's byte count
     /// still ends where the ring does.
     pub fn snapshot(&self, from_seq: Option<u64>) -> (u64, Vec<u8>) {
-        let (base_seq, data) = self.ring.lock().unwrap().snapshot_from(from_seq);
-        let modes: &[u8] = if self.kitty.lock().unwrap().bracketed_paste() {
+        let (base_seq, data) = self.ring.lock().snapshot_from(from_seq);
+        let modes: &[u8] = if self.kitty.lock().bracketed_paste() {
             b"\x1b[?2004h"
         } else {
             b""
@@ -571,8 +575,8 @@ impl PtySession {
     /// out against. No bytes when the ring has not grown past `after_seq`
     /// — the card already has them.
     pub fn tail(&self, max_bytes: usize, after_seq: Option<u64>) -> nebula_core::OutputTail {
-        let (cols, rows) = *self.last_size.lock().unwrap();
-        let ring = self.ring.lock().unwrap();
+        let (cols, rows) = *self.last_size.lock();
+        let ring = self.ring.lock();
         let end_seq = ring.end_seq();
         let data = if after_seq == Some(end_seq) {
             Vec::new()
@@ -589,20 +593,20 @@ impl PtySession {
 
     /// The child's current kitty keyboard flags (0 = legacy).
     pub fn kitty_flags(&self) -> u8 {
-        self.kitty.lock().unwrap().flags()
+        self.kitty.lock().flags()
     }
 
     /// The child's advertised OSC 9;4 busy state, or `None` if it never
     /// advertised one (a CLI without a progress bar, or one not started yet).
     pub fn progress_busy(&self) -> Option<bool> {
-        self.progress.lock().unwrap().busy()
+        self.progress.lock().busy()
     }
 
     /// The child's current window title, or `None` if it never set one.
     /// Test-only: the daemon reads titles off the scanner's change edge.
     #[cfg(test)]
     pub fn window_title(&self) -> Option<String> {
-        self.title.lock().unwrap().title().map(str::to_string)
+        self.title.lock().title().map(str::to_string)
     }
 
     /// Start watching this child's output for the Claude Cloud session id
@@ -614,7 +618,7 @@ impl PtySession {
         let mut scanner = CloudScanner::new();
         let (_, replay) = self.snapshot(None);
         let sightings = scanner.feed(&replay);
-        *self.cloud.lock().unwrap() = Some(scanner);
+        *self.cloud.lock() = Some(scanner);
         for sighting in sightings {
             let _ = self.events.send(sighting.into());
         }
@@ -626,8 +630,8 @@ impl PtySession {
     /// scanner's lock, which the pump takes before it appends a chunk, so
     /// no byte is missed or fed twice.
     pub fn arm_question_scan(&self) {
-        let mut slot = self.question.lock().unwrap();
-        let (cols, rows) = *self.last_size.lock().unwrap();
+        let mut slot = self.question.lock();
+        let (cols, rows) = *self.last_size.lock();
         let (_, history) = self.snapshot(None);
         *slot = Some(QuestionScanner::new(cols, rows, &history));
     }
@@ -639,14 +643,14 @@ impl PtySession {
     /// size — it follows every byte.
     fn query_replies(&self, replies: Vec<kitty::Reply>, chunk: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut cursor = self.cursor.lock().unwrap();
+        let mut cursor = self.cursor.lock();
         let mut fed = 0;
         for reply in replies {
             match reply {
                 kitty::Reply::Bytes(bytes) => out.extend_from_slice(&bytes),
                 kitty::Reply::CursorPosition { at } => {
                     let tracker = cursor.get_or_insert_with(|| {
-                        let (cols, rows) = *self.last_size.lock().unwrap();
+                        let (cols, rows) = *self.last_size.lock();
                         let (_, history) = self.snapshot(None);
                         CursorTracker::new(cols, rows, &history)
                     });
@@ -860,26 +864,25 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         }
         // Terminal queries (kitty keyboard, DA1, DSR) ride in the output
         // stream; nothing else would ever answer them (tmux does the same).
-        let actions = session.kitty.lock().unwrap().feed(pending);
+        let actions = session.kitty.lock().feed(pending);
         let reply = session.query_replies(actions.replies, pending);
         if !reply.is_empty() {
             if let Err(e) = session.write_input(&reply) {
                 tracing::warn!(error = %e, "terminal query reply write failed");
             }
         }
-        let busy_edge = session.progress.lock().unwrap().feed(pending);
-        let title_change = session.title.lock().unwrap().feed(pending);
-        let cloud_sightings = match session.cloud.lock().unwrap().as_mut() {
+        let busy_edge = session.progress.lock().feed(pending);
+        let title_change = session.title.lock().feed(pending);
+        let cloud_sightings = match session.cloud.lock().as_mut() {
             Some(scanner) => scanner.feed(pending),
             None => Vec::new(),
         };
         let question_edge = session
             .question
             .lock()
-            .unwrap()
             .as_mut()
             .and_then(|scanner| scanner.feed(pending, std::time::Instant::now()));
-        let seq = session.ring.lock().unwrap().append(pending);
+        let seq = session.ring.lock().append(pending);
         let _ = session.events.send(PtyEvent::Output {
             seq,
             data: std::mem::take(pending),
@@ -1049,7 +1052,7 @@ mod tests {
         .await
         .expect("child exits within 10s");
 
-        let (head, raw) = session.ring.lock().unwrap().snapshot_from(None);
+        let (head, raw) = session.ring.lock().snapshot_from(None);
         assert!(head > 0, "the ring wrapped");
         let (start, replay) = session.snapshot(None);
         assert_eq!(start + replay.len() as u64, head + raw.len() as u64);

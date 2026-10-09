@@ -109,7 +109,12 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
         .as_ref()
         .map(handoff::Carry::agents)
         .unwrap_or_default();
-    match store.sweep_disconnected(&carried_agents) {
+    let sweep_store = store.clone();
+    let swept =
+        tokio::task::spawn_blocking(move || sweep_store.sweep_disconnected(&carried_agents))
+            .await
+            .context("boot sweep task panicked")?;
+    match swept {
         Ok(swept) if !swept.is_empty() => {
             tracing::info!(
                 count = swept.len(),
@@ -278,7 +283,9 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                     _ = daemon.shutdown.cancelled() => break,
                     _ = interval.tick() => {}
                 }
-                let Ok((projects, _, _, _)) = daemon.store.load_tree() else {
+                let Ok((projects, _, _, _)) =
+                    daemon.store_blocking(|store| store.load_tree()).await
+                else {
                     continue;
                 };
                 seen.retain(|id, _| projects.iter().any(|p| &p.id == id));

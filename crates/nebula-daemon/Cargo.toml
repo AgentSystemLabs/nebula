@@ -22,4 +22,5 @@ rand = "0.10"
 subtle = "2"
 tempfile = { workspace = true }
 vt100 = { workspace = true }
+parking_lot = "0.12.5"
 
