@@ -525,6 +525,12 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     activate::diff_tree_toggled(view);
                     app.modals.diff_tree = view.tree.is_some();
                 }
+                // Ctrl+s flips the diff side by side, or unified;
+                // remembered for the next open, like the tree and width.
+                KeyCode::Char('s') if ctrl => {
+                    view.toggle_split();
+                    app.modals.diff_split = view.split;
+                }
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
                 KeyCode::Down => activate::diff_file(view, view.cursor() as i64 + 1),

@@ -383,6 +383,7 @@ pub(crate) fn open_diff_view(app: &mut App) {
     } else {
         let mut view = DiffView::opening(path.clone(), branch, jobs.clone(), ticket);
         view.files_width = app.modals.diff_files_width;
+        view.split = app.modals.diff_split;
         if app.modals.diff_tree {
             view.toggle_tree();
         }
@@ -424,6 +425,7 @@ pub(crate) fn show_diff_listing(
     let mut view = DiffView::new(path, branch, Vec::new(), true);
     view.jobs = app.jobs.view_jobs.clone();
     view.files_width = app.modals.diff_files_width;
+    view.split = app.modals.diff_split;
     crate::git_diff::fill_view(&mut view, listing);
     // After the marks: the tree opens on the first unreviewed file too.
     if app.modals.diff_tree && view.toggle_tree() {
