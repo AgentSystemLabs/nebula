@@ -3464,6 +3464,11 @@ pub struct App {
     /// prompts on its own, but this also keeps a project switch from asking
     /// again after the user said no.
     pub dismissed_repath_projects: std::collections::HashSet<ProjectId>,
+    /// Unit tests often seed fake `/tmp/...` projects without backing
+    /// directories. Production always prompts; tests opt into that behavior
+    /// when the missing-path flow is what they are exercising.
+    #[cfg(test)]
+    pub prompt_missing_project_paths: bool,
     /// Every PROJECT TAB has been closed: nebula is back on the SPLASH it
     /// opens on before there is any project, with the projects themselves
     /// and their sessions untouched. Set by closing the last tab
@@ -3970,6 +3975,8 @@ impl App {
             hover_crumb: None,
             launcher_tabs: Vec::new(),
             dismissed_repath_projects: std::collections::HashSet::new(),
+            #[cfg(test)]
+            prompt_missing_project_paths: false,
             projects_closed: false,
             launcher_tab_cursor: None,
             launcher_tabs_more: Vec::new(),

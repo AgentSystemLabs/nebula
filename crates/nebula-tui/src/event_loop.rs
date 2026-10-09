@@ -3706,6 +3706,10 @@ fn repath_prefill(old_path: &std::path::Path) -> String {
 }
 
 pub(super) fn prompt_for_missing_project_path(app: &mut App, id: &ProjectId) -> bool {
+    #[cfg(test)]
+    if !app.prompt_missing_project_paths {
+        return false;
+    }
     let Some(project) = app.tree.projects.iter().find(|p| &p.id == id) else {
         return false;
     };
@@ -12585,6 +12589,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let gone = tmp.path().join("moved-away");
         let mut app = App::new();
+        app.prompt_missing_project_paths = true;
         seed_worktree_at(&mut app, &gone);
         let mut out = Vec::new();
 
@@ -12619,6 +12624,7 @@ mod tests {
         let moved = tmp.path().join("new");
         std::fs::create_dir_all(&moved).unwrap();
         let mut app = App::new();
+        app.prompt_missing_project_paths = true;
         seed_worktree_at(&mut app, &gone);
         let mut out = Vec::new();
 
@@ -12675,6 +12681,7 @@ mod tests {
 
         crate::config::with_config_path(config_path.clone(), || {
             let mut app = App::new();
+            app.prompt_missing_project_paths = true;
             seed_worktree_at(&mut app, &gone);
             let mut out = Vec::new();
 
