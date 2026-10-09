@@ -2806,17 +2806,31 @@ mod tests {
         drop(dir);
     }
 
-    /// Save/restore around a process-wide env var a test has to set.
+    /// Save/restore around a process-wide env var a test has to set. Holds
+    /// a lock for its life: tests run on parallel threads, and one guard's
+    /// drop restoring "unset" mid-way through another's run made that run
+    /// spawn the real `claude` (absent on CI, so the create failed).
     struct EnvGuard {
         key: &'static str,
         was: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // A test that panicked holding the lock left the env restored
+            // (drop still ran), so its poison means nothing here.
+            let lock = LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let was = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, was }
+            Self {
+                key,
+                was,
+                _lock: lock,
+            }
         }
     }
 
