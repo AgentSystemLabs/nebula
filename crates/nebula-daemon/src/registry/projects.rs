@@ -495,6 +495,84 @@ impl Daemon {
         Ok(())
     }
 
+    pub async fn cleanup_merged_worktree(
+        self: &Arc<Self>,
+        id: &WorktreeId,
+        branch: &str,
+        pr_number: u64,
+        pr_url: &str,
+        head_sha: &str,
+    ) -> Result<()> {
+        let ops = self.worktree_ops.lock().await;
+        let worktree_lookup = id.clone();
+        let worktree = self
+            .store_blocking(move |store| store.get_worktree(&worktree_lookup))
+            .await?
+            .context("worktree not found")?;
+        if worktree.is_main {
+            bail!(
+                "auto-cleanup skipped {}: never remove the main checkout",
+                worktree.branch
+            );
+        }
+        if worktree.branch != branch {
+            bail!(
+                "auto-cleanup skipped {}: branch changed from {}",
+                worktree.branch,
+                branch
+            );
+        }
+        let project_lookup = worktree.project_id.clone();
+        let project = self
+            .store_blocking(move |store| store.get_project(&project_lookup))
+            .await?
+            .context("project not found")?;
+        if git::default_branch_name(&project.repo_path)
+            .await
+            .as_deref()
+            == Some(branch)
+        {
+            bail!("auto-cleanup skipped {branch}: never remove the default branch");
+        }
+        let head = git::head_sha(&worktree.path).await?;
+        if head != head_sha {
+            bail!("auto-cleanup skipped {branch}: branch has moved since PR #{pr_number} merged");
+        }
+        let status = git::status_porcelain(&worktree.path).await?;
+        if !status.trim().is_empty() {
+            bail!("auto-cleanup skipped {branch}: checkout has uncommitted or untracked changes");
+        }
+
+        let (_, _, agents, terminals) = self.store_blocking(|store| store.load_tree()).await?;
+        if let Some(agent) = agents.iter().find(|agent| {
+            agent.worktree_id == *id && self.is_alive(&SessionRef::Agent(agent.id.clone()))
+        }) {
+            bail!(
+                "auto-cleanup skipped {branch}: session '{}' is still running",
+                agent.name
+            );
+        }
+        if terminals.iter().any(|terminal| {
+            terminal.worktree_id == *id && self.is_alive(&SessionRef::Terminal(terminal.id.clone()))
+        }) {
+            bail!("auto-cleanup skipped {branch}: terminal is still running");
+        }
+
+        self.kill_sessions_in(std::slice::from_ref(id), &agents, &terminals);
+        git::remove_worktree(&project.repo_path, &worktree.path, false).await?;
+        let delete_id = id.clone();
+        self.store_blocking(move |store| store.delete_worktree(&delete_id))
+            .await?;
+        self.broadcast(ServerEvent::EntityRemoved {
+            id: EntityId::Worktree(id.clone()),
+        });
+        tracing::info!(branch, pr_number, pr_url, "cleaned up merged worktree");
+        self.run_worktree_hook(WorktreeHook::Delete, &project.repo_path, &worktree)
+            .await;
+        drop(ops);
+        Ok(())
+    }
+
     /// Run the repository's WORKTREE HOOK for `hook`, if it configures
     /// one, and turn anything it has to say into a client warning.
     pub(super) async fn run_worktree_hook(

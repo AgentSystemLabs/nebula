@@ -269,6 +269,20 @@ pub struct PullRequest {
     /// [`STATE_CLOSED`].
     pub state: String,
     pub is_draft: bool,
+    /// The local checkout branch this pull request's head names
+    /// ([`checkout_branch`]): bare for same-repo PRs, owner-qualified for
+    /// forks.
+    #[serde(default)]
+    pub head: String,
+    /// GitHub's object id for the pull request head. Required before a
+    /// merged/closed PR can keep wearing a branch row: a long-lived branch
+    /// may have moved since the PR was merged.
+    #[serde(default)]
+    pub head_sha: String,
+    /// The branch the PR targets. The branch row does not draw it, but the
+    /// cleanup guard uses the open-list copy to avoid deleting a base branch.
+    #[serde(default)]
+    pub base: String,
     /// Whether the branch still merges and its checks pass — what turns
     /// the row red ([`trouble`](Self::trouble)).
     #[serde(default)]
@@ -339,13 +353,17 @@ pub(crate) fn classify_miss(stderr: &str) -> Lookup {
 
 /// Ask `gh` for the pull request on `dir`'s current branch.
 pub async fn lookup(dir: &Path) -> Lookup {
+    let Some(ctx) = checkout_context(dir).await else {
+        return Lookup::Unavailable;
+    };
     let out = run_gh(
         Some(dir),
         &[
             "pr",
             "view",
             "--json",
-            "number,url,title,state,isDraft,mergeable,statusCheckRollup,comments,reviews",
+            "number,url,title,state,isDraft,headRefName,headRefOid,baseRefName,\
+             isCrossRepository,headRepositoryOwner,mergeable,statusCheckRollup,comments,reviews",
         ],
         TIMEOUT,
     )
@@ -354,11 +372,83 @@ pub async fn lookup(dir: &Path) -> Lookup {
         // Only asked once `gh` has proved it works, so a machine without
         // it never pays for the extra process.
         Ok(out) => match parse(&out, viewer_login().await) {
-            Some(pr) => Lookup::Found(pr),
+            Some(pr) if matches_checkout(dir, &ctx, &pr).await => Lookup::Found(pr),
             None => Lookup::Absent,
+            Some(_) => Lookup::Absent,
         },
         Err(stderr) => classify_miss(&stderr),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckoutContext {
+    branch: String,
+    default_branch: Option<String>,
+}
+
+async fn checkout_context(dir: &Path) -> Option<CheckoutContext> {
+    let branch = git_out(dir, &["branch", "--show-current"]).await?;
+    let branch = branch.trim().to_string();
+    if branch.is_empty() {
+        return None;
+    }
+    Some(CheckoutContext {
+        branch,
+        default_branch: default_branch(dir).await,
+    })
+}
+
+async fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null());
+    let out = tokio::time::timeout(TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+async fn default_branch(dir: &Path) -> Option<String> {
+    let short = git_out(
+        dir,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .await?;
+    short
+        .trim()
+        .strip_prefix("origin/")
+        .map(str::to_string)
+        .filter(|branch| !branch.is_empty())
+}
+
+async fn matches_checkout(dir: &Path, ctx: &CheckoutContext, pr: &PullRequest) -> bool {
+    if pr.head != ctx.branch {
+        return false;
+    }
+    if pr.is_open() {
+        return true;
+    }
+    if ctx.default_branch.as_deref() == Some(ctx.branch.as_str()) {
+        return false;
+    }
+    if pr.head_sha.is_empty() {
+        return false;
+    }
+    let range = format!("{}..HEAD", pr.head_sha);
+    let Some(count) = git_out(dir, &["rev-list", "--count", &range]).await else {
+        return false;
+    };
+    count.trim() == "0"
 }
 
 /// Your own GitHub login, resolved once per process. Needed only to keep
@@ -397,6 +487,9 @@ fn parse(json: &str, viewer: Option<&str>) -> Option<PullRequest> {
         title: str_at(&v, "title"),
         state: state_at(&v),
         is_draft: bool_at(&v, "isDraft"),
+        head: checkout_branch(&v),
+        head_sha: str_at(&v, "headRefOid"),
+        base: str_at(&v, "baseRefName"),
         health: health(&v),
         activity: activity(&v, viewer),
     })
@@ -519,7 +612,7 @@ pub const LIST_LIMIT: usize = 100;
 const LIST_QUERY: &str = "query($owner: String!, $repo: String!, $limit: Int!) { \
     repository(owner: $owner, name: $repo) { \
     pullRequests(states: OPEN, first: $limit, orderBy: {field: CREATED_AT, direction: DESC}) { \
-    nodes { number url title isDraft headRefName isCrossRepository \
+    nodes { number url title isDraft headRefName baseRefName isCrossRepository \
     headRepositoryOwner { login } mergeable \
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } } } }";
 
@@ -543,6 +636,10 @@ pub struct OpenPr {
     /// a name with ours — `main` above all, which every fork has and the
     /// ROOT WORKTREE is on.
     pub head: String,
+    /// The branch this open pull request targets. Auto-cleanup never removes
+    /// a branch while another open PR uses it as its base.
+    #[serde(default)]
+    pub base: String,
 }
 
 /// `#42 title`, or `#42` alone for an untitled one — how a pull request
@@ -705,6 +802,7 @@ pub(crate) fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
                     is_draft: bool_at(v, "isDraft"),
                     health: health(v),
                     head: checkout_branch(v),
+                    base: str_at(v, "baseRefName"),
                 })
             })
             .collect(),
@@ -1254,6 +1352,78 @@ mod tests {
         assert_eq!(bare.standing(), Standing::Open);
     }
 
+    fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_lookup_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "nebula@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Nebula Tests"]);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        run_git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        run_git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        (tmp, repo)
+    }
+
+    fn merged_payload(branch: &str, head: &str) -> String {
+        format!(
+            r#"{{"number":7,"url":"https://github.com/o/r/pull/7","title":"done","state":"MERGED","isDraft":false,"headRefName":"{branch}","headRefOid":"{head}"}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn merged_lookup_never_matches_the_default_branch() {
+        let (_tmp, repo) = init_lookup_repo();
+        let head = run_git(&repo, &["rev-parse", "HEAD"]);
+        let ctx = checkout_context(&repo).await.expect("checkout context");
+        let pr = parse(&merged_payload("main", &head), None).expect("parsed");
+
+        assert!(
+            !matches_checkout(&repo, &ctx, &pr).await,
+            "an old PR from main must not make the default branch purple"
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_lookup_matches_only_while_branch_has_no_commits_beyond_pr_head() {
+        let (_tmp, repo) = init_lookup_repo();
+        run_git(&repo, &["checkout", "-b", "feat"]);
+        let pr_head = run_git(&repo, &["rev-parse", "HEAD"]);
+        let ctx = checkout_context(&repo).await.expect("checkout context");
+        let pr = parse(&merged_payload("feat", &pr_head), None).expect("parsed");
+        assert!(matches_checkout(&repo, &ctx, &pr).await);
+
+        run_git(&repo, &["commit", "--allow-empty", "-m", "new work"]);
+        let ctx = checkout_context(&repo).await.expect("checkout context");
+        assert!(
+            !matches_checkout(&repo, &ctx, &pr).await,
+            "new commits after the merged PR head make the row stale"
+        );
+    }
+
     /// Drafts sink below the finished pull requests and keep `gh`'s
     /// newest-first order on both sides of that line.
     #[test]
@@ -1265,6 +1435,7 @@ mod tests {
             is_draft,
             health: Default::default(),
             head: String::new(),
+            base: "main".into(),
         };
         let mut list = vec![row(42, true), row(40, false), row(31, true), row(30, false)];
         drafts_last(&mut list);

@@ -215,6 +215,17 @@ impl ClientConnection {
                 self.spawn_delete_worktree(req_id, id, force);
                 Ok(true)
             }
+            ClientRequest::CleanupMergedWorktree {
+                req_id,
+                id,
+                branch,
+                pr_number,
+                pr_url,
+                head_sha,
+            } => {
+                self.spawn_cleanup_merged_worktree(req_id, id, branch, pr_number, pr_url, head_sha);
+                Ok(true)
+            }
             ClientRequest::CreateAgent {
                 req_id,
                 worktree,
@@ -689,6 +700,29 @@ impl ClientConnection {
         let out_tx = self.out_tx.clone();
         tokio::spawn(async move {
             reply_done(&out_tx, req_id, daemon.delete_worktree(&id, force).await).await;
+        });
+    }
+
+    fn spawn_cleanup_merged_worktree(
+        &self,
+        req_id: u64,
+        id: nebula_core::WorktreeId,
+        branch: String,
+        pr_number: u64,
+        pr_url: String,
+        head_sha: String,
+    ) {
+        let daemon = self.daemon.clone();
+        let out_tx = self.out_tx.clone();
+        tokio::spawn(async move {
+            reply_done(
+                &out_tx,
+                req_id,
+                daemon
+                    .cleanup_merged_worktree(&id, &branch, pr_number, &pr_url, &head_sha)
+                    .await,
+            )
+            .await;
         });
     }
 

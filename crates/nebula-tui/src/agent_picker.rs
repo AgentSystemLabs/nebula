@@ -284,6 +284,7 @@ mod tests {
             is_draft: false,
             health: Default::default(),
             head: PR_HEAD.into(),
+            base: "main".into(),
         }
     }
 

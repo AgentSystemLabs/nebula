@@ -353,6 +353,11 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   above` on the row of air under the PROJECT TABS once the top has scrolled off, `↓ 3 more below`
   on a row kept under the cards while there is more past the bottom — the row stays as air once the
   grid is scrolled to its end, and neither appears on a grid that fits.
+  Turn on **Auto-clean merged worktrees** in Settings → Sessions (`auto_cleanup_merged`) to have
+  nebula remove linked checkouts after their PR lands. It is off by default and guarded: the ROOT
+  WORKTREE, the repo's default branch, branches used as the base of open PRs, dirty checkouts,
+  checkouts with untracked files, moved heads, running terminals and sessions mid-turn are skipped
+  with a short notice instead.
 - **Walking it.** `j` and `k` walk the bands — the rule of the band under the cursor takes the
   accent and its branch goes bold, its remembered card (the session it was last left on, else its
   first) is raised out of the row — a heavy accent frame (`┏━┓`, a weight no status frame takes) over

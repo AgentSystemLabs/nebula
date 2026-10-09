@@ -3773,6 +3773,10 @@ pub struct LauncherState {
     /// (`launcher::bands`). Mirrors the config, refreshed at startup and
     /// when the settings overlay applies a change.
     pub show_all_worktrees: bool,
+    /// The `auto_cleanup_merged` setting: once a checkout's PR is seen to
+    /// have merged, ask the daemon to remove that clean, idle linked
+    /// worktree after it re-checks the guard rails.
+    pub auto_cleanup_merged: bool,
     /// The `card_issue_number` setting: an ISSUE SESSION's card shows the
     /// `#15` of the issue it was started from, a link a click opens
     /// (`HitTarget::LauncherCardIssue`). Mirrors the config, refreshed at
@@ -4080,6 +4084,10 @@ pub struct GithubState {
     /// or whose first answer ever says merged, landed some other day and
     /// paints solid purple from the first frame.
     pub merge_landed: HashMap<WorktreeId, std::time::Instant>,
+    /// Worktrees this UI has already asked the daemon to auto-clean in this
+    /// session; prevents repeated requests as PR refreshes keep saying
+    /// "merged".
+    pub auto_cleanup_requested: std::collections::HashSet<WorktreeId>,
     /// How far the user has read into each pull request's conversation,
     /// keyed by PR URL — the daemon's `pr_seen` rows, plus whatever this
     /// session has marked since. What's newer than the mark is what the
@@ -6281,6 +6289,9 @@ mod tests {
             title: "Attach links".into(),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            head: String::new(),
+            head_sha: String::new(),
+            base: "main".into(),
             health: Default::default(),
             activity: Vec::new(),
         }

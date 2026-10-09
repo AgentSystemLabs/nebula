@@ -54,11 +54,13 @@ const STORE_FILE: &str = "pull-requests.json";
 const DIFFS_DIR: &str = "diffs";
 /// Bumped when the document's shape changes incompatibly; an older
 /// document is ignored rather than half-read. Field additions don't need
-/// it — `#[serde(default)]` covers those. 2: an open row's `head` is the
+/// it — `#[serde(default)]` covers those. 3: branch rows carry the PR head
+/// SHA; merged rows cached before that could be stale long-lived branches.
+/// 2: an open row's `head` is the
 /// checkout's branch (`pull_request::checkout_branch`), not `gh`'s bare
 /// `headRefName` — a fork row cached under 1 would launch its PR SESSION
 /// into whichever checkout of ours shares the fork branch's name.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// The document on disk. Keyed the way the app keys the same things:
 /// checkout rows by worktree id, open lists by project id, bodies by URL.
@@ -345,6 +347,9 @@ mod tests {
             title: format!("PR {number}"),
             state: state.into(),
             is_draft: false,
+            head: format!("head-{number}"),
+            head_sha: format!("{number:040x}"),
+            base: "main".into(),
             health: Default::default(),
             activity: vec!["2024-04-25T19:55:42Z".into()],
         }
@@ -358,6 +363,7 @@ mod tests {
             is_draft: number % 2 == 1,
             health: Default::default(),
             head: format!("head-{number}"),
+            base: "main".into(),
         }
     }
 

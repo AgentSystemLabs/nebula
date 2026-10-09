@@ -1840,6 +1840,7 @@ pub(super) fn seed_open_prs(app: &mut App, prs: &[(u64, &str)]) {
                     url: format!("https://github.com/o/r/pull/{number}"),
                     is_draft: false,
                     health: Default::default(),
+                    base: "main".into(),
                     head: format!("pr-{number}-head"),
                 })
                 .collect(),
@@ -1991,6 +1992,7 @@ fn the_cursor_follows_a_checkout_that_moves_under_or_out_from_under_its_pull_req
         url: pr_url(7),
         is_draft: false,
         health: Default::default(),
+        base: "main".into(),
         head: "pr-7-head".into(),
     }];
 
@@ -2105,6 +2107,7 @@ fn the_open_pr_list_backs_off_when_empty_and_survives_a_failed_call() {
         url: "https://github.com/o/r/pull/7".into(),
         is_draft: false,
         health: Default::default(),
+        base: "main".into(),
         head: "attach-links".into(),
     }];
     note_open_prs_answer(&mut app, pid.clone(), Some(found.clone()), &mut Vec::new());
@@ -2443,6 +2446,7 @@ fn palette_pull_request_rows_say_draft_or_ready_for_review_and_follow_the_refres
                 url: pr_url(number),
                 is_draft,
                 health: Default::default(),
+                base: "main".into(),
                 head: format!("pr-{number}-head"),
             })
             .collect();
@@ -2608,6 +2612,7 @@ fn a_merged_pull_request_leaves_the_list_on_the_next_refresh() {
                 url: format!("https://github.com/o/r/pull/{number}"),
                 is_draft,
                 health: Default::default(),
+                base: "main".into(),
                 head: format!("pr-{number}-head"),
             })
             .collect();
@@ -2669,6 +2674,7 @@ fn the_cursor_follows_its_pull_request_across_a_reorder() {
             url: pr_url(11),
             is_draft: false,
             health: Default::default(),
+            base: "main".into(),
             head: "brand-new".into(),
         },
         crate::pull_request::OpenPr {
@@ -2677,6 +2683,7 @@ fn the_cursor_follows_its_pull_request_across_a_reorder() {
             url: pr_url(9),
             is_draft: false,
             health: Default::default(),
+            base: "main".into(),
             head: "number-lines".into(),
         },
         crate::pull_request::OpenPr {
@@ -2685,6 +2692,7 @@ fn the_cursor_follows_its_pull_request_across_a_reorder() {
             url: pr_url(7),
             is_draft: false,
             health: Default::default(),
+            base: "main".into(),
             head: "attach-links".into(),
         },
     ];
@@ -2799,6 +2807,7 @@ fn a_pr(number: u64, title: &str, is_draft: bool) -> crate::pull_request::OpenPr
         url: pr_url(number),
         is_draft,
         health: Default::default(),
+        base: "main".into(),
         head: format!("pr-{number}-head"),
     }
 }
@@ -2860,6 +2869,9 @@ fn seed_branch_pr(app: &mut App, number: u64, title: &str) {
             title: title.into(),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            head: String::new(),
+            head_sha: String::new(),
+            base: "main".into(),
             health: Default::default(),
             activity: Vec::new(),
         }),
@@ -3566,6 +3578,9 @@ fn cached_pr(number: u64) -> crate::pull_request::PullRequest {
         title: format!("PR {number}"),
         state: crate::pull_request::STATE_OPEN.into(),
         is_draft: false,
+        head: String::new(),
+        head_sha: String::new(),
+        base: "main".into(),
         health: Default::default(),
         activity: Vec::new(),
     }
@@ -3578,6 +3593,7 @@ fn cached_open(number: u64) -> crate::pull_request::OpenPr {
         url: pr_url(number),
         is_draft: false,
         health: Default::default(),
+        base: "main".into(),
         head: format!("head-{number}"),
     }
 }
@@ -4185,6 +4201,9 @@ fn shift_r_on_the_pr_row_refreshes_pull_requests() {
             title: "Attach links".into(),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            head: String::new(),
+            head_sha: String::new(),
+            base: "main".into(),
             health: Default::default(),
             activity: Vec::new(),
         }),
@@ -4462,6 +4481,9 @@ fn a_found_pr_keeps_being_refreshed() {
             title: "done".into(),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            head: String::new(),
+            head_sha: String::new(),
+            base: "main".into(),
             health: Default::default(),
             activity: Vec::new(),
         }),
@@ -4492,6 +4514,9 @@ fn opening_a_pull_request_marks_it_read() {
             title: "done".into(),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            head: String::new(),
+            head_sha: String::new(),
+            base: "main".into(),
             health: Default::default(),
             activity: vec!["2024-04-25T19:55:42Z".into()],
         }),
@@ -15652,6 +15677,7 @@ fn jumping_to_another_projects_pr_selects_it() {
                 url: "https://github.com/o/secret/pull/3".into(),
                 is_draft: false,
                 health: Default::default(),
+                base: "main".into(),
                 head: "hush".into(),
             }],
             at: now,
