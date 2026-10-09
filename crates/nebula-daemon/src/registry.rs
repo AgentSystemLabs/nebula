@@ -6975,7 +6975,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .filter(|entry| entry.branch.as_deref() == Some("feat"))
+            .filter(|entry| entry.branch == "feat")
             .collect();
         assert_eq!(listed.len(), 1, "one git checkout: {listed:#?}");
     }
