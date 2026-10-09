@@ -4858,7 +4858,7 @@ mod tests {
         }
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join(".zshrc"), "alias claude='echo routed'\n").unwrap();
-        let (program, args) = login_shell_wrap(
+        let (_program, args) = login_shell_wrap(
             "zsh",
             "claude",
             &["--resume".to_string(), "sid-1".to_string()],
