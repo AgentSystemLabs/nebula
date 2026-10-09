@@ -265,7 +265,8 @@
   tick on a five-minute beat. Zero says nothing, and a narrow column
   drops the badge before the name. Each count is a button: a click opens the PULL REQUESTS or
   ISSUES MODAL for that project, as `v` and `i` do. See [Configuration](configuration.md#every-setting).
-- **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree" and
+- **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree"
+  or "do this in a new worktree" and
   it runs `nebula worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
   `<repo>/.claude/worktrees/` on a `worktree-*` branch). nebula creates the checkout in its usual
   `<repo-name>-worktrees/<branch>` spot — or takes the existing one for that branch — re-homes the
@@ -285,8 +286,9 @@
   agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse|grok|opencode`
   names another — opening on that task as its first prompt, so it is working before you look. The new
   card appears on the grid on its own (default name, so it titles itself), and the session you
-  asked from is untouched: no restart, no focus change. Ask for it "in a new worktree" or "on branch
-  fix-login" and the agent adds `--worktree <branch>`: the session starts in the project's worktree on
+  asked from is untouched: no restart, no focus change. Ask for that separate session "on branch
+  fix-login" or say "spin up another agent in a new worktree" and the agent adds `--worktree <branch>`:
+  the session starts in the project's worktree on
   that branch — cut first, from the same base `nebula worktree` uses, when there is none — while the
   one you asked from stays in its own checkout. Claude learns this from the same appended system
   prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission.

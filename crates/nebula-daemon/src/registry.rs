@@ -5981,12 +5981,14 @@ mod tests {
 
         // Blank names are refused before anything is touched.
         assert!(daemon.enter_worktree(&a1, "  ", None).await.is_err());
-        // So is a start point for a branch that already has a checkout.
-        let err = daemon
+        // A start point for a branch that already has a checkout is ignored
+        // for `nebula worktree`, matching the long-standing CLI fallback.
+        let (again, outcome) = daemon
             .enter_worktree(&a1, "feat", Some("main"))
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("already has a worktree"), "{err}");
+            .unwrap();
+        assert_eq!(again.id, target.id);
+        assert_eq!(outcome, EnterOutcome::AlreadyThere);
     }
 
     /// Between `nebula worktree` and the turn's Stop the row already sits
@@ -6938,6 +6940,44 @@ mod tests {
             drain_warnings(&mut events).is_empty(),
             "a clean run warns nobody"
         );
+    }
+
+    /// Two callers finding-or-cutting the same branch share one checkout:
+    /// the lookup and `git worktree add` both happen under `worktree_ops`.
+    #[tokio::test]
+    async fn worktree_on_branch_race_shares_the_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let daemon = test_daemon();
+        let project = project_at(&daemon, &repo);
+
+        let left = {
+            let daemon = daemon.clone();
+            let project_id = project.id.clone();
+            async move { daemon.worktree_on_branch(&project_id, "feat", None).await }
+        };
+        let right = {
+            let daemon = daemon.clone();
+            let project_id = project.id.clone();
+            async move { daemon.worktree_on_branch(&project_id, "feat", None).await }
+        };
+        let (left, right) = tokio::join!(left, right);
+        let left = left.unwrap();
+        let right = right.unwrap();
+
+        assert_eq!(left.id, right.id);
+        assert_eq!(left.path, right.path);
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let feat_rows: Vec<_> = worktrees.iter().filter(|w| w.branch == "feat").collect();
+        assert_eq!(feat_rows.len(), 1, "one registered row: {worktrees:#?}");
+        let listed: Vec<_> = git::list_worktrees(&repo)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.branch.as_deref() == Some("feat"))
+            .collect();
+        assert_eq!(listed.len(), 1, "one git checkout: {listed:#?}");
     }
 
     /// The delete hook runs after the checkout is gone and the row is
