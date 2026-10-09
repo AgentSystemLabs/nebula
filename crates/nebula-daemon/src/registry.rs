@@ -5905,17 +5905,13 @@ mod tests {
             .get_worktree(&WorktreeId("feat".into()))
             .unwrap()
             .unwrap();
-        daemon
-            .pending_moves
-            .lock()
-            .unwrap()
-            .insert(
-                a1.clone(),
-                PendingMove {
-                    target: feat,
-                    notice: true,
-                },
-            );
+        daemon.pending_moves.lock().unwrap().insert(
+            a1.clone(),
+            PendingMove {
+                target: feat,
+                notice: true,
+            },
+        );
 
         daemon.reparent_agent_by_cwd(&a1, "/nebula-test/p", Some("s1"), false);
         assert_eq!(
@@ -6049,17 +6045,13 @@ mod tests {
             .get_worktree(&WorktreeId("feat".into()))
             .unwrap()
             .unwrap();
-        daemon
-            .pending_moves
-            .lock()
-            .unwrap()
-            .insert(
-                a1.clone(),
-                PendingMove {
-                    target: feat,
-                    notice: true,
-                },
-            );
+        daemon.pending_moves.lock().unwrap().insert(
+            a1.clone(),
+            PendingMove {
+                target: feat,
+                notice: true,
+            },
+        );
         let status = |id: &AgentId| daemon.store.get_agent(id).unwrap().unwrap().status;
 
         daemon.apply_hook_event(&a1, HookEvent::Stop, Some("s1".into()));
@@ -6136,7 +6128,10 @@ mod tests {
         // Mid-turn: the row moves, the PTY waits for the turn's end.
         daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("s1".into()));
         daemon.move_agent(&id, &feat.id).unwrap();
-        assert_eq!(agent_worktree(&daemon, &id.to_string()), feat.id.to_string());
+        assert_eq!(
+            agent_worktree(&daemon, &id.to_string()),
+            feat.id.to_string()
+        );
         assert!(daemon.relocation_pending(&id));
         let first = daemon.session(&sref).expect("still the first PTY");
         daemon.apply_hook_event(&id, HookEvent::Stop, Some("s1".into()));
@@ -6153,7 +6148,10 @@ mod tests {
         // Idle: back to the root checkout straight away.
         daemon.move_agent(&id, &main.id).unwrap();
         assert!(!daemon.relocation_pending(&id));
-        assert_eq!(agent_worktree(&daemon, &id.to_string()), main.id.to_string());
+        assert_eq!(
+            agent_worktree(&daemon, &id.to_string()),
+            main.id.to_string()
+        );
         let third = daemon.session(&sref).expect("respawned in the root");
         assert!(!Arc::ptr_eq(&second, &third), "a new PTY");
         drop(dir);
