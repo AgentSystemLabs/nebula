@@ -85,12 +85,12 @@ pub(super) fn metrics_row(app: &mut App, out: &mut Vec<ClientRequest>) {
     open_session(app, sref, out);
 }
 
-/// Move the DIFF modal's file cursor to `index` (clamped) and read that
-/// file's diff when the cursor actually moved — ↑/↓ and a click on a file
-/// row alike.
+/// Move the DIFF modal's sidebar cursor to `index` (clamped) and read the
+/// right pane when the cursor actually moved — ↑/↓ and a click on a row
+/// alike.
 pub(super) fn diff_file(view: &mut DiffView, index: i64) {
-    if view.select(index) {
-        crate::git_diff::load_selected_diff(view);
+    if view.side_select(index) {
+        crate::git_log::load_selected(view);
     }
 }
 
@@ -99,23 +99,37 @@ pub(super) fn diff_file(view: &mut DiffView, index: i64) {
 /// or unfolds as well. On a file's row that is all there is to choose, so
 /// in the flat list this is `diff_file`.
 pub(super) fn diff_row(view: &mut DiffView, index: i64) {
-    let moved = view.select(index);
-    if view.toggle_dir(view.cursor()) || moved {
-        crate::git_diff::load_selected_diff(view);
+    let moved = view.side_select(index);
+    let changed = match view.place {
+        crate::app::Place::ChangesHeader | crate::app::Place::GraphHeader => {
+            view.fold_section(None)
+        }
+        crate::app::Place::Changes => view.toggle_dir(view.cursor()),
+        crate::app::Place::Graph => crate::git_log::fold(view, None),
+    };
+    if changed || moved {
+        crate::git_log::load_selected(view);
     }
 }
 
-/// `→` / `←` in the DIFF modal's tree: open or fold the directory under the
-/// cursor, stepping into an open one or out to the parent's row, and read
-/// whatever the cursor came to rest on.
-pub(super) fn diff_tree_step(view: &mut DiffView, inward: bool) {
-    let moved = if inward {
-        view.expand_selected()
-    } else {
-        view.collapse_selected()
+/// `→` / `←` in the DIFF modal: unfold or fold the section, commit or tree
+/// directory under the cursor, and read whatever the cursor came to rest on.
+pub(super) fn diff_fold(view: &mut DiffView, inward: bool) {
+    let moved = match view.place {
+        crate::app::Place::ChangesHeader | crate::app::Place::GraphHeader => {
+            view.fold_section(Some(inward))
+        }
+        crate::app::Place::Changes => {
+            if inward {
+                view.expand_selected()
+            } else {
+                view.collapse_selected()
+            }
+        }
+        crate::app::Place::Graph => crate::git_log::fold(view, Some(inward)),
     };
     if moved {
-        crate::git_diff::load_selected_diff(view);
+        crate::git_log::load_selected(view);
     }
 }
 
@@ -125,7 +139,7 @@ pub(super) fn diff_tree_step(view: &mut DiffView, inward: bool) {
 /// reads a diff.
 pub(super) fn diff_tree_toggled(view: &mut DiffView) {
     if view.toggle_tree() {
-        crate::git_diff::load_selected_diff(view);
+        crate::git_log::load_selected(view);
     }
 }
 
@@ -133,8 +147,12 @@ pub(super) fn diff_tree_toggled(view: &mut DiffView) {
 /// Esc: the file list narrows, and when that moved the cursor onto another
 /// file its diff is read.
 pub(super) fn diff_filter_changed(view: &mut DiffView) {
-    if view.apply_filter() {
-        crate::git_diff::load_selected_diff(view);
+    let changed = view.apply_filter();
+    if let Some(log) = &mut view.log {
+        log.apply_filter(&view.filter);
+    }
+    if changed || matches!(view.place, crate::app::Place::Graph) {
+        crate::git_log::load_selected(view);
     }
 }
 

@@ -365,10 +365,17 @@ pub(crate) fn open_diff_view(app: &mut App) {
     let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
+    let show_graph = crate::config::Config::load().source_control_graph;
     let Some(jobs) = app.jobs.view_jobs.clone() else {
         // No loop to land an answer on (unit tests): read inline.
         match crate::git_diff::read_listing(&path) {
-            Ok(listing) => show_diff_listing(app, path, branch, listing),
+            Ok(listing) => {
+                if show_graph {
+                    show_graph_diff_listing(app, path, branch, listing);
+                } else {
+                    show_diff_listing(app, path, branch, listing);
+                }
+            }
             Err(msg) => app.chrome.flash = Some(msg),
         }
         return;
@@ -377,13 +384,17 @@ pub(crate) fn open_diff_view(app: &mut App) {
     let selected = app.selected_worktree().map(|w| w.id.clone());
     let known_clean =
         matches!(&app.jobs.git_changes, Some((id, Some(0))) if Some(id) == selected.as_ref());
-    if known_clean {
+    if known_clean && !show_graph {
         app.chrome.flash = Some(format!("no changes in {branch}"));
         app.jobs.diff_probe = Some((ticket, path.clone(), branch));
     } else {
         let mut view = DiffView::opening(path.clone(), branch, jobs.clone(), ticket);
         view.files_width = app.modals.diff_files_width;
         view.split = app.modals.diff_split;
+        if show_graph {
+            view.place = crate::app::Place::ChangesHeader;
+            crate::git_log::request_log(&mut view);
+        }
         if app.modals.diff_tree {
             view.toggle_tree();
         }
@@ -398,6 +409,7 @@ pub(crate) fn open_diff_view(app: &mut App) {
             .filter(|(id, files)| Some(id) == selected.as_ref() && !files.is_empty());
         if let Some((_, files)) = polled {
             view.replace_files(files.clone());
+            view.place = crate::app::Place::Changes;
             crate::git_diff::load_selected_diff(&mut view);
         }
         app.modals.overlay = Some(Overlay::Diff(view));
@@ -408,6 +420,25 @@ pub(crate) fn open_diff_view(app: &mut App) {
             result: crate::git_diff::read_listing(&path),
         })
     });
+}
+
+pub(crate) fn show_graph_diff_listing(
+    app: &mut App,
+    path: std::path::PathBuf,
+    branch: String,
+    listing: crate::view_jobs::DiffListing,
+) {
+    let mut view = DiffView::new(path, branch, Vec::new(), true);
+    view.jobs = app.jobs.view_jobs.clone();
+    view.files_width = app.modals.diff_files_width;
+    view.split = app.modals.diff_split;
+    view.place = crate::app::Place::ChangesHeader;
+    if app.modals.diff_tree {
+        view.toggle_tree();
+    }
+    crate::git_log::request_log(&mut view);
+    crate::git_diff::fill_view(&mut view, listing);
+    app.modals.overlay = Some(Overlay::Diff(view));
 }
 
 /// Open the DIFF VIEWER on a listing already in hand — or say there is
@@ -544,6 +575,16 @@ pub(crate) fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) 
             Some(Overlay::FileTabs(view)) => view.land_preview(ticket, *preview),
             _ => {}
         },
+        Answer::Log { ticket, result } => {
+            if let Some(Overlay::Diff(view)) = &mut app.modals.overlay {
+                crate::git_log::land_log(view, ticket, result);
+            }
+        }
+        Answer::CommitFiles { view, sha, result } => {
+            if let Some(Overlay::Diff(diff)) = &mut app.modals.overlay {
+                crate::git_log::land_files(diff, view, &sha, result);
+            }
+        }
         Answer::ClipboardViaTerminal { payload, flash } => {
             app.chrome.pending_clipboard = Some(payload);
             app.chrome.flash = Some(flash);
@@ -612,12 +653,19 @@ pub(crate) fn land_diff_listing(
         }
         return;
     }
-    let branch = match &app.modals.overlay {
-        Some(Overlay::Diff(view)) if view.listing == Some(ticket) => view.branch.clone(),
+    let (branch, has_graph) = match &app.modals.overlay {
+        Some(Overlay::Diff(view)) if view.listing == Some(ticket) => {
+            (view.branch.clone(), view.log.is_some())
+        }
         _ => return,
     };
     match result {
         Ok(listing) if !listing.files.is_empty() => {
+            if let Some(Overlay::Diff(view)) = &mut app.modals.overlay {
+                crate::git_diff::fill_view(view, listing);
+            }
+        }
+        Ok(listing) if has_graph => {
             if let Some(Overlay::Diff(view)) = &mut app.modals.overlay {
                 crate::git_diff::fill_view(view, listing);
             }

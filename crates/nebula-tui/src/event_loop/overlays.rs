@@ -484,10 +484,11 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Overlay::Diff(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            // Ctrl+d/u walk the file list half its height, as in vim —
-            // the flat list and the tree alike; the diff pages on PgUp/PgDn.
+            // Ctrl+d/u walk the sidebar half its height, as in vim; the
+            // diff pages on PgUp/PgDn.
             let half = (view.list_area.height / 2).max(1) as i64;
             let page = view.view_height.max(1) as i32;
+            let at = view.side_cursor() as i64;
             match key.code {
                 // Two-stage escape: an active filter is cleared before the
                 // second Esc closes the modal.
@@ -496,13 +497,11 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     activate::diff_filter_changed(view);
                 }
                 KeyCode::Esc => app.modals.overlay = None,
-                KeyCode::Char('d') if ctrl => {
-                    activate::diff_file(view, view.cursor() as i64 + half)
-                }
+                KeyCode::Char('d') if ctrl => activate::diff_file(view, at + half),
                 // Ctrl+u is the line editor's kill-to-start while something
                 // is typed; only with an empty filter does it move.
                 KeyCode::Char('u') if ctrl && view.filter.is_empty() => {
-                    activate::diff_file(view, view.cursor() as i64 - half)
+                    activate::diff_file(view, at - half)
                 }
                 // Ctrl+r toggles the reviewed ✓ on the selected file —
                 // nebula-side bookkeeping only, no git state is touched.
@@ -533,17 +532,15 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
-                KeyCode::Down => activate::diff_file(view, view.cursor() as i64 + 1),
-                KeyCode::Up => activate::diff_file(view, view.cursor() as i64 - 1),
-                // The tree folds on the TREE BROWSER's keys: →/← open and
-                // fold a directory (or step in / out to the parent), Enter
-                // flips the one under the cursor. In the flat list all
-                // three stay the filter's.
-                KeyCode::Right if view.tree.is_some() => activate::diff_tree_step(view, true),
-                KeyCode::Left if view.tree.is_some() => activate::diff_tree_step(view, false),
-                KeyCode::Enter if view.tree.is_some() => {
-                    activate::diff_row(view, view.cursor() as i64)
-                }
+                KeyCode::Down => activate::diff_file(view, at + 1),
+                KeyCode::Up => activate::diff_file(view, at - 1),
+                // ->/<- unfold and fold what the cursor is on (a section, a
+                // commit, a tree directory) or step in / out to the parent,
+                // as in the TREE BROWSER; Enter flips it. On the flat
+                // list's files all three stay the filter's.
+                KeyCode::Right if view.folds_on_arrows() => activate::diff_fold(view, true),
+                KeyCode::Left if view.folds_on_arrows() => activate::diff_fold(view, false),
+                KeyCode::Enter if view.folds_on_arrows() => activate::diff_row(view, at),
                 KeyCode::PageDown => view.scroll_by(page),
                 KeyCode::PageUp => view.scroll_by(-page),
                 KeyCode::Home => view.scroll = 0,

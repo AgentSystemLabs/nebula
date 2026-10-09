@@ -1208,9 +1208,21 @@ fn draw_diff_overlay(f: &mut Frame, app: &mut App, view: crate::app::DiffView) {
 
     // Right: the selected file's diff, scrolled — or, on a tree
     // directory's row, the list of what changed under it.
-    let sel_path = match view.selected_dir() {
-        Some(dir) => format!("{dir}/"),
-        None => view.selected_path().unwrap_or("").to_string(),
+    let sel_path = if view.place == crate::app::Place::Graph {
+        view.log
+            .as_ref()
+            .and_then(|log| log.selected_key())
+            .unwrap_or_else(|| "GRAPH".into())
+    } else if matches!(
+        view.place,
+        crate::app::Place::ChangesHeader | crate::app::Place::GraphHeader
+    ) {
+        "status".into()
+    } else {
+        match view.selected_dir() {
+            Some(dir) => format!("{dir}/"),
+            None => view.selected_path().unwrap_or("").to_string(),
+        }
     };
     let sel_reviewed = view.reviewed.contains_key(&sel_path);
     let title = truncate(
@@ -1357,6 +1369,251 @@ fn draw_split_diff(
     f.render_widget(Paragraph::new(right), right_a);
 }
 
+/// A section header's fold marker and name, bold.
+fn header_spans(open: bool, name: &str, th: Theme) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            if open { "▾ " } else { "▸ " },
+            Style::default().fg(th.accent),
+        ),
+        Span::styled(
+            name.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]
+}
+
+fn changes_header_spans(view: &crate::app::DiffView, th: Theme) -> Vec<Span<'static>> {
+    let name = if view.prefetched.is_some() {
+        "FILES"
+    } else {
+        "CHANGES"
+    };
+    let mut spans = header_spans(view.changes_open, name, th);
+    let count = if view.listing.is_some() && view.files.is_empty() {
+        " (…)".to_string()
+    } else if view.filter.is_empty() {
+        format!(" ({})", view.files.len())
+    } else {
+        format!(" ({}/{})", view.matches.len(), view.files.len())
+    };
+    spans.push(Span::styled(count, Style::default().fg(th.dim)));
+    if !view.reviewed.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {}✓", view.reviewed.len()),
+            Style::default().fg(th.dim),
+        ));
+    }
+    spans
+}
+
+fn graph_header_spans(view: &crate::app::DiffView, th: Theme) -> Vec<Span<'static>> {
+    let mut spans = header_spans(view.graph_open, "GRAPH", th);
+    let Some(log) = &view.log else {
+        return spans;
+    };
+    let commits = log
+        .rows
+        .iter()
+        .filter(|r| matches!(r.entry, crate::git_log::Entry::Commit(_)));
+    let count = if log.reading.is_some() && log.commits.is_empty() {
+        " (…)".to_string()
+    } else if view.filter.is_empty() {
+        format!(" ({})", log.commits.len())
+    } else {
+        format!(" ({}/{})", commits.count(), log.commits.len())
+    };
+    spans.push(Span::styled(count, Style::default().fg(th.dim)));
+    let (ahead, behind) = log.sides();
+    if ahead > 0 {
+        spans.push(Span::styled(
+            format!("  ↑{ahead}"),
+            Style::default().fg(th.ok),
+        ));
+    }
+    if behind > 0 {
+        spans.push(Span::styled(
+            format!("  ↓{behind}"),
+            Style::default().fg(th.warn),
+        ));
+    }
+    spans
+}
+
+fn change_gutter(
+    file: Option<&crate::git_diff::DiffFile>,
+    reviewed: bool,
+    th: Theme,
+) -> Vec<Span<'static>> {
+    let status = match file {
+        Some(file) => Span::styled(
+            format!("{} ", file.status_str()),
+            Style::default().fg(match (file.xy[0], file.xy[1]) {
+                ('?', '?') | ('A', _) => th.ok,
+                ('D', _) | (_, 'D') => th.err,
+                ('R', _) | ('C', _) => th.accent,
+                _ => th.warn,
+            }),
+        ),
+        None => Span::raw("   "),
+    };
+    let mark = if reviewed {
+        Span::styled("✓ ", Style::default().fg(th.ok))
+    } else {
+        Span::raw("  ")
+    };
+    vec![status, mark]
+}
+
+fn change_row_spans(
+    view: &crate::app::DiffView,
+    i: usize,
+    done: Option<&[bool]>,
+    width: u16,
+    th: Theme,
+) -> Vec<Span<'static>> {
+    let Some(tree) = &view.tree else {
+        let Some(m) = view.matches.get(i) else {
+            return Vec::new();
+        };
+        let file = &view.files[m.file];
+        let budget = (width as usize).saturating_sub(5);
+        let mut spans = change_gutter(Some(file), view.reviewed.contains_key(&file.path), th);
+        let shown = truncate(&file.path, budget);
+        let used = shown.chars().count();
+        spans.extend(fuzzy_highlight_spans(&shown, &m.positions, th));
+        if let Some(orig) = &file.orig_path {
+            let rest = budget.saturating_sub(used);
+            if rest > 3 {
+                spans.push(Span::styled(
+                    truncate(&format!(" ← {orig}"), rest),
+                    Style::default().fg(th.dim),
+                ));
+            }
+        }
+        return spans;
+    };
+    let Some(r) = tree.rows.get(i) else {
+        return Vec::new();
+    };
+    let node = &tree.nodes[r.node];
+    let file = tree.file_of[r.node].map(|f| &view.files[f]);
+    let indent = "  ".repeat(node.depth);
+    let marker = if !node.is_dir {
+        "  "
+    } else if tree.is_open(r.node, !view.filter.is_empty()) {
+        "▾ "
+    } else {
+        "▸ "
+    };
+    let budget = (width as usize).saturating_sub(5 + indent.chars().count() + 2);
+    let shown = truncate(&node.name, budget);
+    let reviewed = done.is_some_and(|d| d[r.node]);
+    let mut spans = change_gutter(file, reviewed, th);
+    spans.push(Span::raw(indent));
+    spans.push(Span::styled(marker, Style::default().fg(th.accent)));
+    if node.is_dir {
+        spans.push(Span::styled(shown, Style::default().fg(th.accent)));
+    } else {
+        let positions = visible_positions(&r.positions, &shown, &node.name);
+        spans.extend(fuzzy_highlight_spans(&shown, positions, th));
+    }
+    spans
+}
+
+fn graph_spans(graph: &str, under: bool, th: Theme) -> Vec<Span<'static>> {
+    let lanes = [th.accent, th.ok, th.warn, th.special, th.merged, th.err];
+    graph
+        .chars()
+        .enumerate()
+        .map(|(col, ch)| {
+            let glyph = match ch {
+                '*' if under => '│',
+                '*' => '●',
+                '|' => '│',
+                '/' => '╱',
+                '\\' => '╲',
+                '-' | '_' => '─',
+                other => other,
+            };
+            Span::styled(
+                glyph.to_string(),
+                Style::default().fg(lanes[col / 2 % lanes.len()]),
+            )
+        })
+        .collect()
+}
+
+fn log_row_spans(
+    log: &crate::git_log::GitLog,
+    i: usize,
+    now: i64,
+    th: Theme,
+) -> Vec<Span<'static>> {
+    use crate::git_log::{Entry, RefKind, Side};
+    let Some(r) = log.rows.get(i) else {
+        return Vec::new();
+    };
+    let dim = Style::default().fg(th.dim);
+    let graph = r.line.map_or("", |n| log.lines[n].0.as_str());
+    let under = matches!(r.entry, Entry::File(..) | Entry::Note(_));
+    let mut spans = graph_spans(graph, under, th);
+    if !graph.is_empty() {
+        spans.push(Span::raw(" "));
+    }
+    match r.entry {
+        Entry::Graph => {}
+        Entry::Note(c) => spans.push(Span::styled(format!("   {}", log.note(c)), dim)),
+        Entry::File(c, f) => {
+            if let Some(file) = log.file_at(c, f) {
+                spans.push(Span::raw("  "));
+                spans.extend(change_gutter(Some(file), false, th).into_iter().take(1));
+                spans.push(Span::raw(file.path.clone()));
+                if let Some(orig) = &file.orig_path {
+                    spans.push(Span::styled(format!(" ← {orig}"), dim));
+                }
+            }
+        }
+        Entry::Commit(c) => {
+            let c = &log.commits[c];
+            match c.side {
+                Side::Ahead => spans.push(Span::styled("↑ ", Style::default().fg(th.ok))),
+                Side::Behind => spans.push(Span::styled("↓ ", Style::default().fg(th.warn))),
+                Side::Shared => {}
+            }
+            if r.positions.is_empty() {
+                spans.push(Span::styled(c.short.clone(), Style::default().fg(th.muted)));
+                if !c.refs.is_empty() {
+                    spans.push(Span::raw(" ("));
+                    for (n, rf) in c.refs.iter().enumerate() {
+                        if n > 0 {
+                            spans.push(Span::raw(", "));
+                        }
+                        let style = Style::default().fg(match rf.kind {
+                            RefKind::Head | RefKind::Local => th.ok,
+                            RefKind::Remote => th.accent,
+                            RefKind::Tag => th.warn,
+                        });
+                        let style = if rf.kind == RefKind::Head {
+                            style.add_modifier(Modifier::BOLD)
+                        } else {
+                            style
+                        };
+                        spans.push(Span::styled(rf.label(), style));
+                    }
+                    spans.push(Span::raw(")"));
+                }
+                spans.push(Span::raw(format!(" {}", c.subject)));
+            } else {
+                spans.extend(fuzzy_highlight_spans(&c.haystack(), &r.positions, th));
+            }
+            let ago = crate::hosts::ago_label(now - c.time * 1000);
+            spans.push(Span::styled(format!("  {} · {ago}", c.author), dim));
+        }
+    }
+    spans
+}
+
 fn draw_diff_file_list(
     f: &mut Frame,
     view: &crate::app::DiffView,
@@ -1366,7 +1623,9 @@ fn draw_diff_file_list(
     // Left: changed-file list — flat paths, or the directory tree
     // (`Ctrl+t`); a stateless follow-window keeps the selected row
     // visible.
-    let mut files_title = if view.listing.is_some() && view.files.is_empty() {
+    let mut files_title = if view.log.is_some() {
+        "Source control".to_string()
+    } else if view.listing.is_some() && view.files.is_empty() {
         "Files (…)".to_string()
     } else if view.filter.is_empty() {
         format!("Files ({})", view.files.len())
@@ -1395,90 +1654,61 @@ fn draw_diff_file_list(
     }
     let list_inner = below_first_row(files_inner);
 
-    if view.listing.is_some() && view.files.is_empty() {
-        empty_list_row(f, list_inner, "reading changes…", th);
-    } else if view.row_count() == 0 {
-        empty_list_row(f, list_inner, NO_MATCHES, th);
-    }
-    let start = view.window_start(list_inner.height as usize);
-    // Both lists open a row the same way: the status code, then the
-    // ✓ — so the two columns read straight down whichever is up.
-    let gutter = |file: Option<&crate::git_diff::DiffFile>, reviewed: bool| {
-        let status = match file {
-            Some(file) => Span::styled(
-                format!("{} ", file.status_str()),
-                Style::default().fg(match (file.xy[0], file.xy[1]) {
-                    ('?', '?') | ('A', _) => th.ok,
-                    ('D', _) | (_, 'D') => th.err,
-                    ('R', _) | ('C', _) => th.accent,
-                    _ => th.warn,
-                }),
-            ),
-            None => Span::raw("   "),
-        };
-        let mark = if reviewed {
-            Span::styled("✓ ", Style::default().fg(th.ok))
-        } else {
-            Span::raw("  ")
-        };
-        vec![status, mark]
-    };
-    match &view.tree {
-        None => {
-            for (row, (i, m)) in view.matches.iter().enumerate().skip(start).enumerate() {
-                let Some(row_area) = row_rect(list_inner, row) else {
-                    break;
-                };
-                let file = &view.files[m.file];
-                let budget = (list_inner.width as usize).saturating_sub(5);
-                let mut spans = gutter(Some(file), view.reviewed.contains_key(&file.path));
-                let shown = truncate(&file.path, budget);
-                let used = shown.chars().count();
-                spans.extend(fuzzy_highlight_spans(&shown, &m.positions, th));
-                if let Some(orig) = &file.orig_path {
-                    let rest = budget.saturating_sub(used);
-                    if rest > 3 {
-                        spans.push(Span::styled(
-                            truncate(&format!(" ← {orig}"), rest),
-                            Style::default().fg(th.dim),
-                        ));
-                    }
+    if view.log.is_some() {
+        let done = view
+            .tree
+            .as_ref()
+            .map(|tree| tree.reviewed_nodes(&view.files, &view.reviewed));
+        let start = crate::app::window_start(view.side_cursor(), list_inner.height as usize);
+        let now = crate::app::now_ms() as i64;
+        for row in 0..list_inner.height as usize {
+            let index = start + row;
+            let Some((place, inner)) = view.side_row(index) else {
+                break;
+            };
+            let Some(row_area) = row_rect(list_inner, row) else {
+                break;
+            };
+            let spans = match place {
+                crate::app::Place::ChangesHeader => changes_header_spans(view, th),
+                crate::app::Place::Changes => {
+                    change_row_spans(view, inner, done.as_deref(), list_inner.width, th)
                 }
-                render_row(f, row_area, spans, i == view.selected, true, th);
-            }
+                crate::app::Place::GraphHeader => graph_header_spans(view, th),
+                crate::app::Place::Graph => view
+                    .log
+                    .as_ref()
+                    .map(|log| log_row_spans(log, inner, now, th))
+                    .unwrap_or_default(),
+            };
+            render_row(f, row_area, spans, index == view.side_cursor(), true, th);
         }
-        // The TREE BROWSER's rows behind the flat list's gutter: a
-        // directory wears the fold marker and the accent, and its ✓
-        // once every file under it has one.
-        Some(tree) => {
-            let done = tree.reviewed_nodes(&view.files, &view.reviewed);
-            for (row, (i, r)) in tree.rows.iter().enumerate().skip(start).enumerate() {
-                let Some(row_area) = row_rect(list_inner, row) else {
-                    break;
-                };
-                let node = &tree.nodes[r.node];
-                let file = tree.file_of[r.node].map(|f| &view.files[f]);
-                let indent = "  ".repeat(node.depth);
-                let marker = if !node.is_dir {
-                    "  "
-                } else if tree.is_open(r.node, !view.filter.is_empty()) {
-                    "▾ "
-                } else {
-                    "▸ "
-                };
-                let budget =
-                    (list_inner.width as usize).saturating_sub(5 + indent.chars().count() + 2);
-                let shown = truncate(&node.name, budget);
-                let mut spans = gutter(file, done[r.node]);
-                spans.push(Span::raw(indent));
-                spans.push(Span::styled(marker, Style::default().fg(th.accent)));
-                if node.is_dir {
-                    spans.push(Span::styled(shown, Style::default().fg(th.accent)));
-                } else {
-                    let positions = visible_positions(&r.positions, &shown, &node.name);
-                    spans.extend(fuzzy_highlight_spans(&shown, positions, th));
+    } else if view.listing.is_some() && view.files.is_empty() {
+        empty_list_row(f, list_inner, "reading changes…", th);
+    } else {
+        if view.row_count() == 0 {
+            empty_list_row(f, list_inner, NO_MATCHES, th);
+        }
+        let start = view.window_start(list_inner.height as usize);
+        match &view.tree {
+            None => {
+                for (row, (i, _)) in view.matches.iter().enumerate().skip(start).enumerate() {
+                    let Some(row_area) = row_rect(list_inner, row) else {
+                        break;
+                    };
+                    let spans = change_row_spans(view, i, None, list_inner.width, th);
+                    render_row(f, row_area, spans, i == view.selected, true, th);
                 }
-                render_row(f, row_area, spans, i == tree.selected, true, th);
+            }
+            Some(tree) => {
+                let done = tree.reviewed_nodes(&view.files, &view.reviewed);
+                for (row, (i, _)) in tree.rows.iter().enumerate().skip(start).enumerate() {
+                    let Some(row_area) = row_rect(list_inner, row) else {
+                        break;
+                    };
+                    let spans = change_row_spans(view, i, Some(&done), list_inner.width, th);
+                    render_row(f, row_area, spans, i == tree.selected, true, th);
+                }
             }
         }
     }

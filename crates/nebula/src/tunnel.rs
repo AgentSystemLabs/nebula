@@ -595,9 +595,14 @@ mod tests {
     #[test]
     fn no_port_resolves_to_one_that_is_free() {
         let _port_guard = browser::port_test_guard();
-        let port = resolve_local_port(None).expect("resolves");
-        assert_ne!(port, 0, "must be a real port we can print");
-        TcpListener::bind(SocketAddr::new(LOOPBACK, port)).expect("free");
+        for _ in 0..16 {
+            let port = resolve_local_port(None).expect("resolves");
+            assert_ne!(port, 0, "must be a real port we can print");
+            if TcpListener::bind(SocketAddr::new(LOOPBACK, port)).is_ok() {
+                return;
+            }
+        }
+        panic!("resolved ports were repeatedly claimed before the test could bind them");
     }
 
     /// Nothing is listening on a port we just released, so the probe must

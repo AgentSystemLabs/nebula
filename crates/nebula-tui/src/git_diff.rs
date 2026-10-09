@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 /// Keep pathological diffs from bloating the overlay state.
-const MAX_DIFF_LINES: usize = 20_000;
+pub const MAX_DIFF_LINES: usize = 20_000;
 
 /// One changed file from `git status --porcelain=v1 -z`.
 #[derive(Debug, Clone, PartialEq)]
@@ -311,10 +311,28 @@ pub fn head_oid(root: &Path) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Diff text for one file. Never fails: errors become the displayed text so
-/// the modal survives a repo vanishing out from under it.
-pub fn diff_for(root: &Path, file: &DiffFile, head_ok: bool) -> String {
-    let output = if file.is_untracked() {
+/// Diff text for one file: its uncommitted changes, or (given a commit)
+/// what that commit changed in it against its first parent. Never fails:
+/// errors become the displayed text so the modal survives a repo vanishing
+/// out from under it.
+pub fn diff_for(root: &Path, file: &DiffFile, head_ok: bool, commit: Option<&str>) -> String {
+    let output = if let Some(sha) = commit {
+        let mut args = vec![
+            "show",
+            "--format=",
+            "--no-color",
+            "--no-ext-diff",
+            "-M",
+            "--diff-merges=first-parent",
+            sha,
+            "--",
+            &file.path,
+        ];
+        if let Some(orig) = &file.orig_path {
+            args.push(orig);
+        }
+        run_git(root, &args)
+    } else if file.is_untracked() {
         // --no-index exits 1 when the files differ; only >= 2 is an error.
         run_git(
             root,
@@ -387,7 +405,7 @@ pub fn read_listing(root: &Path) -> Result<crate::view_jobs::DiffListing, String
         .iter()
         .filter_map(|file| {
             let mark = *stored.get(&file.path)?;
-            let diff = diff_for(root, file, head.is_some());
+            let diff = diff_for(root, file, head.is_some(), None);
             (crate::review::fingerprint(&diff) == mark).then(|| (file.path.clone(), mark))
         })
         .collect();
@@ -446,8 +464,13 @@ pub fn fill_view(view: &mut DiffView, listing: crate::view_jobs::DiffListing) {
     if head_changed {
         view.cache.clear();
     }
-    if head_changed || view.selected_file() != before.as_ref() {
-        load_selected_diff(view);
+    let changed = head_changed || view.selected_file() != before.as_ref() || view.settle();
+    if changed {
+        if view.log.is_some() {
+            crate::git_log::load_selected(view);
+        } else {
+            load_selected_diff(view);
+        }
     }
 }
 
@@ -481,7 +504,7 @@ pub fn load_selected_diff(view: &mut DiffView) {
         return;
     }
     let Some(jobs) = view.jobs.clone() else {
-        let diff = diff_for(&view.root, &file, view.head_ok);
+        let diff = diff_for(&view.root, &file, view.head_ok, None);
         view.show_diff(Some(&file.path), diff, false);
         return;
     };
@@ -505,7 +528,7 @@ fn request_diff(
         Some(crate::view_jobs::Answer::DiffText {
             view: id,
             ticket,
-            diff: diff_for(&root, &file, head_ok),
+            diff: diff_for(&root, &file, head_ok, None),
             path: file.path,
             prefetch,
         })
@@ -542,6 +565,7 @@ pub fn land_diff(
     if !(same_file && view.diff == diff) {
         view.show_diff(Some(path), diff, same_file);
     }
+    crate::git_log::read_ahead(view);
     let next = view
         .file_after_cursor()
         .filter(|file| view.cached(&file.path).is_none())
@@ -916,11 +940,11 @@ mod tests {
         assert!(fresh.is_untracked());
 
         assert!(has_head(&repo));
-        let diff = diff_for(&repo, tracked, true);
+        let diff = diff_for(&repo, tracked, true, None);
         assert!(diff.contains("-old line"), "{diff}");
         assert!(diff.contains("+new line"), "{diff}");
         // Untracked goes through the --no-index exit-1 path.
-        let diff = diff_for(&repo, fresh, true);
+        let diff = diff_for(&repo, fresh, true, None);
         assert!(diff.contains("+hello"), "{diff}");
     }
 
@@ -969,7 +993,7 @@ mod tests {
         let files = changed_files(&repo).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].is_untracked());
-        let diff = diff_for(&repo, &files[0], false);
+        let diff = diff_for(&repo, &files[0], false, None);
         assert!(diff.contains("+content"), "{diff}");
     }
 

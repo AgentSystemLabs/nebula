@@ -402,6 +402,7 @@ pub enum SettingKind {
     BlackBackground,
     HideCardMarks,
     HighlightCurrentCard,
+    SourceControlGraph,
     SessionPane,
     WorktreeLayout,
     ExpandAllWorktrees,
@@ -510,6 +511,7 @@ impl SettingKind {
             SettingKind::HighlightCurrentCard => (2026, 9, 28),
             SettingKind::AskBeforeArchive => (2026, 10, 3),
             SettingKind::ConfirmDragMove => (2026, 10, 2),
+            SettingKind::SourceControlGraph => (2026, 10, 9),
         }
     }
 
@@ -711,6 +713,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::HideDraftPrs,
                 label: "Draft pull requests",
                 hint: "Show or hide draft pull requests in / search; checkouts always stay",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::SourceControlGraph,
+                label: "Show commit graph",
+                hint: "Add the read-only git commit graph under the g diff view's changed files",
                 group: "",
             },
         ]),
@@ -1125,6 +1133,10 @@ pub struct Config {
     /// the SESSIONS PANEL — those describe work you have, not work you are
     /// browsing. Off by default: a config predating the key hides nothing.
     pub hide_draft_prs: bool,
+    /// SOURCE CONTROL GRAPH: when on, the `g` DIFF VIEWER reads a
+    /// read-only commit graph under the changed files. Off by default, and
+    /// with it off the DIFF VIEWER does not run `git log` or `rev-list`.
+    pub source_control_graph: bool,
     /// RETIRED with the line counts always drawn. Through 0.37 the **Card
     /// line counts** SETTING (Settings → Appearance, off by default)
     /// switched each card's `+3 files` to `+3 files +120 -45`. Every card
@@ -1467,6 +1479,7 @@ impl Default for Config {
             hide_card_prompt: false,
             card_issue_number: true,
             hide_draft_prs: false,
+            source_control_graph: false,
             card_line_changes: false,
             skip_session_naming: false,
             confirm_on_archive: false,
@@ -2309,6 +2322,7 @@ impl Config {
             SettingKind::ExpandAllWorktrees => on_off(self.expand_all_worktrees).into(),
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
+            SettingKind::SourceControlGraph => on_off(self.source_control_graph).into(),
             // A project row with no project to speak of: what one without
             // an entry would show.
             SettingKind::RunCommand | SettingKind::OpenCommand => {
@@ -2428,6 +2442,9 @@ impl Config {
             }
             SettingKind::HideDraftPrs => {
                 self.hide_draft_prs = !self.hide_draft_prs;
+            }
+            SettingKind::SourceControlGraph => {
+                self.source_control_graph = !self.source_control_graph;
             }
             // One project's, not the file's, and typed: see `set_project_text`.
             SettingKind::RunCommand | SettingKind::OpenCommand => {}
@@ -3683,6 +3700,21 @@ mod tests {
         assert!(!legacy.hide_draft_prs);
     }
 
+    #[test]
+    fn source_control_graph_defaults_off_and_toggles_on_the_appearance_tab() {
+        let mut cfg = Config::default();
+        assert!(!cfg.source_control_graph);
+        assert_eq!(cfg.value_label(SettingKind::SourceControlGraph), "off");
+
+        let (tab, row) = locate(SettingKind::SourceControlGraph).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.source_control_graph);
+        assert_eq!(cfg.value_label(SettingKind::SourceControlGraph), "on");
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.source_control_graph);
+    }
+
     /// CARD PROMPT: retired with every card carrying its last prompt. The
     /// key an older build wrote (`hide_card_prompt`, off by default) still
     /// loads to what it wrote and is written back as stored, but no tab
@@ -3801,7 +3833,7 @@ mod tests {
     /// CARD LINE COUNTS: retired with every card counting its lines. The
     /// key an older build wrote (`card_line_changes`, off by default) still
     /// loads to what it wrote and is written back as stored, but no tab
-    /// shows it any more — Appearance ends on DRAFT PULL REQUESTS.
+    /// shows it any more — Appearance carries later source-control settings.
     #[test]
     fn card_line_counts_is_retired_but_still_round_trips() {
         assert!(
@@ -3829,8 +3861,8 @@ mod tests {
         );
         assert_eq!(
             rows.last().map(|r| r.kind),
-            Some(SettingKind::HideDraftPrs),
-            "Appearance ends on DRAFT PULL REQUESTS"
+            Some(SettingKind::SourceControlGraph),
+            "Appearance ends on SOURCE CONTROL GRAPH"
         );
     }
 

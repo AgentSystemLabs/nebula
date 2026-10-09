@@ -259,11 +259,13 @@ fn handle_diff_mouse(
         let over_files = view.area.contains(mouse_pos) && mouse.column < view.splitter_x();
         match mouse.kind {
             MouseEventKind::ScrollUp if over_files => {
-                activate::diff_file(view, view.cursor() as i64 - 1);
+                let at = view.side_cursor();
+                activate::diff_file(view, at as i64 - 1);
                 app.chrome.dirty = true;
             }
             MouseEventKind::ScrollDown if over_files => {
-                activate::diff_file(view, view.cursor() as i64 + 1);
+                let at = view.side_cursor();
+                activate::diff_file(view, at as i64 + 1);
                 app.chrome.dirty = true;
             }
             MouseEventKind::ScrollUp => {
@@ -283,12 +285,22 @@ fn handle_diff_mouse(
                     return true;
                 }
                 let area = view.list_area;
-                let first = view.window_start(area.height as usize);
-                if let Some(index) =
-                    crate::list_hit::row_at(area, first, view.row_count(), mouse_pos)
-                {
-                    activate::diff_row(view, index as i64);
-                    app.chrome.dirty = true;
+                if view.log.is_some() {
+                    let first = crate::app::window_start(view.side_cursor(), area.height as usize);
+                    if let Some(index) =
+                        crate::list_hit::row_at(area, first, view.side_len(), mouse_pos)
+                    {
+                        activate::diff_row(view, index as i64);
+                        app.chrome.dirty = true;
+                    }
+                } else {
+                    let first = view.window_start(area.height as usize);
+                    if let Some(index) =
+                        crate::list_hit::row_at(area, first, view.row_count(), mouse_pos)
+                    {
+                        activate::diff_row(view, index as i64 + 1);
+                        app.chrome.dirty = true;
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
