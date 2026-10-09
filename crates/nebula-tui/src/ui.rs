@@ -16,6 +16,9 @@ use ratatui::Frame;
 mod footer;
 mod launcher_view;
 mod overlay;
+mod rows;
+
+pub(crate) use rows::{fit_to_width, render_row, status_dot};
 
 /// Outer size of the editor modal, as (width, height) percent of the frame.
 /// Shared with the event loop's pre-draw PTY size guess.
@@ -1189,128 +1192,6 @@ fn fit_ago(ago: String, free: usize) -> (String, usize) {
         Some(rest) if rest >= MIN_NAME_W => (ago, rest),
         _ => (String::new(), free),
     }
-}
-
-/// The dot. `unseen` splits the finished state in two: blue while a
-/// finished turn is still unread — the one state that wants a human — and
-/// green once the cursor has been on it, which is a result filed away, not
-/// a job. Every other status ignores the flag.
-fn status_dot(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Span<'static> {
-    let glyph = match status {
-        Some(AgentStatus::Disconnected) | None => "○ ",
-        Some(_) => "● ",
-    };
-    Span::styled(glyph, Style::default().fg(status_color(status, unseen, th)))
-}
-
-/// The STATUS DOT's color on its own, for the marks that answer to it:
-/// the selection rail of a PILL ROW, the `▌` of a PROJECT button and the
-/// TAB UNDERLINE all take the row's dot color, so the cursor carries the
-/// row's status rather than the theme accent.
-fn status_color(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Color {
-    match status {
-        Some(AgentStatus::Fresh) => th.dim,
-        Some(AgentStatus::Running) => th.warn,
-        Some(AgentStatus::Finished) if unseen => th.done,
-        Some(AgentStatus::Finished) => th.ok,
-        Some(AgentStatus::NeedsFeedback) => th.err,
-        Some(AgentStatus::Terminated) => th.special,
-        Some(AgentStatus::Disconnected) | None => th.dim,
-    }
-}
-
-/// The selection mark's color on a focused selection: the row's `mark`
-/// (its STATUS DOT color, or the accent for a row that has no dot),
-/// lifted from dim to muted the way a dim dot is lifted on the fill — a
-/// FRESH row's mark is gray, but not the gray of an unfocused panel.
-fn selection_mark(mark: Color, th: Theme) -> Color {
-    if mark == th.dim {
-        th.muted
-    } else {
-        mark
-    }
-}
-
-/// Base style for a whole list row. Selection reads as a subtly raised
-/// full-width surface (never a reverse-video slab), brighter in the
-/// focused panel than in unfocused ones.
-fn row_bar(selected: bool, focused: bool, th: Theme) -> Style {
-    if selected && focused {
-        Style::default().bg(th.sel_bg).add_modifier(Modifier::BOLD)
-    } else if selected {
-        Style::default().bg(th.sel_bg_dim)
-    } else {
-        Style::default()
-    }
-}
-
-/// Render one list row as a full-width bar: an accent `▌` marker pins the
-/// selection in the focused panel; every other row gets a plain 1-cell
-/// gutter so text stays aligned. Dim spans (idle dots, archived names)
-/// would sink into the selection fill, so they get lifted to muted there.
-/// These rows (overlay lists) carry no STATUS DOT, so the mark is the
-/// accent.
-pub(crate) fn render_row(
-    f: &mut Frame,
-    area: Rect,
-    spans: Vec<Span>,
-    selected: bool,
-    focused: bool,
-    th: Theme,
-) {
-    render_button(f, area, vec![spans], selected, focused, th, 0, th.accent);
-}
-
-/// Render one list entry as a button `area.height` rows tall: the
-/// selection fill covers the whole rect, the `▌` marker runs down its
-/// left edge in `mark` (the row's STATUS DOT color — see
-/// `selection_mark`), and `text` takes consecutive rows starting at
-/// `text_row` (0-based, inside the rect). A second entry is a terminal's
-/// answer to a smaller line under the first, so the caller must size
-/// `area` for it. Dim spans (idle dots, archived names, subtitles) would
-/// sink into the selection fill, so they get lifted to muted there.
-#[allow(clippy::too_many_arguments)]
-fn render_button<'a>(
-    f: &mut Frame,
-    area: Rect,
-    mut text: Vec<Vec<Span<'a>>>,
-    selected: bool,
-    focused: bool,
-    th: Theme,
-    text_row: u16,
-    mark: Color,
-) {
-    if selected {
-        for s in text.iter_mut().flatten() {
-            if s.style.fg == Some(th.dim) {
-                s.style.fg = Some(th.muted);
-            }
-        }
-    }
-    let marker = || {
-        if selected && focused {
-            Span::styled("▌", Style::default().fg(selection_mark(mark, th)))
-        } else if selected {
-            Span::styled("▌", Style::default().fg(th.dim))
-        } else {
-            Span::raw(" ")
-        }
-    };
-    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
-    for r in 0..area.height {
-        let mut spans = vec![marker()];
-        if let Some(row) = r
-            .checked_sub(text_row)
-            .and_then(|i| text.get_mut(i as usize))
-        {
-            spans.append(row);
-        }
-        lines.push(Line::from(spans));
-    }
-    f.render_widget(
-        Paragraph::new(lines).style(row_bar(selected, focused, th)),
-        area,
-    );
 }
 
 /// The pull-request reading pane. Replaces the session view while the

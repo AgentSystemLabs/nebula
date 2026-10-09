@@ -563,19 +563,10 @@ fn handle_palette_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
     match overlay {
         Overlay::Palette(palette) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let action = palette
+                .list
+                .handle_standard_key(&key, palette.list.list_area.height.max(1) as i64);
             match key.code {
-                // Two-stage escape: an active query is cleared before the
-                // second Esc closes the palette.
-                KeyCode::Esc if !palette.query.is_empty() => {
-                    palette.query.clear();
-                    palette.apply_filter();
-                }
-                KeyCode::Esc => app.modals.overlay = None,
-                // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
-                KeyCode::Down => palette.select(palette.selected as i64 + 1),
-                KeyCode::Up => palette.select(palette.selected as i64 - 1),
-                KeyCode::Char('n') if ctrl => palette.select(palette.selected as i64 + 1),
-                KeyCode::Char('p') if ctrl => palette.select(palette.selected as i64 - 1),
                 // Enter picks per the config setting; Ctrl+O always opens
                 // (attach + terminal focus; the browser, for a pull
                 // request), Ctrl+F only focuses the row.
@@ -586,13 +577,13 @@ fn handle_palette_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Char('f') if ctrl => {
                     activate::palette_row(app, Some(Landing::FocusOnly), out)
                 }
-                // Everything else edits the query like a terminal line
-                // (see text_input).
-                _ => {
-                    if palette.query.handle_key(&key).changed() {
-                        palette.apply_filter();
-                    }
-                }
+                _ => match action {
+                    crate::filter_list::FilterListKey::Close => app.modals.overlay = None,
+                    crate::filter_list::FilterListKey::Cleared
+                    | crate::filter_list::FilterListKey::QueryChanged => palette.apply_filter(),
+                    crate::filter_list::FilterListKey::Moved
+                    | crate::filter_list::FilterListKey::None => {}
+                },
             }
         }
         _ => unreachable!("overlay dispatcher passed the wrong overlay"),
@@ -607,19 +598,10 @@ fn handle_files_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) 
     match overlay {
         Overlay::Files(finder) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let action = finder
+                .list
+                .handle_standard_key(&key, finder.list.list_area.height.max(1) as i64);
             match key.code {
-                // Two-stage escape: an active query is cleared before the
-                // second Esc closes the finder.
-                KeyCode::Esc if !finder.query.is_empty() => {
-                    finder.query.clear();
-                    finder.apply_filter();
-                }
-                KeyCode::Esc => app.modals.overlay = None,
-                // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
-                KeyCode::Down => finder.select(finder.selected as i64 + 1),
-                KeyCode::Up => finder.select(finder.selected as i64 - 1),
-                KeyCode::Char('n') if ctrl => finder.select(finder.selected as i64 + 1),
-                KeyCode::Char('p') if ctrl => finder.select(finder.selected as i64 - 1),
                 // Enter opens the selected file in the editor modal, which
                 // closes the finder unless `close_finder_on_open` is off —
                 // or, for a markdown file, reads it first in the FILE TABS.
@@ -633,13 +615,13 @@ fn handle_files_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) 
                         copy_and_flash(app, &path, &label);
                     }
                 }
-                // Everything else edits the query like a terminal line
-                // (see text_input).
-                _ => {
-                    if finder.query.handle_key(&key).changed() {
-                        finder.apply_filter();
-                    }
-                }
+                _ => match action {
+                    crate::filter_list::FilterListKey::Close => app.modals.overlay = None,
+                    crate::filter_list::FilterListKey::Cleared
+                    | crate::filter_list::FilterListKey::QueryChanged => finder.apply_filter(),
+                    crate::filter_list::FilterListKey::Moved
+                    | crate::filter_list::FilterListKey::None => {}
+                },
             }
         }
         _ => unreachable!("overlay dispatcher passed the wrong overlay"),
@@ -653,30 +635,20 @@ fn handle_grep_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     };
     match overlay {
         Overlay::Grep(view) => {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let action = view
+                .list
+                .handle_standard_key(&key, view.list.list_area.height.max(1) as i64);
             match key.code {
-                // Two-stage escape: an active query is cleared before the
-                // second Esc closes the overlay.
-                KeyCode::Esc if !view.query.is_empty() => {
-                    view.query.clear();
-                    view.run_search();
-                }
-                KeyCode::Esc => app.modals.overlay = None,
-                // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
-                KeyCode::Down => view.select(view.selected as i64 + 1),
-                KeyCode::Up => view.select(view.selected as i64 - 1),
-                KeyCode::Char('n') if ctrl => view.select(view.selected as i64 + 1),
-                KeyCode::Char('p') if ctrl => view.select(view.selected as i64 - 1),
                 // Enter opens the hit in the editor modal, which closes this
                 // overlay unless `close_finder_on_open` is off.
                 KeyCode::Enter => open_selected_hit_in_editor(app),
-                // Everything else edits the query like a terminal line
-                // (see text_input).
-                _ => {
-                    if view.query.handle_key(&key).changed() {
-                        view.run_search();
-                    }
-                }
+                _ => match action {
+                    crate::filter_list::FilterListKey::Close => app.modals.overlay = None,
+                    crate::filter_list::FilterListKey::Cleared
+                    | crate::filter_list::FilterListKey::QueryChanged => view.run_search(),
+                    crate::filter_list::FilterListKey::Moved
+                    | crate::filter_list::FilterListKey::None => {}
+                },
             }
         }
         _ => unreachable!("overlay dispatcher passed the wrong overlay"),
@@ -697,8 +669,8 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             match key.code {
                 // Two-stage escape: an active filter is cleared before the
                 // second Esc closes the modal.
-                KeyCode::Esc if !view.filter.is_empty() => {
-                    view.filter.clear();
+                KeyCode::Esc if !view.list.query.is_empty() => {
+                    view.list.query.clear();
                     view.apply_filter();
                 }
                 KeyCode::Esc => app.modals.overlay = None,
@@ -707,7 +679,7 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 KeyCode::Char('d') if ctrl => view.scroll_by(half),
                 // Ctrl+u is the line editor's kill-to-start while something
                 // is typed; only with an empty filter does it scroll.
-                KeyCode::Char('u') if ctrl && view.filter.is_empty() => view.scroll_by(-half),
+                KeyCode::Char('u') if ctrl && view.list.query.is_empty() => view.scroll_by(-half),
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
                 KeyCode::PageDown => view.scroll_by(page),
@@ -715,17 +687,17 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 KeyCode::Home => view.scroll = 0,
                 KeyCode::End => view.scroll = view.max_scroll(),
                 // j/k stay typeable in the filter; Ctrl+n/p mirror ↑/↓.
-                KeyCode::Down => view.select(view.selected as i64 + 1),
-                KeyCode::Up => view.select(view.selected as i64 - 1),
-                KeyCode::Char('n') if ctrl => view.select(view.selected as i64 + 1),
-                KeyCode::Char('p') if ctrl => view.select(view.selected as i64 - 1),
+                KeyCode::Down => view.select(view.list.cursor as i64 + 1),
+                KeyCode::Up => view.select(view.list.cursor as i64 - 1),
+                KeyCode::Char('n') if ctrl => view.select(view.list.cursor as i64 + 1),
+                KeyCode::Char('p') if ctrl => view.select(view.list.cursor as i64 - 1),
                 KeyCode::Right => view.expand_selected(),
                 KeyCode::Left => view.collapse_selected(),
                 // Enter folds/unfolds a directory; on a file it opens the
                 // editor modal, with the browser staying open underneath.
                 KeyCode::Enter => {
                     if view.selected_is_dir() {
-                        view.toggle_row(view.selected);
+                        view.toggle_row(view.list.cursor);
                     } else {
                         open_selected_tree_file_in_editor(app);
                     }
@@ -746,7 +718,7 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // Everything else feeds the always-on fuzzy filter, which
                 // edits like a terminal line (see text_input).
                 _ => {
-                    if view.filter.handle_key(&key).changed() {
+                    if view.list.query.handle_key(&key).changed() {
                         view.apply_filter();
                     }
                 }

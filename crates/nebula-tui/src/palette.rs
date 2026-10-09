@@ -13,11 +13,11 @@
 //! their own in that same order.
 
 use crate::app::{
-    clamp_selection, last_interaction_ms, now_ms, project_recency, project_rollup, project_unseen,
-    window_start, worktree_recency, worktree_rollup, worktree_unseen, OpenPrs, Tree,
+    last_interaction_ms, now_ms, project_recency, project_rollup, project_unseen, worktree_recency,
+    worktree_rollup, worktree_unseen, OpenPrs, Tree,
 };
+use crate::filter_list::{FilterList, FilterMatch};
 use crate::pull_request::{Standing, Trouble};
-use crate::text_input::TextInput;
 use nebula_core::{Agent, AgentId, AgentStatus, Project, ProjectId, WorktreeId};
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -112,37 +112,21 @@ pub struct PaletteItem {
     pub trouble: Option<Trouble>,
 }
 
-/// One visible palette row: an index into `items` plus the char positions of
-/// `text` the query matched, for highlighting.
-#[derive(Debug, Clone)]
-pub struct PaletteMatch {
-    pub item: usize,
-    pub positions: Vec<usize>,
-}
-
 /// Fuzzy-search palette over every project, worktree, and session (`/`).
 #[derive(Debug, Clone)]
 pub struct Palette {
-    pub items: Vec<PaletteItem>,
-    /// Type-to-filter query over `items` texts; always live.
-    pub query: TextInput,
     /// Visible rows, FLAT: `items` narrowed by `query` (to the sessions
     /// while it is empty), best matches first — ties, and the whole list
     /// before a query, in the attention order of [`PaletteTier`] then most
     /// recent interaction. One row per thing, nothing folded under
     /// anything.
-    pub matches: Vec<PaletteMatch>,
-    /// Index into `matches` (not `items`).
-    pub selected: usize,
+    pub list: FilterList<PaletteItem>,
     /// Whether Enter (and a click) on a session row attaches to it, or only
     /// lands on its Sessions-panel row. Snapshot of the config setting at
     /// open time; Ctrl+O / Ctrl+F pick explicitly either way.
     pub enter_attaches: bool,
     /// Whole modal rect, written back during draw so clicks outside close.
     pub area: Rect,
-    /// Screen rect of the result rows (query row excluded), written back
-    /// during draw so clicks can hit-test rows.
-    pub list_area: Rect,
 }
 
 impl Palette {
@@ -153,13 +137,9 @@ impl Palette {
         hide_draft_prs: bool,
     ) -> Self {
         let mut palette = Self {
-            items: build_palette_items(tree, open_prs, hide_draft_prs),
-            query: TextInput::new(),
-            matches: Vec::new(),
-            selected: 0,
+            list: FilterList::new(build_palette_items(tree, open_prs, hide_draft_prs)),
             enter_attaches,
             area: Rect::default(),
-            list_area: Rect::default(),
         };
         palette.apply_filter();
         palette
@@ -177,15 +157,16 @@ impl Palette {
         hide_draft_prs: bool,
     ) {
         let keep = self.selected_target().cloned();
-        self.items = build_palette_items(tree, open_prs, hide_draft_prs);
+        self.list.items = build_palette_items(tree, open_prs, hide_draft_prs);
         self.apply_filter();
         if let Some(target) = keep {
             if let Some(row) = self
+                .list
                 .matches
                 .iter()
-                .position(|m| self.items[m.item].target == target)
+                .position(|m| self.list.items[m.item].target == target)
             {
-                self.selected = row;
+                self.list.cursor = row;
             }
         }
     }
@@ -193,20 +174,21 @@ impl Palette {
     /// First visible row of the result list's stateless follow-window for a
     /// list of `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.selected, height)
+        self.list.window_start(height)
     }
 
     /// Clamped absolute selection in the filtered list.
     pub fn select(&mut self, index: i64) {
-        self.selected = clamp_selection(index, self.matches.len());
+        self.list.select(index);
     }
 
     /// The jump target behind the current selection, if any row is visible.
     pub fn selected_target(&self) -> Option<&PaletteTarget> {
         Some(
             &self
+                .list
                 .items
-                .get(self.matches.get(self.selected)?.item)?
+                .get(self.list.matches.get(self.list.cursor)?.item)?
                 .target,
         )
     }
@@ -217,24 +199,24 @@ impl Palette {
     /// breaks ties and is the whole order when the query is empty, so `/`
     /// `Enter` lands on the session that needs you before anything else.
     pub fn apply_filter(&mut self) {
-        let rank = attention_rank(&self.items);
-        let overview = self.query.trim().is_empty();
-        self.matches = crate::fuzzy::rank_by(
-            &self.query,
-            self.items.iter().map(|i| i.text.as_str()),
+        let rank = attention_rank(&self.list.items);
+        let overview = self.list.query.trim().is_empty();
+        self.list.matches = crate::fuzzy::rank_by(
+            &self.list.query,
+            self.list.items.iter().map(|i| i.text.as_str()),
             |i, _| rank[i],
         )
         .into_iter()
-        .filter(|(i, _)| !overview || self.items[*i].in_overview())
-        .map(|(item, positions)| PaletteMatch { item, positions })
+        .filter(|(i, _)| !overview || self.list.items[*i].in_overview())
+        .map(|(item, positions)| FilterMatch { item, positions })
         .collect();
-        self.selected = 0;
+        self.list.cursor = 0;
     }
 
     /// Rows the query matched — the title's count, which is every visible
     /// row now that the list is flat.
     pub fn hits(&self) -> usize {
-        self.matches.len()
+        self.list.matches.len()
     }
 }
 
@@ -488,20 +470,22 @@ mod tests {
     /// on marked `▶`.
     fn rows(tree: &Tree, query: &str) -> Vec<String> {
         let mut palette = Palette::new(tree, false, &HashMap::new(), false);
-        palette.query = TextInput::from(query);
+        palette.list.query = TextInput::from(query);
         palette.apply_filter();
+        let selected = palette.list.cursor;
         palette
+            .list
             .matches
             .iter()
             .enumerate()
             .map(|(row, m)| {
-                let item = &palette.items[m.item];
+                let item = &palette.list.items[m.item];
                 let crumb = item.crumb.map_or(String::new(), |(at, end)| {
                     let name: String = item.text.chars().take(end).skip(at).collect();
                     format!("{name}/")
                 });
                 let label: String = item.text.chars().skip(item.label_at).collect();
-                let mark = if row == palette.selected { "▶" } else { "" };
+                let mark = if row == selected { "▶" } else { "" };
                 format!("{mark}{crumb}{label}")
             })
             .collect()
@@ -550,9 +534,10 @@ mod tests {
         let palette = Palette::new(&tree, false, &HashMap::new(), false);
         assert!(
             palette
+                .list
                 .matches
                 .iter()
-                .all(|m| matches!(palette.items[m.item].target, PaletteTarget::Session(_))),
+                .all(|m| matches!(palette.list.items[m.item].target, PaletteTarget::Session(_))),
             "only sessions before a query"
         );
         assert_eq!(rows(&tree, "quiet"), ["▶quiet", "quiet/main"]);
@@ -577,10 +562,10 @@ mod tests {
     fn every_visible_row_counts_as_a_hit() {
         let tree = tree();
         let mut palette = Palette::new(&tree, false, &HashMap::new(), false);
-        palette.query = TextInput::from("read");
+        palette.list.query = TextInput::from("read");
         palette.apply_filter();
-        assert_eq!(palette.matches.len(), 2);
-        assert!(palette.matches.iter().all(|m| !m.positions.is_empty()));
+        assert_eq!(palette.list.matches.len(), 2);
+        assert!(palette.list.matches.iter().all(|m| !m.positions.is_empty()));
         assert_eq!(palette.hits(), 2);
     }
 
@@ -630,6 +615,7 @@ mod tests {
         );
         let texts = |hide: bool| -> Vec<String> {
             Palette::new(&tree, false, &open_prs, hide)
+                .list
                 .items
                 .iter()
                 .map(|i| i.text.clone())
@@ -705,6 +691,7 @@ mod tests {
         );
         let palette = Palette::new(&tree, false, &open_prs, false);
         let troubles: Vec<(&str, Option<Trouble>)> = palette
+            .list
             .items
             .iter()
             .filter(|i| matches!(i.target, PaletteTarget::PullRequest { .. }))
@@ -720,6 +707,7 @@ mod tests {
         );
         assert!(
             palette
+                .list
                 .items
                 .iter()
                 .filter(|i| !matches!(i.target, PaletteTarget::PullRequest { .. }))
@@ -762,6 +750,7 @@ mod tests {
         );
         let palette = Palette::new(&tree, false, &open_prs, false);
         let standings: Vec<(&str, Option<Standing>)> = palette
+            .list
             .items
             .iter()
             .filter(|i| matches!(i.target, PaletteTarget::PullRequest { .. }))
@@ -776,6 +765,7 @@ mod tests {
         );
         assert!(
             palette
+                .list
                 .items
                 .iter()
                 .filter(|i| !matches!(i.target, PaletteTarget::PullRequest { .. }))

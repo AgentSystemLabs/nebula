@@ -66,7 +66,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde::{Deserialize, Serialize};
 
-use crate::app::{clamp_selection, window_start, App, HitTarget, Overlay};
+use crate::app::{clamp_selection, App, HitTarget, Overlay};
+use crate::filter_list::FilterList;
 use crate::markdown::{self, Breaks};
 use crate::pr_preview::fit;
 use crate::pull_request::{gh, login, str_at, web_url};
@@ -280,21 +281,15 @@ pub struct IssuesView {
     pub body_lines: usize,
     /// Whole modal rect, written back during draw so clicks outside close.
     pub area: Rect,
-    /// The list rows and the reading pane, for wheel and click routing.
-    pub list_area: Rect,
+    /// The reading pane, for wheel and click routing.
     pub body_area: Rect,
     /// The `↗ open in browser` BUTTON on the reading pane's top border
     /// (`ui::browser_button`), for the click and the pointer resting on
     /// it; `Rect::default()` — no point inside — while there is none.
     pub browser_area: Rect,
-    /// The list's live filter: the rows narrow to the fuzzy matches of
-    /// `#15 title`, best first ([`visible_rows`]), as every letter lands.
-    /// Empty shows every row in the list's order.
-    pub query: TextInput,
-    /// Where the cursor sat among the visible rows as of the last draw:
-    /// the follow-window's anchor, and what a click's row math counts
-    /// from.
-    pub cursor_row: usize,
+    /// Issues plus the list's live filter/cursor. Empty query shows every
+    /// row in the cache's order.
+    pub list: FilterList<Issue>,
     /// `Ctrl+e`: the reading pane turned into the editor for the row under the
     /// cursor, until Enter has saved or Esc has dropped it. Boxed: the
     /// view rides a `Comment` answer, and two text fields would make that
@@ -313,11 +308,9 @@ impl IssuesView {
             view_height: 0,
             body_lines: 0,
             area: Rect::default(),
-            list_area: Rect::default(),
             body_area: Rect::default(),
             browser_area: Rect::default(),
-            query: TextInput::new(),
-            cursor_row: 0,
+            list: FilterList::default(),
             editor: None,
         }
     }
@@ -325,7 +318,7 @@ impl IssuesView {
     /// First visible row of the list's stateless follow-window, over the
     /// rows the filter leaves.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.cursor_row, height)
+        self.list.window_start(height)
     }
 
     pub fn max_scroll(&self) -> u16 {
@@ -665,7 +658,14 @@ pub(crate) fn open_issues(app: &mut App) {
         project.name.clone(),
         project.repo_path.clone(),
     );
-    view.selected = clamp_selection(0, list_len(app, &project.id));
+    let rows = app
+        .github
+        .issues
+        .get(&project.id)
+        .map_or(&[][..], |l| l.list.as_slice());
+    rebuild_list(&mut view, rows);
+    view.selected = clamp_selection(0, rows.len());
+    view.list.move_to_item(view.selected);
     app.modals.overlay = Some(Overlay::Issues(view));
     // A list the prefetch landed moments ago is the answer; an older one
     // paints now while a fresh copy lands underneath.
@@ -676,23 +676,14 @@ pub(crate) fn open_issues(app: &mut App) {
     app.chrome.dirty = true;
 }
 
-fn list_len(app: &App, project: &ProjectId) -> usize {
-    app.github.issues.get(project).map_or(0, |l| l.list.len())
-}
-
 /// Is there a filter to apply — text in the row beyond whitespace?
 fn has_query(view: &IssuesView) -> bool {
-    view.query.split_whitespace().next().is_some()
+    view.list.query_has_words()
 }
 
-/// The rows the filter leaves, top to bottom: indices into `list`, each
-/// with the matched char positions of its `#15 title` (lit when drawn);
-/// every row in list order with nothing typed. Worked out afresh on every
-/// call rather than kept — a repo's open issues are a screenful — so it
-/// can never go stale against the list.
-fn visible_rows(query: &str, list: &[Issue]) -> Vec<(usize, Vec<usize>)> {
-    let labels: Vec<String> = list.iter().map(|issue| issue.label()).collect();
-    crate::fuzzy::rank(query, labels.iter().map(String::as_str))
+fn rebuild_list(view: &mut IssuesView, rows: &[Issue]) {
+    view.list.items = rows.to_vec();
+    view.list.apply_filter(|issue| issue.label());
 }
 
 /// The row under the cursor, as an index into `list`: `selected` while
@@ -707,11 +698,10 @@ fn cursor_index(view: &IssuesView, list: &[Issue]) -> Option<usize> {
     if !has_query(view) {
         return Some(clamp_selection(view.selected as i64, list.len()));
     }
-    let visible = visible_rows(&view.query, list);
-    if visible.iter().any(|(i, _)| *i == view.selected) {
+    if view.list.matches.iter().any(|m| m.item == view.selected) {
         Some(view.selected)
     } else {
-        visible.first().map(|(i, _)| *i)
+        view.list.matches.first().map(|m| m.item)
     }
 }
 
@@ -719,7 +709,14 @@ fn cursor_index(view: &IssuesView, list: &[Issue]) -> Option<usize> {
 /// for it — on the same row, clamped in case the list moved underneath,
 /// with the row's comments asked for as landing on it would.
 pub(crate) fn reopen(app: &mut App, mut view: IssuesView) {
-    view.selected = clamp_selection(view.selected as i64, list_len(app, &view.project));
+    let rows = app
+        .github
+        .issues
+        .get(&view.project)
+        .map_or(&[][..], |l| l.list.as_slice());
+    rebuild_list(&mut view, rows);
+    view.selected = clamp_selection(view.selected as i64, rows.len());
+    view.list.move_to_item(view.selected);
     app.modals.overlay = Some(Overlay::Issues(view));
     schedule_detail(app);
     app.chrome.dirty = true;
@@ -979,10 +976,17 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                     );
                     if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
                         if view.project == project {
+                            let rows = app
+                                .github
+                                .issues
+                                .get(&project)
+                                .map_or(&[][..], |l| l.list.as_slice());
+                            rebuild_list(view, rows);
                             view.selected = match position {
                                 Some(i) => i,
                                 None => clamp_selection(view.selected as i64, len),
                             };
+                            view.list.move_to_item(view.selected);
                         }
                     }
                     schedule_detail(app);
@@ -1225,6 +1229,7 @@ fn select(app: &mut App, index: i64) {
     let next = clamp_selection(index, len);
     if next != view.selected {
         view.selected = next;
+        view.list.move_to_item(next);
         view.scroll = 0;
     }
     schedule_detail(app);
@@ -1245,11 +1250,15 @@ fn step(app: &mut App, delta: i64) {
     let Some(current) = cursor_index(view, list) else {
         return;
     };
-    let visible = visible_rows(&view.query, list);
-    let at = visible.iter().position(|(i, _)| *i == current).unwrap_or(0) as i64;
-    let next = clamp_selection(at + delta, visible.len());
-    if let Some((index, _)) = visible.get(next) {
-        select(app, *index as i64);
+    let at = view
+        .list
+        .matches
+        .iter()
+        .position(|m| m.item == current)
+        .unwrap_or(0) as i64;
+    let next = clamp_selection(at + delta, view.list.matches.len());
+    if let Some(m) = view.list.matches.get(next) {
+        select(app, m.item as i64);
     }
 }
 
@@ -1263,15 +1272,20 @@ fn query_changed(app: &mut App) {
     let Some(Overlay::Issues(view)) = &app.modals.overlay else {
         return;
     };
-    let list = app
+    let list: Vec<Issue> = app
         .github
         .issues
         .get(&view.project)
-        .map_or(&[][..], |l| l.list.as_slice());
+        .map_or(Vec::new(), |l| l.list.clone());
+    let Some(Overlay::Issues(view_mut)) = &mut app.modals.overlay else {
+        return;
+    };
+    rebuild_list(view_mut, &list);
+    let view = view_mut;
     let target = if has_query(view) {
-        visible_rows(&view.query, list).first().map(|(i, _)| *i)
+        view.list.matches.first().map(|m| m.item)
     } else {
-        cursor_index(view, list)
+        cursor_index(view, &list)
     };
     match target {
         Some(index) => select(app, index as i64),
@@ -1283,7 +1297,7 @@ fn query_changed(app: &mut App) {
 /// Esc: the filter cleared, the cursor staying on the row it was on.
 fn clear_query(app: &mut App) {
     if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
-        view.query.clear();
+        view.list.query.clear();
     }
     query_changed(app);
 }
@@ -1408,7 +1422,7 @@ pub(crate) fn paste(app: &mut App, text: &str) -> bool {
         return false;
     };
     if view.editor.is_none() {
-        view.query.insert_str(text);
+        view.list.query.insert_str(text);
         query_changed(app);
         return true;
     }
@@ -1556,7 +1570,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
     match key.code {
         // Two-stage escape, like every fuzzy overlay: a typed filter is
         // cleared before the second Esc closes the modal.
-        KeyCode::Esc if !view.query.is_empty() => clear_query(app),
+        KeyCode::Esc if !view.list.query.is_empty() => clear_query(app),
         KeyCode::Esc => app.modals.overlay = None,
         // Shift+↑/↓ scroll the pane a line; ↑/↓ walk the rows the filter
         // leaves, Ctrl+n/p mirroring them.
@@ -1570,7 +1584,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         // the line editor's kill-to-start while something is typed; only
         // with an empty filter does it scroll.
         KeyCode::Char('d') if ctrl => view.scroll_by(half),
-        KeyCode::Char('u') if ctrl && view.query.is_empty() => view.scroll_by(-half),
+        KeyCode::Char('u') if ctrl && view.list.query.is_empty() => view.scroll_by(-half),
         KeyCode::PageDown => view.scroll_by(page),
         KeyCode::PageUp => view.scroll_by(-page),
         KeyCode::Home => view.scroll = 0,
@@ -1591,7 +1605,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         // Everything else feeds the always-live fuzzy filter, which edits
         // like a terminal line (see text_input).
         _ => {
-            if view.query.handle_key(&key).changed() {
+            if view.list.query.handle_key(&key).changed() {
                 query_changed(app);
             }
         }
@@ -1632,6 +1646,7 @@ pub(crate) fn handle_mouse(
     };
     let over_body = view.body_area.contains(mouse_pos);
     let on_button = view.browser_area.contains(mouse_pos);
+    let mut clicked_row = None;
     match mouse.kind {
         MouseEventKind::ScrollUp if over_body => view.scroll_by(-WHEEL_LINES),
         MouseEventKind::ScrollDown if over_body => view.scroll_by(WHEEL_LINES),
@@ -1641,21 +1656,14 @@ pub(crate) fn handle_mouse(
         // `Ctrl+o` runs.
         MouseEventKind::Down(MouseButton::Left) if on_button => open_in_browser(app, out),
         MouseEventKind::Down(MouseButton::Left) => {
-            let list = view.list_area;
-            let first = view.window_start(list.height as usize);
-            // The row math counts the filter's matches, not the whole list.
-            let visible = visible_rows(
-                &view.query,
-                app.github
-                    .issues
-                    .get(&view.project)
-                    .map_or(&[][..], |l| l.list.as_slice()),
-            );
-            if let Some(row) = crate::list_hit::row_at(list, first, visible.len(), mouse_pos) {
-                select(app, visible[row].0 as i64);
+            if let Some(row) = view.list.hit(mouse_pos) {
+                clicked_row = Some(view.list.matches[row].item as i64);
             }
         }
         _ => {}
+    }
+    if let Some(index) = clicked_row {
+        select(app, index);
     }
     app.chrome.dirty = true;
 }
@@ -1818,17 +1826,12 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         .unwrap_or_default();
     let inflight = app.github.issues_inflight.contains(&view.project);
     let failed = app.github.issues_failed.contains(&view.project);
-    // The rows the filter leaves, and where the cursor sits among them.
-    let visible = visible_rows(&view.query, &rows);
     let cursor = cursor_index(view, &rows);
-    let cursor_row = cursor
-        .and_then(|c| visible.iter().position(|(i, _)| *i == c))
-        .unwrap_or(0);
 
     // ---- left: the list ----
     // The count reads `matches/all` while a filter is on.
     let count = if has_query(view) {
-        format!("{}/{}", visible.len(), rows.len())
+        format!("{}/{}", view.list.matches.len(), rows.len())
     } else {
         rows.len().to_string()
     };
@@ -1849,7 +1852,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     f.render_widget(block, list_a);
     // The always-live filter on the list's first line, the rows under it.
     if let Some(query_area) = row_rect(list_inner, 0) {
-        let line = search_line(&view.query, "type to filter…", query_area, th);
+        let line = search_line(&view.list.query, "type to filter…", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
     let rows_area = crate::ui::below_first_row(list_inner);
@@ -1864,15 +1867,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
             "no open issues"
         };
         empty_list_row(f, rows_area, text, th);
-    } else if visible.is_empty() {
+    } else if view.list.matches.is_empty() {
         empty_list_row(f, rows_area, "no issues match", th);
     }
-    let start = window_start(cursor_row, rows_area.height as usize);
-    for (row, (index, positions)) in visible.iter().enumerate().skip(start) {
-        let Some(row_area) = row_rect(rows_area, row - start) else {
+    let start = view.list.window_start(rows_area.height as usize);
+    for (row, (i, m)) in view.list.matches.iter().enumerate().skip(start).enumerate() {
+        let Some(row_area) = row_rect(rows_area, row) else {
             break;
         };
-        let issue = &rows[*index];
+        let issue = &view.list.items[m.item];
         let budget = (rows_area.width as usize).saturating_sub(2);
         // `#15 title` left, the day it was opened pinned right, dim; the
         // chars the filter matched lit.
@@ -1881,7 +1884,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         let text_budget = budget.saturating_sub(if opened_w > 0 { opened_w + 2 } else { 0 });
         let full = issue.label();
         let label = truncate(&full, text_budget);
-        let positions = visible_positions(positions, &label, &full);
+        let positions = visible_positions(&m.positions, &label, &full);
         let used = label.chars().count();
         let number = format!("#{} ", issue.number);
         let number_w = number.chars().count();
@@ -1906,7 +1909,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
             spans.push(Span::raw(" ".repeat(budget - used - opened_w)));
             spans.push(Span::styled(opened, Style::default().fg(th.dim)));
         }
-        render_row(f, row_area, spans, Some(*index) == cursor, list_focused, th);
+        render_row(f, row_area, spans, i == view.list.cursor, list_focused, th);
     }
 
     // ---- right: the editor, while it is up ----
@@ -1914,8 +1917,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         let (title_area, body_area, body_view) = draw_editor(f, body_a, editor, th);
         if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
             v.area = area;
-            v.list_area = rows_area;
-            v.cursor_row = cursor_row;
+            v.list.list_area = rows_area;
+            v.list.sync_scroll(rows_area.height as usize);
             v.browser_area = Rect::default();
             if let Some(index) = cursor {
                 v.selected = index;
@@ -1982,8 +1985,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     // the pane's size for paging, and the clamped cursor and scroll.
     if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
         v.area = area;
-        v.list_area = rows_area;
-        v.cursor_row = cursor_row;
+        v.list.list_area = rows_area;
+        v.list.sync_scroll(rows_area.height as usize);
         v.body_area = body_inner;
         v.browser_area = browser_area;
         v.view_height = body_inner.height;
@@ -2849,7 +2852,7 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(editor(&app).is_none());
-        assert_eq!(issues_view(&app).query.as_str(), "e");
+        assert_eq!(issues_view(&app).list.query.as_str(), "e");
         let (mut empty, _) = modal_with(vec![]);
         handle_key(
             &mut empty,
@@ -2959,7 +2962,7 @@ mod tests {
             paste(&mut app, "x"),
             "with the form down, the paste is the filter's"
         );
-        assert_eq!(issues_view(&app).query.as_str(), "x");
+        assert_eq!(issues_view(&app).list.query.as_str(), "x");
     }
 
     /// Enter refuses a blank title on the spot, closes an unchanged form
@@ -3224,7 +3227,7 @@ mod tests {
         app.github.pending_issue_detail = None;
         assert!(footer_hint(issues_view(&app)).starts_with("type to filter"));
         type_str(&mut app, "login");
-        assert_eq!(issues_view(&app).query.as_str(), "login");
+        assert_eq!(issues_view(&app).list.query.as_str(), "login");
         let shot = screen(&mut app, 120, 40);
         assert!(shot.contains("(2/3)"), "{shot}");
         assert!(
@@ -3244,7 +3247,7 @@ mod tests {
             key(KeyCode::Char('i'), KeyModifiers::NONE),
             &mut Vec::new(),
         );
-        assert_eq!(issues_view(&app).query.as_str(), "logini");
+        assert_eq!(issues_view(&app).list.query.as_str(), "logini");
         assert!(matches!(&app.modals.overlay, Some(Overlay::Issues(_))));
         handle_key(
             &mut app,
@@ -3285,7 +3288,7 @@ mod tests {
         );
         assert!(editor(&app).is_none());
         assert_eq!(
-            issues_view(&app).query.as_str(),
+            issues_view(&app).list.query.as_str(),
             "login",
             "leaving the editor keeps the filter"
         );
@@ -3298,7 +3301,7 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(matches!(&app.modals.overlay, Some(Overlay::Issues(_))));
-        assert!(issues_view(&app).query.is_empty());
+        assert!(issues_view(&app).list.query.is_empty());
         assert_eq!(cursor_number(&app), Some(second));
         let shot = screen(&mut app, 120, 40);
         assert!(shot.contains("(3)"), "{shot}");
@@ -3356,7 +3359,7 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(
-            issues_view(&app).query.is_empty(),
+            issues_view(&app).list.query.is_empty(),
             "Ctrl+u kills the typed filter"
         );
         assert_eq!(issues_view(&app).scroll, 3, "and does not scroll the pane");
@@ -3388,7 +3391,7 @@ mod tests {
             issue(13, "Login page"),
         ]);
         assert!(paste(&mut app, "log\nin"));
-        assert_eq!(issues_view(&app).query.as_str(), "log in");
+        assert_eq!(issues_view(&app).list.query.as_str(), "log in");
         for _ in 0..3 {
             handle_key(
                 &mut app,
@@ -3398,7 +3401,7 @@ mod tests {
         }
         type_str(&mut app, "in");
         screen(&mut app, 120, 40);
-        let list = issues_view(&app).list_area;
+        let list = issues_view(&app).list.list_area;
         // The second visible row: the second match, whichever it is.
         let at = Position::new(list.x + 1, list.y + 1);
         let click = MouseEvent {
@@ -3409,16 +3412,13 @@ mod tests {
         };
         handle_mouse(&mut app, click, at, &mut Vec::new());
         assert_eq!(
-            issues_view(&app).query.as_str(),
+            issues_view(&app).list.query.as_str(),
             "login",
             "the filter is kept"
         );
         let picked = cursor_number(&app).unwrap();
-        let visible = visible_rows("login", &app.github.issues[&project].list);
-        assert_eq!(
-            picked,
-            app.github.issues[&project].list[visible[1].0].number
-        );
+        let row = issues_view(&app).list.matches[1].item;
+        assert_eq!(picked, issues_view(&app).list.items[row].number);
         assert_ne!(picked, 14);
     }
 
@@ -3477,7 +3477,7 @@ mod tests {
                 &mut Vec::new(),
             );
         }
-        assert_eq!(issues_view(&app).query.as_str(), "roce");
+        assert_eq!(issues_view(&app).list.query.as_str(), "roce");
         assert!(editor(&app).is_none());
         assert!(matches!(&app.modals.overlay, Some(Overlay::Issues(_))));
     }

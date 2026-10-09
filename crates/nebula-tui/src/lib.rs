@@ -12,6 +12,7 @@ pub mod diff_tree;
 pub mod dropped_files;
 pub mod event_loop;
 pub mod file_tabs;
+pub mod filter_list;
 pub mod fuzzy;
 pub mod git_diff;
 pub mod grep_search;

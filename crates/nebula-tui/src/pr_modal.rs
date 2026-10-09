@@ -39,13 +39,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{
-    clamp_selection, window_start, App, HitTarget, Overlay, PendingPrDetail, PromptKind,
-};
+use crate::app::{clamp_selection, App, HitTarget, Overlay, PendingPrDetail, PromptKind};
+use crate::filter_list::FilterList;
 use crate::pr_preview::fit;
 use crate::pull_request::{OpenPr, PrDetail};
 use crate::quick_prompt::{ModalUnder, QuickLaunch, QuickReturn};
-use crate::text_input::TextInput;
 use crate::theme::Theme;
 use crate::ui::{
     centered_rect_pct, empty_list_row, fuzzy_highlight_styled, panel_block, render_row, row_rect,
@@ -95,21 +93,15 @@ pub struct PullRequestsView {
     pub body_lines: usize,
     /// Whole modal rect, written back during draw so clicks outside close.
     pub area: Rect,
-    /// The list rows and the reading pane, for wheel and click routing.
-    pub list_area: Rect,
+    /// The reading pane, for wheel and click routing.
     pub body_area: Rect,
     /// The `↗ open in browser` BUTTON on the reading pane's top border
     /// (`ui::browser_button`), for the click and the pointer resting on
     /// it; `Rect::default()` — no point inside — while there is none.
     pub browser_area: Rect,
-    /// The list's live filter: the rows narrow to the fuzzy matches of
-    /// `#42 title`, best first ([`visible_rows`]), as every letter lands.
-    /// Empty shows every row in the list's order.
-    pub query: TextInput,
-    /// Where the cursor sat among the visible rows as of the last draw:
-    /// the follow-window's anchor, and what a click's row math counts
-    /// from.
-    pub cursor_row: usize,
+    /// Pull request rows plus the list's live filter/cursor. Empty query
+    /// shows every row in the cache's order.
+    pub list: FilterList<OpenPr>,
     /// The last click on a row — when, and which pull request — so a
     /// second click on the same row inside the DOUBLE-CLICK window opens it
     /// in the browser (`event_loop::is_double_click`).
@@ -128,11 +120,9 @@ impl PullRequestsView {
             view_height: 0,
             body_lines: 0,
             area: Rect::default(),
-            list_area: Rect::default(),
             body_area: Rect::default(),
             browser_area: Rect::default(),
-            query: TextInput::new(),
-            cursor_row: 0,
+            list: FilterList::default(),
             last_row_click: None,
         }
     }
@@ -140,7 +130,7 @@ impl PullRequestsView {
     /// First visible row of the list's stateless follow-window, over the
     /// rows the filter leaves.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.cursor_row, height)
+        self.list.window_start(height)
     }
 
     pub fn max_scroll(&self) -> u16 {
@@ -178,10 +168,12 @@ pub(crate) fn open_on(app: &mut App, url: Option<&str>) {
         project.repo_path.clone(),
     );
     let list = rows(app, &project.id);
+    rebuild_list(&mut view, list);
     let start = url
         .and_then(|url| list.iter().position(|row| row.url == url))
         .unwrap_or(0);
     view.selected = clamp_selection(start as i64, list.len());
+    view.list.move_to_item(view.selected);
     view.selected_url = list.get(view.selected).map(|pr| pr.url.clone());
     app.modals.overlay = Some(Overlay::PullRequests(view));
     // A list the beat landed moments ago is the answer; an older one
@@ -228,17 +220,12 @@ fn rows<'a>(app: &'a App, project: &ProjectId) -> &'a [OpenPr] {
 
 /// Is there a filter to apply — text in the row beyond whitespace?
 fn has_query(view: &PullRequestsView) -> bool {
-    view.query.split_whitespace().next().is_some()
+    view.list.query_has_words()
 }
 
-/// The rows the filter leaves, top to bottom: indices into `list`, each
-/// with the matched char positions of its `#42 title` (lit when drawn);
-/// every row in list order with nothing typed. Worked out afresh on every
-/// call rather than kept — a project's open pull requests are a handful
-/// — so it can never go stale against the list.
-fn visible_rows(query: &str, list: &[OpenPr]) -> Vec<(usize, Vec<usize>)> {
-    let labels: Vec<String> = list.iter().map(|pr| pr.label()).collect();
-    crate::fuzzy::rank(query, labels.iter().map(String::as_str))
+fn rebuild_list(view: &mut PullRequestsView, rows: &[OpenPr]) {
+    view.list.items = rows.to_vec();
+    view.list.apply_filter(|pr| pr.label());
 }
 
 /// The row under the cursor, as an index into `list`: `selected` while
@@ -253,11 +240,10 @@ fn cursor_index(view: &PullRequestsView, list: &[OpenPr]) -> Option<usize> {
     if !has_query(view) {
         return Some(clamp_selection(view.selected as i64, list.len()));
     }
-    let visible = visible_rows(&view.query, list);
-    if visible.iter().any(|(i, _)| *i == view.selected) {
+    if view.list.matches.iter().any(|m| m.item == view.selected) {
         Some(view.selected)
     } else {
-        visible.first().map(|(i, _)| *i)
+        view.list.matches.first().map(|m| m.item)
     }
 }
 
@@ -286,8 +272,8 @@ fn selected_pr(app: &App) -> Option<OpenPr> {
     let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return None;
     };
-    let list = rows(app, &view.project);
-    cursor_index(view, list).and_then(|i| list.get(i).cloned())
+    let list = rows(app, &view.project).to_vec();
+    cursor_index(view, &list).and_then(|i| list.get(i).cloned())
 }
 
 /// The URL of the pull request under the cursor, for the browser.
@@ -335,7 +321,7 @@ pub(crate) fn list_changed(app: &mut App) {
     let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
-    let list = rows(app, &view.project);
+    let list = rows(app, &view.project).to_vec();
     let found = view
         .selected_url
         .as_ref()
@@ -351,7 +337,9 @@ pub(crate) fn list_changed(app: &mut App) {
         return;
     };
     let moved = url != view.selected_url;
+    rebuild_list(view, &list);
     view.selected = index;
+    view.list.move_to_item(index);
     view.selected_url = url;
     if moved {
         view.scroll = 0;
@@ -374,6 +362,7 @@ fn select(app: &mut App, index: i64) {
     };
     if next != view.selected || url != view.selected_url {
         view.selected = next;
+        view.list.move_to_item(next);
         view.selected_url = url;
         view.scroll = 0;
     }
@@ -391,11 +380,15 @@ fn step(app: &mut App, delta: i64) {
     let Some(current) = cursor_index(view, list) else {
         return;
     };
-    let visible = visible_rows(&view.query, list);
-    let at = visible.iter().position(|(i, _)| *i == current).unwrap_or(0) as i64;
-    let next = clamp_selection(at + delta, visible.len());
-    if let Some((index, _)) = visible.get(next) {
-        select(app, *index as i64);
+    let at = view
+        .list
+        .matches
+        .iter()
+        .position(|m| m.item == current)
+        .unwrap_or(0) as i64;
+    let next = clamp_selection(at + delta, view.list.matches.len());
+    if let Some(m) = view.list.matches.get(next) {
+        select(app, m.item as i64);
     }
 }
 
@@ -409,11 +402,16 @@ fn query_changed(app: &mut App) {
     let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
-    let list = rows(app, &view.project);
+    let list = rows(app, &view.project).to_vec();
+    let Some(Overlay::PullRequests(view_mut)) = &mut app.modals.overlay else {
+        return;
+    };
+    rebuild_list(view_mut, &list);
+    let view = view_mut;
     let target = if has_query(view) {
-        visible_rows(&view.query, list).first().map(|(i, _)| *i)
+        view.list.matches.first().map(|m| m.item)
     } else {
-        cursor_index(view, list)
+        cursor_index(view, &list)
     };
     match target {
         Some(index) => select(app, index as i64),
@@ -425,7 +423,7 @@ fn query_changed(app: &mut App) {
 /// Esc: the filter cleared, the cursor staying on the row it was on.
 fn clear_query(app: &mut App) {
     if let Some(Overlay::PullRequests(view)) = &mut app.modals.overlay {
-        view.query.clear();
+        view.list.query.clear();
     }
     query_changed(app);
 }
@@ -437,7 +435,7 @@ pub(crate) fn paste(app: &mut App, text: &str) -> bool {
     let Some(Overlay::PullRequests(view)) = &mut app.modals.overlay else {
         return false;
     };
-    view.query.insert_str(text);
+    view.list.query.insert_str(text);
     query_changed(app);
     true
 }
@@ -587,7 +585,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
     match key.code {
         // Two-stage escape, like every fuzzy overlay: a typed filter is
         // cleared before the second Esc closes the modal.
-        KeyCode::Esc if !view.query.is_empty() => clear_query(app),
+        KeyCode::Esc if !view.list.query.is_empty() => clear_query(app),
         KeyCode::Esc => close(app),
         // Shift+↑/↓ scroll the pane a line; ↑/↓ walk the rows the filter
         // leaves, Ctrl+n/p mirroring them.
@@ -601,7 +599,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         // the line editor's kill-to-start while something is typed; only
         // with an empty filter does it scroll.
         KeyCode::Char('d') if ctrl => view.scroll_by(half),
-        KeyCode::Char('u') if ctrl && view.query.is_empty() => view.scroll_by(-half),
+        KeyCode::Char('u') if ctrl && view.list.query.is_empty() => view.scroll_by(-half),
         KeyCode::PageDown => view.scroll_by(page),
         KeyCode::PageUp => view.scroll_by(-page),
         KeyCode::Home => view.scroll = 0,
@@ -626,7 +624,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         // Everything else feeds the always-live fuzzy filter, which edits
         // like a terminal line (see text_input).
         _ => {
-            if view.query.handle_key(&key).changed() {
+            if view.list.query.handle_key(&key).changed() {
                 query_changed(app);
             }
         }
@@ -661,19 +659,12 @@ pub(crate) fn handle_mouse(
         // `Ctrl+o` runs.
         MouseEventKind::Down(MouseButton::Left) if on_button => open_in_browser(app, out),
         MouseEventKind::Down(MouseButton::Left) => {
-            let list = view.list_area;
-            let first = view.window_start(list.height as usize);
-            // The row math counts the filter's matches, not the whole list.
-            let prs: &[OpenPr] = app
-                .github
-                .open_prs
-                .get(&view.project)
-                .map_or(&[], |open| open.list.as_slice());
-            let visible = visible_rows(&view.query, prs);
-            if let Some(row) = crate::list_hit::row_at(list, first, visible.len(), mouse_pos) {
-                let index = visible[row].0;
-                let double =
-                    crate::event_loop::is_double_click(&mut view.last_row_click, prs[index].number);
+            if let Some(row) = view.list.hit(mouse_pos) {
+                let index = view.list.matches[row].item;
+                let double = crate::event_loop::is_double_click(
+                    &mut view.last_row_click,
+                    view.list.items[index].number,
+                );
                 select(app, index as i64);
                 if double {
                     open_in_browser(app, out);
@@ -824,17 +815,12 @@ pub(crate) fn draw(
     // The last ask came back with nothing — these rows are the last
     // answer that worked, however old — and no second ask is running yet.
     let stale = app.github.open_prs_failed.contains(&view.project) && !inflight;
-    // The rows the filter leaves, and where the cursor sits among them.
-    let visible = visible_rows(&view.query, &rows);
     let cursor = cursor_index(view, &rows);
-    let cursor_row = cursor
-        .and_then(|c| visible.iter().position(|(i, _)| *i == c))
-        .unwrap_or(0);
 
     // ---- left: the list ----
     // The count reads `matches/all` while a filter is on.
     let count = if has_query(view) {
-        format!("{}/{}", visible.len(), rows.len())
+        format!("{}/{}", view.list.matches.len(), rows.len())
     } else {
         rows.len().to_string()
     };
@@ -856,7 +842,7 @@ pub(crate) fn draw(
     f.render_widget(block, list_a);
     // The always-live filter on the list's first line, the rows under it.
     if let Some(query_area) = row_rect(list_inner, 0) {
-        let line = search_line(&view.query, "type to filter…", query_area, th);
+        let line = search_line(&view.list.query, "type to filter…", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
     let mut rows_area = crate::ui::below_first_row(list_inner);
@@ -881,20 +867,20 @@ pub(crate) fn draw(
         } else if !stale {
             empty_list_row(f, rows_area, "no open pull requests", th);
         }
-    } else if visible.is_empty() {
+    } else if view.list.matches.is_empty() {
         empty_list_row(f, rows_area, "no pull requests match", th);
     }
-    let start = window_start(cursor_row, rows_area.height as usize);
+    let start = view.list.window_start(rows_area.height as usize);
     let budget = (rows_area.width as usize).saturating_sub(2);
-    for (row, (index, positions)) in visible.iter().enumerate().skip(start) {
-        let Some(row_area) = row_rect(rows_area, row - start) else {
+    for (row, (i, m)) in view.list.matches.iter().enumerate().skip(start).enumerate() {
+        let Some(row_area) = row_rect(rows_area, row) else {
             break;
         };
         render_row(
             f,
             row_area,
-            row_spans(&rows[*index], positions, budget, th),
-            Some(*index) == cursor,
+            row_spans(&view.list.items[m.item], &m.positions, budget, th),
+            i == view.list.cursor,
             !backdrop,
             th,
         );
@@ -951,8 +937,8 @@ pub(crate) fn draw(
     // the pane's size for paging, and the clamped cursor and scroll.
     if let Some(Overlay::PullRequests(v)) = &mut app.modals.overlay {
         v.area = area;
-        v.list_area = rows_area;
-        v.cursor_row = cursor_row;
+        v.list.list_area = rows_area;
+        v.list.sync_scroll(rows_area.height as usize);
         v.body_area = body_inner;
         v.browser_area = browser_area;
         v.view_height = body_inner.height;
@@ -1154,13 +1140,13 @@ mod tests {
                 "{letter} types rather than closing"
             );
         }
-        assert_eq!(view(&app).query.as_str(), "qv");
+        assert_eq!(view(&app).list.query.as_str(), "qv");
         handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
         assert!(
             matches!(&app.modals.overlay, Some(Overlay::PullRequests(_))),
             "the first Esc only clears the filter"
         );
-        assert!(view(&app).query.is_empty());
+        assert!(view(&app).list.query.is_empty());
         handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
         assert!(app.modals.overlay.is_none(), "the second closes");
     }
@@ -1466,7 +1452,7 @@ mod tests {
         assert!(before.contains("draft"), "{before}");
         assert!(before.contains("Pull request #42"), "{before}");
         assert!(before.contains("reading it…"), "{before}");
-        assert!(view(&app).list_area.height > 0, "rects written back");
+        assert!(view(&app).list.list_area.height > 0, "rects written back");
 
         app.github.pr_detail.insert(
             "https://github.com/o/r/pull/42".into(),
@@ -1505,14 +1491,14 @@ mod tests {
         open(&mut app);
         let fine = screen(&mut app, 100, 20);
         assert!(!fine.contains("couldn't refresh"), "{fine}");
-        let first_row = view(&app).list_area.y;
+        let first_row = view(&app).list.list_area.y;
 
         app.github.open_prs_failed.insert(project.clone());
         let stale = screen(&mut app, 100, 20);
         assert!(stale.contains("couldn't refresh (^r retries)"), "{stale}");
         assert!(stale.contains("#42 Fix login"), "{stale}");
         assert_eq!(
-            view(&app).list_area.y,
+            view(&app).list.list_area.y,
             first_row + 1,
             "the rows' hit area starts under the note"
         );
@@ -1612,7 +1598,7 @@ mod tests {
         open(&mut app);
         assert!(footer_hint().starts_with("type to filter"));
         type_str(&mut app, "login");
-        assert_eq!(view(&app).query.as_str(), "login");
+        assert_eq!(view(&app).list.query.as_str(), "login");
         let shot = screen(&mut app, 120, 40);
         assert!(shot.contains("(2/3)"), "{shot}");
         assert!(
@@ -1629,7 +1615,7 @@ mod tests {
 
         // `v` types, rather than closing.
         handle_key(&mut app, key(KeyCode::Char('v')), &mut Vec::new());
-        assert_eq!(view(&app).query.as_str(), "loginv");
+        assert_eq!(view(&app).list.query.as_str(), "loginv");
         assert!(matches!(
             &app.modals.overlay,
             Some(Overlay::PullRequests(_))
@@ -1655,7 +1641,7 @@ mod tests {
             &app.modals.overlay,
             Some(Overlay::PullRequests(_))
         ));
-        assert!(view(&app).query.is_empty());
+        assert!(view(&app).list.query.is_empty());
         assert_eq!(
             selected_pr(&app).unwrap().number,
             second,
@@ -1705,7 +1691,10 @@ mod tests {
             v.scroll = 3;
         }
         handle_key(&mut app, ctrl('u'), &mut Vec::new());
-        assert!(view(&app).query.is_empty(), "Ctrl+u kills the typed filter");
+        assert!(
+            view(&app).list.query.is_empty(),
+            "Ctrl+u kills the typed filter"
+        );
         assert_eq!(view(&app).scroll, 3, "and does not scroll the pane");
         assert_eq!(
             selected_pr(&app).unwrap().number,
@@ -1732,7 +1721,7 @@ mod tests {
         open(&mut app);
         type_str(&mut app, "login");
         screen(&mut app, 120, 40);
-        let list = view(&app).list_area;
+        let list = view(&app).list.list_area;
         // The second visible row: the second match, whichever it is.
         let at = Position::new(list.x + 1, list.y + 1);
         let click = MouseEvent {
@@ -1742,11 +1731,14 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         handle_mouse(&mut app, click, at, &mut Vec::new());
-        assert_eq!(view(&app).query.as_str(), "login", "the filter is kept");
+        assert_eq!(
+            view(&app).list.query.as_str(),
+            "login",
+            "the filter is kept"
+        );
         let picked = selected_pr(&app).unwrap();
-        let list = rows(&app, &view(&app).project);
-        let visible = visible_rows("login", list);
-        assert_eq!(picked.number, list[visible[1].0].number);
+        let row = view(&app).list.matches[1].item;
+        assert_eq!(picked.number, view(&app).list.items[row].number);
         assert_ne!(picked.number, 41);
     }
 
@@ -1762,7 +1754,7 @@ mod tests {
         );
         open(&mut app);
         screen(&mut app, 120, 40);
-        let list = view(&app).list_area;
+        let list = view(&app).list.list_area;
         let click_at = |app: &mut App, row: u16| {
             let at = Position::new(list.x + 1, list.y + row);
             let click = MouseEvent {
@@ -1812,7 +1804,7 @@ mod tests {
         );
         open(&mut app);
         assert!(paste(&mut app, "docs\npass"));
-        assert_eq!(view(&app).query.as_str(), "docs pass");
+        assert_eq!(view(&app).list.query.as_str(), "docs pass");
         assert_eq!(selected_pr(&app).unwrap().number, 41);
         app.modals.overlay = None;
         assert!(!paste(&mut app, "x"));
@@ -1878,7 +1870,7 @@ mod tests {
         for letter in "rgoc".chars() {
             handle_key(&mut app, key(KeyCode::Char(letter)), &mut Vec::new());
         }
-        assert_eq!(view(&app).query.as_str(), "rgoc");
+        assert_eq!(view(&app).list.query.as_str(), "rgoc");
         assert!(matches!(
             &app.modals.overlay,
             Some(Overlay::PullRequests(_))

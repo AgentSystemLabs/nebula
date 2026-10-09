@@ -107,6 +107,18 @@ The TUI also has extras on top of the multiplexer: git diff viewer, grep, the ro
 
 **Input is not action.** In `nebula-tui` a key arm and a mouse arm only translate: they say *which row* (`list_hit::row_at` for the pointer) and then call the one function that says *what choosing it does* — `event_loop::activate` for the grid and the modals `event_loop` owns, a modal's own `activate_selected` or `Cmd` executor (`run_settings_cmd`, `file_tabs::run`, `preset_overlays::activate_selected`) for the rest, `select_clicked_row` / `select_*_row` for moving a cursor, `context_menu_items` for the right button's menu. Nothing that closes a modal, sends a request, spawns a process or moves a cursor lives inline in `handle_mouse` or in a key arm beside a twin that does the same. The rule exists because its absence shipped bugs: a click in a pull request's preset picker launched a plain session into the ROOT WORKTREE while Enter launched the PR SESSION, a click in the file finder skipped the markdown reader Enter had learned, and a right-click moved the cursor without the pane. The `INPUT PARITY` tests in `event_loop.rs` build the same app twice, choose a row once by key and once by pointer, and compare everything observable.
 
+## How to add a modal
+
+Use `crates/nebula-tui/src/issues.rs` as the reference for a list-style modal: the view state owns a `FilterList<T>` for query text, filtered matches, cursor, scroll window and row hit-testing; the module owns the actions that activate a row, refresh data, and reopen after a child prompt. Key and mouse dispatch should delegate to that module, and clicks should only identify/select rows before calling the same action path Enter uses. Draw list rows with `ui::render_row` and row content helpers from `ui/rows.rs` so labels, badges, status dots and width fitting stay consistent across overlays and launcher layouts.
+
+Checklist:
+
+- Add an `Overlay` variant and a small view struct; put long-lived row list state in `FilterList<T>`.
+- Keep slow work off the key handler: ask through the existing background job/channel pattern, then land answers back into the modal state.
+- Record `area` and list/body rects during draw for outside-click and row hit-testing.
+- Route Esc in two stages for fuzzy lists: clear the query first, close on the second Esc.
+- Add input-parity coverage for any row action reachable by both key and mouse.
+
 **A key handler never blocks.** `nebula-tui`'s event loop is one task: while a handler runs nothing paints, no PTY output is parsed and no other key is read. So a handler does bookkeeping and nothing else — anything that spawns a process, reads a file of unknown size or waits on the network is a BACKGROUND READ (`view_jobs.rs`: the worktree views' git and disk, keyed by ticket so a late answer nobody is waiting for is dropped) or one of the per-feature channels `main_loop` owns (`gh`, the BRANCH SWITCHER, issues), and a view built without a handle — every unit test — reads inline through the same parsers. What the DAEMON will confirm is shown first (`event_loop/optimistic.rs`, `event_loop/placeholder.rs`) and rolled back on Error. `event_loop/pacing.rs` decides when the loop may paint. The INPUT LATENCY PROBE (`perf.rs`, `NEBULA_PERF_LOG`) and `make perf` are how a change to any of it is judged: handler, paint, settle and echo per scripted step, with peak RSS beside them, because holding more to feel faster is not a trade this codebase makes — the pane's screen cache got quicker by holding less.
 
 **Mental model:** tmux, but the “windows” are agent CLIs bound to git worktrees, and the grid is a mission-control view of which agents are working, waiting, or dead.
