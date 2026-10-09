@@ -6,28 +6,28 @@ pub(crate) fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec
     // The daemon may hold this session even when the pane has already moved
     // on to another one whose attach is still debounced — release it either
     // way, or the connection stays attached to a row that no longer exists.
-    let showing = app.term.as_ref().is_some_and(|t| &t.sref == sref);
-    if app.attached_sref.as_ref() == Some(sref) || showing {
+    let showing = app.pane.term.as_ref().is_some_and(|t| &t.sref == sref);
+    if app.pane.attached_sref.as_ref() == Some(sref) || showing {
         out.push(ClientRequest::Detach {
             session: sref.clone(),
         });
-        if app.attached_sref.as_ref() == Some(sref) {
-            app.attached_sref = None;
+        if app.pane.attached_sref.as_ref() == Some(sref) {
+            app.pane.attached_sref = None;
         }
     }
     if showing {
-        app.pending_attach = None;
-        app.term = None;
+        app.pane.pending_attach = None;
+        app.pane.term = None;
         // The row went away under the pane — not a key anyone pressed, so
         // it says that the keys are the grid's now.
         app.release_terminal();
-        if app.focus == Focus::Terminal {
-            app.focus = Focus::Sessions;
+        if app.nav.focus == Focus::Terminal {
+            app.nav.focus = Focus::Sessions;
         }
     }
     // Archived, deleted or killed: whatever comes back under this ref is
     // a new process, so its kept screen is stale.
-    app.term_cache.retain(|t| &t.sref != sref);
+    app.pane.term_cache.retain(|t| &t.sref != sref);
 }
 
 pub(crate) fn shellexpand_home(path: &str) -> std::path::PathBuf {
@@ -47,7 +47,7 @@ pub(crate) fn remember_context(app: &mut App) {
         return;
     };
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
-        app.last_worktree_for_project.insert(pid, wid.clone());
+        app.nav.last_worktree_for_project.insert(pid, wid.clone());
     }
     let row = app.selected_session_row();
     // A link row is not a session. Leaving the worktree with the cursor
@@ -58,10 +58,10 @@ pub(crate) fn remember_context(app: &mut App) {
     }
     match row.and_then(|r| r.sref()) {
         Some(sref) => {
-            app.last_session_for_worktree.insert(wid, sref);
+            app.nav.last_session_for_worktree.insert(wid, sref);
         }
         None => {
-            app.last_session_for_worktree.remove(&wid);
+            app.nav.last_session_for_worktree.remove(&wid);
         }
     }
 }
@@ -79,14 +79,14 @@ pub(crate) fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// on its own — its grid draws no pane, so attaching the project's last
 /// session would boot a PTY nobody is looking at.
 pub(crate) fn restore_project_cursors(app: &mut App) {
-    app.sel_worktree = 0;
+    app.nav.sel_worktree = 0;
     schedule_open_prs_lookup(app);
     crate::issues::schedule_prefetch(app);
     schedule_pr_detail(app);
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
-        if let Some(wid) = app.last_worktree_for_project.get(&pid).cloned() {
+        if let Some(wid) = app.nav.last_worktree_for_project.get(&pid).cloned() {
             if let Some(i) = app.worktree_row_of(&wid) {
-                app.sel_worktree = i;
+                app.nav.sel_worktree = i;
             }
         }
     }
@@ -100,13 +100,13 @@ pub(crate) fn restore_project_cursors(app: &mut App) {
 /// Only a worktree with no attachable row at all blanks the pane, rather
 /// than keep showing the previous context's session.
 pub(crate) fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.sel_session = 0;
+    app.nav.sel_session = 0;
     schedule_prewarm(app);
     schedule_pr_lookup(app);
     let rows = app.visible_session_rows();
     let remembered = app
         .selected_worktree()
-        .and_then(|w| app.last_session_for_worktree.get(&w.id).cloned());
+        .and_then(|w| app.nav.last_session_for_worktree.get(&w.id).cloned());
     let attachable = |r: &SessionRow| r.sref().is_some() && !r.is_archived_agent();
     let target = remembered
         .and_then(|sref| {
@@ -117,7 +117,7 @@ pub(crate) fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
         .and_then(|i| rows[i].sref().map(|sref| (i, sref)));
     match target {
         Some((index, sref)) => {
-            app.sel_session = index;
+            app.nav.sel_session = index;
             // A worktree the NESTED layout has folded is its header under
             // the cursor, not the card it was left on: the row is kept
             // for when the band opens, and nothing off screen is attached
@@ -127,7 +127,7 @@ pub(crate) fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
             }
         }
         None => {
-            if app.term.is_some() {
+            if app.pane.term.is_some() {
                 detach_pane(app, out);
             }
         }
@@ -141,7 +141,7 @@ pub(crate) fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// landed under first. Clears the pending follow once it lands; a no-op
 /// until the session's upsert has arrived.
 pub(crate) fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some(pending_sref) = app.select_when_seen.clone() else {
+    let Some(pending_sref) = app.requests.select_when_seen.clone() else {
         return;
     };
     if let Some(index) = app
@@ -149,8 +149,8 @@ pub(crate) fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>
         .iter()
         .position(|r| r.sref().as_ref() == Some(&pending_sref))
     {
-        app.sel_session = index;
-        app.select_when_seen = None;
+        app.nav.sel_session = index;
+        app.requests.select_when_seen = None;
         // A card landed on is a card on screen (the NESTED layout's fold).
         launcher::unfold_cursor_band(app);
         // The pane follows the cursor; a session about to be attached
@@ -192,11 +192,11 @@ pub(crate) fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>
                 .iter()
                 .position(|r| r.sref().as_ref() == Some(&pending_sref))
             {
-                app.sel_session = index;
+                app.nav.sel_session = index;
                 launcher::unfold_cursor_band(app);
                 preview_selected(app, out);
             }
-            app.select_when_seen = None;
+            app.requests.select_when_seen = None;
         }
     }
 }
@@ -211,13 +211,13 @@ pub(crate) fn select_worktree_by_id(
     let Some(index) = app.worktree_row_of(id) else {
         return false;
     };
-    if app.sel_worktree != index {
+    if app.nav.sel_worktree != index {
         remember_context(app);
-        app.sel_worktree = index;
+        app.nav.sel_worktree = index;
         restore_session(app, out);
     }
     // Land on the sessions panel so `n` immediately creates a session here.
-    app.focus = Focus::Sessions;
+    app.nav.focus = Focus::Sessions;
     true
 }
 
@@ -252,10 +252,10 @@ pub(crate) fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectI
     let Some(row) = rows.iter().position(|i| &app.tree.projects[*i].id == id) else {
         return false;
     };
-    app.select_worktree_when_seen = None;
+    app.requests.select_worktree_when_seen = None;
     remember_context(app);
     let left = app.selected_project().map(|p| p.id.clone());
-    app.sel_project = row;
+    app.nav.sel_project = row;
     app.reopen_projects();
     carry_open_band(app, left);
     true
@@ -274,12 +274,13 @@ pub(crate) fn carry_open_band(app: &mut App, left: Option<ProjectId>) {
         return;
     }
     if let Some(pid) = left {
-        match app.launcher_expanded.take() {
-            Some(open) => app.launcher_open_bands.insert(pid, open),
-            None => app.launcher_open_bands.remove(&pid),
+        match app.launcher.launcher_expanded.take() {
+            Some(open) => app.launcher.launcher_open_bands.insert(pid, open),
+            None => app.launcher.launcher_open_bands.remove(&pid),
         };
     }
-    app.launcher_expanded = now.and_then(|pid| app.launcher_open_bands.get(&pid).cloned());
+    app.launcher.launcher_expanded =
+        now.and_then(|pid| app.launcher.launcher_open_bands.get(&pid).cloned());
 }
 
 /// Land the panel selections on a `/` palette pick. A project or worktree
@@ -317,7 +318,7 @@ pub(crate) fn jump_to_target_inner(
         PaletteTarget::Project(id) => launcher::open_tab(app, &id, out),
         PaletteTarget::Worktree(id) => {
             if app.selected_worktree().is_some_and(|w| w.id == id) {
-                app.focus = Focus::Sessions;
+                app.nav.focus = Focus::Sessions;
                 return;
             }
             let found = app
@@ -329,12 +330,12 @@ pub(crate) fn jump_to_target_inner(
                 .is_some_and(|pid| select_project_row_by_id(app, &pid));
             let index = found.then(|| app.worktree_row_of(&id)).flatten();
             let Some(index) = index else {
-                app.flash = Some("worktree no longer exists".into());
+                app.chrome.flash = Some("worktree no longer exists".into());
                 return;
             };
-            app.sel_worktree = index;
+            app.nav.sel_worktree = index;
             restore_session(app, out);
-            app.focus = Focus::Sessions;
+            app.nav.focus = Focus::Sessions;
             // A checkout picked by name is its BAND on the grid, with the
             // pane on the card it was last left on.
             launcher::land_on_grid(app);
@@ -358,10 +359,10 @@ pub(crate) fn jump_to_target_inner(
                 .then(|| worktree.as_ref().and_then(|wid| app.worktree_row_of(wid)))
                 .flatten();
             let Some(wt_index) = wt_index else {
-                app.flash = Some(SESSION_GONE.into());
+                app.chrome.flash = Some(SESSION_GONE.into());
                 return;
             };
-            app.sel_worktree = wt_index;
+            app.nav.sel_worktree = wt_index;
             let Some(index) = app
                 .visible_session_rows()
                 .iter()
@@ -370,18 +371,18 @@ pub(crate) fn jump_to_target_inner(
                 // Vanished (or got archived out of view) mid-pick: land on
                 // its worktree instead of attaching.
                 restore_session(app, out);
-                app.focus = Focus::Sessions;
-                app.flash = Some(SESSION_GONE.into());
+                app.nav.focus = Focus::Sessions;
+                app.chrome.flash = Some(SESSION_GONE.into());
                 return;
             };
-            app.sel_session = index;
+            app.nav.sel_session = index;
             // A session picked by name is its card on the grid, aimed at
             // — and on screen: its worktree opens if it was folded.
             launcher::land_on_card(app);
             match landing {
                 Landing::Attach => attach_selected(app, out),
                 Landing::FocusOnly => {
-                    app.focus = Focus::Sessions;
+                    app.nav.focus = Focus::Sessions;
                     preview_selected(app, out);
                 }
             }
@@ -401,27 +402,27 @@ pub(crate) fn jump_to_target_inner(
                 .map(|p| p.id != project)
                 .unwrap_or(true);
             if !select_project_row_by_id(app, &project) {
-                app.flash = Some("project no longer exists".into());
+                app.chrome.flash = Some("project no longer exists".into());
                 return;
             }
             if changed {
                 restore_context(app, out);
             }
-            if app.open_prs_collapsed {
-                app.open_prs_collapsed = false;
-                app.dirty = true;
+            if app.launcher.open_prs_collapsed {
+                app.launcher.open_prs_collapsed = false;
+                app.chrome.dirty = true;
             }
             let Some(row) = app.open_pr_row_of(&url) else {
-                app.flash = Some(PR_GONE.into());
+                app.chrome.flash = Some(PR_GONE.into());
                 return;
             };
             // Re-picking the row the cursor is already on keeps the
             // reader's scroll; a move re-arms the detail fetch as any
             // cursor move onto the row does.
-            if app.sel_worktree != row {
+            if app.nav.sel_worktree != row {
                 select_worktree_row(app, row, out);
             }
-            app.focus = Focus::Worktrees;
+            app.nav.focus = Focus::Worktrees;
             if landing == Landing::Attach {
                 open_link(app, &url, out);
             }
@@ -459,21 +460,21 @@ pub(crate) fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<Client
         .then(|| worktree.as_ref().and_then(|wid| app.worktree_row_of(wid)))
         .flatten();
     let Some(wt_index) = wt_index else {
-        app.flash = Some(SESSION_GONE.into());
+        app.chrome.flash = Some(SESSION_GONE.into());
         return;
     };
-    app.sel_worktree = wt_index;
+    app.nav.sel_worktree = wt_index;
     let Some(index) = app
         .visible_session_rows()
         .iter()
         .position(|r| r.sref().as_ref() == Some(&sref))
     else {
         restore_session(app, out);
-        app.focus = Focus::Sessions;
-        app.flash = Some(SESSION_GONE.into());
+        app.nav.focus = Focus::Sessions;
+        app.chrome.flash = Some(SESSION_GONE.into());
         return;
     };
-    app.sel_session = index;
+    app.nav.sel_session = index;
     attach_selected(app, out);
 }
 
@@ -546,7 +547,7 @@ pub(crate) fn jump_attention(
 ) {
     let ring = crate::palette::attention_sessions(&app.tree);
     if ring.is_empty() {
-        app.flash = Some(NO_SESSIONS_TO_JUMP.into());
+        app.chrome.flash = Some(NO_SESSIONS_TO_JUMP.into());
         return;
     }
     let len = ring.len() as i64;
@@ -565,8 +566,8 @@ pub(crate) fn jump_attention(
 
 pub(crate) fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     // (row count, cursor) of the focused column.
-    let (len, sel) = match app.focus {
-        Focus::Projects => (app.project_rows().len(), app.sel_project),
+    let (len, sel) = match app.nav.focus {
+        Focus::Projects => (app.project_rows().len(), app.nav.sel_project),
         Focus::Worktrees => {
             // Stepping down off the last row into a folded OPEN PRS group
             // opens it and lands on its first pull request: the rows are
@@ -574,12 +575,12 @@ pub(crate) fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequ
             // at the header.
             let checkouts = app.worktree_row_count();
             if delta > 0
-                && app.open_prs_collapsed
-                && app.sel_worktree + 1 >= checkouts
+                && app.launcher.open_prs_collapsed
+                && app.nav.sel_worktree + 1 >= checkouts
                 && !app.listed_open_prs().is_empty()
             {
-                app.open_prs_collapsed = false;
-                app.dirty = true;
+                app.launcher.open_prs_collapsed = false;
+                app.chrome.dirty = true;
                 // The first pull request's row, once the group is open —
                 // a checkout that just moved under one leaves the plain
                 // rows, so it is not simply the old count.
@@ -595,12 +596,12 @@ pub(crate) fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequ
             // pull request, or the last checkout when there are none —
             // into that group, the same way.
             if delta > 0
-                && app.issues_collapsed
-                && app.sel_worktree + 1 >= checkouts
+                && app.launcher.issues_collapsed
+                && app.nav.sel_worktree + 1 >= checkouts
                 && !app.listed_issues().is_empty()
             {
-                app.issues_collapsed = false;
-                app.dirty = true;
+                app.launcher.issues_collapsed = false;
+                app.chrome.dirty = true;
                 let first = app
                     .worktree_rows()
                     .iter()
@@ -609,9 +610,9 @@ pub(crate) fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequ
                 select_worktree_row(app, first, out);
                 return;
             }
-            (checkouts, app.sel_worktree)
+            (checkouts, app.nav.sel_worktree)
         }
-        Focus::Sessions => (app.visible_session_rows().len(), app.sel_session),
+        Focus::Sessions => (app.visible_session_rows().len(), app.nav.sel_session),
         Focus::Terminal => return,
     };
     if len == 0 {
@@ -622,7 +623,7 @@ pub(crate) fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequ
         return;
     }
     // Selecting a different parent resets child selections.
-    match app.focus {
+    match app.nav.focus {
         Focus::Projects => select_project_row(app, new, out),
         Focus::Worktrees => select_worktree_row(app, new, out),
         Focus::Sessions => select_session_row(app, new, ATTACH_DEBOUNCE, out),
@@ -634,10 +635,10 @@ pub(crate) fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequ
 /// left is remembered, and the new project's is restored.
 pub(crate) fn select_project_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
     // A manual move outranks any pending selection-follows.
-    app.select_worktree_when_seen = None;
+    app.requests.select_worktree_when_seen = None;
     remember_context(app);
     let owner_before = app.selected_project().map(|p| p.id.clone());
-    app.sel_project = i;
+    app.nav.sel_project = i;
     app.reopen_projects();
     carry_open_band(app, owner_before.clone());
     if app.selected_project().map(|p| p.id.clone()) != owner_before {
@@ -650,9 +651,9 @@ pub(crate) fn select_project_row(app: &mut App, i: usize, out: &mut Vec<ClientRe
 /// switch: it has no sessions to restore and nothing to attach, so the
 /// pane is left exactly as it was.
 pub(crate) fn select_worktree_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
-    app.select_worktree_when_seen = None;
+    app.requests.select_worktree_when_seen = None;
     remember_context(app);
-    app.sel_worktree = i;
+    app.nav.sel_worktree = i;
     if app.selected_worktree().is_some() {
         restore_session(app, out);
     }
@@ -699,7 +700,7 @@ pub(crate) fn preview_inner(app: &mut App, delay: Duration, out: &mut Vec<Client
 /// on a link row — hand its URL to the browser and stay put.
 pub(crate) fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     let rows = app.visible_session_rows();
-    let Some(row) = rows.get(app.sel_session) else {
+    let Some(row) = rows.get(app.nav.sel_session) else {
         return;
     };
     let Some(sref) = row.sref() else {
@@ -736,9 +737,9 @@ pub(crate) fn cloud_session_url_of(app: &App, sref: &SessionRef) -> Option<Strin
 /// comes here instead (`launcher::open_session`). [`leave_terminal_lock`]
 /// is its undo.
 pub(crate) fn zoom_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.collapsed = true;
-    app.focus = Focus::Terminal;
-    app.term_locked = true;
+    app.pane.collapsed = true;
+    app.nav.focus = Focus::Terminal;
+    app.pane.term_locked = true;
     fire_pending_attach(app, out);
 }
 
@@ -746,9 +747,9 @@ pub(crate) fn zoom_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// full screen, so there is something on screen to land in — which is
 /// what takes a full-screen session back to the LAUNCHER VIEW's GRID.
 pub(crate) fn leave_terminal_lock(app: &mut App) {
-    app.collapsed = false;
-    app.term_locked = false;
-    app.focus = Focus::Sessions;
+    app.pane.collapsed = false;
+    app.pane.term_locked = false;
+    app.nav.focus = Focus::Sessions;
 }
 
 /// Open a saved link in the browser, reporting either way — the browser
@@ -758,10 +759,10 @@ pub(crate) fn leave_terminal_lock(app: &mut App) {
 /// again from here.
 pub(crate) fn open_link(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
     if open_url(url) {
-        app.flash = Some(format!("opened {}", crate::app::pretty_url(url)));
+        app.chrome.flash = Some(format!("opened {}", crate::app::pretty_url(url)));
         mark_pr_seen(app, url, out);
     } else {
-        app.flash = Some(format!("couldn't open {url}"));
+        app.chrome.flash = Some(format!("couldn't open {url}"));
     }
 }
 
@@ -771,6 +772,7 @@ pub(crate) fn open_link(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) 
 /// URL isn't a PR, or when the mark wouldn't move.
 pub(crate) fn mark_pr_seen(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
     let Some(marker) = app
+        .github
         .pull_requests
         .values()
         .flatten()
@@ -779,11 +781,11 @@ pub(crate) fn mark_pr_seen(app: &mut App, url: &str, out: &mut Vec<ClientRequest
     else {
         return;
     };
-    if app.pr_seen.get(url) == Some(&marker) {
+    if app.github.pr_seen.get(url) == Some(&marker) {
         return;
     }
-    app.pr_seen.insert(url.to_string(), marker.clone());
-    app.dirty = true;
+    app.github.pr_seen.insert(url.to_string(), marker.clone());
+    app.chrome.dirty = true;
     out.push(ClientRequest::MarkPrSeen {
         url: url.to_string(),
         marker,
@@ -800,7 +802,7 @@ pub(crate) fn mark_agent_seen(app: &mut App, id: &AgentId, out: &mut Vec<ClientR
         return;
     };
     a.unseen = false;
-    app.dirty = true;
+    app.chrome.dirty = true;
     out.push(ClientRequest::MarkAgentSeen { id: id.clone() });
 }
 
@@ -844,6 +846,7 @@ pub(crate) fn attach_inner(
         return;
     }
     let showing = app
+        .pane
         .term
         .as_ref()
         .is_some_and(|t| t.sref == sref && !t.exited);
@@ -851,12 +854,12 @@ pub(crate) fn attach_inner(
     if !showing {
         let (cols, rows) = pane_size(app);
         // Fresh screen, so any persisted selection would point at stale cells.
-        app.term_selection = None;
+        app.pane.term_selection = None;
         // The screen being left goes aside for a quick return, and the one
         // arriving comes back from there when it was shown recently: its
         // last screen is up on this frame, and the Attach below asks only
         // for what it missed. Anything else starts blank and replays.
-        if let Some(leaving) = app.term.take() {
+        if let Some(leaving) = app.pane.term.take() {
             app.stash_term(leaving);
         }
         let term = match app.take_cached_term(&sref) {
@@ -874,8 +877,8 @@ pub(crate) fn attach_inner(
                 fresh
             }
         };
-        app.term = Some(term);
-        app.dirty = true;
+        app.pane.term = Some(term);
+        app.chrome.dirty = true;
     }
     // Attaching a session the daemon still holds only replays its ring —
     // there is no CLI to fork, so there is nothing to wait to see whether
@@ -885,23 +888,23 @@ pub(crate) fn attach_inner(
     // wait.
     let delay = if live { Duration::ZERO } else { delay };
     if delay.is_zero() {
-        app.pending_attach = None;
+        app.pane.pending_attach = None;
         send_attach(app, sref, out);
-    } else if app.attached_sref.as_ref() == Some(&sref) {
+    } else if app.pane.attached_sref.as_ref() == Some(&sref) {
         // The daemon already holds it; nothing to send, nothing to wait for.
-        app.pending_attach = None;
+        app.pane.pending_attach = None;
     } else {
-        app.pending_attach = Some((sref, std::time::Instant::now() + delay));
+        app.pane.pending_attach = Some((sref, std::time::Instant::now() + delay));
     }
 }
 
 /// Move the daemon-side attachment to `sref`, releasing whatever it held.
 /// Idempotent, so every caller can just ask for the session it wants.
 pub(crate) fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
-    if app.attached_sref.as_ref() == Some(&sref) {
+    if app.pane.attached_sref.as_ref() == Some(&sref) {
         return;
     }
-    if let Some(old) = app.attached_sref.take() {
+    if let Some(old) = app.pane.attached_sref.take() {
         out.push(ClientRequest::Detach { session: old });
     }
     // A QUICK PROMPT stand-in has no PTY behind it yet: the pane keeps its
@@ -919,11 +922,12 @@ pub(crate) fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientR
     // off, which rebuilds the screen as a first attach would.
     // …unless the whole ring is the point: a history being brought back.
     let from_seq = app
+        .pane
         .term
         .as_ref()
         .filter(|t| t.sref == sref && t.painted && t.pending_scroll.is_none())
         .map(|t| t.next_seq);
-    app.attached_sref = Some(sref.clone());
+    app.pane.attached_sref = Some(sref.clone());
     out.push(ClientRequest::Attach {
         session: sref,
         from_seq,
@@ -938,7 +942,7 @@ pub(crate) fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientR
 /// it, and lands the reader on `scroll` — the notch that asked. One wheel
 /// notch late, once per return, is what the instant return costs.
 pub(crate) fn rehydrate_history(app: &mut App, scroll: usize, out: &mut Vec<ClientRequest>) {
-    let Some(term) = &mut app.term else {
+    let Some(term) = &mut app.pane.term else {
         return;
     };
     if !term.history_dropped {
@@ -949,20 +953,20 @@ pub(crate) fn rehydrate_history(app: &mut App, scroll: usize, out: &mut Vec<Clie
     let sref = term.sref.clone();
     // Let go first, so the forwarder of the attachment being replaced is
     // gone before the replay that supersedes it is sent.
-    if app.attached_sref.as_ref() == Some(&sref) {
-        app.attached_sref = None;
+    if app.pane.attached_sref.as_ref() == Some(&sref) {
+        app.pane.attached_sref = None;
         out.push(ClientRequest::Detach {
             session: sref.clone(),
         });
     }
-    app.pending_attach = None;
+    app.pane.pending_attach = None;
     send_attach(app, sref, out);
 }
 
 /// Send the armed attach now — the selection settled, or something needs
 /// the session live this instant (a keystroke about to be forwarded).
 pub(crate) fn fire_pending_attach(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some((sref, _)) = app.pending_attach.take() else {
+    let Some((sref, _)) = app.pane.pending_attach.take() else {
         return;
     };
     send_attach(app, sref, out);
@@ -973,11 +977,12 @@ pub(crate) fn fire_pending_attach(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// caller that only knows about the pane still lets go. A Detach the daemon
 /// has no attachment for costs it a hash lookup and nothing else.
 pub(crate) fn release_attachment(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.pending_attach = None;
+    app.pane.pending_attach = None;
     // A QUICK PROMPT stand-in in the pane was never attached — `send_attach`
     // stops at it — so there is nothing to let go of there.
-    let session = app.attached_sref.take().or_else(|| {
-        app.term
+    let session = app.pane.attached_sref.take().or_else(|| {
+        app.pane
+            .term
             .as_ref()
             .map(|t| t.sref.clone())
             .filter(|s| !app.is_placeholder_session(s))
@@ -991,16 +996,16 @@ pub(crate) fn release_attachment(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// kept for a quick return (`App::term_cache`); the session is still there.
 pub(crate) fn detach_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
     release_attachment(app, out);
-    if let Some(leaving) = app.term.take() {
+    if let Some(leaving) = app.pane.term.take() {
         app.stash_term(leaving);
     }
-    app.term_locked = false;
+    app.pane.term_locked = false;
 }
 
 /// Terminal-pane grid for spawn/attach requests; the fallback keeps
 /// pre-first-draw requests from booting a 0×0 PTY.
 pub(crate) fn pane_size(app: &App) -> (u16, u16) {
-    let area = app.term_area;
+    let area = app.pane.term_area;
     if pane_usable(area) {
         (area.width, area.height)
     } else {
@@ -1011,7 +1016,7 @@ pub(crate) fn pane_size(app: &App) -> (u16, u16) {
 /// Arm the debounced session prewarm for the selected worktree; the main
 /// loop fires it once the selection has rested there (PREWARM_DEBOUNCE).
 pub(crate) fn schedule_prewarm(app: &mut App) {
-    app.pending_prewarm = app
+    app.requests.pending_prewarm = app
         .selected_worktree()
         .map(|w| (w.id.clone(), std::time::Instant::now() + PREWARM_DEBOUNCE));
 }
@@ -1020,7 +1025,7 @@ pub(crate) fn schedule_prewarm(app: &mut App) {
 /// worktree is a cheap daemon-side no-op, so staleness needs no handling
 /// beyond the daemon skipping rows that no longer exist.
 pub(crate) fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some((worktree, _)) = app.pending_prewarm.take() else {
+    let Some((worktree, _)) = app.requests.pending_prewarm.take() else {
         return;
     };
     // A QUICK PROMPT stand-in checkout is not on disk yet; the launch that
@@ -1037,7 +1042,7 @@ pub(crate) fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) 
     // The selected worktree also keeps one Claude session standing by, so
     // creating a session there adopts an already-booted CLI.
     out.extend(default_claude_prewarm(worktree));
-    app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
+    app.requests.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
 }
 
 /// Flashed at a launch, a delete or a terminal aimed at a QUICK PROMPT
@@ -1093,7 +1098,7 @@ pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec
     let pr = match pr {
         Some(pr) => {
             let Some(project) = project_of_worktree(app, &worktree) else {
-                app.flash = Some("worktree no longer exists".into());
+                app.chrome.flash = Some("worktree no longer exists".into());
                 return;
             };
             // The checkout it runs in: the project's worktree already on
@@ -1118,7 +1123,7 @@ pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec
                     if let Some((kind, text)) = reopen_on_error {
                         reopen_prompt_with(app, kind, text);
                     }
-                    app.flash = Some(WORKTREE_STILL_CREATING.into());
+                    app.chrome.flash = Some(WORKTREE_STILL_CREATING.into());
                     return;
                 }
                 Some(_) => None,
@@ -1190,7 +1195,7 @@ pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec
     // The second half of a launch the user already navigated away from:
     // its Ack leaves the cursors where they are, as the first half's did.
     if !follow {
-        app.left_behind.insert(req_id);
+        app.requests.left_behind.insert(req_id);
     }
     out.push(match pr {
         Some((project, pr, _)) => {
@@ -1261,7 +1266,7 @@ pub(crate) fn default_claude_prewarm(worktree: WorktreeId) -> Option<ClientReque
 /// would empty the slot at its max age and the next create would boot cold.
 pub(crate) fn fire_keepwarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     let Some(worktree) = app.selected_worktree().map(|w| w.id.clone()) else {
-        app.next_keepwarm = None;
+        app.requests.next_keepwarm = None;
         return;
     };
     // The beat keeps going past a QUICK PROMPT stand-in — it is the real
@@ -1269,5 +1274,5 @@ pub(crate) fn fire_keepwarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     if !app.is_placeholder_worktree(&worktree) {
         out.extend(default_claude_prewarm(worktree));
     }
-    app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
+    app.requests.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
 }

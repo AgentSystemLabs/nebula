@@ -38,7 +38,7 @@ pub(crate) fn attach_created(
     // or without `follow`: where the cursor goes is one question, and
     // where the newest session sorts is another.
     if let EntityId::Agent(real) = &id {
-        app.just_launched = Some(real.clone());
+        app.requests.just_launched = Some(real.clone());
     }
     let sref = match id {
         EntityId::Agent(id) => Some(SessionRef::Agent(id)),
@@ -51,7 +51,8 @@ pub(crate) fn attach_created(
     if !follow {
         reconcile_selection_inner(app, before, out);
         let stand_in_shown = placeholder.is_some_and(|stand_in| {
-            app.term
+            app.pane
+                .term
                 .as_ref()
                 .is_some_and(|t| t.sref == SessionRef::Agent(stand_in))
         });
@@ -63,7 +64,7 @@ pub(crate) fn attach_created(
     if matches!(sref, SessionRef::Terminal(_)) && app.launcher_active() {
         launcher::show_created_terminal(app);
     }
-    app.select_when_seen = Some(sref.clone());
+    app.requests.select_when_seen = Some(sref.clone());
     // Its upsert usually lands just before this Ack; land the selection
     // now, or on the upsert otherwise.
     land_pending_selection(app, out);
@@ -72,8 +73,8 @@ pub(crate) fn attach_created(
     // cursor stays where the create was fired from — see
     // `quick_prompt_focus`.
     if focus {
-        app.focus = Focus::Terminal;
-        app.term_locked = true;
+        app.nav.focus = Focus::Terminal;
+        app.pane.term_locked = true;
     }
 }
 
@@ -83,7 +84,7 @@ pub(crate) fn reopen_prompt_with(app: &mut App, mut kind: PromptKind, text: Stri
         crate::quick_prompt::restack(app, launch);
     }
     open_prompt(app, kind);
-    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+    if let Some(Overlay::Prompt(prompt)) = &mut app.modals.overlay {
         prompt.input.set_text(text);
     }
 }
@@ -104,7 +105,7 @@ pub(crate) fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
                     .iter()
                     .position(|i| app.tree.projects[*i].id == id);
                 if let Some(i) = found {
-                    app.sel_project = i;
+                    app.nav.sel_project = i;
                 }
             }
         }
@@ -123,21 +124,23 @@ pub(crate) fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             let id = a.id.clone();
             upsert_by(&mut app.tree.agents, a, |x, y| x.id == y.id);
             if moved && selected.as_ref() == Some(&id) {
-                app.select_when_seen = Some(SessionRef::Agent(id));
+                app.requests.select_when_seen = Some(SessionRef::Agent(id));
             }
         }
         Entity::Terminal(t) => {
             let id = t.id.clone();
             upsert_by(&mut app.tree.terminals, t, |x, y| x.id == y.id);
             if app
+                .requests
                 .run_flash_when_seen
                 .as_ref()
                 .is_some_and(|(want, _)| *want == id)
             {
-                if let (Some(command), Some((_, branch))) =
-                    (run_command_of(app, &id), app.run_flash_when_seen.take())
-                {
-                    app.flash = Some(format!("▶ running {command} in {branch}"));
+                if let (Some(command), Some((_, branch))) = (
+                    run_command_of(app, &id),
+                    app.requests.run_flash_when_seen.take(),
+                ) {
+                    app.chrome.flash = Some(format!("▶ running {command} in {branch}"));
                 }
             }
         }
@@ -181,11 +184,11 @@ pub(crate) fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
                 .terminals
                 .retain(|t| !wt_ids.contains(&t.worktree_id));
             app.tree.links.retain(|l| !wt_ids.contains(&l.worktree_id));
-            app.pull_requests.retain(|w, _| !wt_ids.contains(w));
-            app.pr_recheck.retain(|w, _| !wt_ids.contains(w));
-            app.open_prs.remove(id);
-            app.open_prs_failed.remove(id);
-            app.pr_cache_dirty = true;
+            app.github.pull_requests.retain(|w, _| !wt_ids.contains(w));
+            app.github.pr_recheck.retain(|w, _| !wt_ids.contains(w));
+            app.github.open_prs.remove(id);
+            app.github.open_prs_failed.remove(id);
+            app.github.pr_cache_dirty = true;
             app.tree.worktrees.retain(|w| &w.project_id != id);
             app.tree.projects.retain(|p| &p.id != id);
         }
@@ -193,14 +196,14 @@ pub(crate) fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree.agents.retain(|a| &a.worktree_id != id);
             app.tree.terminals.retain(|t| &t.worktree_id != id);
             app.tree.links.retain(|l| &l.worktree_id != id);
-            app.pr_cache_dirty |= app.pull_requests.remove(id).is_some();
-            app.pr_recheck.remove(id);
+            app.github.pr_cache_dirty |= app.github.pull_requests.remove(id).is_some();
+            app.github.pr_recheck.remove(id);
             app.tree.worktrees.retain(|w| &w.id != id);
         }
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
         EntityId::Terminal(id) => {
             app.tree.terminals.retain(|t| &t.id != id);
-            app.terminal_tails.remove(id);
+            app.pane.terminal_tails.remove(id);
         }
         EntityId::Link(id) => app.tree.links.retain(|l| &l.id != id),
     }
@@ -249,14 +252,14 @@ pub(crate) fn restore_worktree_rows(app: &mut App, rollback: WorktreeRollback) {
         }
     }
     clamp_selections(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Keep an open `/` palette in sync with tree changes (renames, removals,
 /// new entities) so its rows never go stale under the user's cursor.
 pub(crate) fn refresh_palette(app: &mut App) {
-    if let Some(Overlay::Palette(palette)) = &mut app.overlay {
-        palette.rebuild(&app.tree, &app.open_prs, app.hide_draft_prs);
+    if let Some(Overlay::Palette(palette)) = &mut app.modals.overlay {
+        palette.rebuild(&app.tree, &app.github.open_prs, app.launcher.hide_draft_prs);
     }
 }
 
@@ -311,7 +314,7 @@ pub(crate) fn selection_snapshot(app: &App) -> SelectionSnapshot {
         worktree: app.selected_worktree().map(|w| w.id.clone()),
         pr: app.selected_worktree_pr().map(|pr| pr.url.clone()),
         issue: app.selected_worktree_issue().map(|i| i.url.clone()),
-        session_index: app.sel_session,
+        session_index: app.nav.sel_session,
         session_group: row.as_ref().map(session_group),
         session: row.and_then(|r| r.sref()),
     }
@@ -348,8 +351,8 @@ pub(crate) fn reconcile_selection_inner(
             // The selected row's project is gone; the cursor landed on a
             // neighbor — bring up its remembered worktree + session, and
             // the band it was left with open.
-            app.launcher_open_bands.remove(pid);
-            app.launcher_expanded = None;
+            app.launcher.launcher_open_bands.remove(pid);
+            app.launcher.launcher_expanded = None;
             carry_open_band(app, None);
             restore_context(app, out);
             return;
@@ -358,14 +361,14 @@ pub(crate) fn reconcile_selection_inner(
             let rows = app.project_rows();
             let found = rows.iter().position(|i| &app.tree.projects[*i].id == pid);
             if let Some(i) = found {
-                app.sel_project = i;
+                app.nav.sel_project = i;
             }
         }
     }
     if let Some(wid) = &before.worktree {
         if app.selected_worktree().map(|w| w.id.clone()).as_ref() != Some(wid) {
             match app.worktree_row_of(wid) {
-                Some(i) => app.sel_worktree = i,
+                Some(i) => app.nav.sel_worktree = i,
                 None => {
                     restore_session(app, out);
                     return;
@@ -377,26 +380,31 @@ pub(crate) fn reconcile_selection_inner(
         // left is followed nowhere, and the cursor stays where it landed.
         if app.selected_worktree_pr().map(|pr| &pr.url) != Some(url) {
             if let Some(i) = app.open_pr_row_of(url) {
-                app.sel_worktree = i;
+                app.nav.sel_worktree = i;
             }
         }
     } else if let Some(url) = &before.issue {
         if app.selected_worktree_issue().map(|i| &i.url) != Some(url) {
             if let Some(i) = app.issue_row_of(url) {
-                app.sel_worktree = i;
+                app.nav.sel_worktree = i;
             }
         }
     }
     if let Some(sref) = &before.session {
         let rows = app.visible_session_rows();
-        if rows.get(app.sel_session).and_then(|r| r.sref()).as_ref() != Some(sref) {
+        if rows
+            .get(app.nav.sel_session)
+            .and_then(|r| r.sref())
+            .as_ref()
+            != Some(sref)
+        {
             let found = rows.iter().position(|r| {
                 r.sref().as_ref() == Some(sref)
                     && (before.session_group == Some(SessionGroup::Archived)
                         || !r.is_archived_agent())
             });
             match found {
-                Some(i) => app.sel_session = i,
+                Some(i) => app.nav.sel_session = i,
                 None => {
                     // The row below slid up into the cursor's slot, so
                     // that is the neighbor it lands on: archive the top
@@ -408,17 +416,17 @@ pub(crate) fn reconcile_selection_inner(
                     // group. A cursor the list's shrinking already pulled
                     // up (the removed row was the very last) stays put.
                     let group_at = |i: usize| rows.get(i).map(session_group);
-                    if app.sel_session == before.session_index
-                        && app.sel_session > 0
-                        && group_at(app.sel_session) != before.session_group
-                        && group_at(app.sel_session - 1) == before.session_group
+                    if app.nav.sel_session == before.session_index
+                        && app.nav.sel_session > 0
+                        && group_at(app.nav.sel_session) != before.session_group
+                        && group_at(app.nav.sel_session - 1) == before.session_group
                     {
-                        app.sel_session -= 1;
+                        app.nav.sel_session -= 1;
                     }
                     preview_selected(app, out);
                     // Nothing previewable left (empty list, or only archived
                     // rows): don't keep showing a session that's gone.
-                    if let Some(tref) = app.term.as_ref().map(|t| t.sref.clone()) {
+                    if let Some(tref) = app.pane.term.as_ref().map(|t| t.sref.clone()) {
                         let alive = match &tref {
                             SessionRef::Agent(id) => app.tree.agents.iter().any(|a| &a.id == id),
                             SessionRef::Terminal(id) => {
@@ -438,9 +446,9 @@ pub(crate) fn reconcile_selection_inner(
 /// Keep selections valid after the tree shrinks.
 pub(crate) fn clamp_selections(app: &mut App) {
     let project_rows = app.project_rows().len();
-    app.sel_project = clamp_selection(app.sel_project as i64, project_rows);
+    app.nav.sel_project = clamp_selection(app.nav.sel_project as i64, project_rows);
     let wt_len = app.worktree_row_count();
-    app.sel_worktree = clamp_selection(app.sel_worktree as i64, wt_len);
+    app.nav.sel_worktree = clamp_selection(app.nav.sel_worktree as i64, wt_len);
     let sess_len = app.visible_session_rows().len();
-    app.sel_session = clamp_selection(app.sel_session as i64, sess_len);
+    app.nav.sel_session = clamp_selection(app.nav.sel_session as i64, sess_len);
 }

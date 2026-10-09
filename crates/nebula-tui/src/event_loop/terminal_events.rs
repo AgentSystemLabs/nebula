@@ -3,18 +3,18 @@
 use super::*;
 
 pub(crate) fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let area = app.term_area;
+    let area = app.pane.term_area;
     if !pane_usable(area) {
         return;
     }
-    if let Some(term) = &mut app.term {
+    if let Some(term) = &mut app.pane.term {
         if (term.cols, term.rows) != (area.width, area.height) {
             // The grid regrids and the program repaints into it: a
             // finished selection is let go rather than shown over whatever
             // lands. A drag under way keeps its history lines — rows keep
             // their numbers through a resize — and the button ends it.
-            if !app.term_selection.is_some_and(|s| s.dragging) {
-                app.term_selection = None;
+            if !app.pane.term_selection.is_some_and(|s| s.dragging) {
+                app.pane.term_selection = None;
             }
             term.cols = area.width;
             term.rows = area.height;
@@ -31,7 +31,7 @@ pub(crate) fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// Keep the editor modal's PTY and parser sized to the drawn inner rect
 /// (the `sync_pty_size` pattern, minus the daemon round-trip).
 pub(crate) fn sync_vim_size(app: &mut App) {
-    if let Some(vim) = &mut app.vim {
+    if let Some(vim) = &mut app.pane.vim {
         if pane_usable(vim.area) {
             vim.resize(vim.area.width, vim.area.height);
         }
@@ -48,17 +48,22 @@ pub(crate) fn pane_usable(area: ratatui::layout::Rect) -> bool {
 pub(crate) fn handle_vim_event(app: &mut App, ev: VimEvent) {
     match ev {
         VimEvent::Output { generation, data } => {
-            if let Some(vim) = &mut app.vim {
+            if let Some(vim) = &mut app.pane.vim {
                 if vim.generation == generation {
                     vim.process(&data);
-                    app.dirty = true;
+                    app.chrome.dirty = true;
                 }
             }
         }
         VimEvent::Exited { generation } => {
-            if app.vim.as_ref().is_some_and(|v| v.generation == generation) {
+            if app
+                .pane
+                .vim
+                .as_ref()
+                .is_some_and(|v| v.generation == generation)
+            {
                 close_vim(app);
-                app.dirty = true;
+                app.chrome.dirty = true;
             }
         }
     }
@@ -69,9 +74,9 @@ pub(crate) fn handle_vim_event(app: &mut App, ev: VimEvent) {
 /// re-read the file whether the editor was theirs or floating over them,
 /// and land the cursor on the strip — the level Ctrl+Q steps back to.
 pub(crate) fn close_vim(app: &mut App) {
-    let embedded = app.vim.as_ref().is_some_and(|v| v.embedded);
-    app.vim = None;
-    match &mut app.overlay {
+    let embedded = app.pane.vim.as_ref().is_some_and(|v| v.embedded);
+    app.pane.vim = None;
+    match &mut app.modals.overlay {
         Some(Overlay::Tree(view)) if embedded => view.load_preview(),
         Some(Overlay::FileTabs(view)) => view.editor_closed(),
         _ => {}
@@ -90,7 +95,7 @@ pub(crate) fn draw_frame<B: ratatui::backend::Backend>(
     app: &mut App,
 ) -> Result<(), B::Error> {
     terminal.draw(|f| ui::draw(f, app))?;
-    if let Some(cell) = app.host_cursor {
+    if let Some(cell) = app.pane.host_cursor {
         terminal.set_cursor_position(cell)?;
     }
     Ok(())
@@ -115,12 +120,12 @@ pub(crate) fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<C
         return;
     }
     // A follow whose Ack already came, waiting only on the row's upsert.
-    app.select_when_seen = None;
-    app.select_project_when_seen = None;
-    app.select_worktree_when_seen = None;
+    app.requests.select_when_seen = None;
+    app.requests.select_project_when_seen = None;
+    app.requests.select_worktree_when_seen = None;
     for req_id in in_flight {
-        if app.pending.contains_key(&req_id) {
-            app.left_behind.insert(req_id);
+        if app.requests.pending.contains_key(&req_id) {
+            app.requests.left_behind.insert(req_id);
         }
     }
 }
@@ -134,7 +139,7 @@ pub(crate) struct Whereabouts {
 
 pub(crate) fn whereabouts(app: &App) -> Whereabouts {
     Whereabouts {
-        focus: app.focus,
+        focus: app.nav.focus,
         selection: selection_snapshot(app),
     }
 }
@@ -144,14 +149,15 @@ pub(crate) fn whereabouts(app: &App) -> Whereabouts {
 /// motion does not pay for a snapshot it has no use for.
 pub(crate) fn follows_to_watch(app: &App) -> Option<(Whereabouts, Vec<u64>)> {
     let in_flight: Vec<u64> = app
+        .requests
         .pending
         .iter()
-        .filter(|(req_id, intent)| intent.follows() && !app.left_behind.contains(req_id))
+        .filter(|(req_id, intent)| intent.follows() && !app.requests.left_behind.contains(req_id))
         .map(|(req_id, _)| *req_id)
         .collect();
-    let armed = app.select_when_seen.is_some()
-        || app.select_project_when_seen.is_some()
-        || app.select_worktree_when_seen.is_some();
+    let armed = app.requests.select_when_seen.is_some()
+        || app.requests.select_project_when_seen.is_some()
+        || app.requests.select_worktree_when_seen.is_some();
     (armed || !in_flight.is_empty()).then(|| (whereabouts(app), in_flight))
 }
 
@@ -159,7 +165,7 @@ pub(crate) fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec
     // With the pane holding input, whatever this event turns into is headed
     // for the PTY — and the daemon drops Input for a session it hasn't
     // spawned. A still-debounced attach has to land before the keystroke.
-    if app.term_locked {
+    if app.pane.term_locked {
         fire_pending_attach(app, out);
     }
     // The LAUNCHER VIEW's card under the cursor, ahead of a key or a click
@@ -172,7 +178,7 @@ pub(crate) fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec
                 ..
             })
         );
-    let launcher_before = (pressed && app.launcher_grid() && !app.term_locked)
+    let launcher_before = (pressed && app.launcher_grid() && !app.pane.term_locked)
         .then(|| launcher::cursor_entry(app))
         .flatten();
     dispatch_input(app, event, out);
@@ -187,10 +193,14 @@ pub(crate) fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRe
         // The RELEASE WATCH reads every key first: a held unarchive key's
         // repeats end here, one unarchive per press (release_watch.rs).
         Event::Key(key)
-            if release_watch::take(&mut app.release_watch, &key, std::time::Instant::now()) => {}
+            if release_watch::take(
+                &mut app.chrome.release_watch,
+                &key,
+                std::time::Instant::now(),
+            ) => {}
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             let typing = typing_into_pane(app);
-            app.flash = None;
+            app.chrome.flash = None;
             handle_key(app, key, out);
             // A key that only went to the PTY changed nothing here: what
             // it does shows up as the PTY's answer, a couple of
@@ -199,7 +209,7 @@ pub(crate) fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRe
             // behind — 8 ms from key to echo under the INPUT LATENCY
             // PROBE instead of 3 — on every character typed at an agent.
             if !(typing && typing_into_pane(app)) {
-                app.dirty = true;
+                app.chrome.dirty = true;
             }
         }
         Event::Mouse(mouse) => {
@@ -211,8 +221,8 @@ pub(crate) fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRe
                 launcher::leave_tabs(app);
             }
         }
-        Event::Paste(text) if app.vim.is_some() => {
-            if let Some(vim) = &mut app.vim {
+        Event::Paste(text) if app.pane.vim.is_some() => {
+            if let Some(vim) = &mut app.pane.vim {
                 // Bracketed paste so vim doesn't auto-indent it to mush.
                 vim.input(&bracketed(&text));
             }
@@ -226,8 +236,11 @@ pub(crate) fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRe
         Event::Paste(text) => {
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
-            if app.focus == Focus::Terminal && app.term_locked && !app.pane_shows_placeholder() {
-                if let Some(term) = &app.term {
+            if app.nav.focus == Focus::Terminal
+                && app.pane.term_locked
+                && !app.pane_shows_placeholder()
+            {
+                if let Some(term) = &app.pane.term {
                     let session = term.sref.clone();
                     let data = pasted(term.parser.screen(), &text);
                     typed_into(app, &session);
@@ -235,16 +248,16 @@ pub(crate) fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRe
                 }
             }
         }
-        Event::Resize(_, _) => app.dirty = true,
+        Event::Resize(_, _) => app.chrome.dirty = true,
         // The terminal window took focus again — most often back from a
         // browser tab where a pull request was just merged or closed.
         Event::FocusGained => {
-            app.window_focused = true;
+            app.chrome.window_focused = true;
             schedule_pull_request_refresh(app);
         }
         // …and left it: from here until it is back, a session that stops
         // to ask gets a desktop notification, since the pane can't be seen.
-        Event::FocusLost => app.window_focused = false,
+        Event::FocusLost => app.chrome.window_focused = false,
         _ => {}
     }
 }
@@ -256,16 +269,17 @@ pub(crate) fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRe
 /// screen exactly as it was: every hatch out of the pane fails the second
 /// test, and everything a forwarded key clears fails the first.
 pub(crate) fn typing_into_pane(app: &App) -> bool {
-    app.vim.is_none()
-        && app.overlay.is_none()
-        && app.focus == Focus::Terminal
-        && app.term_locked
+    app.pane.vim.is_none()
+        && app.modals.overlay.is_none()
+        && app.nav.focus == Focus::Terminal
+        && app.pane.term_locked
         && !app.splash_active()
-        && app.flash.is_none()
-        && app.term_selection.is_none()
-        && app.key_combo.is_none()
+        && app.chrome.flash.is_none()
+        && app.pane.term_selection.is_none()
+        && app.chrome.key_combo.is_none()
         && !app.pane_shows_placeholder()
         && app
+            .pane
             .term
             .as_ref()
             .is_some_and(|t| !t.exited && t.scroll_offset() == 0)
@@ -277,6 +291,7 @@ pub(crate) fn typing_into_pane(app: &App) -> bool {
 pub(crate) fn folds_launcher_pane(app: &App, chord: &crate::keymap::KeyChord) -> bool {
     !crate::key_combo::is_text_key(chord)
         && app
+            .chrome
             .keymap
             .chords(crate::keymap::Action::ToggleLauncherPane)
             .contains(chord)
@@ -288,6 +303,7 @@ pub(crate) fn folds_launcher_pane(app: &App, chord: &crate::keymap::KeyChord) ->
 pub(crate) fn toggles_full_screen(app: &App, chord: &crate::keymap::KeyChord) -> bool {
     !crate::key_combo::is_text_key(chord)
         && app
+            .chrome
             .keymap
             .chords(crate::keymap::Action::ToggleFullScreen)
             .contains(chord)
@@ -300,6 +316,7 @@ pub(crate) fn toggles_full_screen(app: &App, chord: &crate::keymap::KeyChord) ->
 pub(crate) fn drops_project_dropdown(app: &App, chord: &crate::keymap::KeyChord) -> bool {
     !crate::key_combo::is_text_key(chord)
         && app
+            .chrome
             .keymap
             .chords(crate::keymap::Action::ProjectDropdown)
             .contains(chord)

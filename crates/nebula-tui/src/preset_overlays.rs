@@ -722,10 +722,10 @@ pub(crate) fn open_agent_presets(app: &mut App) {
         crate::issues::open_preset_for_row(app);
         return;
     }
-    let worktree = match (app.focus, app.selected_worktree()) {
+    let worktree = match (app.nav.focus, app.selected_worktree()) {
         (Focus::Sessions | Focus::Worktrees, Some(w)) => w.id.clone(),
         _ => {
-            app.flash = Some("agent presets: put the cursor on a checkout first".into());
+            app.chrome.flash = Some("agent presets: put the cursor on a checkout first".into());
             return;
         }
     };
@@ -752,7 +752,7 @@ pub(crate) fn reopen_presets_list(
     let mut view = AgentPresetsView::new(worktree, crate::agent_presets::load());
     view.selected = clamp_selection(selected as i64, view.presets.len());
     view.quick = quick;
-    app.overlay = Some(Overlay::AgentPresets(view));
+    app.modals.overlay = Some(Overlay::AgentPresets(view));
 }
 
 /// The PRESET EDITOR: blank for `Ctrl+a`, pre-filled from the list's row
@@ -771,7 +771,7 @@ pub(crate) fn open_agent_preset_editor(
         Some(index) => match crate::agent_presets::load().get(index) {
             Some(preset) => AgentPresetEditor::from_preset(worktree, index, preset, text),
             None => {
-                app.flash = Some("that preset is gone".into());
+                app.chrome.flash = Some("that preset is gone".into());
                 reopen_presets_list(app, worktree, quick, 0);
                 return;
             }
@@ -779,7 +779,7 @@ pub(crate) fn open_agent_preset_editor(
         None => AgentPresetEditor::new(worktree, text),
     };
     editor.quick = quick;
-    app.overlay = Some(Overlay::AgentPresetEditor(editor));
+    app.modals.overlay = Some(Overlay::AgentPresetEditor(editor));
 }
 
 /// Enter in the PRESET EDITOR: validate against the stored list, write the
@@ -793,7 +793,7 @@ pub(crate) fn save_agent_preset_editor(app: &mut App, mut editor: AgentPresetEdi
         Ok(preset) => preset,
         Err(error) => {
             editor.reject(error);
-            app.overlay = Some(Overlay::AgentPresetEditor(editor));
+            app.modals.overlay = Some(Overlay::AgentPresetEditor(editor));
             return;
         }
     };
@@ -808,7 +808,7 @@ pub(crate) fn save_agent_preset_editor(app: &mut App, mut editor: AgentPresetEdi
         }
     };
     if let Err(err) = crate::agent_presets::save(&presets) {
-        app.flash = Some(format!("could not save agent presets: {err}"));
+        app.chrome.flash = Some(format!("could not save agent presets: {err}"));
     }
     reopen_presets_list(app, editor.worktree, editor.quick, index);
 }
@@ -819,7 +819,7 @@ pub(crate) fn open_delete_preset_confirm(app: &mut App, view: &AgentPresetsView)
     let Some(preset) = view.presets.get(view.selected) else {
         return;
     };
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+    app.modals.overlay = Some(Overlay::Confirm(ConfirmDialog {
         title: "Delete preset".into(),
         message: format!(
             "Delete preset '{}'?\nIts saved prefix and postfix text go with it.",
@@ -845,11 +845,11 @@ pub(crate) fn open_agent_preset_task(
     out: &mut Vec<ClientRequest>,
 ) {
     let Some(preset) = view.presets.get(view.selected).cloned() else {
-        app.flash = Some("no preset selected — Ctrl+a creates one".into());
+        app.chrome.flash = Some("no preset selected — Ctrl+a creates one".into());
         return;
     };
     if !crate::config::Config::load().preset_harness_usable(&preset) {
-        app.flash = Some(format!(
+        app.chrome.flash = Some(format!(
             "{} is turned off in Settings → Agents",
             preset
                 .custom_harness
@@ -901,12 +901,12 @@ fn apply_preset_to_quick_prompt(
     out: &mut Vec<ClientRequest>,
 ) {
     let Some(preset) = presets.get(selected).cloned() else {
-        app.flash = Some("no preset selected".into());
+        app.chrome.flash = Some("no preset selected".into());
         return;
     };
     let cfg = crate::config::Config::load();
     if !cfg.preset_harness_usable(&preset) {
-        app.flash = Some(format!(
+        app.chrome.flash = Some(format!(
             "{} is turned off in Settings → Agents",
             preset
                 .custom_harness
@@ -931,7 +931,7 @@ fn apply_preset_to_quick_prompt(
 /// the verbs are `Ctrl` chords and ↑/↓ (or `Ctrl+n` / `Ctrl+p`) move, as
 /// in every filtered overlay.
 pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
-    let Some(Overlay::AgentPresets(view)) = &mut app.overlay else {
+    let Some(Overlay::AgentPresets(view)) = &mut app.modals.overlay else {
         return;
     };
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -948,7 +948,7 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<Client
             Some(back) => crate::quick_prompt::reopen(app, back.launch, &back.text),
             None => match view.quick.clone().and_then(|back| back.launch.under) {
                 Some(under) => under.reopen(app),
-                None => app.overlay = None,
+                None => app.modals.overlay = None,
             },
         },
         // Letters type ahead and Enter picks, so the NEW WORKTREE toggle
@@ -972,7 +972,7 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<Client
         }
         KeyCode::Char('e') if ctrl => {
             if view.presets.is_empty() {
-                app.flash = Some("no preset selected — Ctrl+a creates one".into());
+                app.chrome.flash = Some("no preset selected — Ctrl+a creates one".into());
             } else {
                 let (worktree, quick) = (view.worktree.clone(), view.aimed_quick());
                 let index = view.selected;
@@ -998,7 +998,7 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<Client
         KeyCode::Char(c) if !ctrl => {
             let query = format!("{}{c}", view.filter);
             if !view.type_filter(c) {
-                app.flash = Some(if view.presets.is_empty() {
+                app.chrome.flash = Some(if view.presets.is_empty() {
                     "no presets yet — Ctrl+a creates one".into()
                 } else {
                     format!("no preset matches '{query}'")
@@ -1019,7 +1019,7 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<Client
 /// WORKTREE, there only to name the project — started a plain session in
 /// the main checkout.
 fn activate_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+    let Some(Overlay::AgentPresets(view)) = &app.modals.overlay else {
         return;
     };
     let view = view.clone();
@@ -1038,7 +1038,7 @@ fn activate_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// is the pull request's own, and the footer says so. INPUT PARITY: the
 /// key and the click both call this.
 pub(crate) fn toggle_new_worktree(app: &mut App) {
-    let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+    let Some(Overlay::AgentPresets(view)) = &app.modals.overlay else {
         return;
     };
     let home = QuickTarget::Worktree(view.worktree.clone());
@@ -1061,7 +1061,7 @@ pub(crate) fn toggle_new_worktree(app: &mut App) {
     };
     match flipped {
         Ok(target) => {
-            if let Some(Overlay::AgentPresets(view)) = &mut app.overlay {
+            if let Some(Overlay::AgentPresets(view)) = &mut app.modals.overlay {
                 let own = view
                     .quick
                     .as_ref()
@@ -1069,15 +1069,15 @@ pub(crate) fn toggle_new_worktree(app: &mut App) {
                 view.aim = (target != own).then_some(target);
             }
         }
-        Err(why) => app.flash = Some(format!("agent presets: {why}")),
+        Err(why) => app.chrome.flash = Some(format!("agent presets: {why}")),
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Keys in the PRESET EDITOR: Tab order between fields, choice cycling,
 /// text editing, save and back.
 pub(crate) fn handle_editor_key(app: &mut App, key: KeyEvent) {
-    let Some(Overlay::AgentPresetEditor(editor)) = &mut app.overlay else {
+    let Some(Overlay::AgentPresetEditor(editor)) = &mut app.modals.overlay else {
         return;
     };
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1135,7 +1135,7 @@ pub(crate) fn handle_editor_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char(c) if !editor.field.is_typed() && !ctrl => {
             let query = format!("{}{c}", editor.filter);
             if !editor.type_filter(c) {
-                app.flash = Some(format!("no choice matches '{query}'"));
+                app.chrome.flash = Some(format!("no choice matches '{query}'"));
             }
         }
         _ => editor.edit_text(&key),
@@ -1158,17 +1158,17 @@ pub(crate) fn handle_list_mouse(
     mouse_pos: Position,
     out: &mut Vec<ClientRequest>,
 ) {
-    let Some(Overlay::AgentPresets(view)) = &mut app.overlay else {
+    let Some(Overlay::AgentPresets(view)) = &mut app.modals.overlay else {
         return;
     };
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             view.step(-1);
-            app.dirty = true;
+            app.chrome.dirty = true;
         }
         MouseEventKind::ScrollDown => {
             view.step(1);
-            app.dirty = true;
+            app.chrome.dirty = true;
         }
         // Rows are the visible ones — whatever the type-ahead left.
         MouseEventKind::Down(MouseButton::Left) if view.toggle_area.contains(mouse_pos) => {
@@ -1184,7 +1184,7 @@ pub(crate) fn handle_list_mouse(
                 view.selected = index;
                 activate_selected(app, out);
             }
-            app.dirty = true;
+            app.chrome.dirty = true;
         }
         _ => {}
     }
@@ -1311,7 +1311,7 @@ pub(crate) fn draw_list(f: &mut Frame, app: &mut App, view: &AgentPresetsView, t
 
     // Write-back (draw works on a clone): rects for mouse
     // hit-testing, plus the clamped cursor.
-    if let Some(Overlay::AgentPresets(v)) = &mut app.overlay {
+    if let Some(Overlay::AgentPresets(v)) = &mut app.modals.overlay {
         v.area = area;
         v.list_area = inner;
         v.toggle_area = toggle_area;
@@ -1616,7 +1616,7 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
 
     // Write-back (draw works on a clone): the rect a click outside
     // of backs out from, and the view the focused box's rows walk by.
-    if let Some(Overlay::AgentPresetEditor(e)) = &mut app.overlay {
+    if let Some(Overlay::AgentPresetEditor(e)) = &mut app.modals.overlay {
         e.area = area;
         if let (Some(view), Some(input)) = (focused_view, e.text_field_mut()) {
             input.set_view(view);

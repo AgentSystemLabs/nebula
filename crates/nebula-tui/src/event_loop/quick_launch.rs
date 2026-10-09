@@ -135,8 +135,8 @@ pub(super) fn submit(
 /// cursor on the new card, inside its worktree. Where FOCUS goes is
 /// `focus_pane`'s alone (`quick_prompt_focus`).
 fn reveal_pane(app: &mut App) {
-    app.launcher_pane_hidden = false;
-    app.dirty = true;
+    app.launcher.launcher_pane_hidden = false;
+    app.chrome.dirty = true;
 }
 
 /// Does this launch leave the user where they are? It does unless FOLLOW
@@ -150,7 +150,7 @@ fn reveal_pane(app: &mut App) {
 fn stays_put(app: &App, cfg: &crate::config::Config) -> bool {
     !cfg.follow_new_session
         && !cfg.quick_prompt_focus
-        && !app.launcher_unaimed
+        && !app.launcher.launcher_unaimed
         && app
             .selected_session_row()
             .is_some_and(|row| row.sref().is_some())
@@ -164,7 +164,7 @@ fn announce_kept(app: &mut App, launch: &QuickLaunch) {
         Some(pr) => Some(pr.head.clone()),
         None => crate::quick_prompt::target_branch(app, launch),
     };
-    app.flash = Some(match branch {
+    app.chrome.flash = Some(match branch {
         Some(branch) => format!("started a session in {branch}"),
         None => "started a session".into(),
     });
@@ -179,7 +179,7 @@ fn announce_background(app: &mut App, target: &QuickTarget) {
     else {
         return;
     };
-    app.flash = Some(format!("started a session in {name}"));
+    app.chrome.flash = Some(format!("started a session in {name}"));
 }
 
 /// The Ack for that `CreateWorktree`: `worktree` exists now, launch there.
@@ -207,11 +207,11 @@ pub(super) fn launch_in_created_worktree(
         // pressed in, as every QUICK PROMPT launch leaves it
         // (`quick_prompt_focus` decides the pane, in `create_agent`'s
         // intent, not here).
-        let focus = app.focus;
+        let focus = app.nav.focus;
         if !select_worktree_by_id(app, &worktree, out) {
-            app.select_worktree_when_seen = Some(worktree.clone());
+            app.requests.select_worktree_when_seen = Some(worktree.clone());
         }
-        app.focus = focus;
+        app.nav.focus = focus;
     }
     // The cursor was already on the row, so the select above did not arm
     // the prewarm a fresh landing would have; the checkout is real now.
@@ -313,13 +313,13 @@ mod tests {
     }
 
     fn pane(app: &App) -> Option<SessionRef> {
-        app.term.as_ref().map(|t| t.sref.clone())
+        app.pane.term.as_ref().map(|t| t.sref.clone())
     }
 
     /// The box's send, `mods` held on the Enter: the create it put out.
     fn send(app: &mut App, mods: KeyModifiers) -> (u64, WorktreeId) {
         let out = key(app, KeyCode::Enter, mods);
-        assert!(app.overlay.is_none(), "the box launched");
+        assert!(app.modals.overlay.is_none(), "the box launched");
         match out.as_slice() {
             [ClientRequest::CreateAgent {
                 req_id, worktree, ..
@@ -388,19 +388,25 @@ mod tests {
             seed_tree(&mut app);
             draw(&mut app);
             key(&mut app, KeyCode::Char('~'), KeyModifiers::NONE);
-            assert!(app.launcher_pane_hidden, "folded away to start with");
+            assert!(
+                app.launcher.launcher_pane_hidden,
+                "folded away to start with"
+            );
 
             let (req_id, worktree) = launch(&mut app, KeyModifiers::NONE);
-            assert!(!app.launcher_pane_hidden, "the send unfolds the pane");
+            assert!(
+                !app.launcher.launcher_pane_hidden,
+                "the send unfolds the pane"
+            );
             acked(&mut app, req_id, &worktree);
 
             assert_eq!(pane(&app), new_session(), "the pane reads the new session");
             assert!(
-                app.launcher_split(app.launcher_body).1.is_some(),
+                app.launcher_split(app.launcher.launcher_body).1.is_some(),
                 "and it is on screen"
             );
-            assert_eq!(app.focus, Focus::Sessions, "the keys stay on the cards");
-            assert!(!app.term_locked);
+            assert_eq!(app.nav.focus, Focus::Sessions, "the keys stay on the cards");
+            assert!(!app.pane.term_locked);
         });
     }
 
@@ -440,14 +446,17 @@ mod tests {
                 },
             );
             let card = on_card(&mut app);
-            let focus = app.focus;
+            let focus = app.nav.focus;
 
             let (req_id, worktree) = launch(&mut app, KeyModifiers::NONE);
             assert!(
-                app.left_behind.contains(&req_id),
+                app.requests.left_behind.contains(&req_id),
                 "the Ack is born left behind"
             );
-            assert_eq!(app.flash.as_deref(), Some("started a session in main"));
+            assert_eq!(
+                app.chrome.flash.as_deref(),
+                Some("started a session in main")
+            );
             acked(&mut app, req_id, &worktree);
 
             assert_eq!(
@@ -461,8 +470,8 @@ mod tests {
                 "the cursor stayed"
             );
             assert_eq!(pane(&app), card, "and so did the pane");
-            assert_eq!(app.focus, focus);
-            assert!(!app.term_locked);
+            assert_eq!(app.nav.focus, focus);
+            assert!(!app.pane.term_locked);
 
             hse(
                 &mut app,
@@ -488,7 +497,7 @@ mod tests {
             let mut app = App::new();
             seed_tree(&mut app);
             let card = on_card(&mut app);
-            let focus = app.focus;
+            let focus = app.nav.focus;
 
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             type_text(&mut app, "tidy the nav");
@@ -498,9 +507,9 @@ mod tests {
                 [ClientRequest::CreateWorktree { req_id, branch, .. }] => (*req_id, branch.clone()),
                 other => panic!("one CreateWorktree: {other:?}"),
             };
-            assert!(app.left_behind.contains(&req_id));
+            assert!(app.requests.left_behind.contains(&req_id));
             assert_eq!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some(format!("started a session in {branch}").as_str())
             );
             assert!(
@@ -541,7 +550,10 @@ mod tests {
                 }] if *worktree == real => *req_id,
                 other => panic!("the create goes into the new checkout: {other:?}"),
             };
-            assert!(app.left_behind.contains(&create), "born left behind too");
+            assert!(
+                app.requests.left_behind.contains(&create),
+                "born left behind too"
+            );
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(cursor(&app), Some(AgentId("a1".into())));
 
@@ -549,7 +561,7 @@ mod tests {
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(cursor(&app), Some(AgentId("a1".into())));
             assert_eq!(pane(&app), card);
-            assert_eq!(app.focus, focus);
+            assert_eq!(app.nav.focus, focus);
         });
     }
 
@@ -562,19 +574,19 @@ mod tests {
             let mut app = App::new();
             seed_tree(&mut app);
             on_card(&mut app);
-            let focus = app.focus;
+            let focus = app.nav.focus;
             let (req_id, worktree) = launch(&mut app, KeyModifiers::NONE);
-            assert!(!app.left_behind.contains(&req_id));
+            assert!(!app.requests.left_behind.contains(&req_id));
             acked(&mut app, req_id, &worktree);
             assert_eq!(cursor(&app), Some(AgentId("a9".into())));
             assert_eq!(pane(&app), new_session());
             assert_eq!(
-                app.launcher_scroll_on,
+                app.launcher.launcher_scroll_on,
                 new_session(),
                 "the grid scrolled to it"
             );
-            assert_eq!(app.focus, focus, "the keys stay on the cards");
-            assert!(!app.term_locked);
+            assert_eq!(app.nav.focus, focus, "the keys stay on the cards");
+            assert!(!app.pane.term_locked);
         });
     }
 
@@ -626,7 +638,7 @@ mod tests {
             let (req_id, worktree) = launch(&mut app, KeyModifiers::NONE);
             acked(&mut app, req_id, &worktree);
             assert_eq!(pane(&app), new_session());
-            assert_eq!(app.focus, Focus::Sessions);
+            assert_eq!(app.nav.focus, Focus::Sessions);
         });
     }
 
@@ -643,8 +655,8 @@ mod tests {
                 acked(&mut app, req_id, &worktree);
 
                 assert_eq!(pane(&app), new_session(), "{mods:?}");
-                assert_eq!(app.focus, Focus::Sessions, "{mods:?} keeps the keys");
-                assert!(!app.term_locked, "{mods:?}");
+                assert_eq!(app.nav.focus, Focus::Sessions, "{mods:?} keeps the keys");
+                assert!(!app.pane.term_locked, "{mods:?}");
             });
         }
     }
@@ -695,8 +707,14 @@ mod tests {
             let (req_id, worktree) = send(&mut app, KeyModifiers::SUPER);
 
             assert_eq!(worktree.0, "w2root", "into the project the box aimed at");
-            assert!(app.left_behind.contains(&req_id), "the Ack stays put");
-            assert_eq!(app.flash.as_deref(), Some("started a session in web"));
+            assert!(
+                app.requests.left_behind.contains(&req_id),
+                "the Ack stays put"
+            );
+            assert_eq!(
+                app.chrome.flash.as_deref(),
+                Some("started a session in web")
+            );
             acked(&mut app, req_id, &worktree);
 
             assert_eq!(
@@ -705,7 +723,7 @@ mod tests {
                 "the grid stayed where it was"
             );
             assert_ne!(pane(&app), new_session());
-            assert_eq!(app.focus, Focus::Sessions);
+            assert_eq!(app.nav.focus, Focus::Sessions);
         });
     }
 }

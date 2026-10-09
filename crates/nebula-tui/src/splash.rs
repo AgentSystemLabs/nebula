@@ -90,7 +90,7 @@ fn density(dx: f32, dy: f32, rot: f32) -> f32 {
 /// still scene, so it holds one finished frame instead of whatever
 /// instant a stray redraw lands on.
 pub fn scene_time(app: &App, epoch: std::time::Instant) -> f32 {
-    if app.animations {
+    if app.chrome.animations {
         epoch.elapsed().as_secs_f32()
     } else {
         60.0
@@ -172,11 +172,11 @@ fn wordmark_line(row: usize, t: f32, fade: f32) -> Line<'static> {
 }
 
 pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     if area.width < 8 || area.height < 4 {
         return;
     }
-    let t = scene_time(app, app.splash_epoch);
+    let t = scene_time(app, app.chrome.splash_epoch);
     let fade = fade_at(t);
 
     // ---- text block: wordmark, tagline, key hints, bottom-anchored ----
@@ -226,10 +226,10 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         }
         hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
         hint.extend(key("?", "help"));
-    } else if app.projects_closed {
+    } else if app.launcher.projects_closed {
         // Every tab closed: the projects are all still there, so `+`
         // lists them; Enter still opens the repo nebula was started in.
-        let here = app.launch_repo.as_deref().and_then(|path| {
+        let here = app.launcher.launch_repo.as_deref().and_then(|path| {
             app.tree
                 .project_at_path(path)
                 .map(|p| p.name.clone())
@@ -260,7 +260,9 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(lines).centered(), text);
     // A click anywhere lands focus back on the (invisible) projects panel,
     // where `n` creates the first project.
-    app.hits.push((area, HitTarget::PanelBg(Focus::Projects)));
+    app.chrome
+        .hits
+        .push((area, HitTarget::PanelBg(Focus::Projects)));
 }
 
 /// The galaxy and its starfield across `area`, `t` seconds into the

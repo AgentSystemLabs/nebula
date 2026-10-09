@@ -6,7 +6,7 @@ pub(crate) fn request_git_changes(
     app: &mut App,
     git_tx: &tokio::sync::mpsc::UnboundedSender<ChangedFiles>,
 ) {
-    if app.git_changes_inflight.is_some() {
+    if app.jobs.git_changes_inflight.is_some() {
         return;
     }
     let Some((id, path)) = app
@@ -15,7 +15,7 @@ pub(crate) fn request_git_changes(
     else {
         return;
     };
-    app.git_changes_inflight = Some(id.clone());
+    app.jobs.git_changes_inflight = Some(id.clone());
     let git_tx = git_tx.clone();
     tokio::task::spawn_blocking(move || {
         let files = crate::git_diff::changed_files(&path).ok();
@@ -59,11 +59,11 @@ pub(crate) fn note_worktree_lines(
 ) {
     let lines = lines.filter(|l| !l.is_empty());
     let before = match lines {
-        Some(l) => app.worktree_lines.insert(worktree.clone(), l),
-        None => app.worktree_lines.remove(worktree),
+        Some(l) => app.jobs.worktree_lines.insert(worktree.clone(), l),
+        None => app.jobs.worktree_lines.remove(worktree),
     };
     if before != lines {
-        app.dirty = true;
+        app.chrome.dirty = true;
     }
 }
 
@@ -82,7 +82,7 @@ pub(crate) fn keep_changed_files(
     worktree: &WorktreeId,
     files: Option<Vec<crate::git_diff::DiffFile>>,
 ) {
-    app.changed_files = files
+    app.jobs.changed_files = files
         .filter(|files| files.len() <= CHANGED_FILES_KEEP)
         .map(|files| (worktree.clone(), files));
 }
@@ -91,12 +91,12 @@ pub(crate) fn keep_changed_files(
 /// for — `App::selected_worktree_changes` shows it only while that one is
 /// selected — and a value change redraws.
 pub(crate) fn land_git_changes(app: &mut App, worktree: WorktreeId, count: Option<usize>) {
-    app.git_changes_inflight = None;
+    app.jobs.git_changes_inflight = None;
     note_worktree_changes(app, worktree.clone(), count);
     let next = Some((worktree, count));
-    if app.git_changes != next {
-        app.git_changes = next;
-        app.dirty = true;
+    if app.jobs.git_changes != next {
+        app.jobs.git_changes = next;
+        app.chrome.dirty = true;
     }
 }
 
@@ -105,9 +105,9 @@ pub(crate) fn land_git_changes(app: &mut App, worktree: WorktreeId, count: Optio
 /// redraws.
 pub(crate) fn note_worktree_changes(app: &mut App, worktree: WorktreeId, count: Option<usize>) {
     let now = std::time::Instant::now();
-    let before = app.worktree_changes.insert(worktree, (count, now));
+    let before = app.jobs.worktree_changes.insert(worktree, (count, now));
     if before.map(|(was, _)| was) != Some(count) {
-        app.dirty = true;
+        app.chrome.dirty = true;
     }
 }
 
@@ -120,13 +120,13 @@ pub(crate) fn sweep_git_changes(
     app: &mut App,
     tx: &tokio::sync::mpsc::UnboundedSender<SweptChanges>,
 ) {
-    if app.worktree_changes_inflight.is_some() {
+    if app.jobs.worktree_changes_inflight.is_some() {
         return;
     }
     let Some((id, path)) = changes_sweep_target(app) else {
         return;
     };
-    app.worktree_changes_inflight = Some(id.clone());
+    app.jobs.worktree_changes_inflight = Some(id.clone());
     let tx = tx.clone();
     tokio::task::spawn_blocking(move || {
         let files = crate::git_diff::changed_files(&path).ok();
@@ -152,14 +152,14 @@ pub(crate) fn changes_sweep_target(app: &App) -> Option<(WorktreeId, std::path::
         .worktrees
         .iter()
         .filter(|w| held.contains(&w.id) && Some(&w.id) != selected)
-        .min_by_key(|w| app.worktree_changes.get(&w.id).map(|(_, at)| *at))
+        .min_by_key(|w| app.jobs.worktree_changes.get(&w.id).map(|(_, at)| *at))
         .map(|w| (w.id.clone(), w.path.clone()))
 }
 
 /// Land the sweep's count: it frees the slot and feeds the cards only —
 /// the selected checkout's `git_changes` is its own reads' to set.
 pub(crate) fn land_swept_changes(app: &mut App, worktree: WorktreeId, count: Option<usize>) {
-    app.worktree_changes_inflight = None;
+    app.jobs.worktree_changes_inflight = None;
     note_worktree_changes(app, worktree, count);
 }
 
@@ -199,10 +199,10 @@ pub(crate) fn lookup_pull_request(
     // the backoff run, since a worktree can be restored underneath us.
     if !path.is_dir() {
         note_pr_answer(app, &id, false);
-        app.dirty |= app.pull_requests.insert(id, None) != Some(None);
+        app.chrome.dirty |= app.github.pull_requests.insert(id, None) != Some(None);
         return;
     }
-    app.pr_inflight.insert(id.clone());
+    app.github.pr_inflight.insert(id.clone());
     let pr_tx = pr_tx.clone();
     tokio::spawn(async move {
         let pr = crate::pull_request::lookup(&path).await;
@@ -224,7 +224,7 @@ pub(crate) fn sweep_pull_request(
     let Some((id, path)) = sweep_target(app) else {
         return;
     };
-    app.pr_inflight.insert(id.clone());
+    app.github.pr_inflight.insert(id.clone());
     let pr_tx = pr_tx.clone();
     tokio::spawn(async move {
         let pr = crate::pull_request::lookup(&path).await;
@@ -271,7 +271,7 @@ pub(crate) fn sweep_target(app: &mut App) -> Option<(WorktreeId, std::path::Path
         }
         if !path.is_dir() {
             note_pr_answer(app, &id, false);
-            app.dirty |= app.pull_requests.insert(id, None) != Some(None);
+            app.chrome.dirty |= app.github.pull_requests.insert(id, None) != Some(None);
             continue;
         }
         return Some((id, path));
@@ -294,12 +294,13 @@ pub(crate) fn note_pr_answer(app: &mut App, worktree: &WorktreeId, found: bool) 
     } else if found {
         PR_SWEEP_REFRESH
     } else {
-        match app.pr_recheck.get(worktree) {
+        match app.github.pr_recheck.get(worktree) {
             Some((_, prev)) => (*prev * 2).min(PR_RECHECK_MAX),
             None => PR_RECHECK_MIN,
         }
     };
-    app.pr_recheck
+    app.github
+        .pr_recheck
         .insert(worktree.clone(), (std::time::Instant::now() + step, step));
 }
 
@@ -309,7 +310,7 @@ pub(crate) fn note_pr_answer(app: &mut App, worktree: &WorktreeId, found: bool) 
 /// only backs off the next attempt (`note_pr_answer`). A row that changed
 /// goes to the cache at the next flush.
 pub(crate) fn land_pull_request(app: &mut App, worktree: WorktreeId, answer: Lookup) {
-    app.pr_inflight.remove(&worktree);
+    app.github.pr_inflight.remove(&worktree);
     let row = match answer {
         Lookup::Found(pr) => Some(Some(pr)),
         Lookup::Absent => Some(None),
@@ -319,7 +320,7 @@ pub(crate) fn land_pull_request(app: &mut App, worktree: WorktreeId, answer: Loo
     let Some(row) = row else {
         return;
     };
-    let changed = app.pull_requests.get(&worktree) != Some(&row);
+    let changed = app.github.pull_requests.get(&worktree) != Some(&row);
     // A merge seen to happen — the last answer was anything but merged, this
     // one is — starts the row's ONE-SHOT SWEEP. No last answer at all is a
     // checkout met for the first time: whenever that merged, it wasn't now.
@@ -329,15 +330,16 @@ pub(crate) fn land_pull_request(app: &mut App, worktree: WorktreeId, answer: Loo
     };
     let landed = is_merged(&row)
         && app
+            .github
             .pull_requests
             .get(&worktree)
             .is_some_and(|last| !is_merged(last));
     if landed {
         app.note_merge_landed(worktree.clone());
     }
-    app.pull_requests.insert(worktree, row);
-    app.dirty |= changed;
-    app.pr_cache_dirty |= changed;
+    app.github.pull_requests.insert(worktree, row);
+    app.chrome.dirty |= changed;
+    app.github.pr_cache_dirty |= changed;
 }
 
 /// Ask `gh` for every pull request open on the selected project's repo, off
@@ -369,7 +371,7 @@ pub(crate) fn lookup_open_prs(
         note_open_prs_answer(app, id, None, out);
         return;
     }
-    app.open_prs_inflight.insert(id.clone());
+    app.github.open_prs_inflight.insert(id.clone());
     let prs_tx = prs_tx.clone();
     tokio::spawn(async move {
         let list = crate::pull_request::list(&path).await;
@@ -402,7 +404,7 @@ pub(crate) fn sweep_open_prs(
         note_open_prs_answer(app, id, None, out);
         return;
     }
-    app.open_prs_inflight.insert(id.clone());
+    app.github.open_prs_inflight.insert(id.clone());
     let prs_tx = prs_tx.clone();
     tokio::spawn(async move {
         let list = crate::pull_request::list(&path).await;
@@ -419,8 +421,10 @@ pub(crate) fn open_prs_sweep_target(app: &App) -> Option<(ProjectId, std::path::
     app.project_rows()
         .into_iter()
         .map(|i| &app.tree.projects[i])
-        .filter(|p| Some(&p.id) != selected.as_ref() && !app.open_prs_inflight.contains(&p.id))
-        .find(|p| match app.open_prs.get(&p.id) {
+        .filter(|p| {
+            Some(&p.id) != selected.as_ref() && !app.github.open_prs_inflight.contains(&p.id)
+        })
+        .find(|p| match app.github.open_prs.get(&p.id) {
             Some(open) => now >= open.at + open.step.max(OPEN_PRS_SWEEP_REFRESH),
             None => true,
         })
@@ -450,17 +454,17 @@ pub(crate) fn note_open_prs_answer(
     // just opened from its branch (or back out, once that merges), and
     // the cursor goes with it — a checkout is never lost to a re-list.
     let checkout = app.selected_worktree().map(|w| w.id.clone());
-    app.open_prs_inflight.remove(&project);
+    app.github.open_prs_inflight.remove(&project);
     let failed = list.is_none();
-    if failed != app.open_prs_failed.contains(&project) {
-        app.dirty = true;
+    if failed != app.github.open_prs_failed.contains(&project) {
+        app.chrome.dirty = true;
         if failed {
-            app.open_prs_failed.insert(project.clone());
+            app.github.open_prs_failed.insert(project.clone());
         } else {
-            app.open_prs_failed.remove(&project);
+            app.github.open_prs_failed.remove(&project);
         }
     }
-    let previous = app.open_prs.get(&project);
+    let previous = app.github.open_prs.get(&project);
     let found = list.as_ref().is_some_and(|l| !l.is_empty());
     let step = if found {
         OPEN_PRS_REFRESH
@@ -491,10 +495,10 @@ pub(crate) fn note_open_prs_answer(
     // URL, so the reorder never moves the selection off it.
     crate::pull_request::drafts_last(&mut list);
     let changed = previous.map(|o| &o.list) != Some(&list);
-    app.dirty |= changed;
-    app.pr_cache_dirty |= changed;
+    app.chrome.dirty |= changed;
+    app.github.pr_cache_dirty |= changed;
     reask_checkouts_whose_pr_left(app, &left);
-    app.open_prs.insert(
+    app.github.open_prs.insert(
         project,
         crate::app::OpenPrs {
             list,
@@ -531,6 +535,7 @@ pub(crate) fn reask_checkouts_whose_pr_left(app: &mut App, left: &[String]) {
         return;
     }
     let due: Vec<WorktreeId> = app
+        .github
         .pull_requests
         .iter()
         .filter_map(|(wt, pr)| {
@@ -539,7 +544,7 @@ pub(crate) fn reask_checkouts_whose_pr_left(app: &mut App, left: &[String]) {
         })
         .collect();
     for wt in due {
-        app.pr_recheck.remove(&wt);
+        app.github.pr_recheck.remove(&wt);
     }
 }
 
@@ -569,11 +574,11 @@ pub(crate) fn reconcile_open_pr_cursor(
         // `schedule_pr_detail` zeroes `pr_preview_scroll`, and a refresh
         // landing every minute must not yank a reader back to the top of a
         // conversation they're halfway down.
-        Some(i) => app.sel_worktree = i,
+        Some(i) => app.nav.sel_worktree = i,
         None => {
             let rows = app.worktree_row_count();
-            if app.sel_worktree >= rows {
-                app.sel_worktree = rows.saturating_sub(1);
+            if app.nav.sel_worktree >= rows {
+                app.nav.sel_worktree = rows.saturating_sub(1);
             }
             if app.selected_worktree().is_some() {
                 restore_session(app, out);
@@ -582,8 +587,8 @@ pub(crate) fn reconcile_open_pr_cursor(
             // whatever the cursor landed on. Say why, too — a row that
             // evaporates mid-read is otherwise just the cursor jumping.
             schedule_pr_detail(app);
-            app.flash = Some(format!("#{} is no longer open", was.number));
-            app.dirty = true;
+            app.chrome.flash = Some(format!("#{} is no longer open", was.number));
+            app.chrome.dirty = true;
         }
     }
 }
@@ -600,11 +605,11 @@ pub(crate) fn reconcile_open_pr_cursor(
 /// on disk are pruned to the same set, at the next flush.
 pub(crate) fn forget_retired_prs(app: &mut App) {
     let live = app.live_pr_urls();
-    let before = app.pr_detail.len();
-    app.pr_detail.retain(|url, _| live.contains(url));
-    app.pr_detail_stale.retain(|url| live.contains(url));
-    app.pr_detail_failed.retain(|url| live.contains(url));
-    app.pr_cache_dirty |= app.pr_detail.len() != before;
+    let before = app.github.pr_detail.len();
+    app.github.pr_detail.retain(|url, _| live.contains(url));
+    app.github.pr_detail_stale.retain(|url| live.contains(url));
+    app.github.pr_detail_failed.retain(|url| live.contains(url));
+    app.github.pr_cache_dirty |= app.github.pr_detail.len() != before;
 }
 
 /// Carry the state GitHub just gave for one pull request over to the
@@ -618,7 +623,7 @@ pub(crate) fn adopt_pr_state(app: &mut App, detail: &crate::pull_request::PrDeta
     // Checkouts whose row turns merged right here: the same seen-to-happen
     // merge `land_pull_request` stamps, learned a beat earlier.
     let mut landed = Vec::new();
-    for (worktree, pr) in app.pull_requests.iter_mut() {
+    for (worktree, pr) in app.github.pull_requests.iter_mut() {
         let Some(pr) = pr else { continue };
         if pr.url != detail.url {
             continue;
@@ -634,7 +639,7 @@ pub(crate) fn adopt_pr_state(app: &mut App, detail: &crate::pull_request::PrDeta
             if !was_merged && pr.standing() == Standing::Merged {
                 landed.push(worktree.clone());
             }
-            app.dirty = true;
+            app.chrome.dirty = true;
         }
     }
     for worktree in landed {
@@ -650,7 +655,7 @@ pub(crate) fn adopt_pr_state(app: &mut App, detail: &crate::pull_request::PrDeta
 pub(crate) fn drop_retired_pr(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
     let cursor = app.selected_worktree_pr().cloned();
     let mut removed = false;
-    for open in app.open_prs.values_mut() {
+    for open in app.github.open_prs.values_mut() {
         let before = open.list.len();
         open.list.retain(|pr| pr.url != url);
         removed |= open.list.len() != before;
@@ -661,7 +666,7 @@ pub(crate) fn drop_retired_pr(app: &mut App, url: &str, out: &mut Vec<ClientRequ
     reconcile_open_pr_cursor(app, cursor, out);
     refresh_palette(app);
     crate::pr_modal::list_changed(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Drop every cached pull-request row and list whose checkout or project is
@@ -674,12 +679,15 @@ pub(crate) fn prune_pull_requests_to_tree(app: &mut App) {
         app.tree.worktrees.iter().map(|w| w.id.clone()).collect();
     let projects: std::collections::HashSet<ProjectId> =
         app.tree.projects.iter().map(|p| p.id.clone()).collect();
-    let before = (app.pull_requests.len(), app.open_prs.len());
-    app.pull_requests.retain(|w, _| worktrees.contains(w));
-    app.pr_recheck.retain(|w, _| worktrees.contains(w));
-    app.open_prs.retain(|p, _| projects.contains(p));
-    app.open_prs_failed.retain(|p| projects.contains(p));
-    app.pr_cache_dirty |= before != (app.pull_requests.len(), app.open_prs.len());
+    let before = (app.github.pull_requests.len(), app.github.open_prs.len());
+    app.github
+        .pull_requests
+        .retain(|w, _| worktrees.contains(w));
+    app.github.pr_recheck.retain(|w, _| worktrees.contains(w));
+    app.github.open_prs.retain(|p, _| projects.contains(p));
+    app.github.open_prs_failed.retain(|p| projects.contains(p));
+    app.github.pr_cache_dirty |=
+        before != (app.github.pull_requests.len(), app.github.open_prs.len());
     forget_retired_prs(app);
 }
 
@@ -697,14 +705,18 @@ pub(crate) fn prune_pull_requests_to_tree(app: &mut App) {
 /// a list refresh re-arming the pane behind it must not take the fetch of
 /// the row the modal is reading.
 pub(crate) fn schedule_pr_detail(app: &mut App) {
-    if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
+    if matches!(&app.modals.overlay, Some(Overlay::PullRequests(_))) {
         crate::pr_modal::schedule_detail(app);
         return;
     }
     let pending = app.previewed_pr().and_then(|pr| {
         let url = pr.url;
-        let fresh = app.pr_detail.contains_key(&url) && !app.pr_detail_stale.contains(&url);
-        if fresh || app.pr_detail_inflight.contains(&url) || app.pr_detail_failed.contains(&url) {
+        let fresh =
+            app.github.pr_detail.contains_key(&url) && !app.github.pr_detail_stale.contains(&url);
+        if fresh
+            || app.github.pr_detail_inflight.contains(&url)
+            || app.github.pr_detail_failed.contains(&url)
+        {
             return None;
         }
         // Either row lives in the selected project's repo; `gh pr view`
@@ -718,8 +730,9 @@ pub(crate) fn schedule_pr_detail(app: &mut App) {
     });
     // Landing on a different row resets the scroll: the pane is showing
     // something else now.
-    app.pr_preview_scroll = 0;
-    app.pending_pr_detail = pending.map(|p| (p, std::time::Instant::now() + PR_DETAIL_DEBOUNCE));
+    app.github.pr_preview_scroll = 0;
+    app.github.pending_pr_detail =
+        pending.map(|p| (p, std::time::Instant::now() + PR_DETAIL_DEBOUNCE));
 }
 
 /// The one place "the pane is reading something else now" is noticed: the
@@ -744,15 +757,15 @@ pub(crate) fn lookup_pr_detail(
     app: &mut App,
     detail_tx: &tokio::sync::mpsc::UnboundedSender<(String, Option<crate::pull_request::PrDetail>)>,
 ) {
-    let Some((pending, _)) = app.pending_pr_detail.take() else {
+    let Some((pending, _)) = app.github.pending_pr_detail.take() else {
         return;
     };
     if !pending.dir.is_dir() {
-        app.pr_detail_failed.insert(pending.url);
-        app.dirty = true;
+        app.github.pr_detail_failed.insert(pending.url);
+        app.chrome.dirty = true;
         return;
     }
-    app.pr_detail_inflight.insert(pending.url.clone());
+    app.github.pr_detail_inflight.insert(pending.url.clone());
     let detail_tx = detail_tx.clone();
     tokio::spawn(async move {
         let detail = crate::pull_request::detail(&pending.dir, pending.number).await;
@@ -773,24 +786,24 @@ pub(crate) fn land_pr_detail(
     detail: Option<crate::pull_request::PrDetail>,
     out: &mut Vec<ClientRequest>,
 ) {
-    app.pr_detail_inflight.remove(&url);
+    app.github.pr_detail_inflight.remove(&url);
     match detail {
         Some(detail) => {
             let retired = !detail.is_open();
             adopt_pr_state(app, &detail);
-            let changed = app.pr_detail.get(&url) != Some(&detail);
-            app.pr_detail.insert(url.clone(), detail);
-            app.pr_detail_stale.remove(&url);
-            app.pr_cache_dirty |= changed;
+            let changed = app.github.pr_detail.get(&url) != Some(&detail);
+            app.github.pr_detail.insert(url.clone(), detail);
+            app.github.pr_detail_stale.remove(&url);
+            app.github.pr_cache_dirty |= changed;
             if retired {
                 drop_retired_pr(app, &url, out);
             }
         }
         None => {
-            app.pr_detail_failed.insert(url);
+            app.github.pr_detail_failed.insert(url);
         }
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// `y` on a pull request row — a PROJECT OPEN PRS GROUP row or the
@@ -820,12 +833,16 @@ pub(crate) fn open_pr_comment(app: &mut App) {
     let pr = match found {
         Ok(pr) => pr,
         Err(why) => {
-            app.flash = Some(why);
-            app.dirty = true;
+            app.chrome.flash = Some(why);
+            app.chrome.dirty = true;
             return;
         }
     };
-    let draft = app.pr_comment_drafts.remove(&pr.url).unwrap_or_default();
+    let draft = app
+        .github
+        .pr_comment_drafts
+        .remove(&pr.url)
+        .unwrap_or_default();
     reopen_prompt_with(
         app,
         PromptKind::PrComment {
@@ -855,7 +872,7 @@ pub(crate) fn post_pr_comment(
     back: Option<Box<crate::pr_modal::PullRequestsView>>,
 ) {
     let dir = app.selected_project().map(|p| p.repo_path.clone());
-    let refused = if app.pr_comment_inflight.contains(&url) {
+    let refused = if app.github.pr_comment_inflight.contains(&url) {
         Some(format!("still posting the last comment on #{number}…"))
     } else {
         match &dir {
@@ -865,12 +882,12 @@ pub(crate) fn post_pr_comment(
             None => Some("no project selected to post from".into()),
             // Never in the running TUI: the loop installs the channel at
             // startup. Handing the box back beats losing the text.
-            Some(_) if app.pr_comment_tx.is_none() => Some("not ready to post yet".into()),
+            Some(_) if app.github.pr_comment_tx.is_none() => Some("not ready to post yet".into()),
             Some(_) => None,
         }
     };
     if let Some(why) = refused {
-        app.flash = Some(why);
+        app.chrome.flash = Some(why);
         reopen_prompt_with(
             app,
             PromptKind::PrComment {
@@ -881,18 +898,18 @@ pub(crate) fn post_pr_comment(
             },
             body,
         );
-        app.dirty = true;
+        app.chrome.dirty = true;
         return;
     }
     if let Some(view) = back {
         crate::pr_modal::reopen(app, *view);
     }
-    let (Some(dir), Some(tx)) = (dir, app.pr_comment_tx.clone()) else {
+    let (Some(dir), Some(tx)) = (dir, app.github.pr_comment_tx.clone()) else {
         return;
     };
-    app.pr_comment_inflight.insert(url.clone());
-    app.flash = Some(format!("posting a comment on #{number}…"));
-    app.dirty = true;
+    app.github.pr_comment_inflight.insert(url.clone());
+    app.chrome.flash = Some(format!("posting a comment on #{number}…"));
+    app.chrome.dirty = true;
     tokio::spawn(async move {
         let result = crate::pull_request::comment(&dir, number, &body).await;
         let _ = tx.send(PrCommentAnswer {
@@ -922,12 +939,12 @@ pub(crate) fn land_pr_comment(app: &mut App, answer: PrCommentAnswer) {
         body,
         result,
     } = answer;
-    app.pr_comment_inflight.remove(&url);
+    app.github.pr_comment_inflight.remove(&url);
     match result {
         Ok(_) => {
-            app.flash = Some(format!("comment posted on #{number}"));
-            app.pr_detail_stale.insert(url.clone());
-            if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
+            app.chrome.flash = Some(format!("comment posted on #{number}"));
+            app.github.pr_detail_stale.insert(url.clone());
+            if matches!(&app.modals.overlay, Some(Overlay::PullRequests(_))) {
                 // The modal reads its row again, the new comment in.
                 crate::pr_modal::schedule_detail(app);
             } else if app.previewed_pr().is_some_and(|pr| pr.url == url) {
@@ -935,8 +952,8 @@ pub(crate) fn land_pr_comment(app: &mut App, answer: PrCommentAnswer) {
             }
         }
         Err(why) => {
-            app.flash = Some(format!("couldn't post the comment on #{number}: {why}"));
-            let back = match &app.overlay {
+            app.chrome.flash = Some(format!("couldn't post the comment on #{number}: {why}"));
+            let back = match &app.modals.overlay {
                 None => Some(None),
                 Some(Overlay::PullRequests(view)) => Some(Some(Box::new(view.clone()))),
                 Some(_) => None,
@@ -953,12 +970,12 @@ pub(crate) fn land_pr_comment(app: &mut App, answer: PrCommentAnswer) {
                     body,
                 ),
                 None => {
-                    app.pr_comment_drafts.insert(url, body);
+                    app.github.pr_comment_drafts.insert(url, body);
                 }
             }
         }
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// `g` on an open-PR row: fetch the whole pull request diff off the loop and
@@ -981,27 +998,27 @@ pub(crate) fn request_pr_diff(app: &mut App) {
 /// titled `title` — the pane's row, or the PULL REQUESTS MODAL's (`g`
 /// there), whose modal the diff's replaces.
 pub(crate) fn request_pr_diff_for(app: &mut App, number: u64, url: String, title: String) {
-    if app.pr_diff_inflight == Some(number) {
-        app.flash = Some(format!("still fetching the diff for #{number}…"));
+    if app.github.pr_diff_inflight == Some(number) {
+        app.chrome.flash = Some(format!("still fetching the diff for #{number}…"));
         return;
     }
     let Some(dir) = app.selected_project().map(|p| p.repo_path.clone()) else {
         return;
     };
     if !dir.is_dir() {
-        app.flash = Some(format!("repo path missing on disk: {}", dir.display()));
+        app.chrome.flash = Some(format!("repo path missing on disk: {}", dir.display()));
         return;
     }
-    let Some(prdiff_tx) = app.pr_diff_tx.clone() else {
+    let Some(prdiff_tx) = app.github.pr_diff_tx.clone() else {
         return; // never: the loop installs it at startup
     };
     if open_cached_pr_diff(app, number, &url, &title) {
-        app.pr_diff_refreshing.insert(url.clone());
+        app.github.pr_diff_refreshing.insert(url.clone());
     } else {
-        app.flash = Some(format!("fetching the diff for #{number}…"));
+        app.chrome.flash = Some(format!("fetching the diff for #{number}…"));
     }
-    app.pr_diff_inflight = Some(number);
-    app.dirty = true;
+    app.github.pr_diff_inflight = Some(number);
+    app.chrome.dirty = true;
     tokio::spawn(async move {
         let diff = crate::pull_request::diff(&dir, number).await;
         let _ = prdiff_tx.send(PrDiffAnswer {
@@ -1020,7 +1037,7 @@ pub(crate) fn open_cached_pr_diff(app: &mut App, number: u64, url: &str, title: 
         return false;
     };
     open_pr_diff_view(app, number, url, title.to_string(), Some(cached));
-    matches!(&app.overlay, Some(Overlay::Diff(view)) if view.pr_url.as_deref() == Some(url))
+    matches!(&app.modals.overlay, Some(Overlay::Diff(view)) if view.pr_url.as_deref() == Some(url))
 }
 
 /// A `gh pr diff` landed. It goes to the cache for next time, and then: a
@@ -1038,27 +1055,27 @@ pub(crate) fn land_pr_diff(app: &mut App, answer: PrDiffAnswer) {
     if let Some(diff) = &diff {
         crate::pr_cache::remember_diff(app, &url, diff);
     }
-    if !app.pr_diff_refreshing.remove(&url) {
+    if !app.github.pr_diff_refreshing.remove(&url) {
         open_pr_diff_view(app, number, &url, title, diff);
         return;
     }
-    if app.pr_diff_inflight == Some(number) {
-        app.pr_diff_inflight = None;
+    if app.github.pr_diff_inflight == Some(number) {
+        app.github.pr_diff_inflight = None;
     }
     // A fetch that failed leaves the cached copy on screen: it was the best
     // answer there was when `g` was pressed, and still is.
     let Some(diff) = diff else {
         return;
     };
-    let Some(Overlay::Diff(view)) = &mut app.overlay else {
+    let Some(Overlay::Diff(view)) = &mut app.modals.overlay else {
         return;
     };
     if view.pr_url.as_deref() != Some(url.as_str()) {
         return;
     }
     if refresh_pr_diff_view(view, &diff) {
-        app.flash = Some(format!("#{number}'s diff changed since it was last read"));
-        app.dirty = true;
+        app.chrome.flash = Some(format!("#{number}'s diff changed since it was last read"));
+        app.chrome.dirty = true;
     }
 }
 
@@ -1110,18 +1127,18 @@ pub(crate) fn open_pr_diff_view(
     title: String,
     diff: Option<String>,
 ) {
-    if app.pr_diff_inflight == Some(number) {
-        app.pr_diff_inflight = None;
+    if app.github.pr_diff_inflight == Some(number) {
+        app.github.pr_diff_inflight = None;
     }
     let Some(diff) = diff else {
-        app.flash = Some(format!(
+        app.chrome.flash = Some(format!(
             "couldn't read the diff for #{number} — is `gh` set up?"
         ));
         return;
     };
     let chunks = crate::pull_request::split_unified_diff(&diff);
     if chunks.is_empty() {
-        app.flash = Some(format!("#{number} changes no files"));
+        app.chrome.flash = Some(format!("#{number} changes no files"));
         return;
     }
     let files = pr_diff_files(&chunks);
@@ -1135,14 +1152,14 @@ pub(crate) fn open_pr_diff_view(
     let mut view = DiffView::new(root, title, files, true);
     view.prefetched = Some(chunks.into_iter().collect());
     view.pr_url = Some(url.to_string());
-    view.files_width = app.diff_files_width;
-    if app.diff_tree {
+    view.files_width = app.modals.diff_files_width;
+    if app.modals.diff_tree {
         view.toggle_tree();
     }
     crate::git_diff::load_selected_diff(&mut view);
-    app.overlay = Some(Overlay::Diff(view));
-    app.flash = None;
-    app.dirty = true;
+    app.modals.overlay = Some(Overlay::Diff(view));
+    app.chrome.flash = None;
+    app.chrome.dirty = true;
 }
 
 /// Arm the selected project for a prompt open-pull-request lookup: arriving
@@ -1154,7 +1171,7 @@ pub(crate) fn schedule_open_prs_lookup(app: &mut App) {
     let Some(id) = app.selected_project().map(|p| p.id.clone()) else {
         return;
     };
-    if let Some(open) = app.open_prs.get_mut(&id) {
+    if let Some(open) = app.github.open_prs.get_mut(&id) {
         open.due = open.due.min(open.at + crate::app::OPEN_PRS_MIN_AGE);
     }
 }
@@ -1165,7 +1182,7 @@ pub(crate) fn schedule_open_prs_lookup(app: &mut App) {
 /// — so drop whatever timer had accumulated and ask on the next tick.
 pub(crate) fn schedule_pr_lookup(app: &mut App) {
     if let Some(id) = app.selected_worktree().map(|w| w.id.clone()) {
-        app.pr_recheck.remove(&id);
+        app.github.pr_recheck.remove(&id);
     }
 }
 
@@ -1178,7 +1195,7 @@ pub(crate) fn schedule_pr_sweep(app: &mut App) {
         .map(|w| w.id.clone())
         .collect();
     for id in ids {
-        app.pr_recheck.remove(&id);
+        app.github.pr_recheck.remove(&id);
     }
 }
 
@@ -1214,16 +1231,16 @@ pub(crate) fn refresh_pull_requests(app: &mut App) {
     let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
         return;
     };
-    if let Some(open) = app.open_prs.get_mut(&project) {
+    if let Some(open) = app.github.open_prs.get_mut(&project) {
         open.due = std::time::Instant::now();
     }
     schedule_pr_lookup(app);
     schedule_pr_sweep(app);
     refetch_pr_detail(app);
-    app.pr_refresh_requested = true;
+    app.github.pr_refresh_requested = true;
     crate::issues::reload_selected(app);
-    app.flash = Some(RELOAD_FLASH.into());
-    app.dirty = true;
+    app.chrome.flash = Some(RELOAD_FLASH.into());
+    app.chrome.dirty = true;
 }
 
 /// Fetch the previewed pull request's body and conversation again, over
@@ -1236,14 +1253,14 @@ pub(crate) fn refetch_pr_detail(app: &mut App) {
     let Some(pr) = app.previewed_pr() else {
         return;
     };
-    if app.pr_detail_inflight.contains(&pr.url) {
+    if app.github.pr_detail_inflight.contains(&pr.url) {
         return;
     }
     let Some(dir) = app.selected_project().map(|p| p.repo_path.clone()) else {
         return;
     };
-    app.pr_detail_failed.remove(&pr.url);
-    app.pending_pr_detail = Some((
+    app.github.pr_detail_failed.remove(&pr.url);
+    app.github.pending_pr_detail = Some((
         crate::app::PendingPrDetail {
             url: pr.url,
             number: pr.number,
@@ -1257,7 +1274,7 @@ pub(crate) fn refetch_pr_detail(app: &mut App) {
 /// the two that show pull requests — is a reason to re-ask GitHub; walking
 /// off them into the pane is not.
 pub(crate) fn note_focus_change(app: &mut App) {
-    if matches!(app.focus, Focus::Worktrees | Focus::Sessions) {
+    if matches!(app.nav.focus, Focus::Worktrees | Focus::Sessions) {
         schedule_pull_request_refresh(app);
     }
 }
@@ -1272,7 +1289,7 @@ pub(crate) fn note_focus_change(app: &mut App) {
 /// whatever key arrives during it.
 pub(crate) fn request_metrics(app: &mut App, out: &mut Vec<ClientRequest>) {
     let own_rss = || nebula_core::mem::process_rss_bytes(std::process::id()).unwrap_or(0);
-    match app.view_jobs.clone() {
+    match app.jobs.view_jobs.clone() {
         Some(jobs) => jobs.run(move || Some(crate::view_jobs::Answer::ClientRss(own_rss()))),
         None => land_client_rss(app, own_rss()),
     }
@@ -1289,9 +1306,9 @@ pub(crate) fn request_metrics(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// nothing repaints keeps asking after the same cards until the next
 /// frame says otherwise. The reply is `ServerEvent::OutputTail`.
 pub(crate) fn request_terminal_tails(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let attached = app.term.as_ref().map(|t| t.sref.clone());
+    let attached = app.pane.term.as_ref().map(|t| t.sref.clone());
     let mut asked = std::collections::HashSet::new();
-    for id in app.tail_cards.clone() {
+    for id in app.pane.tail_cards.clone() {
         if !asked.insert(id.clone()) {
             continue;
         }
@@ -1302,7 +1319,7 @@ pub(crate) fn request_terminal_tails(app: &mut App, out: &mut Vec<ClientRequest>
         if !app.tree.terminals.iter().any(|t| t.id == id && t.alive) {
             continue;
         }
-        let after_seq = app.terminal_tails.get(&id).map(|t| t.end_seq);
+        let after_seq = app.pane.terminal_tails.get(&id).map(|t| t.end_seq);
         send(app, out, |req_id| ClientRequest::TailOutput {
             req_id,
             session: sref,
@@ -1323,7 +1340,7 @@ pub(crate) fn land_terminal_tail(
     tail: Option<nebula_core::OutputTail>,
 ) {
     let Some(tail) = tail else { return };
-    let entry = app.terminal_tails.entry(id).or_default();
+    let entry = app.pane.terminal_tails.entry(id).or_default();
     if tail.data.is_empty() {
         entry.end_seq = tail.end_seq;
         return;
@@ -1336,7 +1353,7 @@ pub(crate) fn land_terminal_tail(
     );
     if entry.lines != lines {
         entry.lines = lines;
-        app.dirty = true;
+        app.chrome.dirty = true;
     }
     entry.end_seq = tail.end_seq;
 }
@@ -1345,13 +1362,13 @@ pub(crate) fn land_terminal_tail(
 /// A reading is requested right away: the main loop's poll may be up to
 /// FOOTER_METRICS_POLL out.
 pub(crate) fn open_metrics(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.overlay = Some(Overlay::Metrics(MetricsView::new()));
+    app.modals.overlay = Some(Overlay::Metrics(MetricsView::new()));
     request_metrics(app, out);
 }
 
 pub(crate) fn land_client_rss(app: &mut App, bytes: u64) {
-    app.client_rss_bytes = bytes;
-    if let Some(Overlay::Metrics(view)) = &mut app.overlay {
+    app.jobs.client_rss_bytes = bytes;
+    if let Some(Overlay::Metrics(view)) = &mut app.modals.overlay {
         view.client_rss_bytes = bytes;
     }
 }

@@ -140,7 +140,7 @@ pub(super) fn report_working_directory(
 ) -> std::io::Result<()> {
     // ponytail: local checkout roots only; child-shell cd and remote host
     // identity need separate tracking, never advertise SSH paths as local.
-    if app.is_remote {
+    if app.chrome.is_remote {
         return Ok(());
     }
     let cwd = super::attached_worktree_root(app).or_else(|| std::env::current_dir().ok());
@@ -280,10 +280,10 @@ mod tests {
     #[test]
     fn working_directory_follows_the_attached_agent_not_the_sidebar() {
         let mut app = App::new();
-        app.is_remote = false;
+        app.chrome.is_remote = false;
         seed_tree(&mut app);
         seed_feat_worktree(&mut app, "w2", "links");
-        app.term = Some(AttachedTerm::new(
+        app.pane.term = Some(AttachedTerm::new(
             SessionRef::Agent(AgentId("a1".into())),
             80,
             24,
@@ -309,7 +309,7 @@ mod tests {
         );
 
         out.clear();
-        app.term = None;
+        app.pane.term = None;
         report_working_directory(&app, &mut sent, &mut out).unwrap();
         assert_eq!(text(&out), "\x1b]7;file://localhost/tmp/demo\x1b\\");
     }
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn working_directory_follows_an_attached_shell_and_leaves_ssh_alone() {
         let mut app = App::new();
-        app.is_remote = false;
+        app.chrome.is_remote = false;
         seed_tree(&mut app);
         seed_feat_worktree(&mut app, "w2", "shell");
         let id = TerminalId("t1".into());
@@ -329,7 +329,7 @@ mod tests {
             alive: true,
             run_command: None,
         });
-        app.term = Some(AttachedTerm::new(SessionRef::Terminal(id), 80, 24));
+        app.pane.term = Some(AttachedTerm::new(SessionRef::Terminal(id), 80, 24));
         let mut sent = None;
         let mut out = Vec::new();
         report_working_directory(&app, &mut sent, &mut out).unwrap();
@@ -338,7 +338,7 @@ mod tests {
             "\x1b]7;file://localhost/tmp/demo-worktrees/shell\x1b\\"
         );
 
-        app.is_remote = true;
+        app.chrome.is_remote = true;
         sent = None;
         out.clear();
         report_working_directory(&app, &mut sent, &mut out).unwrap();
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn working_directory_retries_a_failed_write() {
         let mut app = App::new();
-        app.is_remote = false;
+        app.chrome.is_remote = false;
         seed_tree(&mut app);
         let mut sent = None;
         let mut full = &mut [][..];

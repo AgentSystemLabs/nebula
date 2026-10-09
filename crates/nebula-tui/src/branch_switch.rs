@@ -1116,16 +1116,16 @@ impl BranchSwitchView {
 /// row), on the project's root.
 pub(crate) fn open_branch_switch(app: &mut App) {
     let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
-        app.flash = Some("switch branch: select a project first".into());
+        app.chrome.flash = Some("switch branch: select a project first".into());
         return;
     };
     let on_checkout = matches!(
-        app.focus,
+        app.nav.focus,
         Focus::Worktrees | Focus::Sessions | Focus::Terminal
     );
     let target = match app.selected_worktree().filter(|_| on_checkout) {
         Some(w) if !w.is_main => {
-            app.flash = Some(
+            app.chrome.flash = Some(
                 "switch branch is for the ⌂ root checkout — a worktree stays on the branch it was cut for"
                     .into(),
             );
@@ -1136,7 +1136,9 @@ pub(crate) fn open_branch_switch(app: &mut App) {
     };
     match target {
         Some(id) => open_for(app, &id),
-        None => app.flash = Some("switch branch: the project has no root checkout yet".into()),
+        None => {
+            app.chrome.flash = Some("switch branch: the project has no root checkout yet".into())
+        }
     }
 }
 
@@ -1201,16 +1203,16 @@ pub(crate) fn open_for(app: &mut App, worktree: &WorktreeId) {
         w.branch.clone(),
         live,
     );
-    if let Some(cached) = app.branch_switch.lists.get(&w.id) {
+    if let Some(cached) = app.jobs.branch_switch.lists.get(&w.id) {
         view.set_branches(recurrent(cached, &w.branch));
     }
-    if let Some(job) = app.branch_switch.switching.get(&w.id) {
+    if let Some(job) = app.jobs.branch_switch.switching.get(&w.id) {
         view.stage = Stage::Working(job.clone());
     }
-    app.overlay = Some(Overlay::BranchSwitch(view));
+    app.modals.overlay = Some(Overlay::BranchSwitch(view));
     request_list(app, w.id.clone(), w.path.clone());
     request_fetch(app, w.id, w.path, false);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// List the branches and count the changes, off the loop (inline in the
@@ -1223,9 +1225,9 @@ fn request_list(app: &mut App, worktree: WorktreeId, root: PathBuf) {
         land_answer(app, Answer::Listed { worktree, list });
         return;
     }
-    let tx = app.branch_switch.tx.clone();
-    if tx.is_some() && !app.branch_switch.listing.insert(worktree.clone()) {
-        app.branch_switch.relist.insert(worktree);
+    let tx = app.jobs.branch_switch.tx.clone();
+    if tx.is_some() && !app.jobs.branch_switch.listing.insert(worktree.clone()) {
+        app.jobs.branch_switch.relist.insert(worktree);
         return;
     }
     let ask = move |send: &mut dyn FnMut(Answer)| {
@@ -1257,10 +1259,10 @@ fn request_list(app: &mut App, worktree: WorktreeId, root: PathBuf) {
 /// Refresh the remotes in the background: skipped while one runs, within
 /// [`FETCH_GAP`] of the last unless `force`d, and in the unit tests.
 fn request_fetch(app: &mut App, worktree: WorktreeId, root: PathBuf, force: bool) {
-    let Some(tx) = app.branch_switch.tx.clone() else {
+    let Some(tx) = app.jobs.branch_switch.tx.clone() else {
         return;
     };
-    let shared = &mut app.branch_switch;
+    let shared = &mut app.jobs.branch_switch;
     let recent = shared
         .fetched
         .get(&worktree)
@@ -1279,7 +1281,7 @@ fn request_fetch(app: &mut App, worktree: WorktreeId, root: PathBuf, force: bool
 
 /// The open modal, when it is `worktree`'s.
 fn view_for<'a>(app: &'a mut App, worktree: &WorktreeId) -> Option<&'a mut BranchSwitchView> {
-    match &mut app.overlay {
+    match &mut app.modals.overlay {
         Some(Overlay::BranchSwitch(view)) if &view.worktree == worktree => Some(view),
         _ => None,
     }
@@ -1290,7 +1292,8 @@ pub(crate) fn land_answer(app: &mut App, answer: Answer) {
     match answer {
         Answer::Listed { worktree, list } => {
             if let Ok(list) = &list {
-                app.branch_switch
+                app.jobs
+                    .branch_switch
                     .lists
                     .insert(worktree.clone(), list.clone());
             }
@@ -1308,19 +1311,19 @@ pub(crate) fn land_answer(app: &mut App, answer: Answer) {
             }
         }
         Answer::Changes { worktree, changes } => {
-            app.branch_switch.listing.remove(&worktree);
+            app.jobs.branch_switch.listing.remove(&worktree);
             let root = view_for(app, &worktree).map(|view| {
                 view.changes = changes;
                 view.root.clone()
             });
-            if app.branch_switch.relist.remove(&worktree) {
+            if app.jobs.branch_switch.relist.remove(&worktree) {
                 if let Some(root) = root {
                     request_list(app, worktree, root);
                 }
             }
         }
         Answer::Fetched { worktree, ok } => {
-            app.branch_switch.fetching.remove(&worktree);
+            app.jobs.branch_switch.fetching.remove(&worktree);
             let root = view_for(app, &worktree).map(|view| {
                 view.fetch_failed = !ok;
                 view.root.clone()
@@ -1335,16 +1338,16 @@ pub(crate) fn land_answer(app: &mut App, answer: Answer) {
             outcome,
         } => land_switch(app, worktree, request, outcome),
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outcome) {
     // Only the running job's answer counts.
-    match app.branch_switch.switching.get(&worktree) {
+    match app.jobs.branch_switch.switching.get(&worktree) {
         Some(job) if job.request == request => {}
         _ => return,
     }
-    let Some(job) = app.branch_switch.switching.remove(&worktree) else {
+    let Some(job) = app.jobs.branch_switch.switching.remove(&worktree) else {
         return;
     };
     let from = app
@@ -1357,7 +1360,7 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
     // Whether the modal is still showing this job: `Esc` hides it while git
     // works, and the answer then goes to the footer.
     let showing = matches!(
-        &app.overlay,
+        &app.modals.overlay,
         Some(Overlay::BranchSwitch(v))
             if v.worktree == worktree && matches!(&v.stage, Stage::Working(j) if j.request == request)
     );
@@ -1369,22 +1372,23 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
             if let Some(w) = app.tree.worktrees.iter_mut().find(|w| w.id == worktree) {
                 w.branch = branch.clone();
             }
-            app.branch_switch.lists.remove(&worktree);
+            app.jobs.branch_switch.lists.remove(&worktree);
             if app
+                .jobs
                 .git_changes
                 .as_ref()
                 .is_some_and(|(id, _)| id == &worktree)
             {
-                app.git_changes = None;
+                app.jobs.git_changes = None;
             }
-            app.worktree_changes.remove(&worktree);
-            app.worktree_lines.remove(&worktree);
-            app.pull_requests.remove(&worktree);
-            app.pr_recheck.remove(&worktree);
+            app.jobs.worktree_changes.remove(&worktree);
+            app.jobs.worktree_lines.remove(&worktree);
+            app.github.pull_requests.remove(&worktree);
+            app.github.pr_recheck.remove(&worktree);
             if view_for(app, &worktree).is_some() {
-                app.overlay = None;
+                app.modals.overlay = None;
             }
-            app.flash = Some(match note {
+            app.chrome.flash = Some(match note {
                 Some(note) => format!("⌂ root is on {branch} · {note}"),
                 None => format!("⌂ root is on {branch}"),
             });
@@ -1407,7 +1411,7 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
             }
         }
         Outcome::Dirty { files, .. } => {
-            app.flash = Some(format!(
+            app.chrome.flash = Some(format!(
                 "not switched: {from} has {} — c to choose what happens to them",
                 changes_text(files.len())
             ));
@@ -1442,7 +1446,7 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
             }
         }
         Outcome::Failed(error) | Outcome::Stopped(error) => {
-            app.flash = Some(format!("switch branch failed: {error}"))
+            app.chrome.flash = Some(format!("switch branch failed: {error}"))
         }
     }
 }
@@ -1465,10 +1469,10 @@ fn start_switch(
     files: Vec<DiffFile>,
     keys: Vec<String>,
 ) {
-    let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
+    let Some(Overlay::BranchSwitch(view)) = &mut app.modals.overlay else {
         return;
     };
-    let shared = &mut app.branch_switch;
+    let shared = &mut app.jobs.branch_switch;
     if shared.switching.contains_key(&view.worktree) {
         view.status = Some(Status::error(
             "a switch is already running in this checkout",
@@ -1515,14 +1519,14 @@ fn start_switch(
             );
         }
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 // ---- keys and mouse ----
 
 /// `Enter` on the list.
 fn activate_selected(app: &mut App) {
-    let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
+    let Some(Overlay::BranchSwitch(view)) = &mut app.modals.overlay else {
         return;
     };
     let Some(branch) = view.selected_branch().cloned() else {
@@ -1552,7 +1556,7 @@ fn activate_selected(app: &mut App) {
 
 /// `Ctrl+r`: fetch the remotes now, past the minute's gap, and list again.
 fn refresh(app: &mut App) {
-    let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
+    let Some(Overlay::BranchSwitch(view)) = &mut app.modals.overlay else {
         return;
     };
     view.fetch_failed = false;
@@ -1563,7 +1567,7 @@ fn refresh(app: &mut App) {
 
 /// Pick one of the [`CHOICES`] on the DIRTY prompt.
 fn choose(app: &mut App, choice: Choice) {
-    let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
+    let Some(Overlay::BranchSwitch(view)) = &mut app.modals.overlay else {
         return;
     };
     let detached = view.detached();
@@ -1612,11 +1616,11 @@ fn choose(app: &mut App, choice: Choice) {
 
 /// Keys in the BRANCH SWITCHER.
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
-    let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
+    let Some(Overlay::BranchSwitch(view)) = &mut app.modals.overlay else {
         return;
     };
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    app.dirty = true;
+    app.chrome.dirty = true;
     match &mut view.stage {
         Stage::Pick => {
             let page = view.list_area.height.max(1) as i64;
@@ -1627,7 +1631,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                     view.query.clear();
                     view.requery();
                 }
-                KeyCode::Esc => app.overlay = None,
+                KeyCode::Esc => app.modals.overlay = None,
                 // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
                 KeyCode::Down => view.select(selected + 1),
                 KeyCode::Up => view.select(selected - 1),
@@ -1705,8 +1709,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // back), and the result lands in the footer.
         Stage::Working(_) => {
             if key.code == KeyCode::Esc {
-                app.overlay = None;
-                app.flash = Some("still switching — c shows it, the result lands here".into());
+                app.modals.overlay = None;
+                app.chrome.flash =
+                    Some("still switching — c shows it, the result lands here".into());
             }
         }
     }
@@ -1735,10 +1740,10 @@ pub(crate) fn paste(view: &mut BranchSwitchView, text: &str) -> bool {
 /// CONTEXT MENU's rule for rows that are actions. A click outside closes
 /// (`overlay_close`).
 pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, pos: Position) {
-    let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
+    let Some(Overlay::BranchSwitch(view)) = &mut app.modals.overlay else {
         return;
     };
-    app.dirty = true;
+    app.chrome.dirty = true;
     let delta = match mouse.kind {
         MouseEventKind::ScrollUp => -1,
         MouseEventKind::ScrollDown => 1,
@@ -1945,7 +1950,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &BranchSwitchView, th: Th
 
     // The status line: what's running, else what just went wrong or right,
     // else what the user should know before switching.
-    let fetching = app.branch_switch.fetching.contains(&view.worktree);
+    let fetching = app.jobs.branch_switch.fetching.contains(&view.worktree);
     let (text, color) = if let Stage::Working(job) = &view.stage {
         let doing = match job.carry {
             Carry::Stash => "stashing and switching",
@@ -1991,7 +1996,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &BranchSwitchView, th: Th
     );
 
     // Write-back (draw works on a clone).
-    if let Some(Overlay::BranchSwitch(v)) = &mut app.overlay {
+    if let Some(Overlay::BranchSwitch(v)) = &mut app.modals.overlay {
         v.area = area;
         v.list_area = list_area;
         v.choices_area = choices_area;
@@ -2860,14 +2865,14 @@ mod tests {
     }
 
     fn view(app: &App) -> &BranchSwitchView {
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::BranchSwitch(view)) => view,
             other => panic!("no branch switcher: {other:?}"),
         }
     }
 
     fn view_mut(app: &mut App) -> &mut BranchSwitchView {
-        match &mut app.overlay {
+        match &mut app.modals.overlay {
             Some(Overlay::BranchSwitch(view)) => view,
             other => panic!("no branch switcher: {other:?}"),
         }
@@ -2876,10 +2881,10 @@ mod tests {
     fn screen(app: &mut App, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| {
-            let Some(Overlay::BranchSwitch(v)) = app.overlay.clone() else {
+            let Some(Overlay::BranchSwitch(v)) = app.modals.overlay.clone() else {
                 panic!("no switcher");
             };
-            draw(f, app, &v, app.theme);
+            draw(f, app, &v, app.chrome.theme);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -2934,7 +2939,7 @@ mod tests {
             "the first Esc clears the query"
         );
         key(&mut app, KeyCode::Esc);
-        assert!(app.overlay.is_none(), "the second closes");
+        assert!(app.modals.overlay.is_none(), "the second closes");
     }
 
     #[test]
@@ -2945,11 +2950,11 @@ mod tests {
         open_for(&mut app, &w1());
         type_text(&mut app, "feat");
         key(&mut app, KeyCode::Enter);
-        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
         assert_eq!(head(&repo), "feature");
         assert_eq!(app.tree.worktrees[0].branch, "feature");
-        assert_eq!(app.flash.as_deref(), Some("⌂ root is on feature"));
-        assert!(app.branch_switch.switching.is_empty());
+        assert_eq!(app.chrome.flash.as_deref(), Some("⌂ root is on feature"));
+        assert!(app.jobs.branch_switch.switching.is_empty());
     }
 
     #[test]
@@ -2963,7 +2968,7 @@ mod tests {
         assert!(screen(&mut app, 110, 30).contains("Enter creates \"brand-new\" off main"));
         key(&mut app, KeyCode::Enter);
         assert_eq!(head(&repo), "brand-new");
-        assert_eq!(app.flash.as_deref(), Some("⌂ root is on brand-new"));
+        assert_eq!(app.chrome.flash.as_deref(), Some("⌂ root is on brand-new"));
     }
 
     #[test]
@@ -3010,7 +3015,10 @@ mod tests {
             "{:?}",
             view(&app).stage
         );
-        assert!(app.branch_switch.switching.is_empty(), "the ask is over");
+        assert!(
+            app.jobs.branch_switch.switching.is_empty(),
+            "the ask is over"
+        );
         let text = screen(&mut app, 110, 30);
         assert!(text.contains("main has 1 uncommitted change"), "{text}");
         assert!(
@@ -3026,9 +3034,9 @@ mod tests {
         );
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Char('s'));
-        assert!(app.overlay.is_none());
+        assert!(app.modals.overlay.is_none());
         assert_eq!(head(&repo), "feature");
-        assert!(app.flash.as_deref().unwrap().contains("stashed"));
+        assert!(app.chrome.flash.as_deref().unwrap().contains("stashed"));
     }
 
     #[test]
@@ -3071,7 +3079,7 @@ mod tests {
         type_text(&mut app, "save my work");
         assert!(screen(&mut app, 110, 30).contains("save my work"));
         key(&mut app, KeyCode::Enter);
-        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
         assert_eq!(head(&repo), "feature");
         assert_eq!(
             git(&repo, &["log", "-1", "--format=%s", "main"]),
@@ -3116,7 +3124,7 @@ mod tests {
             keys: fingerprints(&repo, &files),
             files,
         };
-        app.branch_switch.switching.insert(w1(), job.clone());
+        app.jobs.branch_switch.switching.insert(w1(), job.clone());
         view_mut(&mut app).stage = Stage::Working(job);
         land_answer(
             &mut app,
@@ -3152,8 +3160,8 @@ mod tests {
             files: Vec::new(),
             keys: Vec::new(),
         };
-        app.branch_switch.switching.insert(w1(), job);
-        app.branch_switch.requests = 7;
+        app.jobs.branch_switch.switching.insert(w1(), job);
+        app.jobs.branch_switch.requests = 7;
 
         open_for(&mut app, &w1());
         assert!(matches!(view(&app).stage, Stage::Working(ref j) if j.request == 7));
@@ -3170,10 +3178,10 @@ mod tests {
         assert!(status.text.contains("already running"), "{status:?}");
         assert_eq!(head(&repo), "main");
 
-        let running = app.branch_switch.switching[&w1()].clone();
+        let running = app.jobs.branch_switch.switching[&w1()].clone();
         view_mut(&mut app).stage = Stage::Working(running);
         key(&mut app, KeyCode::Esc);
-        assert!(app.overlay.is_none(), "Esc hides the working modal");
+        assert!(app.modals.overlay.is_none(), "Esc hides the working modal");
 
         // A stale answer is nobody's.
         land_answer(
@@ -3184,7 +3192,7 @@ mod tests {
                 outcome: Outcome::Failed("stale".into()),
             },
         );
-        assert!(app.branch_switch.switching.contains_key(&w1()));
+        assert!(app.jobs.branch_switch.switching.contains_key(&w1()));
 
         let files = vec![DiffFile {
             path: "a.txt".into(),
@@ -3202,9 +3210,9 @@ mod tests {
                 },
             },
         );
-        assert!(app.branch_switch.switching.is_empty());
+        assert!(app.jobs.branch_switch.switching.is_empty());
         assert_eq!(
-            app.flash.as_deref(),
+            app.chrome.flash.as_deref(),
             Some("not switched: main has 1 uncommitted change — c to choose what happens to them")
         );
     }
@@ -3215,7 +3223,7 @@ mod tests {
         let mut main = local("main");
         main.current = true;
         let rows = vec![main, local("feature"), local("other")];
-        app.branch_switch.lists.insert(w1(), rows);
+        app.jobs.branch_switch.lists.insert(w1(), rows);
         app.tree.worktrees[0].branch = "feature".into();
         open_for(&mut app, &w1());
         let v = view(&app);

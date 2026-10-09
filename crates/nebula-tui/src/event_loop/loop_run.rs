@@ -6,21 +6,21 @@ macro_rules! main_loop_body {
     ($terminal:ident, $channels:ident) => {{
 
     let mut app = App::new();
-    app.conn = ConnState::Connected;
+    app.chrome.conn = ConnState::Connected;
     // The repo nebula was started in, for the first run's "open this
     // folder" — looked up once, off the tree the snapshot has not sent yet.
-    app.launch_repo = crate::app::launch_repo();
+    app.launcher.launch_repo = crate::app::launch_repo();
     let cfg = crate::config::Config::load();
     apply_config(&mut app, &cfg);
-    app.keymap = cfg.keymap();
+    app.chrome.keymap = cfg.keymap();
     // Every pull request the last run knew about, painted before the
     // daemon's snapshot even lands; the lookups below refresh them all in
     // the background (`pr_cache`).
-    app.pr_cache = Some(crate::pr_cache::PrCache::default_location());
+    app.github.pr_cache = Some(crate::pr_cache::PrCache::default_location());
     crate::pr_cache::hydrate(&mut app);
     // A screenshot dropped onto a prompt box is copied here the moment it
     // lands, before macOS deletes the file behind its thumbnail.
-    app.attachments_dir = Some(crate::dropped_files::default_dir());
+    app.modals.attachments_dir = Some(crate::dropped_files::default_dir());
     // The Cursor MODEL / EFFORT lists: cached `cursor-agent --list-models`
     // now, a background refresh when the cache is a day old.
     crate::cursor_catalogue::bootstrap(cfg.cursor_enabled);
@@ -40,14 +40,14 @@ macro_rules! main_loop_body {
     let mut pacer = pacing::FramePacer::new(next_draw);
     let mut next_git_poll = tokio::time::Instant::now();
     // The changed-file badge's `git status`, run off the loop; the count
-    // lands here and in `app.git_changes`.
+    // lands here and in `app.jobs.git_changes`.
     let (git_tx, mut git_rx) = tokio::sync::mpsc::unbounded_channel::<ChangedFiles>();
     // The cards' sweep of every other checkout the grid lists, one per
-    // tick; its counts land in `app.worktree_changes` (and its line counts
-    // in `app.worktree_lines`) and nowhere else.
+    // tick; its counts land in `app.jobs.worktree_changes` (and its line counts
+    // in `app.jobs.worktree_lines`) and nowhere else.
     let (sweep_git_tx, mut sweep_git_rx) = tokio::sync::mpsc::unbounded_channel::<SweptChanges>();
     // Pull-request lookups run off the loop (they hit the network); answers
-    // come back here and land in `app.pull_requests`.
+    // come back here and land in `app.github.pull_requests`.
     let (pr_tx, mut pr_rx) = tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Lookup)>();
     // The selected project's open-pull-request list, on the same off-loop
     // footing. `None` is "couldn't ask", which keeps the last good list.
@@ -61,28 +61,28 @@ macro_rules! main_loop_body {
     // A whole `gh pr diff`, which opens the diff modal when it lands — or
     // refreshes the one already open on the cached copy.
     let (prdiff_tx, mut prdiff_rx) = tokio::sync::mpsc::unbounded_channel::<PrDiffAnswer>();
-    app.pr_diff_tx = Some(prdiff_tx);
+    app.github.pr_diff_tx = Some(prdiff_tx);
     // A finished `gh pr comment`, which flashes its outcome when it lands
     // — and re-reads the pull request so the pane shows what was said.
     let (prcomment_tx, mut prcomment_rx) =
         tokio::sync::mpsc::unbounded_channel::<PrCommentAnswer>();
-    app.pr_comment_tx = Some(prcomment_tx);
+    app.github.pr_comment_tx = Some(prcomment_tx);
     // The ISSUES MODAL's `gh issue list` / `gh issue view` answers, on the
     // same footing: the modal's own handlers start the fetch, the loop
     // lands it.
     let (issues_tx, mut issues_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::issues::IssuesAnswer>();
-    app.issues_tx = Some(issues_tx);
+    app.github.issues_tx = Some(issues_tx);
     // The BRANCH SWITCHER's git — the listing, the changed-file count,
     // the background fetch and the switch itself — lands here too.
     let (branch_tx, mut branch_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::branch_switch::Answer>();
-    app.branch_switch.tx = Some(branch_tx);
+    app.jobs.branch_switch.tx = Some(branch_tx);
     // BACKGROUND READS for the worktree views: the git and the disk behind
     // `g`, `f`, `F` and `b` run on the blocking pool and land here.
     let (views_tx, mut views_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::view_jobs::Answer>();
-    app.view_jobs = Some(crate::view_jobs::Jobs::new(views_tx));
+    app.jobs.view_jobs = Some(crate::view_jobs::Jobs::new(views_tx));
     // A newer nebula published on GitHub, probed off the loop at start and
     // then on a slow beat (`update_check::interval`; the e2e tests turn it
     // off). Only a newer version ever arrives, so the footer's indicator,
@@ -102,13 +102,13 @@ macro_rules! main_loop_body {
     // Editor-modal PTY output; the channel outlives individual editor
     // spawns (VimEvent generations keep them apart).
     let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
-    app.vim_tx = Some(vim_tx);
+    app.pane.vim_tx = Some(vim_tx);
     // The INPUT LATENCY PROBE (`NEBULA_PERF_LOG`); None outside a
     // measurement run.
     let mut perf = crate::perf::Perf::from_env();
 
     loop {
-        if app.dirty && tokio::time::Instant::now() >= next_draw {
+        if app.chrome.dirty && tokio::time::Instant::now() >= next_draw {
             // A selection change must never paint another checkout's badge:
             // the badge stays off until this checkout's count lands, and
             // between selections the slow poll keeps it fresh.
@@ -120,29 +120,29 @@ macro_rules! main_loop_body {
             if let Some(perf) = &mut perf {
                 perf.frame(began, &app);
             }
-            app.dirty = false;
+            app.chrome.dirty = false;
             next_draw = pacer.drew(tokio::time::Instant::now(), began.elapsed());
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
         }
 
-        let focus_before = app.focus;
+        let focus_before = app.nav.focus;
         let preview_before = app.reading_url();
         // When the KEY COMBO DISPLAY's last press comes down (its arm below).
         let key_combo_deadline = app
-            .key_combo
+            .chrome.key_combo
             .as_ref()
             .map_or_else(tokio::time::Instant::now, |combo| {
                 tokio::time::Instant::from_std(combo.deadline())
             });
         // When the EDGE AUTO-SCROLL next steps (its arm below).
         let drag_autoscroll_deadline = app
-            .next_drag_autoscroll
+            .pane.next_drag_autoscroll
             .map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std);
         tokio::select! {
             // Pending redraw: wake at the frame boundary even if no new
             // events arrive.
-            _ = tokio::time::sleep_until(next_draw), if app.dirty => {}
+            _ = tokio::time::sleep_until(next_draw), if app.chrome.dirty => {}
             // Fixed deadline (not a fresh sleep per iteration) so heavy PTY
             // traffic can't starve the badge refresh.
             _ = tokio::time::sleep_until(next_git_poll) => {
@@ -175,8 +175,8 @@ macro_rules! main_loop_body {
             // `Shift+R` asked for the pull requests now: the same lookups
             // the git tick runs, on this turn instead of up to `GIT_POLL`
             // later.
-            _ = std::future::ready(()), if app.pr_refresh_requested => {
-                app.pr_refresh_requested = false;
+            _ = std::future::ready(()), if app.github.pr_refresh_requested => {
+                app.github.pr_refresh_requested = false;
                 lookup_pull_request(&mut app, &pr_tx);
                 sweep_pull_request(&mut app, &pr_tx);
                 lookup_open_prs(&mut app, &prs_tx, &mut out);
@@ -186,7 +186,7 @@ macro_rules! main_loop_body {
             // initial reading is requested by the M keypress itself).
             _ = tokio::time::sleep_until(next_metrics_poll) => {
                 request_metrics(&mut app, &mut out);
-                let period = if matches!(app.overlay, Some(Overlay::Metrics(_))) {
+                let period = if matches!(app.modals.overlay, Some(Overlay::Metrics(_))) {
                     METRICS_POLL
                 } else {
                     FOOTER_METRICS_POLL
@@ -197,7 +197,7 @@ macro_rules! main_loop_body {
             // on a beat of its own for as long as any is on screen — with
             // the grid folded away or no $terminal drawn there is nothing
             // to ask after, and the beat sleeps with it.
-            _ = tokio::time::sleep_until(next_tail_poll), if !app.tail_cards.is_empty() => {
+            _ = tokio::time::sleep_until(next_tail_poll), if !app.pane.tail_cards.is_empty() => {
                 request_terminal_tails(&mut app, &mut out);
                 next_tail_poll = tokio::time::Instant::now() + TAIL_POLL;
             }
@@ -205,7 +205,7 @@ macro_rules! main_loop_body {
             // same sky: while either is on screen nothing else repaints an
             // idle app, so tick the animation on a fixed cadence.
             _ = tokio::time::sleep_until(next_splash_frame), if app.splash_active() || app.welcome_active() => {
-                app.dirty = true;
+                app.chrome.dirty = true;
                 next_splash_frame = tokio::time::Instant::now() + SPLASH_FRAME;
             }
             // Status sweep: running / needs-feedback rows shimmer, so keep
@@ -215,7 +215,7 @@ macro_rules! main_loop_body {
             // the row it leaves mid-band, so the tick after the last sweep
             // stops still fires: that frame is the row settling.
             _ = tokio::time::sleep_until(next_sweep_frame), if app.status_anim_active() || sweep_was_ticking => {
-                app.dirty = true;
+                app.chrome.dirty = true;
                 sweep_was_ticking = app.status_anim_active();
                 next_sweep_frame = tokio::time::Instant::now() + SWEEP_FRAME;
             }
@@ -225,16 +225,16 @@ macro_rules! main_loop_body {
             // so the whole tree is the test, not just the visible sessions.
             _ = tokio::time::sleep_until(next_ago_refresh) => {
                 if app.tree.agents.iter().any(|a| a.status_changed_at > 0) {
-                    app.dirty = true;
+                    app.chrome.dirty = true;
                 }
                 next_ago_refresh = tokio::time::Instant::now() + AGO_REFRESH;
             }
             // The KEY COMBO DISPLAY clears itself a moment after the press
             // (`key_combo::LINGER`) — nothing else repaints an idle app, so
             // the deadline takes a wake of its own.
-            _ = tokio::time::sleep_until(key_combo_deadline), if app.key_combo.is_some() => {
-                app.key_combo = None;
-                app.dirty = true;
+            _ = tokio::time::sleep_until(key_combo_deadline), if app.chrome.key_combo.is_some() => {
+                app.chrome.key_combo = None;
+                app.chrome.dirty = true;
             }
             // A host that reset itself (iTerm2's ⌘R) drops mouse reporting
             // without a word, and a dead mouse can't report that it is
@@ -248,7 +248,7 @@ macro_rules! main_loop_body {
             _ = tokio::time::sleep_until(next_mode_reassert), if !app.mouse_held() => {
                 // A RELEASE WATCH nothing has touched for a while goes
                 // first, so the beat re-asks the resting flags, not its.
-                if release_watch::expire(&mut app.release_watch, std::time::Instant::now()) {
+                if release_watch::expire(&mut app.chrome.release_watch, std::time::Instant::now()) {
                     let _ = watch_held_key($terminal.backend_mut(), false);
                 }
                 let _ = reassert_modes($terminal.backend_mut());
@@ -257,13 +257,13 @@ macro_rules! main_loop_body {
             // The EDGE AUTO-SCROLL beat: a drag-selection resting past the
             // pane's top or bottom edge scrolls the history under it, with
             // no further mouse report to prompt it.
-            _ = tokio::time::sleep_until(drag_autoscroll_deadline), if app.next_drag_autoscroll.is_some() => {
+            _ = tokio::time::sleep_until(drag_autoscroll_deadline), if app.pane.next_drag_autoscroll.is_some() => {
                 drag_autoscroll_tick(&mut app, &mut out);
             }
             // The selection rested past the debounce: tell the daemon what
             // the pane has been showing since the cursor landed here.
             _ = tokio::time::sleep(app.attach_delay().unwrap_or_default()),
-                if app.pending_attach.is_some() =>
+                if app.pane.pending_attach.is_some() =>
             {
                 fire_pending_attach(&mut app, &mut out);
             }
@@ -271,7 +271,7 @@ macro_rules! main_loop_body {
             // daemon to boot its dead sessions in the background so
             // attaching one replays a live screen instead of a cold boot.
             _ = tokio::time::sleep(app.prewarm_delay().unwrap_or_default()),
-                if app.pending_prewarm.is_some() =>
+                if app.requests.pending_prewarm.is_some() =>
             {
                 fire_pending_prewarm(&mut app, &mut out);
             }
@@ -279,7 +279,7 @@ macro_rules! main_loop_body {
             // for its open issues in the background, so `i` paints the
             // rows at once instead of an empty modal.
             _ = tokio::time::sleep(app.issues_prefetch_delay().unwrap_or_default()),
-                if app.pending_issues_prefetch.is_some() =>
+                if app.github.pending_issues_prefetch.is_some() =>
             {
                 crate::issues::fire_prefetch(&mut app);
             }
@@ -287,7 +287,7 @@ macro_rules! main_loop_body {
             // worktree's warm default-spec Claude session so the daemon's
             // reaper never leaves the next create cold.
             _ = tokio::time::sleep(app.keepwarm_delay().unwrap_or_default()),
-                if app.next_keepwarm.is_some() =>
+                if app.requests.next_keepwarm.is_some() =>
             {
                 fire_keepwarm(&mut app, &mut out);
             }
@@ -301,19 +301,19 @@ macro_rules! main_loop_body {
                         .as_ref()
                         .and_then(|_| crate::perf::label(&event))
                         .map(|label| (label, std::time::Instant::now()));
-                    let watching = app.release_watch.is_some();
+                    let watching = app.chrome.release_watch.is_some();
                     handle_terminal_event(&mut app, event, &mut out);
                     // A RELEASE WATCH armed by this key flips the host's
                     // keyboard flags now, ahead of the key's first repeat;
                     // one ended by it flips them back (release_watch.rs).
-                    if watching != app.release_watch.is_some() {
+                    if watching != app.chrome.release_watch.is_some() {
                         let _ = watch_held_key($terminal.backend_mut(), !watching);
                     }
                     if let (Some(perf), Some((label, arrived))) = (&mut perf, probe) {
                         perf.input(label, arrived, &app);
                     }
                 }
-                Some(Err(_)) | None => app.should_quit = true,
+                Some(Err(_)) | None => app.chrome.should_quit = true,
             },
             ev = $channels.rx.recv() => match ev {
                 Some(server_event) => {
@@ -324,13 +324,13 @@ macro_rules! main_loop_body {
                     handle_server_event(&mut app, server_event, &mut out);
                 }
                 None => {
-                    app.conn = ConnState::Disconnected;
-                    app.flash = Some("daemon connection lost".into());
-                    app.dirty = true;
+                    app.chrome.conn = ConnState::Disconnected;
+                    app.chrome.flash = Some("daemon connection lost".into());
+                    app.chrome.dirty = true;
                 }
             },
             ev = vim_rx.recv() => {
-                // Never None: app.vim_tx keeps a sender alive.
+                // Never None: app.pane.vim_tx keeps a sender alive.
                 if let Some(ev) = ev {
                     handle_vim_event(&mut app, ev);
                 }
@@ -377,8 +377,8 @@ macro_rules! main_loop_body {
             answer = update_rx.recv() => {
                 // Never None: `update_tx` lives as long as the loop.
                 if let Some(version) = answer {
-                    app.dirty |= app.update_available.as_deref() != Some(version.as_str());
-                    app.update_available = Some(version);
+                    app.chrome.dirty |= app.chrome.update_available.as_deref() != Some(version.as_str());
+                    app.chrome.update_available = Some(version);
                 }
             }
             // The hover debounce: the cursor has rested on a pull request
@@ -419,14 +419,14 @@ macro_rules! main_loop_body {
                 }
             }
             answer = views_rx.recv() => {
-                // Never None: `app.view_jobs` keeps a sender alive.
+                // Never None: `app.jobs.view_jobs` keeps a sender alive.
                 if let Some(answer) = answer {
                     land_view_answer(&mut app, answer);
                 }
             }
         }
-        if app.focus != focus_before {
-            tracing::debug!(from = ?focus_before, to = ?app.focus, "focus changed");
+        if app.nav.focus != focus_before {
+            tracing::debug!(from = ?focus_before, to = ?app.nav.focus, "focus changed");
             note_focus_change(&mut app);
         }
 
@@ -449,8 +449,8 @@ macro_rules! main_loop_body {
         // has the backtrace.
         if take_worker_panic() {
             repaint($terminal)?;
-            app.flash = Some("a background task crashed — logged to tui.log".into());
-            app.dirty = true;
+            app.chrome.flash = Some("a background task crashed — logged to tui.log".into());
+            app.chrome.dirty = true;
         }
 
         report_working_directory(&app, &mut directory_sent, $terminal.backend_mut())?;
@@ -458,8 +458,8 @@ macro_rules! main_loop_body {
         // Mouse handlers only record the pointer shape they want; emit the
         // OSC 22 request when it changes. Terminals without pointer-shape
         // support (Terminal.app) parse and drop the sequence.
-        if app.pointer_shape != pointer_sent {
-            pointer_sent = app.pointer_shape;
+        if app.chrome.pointer_shape != pointer_sent {
+            pointer_sent = app.chrome.pointer_shape;
             use std::io::Write;
             let backend = $terminal.backend_mut();
             let _ = write!(backend, "\x1b]22;{}\x1b\\", pointer_sent.osc_name());
@@ -470,7 +470,7 @@ macro_rules! main_loop_body {
         // the only clipboard reachable from a headless `nebula ssh` host).
         // BEL-terminated on purpose: it is the form every OSC 52 implementer
         // accepts, ST is not.
-        if let Some(payload) = app.pending_clipboard.take() {
+        if let Some(payload) = app.chrome.pending_clipboard.take() {
             use std::io::Write;
             let backend = $terminal.backend_mut();
             let _ = write!(backend, "\x1b]52;c;{payload}\x07");
@@ -481,7 +481,7 @@ macro_rules! main_loop_body {
         // through the same $terminal as the OSC writes above, so over ssh it
         // rings the $terminal the user is sitting at. CONFIG.JSON is read
         // fresh, like every other setting.
-        if std::mem::take(&mut app.pending_ding) {
+        if std::mem::take(&mut app.chrome.pending_ding) {
             if let Some(sound) = crate::config::Config::load().done_sound() {
                 alerts::play_sound($terminal.backend_mut(), sound);
             }
@@ -492,11 +492,11 @@ macro_rules! main_loop_body {
         // background, name each of them in a desktop notification — never
         // over ssh, where the desktop is the wrong machine's. `off` is
         // silence for both.
-        let alerts = std::mem::take(&mut app.pending_feedback);
+        let alerts = std::mem::take(&mut app.chrome.pending_feedback);
         if !alerts.is_empty() {
             if let Some(sound) = crate::config::Config::load().feedback_sound() {
                 alerts::play_sound($terminal.backend_mut(), sound);
-                if !app.window_focused && !app.is_remote {
+                if !app.chrome.window_focused && !app.chrome.is_remote {
                     alerts::notify_desktop(&alerts);
                 }
             }
@@ -504,12 +504,12 @@ macro_rules! main_loop_body {
 
         for req in out.drain(..) {
             if $channels.tx.send(req).await.is_err() {
-                app.conn = ConnState::Disconnected;
-                app.dirty = true;
+                app.chrome.conn = ConnState::Disconnected;
+                app.chrome.dirty = true;
             }
         }
 
-        if app.should_quit {
+        if app.chrome.should_quit {
             // Whatever the pull-request lookups learned since the last tick,
             // written inline: the process is about to end, and a write
             // handed to a thread here could be cut off with it.
@@ -523,7 +523,7 @@ macro_rules! main_loop_body {
                     json: ui_state_json(&app),
                 })
                 .await;
-            return Ok(app.pending_ssh.take());
+            return Ok(app.chrome.pending_ssh.take());
         }
     }
 

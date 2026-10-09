@@ -42,7 +42,7 @@ fn is_archived(app: &App, id: &AgentId) -> bool {
 
 /// The one of those two this grid means.
 fn nothing_here(app: &App) -> &'static str {
-    if app.show_archived {
+    if app.launcher.show_archived {
         NO_ARCHIVED_SESSIONS
     } else {
         NO_SESSIONS
@@ -106,7 +106,7 @@ pub(super) fn open_new_session(app: &mut App) {
     // The checkout the rows are built against; the launch keeps its own
     // target either way (`quick_prompt::open_launch_picker` does the same).
     let Some(context) = crate::quick_prompt::picker_context(app, &launch) else {
-        app.flash = Some("project no longer exists".into());
+        app.chrome.flash = Some("project no longer exists".into());
         return;
     };
     let back = QuickReturn::fresh(launch);
@@ -127,7 +127,7 @@ fn box_launch(app: &mut App) -> Option<QuickLaunch> {
             .map(|p| p.id.clone())
     });
     let Some(project) = project else {
-        app.flash = Some("add a project first".into());
+        app.chrome.flash = Some("add a project first".into());
         return None;
     };
     let cfg = crate::config::Config::load();
@@ -144,10 +144,10 @@ fn box_launch(app: &mut App) -> Option<QuickLaunch> {
 pub(super) fn take_aim(app: &mut App) {
     // The card is wanted on screen, wheel or no wheel: the next frame
     // scrolls the grid to it (`App::launcher_reveal`).
-    app.launcher_reveal = true;
-    if app.launcher_unaimed {
-        app.launcher_unaimed = false;
-        app.dirty = true;
+    app.launcher.launcher_reveal = true;
+    if app.launcher.launcher_unaimed {
+        app.launcher.launcher_unaimed = false;
+        app.chrome.dirty = true;
     }
 }
 
@@ -164,9 +164,9 @@ pub(super) fn take_aim(app: &mut App) {
 /// of them: a miss with the pointer folds nothing away — see the
 /// `PanelBg` arm in `event_loop`.
 pub(super) fn clear_aim(app: &mut App) {
-    app.launcher_unaimed = true;
-    app.flash = Some(UNAIMED.into());
-    app.dirty = true;
+    app.launcher.launcher_unaimed = true;
+    app.chrome.flash = Some(UNAIMED.into());
+    app.chrome.dirty = true;
 }
 
 /// `⇧A`: swap the grid between a project's LIVE sessions and its
@@ -180,20 +180,20 @@ pub(super) fn clear_aim(app: &mut App) {
 /// INPUT PARITY: the one function behind the `⇧A` key and the card
 /// menu's **Show/hide archived**, so both end in the same state.
 pub(crate) fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.show_archived = !app.show_archived;
+    app.launcher.show_archived = !app.launcher.show_archived;
     match view::rows(app).first().map(|row| row.agent.id.clone()) {
         Some(first) => select(app, first, out),
         None => clear_aim(app),
     }
-    app.flash = Some(
-        if app.show_archived {
+    app.chrome.flash = Some(
+        if app.launcher.show_archived {
             ARCHIVED_VIEW
         } else {
             LIVE_VIEW
         }
         .into(),
     );
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// `^``, and every other chord the pane fold answers to: the way out of
@@ -208,13 +208,13 @@ pub(crate) fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// PANE let it through (`event_loop::handle_key`) or the grid got it
 /// ([`handle_action`]).
 pub(super) fn fold_key(app: &mut App) -> &'static str {
-    if app.focus == Focus::Terminal && !app.launcher_pane_hidden {
+    if app.nav.focus == Focus::Terminal && !app.launcher.launcher_pane_hidden {
         super::leave_terminal_lock(app);
-        app.dirty = true;
+        app.chrome.dirty = true;
         return BACK_TO_CARD;
     }
     toggle_pane(app);
-    if app.launcher_pane_hidden {
+    if app.launcher.launcher_pane_hidden {
         "Hide the pane"
     } else {
         "Show the pane"
@@ -231,19 +231,19 @@ pub(super) fn fold_key(app: &mut App) -> &'static str {
 /// with no sessions) is off screen too, and the key brings it back rather
 /// than folding away a pane that is already gone.
 pub(super) fn toggle_pane(app: &mut App) {
-    app.launcher_pane_hidden = !app.launcher_pane_hidden && app.launcher_aimed();
-    if app.launcher_pane_hidden {
+    app.launcher.launcher_pane_hidden = !app.launcher.launcher_pane_hidden && app.launcher_aimed();
+    if app.launcher.launcher_pane_hidden {
         clear_aim(app);
         // FOCUS cannot stay in a pane that is no longer drawn: the keys
         // come back to the cards, the way `^q` hands them back.
-        app.focus = Focus::Sessions;
-        app.term_locked = false;
-        app.flash = Some(PANE_HIDDEN.into());
+        app.nav.focus = Focus::Sessions;
+        app.pane.term_locked = false;
+        app.chrome.flash = Some(PANE_HIDDEN.into());
     } else {
         take_aim(app);
-        app.flash = Some(PANE_SHOWN.into());
+        app.chrome.flash = Some(PANE_SHOWN.into());
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// The pane's SIDE BUTTON: move the PANE to the other side of the cards —
@@ -259,7 +259,7 @@ pub(super) fn move_pane(app: &mut App) {
     cfg.session_pane = to.as_str().into();
     if super::save_config(app, &cfg) {
         super::apply_config(app, &cfg);
-        app.flash = Some(
+        app.chrome.flash = Some(
             match to {
                 view::PaneSide::Right => PANE_MOVED_RIGHT,
                 view::PaneSide::Bottom => PANE_MOVED_BOTTOM,
@@ -267,7 +267,7 @@ pub(super) fn move_pane(app: &mut App) {
             .into(),
         );
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// A double-click on the pane's edge: the edge snaps to the middle of the
@@ -285,8 +285,8 @@ pub(super) fn center_pane(app: &mut App) {
         return;
     }
     app.set_launcher_pane(app.launcher_pane_midpoint());
-    app.flash = Some(PANE_CENTERED.into());
-    app.dirty = true;
+    app.chrome.flash = Some(PANE_CENTERED.into());
+    app.chrome.dirty = true;
 }
 
 // ---- the BANDS ----
@@ -306,14 +306,14 @@ const NO_ROOT_FOR_TERMINAL: &str = "no checkout selected — j/k onto a worktree
 /// The band the cursor wears — None once the aim has been let go of
 /// (`App::launcher_unaimed`), as `ui::launcher_view::wearing` draws it.
 fn wearing_band(app: &App, bands: &[view::Band]) -> Option<usize> {
-    (!app.launcher_unaimed)
+    (!app.launcher.launcher_unaimed)
         .then(|| view::band_cursor(app, bands))
         .flatten()
 }
 
 /// The card the cursor wears inside `band`, by the same rule.
 fn wearing_card(app: &App, band: &view::Band) -> Option<usize> {
-    (!app.launcher_unaimed)
+    (!app.launcher.launcher_unaimed)
         .then(|| view::card_cursor(app, band))
         .flatten()
 }
@@ -352,7 +352,7 @@ pub(super) fn land_on_card(app: &mut App) {
 /// row under the cursor is one the grid is drawing. The other layouts
 /// keep no fold, and leave the NESTED one's as it was left.
 pub(super) fn unfold_cursor_band(app: &mut App) {
-    if !app.launcher_nested || app.launcher_all_open {
+    if !app.launcher.launcher_nested || app.launcher.launcher_all_open {
         return;
     }
     let bands = view::bands(app);
@@ -415,7 +415,7 @@ pub(super) fn select_band(app: &mut App, worktree: WorktreeId, out: &mut Vec<Cli
     // The FOLLOW-UP STRIP is aimed at the card it was opened on: the
     // cursor leaving for another checkout folds it rather than sending
     // the next turn to a session the cursor has left.
-    app.follow_up = None;
+    app.modals.follow_up = None;
     take_aim(app);
     jump_to_target_inner(
         app,
@@ -423,8 +423,8 @@ pub(super) fn select_band(app: &mut App, worktree: WorktreeId, out: &mut Vec<Cli
         Landing::FocusOnly,
         out,
     );
-    app.focus = Focus::Sessions;
-    app.dirty = true;
+    app.nav.focus = Focus::Sessions;
+    app.chrome.dirty = true;
 }
 
 /// The cursor onto `sref`'s card, inside its worktree: a session through
@@ -453,7 +453,7 @@ const TERMINAL_GONE: &str = "that terminal is gone";
 /// it, as walking onto a card does. The `/` PALETTE has no terminal
 /// rows, so this landing is the grid's own.
 fn select_terminal(app: &mut App, id: nebula_core::TerminalId, out: &mut Vec<ClientRequest>) {
-    app.follow_up = None;
+    app.modals.follow_up = None;
     take_aim(app);
     let worktree = app
         .tree
@@ -473,21 +473,21 @@ fn select_terminal(app: &mut App, id: nebula_core::TerminalId, out: &mut Vec<Cli
             .flatten()
     });
     let Some(wt_index) = landed else {
-        app.flash = Some(TERMINAL_GONE.into());
+        app.chrome.flash = Some(TERMINAL_GONE.into());
         return;
     };
-    app.sel_worktree = wt_index;
+    app.nav.sel_worktree = wt_index;
     let Some(index) = app
         .visible_session_rows()
         .iter()
         .position(|r| matches!(r, SessionRow::Terminal(t) if t.id == id))
     else {
-        app.flash = Some(TERMINAL_GONE.into());
+        app.chrome.flash = Some(TERMINAL_GONE.into());
         return;
     };
-    app.sel_session = index;
-    app.focus = Focus::Sessions;
-    app.dirty = true;
+    app.nav.sel_session = index;
+    app.nav.focus = Focus::Sessions;
+    app.chrome.dirty = true;
     unfold_cursor_band(app);
     super::preview_selected(app, out);
 }
@@ -495,19 +495,19 @@ fn select_terminal(app: &mut App, id: nebula_core::TerminalId, out: &mut Vec<Cli
 /// Show `worktree`'s children in the NESTED layout, and remember that
 /// against the default of collapsed.
 fn expand_nested_thread(app: &mut App, worktree: &WorktreeId) {
-    let removed = app.launcher_folded.remove(worktree);
-    let inserted = app.launcher_thread_open.insert(worktree.clone());
+    let removed = app.launcher.launcher_folded.remove(worktree);
+    let inserted = app.launcher.launcher_thread_open.insert(worktree.clone());
     if removed || inserted {
-        app.dirty = true;
+        app.chrome.dirty = true;
     }
 }
 
 /// Hide `worktree`'s children in the NESTED layout. The root row stays.
 fn collapse_nested_thread(app: &mut App, worktree: &WorktreeId) {
-    let inserted = app.launcher_folded.insert(worktree.clone());
-    let removed = app.launcher_thread_open.remove(worktree);
+    let inserted = app.launcher.launcher_folded.insert(worktree.clone());
+    let removed = app.launcher.launcher_thread_open.remove(worktree);
     if inserted || removed {
-        app.dirty = true;
+        app.chrome.dirty = true;
     }
 }
 
@@ -533,7 +533,7 @@ fn nested_side(app: &mut App, expand: bool, out: &mut Vec<ClientRequest>) {
         select_card(app, band.cards[root].sref(), out);
         return;
     }
-    if app.launcher_all_open {
+    if app.launcher.launcher_all_open {
         return;
     }
     if expand {
@@ -568,14 +568,14 @@ fn nested_side(app: &mut App, expand: bool, out: &mut Vec<ClientRequest>) {
 /// band's rule ([`click_band`]) and a click on a NESTED thread's fold
 /// caret ([`click_band_fold`]).
 pub(super) fn toggle_band_expand(app: &mut App, out: &mut Vec<ClientRequest>) {
-    if app.launcher_all_open {
-        app.flash = Some(ALL_OPEN.into());
+    if app.launcher.launcher_all_open {
+        app.chrome.flash = Some(ALL_OPEN.into());
         return;
     }
     app.classify_nested_threads();
     let bands = view::bands(app);
     if bands.is_empty() {
-        app.flash = Some(nothing_here(app).into());
+        app.chrome.flash = Some(nothing_here(app).into());
         return;
     }
     let index = match wearing_band(app, &bands) {
@@ -587,12 +587,12 @@ pub(super) fn toggle_band_expand(app: &mut App, out: &mut Vec<ClientRequest>) {
     };
     if bands[index].cards.is_empty() {
         // An EMPTY BAND has no cards to open onto rows.
-        app.flash = Some(NO_SESSIONS.into());
+        app.chrome.flash = Some(NO_SESSIONS.into());
         take_aim(app);
         return;
     }
     let worktree = bands[index].worktree.clone();
-    if app.launcher_nested {
+    if app.launcher.launcher_nested {
         take_aim(app);
         if view::thread_order(&bands[index]).len() <= 1 {
             return;
@@ -609,17 +609,17 @@ pub(super) fn toggle_band_expand(app: &mut App, out: &mut Vec<ClientRequest>) {
         }
         return;
     }
-    let open = app.launcher_expanded.as_ref() == Some(&worktree);
-    if app.launcher_list && !open && bands[index].cards.len() <= view::LIST_RECENT {
+    let open = app.launcher.launcher_expanded.as_ref() == Some(&worktree);
+    if app.launcher.launcher_list && !open && bands[index].cards.len() <= view::LIST_RECENT {
         // The LIST already shows every entry of a band this short:
         // opening it would change nothing on screen but the rule's word.
-        app.flash = Some(ALL_LISTED.into());
+        app.chrome.flash = Some(ALL_LISTED.into());
         take_aim(app);
         return;
     }
-    app.launcher_expanded = if open { None } else { Some(worktree) };
+    app.launcher.launcher_expanded = if open { None } else { Some(worktree) };
     take_aim(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// A terminal just opened — `t`, an EMPTY BAND's **New terminal** —
@@ -628,9 +628,9 @@ pub(super) fn toggle_band_expand(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// behind a fold. Run by the create's Ack (`event_loop::attach_created`),
 /// which lands the selection on the row and attaches it.
 pub(super) fn show_created_terminal(app: &mut App) {
-    app.launcher_pane_hidden = false;
+    app.launcher.launcher_pane_hidden = false;
     take_aim(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// `t` on the grid: a shell terminal in the cursor's checkout — the band
@@ -641,20 +641,20 @@ pub(super) fn show_created_terminal(app: &mut App) {
 /// for a terminal: the key, and an EMPTY BAND's **New terminal**, are
 /// how one opens.
 pub(super) fn new_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
-    if !app.launcher_unaimed && app.selected_worktree().is_some() {
+    if !app.launcher.launcher_unaimed && app.selected_worktree().is_some() {
         super::create_terminal_for_context(app, out);
         return;
     }
     let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
-        app.flash = Some("add a project first".into());
+        app.chrome.flash = Some("add a project first".into());
         return;
     };
     let Some(root) = view::root_checkout(app, &project) else {
-        app.flash = Some(NO_ROOT_FOR_TERMINAL.into());
+        app.chrome.flash = Some(NO_ROOT_FOR_TERMINAL.into());
         return;
     };
     super::create_terminal(app, root, out);
-    app.flash = Some(TERMINAL_ON_ROOT.into());
+    app.chrome.flash = Some(TERMINAL_ON_ROOT.into());
 }
 
 /// `` ` `` on the grid: the next TERMINAL chip in the cursor's checkout —
@@ -664,7 +664,7 @@ pub(super) fn new_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
 pub(super) fn walk_terminals(app: &mut App, out: &mut Vec<ClientRequest>) {
     let bands = view::bands(app);
     let Some(band) = view::band_cursor(app, &bands) else {
-        app.flash = Some(nothing_here(app).into());
+        app.chrome.flash = Some(nothing_here(app).into());
         return;
     };
     let cards = &bands[band].cards;
@@ -675,7 +675,7 @@ pub(super) fn walk_terminals(app: &mut App, out: &mut Vec<ClientRequest>) {
         .map(|(i, _)| i)
         .collect();
     if terminals.is_empty() {
-        app.flash = Some(NO_TERMINALS.into());
+        app.chrome.flash = Some(NO_TERMINALS.into());
         return;
     }
     let at = wearing_card(app, &bands[band]);
@@ -703,7 +703,7 @@ pub(super) fn walk_band(app: &mut App, dx: i64, out: &mut Vec<ClientRequest>) {
     let Some(band) = view::band_cursor(app, &bands) else {
         match bands.first() {
             Some(first) => select_band(app, first.worktree.clone(), out),
-            None => app.flash = Some(nothing_here(app).into()),
+            None => app.chrome.flash = Some(nothing_here(app).into()),
         }
         return;
     };
@@ -734,7 +734,7 @@ pub(super) fn click_strip_arrow(
     if index >= bands.len() {
         return;
     }
-    if view::band_cursor(app, &bands) != Some(index) || app.launcher_pane_hidden {
+    if view::band_cursor(app, &bands) != Some(index) || app.launcher.launcher_pane_hidden {
         select_band_row(app, index, out);
     }
     walk_band(app, dx, out);
@@ -749,12 +749,12 @@ pub(super) fn click_strip_arrow(
 /// the way back down: the cards get the keys again, on the project the
 /// header's cursor walked to and the card it shows.
 pub(super) fn escape(app: &mut App) {
-    if app.launcher_tab_cursor.is_some() {
+    if app.launcher.launcher_tab_cursor.is_some() {
         leave_tabs(app);
     } else if app.open_band(&view::bands(app)).is_some() {
-        app.launcher_expanded = None;
-        app.dirty = true;
-    } else if !app.launcher_unaimed {
+        app.launcher.launcher_expanded = None;
+        app.chrome.dirty = true;
+    } else if !app.launcher.launcher_unaimed {
         clear_aim(app);
     }
 }
@@ -781,13 +781,13 @@ pub(super) fn handle_action(
     chord: &KeyChord,
     out: &mut Vec<ClientRequest>,
 ) -> bool {
-    if app.launcher_tab_cursor.is_some() && tabs_action(app, action, armed, chord, out) {
+    if app.launcher.launcher_tab_cursor.is_some() && tabs_action(app, action, armed, chord, out) {
         return true;
     }
     // The NESTED layout's `h` / `l` fold the thread under the cursor
     // rather than walking a row of cards: `l` opens a collapsed root,
     // `h` closes an expanded one, and `h` on a child moves to its root.
-    if app.launcher_nested {
+    if app.launcher.launcher_nested {
         match action {
             Action::FocusRight => {
                 nested_side(app, true, out);
@@ -812,7 +812,7 @@ pub(super) fn handle_action(
         }
         if acts_on_card(action) {
             take_aim(app);
-            app.flash = Some(FOLDED.into());
+            app.chrome.flash = Some(FOLDED.into());
             return true;
         }
     }
@@ -895,11 +895,11 @@ pub(super) fn handle_action(
 /// [`super::activate::no_follow_up`] the panel's box asks.
 pub(super) fn follow_up(app: &mut App) {
     let Some(row) = app.selected_session_row() else {
-        app.flash = Some(nothing_here(app).into());
+        app.chrome.flash = Some(nothing_here(app).into());
         return;
     };
     if let Some(why) = super::activate::no_follow_up(app, &row) {
-        app.flash = Some(why);
+        app.chrome.flash = Some(why);
         return;
     }
     let crate::app::SessionRow::Agent(agent) = row else {
@@ -947,7 +947,7 @@ const NO_CARD_FOR_PR: &str = "no card selected — j/k onto one, then ⇧V opens
 pub(super) fn open_pull_request(app: &mut App, out: &mut Vec<ClientRequest>) {
     match card_pull_request(app, NO_CARD_FOR_PR) {
         Ok(pr) => super::open_link(app, &pr.url, out),
-        Err(why) => app.flash = Some(why),
+        Err(why) => app.chrome.flash = Some(why),
     }
 }
 
@@ -961,7 +961,7 @@ pub(super) const NO_CARD_FOR_COMMENT: &str =
 /// with the aim let go of, or that the checkout has none yet. `⇧V` opens
 /// it in the browser; `y` comments on it.
 pub(super) fn card_pull_request(app: &App, no_card: &str) -> Result<view::RowPr, String> {
-    let aimed = !(app.launcher_grid() && app.launcher_unaimed);
+    let aimed = !(app.launcher_grid() && app.launcher.launcher_unaimed);
     let bands = view::bands(app);
     let Some(band) = view::band_cursor(app, &bands).filter(|_| aimed) else {
         return Err(no_card.into());
@@ -1013,14 +1013,14 @@ const NO_ISSUE: &str = "this session wasn't started from an issue — i lists th
 /// INPUT PARITY: the menu row's `MenuAction::OpenLink` carries the URL
 /// this reads, and ends in the same `open_link`.
 pub(super) fn open_issue(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let aimed = !(app.launcher_grid() && app.launcher_unaimed);
+    let aimed = !(app.launcher_grid() && app.launcher.launcher_unaimed);
     let Some(agent) = app.selected_session().filter(|_| aimed) else {
-        app.flash = Some(NO_CARD_FOR_ISSUE.into());
+        app.chrome.flash = Some(NO_CARD_FOR_ISSUE.into());
         return;
     };
     match agent.issue_url {
         Some(url) => super::open_link(app, &url, out),
-        None => app.flash = Some(NO_ISSUE.into()),
+        None => app.chrome.flash = Some(NO_ISSUE.into()),
     }
 }
 
@@ -1077,9 +1077,9 @@ const NO_CARD_TO_DUPLICATE: &str =
 /// INPUT PARITY: the menu row's `MenuAction::DuplicateAgent` carries the
 /// id this reads off the cursor, and ends in the same [`duplicate_agent`].
 pub(super) fn duplicate_session(app: &mut App) {
-    let aimed = !(app.launcher_grid() && app.launcher_unaimed);
+    let aimed = !(app.launcher_grid() && app.launcher.launcher_unaimed);
     let Some(agent) = app.selected_session().filter(|_| aimed) else {
-        app.flash = Some(NO_CARD_TO_DUPLICATE.into());
+        app.chrome.flash = Some(NO_CARD_TO_DUPLICATE.into());
         return;
     };
     duplicate_agent(app, agent.id);
@@ -1101,13 +1101,13 @@ pub(super) fn duplicate_agent(app: &mut App, id: AgentId) {
         .find(|w| w.id == agent.worktree_id)
         .cloned()
     else {
-        app.flash = Some("worktree no longer exists".into());
+        app.chrome.flash = Some("worktree no longer exists".into());
         return;
     };
     // A stand-in checkout git is still cutting: the box would only be
     // refused at Enter, as `p` says on one.
     if app.is_placeholder_worktree(&worktree.id) {
-        app.flash = Some("quick prompt: worktree is still being created".into());
+        app.chrome.flash = Some("quick prompt: worktree is still being created".into());
         return;
     }
     let issue = agent
@@ -1134,6 +1134,7 @@ pub(super) fn duplicate_agent(app: &mut App, id: AgentId) {
 fn issue_ref(app: &App, project: &ProjectId, url: &str) -> Option<crate::issues::IssueRef> {
     let number: u64 = url.trim_end_matches('/').rsplit('/').next()?.parse().ok()?;
     let title = app
+        .github
         .issues
         .get(project)
         .and_then(|issues| issues.list.iter().find(|i| i.url == url))
@@ -1207,10 +1208,10 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
     app.classify_nested_threads();
     let bands = view::bands(app);
     if bands.is_empty() {
-        app.flash = Some(nothing_here(app).into());
+        app.chrome.flash = Some(nothing_here(app).into());
         return;
     }
-    if app.launcher_nested && dx == 0 {
+    if app.launcher.launcher_nested && dx == 0 {
         step_nested(app, &bands, dy, out);
         return;
     }
@@ -1249,7 +1250,11 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
         None => last as usize,
         Some(b) => (b as i64 + dy).clamp(0, last) as usize,
     };
-    if (app.launcher_list || app.launcher_nested || app.launcher_all_open) && Some(next) != at {
+    if (app.launcher.launcher_list
+        || app.launcher.launcher_nested
+        || app.launcher.launcher_all_open)
+        && Some(next) != at
+    {
         // The LIST reads as one column down every band: `j` off a band's
         // last line lands on the next band's first, `k` off its first on
         // the band above's last — not on whichever card that band last
@@ -1259,17 +1264,23 @@ pub(super) fn step_grid(app: &mut App, dx: i64, dy: i64, out: &mut Vec<ClientReq
         // layout is a column of cards too; a band folded to its header
         // there has no card to land on, and takes the cursor as a band —
         // on its header, the pane reading nothing ([`select_band`]).
-        let entries = if app.launcher_nested {
+        let entries = if app.launcher.launcher_nested {
             app.panel_layout(&bands)
                 .bands
                 .swap_remove(next)
                 .content
                 .map(|content| content.rows)
                 .unwrap_or_default()
-        } else if app.launcher_list {
-            view::list_layout(app.body_area, &bands[next], app.launcher_all_open, None).rows
+        } else if app.launcher.launcher_list {
+            view::list_layout(
+                app.chrome.body_area,
+                &bands[next],
+                app.launcher.launcher_all_open,
+                None,
+            )
+            .rows
         } else {
-            view::expanded_layout(app.body_area, &bands[next]).rows
+            view::expanded_layout(app.chrome.body_area, &bands[next]).rows
         };
         let edge = if dy > 0 {
             entries.first()
@@ -1346,7 +1357,7 @@ fn nested_at(app: &App, bands: &[view::Band]) -> Option<NestedStop> {
 fn step_nested(app: &mut App, bands: &[view::Band], dy: i64, out: &mut Vec<ClientRequest>) {
     let stops = nested_stops(app, bands);
     let Some(last) = stops.len().checked_sub(1) else {
-        app.flash = Some(nothing_here(app).into());
+        app.chrome.flash = Some(nothing_here(app).into());
         return;
     };
     let at = nested_at(app, bands).and_then(|s| stops.iter().position(|&x| x == s));
@@ -1382,7 +1393,7 @@ fn step_up(
 ) {
     let bands = view::bands(app);
     let top = match app.walked_band(&bands) {
-        Some(_) if app.launcher_nested => {
+        Some(_) if app.launcher.launcher_nested => {
             let stops = nested_stops(app, &bands);
             stops.is_empty() || nested_at(app, &bands) == stops.first().copied()
         }
@@ -1421,13 +1432,13 @@ pub(super) fn wheel_grid(app: &mut App, up: bool) {
     } else {
         GRID_WHEEL_ROWS
     };
-    let next = crate::app::scrolled_by(panel.clamp(app.launcher_scroll), delta, max);
-    if next == app.launcher_scroll {
+    let next = crate::app::scrolled_by(panel.clamp(app.launcher.launcher_scroll), delta, max);
+    if next == app.launcher.launcher_scroll {
         return;
     }
-    app.launcher_scroll = next;
-    app.launcher_scroll_held = true;
-    app.dirty = true;
+    app.launcher.launcher_scroll = next;
+    app.launcher.launcher_scroll_held = true;
+    app.chrome.dirty = true;
 }
 
 // ---- the PROJECT TABS ----
@@ -1478,7 +1489,7 @@ fn open_tab_slot(app: &mut App, slot: u8, out: &mut Vec<ClientRequest>) {
         .get(usize::from(slot).saturating_sub(1))
         .cloned()
     else {
-        app.flash = Some(format!("no project tab {slot} — + in the header opens one"));
+        app.chrome.flash = Some(format!("no project tab {slot} — + in the header opens one"));
         return;
     };
     open_tab(app, &id, out);
@@ -1498,7 +1509,7 @@ pub(super) fn step_tab(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) 
     app.settle_project_tabs();
     let tabs = open_tabs(app);
     let Some(last) = tabs.len().checked_sub(1) else {
-        app.flash = Some(NO_TABS.into());
+        app.chrome.flash = Some(NO_TABS.into());
         return;
     };
     let at = app
@@ -1513,7 +1524,7 @@ pub(super) fn step_tab(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) 
     // nowhere.
     if Some(next) == at {
         if last == 0 {
-            app.flash = Some(ONE_TAB.into());
+            app.chrome.flash = Some(ONE_TAB.into());
         }
         return;
     }
@@ -1531,7 +1542,7 @@ pub(super) fn focus_tabs(app: &mut App) {
     app.settle_project_tabs();
     let tabs = open_tabs(app);
     let Some(first) = tabs.first().cloned() else {
-        app.flash = Some(NO_TABS.into());
+        app.chrome.flash = Some(NO_TABS.into());
         return;
     };
     let on = app
@@ -1539,16 +1550,16 @@ pub(super) fn focus_tabs(app: &mut App) {
         .map(|p| p.id.clone())
         .filter(|id| tabs.contains(id))
         .unwrap_or(first);
-    app.launcher_tab_cursor = Some(on);
-    app.dirty = true;
+    app.launcher.launcher_tab_cursor = Some(on);
+    app.chrome.dirty = true;
 }
 
 /// The keys back to the cards, on whichever project the header's cursor
 /// walked the grid to: Esc, a click, and any key the header has no use
 /// for, which then goes on to mean what it means on the grid.
 pub(super) fn leave_tabs(app: &mut App) {
-    if app.launcher_tab_cursor.take().is_some() {
-        app.dirty = true;
+    if app.launcher.launcher_tab_cursor.take().is_some() {
+        app.chrome.dirty = true;
     }
 }
 
@@ -1567,7 +1578,7 @@ fn tabs_action(
     chord: &KeyChord,
     out: &mut Vec<ClientRequest>,
 ) -> bool {
-    let Some(on) = app.launcher_tab_cursor.clone() else {
+    let Some(on) = app.launcher.launcher_tab_cursor.clone() else {
         return false;
     };
     match action {
@@ -1611,6 +1622,7 @@ fn walk_tab_cursor(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     app.settle_project_tabs();
     let tabs = open_tabs(app);
     let Some(at) = app
+        .launcher
         .launcher_tab_cursor
         .as_ref()
         .and_then(|on| tabs.iter().position(|t| t == on))
@@ -1618,15 +1630,15 @@ fn walk_tab_cursor(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
         return;
     };
     if tabs.len() == 1 {
-        app.flash = Some(ONE_TAB.into());
+        app.chrome.flash = Some(ONE_TAB.into());
         return;
     }
     let next = (at as i64 + delta).clamp(0, tabs.len() as i64 - 1) as usize;
     if next == at {
         return;
     }
-    app.launcher_tab_cursor = Some(tabs[next].clone());
-    app.dirty = true;
+    app.launcher.launcher_tab_cursor = Some(tabs[next].clone());
+    app.chrome.dirty = true;
     open_tab(app, &tabs[next], out);
 }
 
@@ -1646,7 +1658,7 @@ pub(super) fn choose_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequ
 /// Enter on that tab ([`choose_tab`]) — so the pointer never means
 /// something else than the key would in the same state.
 pub(super) fn click_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
-    if app.launcher_tab_cursor.is_some() {
+    if app.launcher.launcher_tab_cursor.is_some() {
         choose_tab(app, id, out);
     } else {
         open_tab(app, id, out);
@@ -1664,14 +1676,14 @@ pub(super) fn close_cursor_tab(app: &mut App, on: &ProjectId, out: &mut Vec<Clie
     let at = open_tabs(app).iter().position(|t| t == on);
     close_tab(app, on, out);
     let tabs = open_tabs(app);
-    if tabs.contains(on) || app.launcher_tab_cursor.as_ref() != Some(on) {
+    if tabs.contains(on) || app.launcher.launcher_tab_cursor.as_ref() != Some(on) {
         return;
     }
     let next = at
         .and_then(|at| tabs.get(at.min(tabs.len().saturating_sub(1))))
         .cloned();
-    app.launcher_tab_cursor = next;
-    app.dirty = true;
+    app.launcher.launcher_tab_cursor = next;
+    app.chrome.dirty = true;
 }
 
 /// `d`, `Delete` or `Backspace` with the PROJECT TABS holding the keys:
@@ -1686,7 +1698,7 @@ fn confirm_close_cursor_tab(app: &mut App, on: &ProjectId) {
         .find(|p| &p.id == on)
         .map(|p| p.name.clone())
         .unwrap_or_default();
-    app.overlay = Some(Overlay::Confirm(confirm_close_tab(&name, on.clone())));
+    app.modals.overlay = Some(Overlay::Confirm(confirm_close_tab(&name, on.clone())));
 }
 
 /// The confirm before a PROJECT TAB is closed from a delete key. It says
@@ -1710,7 +1722,7 @@ fn close_active_tab(app: &mut App, out: &mut Vec<ClientRequest>) {
         .filter(|id| open_tabs(app).contains(id));
     match active {
         Some(id) => close_tab(app, &id, out),
-        None => app.flash = Some(NO_TABS.into()),
+        None => app.chrome.flash = Some(NO_TABS.into()),
     }
 }
 
@@ -1733,9 +1745,9 @@ pub(super) fn close_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientReque
         return;
     }
     let showing = app.selected_project().is_some_and(|p| &p.id == id);
-    app.launcher_tabs.retain(|t| t != id);
+    app.launcher.launcher_tabs.retain(|t| t != id);
     tabs.remove(at);
-    app.dirty = true;
+    app.chrome.dirty = true;
     if !showing {
         return;
     }
@@ -1752,18 +1764,18 @@ pub(super) fn close_tab(app: &mut App, id: &ProjectId, out: &mut Vec<ClientReque
 /// The pane lets go of its session — nothing on the splash shows it — and
 /// the header's cursor, the aim and the accordion go with the grid.
 fn close_every_project(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.launcher_tabs.clear();
-    app.launcher_tab_cursor = None;
-    app.launcher_expanded = None;
-    app.follow_up = None;
+    app.launcher.launcher_tabs.clear();
+    app.launcher.launcher_tab_cursor = None;
+    app.launcher.launcher_expanded = None;
+    app.modals.follow_up = None;
     clear_aim(app);
-    if app.term.is_some() {
+    if app.pane.term.is_some() {
         super::detach_pane(app, out);
     }
-    app.focus = Focus::Sessions;
-    app.projects_closed = true;
-    app.flash = Some(LAST_TAB.into());
-    app.dirty = true;
+    app.nav.focus = Focus::Sessions;
+    app.launcher.projects_closed = true;
+    app.chrome.flash = Some(LAST_TAB.into());
+    app.chrome.dirty = true;
 }
 
 /// The PROJECT DROPDOWN: a click on the `+` after the PROJECT TABS drops
@@ -1801,7 +1813,7 @@ pub(super) fn open_project_menu(app: &mut App) {
         .flatten();
     let cards = view::project_cards(app);
     if cards.is_empty() {
-        app.flash = Some(NO_PROJECTS.into());
+        app.chrome.flash = Some(NO_PROJECTS.into());
         return;
     }
     let mut items: Vec<MenuItem> = cards
@@ -1830,7 +1842,7 @@ pub(super) fn open_project_menu(app: &mut App) {
     // On the splash there is no header `+` to hang it off, so it sits in
     // the middle of the screen, over the nebula, rather than in a corner.
     let at = (!app.splash_showing()).then(|| crumb_anchor(app, &HitTarget::LauncherTabAdd));
-    app.overlay = Some(Overlay::Menu(ContextMenu {
+    app.modals.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some("Project".into()),
         filter: Some(MenuFilter {
             query: String::new(),
@@ -1842,7 +1854,7 @@ pub(super) fn open_project_menu(app: &mut App) {
         area: ratatui::layout::Rect::default(),
         parent: None,
     }));
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// A click on the header's MORE CHIP (`2 more ▾`): the PROJECT TABS the
@@ -1856,6 +1868,7 @@ pub(super) fn open_project_menu(app: &mut App) {
 pub(super) fn open_more_tabs_menu(app: &mut App) {
     let cards = view::project_cards(app);
     let items: Vec<MenuItem> = app
+        .launcher
         .launcher_tabs_more
         .iter()
         .filter_map(|id| cards.iter().find(|card| &card.id == id))
@@ -1868,7 +1881,7 @@ pub(super) fn open_more_tabs_menu(app: &mut App) {
         .collect();
     let at = crumb_anchor(app, &HitTarget::LauncherTabMore);
     super::open_menu(app, items, at);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Put the cursor on project `id` — the grid's scope, and the lit tab.
@@ -1877,11 +1890,11 @@ pub(super) fn open_more_tabs_menu(app: &mut App) {
 fn select_project(app: &mut App, id: &ProjectId) {
     take_aim(app);
     if !select_project_row_by_id(app, id) {
-        app.flash = Some("project no longer exists".into());
+        app.chrome.flash = Some("project no longer exists".into());
         return;
     }
     restore_project_cursors(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Into project `id` — the one move, so a tab, a digit and a pick from the
@@ -1903,7 +1916,7 @@ fn select_project(app: &mut App, id: &ProjectId) {
 /// on it folds away ([`fold_empty_grid`]).
 pub(super) fn open_project(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRequest>) {
     let Some(card) = view::project_cards(app).into_iter().find(|c| &c.id == id) else {
-        app.flash = Some("project no longer exists".into());
+        app.chrome.flash = Some("project no longer exists".into());
         return;
     };
     let land = last_focused(app, &card).or_else(|| card.sessions.first().map(|a| a.id.clone()));
@@ -1947,15 +1960,15 @@ fn fold_empty_grid(app: &mut App, out: &mut Vec<ClientRequest>) {
     let word = nothing_here(app);
     clear_aim(app);
     // Nothing left to keep open either: the grid is the (empty) bands.
-    app.launcher_expanded = None;
+    app.launcher.launcher_expanded = None;
     // And nothing left attached behind the fold: what the pane read
     // belongs to cards this grid no longer holds — another project's, or
     // the one just archived — so bringing the pane back (`^``) opens it
     // empty, never on a session from somewhere else.
-    if app.term.is_some() {
+    if app.pane.term.is_some() {
         super::detach_pane(app, out);
     }
-    app.flash = Some(word.into());
+    app.chrome.flash = Some(word.into());
 }
 
 /// The card project `card` was last left on: the session under the cursor
@@ -1964,8 +1977,8 @@ fn fold_empty_grid(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// project's cards. Read before [`select_project`], whose own bookkeeping
 /// rewrites it.
 fn last_focused(app: &App, card: &view::ProjectCard) -> Option<AgentId> {
-    let wid = app.last_worktree_for_project.get(&card.id)?;
-    let SessionRef::Agent(id) = app.last_session_for_worktree.get(wid)? else {
+    let wid = app.nav.last_worktree_for_project.get(&card.id)?;
+    let SessionRef::Agent(id) = app.nav.last_session_for_worktree.get(wid)? else {
         return None;
     };
     card.sessions
@@ -1988,12 +2001,12 @@ fn select(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     // an open FOLLOW-UP STRIP while it holds the keyboard: the strip is
     // aimed at the card it was opened on, so it folds rather than sending
     // the next turn to a session the cursor has left.
-    if app.follow_up.as_ref().is_some_and(|f| f.agent != id) {
-        app.follow_up = None;
+    if app.modals.follow_up.as_ref().is_some_and(|f| f.agent != id) {
+        app.modals.follow_up = None;
     }
     take_aim(app);
     jump_to_target_inner(app, PaletteTarget::Session(id), Landing::FocusOnly, out);
-    app.focus = Focus::Sessions;
+    app.nav.focus = Focus::Sessions;
 }
 
 /// A click on the card at `at`: the cursor lands on it, which opens the
@@ -2009,7 +2022,7 @@ pub(super) fn click_card(app: &mut App, at: CardRef, out: &mut Vec<ClientRequest
         return;
     };
     if is_double_click(
-        &mut app.last_session_click,
+        &mut app.pane.last_session_click,
         crate::app::RowKey::Session(sref),
     ) {
         enter_pane(app, out);
@@ -2021,7 +2034,7 @@ pub(super) fn click_card(app: &mut App, at: CardRef, out: &mut Vec<ClientRequest
 /// ([`drop_card`]). A terminal card stays put: only sessions move.
 pub(super) fn press_card(app: &mut App, at: CardRef, from: (u16, u16)) {
     let bands = view::bands(app);
-    app.card_drag = match view::card_at(&bands, at) {
+    app.launcher.card_drag = match view::card_at(&bands, at) {
         Some(view::Card::Session(row)) => Some(CardDrag {
             agent: row.agent.id.clone(),
             from,
@@ -2037,7 +2050,7 @@ pub(super) fn press_card(app: &mut App, at: CardRef, from: (u16, u16)) {
 /// drop target, unless it is the card's own checkout or a stand-in. A
 /// PROJECT TAB under it aims at that project's first checkout, its root.
 pub(super) fn drag_card(app: &mut App, pos: (u16, u16)) {
-    let Some(drag) = &app.card_drag else {
+    let Some(drag) = &app.launcher.card_drag else {
         return;
     };
     if !drag.active && pos == drag.from {
@@ -2057,6 +2070,7 @@ pub(super) fn drag_card(app: &mut App, pos: (u16, u16)) {
         // The air under a band, down to the next one or the grid's foot:
         // the band above it, so an empty band is a target past its rule.
         Some(HitTarget::PanelBg(Focus::Sessions)) => app
+            .chrome
             .hits
             .iter()
             .filter_map(|(r, hit)| match hit {
@@ -2085,12 +2099,12 @@ pub(super) fn drag_card(app: &mut App, pos: (u16, u16)) {
         .find(|a| a.id == drag.agent)
         .map(|a| a.worktree_id.clone());
     let over = over.filter(|w| Some(w) != home.as_ref() && !app.is_placeholder_worktree(w));
-    if let Some(drag) = &mut app.card_drag {
+    if let Some(drag) = &mut app.launcher.card_drag {
         drag.active = true;
         drag.over = over;
         drag.over_tab = over_tab;
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// The button let go: a drag that ended over another band moves the
@@ -2098,15 +2112,15 @@ pub(super) fn drag_card(app: &mut App, pos: (u16, u16)) {
 /// move** SETTING is on ([`confirm_move`]). A press that never left its
 /// card was the click it already ran as.
 pub(super) fn drop_card(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some(drag) = app.card_drag.take() else {
+    let Some(drag) = app.launcher.card_drag.take() else {
         return;
     };
     if !drag.active {
         return;
     }
     // A drag is not the first half of a double-click on the card.
-    app.last_session_click = None;
-    app.dirty = true;
+    app.pane.last_session_click = None;
+    app.chrome.dirty = true;
     if let Some(worktree) = drag.over {
         if crate::config::Config::load().confirm_drag_move {
             confirm_move(app, drag.agent, worktree);
@@ -2127,7 +2141,7 @@ fn confirm_move(app: &mut App, id: AgentId, worktree: WorktreeId) {
     } else {
         ""
     };
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+    app.modals.overlay = Some(Overlay::Confirm(ConfirmDialog {
         title: "Move session".into(),
         message: format!(
             "Move '{name}' to {dest}? It restarts there{when}, on the same conversation."
@@ -2178,7 +2192,7 @@ pub(super) fn click_band(app: &mut App, index: usize, out: &mut Vec<ClientReques
     };
     select_band_row(app, index, out);
     if is_double_click(
-        &mut app.last_session_click,
+        &mut app.pane.last_session_click,
         crate::app::RowKey::Worktree(worktree),
     ) {
         toggle_band_expand(app, out);
@@ -2194,7 +2208,7 @@ pub(super) fn click_band_more(app: &mut App, index: usize, out: &mut Vec<ClientR
         return;
     }
     let bands = view::bands(app);
-    if app.launcher_expanded.as_ref() != bands.get(index).map(|b| &b.worktree) {
+    if app.launcher.launcher_expanded.as_ref() != bands.get(index).map(|b| &b.worktree) {
         toggle_band_expand(app, out);
     }
 }
@@ -2246,7 +2260,7 @@ pub(super) fn select_band_row(app: &mut App, index: usize, out: &mut Vec<ClientR
         return false;
     };
     let worktree = band.worktree.clone();
-    if app.launcher_pane_hidden {
+    if app.launcher.launcher_pane_hidden {
         toggle_pane(app);
     }
     select_band(app, worktree, out);
@@ -2277,7 +2291,7 @@ pub(super) fn select_band_of(
 fn point_at(app: &mut App, at: CardRef, out: &mut Vec<ClientRequest>) -> Option<SessionRef> {
     let bands = view::bands(app);
     let sref = view::card_at(&bands, at)?.sref();
-    if app.launcher_pane_hidden {
+    if app.launcher.launcher_pane_hidden {
         toggle_pane(app);
     }
     select_card(app, sref.clone(), out);
@@ -2313,7 +2327,7 @@ pub(super) struct CursorCard {
 /// thread order — root, then its children oldest to newest — and every
 /// other layout's band order.
 fn shown_order(app: &App, band: &view::Band) -> Vec<usize> {
-    if app.launcher_nested && !app.launcher_list {
+    if app.launcher.launcher_nested && !app.launcher.launcher_list {
         view::thread_order(band)
     } else {
         (0..band.cards.len()).collect()
@@ -2335,7 +2349,7 @@ pub(super) fn cursor_entry(app: &App) -> Option<CursorCard> {
         before: at.and_then(|n| n.checked_sub(1)).and_then(sref_at),
         after: at.and_then(|n| sref_at(n + 1)),
         project: app.selected_project().map(|p| p.id.clone()),
-        archived: app.show_archived,
+        archived: app.launcher.show_archived,
     })
 }
 
@@ -2360,10 +2374,10 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
     // left it, this one with them, and whatever put the cursor on one of
     // the new ones meant to.
     if app.selected_project().map(|p| p.id.clone()) != before.project
-        || app.show_archived != before.archived
+        || app.launcher.show_archived != before.archived
         // A create is still being followed onto its own row (`n`, the
         // box): that landing is the one the user asked for.
-        || app.select_when_seen.is_some()
+        || app.requests.select_when_seen.is_some()
     {
         return;
     }
@@ -2391,8 +2405,8 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
         );
         // A band that leaves the grid takes its ACCORDION with it: the
         // one that slides up is collapsed, as every other band is.
-        if app.launcher_expanded.as_ref() == Some(&before.worktree) {
-            app.launcher_expanded = None;
+        if app.launcher.launcher_expanded.as_ref() == Some(&before.worktree) {
+            app.launcher.launcher_expanded = None;
         }
         match &bands[next] {
             band if band.solo => select_card(app, band.cards[0].sref(), out),
@@ -2447,7 +2461,7 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
     // under the grid. With the pane already drawn this changes nothing
     // and focus lands in it below, so a second ask, with the keys already
     // there, is a no-op.
-    if app.launcher_pane_hidden {
+    if app.launcher.launcher_pane_hidden {
         toggle_pane(app);
     }
     // Nor is a pane collapsed for want of a card under the cursor
@@ -2463,7 +2477,7 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
         return;
     }
     let Some(sref) = cursor_or_first(app) else {
-        app.flash = Some(nothing_here(app).into());
+        app.chrome.flash = Some(nothing_here(app).into());
         return;
     };
     match sref {
@@ -2477,13 +2491,13 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
             // it when it was archived. Say what to press rather than
             // handing the keys to an empty pane.
             if is_archived(app, &id) {
-                app.flash = Some(super::AGENT_ARCHIVED.into());
+                app.chrome.flash = Some(super::AGENT_ARCHIVED.into());
                 return;
             }
             jump_to_target(app, PaletteTarget::Session(id), Landing::Attach, out);
             // A Cloud row's Enter is its browser page, not a PTY: the jump
             // has already opened it and there is nothing to type into.
-            if app.term.is_some() {
+            if app.pane.term.is_some() {
                 enter_terminal_pane(app, out);
             }
         }
@@ -2499,7 +2513,7 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// comes up.
 pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     let Some(sref) = cursor_or_first(app) else {
-        app.flash = Some(nothing_here(app).into());
+        app.chrome.flash = Some(nothing_here(app).into());
         return;
     };
     match sref {
@@ -2510,14 +2524,14 @@ pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
         }
         SessionRef::Agent(id) => {
             if is_archived(app, &id) {
-                app.flash = Some(super::AGENT_ARCHIVED.into());
+                app.chrome.flash = Some(super::AGENT_ARCHIVED.into());
                 return;
             }
             take_aim(app);
             jump_to_target(app, PaletteTarget::Session(id), Landing::Attach, out);
             // A Cloud row's Enter is its browser page, not a PTY: the jump
             // has already opened it and there is nothing to full-screen.
-            if app.term.is_some() {
+            if app.pane.term.is_some() {
                 super::zoom_pane(app, out);
             }
         }
@@ -2538,16 +2552,16 @@ pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// through a LOCKED PANE), `^q` and `^`` in a full-screen session, the
 /// `‹ sessions` crumb and the header's button.
 pub(super) fn toggle_full_screen(app: &mut App, out: &mut Vec<ClientRequest>) -> &'static str {
-    app.dirty = true;
-    if app.collapsed {
-        app.collapsed = false;
-        if app.launcher_pane_hidden || !has_pane(app) {
+    app.chrome.dirty = true;
+    if app.pane.collapsed {
+        app.pane.collapsed = false;
+        if app.launcher.launcher_pane_hidden || !has_pane(app) {
             super::leave_terminal_lock(app);
             return "Back to the grid";
         }
         return NORMAL_SIZE;
     }
-    if app.focus == Focus::Terminal && app.term.is_some() {
+    if app.nav.focus == Focus::Terminal && app.pane.term.is_some() {
         super::zoom_pane(app, out);
     } else {
         open_session(app, out);
@@ -2564,7 +2578,7 @@ pub(super) const NORMAL_SIZE: &str = "Normal size";
 /// and a pane worth the name, where a session is only ever seen
 /// full-screen — and before the first draw, which no key beats.
 fn has_pane(app: &App) -> bool {
-    app.launcher_split(app.launcher_body).1.is_some()
+    app.launcher_split(app.launcher.launcher_body).1.is_some()
 }
 
 /// The card under the cursor — inside a worktree, or the band's card the
@@ -2630,7 +2644,7 @@ pub(super) fn open_box_field(app: &mut App, field: BoxField, back: QuickReturn) 
 /// A click on one of the box's details: the launch and the text read off
 /// the box that is up, then the same [`open_box_field`] the chord takes.
 pub(super) fn click_box_field(app: &mut App, field: BoxField) {
-    let Some(crate::app::Overlay::Prompt(prompt)) = &app.overlay else {
+    let Some(crate::app::Overlay::Prompt(prompt)) = &app.modals.overlay else {
         return;
     };
     let crate::app::PromptKind::QuickPrompt(launch) = &prompt.kind else {
@@ -2650,21 +2664,21 @@ pub(super) fn click_box_field(app: &mut App, field: BoxField) {
 /// one back ([`handle_picker_key`]).
 fn open_project_picker(app: &mut App, back: QuickReturn) {
     if let Some(issue) = &back.launch.issue {
-        app.flash = Some(format!(
+        app.chrome.flash = Some(format!(
             "this box is for issue #{} — its project is fixed",
             issue.number
         ));
         return;
     }
     if let Some(pr) = &back.launch.pr {
-        app.flash = Some(format!(
+        app.chrome.flash = Some(format!(
             "this box is for PR #{} — its project is fixed",
             pr.number
         ));
         return;
     }
     let picker = ProjectPicker::new(app, back);
-    app.overlay = Some(Overlay::ProjectPicker(picker));
+    app.modals.overlay = Some(Overlay::ProjectPicker(picker));
 }
 
 /// `^O`: the MODEL list of the box's harness — the submenu `Tab` reaches
@@ -2675,13 +2689,13 @@ fn open_model_picker(app: &mut App, back: QuickReturn) {
     let (kind, custom) = (back.launch.kind, back.launch.custom.clone());
     if crate::config::model_choices(kind, custom.as_deref()).is_empty() {
         let harness = crate::agent_picker::harness_label(kind, custom.as_deref());
-        app.flash = Some(format!(
+        app.chrome.flash = Some(format!(
             "{harness} has no model list — Tab picks the harness"
         ));
         return;
     }
     let Some(worktree) = crate::quick_prompt::picker_context(app, &back.launch) else {
-        app.flash = Some("project no longer exists".into());
+        app.chrome.flash = Some("project no longer exists".into());
         return;
     };
     let pr = back.launch.pr.clone();
@@ -2700,7 +2714,7 @@ fn open_model_picker(app: &mut App, back: QuickReturn) {
         },
     );
     if let Some(menu) = build_submenu(&row) {
-        app.overlay = Some(Overlay::Menu(menu));
+        app.modals.overlay = Some(Overlay::Menu(menu));
     }
 }
 
@@ -2708,7 +2722,7 @@ fn open_model_picker(app: &mut App, back: QuickReturn) {
 /// read off the box that is up — input is not action, so there is one
 /// [`toggle_new_worktree`] and both ways in call it.
 pub(super) fn click_new_worktree(app: &mut App) {
-    let Some(crate::app::Overlay::Prompt(prompt)) = &app.overlay else {
+    let Some(crate::app::Overlay::Prompt(prompt)) = &app.modals.overlay else {
         return;
     };
     let crate::app::PromptKind::QuickPrompt(launch) = &prompt.kind else {
@@ -2728,8 +2742,8 @@ pub(super) fn click_new_worktree(app: &mut App) {
 fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
     match view::flipped_target(app, &launch) {
         Ok(target) => reopen_with(app, QuickLaunch { target, ..launch }, input),
-        Err(why) if launch.pr.is_some() => app.flash = Some(format!("quick prompt: {why}")),
-        Err(why) => app.flash = Some(why.into()),
+        Err(why) if launch.pr.is_some() => app.chrome.flash = Some(format!("quick prompt: {why}")),
+        Err(why) => app.chrome.flash = Some(why.into()),
     }
 }
 
@@ -2761,9 +2775,9 @@ fn picker_checkouts<'a>(app: &'a App, project: &ProjectId) -> Vec<&'a nebula_cor
 /// INPUT PARITY: the card menu's **Move to…** opens the same
 /// [`open_move_picker`].
 pub(super) fn move_session(app: &mut App) {
-    let aimed = !(app.launcher_grid() && app.launcher_unaimed);
+    let aimed = !(app.launcher_grid() && app.launcher.launcher_unaimed);
     let Some(agent) = app.selected_session().filter(|_| aimed) else {
-        app.flash = Some("no session card to move".into());
+        app.chrome.flash = Some("no session card to move".into());
         return;
     };
     open_move_picker(app, agent.id);
@@ -2778,7 +2792,7 @@ pub(super) fn open_move_picker(app: &mut App, id: AgentId) {
         return;
     };
     if agent.archived {
-        app.flash = Some("an archived session stays where it is: unarchive it first".into());
+        app.chrome.flash = Some("an archived session stays where it is: unarchive it first".into());
         return;
     }
     let Some(project) = app
@@ -2788,7 +2802,7 @@ pub(super) fn open_move_picker(app: &mut App, id: AgentId) {
         .find(|w| w.id == agent.worktree_id)
         .map(|w| w.project_id.clone())
     else {
-        app.flash = Some("worktree no longer exists".into());
+        app.chrome.flash = Some("worktree no longer exists".into());
         return;
     };
     let others = app.tree.projects.iter().filter(|p| p.id != project);
@@ -2811,10 +2825,10 @@ pub(super) fn open_move_picker(app: &mut App, id: AgentId) {
         }
     }
     if items.is_empty() {
-        app.flash = Some("no other worktree to move to".into());
+        app.chrome.flash = Some("no other worktree to move to".into());
         return;
     }
-    app.overlay = Some(Overlay::Menu(ContextMenu {
+    app.modals.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some("Move to".into()),
         items: items.clone(),
         at: None,
@@ -2840,7 +2854,7 @@ pub(super) fn move_agent(
     let Some((name, dest, mid_turn)) = move_plan(app, &id, &worktree) else {
         return;
     };
-    app.flash = Some(if mid_turn {
+    app.chrome.flash = Some(if mid_turn {
         format!("{name} moves to {dest} when its turn ends")
     } else {
         format!("moved {name} to {dest}")
@@ -2870,12 +2884,12 @@ pub(super) fn move_agent(
 /// pick: the DAEMON runs it in the pull request's own checkout.
 fn open_worktree_picker(app: &mut App, back: QuickReturn) {
     if back.launch.pr.is_some() {
-        app.flash =
+        app.chrome.flash =
             Some("quick prompt: a PR session runs in the pull request's own checkout".into());
         return;
     }
     let Some(project) = view::project_of(app, &back.launch.target) else {
-        app.flash = Some("project no longer exists".into());
+        app.chrome.flash = Some("project no longer exists".into());
         return;
     };
     let checkouts = picker_checkouts(app, &project);
@@ -2916,7 +2930,7 @@ fn open_worktree_picker(app: &mut App, back: QuickReturn) {
         .iter()
         .position(|i| i.label.ends_with(" ✓"))
         .unwrap_or(0);
-    app.overlay = Some(Overlay::Menu(crate::app::ContextMenu {
+    app.modals.overlay = Some(Overlay::Menu(crate::app::ContextMenu {
         title: Some("Worktree".into()),
         items: items.clone(),
         at: None,
@@ -2945,7 +2959,7 @@ pub(super) fn pick_launch_worktree(app: &mut App, target: QuickTarget, back: Qui
 /// was.
 fn reopen_with(app: &mut App, launch: QuickLaunch, input: TextInput) {
     open_prompt(app, PromptKind::QuickPrompt(launch));
-    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+    if let Some(Overlay::Prompt(prompt)) = &mut app.modals.overlay {
         prompt.input = input;
     }
 }
@@ -2956,7 +2970,7 @@ fn reopen_with(app: &mut App, launch: QuickLaunch, input: TextInput) {
 /// picks, Esc clears a typed query and then hands the box back, and
 /// everything else edits the query, the list narrowing as you type.
 pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) {
-    let Some(Overlay::ProjectPicker(picker)) = &mut app.overlay else {
+    let Some(Overlay::ProjectPicker(picker)) = &mut app.modals.overlay else {
         return;
     };
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2967,7 +2981,7 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Esc => {
             let back = picker.back.clone();
-            app.overlay = None;
+            app.modals.overlay = None;
             // A picker with no box under it — `p` with nothing selected —
             // closes on Esc rather than putting up a box nobody asked
             // for, exactly as the preset picker reached off a pull
@@ -2994,7 +3008,7 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) {
 /// A click in the PROJECT PICKER's list: the row under the pointer is
 /// picked, as Enter on it would pick it.
 pub(super) fn click_picker_row(app: &mut App, index: usize) {
-    let Some(Overlay::ProjectPicker(picker)) = &mut app.overlay else {
+    let Some(Overlay::ProjectPicker(picker)) = &mut app.modals.overlay else {
         return;
     };
     if index >= picker.matches.len() {
@@ -3012,14 +3026,14 @@ pub(super) fn click_picker_row(app: &mut App, index: usize) {
 /// BACKGROUND LAUNCH (`view::is_background`) — it starts the session over
 /// there and leaves the screen here.
 fn pick(app: &mut App) {
-    let Some(Overlay::ProjectPicker(picker)) = &app.overlay else {
+    let Some(Overlay::ProjectPicker(picker)) = &app.modals.overlay else {
         return;
     };
     let Some(project) = picker.selected_project().cloned() else {
         return;
     };
     let back = picker.back.clone();
-    app.overlay = None;
+    app.modals.overlay = None;
     let target = view::target_for(app, &project.id, back.launch.is_new_worktree());
     let launch = QuickLaunch {
         target,
@@ -3070,7 +3084,7 @@ mod tests {
         // geometry — the row the pane's strip lands on, how many cards a
         // row holds — and the side is the setting's own tests' business
         // (`the_side_button_moves_the_pane_to_the_bottom_and_back`).
-        app.launcher_pane_at = crate::launcher::PaneSide::Bottom;
+        app.launcher.launcher_pane_at = crate::launcher::PaneSide::Bottom;
         seed_tree(&mut app);
         seed_feat(&mut app, "/tmp/demo-feat".into());
         seed_web(&mut app);
@@ -3251,7 +3265,8 @@ mod tests {
         with_default_config(|| {
             let mut app = two_sessions();
             let edge = |app: &App| {
-                app.hits
+                app.chrome
+                    .hits
                     .iter()
                     .find(|(_, hit)| *hit == HitTarget::LauncherPaneSplitter)
                     .map(|(rect, _)| *rect)
@@ -3266,7 +3281,7 @@ mod tests {
 
             let terminal = draw(&mut app);
             let zone = edge(&app).expect("the pane's edge was registered");
-            let body = app.launcher_body;
+            let body = app.launcher.launcher_body;
             let pane_h = crate::launcher::pane_height(body, None).expect("34 rows fits a pane");
             let boundary = body.y + body.height - pane_h;
             assert_eq!(
@@ -3298,7 +3313,7 @@ mod tests {
                 60,
                 boundary - 4,
             );
-            assert_eq!(app.launcher_pane_h, Some(pane_h + 4));
+            assert_eq!(app.launcher.launcher_pane_h, Some(pane_h + 4));
 
             // The next frame lays it out there, grip and grab zone with it.
             let terminal = draw(&mut app);
@@ -3327,9 +3342,10 @@ mod tests {
         with_default_config(|| {
             let side = PaneSide::Right;
             let mut app = two_sessions();
-            app.launcher_pane_at = side;
+            app.launcher.launcher_pane_at = side;
             let edge = |app: &App| {
-                app.hits
+                app.chrome
+                    .hits
                     .iter()
                     .find(|(_, hit)| *hit == HitTarget::LauncherPaneSplitter)
                     .map(|(rect, _)| *rect)
@@ -3342,7 +3358,7 @@ mod tests {
             };
 
             let terminal = draw(&mut app);
-            let body = app.launcher_body;
+            let body = app.launcher.launcher_body;
             let (_, pane) = app.launcher_split(body);
             let pane = pane.expect("130 columns fits a pane beside the cards");
             assert_eq!(app.launcher_pane_side(), side);
@@ -3364,11 +3380,14 @@ mod tests {
             );
             mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), to, row);
             mouse(&mut app, MouseEventKind::Up(MouseButton::Left), to, row);
-            assert_eq!(app.launcher_pane_w, Some(pane.width + 4));
-            assert_eq!(app.launcher_pane_h, None, "the bottom's height untouched");
+            assert_eq!(app.launcher.launcher_pane_w, Some(pane.width + 4));
+            assert_eq!(
+                app.launcher.launcher_pane_h, None,
+                "the bottom's height untouched"
+            );
 
             let terminal = draw(&mut app);
-            let (_, moved) = app.launcher_split(app.launcher_body);
+            let (_, moved) = app.launcher_split(app.launcher.launcher_body);
             let moved = moved.expect("still a pane");
             assert_eq!(moved.width, pane.width + 4);
             assert_eq!(crate::launcher::pane_edge(side, moved).x, to);
@@ -3386,9 +3405,9 @@ mod tests {
         use crate::launcher::PaneSide;
         with_default_config(|| {
             let mut app = two_sessions();
-            app.launcher_pane_at = PaneSide::Right;
+            app.launcher.launcher_pane_at = PaneSide::Right;
             draw(&mut app);
-            let body = app.launcher_body;
+            let body = app.launcher.launcher_body;
             let (_, pane) = app.launcher_split(body);
             let pane = pane.expect("130 columns fits a pane beside the cards");
             let grip_x = crate::launcher::pane_edge(PaneSide::Right, pane).x;
@@ -3421,7 +3440,7 @@ mod tests {
                 row,
             );
             assert_eq!(
-                app.launcher_pane_drag,
+                app.launcher.launcher_pane_drag,
                 Some(0),
                 "a click after a drag only starts another drag"
             );
@@ -3434,10 +3453,10 @@ mod tests {
                 row,
             );
             assert!(
-                app.launcher_pane_drag.is_none(),
+                app.launcher.launcher_pane_drag.is_none(),
                 "the double-click arms no drag"
             );
-            assert_eq!(app.flash.as_deref(), Some(super::PANE_CENTERED));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::PANE_CENTERED));
             mouse(&mut app, MouseEventKind::Up(MouseButton::Left), edge_x, row);
 
             draw(&mut app);
@@ -3449,7 +3468,10 @@ mod tests {
                 "the edge sits on the middle column"
             );
             assert_eq!(grid.width + centered.width, body.width);
-            assert_eq!(app.launcher_pane_h, None, "the bottom's height untouched");
+            assert_eq!(
+                app.launcher.launcher_pane_h, None,
+                "the bottom's height untouched"
+            );
         });
     }
 
@@ -3462,9 +3484,9 @@ mod tests {
         use crate::launcher::PaneSide;
         with_default_config(|| {
             let mut app = two_sessions();
-            app.launcher_pane_at = PaneSide::Bottom;
+            app.launcher.launcher_pane_at = PaneSide::Bottom;
             draw(&mut app);
-            let body = app.launcher_body;
+            let body = app.launcher.launcher_body;
             let pane_h = crate::launcher::pane_height(body, None).expect("34 rows fits a pane");
             let boundary = body.y + body.height - pane_h;
             assert_ne!(pane_h, body.height / 2, "the default share is not half");
@@ -3477,11 +3499,11 @@ mod tests {
                 boundary,
             );
             assert_eq!(
-                app.launcher_pane_drag,
+                app.launcher.launcher_pane_drag,
                 Some(0),
                 "a single click starts a drag"
             );
-            assert_eq!(app.launcher_pane_h, None, "…and moves nothing");
+            assert_eq!(app.launcher.launcher_pane_h, None, "…and moves nothing");
             mouse(
                 &mut app,
                 MouseEventKind::Up(MouseButton::Left),
@@ -3502,8 +3524,11 @@ mod tests {
                 60,
                 boundary - 1,
             );
-            assert!(app.launcher_pane_drag.is_none());
-            assert_eq!(app.launcher_pane_w, None, "the side's width untouched");
+            assert!(app.launcher.launcher_pane_drag.is_none());
+            assert_eq!(
+                app.launcher.launcher_pane_w, None,
+                "the side's width untouched"
+            );
 
             draw(&mut app);
             let (grid, centered) = app.launcher_split(body);
@@ -3528,7 +3553,7 @@ mod tests {
         use crate::launcher::PaneSide;
         with_default_config(|| {
             let mut app = two_sessions();
-            app.launcher_pane_at = PaneSide::default();
+            app.launcher.launcher_pane_at = PaneSide::default();
             let click = |app: &mut App| {
                 let at = tab_at(app, HitTarget::LauncherPaneSide);
                 let close = tab_at(app, HitTarget::LauncherPaneClose);
@@ -3537,7 +3562,10 @@ mod tests {
                 mouse(app, MouseEventKind::Down(MouseButton::Left), at.x + 1, at.y);
             };
             let side_strip = |app: &App, terminal: &Terminal<TestBackend>| {
-                let pane = app.launcher_split(app.launcher_body).1.expect("a pane");
+                let pane = app
+                    .launcher_split(app.launcher.launcher_body)
+                    .1
+                    .expect("a pane");
                 buffer_text(terminal)
                     .lines()
                     .nth(usize::from(pane.y) + 1)
@@ -3554,9 +3582,9 @@ mod tests {
             );
             assert!(!strip.contains('◨'));
             click(&mut app);
-            assert_eq!(app.launcher_pane_at, PaneSide::Bottom);
+            assert_eq!(app.launcher.launcher_pane_at, PaneSide::Bottom);
             assert_eq!(crate::config::Config::load().pane_side(), PaneSide::Bottom);
-            assert_eq!(app.flash.as_deref(), Some(super::PANE_MOVED_BOTTOM));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::PANE_MOVED_BOTTOM));
 
             let terminal = draw(&mut app);
             assert_eq!(app.launcher_pane_side(), PaneSide::Bottom);
@@ -3565,9 +3593,9 @@ mod tests {
                 "along the bottom it pictures the pane on the right"
             );
             click(&mut app);
-            assert_eq!(app.launcher_pane_at, PaneSide::Right);
+            assert_eq!(app.launcher.launcher_pane_at, PaneSide::Right);
             assert_eq!(crate::config::Config::load().pane_side(), PaneSide::Right);
-            assert_eq!(app.flash.as_deref(), Some(super::PANE_MOVED_RIGHT));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::PANE_MOVED_RIGHT));
             let terminal = draw(&mut app);
             assert_eq!(app.launcher_pane_side(), PaneSide::Right);
             assert!(
@@ -3587,13 +3615,15 @@ mod tests {
             draw_at(&mut app, 70, 34);
             assert_eq!(app.launcher_pane_move_to(), None);
             assert!(
-                !app.hits
+                !app.chrome
+                    .hits
                     .iter()
                     .any(|(_, h)| *h == HitTarget::LauncherPaneSide),
                 "no button drawn"
             );
             assert!(
-                app.hits
+                app.chrome
+                    .hits
                     .iter()
                     .any(|(_, h)| *h == HitTarget::LauncherPaneClose),
                 "the close button stays"
@@ -3608,10 +3638,10 @@ mod tests {
         use crate::launcher::PaneSide;
         with_default_config(|| {
             let mut app = two_sessions();
-            app.launcher_pane_at = PaneSide::Right;
+            app.launcher.launcher_pane_at = PaneSide::Right;
             draw_at(&mut app, 70, 34);
             assert_eq!(app.launcher_pane_side(), PaneSide::Bottom);
-            let body = app.launcher_body;
+            let body = app.launcher.launcher_body;
             let pane = app.launcher_split(body).1.expect("a pane under the cards");
             assert_eq!((pane.x, pane.width), (body.x, body.width), "full width");
             assert_eq!(pane.y + pane.height, body.y + body.height, "at the bottom");
@@ -3704,7 +3734,7 @@ mod tests {
             assert_eq!(fresh(&app), !start, "^N flips it");
 
             let mut terminal = draw_at(&mut app, 140, 40);
-            let toggle = match &app.overlay {
+            let toggle = match &app.modals.overlay {
                 Some(Overlay::Prompt(p)) => p.toggle_area,
                 other => panic!("expected the box, got {other:?}"),
             };
@@ -3725,7 +3755,7 @@ mod tests {
             // And again, so a click is not a one-way trip.
             terminal = draw_at(&mut app, 140, 40);
             let _ = &terminal;
-            let toggle = match &app.overlay {
+            let toggle = match &app.modals.overlay {
                 Some(Overlay::Prompt(p)) => p.toggle_area,
                 other => panic!("expected the box, got {other:?}"),
             };
@@ -3751,8 +3781,8 @@ mod tests {
 
     /// The columns `field` was drawn in on the box that is up.
     fn detail(app: &App, field: BoxField) -> ratatui::layout::Rect {
-        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-            panic!("expected the box, got {:?}", app.overlay);
+        let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+            panic!("expected the box, got {:?}", app.modals.overlay);
         };
         prompt
             .detail_areas
@@ -3778,7 +3808,7 @@ mod tests {
             // box up with a flash, and that is a shape too — the click
             // has to be refused exactly as the chord is.
             fn shape(app: &App) -> String {
-                match &app.overlay {
+                match &app.modals.overlay {
                     Some(Overlay::ProjectPicker(picker)) => format!(
                         "projects[{}]: {}",
                         picker.selected,
@@ -3803,7 +3833,7 @@ mod tests {
                             .collect::<Vec<_>>()
                             .join(",")
                     ),
-                    Some(Overlay::Prompt(_)) => format!("box: {:?}", app.flash),
+                    Some(Overlay::Prompt(_)) => format!("box: {:?}", app.chrome.flash),
                     other => panic!("expected a picker or the box, got {other:?}"),
                 }
             }
@@ -3897,12 +3927,13 @@ mod tests {
 
     /// What the PANE is reading, as its tab strip would have to agree.
     fn reading(app: &App) -> Option<SessionRef> {
-        app.term.as_ref().map(|t| t.sref.clone())
+        app.pane.term.as_ref().map(|t| t.sref.clone())
     }
 
     /// Where the draw put the tab for `hit`.
     fn tab_at(app: &App, hit: HitTarget) -> ratatui::layout::Rect {
-        app.hits
+        app.chrome
+            .hits
             .iter()
             .find(|(_, h)| *h == hit)
             .map(|(r, _)| *r)
@@ -3911,9 +3942,9 @@ mod tests {
 
     /// The PANE's header row, as the last draw left it.
     fn head_row(app: &App, terminal: &Terminal<TestBackend>) -> String {
-        let body = app.launcher_body;
-        let pane_h =
-            crate::launcher::pane_height(body, app.launcher_pane_h).expect("a pane worth drawing");
+        let body = app.launcher.launcher_body;
+        let pane_h = crate::launcher::pane_height(body, app.launcher.launcher_pane_h)
+            .expect("a pane worth drawing");
         let y = body.y + body.height - pane_h + 1;
         buffer_text(terminal)
             .lines()
@@ -3943,7 +3974,7 @@ mod tests {
                 super::step_grid(app, 0, (target as i64 - on as i64).signum(), &mut out);
                 continue;
             }
-            if app.launcher_expanded.as_ref() != Some(&bands[target].worktree) {
+            if app.launcher.launcher_expanded.as_ref() != Some(&bands[target].worktree) {
                 super::toggle_band_expand(app, &mut out);
                 continue;
             }
@@ -3953,7 +3984,7 @@ mod tests {
             if at == to {
                 return;
             }
-            let layout = crate::launcher::expanded_layout(app.body_area, band);
+            let layout = crate::launcher::expanded_layout(app.chrome.body_area, band);
             let (row_at, col_at) = layout.row_of(at).expect("a row");
             let (row_to, col_to) = layout.row_of(to).expect("a row");
             let (dx, dy) = if row_at != row_to {
@@ -3979,14 +4010,14 @@ mod tests {
                 draw(&mut app);
                 key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
                 key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-                if app.term.is_none() {
-                    app.term = Some(crate::app::AttachedTerm::new(
+                if app.pane.term.is_none() {
+                    app.pane.term = Some(crate::app::AttachedTerm::new(
                         SessionRef::Agent(AgentId("a2".into())),
                         40,
                         10,
                     ));
                 }
-                assert!(app.term_locked, "Enter put the keys in the pane");
+                assert!(app.pane.term_locked, "Enter put the keys in the pane");
                 app
             };
 
@@ -4012,9 +4043,9 @@ mod tests {
             key(&mut by_key, KeyCode::Char('`'), KeyModifiers::CONTROL);
 
             for app in [&by_click, &by_key] {
-                assert!(app.launcher_pane_hidden, "the pane folded away");
-                assert_eq!(app.focus, Focus::Sessions, "the keys are the cards'");
-                assert!(!app.term_locked);
+                assert!(app.launcher.launcher_pane_hidden, "the pane folded away");
+                assert_eq!(app.nav.focus, Focus::Sessions, "the keys are the cards'");
+                assert!(!app.pane.term_locked);
             }
             assert_eq!(by_click.launcher_unaimed, by_key.launcher_unaimed);
             assert_eq!(by_click.flash, by_key.flash);
@@ -4035,10 +4066,10 @@ mod tests {
             // On the card, `d` is the card's.
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             assert!(
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if matches!(c.action, PendingAction::DeleteAgent(_))),
                 "the card's delete: {:?}",
-                app.overlay
+                app.modals.overlay
             );
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
@@ -4046,10 +4077,10 @@ mod tests {
             key(&mut app, KeyCode::Char('`'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             assert!(
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if matches!(c.action, PendingAction::CloseTerminal(_))),
                 "the terminal's close: {:?}",
-                app.overlay
+                app.modals.overlay
             );
         });
     }
@@ -4059,7 +4090,7 @@ mod tests {
     /// EMPTY BAND the grid's last, under `feat`'s.
     fn with_empty_band() -> App {
         let mut app = two_sessions();
-        app.show_all_worktrees = true;
+        app.launcher.show_all_worktrees = true;
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
@@ -4097,7 +4128,8 @@ mod tests {
 
     /// Where the EMPTY BAND `index` was drawn: the band's whole area.
     fn band_area(app: &App, index: usize) -> ratatui::layout::Rect {
-        app.hits
+        app.chrome
+            .hits
             .iter()
             .find(|(_, hit)| *hit == HitTarget::LauncherBand(index))
             .map(|(rect, _)| *rect)
@@ -4145,8 +4177,8 @@ mod tests {
             // Tab has no cards to open, and says so.
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded, None);
-            assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+            assert_eq!(app.launcher.launcher_expanded, None);
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_SESSIONS));
         });
     }
 
@@ -4158,7 +4190,7 @@ mod tests {
     fn d_and_the_menu_on_an_empty_band_ask_to_delete_the_worktree() {
         with_default_config(|| {
             let is_worktree_confirm = |app: &App| {
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if c.action == PendingAction::DeleteWorktree(WorktreeId("w3".into())))
             };
 
@@ -4201,7 +4233,8 @@ mod tests {
     /// hold the pull request's link row, and the cursor rests on it.
     fn with_empty_band_on_a_pull_request() -> App {
         let mut app = with_empty_band();
-        app.pull_requests
+        app.github
+            .pull_requests
             .insert(WorktreeId("w3".into()), Some(pull_request(7)));
         app
     }
@@ -4215,7 +4248,7 @@ mod tests {
     fn an_empty_band_on_a_pull_request_still_deletes_the_worktree() {
         with_default_config(|| {
             let is_worktree_confirm = |app: &App| {
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if c.action == PendingAction::DeleteWorktree(WorktreeId("w3".into())))
             };
 
@@ -4292,7 +4325,7 @@ mod tests {
             draw_tall(&mut app);
             to_feat(&mut app);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
-            match &app.overlay {
+            match &app.modals.overlay {
                 Some(Overlay::Confirm(c)) => {
                     assert!(
                         matches!(c.action, PendingAction::DeleteAgent(_)),
@@ -4340,7 +4373,7 @@ mod tests {
             draw_tall(&mut app);
             to_feat(&mut app);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
-            match &app.overlay {
+            match &app.modals.overlay {
                 Some(Overlay::Confirm(c)) => assert!(
                     matches!(
                         c.action,
@@ -4383,16 +4416,16 @@ mod tests {
         with_default_config(|| {
             let mut app = two_sessions();
             draw(&mut app);
-            let (rows, reading, focus) = (app.term_area, pane(&app), app.focus);
+            let (rows, reading, focus) = (app.pane.term_area, pane(&app), app.nav.focus);
             let id = app.selected_session().map(|a| a.id.clone()).unwrap();
             let name = app.selected_session().map(|a| a.name.clone()).unwrap();
 
             key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
             assert!(
-                matches!(&app.overlay, Some(Overlay::Prompt(p))
+                matches!(&app.modals.overlay, Some(Overlay::Prompt(p))
                     if p.kind == PromptKind::FollowUp { id: id.clone() }),
                 "the box is aimed at the card under the cursor: {:?}",
-                app.overlay
+                app.modals.overlay
             );
 
             let text = buffer_text(&draw(&mut app));
@@ -4400,9 +4433,9 @@ mod tests {
                 text.contains(&format!("Follow-up · {name}")),
                 "the modal names the session it will prompt:\n{text}"
             );
-            assert_eq!(app.term_area, rows, "the pane kept its rows");
+            assert_eq!(app.pane.term_area, rows, "the pane kept its rows");
             assert_eq!(pane(&app), reading, "and went on reading the same thing");
-            assert_eq!(app.focus, focus, "the keys never left the cards");
+            assert_eq!(app.nav.focus, focus, "the keys never left the cards");
         });
     }
 
@@ -4426,9 +4459,13 @@ mod tests {
                 vec![b"rebase onto main".to_vec(), b"\r".to_vec()],
                 "the prompt, then the Enter that submits it: {out:?}"
             );
-            assert!(app.overlay.is_none(), "the box closed: {:?}", app.overlay);
+            assert!(
+                app.modals.overlay.is_none(),
+                "the box closed: {:?}",
+                app.modals.overlay
+            );
             assert_eq!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some(format!("sent to {name}").as_str())
             );
         });
@@ -4444,7 +4481,7 @@ mod tests {
             let mut app = three_sessions();
             draw(&mut app);
             key(&mut app, KeyCode::Char('~'), KeyModifiers::NONE);
-            assert!(app.launcher_pane_hidden, "the pane is folded away");
+            assert!(app.launcher.launcher_pane_hidden, "the pane is folded away");
 
             let mut sent = Vec::new();
             for (turn, step) in [("first", 'h'), ("second", 'l')] {
@@ -4469,8 +4506,15 @@ mod tests {
                 sent.push(id);
             }
             assert_ne!(sent[0], sent[1], "two different cards were prompted");
-            assert!(app.launcher_pane_hidden, "and the pane stayed folded away");
-            assert_eq!(app.focus, Focus::Sessions, "the keys never left the cards");
+            assert!(
+                app.launcher.launcher_pane_hidden,
+                "and the pane stayed folded away"
+            );
+            assert_eq!(
+                app.nav.focus,
+                Focus::Sessions,
+                "the keys never left the cards"
+            );
         });
     }
 
@@ -4485,7 +4529,7 @@ mod tests {
             type_text(&mut app, "never mind");
 
             let out = key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "the box closed");
+            assert!(app.modals.overlay.is_none(), "the box closed");
             assert!(
                 !out.iter().any(|r| matches!(r, ClientRequest::Input { .. })),
                 "nothing was sent: {out:?}"
@@ -4508,7 +4552,7 @@ mod tests {
             let id = app.selected_session().map(|a| a.id.clone()).unwrap();
 
             right_click_card(&mut app);
-            let at = match &app.overlay {
+            let at = match &app.modals.overlay {
                 Some(Overlay::Menu(menu)) => menu
                     .items
                     .iter()
@@ -4522,10 +4566,10 @@ mod tests {
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
             assert!(
-                matches!(&app.overlay, Some(Overlay::Prompt(p))
+                matches!(&app.modals.overlay, Some(Overlay::Prompt(p))
                     if p.kind == PromptKind::FollowUp { id: id.clone() }),
                 "the menu row opened the box too: {:?}",
-                app.overlay
+                app.modals.overlay
             );
         });
     }
@@ -4543,9 +4587,9 @@ mod tests {
                 a.cloud_session_id = Some("cs-1".into());
             }
             key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "no box over a cloud session");
+            assert!(app.modals.overlay.is_none(), "no box over a cloud session");
             assert_eq!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some("cloud sessions take a queued message — right-click, then Send to cloud session"),
             );
         });
@@ -4567,7 +4611,7 @@ mod tests {
 
     /// The branch in the box's header, as drawn.
     fn branch_button(app: &App) -> ratatui::layout::Rect {
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::Prompt(p)) => p.branch_area,
             other => panic!("expected the box, got {other:?}"),
         }
@@ -4575,7 +4619,7 @@ mod tests {
 
     /// The WORKTREE PICKER's rows and the one under its cursor.
     fn picker_rows(app: &App) -> (Vec<String>, usize) {
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Worktree") => {
                 (m.items.iter().map(|i| i.label.clone()).collect(), m.hover)
             }
@@ -4599,7 +4643,7 @@ mod tests {
 
     /// Click the picker's row that starts with `label`, as drawn.
     fn click_picker_row(app: &mut App, label: &str) {
-        let (area, index) = match &app.overlay {
+        let (area, index) = match &app.modals.overlay {
             Some(Overlay::Menu(m)) => (
                 m.area,
                 m.items
@@ -4715,7 +4759,7 @@ mod tests {
             open_worktree_picker(&mut app);
             for ((w, h), button) in buttons {
                 draw_at(&mut app, w, h);
-                let area = match &app.overlay {
+                let area = match &app.modals.overlay {
                     Some(Overlay::Menu(m)) => m.area,
                     other => panic!("expected the worktree picker, got {other:?}"),
                 };
@@ -4738,11 +4782,11 @@ mod tests {
     }
 
     fn pane(app: &App) -> Option<SessionRef> {
-        app.term.as_ref().map(|t| t.sref.clone())
+        app.pane.term.as_ref().map(|t| t.sref.clone())
     }
 
     fn launch(app: &App) -> (QuickLaunch, String) {
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::Prompt(prompt)) => match &prompt.kind {
                 PromptKind::QuickPrompt(launch) => {
                     (launch.clone(), prompt.input.as_str().to_string())
@@ -4778,6 +4822,7 @@ mod tests {
     fn card_cell(app: &App, sref: &SessionRef) -> (u16, u16) {
         let bands = crate::launcher::bands(app);
         let (rect, _) = app
+            .chrome
             .hits
             .iter()
             .find(|(_, hit)| match hit {
@@ -4800,9 +4845,12 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
-            assert!(app.overlay.is_none(), "the first snapshot opens nothing");
+            assert!(
+                app.modals.overlay.is_none(),
+                "the first snapshot opens nothing"
+            );
             seed_web(&mut app);
-            assert!(app.overlay.is_none(), "nor any later one");
+            assert!(app.modals.overlay.is_none(), "nor any later one");
 
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             let (launch, text) = launch(&app);
@@ -4830,8 +4878,8 @@ mod tests {
         with_default_config(|| {
             let mut app = two_sessions();
             draw(&mut app);
-            assert_eq!(app.focus, Focus::Sessions, "the grid has the keys");
-            assert_eq!(app.launcher_expanded, None, "every band collapsed");
+            assert_eq!(app.nav.focus, Focus::Sessions, "the grid has the keys");
+            assert_eq!(app.launcher.launcher_expanded, None, "every band collapsed");
             assert_eq!(
                 selected(&app).as_deref(),
                 Some("a1"),
@@ -4858,15 +4906,15 @@ mod tests {
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a2"), "the last band stays");
 
-            app.flash = None;
+            app.chrome.flash = None;
             key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
             assert_eq!(
                 selected(&app).as_deref(),
                 Some("a2"),
                 "h walks the band's cards, and this band has the one"
             );
-            assert_eq!(app.launcher_expanded, None, "without opening it");
-            assert_eq!(app.flash, None, "and says nothing of it");
+            assert_eq!(app.launcher.launcher_expanded, None, "without opening it");
+            assert_eq!(app.chrome.flash, None, "and says nothing of it");
 
             key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a1"));
@@ -4881,7 +4929,7 @@ mod tests {
                 Some("a1"),
                 "the first band stays"
             );
-            assert_eq!(app.launcher_expanded, None);
+            assert_eq!(app.launcher.launcher_expanded, None);
 
             // Tab opens the band under the cursor in place, the cursor on
             // the card the pane was reading and the keys still the grid's;
@@ -4889,22 +4937,28 @@ mod tests {
             let (root, feat) = (WorktreeId("w1".into()), WorktreeId("w2".into()));
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(
-                app.launcher_expanded,
+                app.launcher.launcher_expanded,
                 Some(root.clone()),
                 "the root band is open"
             );
             assert_eq!(selected(&app).as_deref(), Some("a1"));
-            assert_eq!(app.focus, Focus::Sessions, "the keys stay on the grid");
+            assert_eq!(app.nav.focus, Focus::Sessions, "the keys stay on the grid");
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded, None, "Tab again closes it");
-            assert!(!app.launcher_unaimed, "with the band still aimed at");
+            assert_eq!(app.launcher.launcher_expanded, None, "Tab again closes it");
+            assert!(
+                !app.launcher.launcher_unaimed,
+                "with the band still aimed at"
+            );
             assert_eq!(selected(&app).as_deref(), Some("a1"));
 
             // Esc closes it too, and only then lets the aim go.
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded, None, "Esc closes the open band");
-            assert!(!app.launcher_unaimed, "the band still aimed at");
+            assert_eq!(
+                app.launcher.launcher_expanded, None,
+                "Esc closes the open band"
+            );
+            assert!(!app.launcher.launcher_unaimed, "the band still aimed at");
 
             // One band open at a time: Tab on another closes the first.
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
@@ -4914,10 +4968,14 @@ mod tests {
                 Some("a2"),
                 "j walks on past the open band"
             );
-            assert_eq!(app.launcher_expanded, Some(root), "which stays open");
+            assert_eq!(
+                app.launcher.launcher_expanded,
+                Some(root),
+                "which stays open"
+            );
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(
-                app.launcher_expanded,
+                app.launcher.launcher_expanded,
                 Some(feat),
                 "feat's band open, the root's closed"
             );
@@ -4940,7 +4998,10 @@ mod tests {
             }
             seed_terminal(&mut app, "t1", "w1", "shell");
             draw(&mut app);
-            assert_eq!(app.launcher_expanded, None, "the band is collapsed");
+            assert_eq!(
+                app.launcher.launcher_expanded, None,
+                "the band is collapsed"
+            );
             let bands = crate::launcher::bands(&app);
             let cards: Vec<SessionRef> = bands[0].cards.iter().map(|c| c.sref()).collect();
             assert_eq!(cards.len(), 5, "four sessions and the terminal");
@@ -4955,7 +5016,10 @@ mod tests {
                 key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
             }
             assert_eq!(at(&app), Some(0), "h stops at the first card");
-            assert!(app.launcher_expanded.is_none(), "and never goes in");
+            assert!(
+                app.launcher.launcher_expanded.is_none(),
+                "and never goes in"
+            );
             let term = draw(&mut app);
             assert!(
                 app.hit_rect(&HitTarget::LauncherStripLeft(0)).is_none(),
@@ -4984,7 +5048,10 @@ mod tests {
                 key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
                 assert_eq!(at(&app), Some(i), "l onto card {i}");
                 assert_eq!(pane(&app).as_ref(), Some(card), "the pane follows");
-                assert!(app.launcher_expanded.is_none(), "at the band level still");
+                assert!(
+                    app.launcher.launcher_expanded.is_none(),
+                    "at the band level still"
+                );
             }
             key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
             assert_eq!(at(&app), Some(last), "l stops at the last card");
@@ -5004,10 +5071,10 @@ mod tests {
             // Tab opens the band on the card the walk stopped on, and
             // closes it again on the same card.
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert!(app.launcher_expanded.is_some());
+            assert!(app.launcher.launcher_expanded.is_some());
             assert_eq!(pane(&app).as_ref(), Some(&cards[last]));
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert!(app.launcher_expanded.is_none());
+            assert!(app.launcher.launcher_expanded.is_none());
             assert_eq!(at(&app), Some(last));
 
             // A click on ❮ is `h`, on ❯ is `l`.
@@ -5017,7 +5084,7 @@ mod tests {
             assert_eq!(at(&app), Some(last - 1), "one card back");
             assert_eq!(pane(&app).as_ref(), Some(&cards[last - 1]));
             assert!(
-                app.launcher_expanded.is_none(),
+                app.launcher.launcher_expanded.is_none(),
                 "the click keeps the level too"
             );
             draw(&mut app);
@@ -5045,6 +5112,7 @@ mod tests {
             let bands = crate::launcher::bands(&app);
             let hidden = bands[0].cards.len()
                 - app
+                    .chrome
                     .hits
                     .iter()
                     .filter(|(_, h)| matches!(h, HitTarget::LauncherCard(c) if c.band == 0))
@@ -5054,6 +5122,7 @@ mod tests {
                 .hit_rect(&HitTarget::LauncherBandMore(0))
                 .expect("a hint under the row");
             let card = app
+                .chrome
                 .hits
                 .iter()
                 .find_map(|(r, h)| {
@@ -5070,7 +5139,7 @@ mod tests {
 
             click_at(&mut app, hint.x + 1, hint.y);
             assert_eq!(
-                app.launcher_expanded.as_ref(),
+                app.launcher.launcher_expanded.as_ref(),
                 Some(&bands[0].worktree),
                 "the click opens the band"
             );
@@ -5129,6 +5198,7 @@ mod tests {
                 "the grid is still up over it: {text}"
             );
             let below = app
+                .chrome
                 .hits
                 .iter()
                 .filter_map(|(r, hit)| {
@@ -5137,9 +5207,9 @@ mod tests {
                 .max()
                 .expect("the grid drew cards");
             assert!(
-                app.term_area.y >= below,
+                app.pane.term_area.y >= below,
                 "the pane is under the cards, not beside them: {:?} vs {below}",
-                app.term_area
+                app.pane.term_area
             );
 
             // And the walk keeps swapping it.
@@ -5164,16 +5234,16 @@ mod tests {
             to_feat(&mut app);
             draw(&mut app);
 
-            let pane = app.term_area;
+            let pane = app.pane.term_area;
             mouse(
                 &mut app,
                 MouseEventKind::Down(MouseButton::Left),
                 pane.x + 2,
                 pane.y + 1,
             );
-            assert_eq!(app.focus, Focus::Terminal, "the pane has the keys");
-            assert!(app.term_locked);
-            assert!(!app.collapsed, "and the grid is still up over it");
+            assert_eq!(app.nav.focus, Focus::Terminal, "the pane has the keys");
+            assert!(app.pane.term_locked);
+            assert!(!app.pane.collapsed, "and the grid is still up over it");
 
             let out = key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
             assert!(
@@ -5184,11 +5254,15 @@ mod tests {
             );
             // The view's draw must not snatch the focus back off the pane.
             draw(&mut app);
-            assert_eq!(app.focus, Focus::Terminal);
+            assert_eq!(app.nav.focus, Focus::Terminal);
 
             key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
-            assert_eq!(app.focus, Focus::Sessions, "the hatch is back to the cards");
-            assert!(!app.term_locked);
+            assert_eq!(
+                app.nav.focus,
+                Focus::Sessions,
+                "the hatch is back to the cards"
+            );
+            assert!(!app.pane.term_locked);
             keys(&mut app, &[KeyCode::Esc, KeyCode::Char('k')]);
             assert_eq!(
                 selected(&app).as_deref(),
@@ -5208,9 +5282,12 @@ mod tests {
             draw(&mut app);
             to_feat(&mut app);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(app.focus, Focus::Terminal);
-            assert!(app.term_locked);
-            assert!(!app.collapsed, "the pane under the grid, not full-screen");
+            assert_eq!(app.nav.focus, Focus::Terminal);
+            assert!(app.pane.term_locked);
+            assert!(
+                !app.pane.collapsed,
+                "the pane under the grid, not full-screen"
+            );
             let text = buffer_text(&draw(&mut app));
             assert_eq!(
                 tabs_drawn(&app),
@@ -5227,8 +5304,12 @@ mod tests {
             );
 
             key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
-            assert_eq!(app.focus, Focus::Sessions, "the hatch is back to the cards");
-            assert!(!app.term_locked);
+            assert_eq!(
+                app.nav.focus,
+                Focus::Sessions,
+                "the hatch is back to the cards"
+            );
+            assert!(!app.pane.term_locked);
             assert_eq!(selected(&app).as_deref(), Some("a2"));
         });
     }
@@ -5243,9 +5324,12 @@ mod tests {
             draw(&mut app);
             to_feat(&mut app);
             full_screen(&mut app);
-            assert_eq!(app.focus, Focus::Terminal);
-            assert!(app.term_locked);
-            assert!(app.collapsed, "full-screen, not a pane beside the grid");
+            assert_eq!(app.nav.focus, Focus::Terminal);
+            assert!(app.pane.term_locked);
+            assert!(
+                app.pane.collapsed,
+                "full-screen, not a pane beside the grid"
+            );
             let text = buffer_text(&draw(&mut app));
             assert!(
                 text.contains("‹ sessions / ● polish-nav"),
@@ -5265,9 +5349,9 @@ mod tests {
             );
 
             key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
-            assert_eq!(app.focus, Focus::Sessions);
-            assert!(!app.term_locked);
-            assert!(!app.collapsed, "back out of full-screen");
+            assert_eq!(app.nav.focus, Focus::Sessions);
+            assert!(!app.pane.term_locked);
+            assert!(!app.pane.collapsed, "back out of full-screen");
             assert_eq!(selected(&app).as_deref(), Some("a2"));
             let text = buffer_text(&draw(&mut app));
             assert_eq!(
@@ -5282,7 +5366,8 @@ mod tests {
     /// The PROJECT TABS the last draw laid down, by project name, left to
     /// right — none at all while the grid's header is not on screen.
     fn tabs_drawn(app: &App) -> Vec<String> {
-        app.hits
+        app.chrome
+            .hits
             .iter()
             .filter_map(|(_, h)| match h {
                 HitTarget::LauncherTab(id) => app
@@ -5299,6 +5384,7 @@ mod tests {
     /// A cell inside the crumb `hit` names, as the header drew it.
     fn crumb_cell(app: &App, hit: HitTarget) -> (u16, u16) {
         let (rect, _) = app
+            .chrome
             .hits
             .iter()
             .find(|(_, h)| *h == hit)
@@ -5319,6 +5405,7 @@ mod tests {
 
             let demo = ProjectId("p1".into());
             let head: Vec<HitTarget> = app
+                .chrome
                 .hits
                 .iter()
                 .filter(|(r, h)| {
@@ -5379,8 +5466,8 @@ mod tests {
             // under the button.
             let (x, y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("the + drops a list: {:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("the + drops a list: {:?}", app.modals.overlay);
             };
             assert!(menu.is_project_picker());
             assert_eq!(menu.at, Some((x, y + 1)), "it hangs off the +");
@@ -5401,7 +5488,11 @@ mod tests {
             // rows take type-ahead, so the arrows move here, not j/k.
             key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "the list closes: {:?}", app.overlay);
+            assert!(
+                app.modals.overlay.is_none(),
+                "the list closes: {:?}",
+                app.modals.overlay
+            );
             assert_eq!(
                 app.selected_project().map(|p| p.name.clone()),
                 Some("web".into())
@@ -5424,7 +5515,7 @@ mod tests {
         with_default_config(|| {
             let mut app = two_sessions();
             let (demo, web) = (ProjectId("p1".into()), ProjectId("p2".into()));
-            app.launcher_tabs = vec![demo, web.clone()];
+            app.launcher.launcher_tabs = vec![demo, web.clone()];
             for p in &mut app.tree.projects {
                 if p.id == web {
                     p.name = "web-storefront-admin".into();
@@ -5434,14 +5525,18 @@ mod tests {
                 .rev()
                 .find(|&w| {
                     draw_at(&mut app, w, 34);
-                    !app.launcher_tabs_more.is_empty()
+                    !app.launcher.launcher_tabs_more.is_empty()
                 })
                 .expect("some width puts web in the chip");
-            assert_eq!(app.launcher_tabs_more, vec![web.clone()], "at {width}");
+            assert_eq!(
+                app.launcher.launcher_tabs_more,
+                vec![web.clone()],
+                "at {width}"
+            );
             let (x, y) = crumb_cell(&app, HitTarget::LauncherTabMore);
             let listed = |app: &App| -> Vec<String> {
-                let Some(Overlay::Menu(menu)) = &app.overlay else {
-                    panic!("the chip drops a list: {:?}", app.overlay);
+                let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                    panic!("the chip drops a list: {:?}", app.modals.overlay);
                 };
                 assert_eq!(menu.at, Some((x, y + 1)), "it hangs off the chip");
                 menu.items.iter().map(|i| i.label.clone()).collect()
@@ -5450,12 +5545,16 @@ mod tests {
             mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y);
             assert_eq!(listed(&app), ["web-storefront-admin  (1)"]);
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
 
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
             assert_eq!(listed(&app), ["web-storefront-admin  (1)"]);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "the list closes: {:?}", app.overlay);
+            assert!(
+                app.modals.overlay.is_none(),
+                "the list closes: {:?}",
+                app.modals.overlay
+            );
             assert_eq!(app.selected_project().map(|p| p.id.clone()), Some(web));
         });
     }
@@ -5475,8 +5574,8 @@ mod tests {
             let (x, y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
             let labels = |app: &App| -> Vec<String> {
-                let Some(Overlay::Menu(menu)) = &app.overlay else {
-                    panic!("the dropdown closed: {:?}", app.overlay);
+                let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                    panic!("the dropdown closed: {:?}", app.modals.overlay);
                 };
                 menu.items.iter().map(|i| i.label.clone()).collect()
             };
@@ -5500,7 +5599,7 @@ mod tests {
             key(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
             assert_eq!(labels(&app)[0], "docs  (0)");
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
             assert_eq!(
                 app.selected_project().map(|p| p.name.clone()),
                 Some("docs".into())
@@ -5516,11 +5615,15 @@ mod tests {
             let narrowed = labels(&app);
             key(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
             assert_eq!(labels(&app), narrowed, "the list never empties");
-            assert!(app.flash.is_some(), "and the refusal says so");
+            assert!(app.chrome.flash.is_some(), "and the refusal says so");
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             assert_eq!(labels(&app).len(), 4, "Esc clears the query first");
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "and then closes: {:?}", app.overlay);
+            assert!(
+                app.modals.overlay.is_none(),
+                "and then closes: {:?}",
+                app.modals.overlay
+            );
         });
     }
 
@@ -5537,8 +5640,8 @@ mod tests {
         with_default_config(|| {
             let cmd_p = |app: &mut App| key(app, KeyCode::Char('p'), KeyModifiers::SUPER);
             let dropdown = |app: &App| -> (Vec<String>, Option<(u16, u16)>, usize) {
-                let Some(Overlay::Menu(menu)) = &app.overlay else {
-                    panic!("no PROJECT DROPDOWN: {:?}", app.overlay);
+                let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                    panic!("no PROJECT DROPDOWN: {:?}", app.modals.overlay);
                 };
                 assert!(menu.is_project_picker());
                 let labels = menu.items.iter().map(|i| i.label.clone()).collect();
@@ -5569,7 +5672,7 @@ mod tests {
             let mut app = two_sessions();
             draw(&mut app);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(app.term_locked && !app.collapsed);
+            assert!(app.pane.term_locked && !app.pane.collapsed);
             draw(&mut app);
             let out = cmd_p(&mut app);
             assert!(
@@ -5578,26 +5681,30 @@ mod tests {
             );
             assert_eq!(dropdown(&app).1, dropdown(&by_click).1, "off the same +");
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
-            assert_eq!(app.focus, Focus::Terminal, "the keys are the pane's again");
-            assert!(app.term_locked);
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
+            assert_eq!(
+                app.nav.focus,
+                Focus::Terminal,
+                "the keys are the pane's again"
+            );
+            assert!(app.pane.term_locked);
 
             // A project picked from over the pane lands on its cards.
             cmd_p(&mut app);
             key(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
             assert_eq!(
                 app.selected_project().map(|p| p.name.clone()),
                 Some("web".into())
             );
-            assert_eq!(app.focus, Focus::Sessions);
+            assert_eq!(app.nav.focus, Focus::Sessions);
 
             // Full-screen: no header, so no list.
             full_screen(&mut app);
-            assert!(app.collapsed && app.term_locked);
+            assert!(app.pane.collapsed && app.pane.term_locked);
             cmd_p(&mut app);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
         });
     }
 
@@ -5616,8 +5723,8 @@ mod tests {
             // Down the `+`'s list to `docs`, the one with no sessions.
             let (x, y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("the + drops a list: {:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("the + drops a list: {:?}", app.modals.overlay);
             };
             let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
             assert_eq!(
@@ -5630,16 +5737,19 @@ mod tests {
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
             assert!(
-                app.overlay.is_none(),
+                app.modals.overlay.is_none(),
                 "switching projects put a modal up: {:?}",
-                app.overlay
+                app.modals.overlay
             );
             assert_eq!(
                 app.selected_project().map(|p| p.name.clone()),
                 Some("docs".into())
             );
-            assert!(app.launcher_unaimed, "no card to aim at, so the pane folds");
-            assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+            assert!(
+                app.launcher.launcher_unaimed,
+                "no card to aim at, so the pane folds"
+            );
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_SESSIONS));
             let text = buffer_text(&draw(&mut app));
             assert_eq!(tabs_drawn(&app), ["docs", "demo"], "{text}");
             assert!(
@@ -5697,7 +5807,7 @@ mod tests {
                     !super::has_pane(&app),
                     "ack_first={ack_first}: the pane folded away: {text}"
                 );
-                assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+                assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_SESSIONS));
                 assert!(text.contains("Welcome to nebula"), "{text}");
                 assert!(!text.contains("shell-1"), "no terminal of demo's: {text}");
             }
@@ -5729,7 +5839,7 @@ mod tests {
                 Some("docs".into())
             );
             assert!(!super::has_pane(&app), "the pane folded away");
-            assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_SESSIONS));
         });
     }
 
@@ -5767,7 +5877,7 @@ mod tests {
         with_default_config(|| {
             for (way, open) in ways {
                 let mut app = two_sessions();
-                app.show_all_worktrees = true;
+                app.launcher.show_all_worktrees = true;
                 seed_empty_project(&mut app);
                 draw(&mut app);
                 let mut out = Vec::new();
@@ -5792,7 +5902,11 @@ mod tests {
                     text.contains("Welcome to nebula"),
                     "{way}: docs' lone empty root is the welcome: {text}"
                 );
-                assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS), "{way}");
+                assert_eq!(
+                    app.chrome.flash.as_deref(),
+                    Some(super::NO_SESSIONS),
+                    "{way}"
+                );
 
                 key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
                 let text = buffer_text(&draw(&mut app));
@@ -5813,7 +5927,7 @@ mod tests {
         with_default_config(|| {
             for (show_all, checkout) in [(false, "w3root"), (true, "w3root"), (true, "w3feat")] {
                 let mut app = two_sessions();
-                app.show_all_worktrees = show_all;
+                app.launcher.show_all_worktrees = show_all;
                 seed_empty_project(&mut app);
                 hse(
                     &mut app,
@@ -5940,7 +6054,7 @@ mod tests {
                     "ack_first={ack_first}: on the chip"
                 );
                 assert!(text.contains("term-1"), "the chip is drawn: {text}");
-                assert_eq!(app.focus, Focus::Terminal, "and the keys are in it");
+                assert_eq!(app.nav.focus, Focus::Terminal, "and the keys are in it");
                 let card = tab_at(&app, HitTarget::LauncherCard(CardRef { band: 0, card: 0 }));
                 assert_eq!(
                     card.height,
@@ -5979,12 +6093,14 @@ mod tests {
             let bands = crate::launcher::bands(&app);
             let is_terminal = |h: &HitTarget| matches!(h, HitTarget::LauncherCard(at) if bands[at.band].cards[at.card].is_terminal());
             let shell = app
+                .chrome
                 .hits
                 .iter()
                 .find(|(_, h)| is_terminal(h))
                 .map(|(r, _)| *r)
                 .expect("shell-1's card");
             let session = app
+                .chrome
                 .hits
                 .iter()
                 .find(|(_, h)| matches!(h, HitTarget::LauncherCard(_)) && !is_terminal(h))
@@ -6042,7 +6158,7 @@ mod tests {
             let mut by_key = on_an_empty_project();
             draw(&mut by_key);
             key(&mut by_key, KeyCode::Char('p'), KeyModifiers::NONE);
-            let launch = |app: &App| match &app.overlay {
+            let launch = |app: &App| match &app.modals.overlay {
                 Some(Overlay::Prompt(p)) => match &p.kind {
                     PromptKind::QuickPrompt(launch) => launch.clone(),
                     other => panic!("not the box: {other:?}"),
@@ -6078,9 +6194,9 @@ mod tests {
 
             let mut app = on_an_empty_project();
             // Animations off hold one finished frame, well past the fade.
-            app.animations = false;
+            app.chrome.animations = false;
             let terminal = draw(&mut app);
-            let grid = crate::launcher::grid(app.body_area).area;
+            let grid = crate::launcher::grid(app.chrome.body_area).area;
             let (_, key_y) = crumb_cell(&app, HitTarget::LauncherWelcomePrompt);
             let sky = glyphs(&terminal, grid.y..key_y - 3);
             assert!(sky > 40, "{sky} specks of dust: {}", buffer_text(&terminal));
@@ -6107,7 +6223,11 @@ mod tests {
             key(app, KeyCode::Char(c), KeyModifiers::NONE);
         }
         key(app, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(app.overlay.is_none(), "the jump landed: {:?}", app.overlay);
+        assert!(
+            app.modals.overlay.is_none(),
+            "the jump landed: {:?}",
+            app.modals.overlay
+        );
     }
 
     /// A `/` jump into another project ADDS its tab: the header keeps
@@ -6160,8 +6280,8 @@ mod tests {
                 key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-                panic!("the row opens the prompt: {:?}", app.overlay);
+            let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+                panic!("the row opens the prompt: {:?}", app.modals.overlay);
             };
             assert!(matches!(prompt.kind, PromptKind::AddProject));
             assert_eq!(prompt.title, "Open project");
@@ -6183,8 +6303,8 @@ mod tests {
                 Some("web"),
                 "the tab opened"
             );
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("the tab's menu: {:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("the tab's menu: {:?}", app.modals.overlay);
             };
             let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
             for want in ["New worktree", "Rename", "Remove from list"] {
@@ -6203,18 +6323,27 @@ mod tests {
             let mut app = two_sessions();
             draw(&mut app);
             key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
-            let title = match &app.overlay {
+            let title = match &app.modals.overlay {
                 Some(Overlay::Menu(m)) => m.title.as_deref(),
                 _ => None,
             };
-            assert_eq!(title, Some("Move to"), "on a card: {:?}", app.overlay);
+            assert_eq!(
+                title,
+                Some("Move to"),
+                "on a card: {:?}",
+                app.modals.overlay
+            );
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.overlay.is_none());
+            assert!(app.modals.overlay.is_none());
 
             keys(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
-            assert!(app.launcher_unaimed);
+            assert!(app.launcher.launcher_unaimed);
             key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "unaimed: {:?}", app.overlay);
+            assert!(
+                app.modals.overlay.is_none(),
+                "unaimed: {:?}",
+                app.modals.overlay
+            );
         });
     }
 
@@ -6223,7 +6352,7 @@ mod tests {
     fn two_tabs() -> App {
         let mut app = two_sessions();
         draw(&mut app);
-        app.launcher_tabs = vec![ProjectId("p2".into()), ProjectId("p1".into())];
+        app.launcher.launcher_tabs = vec![ProjectId("p2".into()), ProjectId("p1".into())];
         draw(&mut app);
         app
     }
@@ -6234,7 +6363,11 @@ mod tests {
         (
             app.selected_project().map(|p| p.name.clone()),
             selected(app),
-            app.launcher_tabs.iter().map(|t| t.0.clone()).collect(),
+            app.launcher
+                .launcher_tabs
+                .iter()
+                .map(|t| t.0.clone())
+                .collect(),
         )
     }
 
@@ -6267,13 +6400,13 @@ mod tests {
             let before = tab_state(&app);
             key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
             assert_eq!(tab_state(&app), before, "`]` on the last tab");
-            assert_eq!(app.flash, None);
+            assert_eq!(app.chrome.flash, None);
             key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
             assert_eq!(tab_state(&app).0.as_deref(), Some("web"));
             let first = tab_state(&app);
             key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
             assert_eq!(tab_state(&app), first, "`[` on the first tab");
-            assert_eq!(app.flash, None);
+            assert_eq!(app.chrome.flash, None);
             key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
             assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
 
@@ -6339,35 +6472,44 @@ mod tests {
         with_default_config(|| {
             let mut app = two_tabs();
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            let demo = app.launcher_expanded.clone();
+            let demo = app.launcher.launcher_expanded.clone();
             assert!(demo.is_some(), "Tab opened demo's band");
 
             key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
             assert_eq!(tab_state(&app).0.as_deref(), Some("web"));
-            assert_eq!(app.launcher_expanded, None, "web's bands start collapsed");
+            assert_eq!(
+                app.launcher.launcher_expanded, None,
+                "web's bands start collapsed"
+            );
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             let web = Some(WorktreeId("w2root".into()));
-            assert_eq!(app.launcher_expanded, web, "Tab opened web's band");
+            assert_eq!(app.launcher.launcher_expanded, web, "Tab opened web's band");
 
             key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
             assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
-            assert_eq!(app.launcher_expanded, demo, "demo's band is open again");
+            assert_eq!(
+                app.launcher.launcher_expanded, demo,
+                "demo's band is open again"
+            );
 
             draw(&mut app);
             let (x, y) = crumb_cell(&app, HitTarget::LauncherTab(ProjectId("p2".into())));
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
             assert_eq!(tab_state(&app).0.as_deref(), Some("web"));
             assert_eq!(
-                app.launcher_expanded, web,
+                app.launcher.launcher_expanded, web,
                 "web's too, by a click on its tab"
             );
 
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded, None, "Esc closed web's band");
+            assert_eq!(
+                app.launcher.launcher_expanded, None,
+                "Esc closed web's band"
+            );
             key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded, demo, "demo's stayed open");
+            assert_eq!(app.launcher.launcher_expanded, demo, "demo's stayed open");
             key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded, None, "web's stayed closed");
+            assert_eq!(app.launcher.launcher_expanded, None, "web's stayed closed");
 
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             let json = super::super::ui_state_json(&app);
@@ -6418,13 +6560,13 @@ mod tests {
         with_default_config(|| {
             for paste in [false, true] {
                 let mut app = two_tabs();
-                app.term = Some(crate::app::AttachedTerm::new(
+                app.pane.term = Some(crate::app::AttachedTerm::new(
                     SessionRef::Agent(AgentId("a2".into())),
                     40,
                     10,
                 ));
-                app.focus = Focus::Terminal;
-                app.term_locked = true;
+                app.nav.focus = Focus::Terminal;
+                app.pane.term_locked = true;
 
                 let mut out = Vec::new();
                 let event = if paste {
@@ -6535,16 +6677,27 @@ mod tests {
         with_default_config(|| {
             let mut app = two_tabs();
             keys(&mut app, &[KeyCode::Char('x'), KeyCode::Char('x')]);
-            assert!(app.projects_closed && app.splash_showing());
-            assert!(app.term.is_none(), "the pane let go");
+            assert!(app.launcher.projects_closed && app.splash_showing());
+            assert!(app.pane.term.is_none(), "the pane let go");
             draw(&mut app);
-            assert!(app.launcher_tabs.is_empty());
+            assert!(app.launcher.launcher_tabs.is_empty());
 
             // Keys that would walk the hidden rows do nothing.
-            let before = (app.sel_project, app.sel_worktree, app.sel_session);
+            let before = (
+                app.nav.sel_project,
+                app.nav.sel_worktree,
+                app.nav.sel_session,
+            );
             keys(&mut app, &[KeyCode::Char('j'), KeyCode::Char('l')]);
-            assert_eq!((app.sel_project, app.sel_worktree, app.sel_session), before);
-            assert!(app.projects_closed);
+            assert_eq!(
+                (
+                    app.nav.sel_project,
+                    app.nav.sel_worktree,
+                    app.nav.sel_session
+                ),
+                before
+            );
+            assert!(app.launcher.projects_closed);
 
             let json = super::super::ui_state_json(&app);
             let mut next = two_sessions();
@@ -6554,15 +6707,15 @@ mod tests {
 
             // `+`: every project, none ticked; picking one reopens it.
             key(&mut app, KeyCode::Char('+'), KeyModifiers::NONE);
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("no dropdown: {:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("no dropdown: {:?}", app.modals.overlay);
             };
             let labels: Vec<_> = menu.items.iter().map(|i| i.label.clone()).collect();
             assert_eq!(labels, vec!["demo  (2)", "web  (1)", super::OPEN_FOLDER]);
             assert_eq!(menu.at, None, "no header + here: it sits mid-screen");
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
-            assert!(!app.projects_closed && app.launcher_active());
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
+            assert!(!app.launcher.projects_closed && app.launcher_active());
             draw(&mut app);
             assert_eq!(tabs_drawn(&app), ["demo"]);
         });
@@ -6607,7 +6760,7 @@ mod tests {
         let buf = terminal.backend().buffer();
         (0..buf.area.width)
             .filter_map(|x| buf.cell((x, 1)))
-            .filter(|c| c.bg == app.theme.accent)
+            .filter(|c| c.bg == app.chrome.theme.accent)
             .map(|c| c.symbol())
             .collect::<String>()
             .trim()
@@ -6668,15 +6821,18 @@ mod tests {
         with_default_config(|| {
             let mut app = two_tabs();
             let terminal = draw(&mut app);
-            let th = app.theme;
-            assert_eq!(app.launcher_tab_cursor, None);
+            let th = app.chrome.theme;
+            assert_eq!(app.launcher.launcher_tab_cursor, None);
             assert_eq!(
                 band_rule_look(&terminal, "⌂ main"),
                 (th.accent, true, true),
                 "the keys are on the root band"
             );
             keys(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
-            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+            assert_eq!(
+                app.launcher.launcher_tab_cursor,
+                Some(ProjectId("p1".into()))
+            );
             let terminal = draw(&mut app);
             assert!(
                 !tab_cursor_drawn(&app, &terminal).is_empty(),
@@ -6689,7 +6845,7 @@ mod tests {
             );
 
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(app.launcher.launcher_tab_cursor, None);
             let terminal = draw(&mut app);
             assert_eq!(
                 band_rule_look(&terminal, "⌂ main"),
@@ -6700,21 +6856,21 @@ mod tests {
             // The pane under the grid holding the keys grays it too. The
             // attach is the daemon's to answer; the pane's hold on the
             // band's card is built by hand, as the pane's own tests do.
-            if app.term.is_none() {
-                app.term = Some(crate::app::AttachedTerm::new(
+            if app.pane.term.is_none() {
+                app.pane.term = Some(crate::app::AttachedTerm::new(
                     SessionRef::Agent(AgentId("a1".into())),
                     40,
                     10,
                 ));
             }
-            let pane = app.term_area;
+            let pane = app.pane.term_area;
             mouse(
                 &mut app,
                 MouseEventKind::Down(MouseButton::Left),
                 pane.x + 2,
                 pane.y + 1,
             );
-            assert_eq!(app.focus, Focus::Terminal, "the pane has the keys");
+            assert_eq!(app.nav.focus, Focus::Terminal, "the pane has the keys");
             let terminal = draw(&mut app);
             assert_eq!(
                 band_rule_look(&terminal, "⌂ main"),
@@ -6744,24 +6900,31 @@ mod tests {
             let before = tab_state(&app);
 
             key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, None, "one press stays put");
+            assert_eq!(
+                app.launcher.launcher_tab_cursor, None,
+                "one press stays put"
+            );
             assert!(
-                app.flash
+                app.chrome
+                    .flash
                     .as_deref()
                     .is_some_and(|f| f.ends_with("again: project tabs")),
                 "{:?}",
-                app.flash
+                app.chrome.flash
             );
             key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
             assert_eq!(
-                app.launcher_tab_cursor,
+                app.launcher.launcher_tab_cursor,
                 Some(ProjectId("p1".into())),
                 "on the lit tab"
             );
             assert_eq!(tab_state(&app), before, "nothing opened");
 
             key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p2".into())));
+            assert_eq!(
+                app.launcher.launcher_tab_cursor,
+                Some(ProjectId("p2".into()))
+            );
             let on_web = (Some("web".into()), Some("a3".into()), before.2.clone());
             assert_eq!(tab_state(&app), on_web, "the grid comes with the cursor");
             assert_eq!(
@@ -6771,20 +6934,20 @@ mod tests {
             );
             key(&mut app, KeyCode::Left, KeyModifiers::NONE);
             assert_eq!(
-                app.launcher_tab_cursor,
+                app.launcher.launcher_tab_cursor,
                 Some(ProjectId("p2".into())),
                 "← on the first tab stays on it"
             );
             keys(&mut app, &[KeyCode::Right, KeyCode::Right]);
             assert_eq!(
-                app.launcher_tab_cursor,
+                app.launcher.launcher_tab_cursor,
                 Some(ProjectId("p1".into())),
                 "→ past the last tab stays on it"
             );
             assert_eq!(tab_state(&app), before, "demo, on the card it was left on");
             key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
             assert_eq!(
-                app.launcher_tab_cursor,
+                app.launcher.launcher_tab_cursor,
                 Some(ProjectId("p2".into())),
                 "`[` walks the cursor too"
             );
@@ -6792,7 +6955,7 @@ mod tests {
 
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(
-                app.launcher_tab_cursor, None,
+                app.launcher.launcher_tab_cursor, None,
                 "the keys are the cards' again"
             );
             assert_eq!(
@@ -6803,7 +6966,7 @@ mod tests {
                     vec!["p2".into(), "p1".into()]
                 )
             );
-            assert_eq!(app.focus, Focus::Sessions);
+            assert_eq!(app.nav.focus, Focus::Sessions);
         });
     }
 
@@ -6817,15 +6980,24 @@ mod tests {
             draw(&mut app);
             keys(&mut app, &[KeyCode::Esc, KeyCode::Char('j')]);
             assert_eq!(selected(&app).as_deref(), Some("a2"), "the second band");
-            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(app.launcher.launcher_tab_cursor, None);
 
             key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a1"), "a band up");
-            assert_eq!(app.launcher_tab_cursor, None, "and not armed by the step");
+            assert_eq!(
+                app.launcher.launcher_tab_cursor, None,
+                "and not armed by the step"
+            );
             key(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, None, "the top band's first press");
+            assert_eq!(
+                app.launcher.launcher_tab_cursor, None,
+                "the top band's first press"
+            );
             key(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+            assert_eq!(
+                app.launcher.launcher_tab_cursor,
+                Some(ProjectId("p1".into()))
+            );
         });
     }
 
@@ -6845,16 +7017,20 @@ mod tests {
             keys(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
 
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+            assert_eq!(
+                app.launcher.launcher_tab_cursor,
+                Some(ProjectId("p1".into()))
+            );
             assert!(
-                app.flash
+                app.chrome
+                    .flash
                     .as_deref()
                     .is_some_and(|f| f.ends_with("again: into demo")),
                 "{:?}",
-                app.flash
+                app.chrome.flash
             );
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(app.launcher.launcher_tab_cursor, None);
             assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
             assert_eq!(selected(&app).as_deref(), Some("a1"), "the card it was on");
 
@@ -6869,7 +7045,7 @@ mod tests {
                     KeyCode::Down,
                 ],
             );
-            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(app.launcher.launcher_tab_cursor, None);
             assert_eq!(tab_state(&app).0.as_deref(), Some("web"));
             assert_eq!(selected(&app).as_deref(), Some("a3"));
 
@@ -6900,20 +7076,23 @@ mod tests {
                 &mut app,
                 &[KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('h')],
             );
-            assert!(app.launcher_tab_cursor.is_some());
+            assert!(app.launcher.launcher_tab_cursor.is_some());
             let walked = tab_state(&app);
             assert_eq!(walked.0.as_deref(), Some("web"));
 
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(app.launcher.launcher_tab_cursor, None);
             assert_eq!(tab_state(&app), walked, "still on the project walked to");
-            assert!(!app.launcher_unaimed, "and the card is still selected");
+            assert!(
+                !app.launcher.launcher_unaimed,
+                "and the card is still selected"
+            );
 
             keys(
                 &mut app,
                 &[KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('p')],
             );
-            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(app.launcher.launcher_tab_cursor, None);
             launch(&app);
         });
     }
@@ -6968,7 +7147,7 @@ mod tests {
             draw(&mut app);
             let (x, y) = card_cell(&app, &SessionRef::Agent(AgentId("a1".into())));
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            assert_eq!(app.launcher_tab_cursor, None);
+            assert_eq!(app.launcher.launcher_tab_cursor, None);
             assert_eq!(selected(&app).as_deref(), Some("a1"));
         });
     }
@@ -6993,7 +7172,7 @@ mod tests {
                 ],
             );
             assert_eq!(
-                app.launcher_tabs,
+                app.launcher.launcher_tabs,
                 [ProjectId("p1".into())],
                 "web's tab went"
             );
@@ -7002,7 +7181,10 @@ mod tests {
                 (before.0, before.1),
                 "the grid back on demo, on its card"
             );
-            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+            assert_eq!(
+                app.launcher.launcher_tab_cursor,
+                Some(ProjectId("p1".into()))
+            );
         });
     }
 
@@ -7032,7 +7214,7 @@ mod tests {
                 keys(&mut app, &up);
                 let before = tab_state(&app);
                 key(&mut app, code, KeyModifiers::NONE);
-                let closing = match &app.overlay {
+                let closing = match &app.modals.overlay {
                     Some(Overlay::Confirm(c)) => match &c.action {
                         PendingAction::CloseProjectTab(id) => Some(id.clone()),
                         _ => None,
@@ -7043,36 +7225,42 @@ mod tests {
                     closing,
                     Some(ProjectId("p2".into())),
                     "{code:?} asks about web's tab: {:?}",
-                    app.overlay
+                    app.modals.overlay
                 );
                 assert_eq!(tab_state(&app), before, "{code:?} closed nothing yet");
 
                 // Esc keeps the tab, and the cursor on it.
                 key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-                assert!(app.overlay.is_none());
+                assert!(app.modals.overlay.is_none());
                 assert_eq!(tab_state(&app), before, "{code:?} Esc kept the tab");
-                assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p2".into())));
+                assert_eq!(
+                    app.launcher.launcher_tab_cursor,
+                    Some(ProjectId("p2".into()))
+                );
 
                 // Enter on the dialog is x.
                 key(&mut app, code, KeyModifiers::NONE);
                 key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-                assert!(app.overlay.is_none());
+                assert!(app.modals.overlay.is_none());
                 assert_eq!(tab_state(&app), tab_state(&by_x), "{code:?} Enter is x");
-                assert_eq!(app.launcher_tab_cursor, by_x.launcher_tab_cursor);
-                assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+                assert_eq!(app.launcher.launcher_tab_cursor, by_x.launcher_tab_cursor);
+                assert_eq!(
+                    app.launcher.launcher_tab_cursor,
+                    Some(ProjectId("p1".into()))
+                );
 
                 // The only tab left asks too, and its Enter closes it.
                 key(&mut app, code, KeyModifiers::NONE);
                 assert!(
-                    matches!(&app.overlay, Some(Overlay::Confirm(c))
+                    matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                         if c.action == PendingAction::CloseProjectTab(ProjectId("p1".into()))),
                     "{code:?} asks about the last tab: {:?}",
-                    app.overlay
+                    app.modals.overlay
                 );
                 key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-                assert!(app.launcher_tabs.is_empty());
-                assert_eq!(app.launcher_tab_cursor, None);
-                assert!(app.projects_closed);
+                assert!(app.launcher.launcher_tabs.is_empty());
+                assert_eq!(app.launcher.launcher_tab_cursor, None);
+                assert!(app.launcher.projects_closed);
             }
 
             // Down on the cards the same key is the card's own delete.
@@ -7080,12 +7268,12 @@ mod tests {
             keys(&mut app, &[KeyCode::Char('h'), KeyCode::Char('h')]);
             key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
             assert!(
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if matches!(c.action, PendingAction::DeleteAgent(_))),
                 "{:?}",
-                app.overlay
+                app.modals.overlay
             );
-            assert_eq!(app.launcher_tabs.len(), 2);
+            assert_eq!(app.launcher.launcher_tabs.len(), 2);
         });
     }
 
@@ -7125,7 +7313,9 @@ mod tests {
     fn the_tabs_come_back_after_a_restart() {
         with_default_config(|| {
             let mut app = two_tabs();
-            app.launcher_tabs.insert(1, ProjectId("gone".into()));
+            app.launcher
+                .launcher_tabs
+                .insert(1, ProjectId("gone".into()));
             let json = super::super::ui_state_json(&app);
 
             let mut next = two_sessions();
@@ -7185,18 +7375,18 @@ mod tests {
             let demo = HitTarget::LauncherTab(ProjectId("p1".into()));
             let (demo_x, demo_y) = crumb_cell(&app, demo.clone());
             mouse(&mut app, MouseEventKind::Moved, demo_x, demo_y);
-            assert_eq!(app.hover_crumb, Some(demo));
+            assert_eq!(app.launcher.hover_crumb, Some(demo));
             assert_eq!(underlined_head(&draw(&mut app)), "demo");
 
             // The `+` is a button too.
             let (add_x, add_y) = crumb_cell(&app, HitTarget::LauncherTabAdd);
             mouse(&mut app, MouseEventKind::Moved, add_x + 1, add_y);
-            assert_eq!(app.hover_crumb, Some(HitTarget::LauncherTabAdd));
+            assert_eq!(app.launcher.hover_crumb, Some(HitTarget::LauncherTabAdd));
             assert_eq!(underlined_head(&draw(&mut app)), "+");
 
             // And the pointer off the row takes the underline with it.
             mouse(&mut app, MouseEventKind::Moved, demo_x, demo_y + 6);
-            assert_eq!(app.hover_crumb, None);
+            assert_eq!(app.launcher.hover_crumb, None);
             assert_eq!(underlined_head(&draw(&mut app)), "");
 
             // The hatch out of a full-screen session is the same kind of
@@ -7250,9 +7440,13 @@ mod tests {
         with_default_config(|| {
             let ctrl_f = |app: &mut App| key(app, KeyCode::Char('f'), KeyModifiers::CONTROL);
             let in_pane = |app: &App| {
-                assert_eq!(app.focus, Focus::Terminal, "the keys stay in the session");
-                assert!(app.term_locked);
-                assert!(!app.collapsed, "back in the pane beside the cards");
+                assert_eq!(
+                    app.nav.focus,
+                    Focus::Terminal,
+                    "the keys stay in the session"
+                );
+                assert!(app.pane.term_locked);
+                assert!(!app.pane.collapsed, "back in the pane beside the cards");
             };
             let mut app = two_sessions();
             draw(&mut app);
@@ -7270,9 +7464,9 @@ mod tests {
                     !out.iter().any(|r| matches!(r, ClientRequest::Input { .. })),
                     "^F is nebula's, not the agent's: {out:?}"
                 );
-                assert!(app.collapsed, "full-screen");
-                assert_eq!(app.focus, Focus::Terminal);
-                assert!(app.term_locked);
+                assert!(app.pane.collapsed, "full-screen");
+                assert_eq!(app.nav.focus, Focus::Terminal);
+                assert!(app.pane.term_locked);
                 let text = buffer_text(&draw(&mut app));
                 assert!(text.contains("‹ sessions"), "the crumb header: {text}");
                 assert!(tabs_drawn(&app).is_empty(), "no grid header: {text}");
@@ -7297,11 +7491,11 @@ mod tests {
             let mut app = two_sessions();
             draw(&mut app);
             to_feat(&mut app);
-            assert_eq!(app.focus, Focus::Sessions);
+            assert_eq!(app.nav.focus, Focus::Sessions);
             key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
-            assert!(app.collapsed);
-            assert_eq!(app.focus, Focus::Terminal);
-            assert!(app.term_locked);
+            assert!(app.pane.collapsed);
+            assert_eq!(app.nav.focus, Focus::Terminal);
+            assert!(app.pane.term_locked);
             assert_eq!(pane(&app), Some(SessionRef::Agent(AgentId("a2".into()))));
         });
     }
@@ -7360,9 +7554,12 @@ mod tests {
             assert_eq!(pane(&app), None);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(pane(&app), Some(SessionRef::Agent(AgentId("a1".into()))));
-            assert_eq!(app.focus, Focus::Terminal);
-            assert!(app.term_locked);
-            assert!(!app.collapsed, "the pane under the grid, not full-screen");
+            assert_eq!(app.nav.focus, Focus::Terminal);
+            assert!(app.pane.term_locked);
+            assert!(
+                !app.pane.collapsed,
+                "the pane under the grid, not full-screen"
+            );
         });
     }
 
@@ -7375,15 +7572,18 @@ mod tests {
             let mut app = two_sessions();
             draw_at(&mut app, 130, 20);
             assert!(
-                crate::launcher::split(app.launcher_body, app.launcher_pane_h)
+                crate::launcher::split(app.launcher.launcher_body, app.launcher.launcher_pane_h)
                     .1
                     .is_none(),
                 "too short for a pane"
             );
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(app.focus, Focus::Terminal);
-            assert!(app.term_locked);
-            assert!(app.collapsed, "full-screen: there is no pane to step into");
+            assert_eq!(app.nav.focus, Focus::Terminal);
+            assert!(app.pane.term_locked);
+            assert!(
+                app.pane.collapsed,
+                "full-screen: there is no pane to step into"
+            );
         });
     }
 
@@ -7408,14 +7608,14 @@ mod tests {
 
             key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
             assert!(
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if c.action == PendingAction::ArchiveAgent(AgentId("a1".into()))),
                 "the press asks: {:?}",
-                app.overlay
+                app.modals.overlay
             );
             assert_eq!(cards(&app), ["a9", "a2", "a1"], "and archives nothing yet");
             assert!(
-                app.release_watch.is_none(),
+                app.chrome.release_watch.is_none(),
                 "nothing ran, so no key to watch"
             );
             for _ in 0..5 {
@@ -7423,9 +7623,9 @@ mod tests {
                 key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
             }
             assert!(
-                matches!(&app.overlay, Some(Overlay::Confirm(_))),
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(_))),
                 "marked or not, the repeats land on the one dialog: {:?}",
-                app.overlay
+                app.modals.overlay
             );
             assert_eq!(
                 cards(&app),
@@ -7435,14 +7635,14 @@ mod tests {
             key_kind(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, Release);
 
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "Enter answers it");
+            assert!(app.modals.overlay.is_none(), "Enter answers it");
             assert_eq!(cards(&app), ["a9", "a2"], "and that is the archive");
             assert_eq!(
                 selected(&app).as_deref(),
                 Some("a9"),
                 "the card before it in its band"
             );
-            assert!(app.release_watch.is_none(), "still nothing to watch");
+            assert!(app.chrome.release_watch.is_none(), "still nothing to watch");
         });
     }
 
@@ -7462,16 +7662,23 @@ mod tests {
             assert_eq!(selected(&app).as_deref(), Some("a1"), "the last card");
 
             key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "no confirm: {:?}", app.overlay);
+            assert!(
+                app.modals.overlay.is_none(),
+                "no confirm: {:?}",
+                app.modals.overlay
+            );
             assert_eq!(cards(&app), ["a9", "a2"], "the press archives it");
             assert_eq!(selected(&app).as_deref(), Some("a9"));
-            assert!(app.release_watch.is_some(), "and the key is watched");
+            assert!(app.chrome.release_watch.is_some(), "and the key is watched");
             for _ in 0..5 {
                 key_kind(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, Repeat);
             }
             assert_eq!(cards(&app), ["a9", "a2"], "held, it archives no more");
             key_kind(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, Release);
-            assert!(app.release_watch.is_none(), "the release ends the watch");
+            assert!(
+                app.chrome.release_watch.is_none(),
+                "the release ends the watch"
+            );
 
             key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
             assert_eq!(cards(&app), ["a2"], "a fresh press archives the next");
@@ -7508,11 +7715,11 @@ mod tests {
                 Some("a9"),
                 "the card before it in its band"
             );
-            assert!(app.release_watch.is_some(), "and the key is watched");
+            assert!(app.chrome.release_watch.is_some(), "and the key is watched");
 
             key_kind(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, Release);
             assert!(
-                app.release_watch.is_some(),
+                app.chrome.release_watch.is_some(),
                 "another key let go changes nothing"
             );
             key_kind(&mut app, KeyCode::Char('u'), KeyModifiers::NONE, Repeat);
@@ -7524,11 +7731,14 @@ mod tests {
                 Some("a9"),
                 "a held `h` still walks"
             );
-            assert!(app.release_watch.is_some(), "with the watch still on");
+            assert!(
+                app.chrome.release_watch.is_some(),
+                "with the watch still on"
+            );
 
             key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
             assert!(
-                app.release_watch.is_none(),
+                app.chrome.release_watch.is_none(),
                 "a fresh press of anything ends it"
             );
         });
@@ -7554,7 +7764,7 @@ mod tests {
             let before = archived(&app);
             key(&mut app, KeyCode::Char('u'), KeyModifiers::NONE);
             assert_eq!(archived(&app), before - 1, "the press unarchives one");
-            assert!(app.release_watch.is_some(), "and the key is watched");
+            assert!(app.chrome.release_watch.is_some(), "and the key is watched");
             for _ in 0..5 {
                 key_kind(&mut app, KeyCode::Char('u'), KeyModifiers::NONE, Repeat);
             }
@@ -7584,10 +7794,10 @@ mod tests {
                 "its band went with it: the root band's card, at the band level"
             );
             assert!(
-                app.launcher_expanded.is_none(),
+                app.launcher.launcher_expanded.is_none(),
                 "the bands, not an empty worktree"
             );
-            assert_eq!(app.focus, Focus::Sessions);
+            assert_eq!(app.nav.focus, Focus::Sessions);
         });
     }
 
@@ -7610,7 +7820,7 @@ mod tests {
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a2"), "feat's one card");
             assert_eq!(
-                app.launcher_expanded,
+                app.launcher.launcher_expanded,
                 Some(WorktreeId("w2".into())),
                 "feat's band open"
             );
@@ -7619,7 +7829,7 @@ mod tests {
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(cards(&app), ["a9", "a1"]);
             assert_eq!(
-                app.launcher_expanded, None,
+                app.launcher.launcher_expanded, None,
                 "feat's band is gone, and its accordion with it"
             );
             assert_eq!(
@@ -7633,7 +7843,7 @@ mod tests {
                 Some(true),
                 "and the pane reads it"
             );
-            assert_eq!(app.focus, Focus::Sessions);
+            assert_eq!(app.nav.focus, Focus::Sessions);
         });
     }
 
@@ -7654,7 +7864,7 @@ mod tests {
             key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
             assert_eq!(cards(&app), ["a9", "a1"], "the delete went through");
             assert!(
-                app.launcher_expanded.is_none(),
+                app.launcher.launcher_expanded.is_none(),
                 "its band went with it: the bands"
             );
             assert_eq!(
@@ -7838,9 +8048,12 @@ mod tests {
                     key(&mut app, KeyCode::Char(*c), KeyModifiers::NONE);
                 }
                 assert!(cards(&app).is_empty(), "{keys:?}: the card left");
-                assert!(app.launcher_unaimed, "{keys:?}: nothing left to aim at");
+                assert!(
+                    app.launcher.launcher_unaimed,
+                    "{keys:?}: nothing left to aim at"
+                );
                 assert!(!super::has_pane(&app), "{keys:?}: and the pane folded");
-                assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+                assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_SESSIONS));
                 let text = buffer_text(&draw(&mut app));
                 assert!(
                     text.contains("press  p  to prompt"),
@@ -7986,7 +8199,7 @@ mod tests {
                 key(app, KeyCode::Char('~'), KeyModifiers::NONE);
                 keys(app, &[KeyCode::Esc, KeyCode::Char('j')]);
                 assert!(
-                    app.launcher_pane_hidden,
+                    app.launcher.launcher_pane_hidden,
                     "a key walking the bands leaves the fold be"
                 );
                 draw(app);
@@ -8001,9 +8214,12 @@ mod tests {
             );
 
             for app in [&by_left, &by_right] {
-                assert!(!app.launcher_pane_hidden, "the click brought the pane back");
-                assert!(!app.launcher_unaimed, "on the card clicked");
-                assert_eq!(app.focus, Focus::Sessions, "the keys stay on the cards");
+                assert!(
+                    !app.launcher.launcher_pane_hidden,
+                    "the click brought the pane back"
+                );
+                assert!(!app.launcher.launcher_unaimed, "on the card clicked");
+                assert_eq!(app.nav.focus, Focus::Sessions, "the keys stay on the cards");
             }
             assert_eq!(
                 by_right.selected_session().map(|a| a.id.clone()),
@@ -8051,15 +8267,19 @@ mod tests {
                 .cursor_in_open_band(&bands)
                 .expect("Tab opened the cursor's band");
             let panel = crate::launcher::panel_layout(
-                app.body_area,
+                app.chrome.body_area,
                 &bands,
-                app.launcher_expanded.as_ref(),
+                app.launcher.launcher_expanded.as_ref(),
             );
             let pb = &panel.bands[band];
             assert!(panel.overflows(), "the cards outrun the body");
             let whole = |app: &App, card: usize| {
-                crate::launcher::place(panel.window(), app.launcher_scroll, pb.cell(card).unwrap())
-                    .is_some_and(|p| p.whole())
+                crate::launcher::place(
+                    panel.window(),
+                    app.launcher.launcher_scroll,
+                    pb.cell(card).unwrap(),
+                )
+                .is_some_and(|p| p.whole())
             };
             let (x, y) = card_cell(&app, &SessionRef::Agent(AgentId("a1".into())));
             let before = selected(&app);
@@ -8075,24 +8295,31 @@ mod tests {
                 mouse(&mut app, MouseEventKind::ScrollUp, x, y);
             }
             assert_eq!(selected(&app), before, "the wheel up moves nothing");
-            assert_eq!(app.launcher_scroll, 0, "the top is the top");
+            assert_eq!(app.launcher.launcher_scroll, 0, "the top is the top");
             mouse(&mut app, MouseEventKind::ScrollDown, x, y);
             assert_eq!(selected(&app), before, "and neither does the wheel down");
             assert_eq!(
-                app.launcher_scroll, 3,
+                app.launcher.launcher_scroll, 3,
                 "it scrolls the cards, three rows a notch"
             );
             draw_narrow(&mut app);
-            assert_eq!(app.launcher_scroll, 3, "and the draw keeps them there");
-            assert!(app.launcher_scroll_held);
+            assert_eq!(
+                app.launcher.launcher_scroll, 3,
+                "and the draw keeps them there"
+            );
+            assert!(app.launcher.launcher_scroll_held);
 
             for _ in 0..20 {
                 mouse(&mut app, MouseEventKind::ScrollDown, x, y);
             }
-            assert_eq!(app.launcher_scroll, panel.max_scroll(), "held at the end");
+            assert_eq!(
+                app.launcher.launcher_scroll,
+                panel.max_scroll(),
+                "held at the end"
+            );
             draw_narrow(&mut app);
             assert!(
-                panel.hidden(app.launcher_scroll).above > 0,
+                panel.hidden(app.launcher.launcher_scroll).above > 0,
                 "the top of the grid has scrolled off"
             );
 
@@ -8103,7 +8330,10 @@ mod tests {
             let step = if row == 0 { 'j' } else { 'k' };
             key(&mut app, KeyCode::Char(step), KeyModifiers::NONE);
             draw_narrow(&mut app);
-            assert!(!app.launcher_scroll_held, "the keys took the scroll back");
+            assert!(
+                !app.launcher.launcher_scroll_held,
+                "the keys took the scroll back"
+            );
             let at = crate::launcher::card_cursor(&app, &bands[band]).expect("on a card");
             assert_ne!(at, a1, "{step} walked the cursor");
             assert!(
@@ -8201,8 +8431,8 @@ mod tests {
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             type_text(&mut app, "fix it");
             key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
-            let Some(Overlay::ProjectPicker(picker)) = &app.overlay else {
-                panic!("expected the project picker, got {:?}", app.overlay);
+            let Some(Overlay::ProjectPicker(picker)) = &app.modals.overlay else {
+                panic!("expected the project picker, got {:?}", app.modals.overlay);
             };
             assert_eq!(picker.matches.len(), 2);
 
@@ -8248,7 +8478,7 @@ mod tests {
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
-            assert!(app.overlay.is_none(), "the box launched");
+            assert!(app.modals.overlay.is_none(), "the box launched");
             assert!(
                 matches!(
                     out.as_slice(),
@@ -8264,7 +8494,7 @@ mod tests {
             assert_eq!(selected(&app), card, "and so did the cursor");
             assert_eq!(pane(&app), shown, "and the pane");
             assert_eq!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some("started a session in web"),
                 "the footer is the only sign of it"
             );
@@ -8319,7 +8549,7 @@ mod tests {
                 other => panic!("one CreateAgent into web's checkout: {other:?}"),
             };
             assert!(
-                app.left_behind.contains(&req_id),
+                app.requests.left_behind.contains(&req_id),
                 "the Ack moves nothing back"
             );
             assert_eq!(
@@ -8388,7 +8618,7 @@ mod tests {
                 sort_order: 2,
             });
             draw(&mut app);
-            let tabs = app.launcher_tabs.clone();
+            let tabs = app.launcher.launcher_tabs.clone();
 
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
@@ -8402,7 +8632,7 @@ mod tests {
                 "the box is aimed at it"
             );
             let _ = out;
-            assert_eq!(app.launcher_tabs, tabs, "no tab was added");
+            assert_eq!(app.launcher.launcher_tabs, tabs, "no tab was added");
             assert_eq!(
                 app.selected_project().map(|p| p.name.as_str()),
                 Some("demo")
@@ -8420,12 +8650,12 @@ mod tests {
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             type_text(&mut app, "hi");
             key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("expected the model list, got {:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("expected the model list, got {:?}", app.modals.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("Claude model"));
             key(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
                 unreachable!()
             };
             let crate::app::MenuAction::NewAgentOfKind {
@@ -8457,7 +8687,7 @@ mod tests {
             type_text(&mut app, "hi");
             key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
             let labels = |app: &App| -> Vec<String> {
-                match &app.overlay {
+                match &app.modals.overlay {
                     Some(Overlay::Menu(menu)) => {
                         menu.items.iter().map(|i| i.label.clone()).collect()
                     }
@@ -8543,7 +8773,7 @@ mod tests {
             assert!(!text.contains("polish-nav"), "the live grid: {text}");
 
             key(&mut app, KeyCode::Char('A'), KeyModifiers::SHIFT);
-            assert!(app.show_archived, "the archived view is on");
+            assert!(app.launcher.show_archived, "the archived view is on");
             let text = buffer_text(&draw(&mut app));
             assert!(text.contains("polish-nav"), "the archived card: {text}");
             assert!(!text.contains("agent-1"), "and only that one: {text}");
@@ -8558,18 +8788,18 @@ mod tests {
             );
 
             // Enter has no session to step into there.
-            app.flash = None;
+            app.chrome.flash = None;
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some(crate::event_loop::AGENT_ARCHIVED),
                 "inside={} unaimed={} focus={:?} hidden={} collapsed={} overlay={}",
-                app.launcher_expanded.is_some(),
-                app.launcher_unaimed,
-                app.focus,
-                app.launcher_pane_hidden,
-                app.collapsed,
-                app.overlay.is_some()
+                app.launcher.launcher_expanded.is_some(),
+                app.launcher.launcher_unaimed,
+                app.nav.focus,
+                app.launcher.launcher_pane_hidden,
+                app.pane.collapsed,
+                app.modals.overlay.is_some()
             );
 
             // `u` unarchives the card under the cursor where it stands.
@@ -8585,7 +8815,7 @@ mod tests {
             // And `⇧A` again is the live grid — inside the checkout of the
             // card just unarchived, the bands a step out.
             key(&mut app, KeyCode::Char('A'), KeyModifiers::SHIFT);
-            assert!(!app.show_archived);
+            assert!(!app.launcher.show_archived);
             let text = buffer_text(&draw(&mut app));
             assert!(!text.contains("archived session"), "{text}");
             assert!(text.contains("polish-nav"), "{text}");
@@ -8623,23 +8853,23 @@ mod tests {
     fn a_pane_losing_the_keyboard_says_so() {
         with_default_config(|| {
             let mut app = two_sessions();
-            app.term = Some(crate::app::AttachedTerm::new(
+            app.pane.term = Some(crate::app::AttachedTerm::new(
                 SessionRef::Agent(AgentId("a2".into())),
                 40,
                 10,
             ));
-            app.focus = Focus::Terminal;
-            app.term_locked = true;
+            app.nav.focus = Focus::Terminal;
+            app.pane.term_locked = true;
 
             // Nothing was pressed at the pane: it simply is not drawn any
             // more, and the draw settles focus back onto the cards.
-            app.launcher_pane_hidden = true;
-            app.flash = None;
+            app.launcher.launcher_pane_hidden = true;
+            app.chrome.flash = None;
             draw(&mut app);
 
-            assert!(!app.term_locked, "the keys are the grid's now");
+            assert!(!app.pane.term_locked, "the keys are the grid's now");
             assert_eq!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some(crate::app::TERMINAL_RELEASED),
                 "and the handover said so"
             );
@@ -8649,9 +8879,9 @@ mod tests {
             );
 
             // Said once, on the handover — not repainted every frame.
-            app.flash = None;
+            app.chrome.flash = None;
             draw(&mut app);
-            assert_eq!(app.flash, None, "once, not every frame");
+            assert_eq!(app.chrome.flash, None, "once, not every frame");
         });
     }
 
@@ -8662,20 +8892,20 @@ mod tests {
     fn a_previewed_pane_losing_focus_says_nothing() {
         with_default_config(|| {
             let mut app = two_sessions();
-            app.term = Some(crate::app::AttachedTerm::new(
+            app.pane.term = Some(crate::app::AttachedTerm::new(
                 SessionRef::Agent(AgentId("a2".into())),
                 40,
                 10,
             ));
-            app.focus = Focus::Terminal;
-            app.term_locked = false;
+            app.nav.focus = Focus::Terminal;
+            app.pane.term_locked = false;
 
-            app.launcher_pane_hidden = true;
-            app.flash = None;
+            app.launcher.launcher_pane_hidden = true;
+            app.chrome.flash = None;
             draw(&mut app);
 
-            assert_eq!(app.focus, Focus::Sessions, "focus still settles");
-            assert_eq!(app.flash, None, "nothing was being typed at");
+            assert_eq!(app.nav.focus, Focus::Sessions, "focus still settles");
+            assert_eq!(app.chrome.flash, None, "nothing was being typed at");
         });
     }
 
@@ -8688,7 +8918,7 @@ mod tests {
             let mut app = two_sessions();
             seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Fix the nav")]);
             seed_issues(&mut app, &[(15, "Crash on boot")]);
-            app.launcher_expanded = None;
+            app.launcher.launcher_expanded = None;
 
             let text = buffer_text(&draw(&mut app));
             assert!(text.contains("2 sessions"), "{text}");
@@ -8729,30 +8959,30 @@ mod tests {
 
             let (x, y) = crumb_cell(&app, HitTarget::LauncherPullRequests);
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            let Some(Overlay::PullRequests(view)) = &app.overlay else {
-                panic!("`2 prs` opens the pull requests: {:?}", app.overlay);
+            let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
+                panic!("`2 prs` opens the pull requests: {:?}", app.modals.overlay);
             };
             assert_eq!(view.project, project);
-            let clicked = app.overlay.take();
+            let clicked = app.modals.overlay.take();
             key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
             assert_eq!(
-                format!("{:?}", app.overlay),
+                format!("{:?}", app.modals.overlay),
                 format!("{clicked:?}"),
                 "the click is `v`"
             );
 
-            app.overlay = None;
+            app.modals.overlay = None;
             draw(&mut app);
             let (x, y) = crumb_cell(&app, HitTarget::LauncherIssues);
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            let Some(Overlay::Issues(view)) = &app.overlay else {
-                panic!("`1 issue` opens the issues: {:?}", app.overlay);
+            let Some(Overlay::Issues(view)) = &app.modals.overlay else {
+                panic!("`1 issue` opens the issues: {:?}", app.modals.overlay);
             };
             assert_eq!(view.project, project);
-            let clicked = app.overlay.take();
+            let clicked = app.modals.overlay.take();
             key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
             assert_eq!(
-                format!("{:?}", app.overlay),
+                format!("{:?}", app.modals.overlay),
                 format!("{clicked:?}"),
                 "the click is `i`"
             );
@@ -8766,7 +8996,7 @@ mod tests {
     fn the_grid_names_each_sessions_place_and_pull_request() {
         with_default_config(|| {
             let mut app = two_sessions();
-            app.pull_requests.insert(
+            app.github.pull_requests.insert(
                 WorktreeId("w2".into()),
                 Some(crate::pull_request::PullRequest {
                     number: 42,
@@ -8830,7 +9060,9 @@ mod tests {
             .selected_session()
             .map(|a| a.worktree_id.clone())
             .expect("a card under the cursor");
-        app.pull_requests.insert(worktree, Some(pull_request(42)));
+        app.github
+            .pull_requests
+            .insert(worktree, Some(pull_request(42)));
         // The pull request is on the checkout's rule, over its card.
         draw(&mut app);
         app
@@ -8839,7 +9071,8 @@ mod tests {
     /// The cell of the one pull request the grid drew on a band's rule,
     /// and the checkout it is on.
     fn pull_request_line(app: &App) -> (ratatui::layout::Rect, WorktreeId) {
-        app.hits
+        app.chrome
+            .hits
             .iter()
             .find_map(|(rect, hit)| match hit {
                 HitTarget::LauncherBandPr(wid) => Some((*rect, wid.clone())),
@@ -8871,7 +9104,7 @@ mod tests {
     /// it is there at all.
     fn pr_menu_row(app: &mut App) -> Option<usize> {
         right_click_card(app);
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::Menu(menu)) => menu
                 .items
                 .iter()
@@ -8926,12 +9159,21 @@ mod tests {
             for p in app.tree.projects.iter_mut() {
                 p.repo_path = "/nonexistent/nebula-shift-r".into();
             }
-            assert!(!app.issues_failed.contains(&pid));
+            assert!(!app.github.issues_failed.contains(&pid));
             let sent = key(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT);
             assert!(sent.is_empty(), "gh runs client-side: {sent:?}");
-            assert!(app.pr_refresh_requested, "the pull requests are re-asked");
-            assert!(app.issues_failed.contains(&pid), "and the issues with them");
-            assert_eq!(app.flash.as_deref(), Some(crate::event_loop::RELOAD_FLASH));
+            assert!(
+                app.github.pr_refresh_requested,
+                "the pull requests are re-asked"
+            );
+            assert!(
+                app.github.issues_failed.contains(&pid),
+                "and the issues with them"
+            );
+            assert_eq!(
+                app.chrome.flash.as_deref(),
+                Some(crate::event_loop::RELOAD_FLASH)
+            );
         });
     }
 
@@ -8950,7 +9192,7 @@ mod tests {
             let sent = key(&mut app, KeyCode::Char('V'), KeyModifiers::SHIFT);
             assert!(sent.is_empty(), "{sent:?}");
             assert_eq!(
-                app.flash,
+                app.chrome.flash,
                 Some(format!(
                     "no pull request on {branch} yet — ⇧R reloads from GitHub"
                 ))
@@ -8967,10 +9209,10 @@ mod tests {
         with_default_config(|| {
             let mut app = card_on_a_pull_request();
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.launcher_unaimed);
+            assert!(app.launcher.launcher_unaimed);
             let sent = key(&mut app, KeyCode::Char('V'), KeyModifiers::SHIFT);
             assert!(sent.is_empty(), "{sent:?}");
-            assert_eq!(app.flash.as_deref(), Some(super::NO_CARD_FOR_PR));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_CARD_FOR_PR));
         });
     }
 
@@ -8983,7 +9225,7 @@ mod tests {
             let mut app = card_on_a_pull_request();
             let sent = key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
             assert!(sent.is_empty(), "{sent:?}");
-            match &app.overlay {
+            match &app.modals.overlay {
                 Some(Overlay::Prompt(prompt)) => match &prompt.kind {
                     crate::app::PromptKind::PrComment {
                         number, url, label, ..
@@ -9007,19 +9249,23 @@ mod tests {
             let mut app = card_on_a_pull_request();
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
-            assert_eq!(app.flash.as_deref(), Some(super::NO_CARD_FOR_COMMENT));
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
+            assert_eq!(
+                app.chrome.flash.as_deref(),
+                Some(super::NO_CARD_FOR_COMMENT)
+            );
 
             let mut app = two_sessions();
             draw(&mut app);
             key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
             assert!(
-                app.flash
+                app.chrome
+                    .flash
                     .as_deref()
                     .is_some_and(|f| f.starts_with("no pull request on ")),
                 "{:?}",
-                app.flash
+                app.chrome.flash
             );
         });
     }
@@ -9097,7 +9343,8 @@ mod tests {
                 .find(|&i| i != cursor)
                 .expect("a second band");
             for (i, number) in [(cursor, 42), (other, 43)] {
-                app.pull_requests
+                app.github
+                    .pull_requests
                     .insert(bands[i].worktree.clone(), Some(pull_request(number)));
             }
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -9113,7 +9360,7 @@ mod tests {
                 "the cursor is on the band whose link was clicked"
             );
             assert_eq!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some("opened github.com/o/demo/pull/43"),
                 "and it is that band's pull request that opened"
             );
@@ -9141,7 +9388,7 @@ mod tests {
                 line.x,
                 line.y,
             );
-            let labels: Vec<String> = match &app.overlay {
+            let labels: Vec<String> = match &app.modals.overlay {
                 Some(Overlay::Menu(menu)) => menu.items.iter().map(|i| i.label.clone()).collect(),
                 other => panic!("expected the card's menu, got {other:?}"),
             };
@@ -9171,11 +9418,17 @@ mod tests {
             assert_eq!(underlined(&draw(&mut app)), "");
 
             mouse(&mut app, MouseEventKind::Moved, line.x + 2, line.y);
-            assert_eq!(app.hover_crumb, Some(HitTarget::LauncherBandPr(worktree)));
+            assert_eq!(
+                app.launcher.hover_crumb,
+                Some(HitTarget::LauncherBandPr(worktree))
+            );
             assert_eq!(underlined(&draw(&mut app)), "#42 Polish the nav");
 
             mouse(&mut app, MouseEventKind::Moved, line.x, line.y + 2);
-            assert_eq!(app.hover_crumb, None, "the card under the rule is no link");
+            assert_eq!(
+                app.launcher.hover_crumb, None,
+                "the card under the rule is no link"
+            );
             assert_eq!(underlined(&draw(&mut app)), "");
         });
     }
@@ -9200,6 +9453,7 @@ mod tests {
                 .hit_rect(&HitTarget::LauncherBand(other))
                 .expect("the other band's rule");
             let whole = app
+                .chrome
                 .hits
                 .iter()
                 .filter(|(_, h)| *h == HitTarget::LauncherBand(other))
@@ -9230,7 +9484,8 @@ mod tests {
             let mut app = two_sessions();
             draw(&mut app);
             assert!(
-                !app.hits
+                !app.chrome
+                    .hits
                     .iter()
                     .any(|(_, h)| matches!(h, HitTarget::LauncherBandPr(_))),
                 "no checkout has a pull request"
@@ -9249,7 +9504,7 @@ mod tests {
             assert!(sent.is_empty(), "{sent:?}");
             quick_box(&app);
             assert_ne!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some("opened github.com/o/demo/pull/42")
             );
         });
@@ -9279,7 +9534,7 @@ mod tests {
     /// Where **Duplicate** sits on the card's right-click menu.
     fn duplicate_menu_row(app: &mut App) -> usize {
         right_click_card(app);
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::Menu(menu)) => menu
                 .items
                 .iter()
@@ -9291,7 +9546,7 @@ mod tests {
 
     /// The QUICK PROMPT that is up, and what it is set to launch.
     fn quick_box(app: &App) -> QuickLaunch {
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::Prompt(prompt)) => match &prompt.kind {
                 PromptKind::QuickPrompt(launch) => launch.clone(),
                 other => panic!("expected the quick prompt, got {other:?}"),
@@ -9376,11 +9631,14 @@ mod tests {
         with_default_config(|| {
             let mut app = card_with_settings();
             keys(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
-            assert!(app.launcher_unaimed);
+            assert!(app.launcher.launcher_unaimed);
             let sent = key(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT);
             assert!(sent.is_empty(), "{sent:?}");
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
-            assert_eq!(app.flash.as_deref(), Some(super::NO_CARD_TO_DUPLICATE));
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
+            assert_eq!(
+                app.chrome.flash.as_deref(),
+                Some(super::NO_CARD_TO_DUPLICATE)
+            );
         });
     }
 
@@ -9440,7 +9698,7 @@ mod tests {
     /// there.
     fn issue_menu_row(app: &mut App) -> Option<usize> {
         right_click_card(app);
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::Menu(menu)) => menu.items.iter().position(|i| i.label == "Open issue"),
             other => panic!("expected the card's menu, got {other:?}"),
         }
@@ -9529,9 +9787,10 @@ mod tests {
     fn the_cards_issue_number_is_off_by_default() {
         with_default_config(|| {
             let app = card_from_an_issue();
-            assert!(!app.card_issue_number);
+            assert!(!app.launcher.card_issue_number);
             assert!(
-                !app.hits
+                !app.chrome
+                    .hits
                     .iter()
                     .any(|(_, h)| matches!(h, HitTarget::LauncherCardIssue(_))),
                 "no issue link drawn"
@@ -9545,7 +9804,7 @@ mod tests {
     fn right_clicking_the_cards_issue_number_opens_the_cards_menu() {
         with_default_config(|| {
             let mut app = card_from_an_issue();
-            app.card_issue_number = true;
+            app.launcher.card_issue_number = true;
             draw(&mut app);
             let id = app.selected_session().expect("a card").id;
             let chip = app
@@ -9557,7 +9816,7 @@ mod tests {
                 chip.x,
                 chip.y,
             );
-            match &app.overlay {
+            match &app.modals.overlay {
                 Some(Overlay::Menu(menu)) => assert!(
                     menu.items.iter().any(|i| i.label == "Open issue"),
                     "{:?}",
@@ -9577,7 +9836,7 @@ mod tests {
             draw(&mut app);
             let sent = key(&mut app, KeyCode::Char('I'), KeyModifiers::SHIFT);
             assert!(sent.is_empty(), "{sent:?}");
-            assert_eq!(app.flash.as_deref(), Some(super::NO_ISSUE));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_ISSUE));
             assert_eq!(issue_menu_row(&mut app), None);
         });
     }
@@ -9588,10 +9847,10 @@ mod tests {
         with_default_config(|| {
             let mut app = card_from_an_issue();
             keys(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
-            assert!(app.launcher_unaimed);
+            assert!(app.launcher.launcher_unaimed);
             let sent = key(&mut app, KeyCode::Char('I'), KeyModifiers::SHIFT);
             assert!(sent.is_empty(), "{sent:?}");
-            assert_eq!(app.flash.as_deref(), Some(super::NO_CARD_FOR_ISSUE));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_CARD_FOR_ISSUE));
         });
     }
 
@@ -9634,7 +9893,7 @@ mod tests {
         with_default_config(|| {
             let mut app = two_sessions();
             draw(&mut app);
-            let red = app.theme.err;
+            let red = app.chrome.theme.err;
             let term = draw(&mut app);
             let text = buffer_text(&term);
             assert!(
@@ -9690,9 +9949,9 @@ mod tests {
     fn a_project_tabs_name_sweeps_the_loudest_status_under_it() {
         with_default_config(|| {
             let mut app = two_sessions();
-            app.launcher_tabs.push(ProjectId("p2".into()));
+            app.launcher.launcher_tabs.push(ProjectId("p2".into()));
             draw(&mut app);
-            let th = app.theme;
+            let th = app.chrome.theme;
             let sweeps = |term: &Terminal<TestBackend>, name: &str, ramp: [Color; 3]| {
                 tab_name_colors(term, name).iter().all(|c| ramp.contains(c))
             };
@@ -9743,7 +10002,7 @@ mod tests {
             assert!(!app.status_anim_active(), "and nothing left to tick for");
 
             set(&mut app, "a2", AgentStatus::Running, false);
-            app.animations = false;
+            app.chrome.animations = false;
             assert_eq!(
                 tab_name_colors(&draw(&mut app), "demo"),
                 vec![th.accent; 4],
@@ -9762,7 +10021,7 @@ mod tests {
     fn the_header_never_overprints_its_count() {
         with_default_config(|| {
             let mut app = two_sessions();
-            app.launcher_expanded = None;
+            app.launcher.launcher_expanded = None;
             let mut counted = 0;
             // Below this the lit tab and its `×` are wider than the row.
             for width in 20..=130u16 {
@@ -9813,7 +10072,7 @@ mod tests {
                     ];
                 }
             }
-            app.launcher_expanded = None;
+            app.launcher.launcher_expanded = None;
             let text = buffer_text(&draw_at(&mut app, 130, 50));
             assert!(text.contains("› now make it sticky"), "the newest: {text}");
             assert!(!text.contains("first pass at the nav"), "{text}");
@@ -9839,7 +10098,7 @@ mod tests {
             }
             // One card a row, so a buffer row is one card's and the
             // continuation cannot be a neighbour card's text.
-            app.launcher_expanded = None;
+            app.launcher.launcher_expanded = None;
             let text = buffer_text(&draw_at(&mut app, 44, 60));
             let rows: Vec<&str> = text.lines().collect();
             let head = rows
@@ -9912,7 +10171,7 @@ mod tests {
                 (selected(&app), app.selected_project().map(|p| p.id.clone())),
                 before
             );
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
         });
     }
 
@@ -9927,13 +10186,13 @@ mod tests {
         seed_tree(&mut app);
         seed_feat(&mut app, feat.path().to_path_buf());
         seed_web(&mut app);
-        app.sel_project = project_row(&app, "p1");
+        app.nav.sel_project = project_row(&app, "p1");
         let (id, _) = sweep_target(&mut app).expect("demo's other checkout is listed");
         assert_eq!(id, WorktreeId("w2".into()));
 
         // Walked into `web`, whose only checkout is its root: the sweep
         // went with the level and has nothing to spend the tick on.
-        app.sel_project = project_row(&app, "p2");
+        app.nav.sel_project = project_row(&app, "p2");
         assert_eq!(sweep_target(&mut app), None, "the sweep followed the level");
     }
 
@@ -10005,12 +10264,13 @@ mod tests {
             );
             let at = crate::launcher::cursor(&app, &bands).expect("a card under the cursor");
             let (cell, _) = *app
+                .chrome
                 .hits
                 .iter()
                 .find(|(_, hit)| *hit == HitTarget::LauncherCard(at))
                 .expect("the cursor's card was drawn");
-            let accent = app.theme.accent;
-            let edge = app.theme.edge;
+            let accent = app.chrome.theme.accent;
+            let edge = app.chrome.theme.edge;
             assert_eq!(
                 corner(&terminal, cell),
                 accent,
@@ -10021,9 +10281,10 @@ mod tests {
             // collapsed row — the cursor is on the band, and the card is
             // the one it remembers.
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.launcher_expanded.is_none(), "closed");
+            assert!(app.launcher.launcher_expanded.is_none(), "closed");
             let terminal = draw(&mut app);
             let (cell, _) = *app
+                .chrome
                 .hits
                 .iter()
                 .find(|(_, hit)| *hit == HitTarget::LauncherCard(at))
@@ -10037,7 +10298,7 @@ mod tests {
             // A second Esc lets the aim go: no card wears the cursor,
             // though the grid still knows where it was.
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.launcher_unaimed);
+            assert!(app.launcher.launcher_unaimed);
             let terminal = draw(&mut app);
             assert_eq!(
                 corner(&terminal, cell),
@@ -10058,9 +10319,12 @@ mod tests {
                 cell.x + 2,
                 cell.y + 1,
             );
-            assert!(app.launcher_expanded.is_none(), "one click opens nothing");
-            assert!(!app.launcher_unaimed, "aimed at the card's band");
-            assert_eq!(app.focus, Focus::Sessions, "the keys stay on the grid");
+            assert!(
+                app.launcher.launcher_expanded.is_none(),
+                "one click opens nothing"
+            );
+            assert!(!app.launcher.launcher_unaimed, "aimed at the card's band");
+            assert_eq!(app.nav.focus, Focus::Sessions, "the keys stay on the grid");
             let terminal = draw(&mut app);
             assert_eq!(corner(&terminal, cell), accent);
             mouse(
@@ -10070,12 +10334,13 @@ mod tests {
                 cell.y + 1,
             );
             assert!(
-                app.launcher_expanded.is_none(),
+                app.launcher.launcher_expanded.is_none(),
                 "the second click opens nothing either"
             );
-            assert_eq!(app.focus, Focus::Terminal, "it is Enter: into the pane");
+            assert_eq!(app.nav.focus, Focus::Terminal, "it is Enter: into the pane");
             let terminal = draw(&mut app);
             let (cell, _) = *app
+                .chrome
                 .hits
                 .iter()
                 .find(|(_, hit)| *hit == HitTarget::LauncherCard(at))
@@ -10103,21 +10368,26 @@ mod tests {
             let draw = |app: &mut App| draw_at(app, 130, 50);
             draw(&mut app);
             let has_pane = |app: &App| {
-                app.hits
+                app.chrome
+                    .hits
                     .iter()
                     .any(|(_, hit)| *hit == HitTarget::LauncherPaneSplitter)
             };
             let cards_h = |app: &App| {
-                app.hits
+                app.chrome
+                    .hits
                     .iter()
                     .find(|(_, hit)| *hit == HitTarget::PanelBg(Focus::Sessions))
                     .map(|(area, _)| area.height)
                     .expect("the grid registered its background")
             };
-            let pane_h = crate::launcher::pane_height(app.launcher_body, app.launcher_pane_h)
-                .expect("34 rows fits a pane");
+            let pane_h = crate::launcher::pane_height(
+                app.launcher.launcher_body,
+                app.launcher.launcher_pane_h,
+            )
+            .expect("34 rows fits a pane");
             let grid_with_pane = cards_h(&app);
-            assert!(has_pane(&app) && !app.launcher_unaimed);
+            assert!(has_pane(&app) && !app.launcher.launcher_unaimed);
 
             // A click that misses every card leaves all of it alone:
             // same pane, same rows, same card under the cursor.
@@ -10125,7 +10395,7 @@ mod tests {
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), ax, ay);
             draw(&mut app);
             assert!(
-                has_pane(&app) && !app.launcher_unaimed,
+                has_pane(&app) && !app.launcher.launcher_unaimed,
                 "a click on the air shut the pane"
             );
             assert_eq!(cards_h(&app), grid_with_pane);
@@ -10135,28 +10405,34 @@ mod tests {
             // drawn over.
             keys(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
             draw(&mut app);
-            assert!(app.launcher_unaimed);
+            assert!(app.launcher.launcher_unaimed);
             assert!(!has_pane(&app), "nothing selected, no pane");
             assert_eq!(cards_h(&app), grid_with_pane + pane_h);
 
             // A click on a card opens it again — and only opens it.
             let (x, y) = row_cell(&app, 0);
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            assert!(!app.launcher_unaimed, "the click aimed the grid again");
+            assert!(
+                !app.launcher.launcher_unaimed,
+                "the click aimed the grid again"
+            );
             assert_eq!(
-                app.focus,
+                app.nav.focus,
                 Focus::Sessions,
                 "one click opens the pane, it does not enter it"
             );
-            assert!(!app.term_locked, "and nothing is being typed into");
+            assert!(!app.pane.term_locked, "and nothing is being typed into");
             draw(&mut app);
             assert!(has_pane(&app), "the pane came back under the cards");
             assert_eq!(cards_h(&app), grid_with_pane);
 
             // The second click on the same card is Enter, into the pane.
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            assert_eq!(app.focus, Focus::Terminal, "the second click is Enter");
-            assert!(!app.collapsed, "the pane under the grid, not full-screen");
+            assert_eq!(app.nav.focus, Focus::Terminal, "the second click is Enter");
+            assert!(
+                !app.pane.collapsed,
+                "the pane under the grid, not full-screen"
+            );
 
             // And with the keys in the pane, letting the card go takes
             // them back out with it rather than leaving FOCUS on a pane
@@ -10170,8 +10446,8 @@ mod tests {
                 !has_pane(&app),
                 "the pane collapsed out from under the keys"
             );
-            assert_eq!(app.focus, Focus::Sessions, "which handed them back");
-            assert!(!app.term_locked);
+            assert_eq!(app.nav.focus, Focus::Sessions, "which handed them back");
+            assert!(!app.pane.term_locked);
         });
     }
 
@@ -10189,26 +10465,31 @@ mod tests {
             // there is a pane to drag, and the rows the cards are laid
             // out over: the fold hands one to the other.
             let has_pane = |app: &App| {
-                app.hits
+                app.chrome
+                    .hits
                     .iter()
                     .any(|(_, hit)| *hit == HitTarget::LauncherPaneSplitter)
             };
             let cards_h = |app: &App| {
-                app.hits
+                app.chrome
+                    .hits
                     .iter()
                     .find(|(_, hit)| *hit == HitTarget::PanelBg(Focus::Sessions))
                     .map(|(area, _)| area.height)
                     .expect("the grid registered its background")
             };
-            let pane_h = crate::launcher::pane_height(app.launcher_body, app.launcher_pane_h)
-                .expect("34 rows fits a pane");
+            let pane_h = crate::launcher::pane_height(
+                app.launcher.launcher_body,
+                app.launcher.launcher_pane_h,
+            )
+            .expect("34 rows fits a pane");
             let (was_pane, grid_was) = (has_pane(&app), cards_h(&app));
-            assert!(was_pane && !app.launcher_unaimed);
+            assert!(was_pane && !app.launcher.launcher_unaimed);
 
             key(&mut app, KeyCode::Char('~'), KeyModifiers::CONTROL);
-            assert!(app.launcher_pane_hidden, "^~ folded the pane away");
+            assert!(app.launcher.launcher_pane_hidden, "^~ folded the pane away");
             assert!(
-                app.launcher_unaimed,
+                app.launcher.launcher_unaimed,
                 "folding the pane away let the card under the cursor go"
             );
             draw(&mut app);
@@ -10225,9 +10506,9 @@ mod tests {
             // The same key back: the pane returns, reading the card it is
             // aimed at again.
             key(&mut app, KeyCode::Char('~'), KeyModifiers::CONTROL);
-            assert!(!app.launcher_pane_hidden);
+            assert!(!app.launcher.launcher_pane_hidden);
             assert!(
-                !app.launcher_unaimed,
+                !app.launcher.launcher_unaimed,
                 "the pane came back without the card it reads"
             );
             draw(&mut app);
@@ -10240,10 +10521,10 @@ mod tests {
                 (KeyCode::Char('~'), KeyModifiers::NONE),
                 (KeyCode::Char('`'), KeyModifiers::CONTROL),
             ] {
-                let folded = app.launcher_pane_hidden;
+                let folded = app.launcher.launcher_pane_hidden;
                 key(&mut app, chord.0, chord.1);
                 assert_ne!(
-                    app.launcher_pane_hidden, folded,
+                    app.launcher.launcher_pane_hidden, folded,
                     "{chord:?} did not fold the pane"
                 );
                 draw(&mut app);
@@ -10261,40 +10542,49 @@ mod tests {
             draw(&mut app);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(app.focus, Focus::Terminal);
-            assert!(app.term_locked && !app.collapsed);
+            assert_eq!(app.nav.focus, Focus::Terminal);
+            assert!(app.pane.term_locked && !app.pane.collapsed);
 
             let typed = |out: &[ClientRequest]| {
                 out.iter().any(|r| matches!(r, ClientRequest::Input { .. }))
             };
             let out = key(&mut app, KeyCode::Char('~'), KeyModifiers::NONE);
             assert!(typed(&out), "a bare ~ is typed into the session: {out:?}");
-            assert!(!app.launcher_pane_hidden && app.term_locked);
+            assert!(!app.launcher.launcher_pane_hidden && app.pane.term_locked);
 
             let card = crate::launcher::cursor(&app, &crate::launcher::bands(&app));
             let out = key(&mut app, KeyCode::Char('`'), KeyModifiers::CONTROL);
             assert!(!typed(&out), "^` never reaches the session: {out:?}");
-            assert_eq!(app.focus, Focus::Sessions, "the keys are the grid's");
-            assert!(!app.term_locked);
-            assert!(!app.launcher_pane_hidden, "the first ^` left the pane up");
-            assert!(!app.launcher_unaimed, "and the card it reads selected");
+            assert_eq!(app.nav.focus, Focus::Sessions, "the keys are the grid's");
+            assert!(!app.pane.term_locked);
+            assert!(
+                !app.launcher.launcher_pane_hidden,
+                "the first ^` left the pane up"
+            );
+            assert!(
+                !app.launcher.launcher_unaimed,
+                "and the card it reads selected"
+            );
             assert_eq!(
                 crate::launcher::cursor(&app, &crate::launcher::bands(&app)),
                 card,
                 "the cursor stayed on it"
             );
             draw(&mut app);
-            assert_eq!(app.focus, Focus::Sessions);
+            assert_eq!(app.nav.focus, Focus::Sessions);
 
             // Again, from the cards: the pane folds away.
             key(&mut app, KeyCode::Char('`'), KeyModifiers::CONTROL);
-            assert!(app.launcher_pane_hidden, "the second ^` folded the pane");
-            assert_eq!(app.focus, Focus::Sessions);
+            assert!(
+                app.launcher.launcher_pane_hidden,
+                "the second ^` folded the pane"
+            );
+            assert_eq!(app.nav.focus, Focus::Sessions);
             draw(&mut app);
 
             // And once more brings it back.
             key(&mut app, KeyCode::Char('`'), KeyModifiers::CONTROL);
-            assert!(!app.launcher_pane_hidden);
+            assert!(!app.launcher.launcher_pane_hidden);
         });
     }
 
@@ -10309,18 +10599,18 @@ mod tests {
             draw(&mut app);
 
             keys(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
-            assert!(app.launcher_unaimed);
+            assert!(app.launcher.launcher_unaimed);
             let project = app.selected_project().map(|p| p.id.clone());
 
-            app.flash = None;
+            app.chrome.flash = None;
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.launcher_unaimed);
+            assert!(app.launcher.launcher_unaimed);
             assert_eq!(app.selected_project().map(|p| p.id.clone()), project);
-            assert_eq!(app.flash, None, "nothing moved, nothing said");
+            assert_eq!(app.chrome.flash, None, "nothing moved, nothing said");
 
             // A step along the bands takes the aim back.
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
-            assert!(!app.launcher_unaimed, "a step re-aimed the grid");
+            assert!(!app.launcher.launcher_unaimed, "a step re-aimed the grid");
         });
     }
 
@@ -10353,36 +10643,39 @@ mod tests {
                 feat,
                 "the box is the card's checkout"
             );
-            app.overlay = None;
+            app.modals.overlay = None;
 
             // With feat's band open as the ACCORDION, the same: the box
             // is the checkout under the cursor either way.
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded, Some(WorktreeId("w2".into())));
+            assert_eq!(
+                app.launcher.launcher_expanded,
+                Some(WorktreeId("w2".into()))
+            );
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             assert_eq!(launch(&app).0.target, feat, "the open band's checkout");
-            app.overlay = None;
+            app.modals.overlay = None;
 
             // Closed again, the band still aimed at: still feat's box, and
             // `^N` flips it onto a fresh worktree and back onto feat, not
             // onto the root.
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.launcher_expanded.is_none() && !app.launcher_unaimed);
+            assert!(app.launcher.launcher_expanded.is_none() && !app.launcher.launcher_unaimed);
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             assert_eq!(launch(&app).0.target, feat, "the band's checkout");
             key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
             assert!(launch(&app).0.is_new_worktree());
             key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
             assert_eq!(launch(&app).0.target, feat, "^N came back off feat");
-            app.overlay = None;
+            app.modals.overlay = None;
 
             // Let the aim go: off the band.
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.launcher_unaimed);
+            assert!(app.launcher.launcher_unaimed);
 
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             assert!(
-                !matches!(&app.overlay, Some(Overlay::ProjectPicker(_))),
+                !matches!(&app.modals.overlay, Some(Overlay::ProjectPicker(_))),
                 "the picker went up instead of the box"
             );
             assert_eq!(
@@ -10420,8 +10713,11 @@ mod tests {
             super::select(&mut app, AgentId("a2".into()), &mut Vec::new());
 
             key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("expected the NEW SESSION PICKER, got {:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!(
+                    "expected the NEW SESSION PICKER, got {:?}",
+                    app.modals.overlay
+                );
             };
             assert_eq!(menu.title.as_deref(), Some("New session"));
             let back = super::super::menu_quick_return(menu).expect("the rows owe a box");
@@ -10437,16 +10733,16 @@ mod tests {
             // Esc: the picker closes and nothing goes up in its place.
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             assert!(
-                app.overlay.is_none(),
+                app.modals.overlay.is_none(),
                 "Esc put up a box nobody asked for: {:?}",
-                app.overlay
+                app.modals.overlay
             );
 
             // Pick a harness other than the one the box would open on:
             // the box opens set to it, empty, aimed where p would aim.
             key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            let row_kind = match &app.overlay {
+            let row_kind = match &app.modals.overlay {
                 Some(Overlay::Menu(menu)) => match &menu.items[menu.hover].action {
                     crate::app::MenuAction::NewAgentOfKind { kind, .. } => *kind,
                     other => panic!("{other:?}"),
@@ -10462,8 +10758,8 @@ mod tests {
 
             // A parked draft aimed the same way: its text comes back, the
             // pick's harness stays, and the slot is emptied.
-            app.overlay = None;
-            app.quick_draft = Some(crate::quick_prompt::QuickDraft {
+            app.modals.overlay = None;
+            app.modals.quick_draft = Some(crate::quick_prompt::QuickDraft {
                 launch: QuickLaunch::from_config(feat.clone(), &crate::config::Config::default()),
                 input: crate::text_input::TextInput::multiline_with_text("parked words"),
             });
@@ -10473,7 +10769,7 @@ mod tests {
             let (picked, typed) = launch(&app);
             assert_eq!(typed, "parked words");
             assert_eq!(picked.kind, row_kind, "the parked spec overrode the pick");
-            assert!(app.quick_draft.is_none(), "the draft was not taken");
+            assert!(app.modals.quick_draft.is_none(), "the draft was not taken");
         });
     }
 
@@ -10496,7 +10792,7 @@ mod tests {
                     "{agent}: {:?}",
                     launch(&app).0.target
                 );
-                app.overlay = None;
+                app.modals.overlay = None;
             }
         });
     }
@@ -10513,8 +10809,8 @@ mod tests {
             key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
 
             key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
-            let Some(Overlay::ProjectPicker(picker)) = &app.overlay else {
-                panic!("expected the project picker, got {:?}", app.overlay);
+            let Some(Overlay::ProjectPicker(picker)) = &app.modals.overlay else {
+                panic!("expected the project picker, got {:?}", app.modals.overlay);
             };
             assert!(picker.back.from_box, "the box under it was forgotten");
             let to = picker
@@ -10539,6 +10835,7 @@ mod tests {
     /// falls through to the `PanelBg` the grid registers under them.
     fn air(app: &App) -> (u16, u16) {
         let (area, _) = *app
+            .chrome
             .hits
             .iter()
             .find(|(_, hit)| *hit == HitTarget::PanelBg(Focus::Sessions))
@@ -10579,7 +10876,7 @@ mod tests {
     /// `demo`'s root: its band holds five, the `feat` band one.
     fn list_of_five() -> App {
         let mut app = two_sessions();
-        app.launcher_list = true;
+        app.launcher.launcher_list = true;
         for (id, name) in [
             ("a4", "second"),
             ("a5", "third"),
@@ -10595,6 +10892,7 @@ mod tests {
     /// their index in the band, top to bottom.
     fn drawn_entries(app: &App, band: usize) -> Vec<(usize, ratatui::layout::Rect)> {
         let mut out: Vec<(usize, ratatui::layout::Rect)> = app
+            .chrome
             .hits
             .iter()
             .filter_map(|(r, h)| match h {
@@ -10618,13 +10916,13 @@ mod tests {
         with_config_json(r#"{"worktree_layout": "list"}"#, || {
             let mut app = two_sessions();
             super::super::apply_config(&mut app, &crate::config::Config::load());
-            assert!(app.launcher_list);
+            assert!(app.launcher.launcher_list);
         });
         with_default_config(|| {
             let mut app = two_sessions();
-            app.launcher_list = true;
+            app.launcher.launcher_list = true;
             super::super::apply_config(&mut app, &crate::config::Config::load());
-            assert!(!app.launcher_list, "the cards out of the box");
+            assert!(!app.launcher.launcher_list, "the cards out of the box");
         });
     }
 
@@ -10643,7 +10941,7 @@ mod tests {
             // it too (`the_cursors_session_stays_listed_on_a_collapsed_band`).
             super::select_card(&mut app, bands[0].cards[0].sref(), &mut Vec::new());
             let term = draw(&mut app);
-            assert_eq!(app.launcher_expanded, None, "collapsed by default");
+            assert_eq!(app.launcher.launcher_expanded, None, "collapsed by default");
             let entries = drawn_entries(&app, 0);
             assert_eq!(
                 entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
@@ -10683,14 +10981,17 @@ mod tests {
             );
 
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[0].worktree));
+            assert_eq!(
+                app.launcher.launcher_expanded.as_ref(),
+                Some(&bands[0].worktree)
+            );
             let screen = buffer_text(&draw(&mut app));
             assert_eq!(drawn_entries(&app, 0).len(), 5, "every session");
             assert!(screen.contains(bands[0].cards[4].name()), "{screen}");
             assert!(app.hit_rect(&HitTarget::LauncherBandMore(0)).is_none());
 
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded, None, "Tab folds it back");
+            assert_eq!(app.launcher.launcher_expanded, None, "Tab folds it back");
             draw(&mut app);
             assert_eq!(drawn_entries(&app, 0).len(), 3);
         });
@@ -10723,8 +11024,8 @@ mod tests {
     /// `demo`'s root band holds five sessions, the `feat` band one.
     fn all_open_of_five() -> App {
         let mut app = list_of_five();
-        app.launcher_list = false;
-        app.launcher_all_open = true;
+        app.launcher.launcher_list = false;
+        app.launcher.launcher_all_open = true;
         app
     }
 
@@ -10735,13 +11036,13 @@ mod tests {
         with_config_json(r#"{"expand_all_worktrees": true}"#, || {
             let mut app = two_sessions();
             super::super::apply_config(&mut app, &crate::config::Config::load());
-            assert!(app.launcher_all_open);
+            assert!(app.launcher.launcher_all_open);
         });
         with_default_config(|| {
             let mut app = two_sessions();
-            app.launcher_all_open = true;
+            app.launcher.launcher_all_open = true;
             super::super::apply_config(&mut app, &crate::config::Config::load());
-            assert!(!app.launcher_all_open, "off out of the box");
+            assert!(!app.launcher.launcher_all_open, "off out of the box");
         });
     }
 
@@ -10777,10 +11078,13 @@ mod tests {
             }
 
             // A band the accordion remembered stays remembered, unread.
-            app.launcher_expanded = Some(bands[1].worktree.clone());
+            app.launcher.launcher_expanded = Some(bands[1].worktree.clone());
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert_eq!(app.flash.as_deref(), Some(super::ALL_OPEN));
-            assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[1].worktree));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::ALL_OPEN));
+            assert_eq!(
+                app.launcher.launcher_expanded.as_ref(),
+                Some(&bands[1].worktree)
+            );
             draw_tall(&mut app);
             assert_eq!(drawn_entries(&app, 0).len(), 5, "still every card");
 
@@ -10788,17 +11092,27 @@ mod tests {
                 .hit_rect(&HitTarget::LauncherBand(1))
                 .expect("feat's rule");
             let (x, y) = (rule.x + rule.width - 2, rule.y);
-            app.flash = None;
+            app.chrome.flash = None;
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
             draw_tall(&mut app);
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            assert_eq!(app.flash.as_deref(), Some(super::ALL_OPEN), "as Tab says");
-            assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[1].worktree));
+            assert_eq!(
+                app.chrome.flash.as_deref(),
+                Some(super::ALL_OPEN),
+                "as Tab says"
+            );
+            assert_eq!(
+                app.launcher.launcher_expanded.as_ref(),
+                Some(&bands[1].worktree)
+            );
 
-            app.flash = None;
+            app.chrome.flash = None;
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.launcher_unaimed, "the first Esc lets the card go");
-            assert_eq!(app.flash.as_deref(), Some(super::UNAIMED));
+            assert!(
+                app.launcher.launcher_unaimed,
+                "the first Esc lets the card go"
+            );
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::UNAIMED));
         });
     }
 
@@ -10813,7 +11127,7 @@ mod tests {
             let bands = crate::launcher::bands(&app);
             draw_tall(&mut app);
             assert_eq!(
-                crate::launcher::expanded_layout(app.body_area, &bands[0]).rows,
+                crate::launcher::expanded_layout(app.chrome.body_area, &bands[0]).rows,
                 vec![vec![0, 1, 2], vec![3, 4]],
                 "three cards to a row at 130 columns"
             );
@@ -10876,8 +11190,8 @@ mod tests {
             draw(&mut app);
             super::select_card(&mut app, bands[1].cards[0].sref(), &mut Vec::new());
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert_eq!(app.launcher_expanded, None);
-            assert_eq!(app.flash.as_deref(), Some(super::ALL_LISTED));
+            assert_eq!(app.launcher.launcher_expanded, None);
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::ALL_LISTED));
         });
     }
 
@@ -10905,7 +11219,10 @@ mod tests {
             draw(&mut app);
             let hint = app.hit_rect(&HitTarget::LauncherBandMore(0)).unwrap();
             click_at(&mut app, hint.x + 1, hint.y);
-            assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[0].worktree));
+            assert_eq!(
+                app.launcher.launcher_expanded.as_ref(),
+                Some(&bands[0].worktree)
+            );
         });
     }
 
@@ -10929,7 +11246,7 @@ mod tests {
     /// a minute ago, `polish-nav` never.
     fn threaded() -> App {
         let mut app = two_sessions();
-        app.launcher_nested = true;
+        app.launcher.launcher_nested = true;
         unroot(&mut app);
         let now = crate::app::now_ms();
         update_agent(&mut app, "a1", |a| a.status_changed_at = now - 60 * 1000);
@@ -10960,7 +11277,7 @@ mod tests {
     /// holding three sessions and a terminal, `agent-1` the oldest.
     fn nested_root() -> App {
         let mut app = two_sessions();
-        app.launcher_nested = true;
+        app.launcher.launcher_nested = true;
         let now = crate::app::now_ms();
         update_agent(&mut app, "a1", |a| {
             a.status_changed_at = now - 30 * 60 * 1000
@@ -11030,20 +11347,20 @@ mod tests {
         with_config_json(r#"{"worktree_layout": "nested"}"#, || {
             let mut app = two_sessions();
             super::super::apply_config(&mut app, &crate::config::Config::load());
-            assert!(app.launcher_nested);
-            assert!(!app.launcher_list);
+            assert!(app.launcher.launcher_nested);
+            assert!(!app.launcher.launcher_list);
         });
         with_config_json(r#"{"worktree_layout": "list"}"#, || {
             let mut app = two_sessions();
-            app.launcher_nested = true;
+            app.launcher.launcher_nested = true;
             super::super::apply_config(&mut app, &crate::config::Config::load());
-            assert!(app.launcher_list && !app.launcher_nested);
+            assert!(app.launcher.launcher_list && !app.launcher.launcher_nested);
         });
         with_default_config(|| {
             let mut app = two_sessions();
-            app.launcher_nested = true;
+            app.launcher.launcher_nested = true;
             super::super::apply_config(&mut app, &crate::config::Config::load());
-            assert!(!app.launcher_nested, "the cards out of the box");
+            assert!(!app.launcher.launcher_nested, "the cards out of the box");
         });
     }
 
@@ -11106,7 +11423,7 @@ mod tests {
             assert!(lines[3].starts_with("    └ ❯ term-1"), "{:?}", lines[3]);
             assert_eq!(
                 term.backend().buffer()[(main[3].1.x + 6, main[3].1.y)].fg,
-                app.theme.ok,
+                app.chrome.theme.ok,
                 "green while it runs"
             );
             assert!(!lines.iter().any(|l| l.contains('●')), "no status dot");
@@ -11160,7 +11477,7 @@ mod tests {
         with_default_config(|| {
             let mut app = nested();
             let term = draw_tall(&mut app);
-            let th = app.theme;
+            let th = app.chrome.theme;
             let main = drawn_entries(&app, 0);
             let buf = term.backend().buffer();
             let root = main[0].1;
@@ -11211,8 +11528,8 @@ mod tests {
         with_default_config(|| {
             // The cursor is on `agent-1`, so `polish-nav` is the root read.
             let mut app = nested();
-            let th = app.theme;
-            app.animations = true;
+            let th = app.chrome.theme;
+            app.chrome.animations = true;
             let term = draw_tall(&mut app);
             let feat = drawn_entries(&app, 1)[0].1;
             let title: Vec<_> = (0.."polish-nav".len() as u16)
@@ -11223,7 +11540,7 @@ mod tests {
                 "a running title sweeps: {title:?}"
             );
 
-            app.animations = false;
+            app.chrome.animations = false;
             let term = draw_tall(&mut app);
             let live = &term.backend().buffer()[(feat.x + 4, feat.y)];
             assert_eq!(live.fg, th.warn, "working, held still");
@@ -11249,10 +11566,10 @@ mod tests {
     fn a_merged_pull_request_turns_its_root_purple() {
         with_default_config(|| {
             let mut app = nested();
-            let th = app.theme;
-            app.animations = false;
+            let th = app.chrome.theme;
+            app.chrome.animations = false;
             let w2 = WorktreeId("w2".into());
-            app.pull_requests.insert(
+            app.github.pull_requests.insert(
                 w2.clone(),
                 Some(crate::pull_request::PullRequest {
                     state: crate::pull_request::STATE_MERGED.into(),
@@ -11284,7 +11601,7 @@ mod tests {
             );
             assert!(!title[0].modifier.contains(Modifier::BOLD));
 
-            app.animations = true;
+            app.chrome.animations = true;
             app.note_merge_landed(w2.clone());
             let title = feat_root(&mut app);
             assert!(
@@ -11293,7 +11610,7 @@ mod tests {
                 title.iter().map(|c| c.fg).collect::<Vec<_>>()
             );
 
-            app.animations = false;
+            app.chrome.animations = false;
             super::select_card(
                 &mut app,
                 SessionRef::Agent(AgentId("a2".into())),
@@ -11334,7 +11651,10 @@ mod tests {
             );
             assert_eq!(drawn_after(&mut app, 0).len(), 2, "and does not fold");
             h(&mut app);
-            assert!(app.launcher_folded.contains(&WorktreeId("w1".into())));
+            assert!(app
+                .launcher
+                .launcher_folded
+                .contains(&WorktreeId("w1".into())));
             assert_eq!(drawn_after(&mut app, 0).len(), 1, "folded to the root");
             assert!(super::has_pane(&app), "the root session stays on screen");
             l(&mut app);
@@ -11375,7 +11695,11 @@ mod tests {
             key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
             assert!(app.band_folded(&crate::launcher::bands(&app)[0]));
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(app.focus, Focus::Terminal, "Enter opens the root session");
+            assert_eq!(
+                app.nav.focus,
+                Focus::Terminal,
+                "Enter opens the root session"
+            );
             assert!(
                 app.band_folded(&crate::launcher::bands(&app)[0]),
                 "and leaves it folded"
@@ -11402,9 +11726,15 @@ mod tests {
             let mut app = nested();
             draw_tall(&mut app);
             key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, None, "one press stays put");
+            assert_eq!(
+                app.launcher.launcher_tab_cursor, None,
+                "one press stays put"
+            );
             key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-            assert_eq!(app.launcher_tab_cursor, Some(ProjectId("p1".into())));
+            assert_eq!(
+                app.launcher.launcher_tab_cursor,
+                Some(ProjectId("p1".into()))
+            );
         });
     }
 
@@ -11419,7 +11749,10 @@ mod tests {
                 .hit_rect(&HitTarget::LauncherBandFold(0))
                 .expect("main's caret");
             click_at(&mut app, caret.x, caret.y);
-            assert!(app.launcher_folded.contains(&WorktreeId("w1".into())));
+            assert!(app
+                .launcher
+                .launcher_folded
+                .contains(&WorktreeId("w1".into())));
             assert_eq!(drawn_after(&mut app, 0).len(), 1);
             let caret = app.hit_rect(&HitTarget::LauncherBandFold(0)).unwrap();
             click_at(&mut app, caret.x, caret.y);
@@ -11434,7 +11767,7 @@ mod tests {
     fn an_empty_worktree_is_one_line_in_the_nested_layout() {
         with_default_config(|| {
             let mut app = with_empty_band();
-            app.launcher_nested = true;
+            app.launcher.launcher_nested = true;
             let term = draw_tall(&mut app);
             let (head, text) = band_header(&app, &term, 2);
             assert_eq!(head.height, 1);
@@ -11451,9 +11784,9 @@ mod tests {
             );
             key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
-            assert!(app.launcher_folded.is_empty());
+            assert!(app.launcher.launcher_folded.is_empty());
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert_eq!(app.flash.as_deref(), Some(super::NO_SESSIONS));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_SESSIONS));
         });
     }
 
@@ -11504,17 +11837,17 @@ mod tests {
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             assert!(
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if c.action == PendingAction::DeleteAgent(AgentId("a5".into()))),
                 "a child deletes alone: {:?}",
-                app.overlay
+                app.modals.overlay
             );
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
             key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
-            let Some(Overlay::Confirm(c)) = &app.overlay else {
-                panic!("the root asks: {:?}", app.overlay);
+            let Some(Overlay::Confirm(c)) = &app.modals.overlay else {
+                panic!("the root asks: {:?}", app.modals.overlay);
             };
             assert_eq!(
                 c.action,
@@ -11602,8 +11935,8 @@ mod tests {
         with_config_json(r#"{"ask_before_archive": false}"#, || {
             let mut app = nested_with_children();
             key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
-            let Some(Overlay::Confirm(c)) = &app.overlay else {
-                panic!("the root asks: {:?}", app.overlay);
+            let Some(Overlay::Confirm(c)) = &app.modals.overlay else {
+                panic!("the root asks: {:?}", app.modals.overlay);
             };
             assert_eq!(
                 c.action,
@@ -11627,7 +11960,7 @@ mod tests {
             );
             draw_tall(&mut app);
             let out = key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
-            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
             assert_eq!(archived_agents(&out), ["a6"]);
         });
     }
@@ -11645,23 +11978,23 @@ mod tests {
                 &mut out,
             );
             assert!(
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if matches!(&c.action, PendingAction::ThenDeleteWorktree { first, .. }
                         if matches!(**first, PendingAction::DeleteAllSessions { .. }))),
                 "{:?}",
-                app.overlay
+                app.modals.overlay
             );
-            app.overlay = None;
+            app.modals.overlay = None;
             super::super::run_menu_action(
                 &mut app,
                 crate::app::MenuAction::ArchiveAgent(AgentId("a1".into())),
                 &mut out,
             );
             assert!(
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if matches!(c.action, PendingAction::ArchiveThread { .. })),
                 "{:?}",
-                app.overlay
+                app.modals.overlay
             );
         });
     }
@@ -11673,7 +12006,7 @@ mod tests {
     fn deleting_every_thread_leaves_the_welcome() {
         with_config_json(r#"{"delete_empty_worktree": true}"#, || {
             let mut app = nested_with_children();
-            app.show_all_worktrees = true;
+            app.launcher.show_all_worktrees = true;
             super::select_card(
                 &mut app,
                 SessionRef::Agent(AgentId("a2".into())),
@@ -11705,8 +12038,8 @@ mod tests {
     fn expand_all_worktrees_holds_every_nested_thread_open() {
         with_default_config(|| {
             let mut app = nested();
-            app.launcher_folded.insert(WorktreeId("w1".into()));
-            app.launcher_all_open = true;
+            app.launcher.launcher_folded.insert(WorktreeId("w1".into()));
+            app.launcher.launcher_all_open = true;
             let term = draw_tall(&mut app);
             assert_eq!(drawn_entries(&app, 0).len(), 2);
             let root = row_text(&term, drawn_entries(&app, 0)[0].1);
@@ -11718,8 +12051,11 @@ mod tests {
             );
 
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            assert_eq!(app.flash.as_deref(), Some(super::ALL_OPEN));
-            assert!(app.launcher_folded.contains(&WorktreeId("w1".into())));
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::ALL_OPEN));
+            assert!(app
+                .launcher
+                .launcher_folded
+                .contains(&WorktreeId("w1".into())));
             key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
             assert_eq!(drawn_after(&mut app, 0).len(), 2, "h does not fold");
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
@@ -11734,17 +12070,17 @@ mod tests {
     fn the_nested_layout_scrolls_to_keep_the_cursors_row_on_screen() {
         with_default_config(|| {
             let mut app = list_of_five();
-            app.launcher_list = false;
-            app.launcher_nested = true;
+            app.launcher.launcher_list = false;
+            app.launcher.launcher_nested = true;
             unroot(&mut app);
-            app.launcher_pane_hidden = true;
+            app.launcher.launcher_pane_hidden = true;
             let root = SessionRef::Agent(AgentId("a1".into()));
             super::select_card(&mut app, root, &mut Vec::new());
             // A body with a three-row grid: two rows and the marker.
             let term = draw_at(&mut app, 80, 9);
             let shown = drawn_entries(&app, 0);
             assert!(shown.len() < 5, "five rows do not fit: {shown:?}");
-            assert_eq!(app.launcher_scroll, 0, "the root is the top row");
+            assert_eq!(app.launcher.launcher_scroll, 0, "the root is the top row");
             let screen = screen_text(&term);
             assert!(screen.contains("more below"), "{screen}");
 
@@ -11761,7 +12097,7 @@ mod tests {
                 .find(|(i, _)| *i == card)
                 .expect("the cursor's row is drawn");
             assert_eq!(drawn.1.height, 1);
-            assert!(app.launcher_scroll > 0);
+            assert!(app.launcher.launcher_scroll > 0);
         });
     }
 
@@ -11773,9 +12109,13 @@ mod tests {
     fn folded_threads_are_remembered_across_a_restart() {
         let mut app = nested();
         seed_running(&mut app, "a3", "w2", "later");
-        app.launcher_folded.insert(WorktreeId("w2".into()));
-        app.launcher_folded.insert(WorktreeId("gone".into()));
-        app.launcher_thread_open.insert(WorktreeId("w1".into()));
+        app.launcher.launcher_folded.insert(WorktreeId("w2".into()));
+        app.launcher
+            .launcher_folded
+            .insert(WorktreeId("gone".into()));
+        app.launcher
+            .launcher_thread_open
+            .insert(WorktreeId("w1".into()));
         let json = super::super::ui_state_json(&app);
 
         let mut back = nested();
@@ -11816,14 +12156,20 @@ mod tests {
             let mut app = nested();
             seed_running(&mut app, "a3", "w2", "later");
             draw_tall(&mut app);
-            assert!(app.launcher_folded.contains(&WorktreeId("w2".into())));
+            assert!(app
+                .launcher
+                .launcher_folded
+                .contains(&WorktreeId("w2".into())));
             super::super::jump_to_target(
                 &mut app,
                 crate::palette::PaletteTarget::Session(AgentId("a3".into())),
                 super::super::Landing::FocusOnly,
                 &mut Vec::new(),
             );
-            assert!(!app.launcher_folded.contains(&WorktreeId("w2".into())));
+            assert!(!app
+                .launcher
+                .launcher_folded
+                .contains(&WorktreeId("w2".into())));
             assert_eq!(selected(&app).as_deref(), Some("a3"));
             draw_tall(&mut app);
             assert_eq!(drawn_entries(&app, 1).len(), 2, "the child is on screen");
@@ -11835,8 +12181,8 @@ mod tests {
                 root.x + 4,
                 root.y,
             );
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("a right-click opens a menu: {:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("a right-click opens a menu: {:?}", app.modals.overlay);
             };
             let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
             assert!(labels.contains(&"Archive"), "{labels:?}");
@@ -11873,7 +12219,7 @@ mod tests {
             head: "feat".into(),
         };
         let at = std::time::Instant::now();
-        app.open_prs.insert(
+        app.github.open_prs.insert(
             ProjectId("p1".into()),
             crate::app::OpenPrs {
                 list: vec![open],
@@ -11882,7 +12228,7 @@ mod tests {
                 step: std::time::Duration::from_secs(60),
             },
         );
-        app.worktree_lines.insert(
+        app.jobs.worktree_lines.insert(
             WorktreeId("w2".into()),
             crate::git_diff::LineChanges {
                 added: 265,
@@ -11981,15 +12327,15 @@ mod tests {
             assert_eq!(link.width, 4);
 
             click_at(&mut app, link.x + 1, link.y);
-            let Some(Overlay::PullRequests(view)) = &app.overlay else {
-                panic!("the PR modal: {:?}", app.overlay);
+            let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
+                panic!("the PR modal: {:?}", app.modals.overlay);
             };
             assert_eq!(
                 view.selected_url.as_deref(),
                 Some("https://github.com/o/demo/pull/141")
             );
             assert_eq!(selected(&app).as_deref(), Some("a2"), "the cursor stayed");
-            assert_ne!(app.focus, Focus::Terminal, "no session opened");
+            assert_ne!(app.nav.focus, Focus::Terminal, "no session opened");
         });
     }
 
@@ -12059,10 +12405,10 @@ mod tests {
 
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             assert!(
-                matches!(&app.overlay, Some(Overlay::Confirm(c))
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
                     if c.action == PendingAction::DeleteAgent(AgentId("a1".into()))),
                 "{:?}",
-                app.overlay
+                app.modals.overlay
             );
             let out = key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
             assert_eq!(deleted_agents(&out), ["a1"]);
@@ -12080,7 +12426,7 @@ mod tests {
         with_default_config(|| {
             let mut app = nested_with_detail();
             let term = draw_tall(&mut app);
-            let body = app.body_area;
+            let body = app.chrome.body_area;
             let lines = strip_lines(&term);
             assert!(lines[0].starts_with("polish-nav"), "{lines:#?}");
             assert!(lines[0].ends_with("+265 −3"), "{lines:#?}");
@@ -12104,7 +12450,7 @@ mod tests {
             assert_eq!(lines[1], "agent    claude · opus · high");
             assert_eq!(lines[2], "worktree feat");
             assert!(lines[3].starts_with("pr       #141 open"));
-            assert_eq!(app.body_area, body, "the list keeps its height");
+            assert_eq!(app.chrome.body_area, body, "the list keeps its height");
 
             key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
             let lines = strip_lines(&draw_tall(&mut app));
@@ -12123,7 +12469,8 @@ mod tests {
     /// A cell on the rule of `worktree`'s band, as drawn.
     fn band_rule_cell(app: &App, worktree: &str) -> (u16, u16) {
         let bands = crate::launcher::bands(app);
-        app.hits
+        app.chrome
+            .hits
             .iter()
             .find_map(|(rect, hit)| match hit {
                 HitTarget::LauncherBand(i) if bands[*i].worktree.0 == worktree => {
@@ -12158,7 +12505,7 @@ mod tests {
             assert_eq!(app.selected_session().unwrap().id.0, "a2");
 
             key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
                 panic!("m opens the move picker");
             };
             assert_eq!(menu.title.as_deref(), Some("Move to"));
@@ -12172,7 +12519,7 @@ mod tests {
             let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(sent_move(&out), Some(("a2".into(), "w1".into())));
             assert_eq!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some("polish-nav moves to main when its turn ends")
             );
 
@@ -12184,7 +12531,7 @@ mod tests {
             let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(sent_move(&out), Some(("a2".into(), "w2root".into())));
             assert_eq!(
-                app.flash.as_deref(),
+                app.chrome.flash.as_deref(),
                 Some("polish-nav moves to web ▸ main when its turn ends")
             );
         });
@@ -12204,6 +12551,7 @@ mod tests {
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
             draw_at(&mut app, 130, 50);
             let (tx, ty) = app
+                .chrome
                 .hits
                 .iter()
                 .find_map(|(rect, hit)| match hit {
@@ -12213,7 +12561,7 @@ mod tests {
                 .expect("web's tab was drawn");
             mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), tx, ty);
             assert_eq!(
-                app.card_drag.as_ref().and_then(|d| d.over.clone()),
+                app.launcher.card_drag.as_ref().and_then(|d| d.over.clone()),
                 Some(WorktreeId("w2root".into()))
             );
             assert!(crate::launcher::project_tabs(&app)
@@ -12261,14 +12609,17 @@ mod tests {
             draw_at(&mut app, 130, 50);
             let (x, y) = row_cell(&app, 0);
             assert!(sent_move(&click_at(&mut app, x, y)).is_none());
-            assert!(app.card_drag.is_none(), "the release ends the press");
+            assert!(
+                app.launcher.card_drag.is_none(),
+                "the release ends the press"
+            );
 
             mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
             draw_at(&mut app, 130, 50);
             let (bx, by) = band_rule_cell(&app, "w1");
             mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), bx, by);
             assert_eq!(
-                app.card_drag.as_ref().and_then(|d| d.over.clone()),
+                app.launcher.card_drag.as_ref().and_then(|d| d.over.clone()),
                 Some(WorktreeId("w1".into()))
             );
             let term = draw_at(&mut app, 130, 50);
@@ -12290,9 +12641,9 @@ mod tests {
             };
             handle_terminal_event(&mut app, crossterm::event::Event::Mouse(up), &mut out);
             assert!(sent_move(&out).is_none(), "the drop asks first");
-            assert!(app.card_drag.is_none());
-            let Some(Overlay::Confirm(c)) = &app.overlay else {
-                panic!("the drop's confirm: {:?}", app.overlay);
+            assert!(app.launcher.card_drag.is_none());
+            let Some(Overlay::Confirm(c)) = &app.modals.overlay else {
+                panic!("the drop's confirm: {:?}", app.modals.overlay);
             };
             assert_eq!(
                 c.message,
@@ -12319,6 +12670,7 @@ mod tests {
             draw_at(&mut app, 130, 50);
             let bands = crate::launcher::bands(&app);
             let (last, foot) = app
+                .chrome
                 .hits
                 .iter()
                 .filter_map(|(r, hit)| match hit {
@@ -12346,7 +12698,7 @@ mod tests {
                 };
                 handle_terminal_event(&mut app, crossterm::event::Event::Mouse(event), &mut out);
             }
-            assert!(app.overlay.is_none(), "no confirm");
+            assert!(app.modals.overlay.is_none(), "no confirm");
             assert_eq!(sent_move(&out), Some(("a1".into(), "w2".into())));
         });
     }

@@ -33,13 +33,13 @@ use nebula_core::{AgentId, ClientRequest, SessionRef, WorktreeId};
 /// goes and the row's action runs. A row that is not there (a click on a
 /// blank line) does nothing.
 pub(super) fn menu_row(app: &mut App, index: usize, out: &mut Vec<ClientRequest>) {
-    let Some(Overlay::Menu(menu)) = &app.overlay else {
+    let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
         return;
     };
     let Some(action) = menu.items.get(index).map(|item| item.action.clone()) else {
         return;
     };
-    app.overlay = None;
+    app.modals.overlay = None;
     run_menu_action(app, action, out);
 }
 
@@ -49,7 +49,7 @@ pub(super) fn menu_row(app: &mut App, index: usize, out: &mut Vec<ClientRequest>
 /// browser for a pull request, an attach for a session waiting on you),
 /// which a click follows too; the two chords name theirs.
 pub(super) fn palette_row(app: &mut App, landing: Option<Landing>, out: &mut Vec<ClientRequest>) {
-    let Some(Overlay::Palette(palette)) = &app.overlay else {
+    let Some(Overlay::Palette(palette)) = &app.modals.overlay else {
         return;
     };
     let Some(target) = palette.selected_target().cloned() else {
@@ -57,7 +57,7 @@ pub(super) fn palette_row(app: &mut App, landing: Option<Landing>, out: &mut Vec
     };
     let attaches = palette.enter_attaches;
     let landing = landing.unwrap_or_else(|| Landing::for_enter_on(app, &target, attaches));
-    app.overlay = None;
+    app.modals.overlay = None;
     jump_to_target(app, target, landing, out);
 }
 
@@ -65,9 +65,9 @@ pub(super) fn palette_row(app: &mut App, landing: Option<Landing>, out: &mut Vec
 /// Enter on a typed destination: nebula leaves this machine's UI for a
 /// fresh `nebula ssh` at it (the daemon and its sessions stay up).
 pub(super) fn host(app: &mut App, entry: crate::hosts::HostEntry) {
-    app.overlay = None;
-    app.pending_ssh = Some(entry);
-    app.should_quit = true;
+    app.modals.overlay = None;
+    app.chrome.pending_ssh = Some(entry);
+    app.chrome.should_quit = true;
 }
 
 /// The METRICS modal's selected row — Enter, or a click on the row the
@@ -75,13 +75,13 @@ pub(super) fn host(app: &mut App, entry: crate::hosts::HostEntry) {
 /// session. Nebula's own rows (the daemon, this UI) carry no session and
 /// do nothing.
 pub(super) fn metrics_row(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some(Overlay::Metrics(view)) = &app.overlay else {
+    let Some(Overlay::Metrics(view)) = &app.modals.overlay else {
         return;
     };
     let Some(Some(sref)) = view.rows.get(view.selected).cloned() else {
         return;
     };
-    app.overlay = None;
+    app.modals.overlay = None;
     open_session(app, sref, out);
 }
 
@@ -160,7 +160,7 @@ pub(super) fn worktrees_row(app: &mut App, out: &mut Vec<ClientRequest>) {
         .or_else(|| app.selected_worktree_issue().map(|i| i.url.clone()));
     match link {
         Some(url) => open_link(app, &url, out),
-        None => app.focus = Focus::Sessions,
+        None => app.nav.focus = Focus::Sessions,
     }
 }
 
@@ -180,8 +180,8 @@ pub(super) fn cloud_link(app: &mut App, out: &mut Vec<ClientRequest>) -> bool {
 /// FOCUS and the input lock.
 pub(super) fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     attach_now(app, sref, out);
-    app.focus = Focus::Terminal;
-    app.term_locked = true;
+    app.nav.focus = Focus::Terminal;
+    app.pane.term_locked = true;
 }
 
 /// The FOLLOW-UP CHEVRON chosen — `Space` on the card, a click on the
@@ -199,25 +199,30 @@ pub(super) fn follow_up(app: &mut App) {
         return;
     };
     if let SessionRow::Agent(a) = &row {
-        if app.follow_up.as_ref().is_some_and(|f| f.agent == a.id) {
-            app.follow_up = None;
-            app.dirty = true;
+        if app
+            .modals
+            .follow_up
+            .as_ref()
+            .is_some_and(|f| f.agent == a.id)
+        {
+            app.modals.follow_up = None;
+            app.chrome.dirty = true;
             return;
         }
     }
     if let Some(why) = no_follow_up(app, &row) {
-        app.flash = Some(why);
+        app.chrome.flash = Some(why);
         return;
     }
     let SessionRow::Agent(a) = row else {
         return;
     };
-    app.follow_up = Some(FollowUp {
+    app.modals.follow_up = Some(FollowUp {
         agent: a.id,
         input: crate::text_input::TextInput::multiline(),
     });
-    app.focus = Focus::Sessions;
-    app.dirty = true;
+    app.nav.focus = Focus::Sessions;
+    app.chrome.dirty = true;
 }
 
 /// Why `row` takes no follow-up, or None when it does. Both composers
@@ -258,11 +263,11 @@ pub(super) fn delete_worktree(app: &mut App, id: &WorktreeId) {
         return;
     };
     if w.is_main {
-        app.flash = Some("cannot delete the main checkout".into());
+        app.chrome.flash = Some("cannot delete the main checkout".into());
         return;
     }
     if app.is_placeholder_worktree(id) {
-        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        app.chrome.flash = Some(WORKTREE_STILL_CREATING.into());
         return;
     }
     let live_here = app
@@ -277,7 +282,7 @@ pub(super) fn delete_worktree(app: &mut App, id: &WorktreeId) {
             .iter()
             .filter(|t| &t.worktree_id == id)
             .count();
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+    app.modals.overlay = Some(Overlay::Confirm(ConfirmDialog {
         title: "Delete worktree".into(),
         message: format!(
             "Delete worktree '{}' from disk? {live_here} session(s) will be killed.",

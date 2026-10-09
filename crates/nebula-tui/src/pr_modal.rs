@@ -169,7 +169,7 @@ pub(crate) fn open(app: &mut App) {
 /// the list does not hold starts on its first row.
 pub(crate) fn open_on(app: &mut App, url: Option<&str>) {
     let Some(project) = app.selected_project().cloned() else {
-        app.flash = Some("pull requests: select a project first".into());
+        app.chrome.flash = Some("pull requests: select a project first".into());
         return;
     };
     let mut view = PullRequestsView::new(
@@ -183,14 +183,14 @@ pub(crate) fn open_on(app: &mut App, url: Option<&str>) {
         .unwrap_or(0);
     view.selected = clamp_selection(start as i64, list.len());
     view.selected_url = list.get(view.selected).map(|pr| pr.url.clone());
-    app.overlay = Some(Overlay::PullRequests(view));
+    app.modals.overlay = Some(Overlay::PullRequests(view));
     // A list the beat landed moments ago is the answer; an older one
     // paints now while a fresh copy lands underneath.
     if !is_fresh(app, &project.id) {
         request_list(app, &project.id);
     }
     schedule_detail(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Close the modal. The pane behind reads the Worktrees cursor's pull
@@ -198,28 +198,30 @@ pub(crate) fn open_on(app: &mut App, url: Option<&str>) {
 /// was waiting on — so that one is armed again, without touching the
 /// pane's scroll.
 fn close(app: &mut App) {
-    app.overlay = None;
+    app.modals.overlay = None;
     let pending = app.previewed_pr().and_then(|pr| {
         let dir = app.selected_project()?.repo_path.clone();
         pending_for(app, pr.url, pr.number, dir)
     });
-    app.pending_pr_detail = pending.map(|p| (p, std::time::Instant::now() + DETAIL_DEBOUNCE));
+    app.github.pending_pr_detail =
+        pending.map(|p| (p, std::time::Instant::now() + DETAIL_DEBOUNCE));
 }
 
 /// Put the modal back as it was — the COMMENT BOX stood in for it — on the
 /// same pull request, followed by URL in case the list moved underneath.
 pub(crate) fn reopen(app: &mut App, view: PullRequestsView) {
-    app.overlay = Some(Overlay::PullRequests(view));
+    app.modals.overlay = Some(Overlay::PullRequests(view));
     list_changed(app);
     schedule_detail(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// The project's open pull requests, as the group shows them (drafts and
 /// all: the modal lists everything open, whatever `hide_draft_prs` keeps
 /// out of the panel).
 fn rows<'a>(app: &'a App, project: &ProjectId) -> &'a [OpenPr] {
-    app.open_prs
+    app.github
+        .open_prs
         .get(project)
         .map_or(&[], |open| open.list.as_slice())
 }
@@ -261,7 +263,8 @@ fn cursor_index(view: &PullRequestsView, list: &[OpenPr]) -> Option<usize> {
 
 /// A list that landed within [`FRESH`]: the modal opens on it as it is.
 fn is_fresh(app: &App, project: &ProjectId) -> bool {
-    app.open_prs
+    app.github
+        .open_prs
         .get(project)
         .is_some_and(|open| open.at.elapsed() < FRESH)
 }
@@ -271,16 +274,16 @@ fn is_fresh(app: &App, project: &ProjectId) -> bool {
 /// the selected project, the modal's. A lookup already in flight is left
 /// to land.
 fn request_list(app: &mut App, project: &ProjectId) {
-    if let Some(open) = app.open_prs.get_mut(project) {
+    if let Some(open) = app.github.open_prs.get_mut(project) {
         open.due = std::time::Instant::now();
     }
-    app.pr_refresh_requested = true;
+    app.github.pr_refresh_requested = true;
 }
 
 /// The pull request under the cursor, while the modal is up and the list
 /// has a row the filter shows.
 fn selected_pr(app: &App) -> Option<OpenPr> {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return None;
     };
     let list = rows(app, &view.project);
@@ -297,8 +300,12 @@ fn selected_url(app: &App) -> Option<String> {
 /// hydrated (`pr_detail_stale`), which shows at once and is fetched fresh
 /// over the top, as the pane's is.
 fn pending_for(app: &App, url: String, number: u64, dir: PathBuf) -> Option<PendingPrDetail> {
-    let fresh = app.pr_detail.contains_key(&url) && !app.pr_detail_stale.contains(&url);
-    if fresh || app.pr_detail_inflight.contains(&url) || app.pr_detail_failed.contains(&url) {
+    let fresh =
+        app.github.pr_detail.contains_key(&url) && !app.github.pr_detail_stale.contains(&url);
+    if fresh
+        || app.github.pr_detail_inflight.contains(&url)
+        || app.github.pr_detail_failed.contains(&url)
+    {
         return None;
     }
     Some(PendingPrDetail { url, number, dir })
@@ -310,12 +317,13 @@ fn pending_for(app: &App, url: String, number: u64, dir: PathBuf) -> Option<Pend
 /// While the modal is up this is the one that decides what that slot holds
 /// (`event_loop::schedule_pr_detail` defers to it).
 pub(crate) fn schedule_detail(app: &mut App) {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
     let dir = view.dir.clone();
     let pending = selected_pr(app).and_then(|pr| pending_for(app, pr.url, pr.number, dir));
-    app.pending_pr_detail = pending.map(|p| (p, std::time::Instant::now() + DETAIL_DEBOUNCE));
+    app.github.pending_pr_detail =
+        pending.map(|p| (p, std::time::Instant::now() + DETAIL_DEBOUNCE));
 }
 
 /// The list under the modal changed — an answer landed, or a detail said
@@ -324,7 +332,7 @@ pub(crate) fn schedule_detail(app: &mut App) {
 /// cursor on the row that took its index, with that row's body asked for
 /// and the pane rewound. Run from wherever `App::open_prs` changes.
 pub(crate) fn list_changed(app: &mut App) {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
     let list = rows(app, &view.project);
@@ -339,7 +347,7 @@ pub(crate) fn list_changed(app: &mut App) {
             (i, list.get(i).map(|pr| pr.url.clone()))
         }
     };
-    let Some(Overlay::PullRequests(view)) = &mut app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &mut app.modals.overlay else {
         return;
     };
     let moved = url != view.selected_url;
@@ -349,19 +357,19 @@ pub(crate) fn list_changed(app: &mut App) {
         view.scroll = 0;
         schedule_detail(app);
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Move the cursor to `index` (clamped): the pane rewinds and the row's
 /// body is asked for once the cursor rests.
 fn select(app: &mut App, index: i64) {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
     let list = rows(app, &view.project);
     let next = clamp_selection(index, list.len());
     let url = list.get(next).map(|pr| pr.url.clone());
-    let Some(Overlay::PullRequests(view)) = &mut app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &mut app.modals.overlay else {
         return;
     };
     if next != view.selected || url != view.selected_url {
@@ -370,13 +378,13 @@ fn select(app: &mut App, index: i64) {
         view.scroll = 0;
     }
     schedule_detail(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// ↑/↓, the wheel: the cursor `delta` rows through the visible ones —
 /// the filter's matches while one is typed — clamped at either end.
 fn step(app: &mut App, delta: i64) {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
     let list = rows(app, &view.project);
@@ -398,7 +406,7 @@ fn step(app: &mut App, delta: i64) {
 /// nothing matches moves nothing: the list says so, the pane has no row
 /// to read, and the next letter or Backspace decides.
 fn query_changed(app: &mut App) {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
     let list = rows(app, &view.project);
@@ -411,12 +419,12 @@ fn query_changed(app: &mut App) {
         Some(index) => select(app, index as i64),
         None => schedule_detail(app),
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Esc: the filter cleared, the cursor staying on the row it was on.
 fn clear_query(app: &mut App) {
-    if let Some(Overlay::PullRequests(view)) = &mut app.overlay {
+    if let Some(Overlay::PullRequests(view)) = &mut app.modals.overlay {
         view.query.clear();
     }
     query_changed(app);
@@ -426,7 +434,7 @@ fn clear_query(app: &mut App) {
 /// rows as typing it would. True whenever the modal is up: the filter is
 /// always live.
 pub(crate) fn paste(app: &mut App, text: &str) -> bool {
-    let Some(Overlay::PullRequests(view)) = &mut app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &mut app.modals.overlay else {
         return false;
     };
     view.query.insert_str(text);
@@ -437,15 +445,15 @@ pub(crate) fn paste(app: &mut App, text: &str) -> bool {
 /// `Ctrl+r`: ask for the list again now, and the selected pull request's body
 /// over the cached copy. The rows stay until the answer lands.
 fn refresh(app: &mut App) {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
     let (project, dir) = (view.project.clone(), view.dir.clone());
     request_list(app, &project);
     if let Some(pr) = selected_pr(app) {
-        if !app.pr_detail_inflight.contains(&pr.url) {
-            app.pr_detail_failed.remove(&pr.url);
-            app.pending_pr_detail = Some((
+        if !app.github.pr_detail_inflight.contains(&pr.url) {
+            app.github.pr_detail_failed.remove(&pr.url);
+            app.github.pending_pr_detail = Some((
                 PendingPrDetail {
                     url: pr.url,
                     number: pr.number,
@@ -455,8 +463,8 @@ fn refresh(app: &mut App) {
             ));
         }
     }
-    app.flash = Some("refreshing pull requests…".into());
-    app.dirty = true;
+    app.chrome.flash = Some("refreshing pull requests…".into());
+    app.chrome.dirty = true;
 }
 
 // ---- launching ----
@@ -465,12 +473,12 @@ fn refresh(app: &mut App) {
 /// this pull request: the `quick_prompt_kind` SETTING's harness, the pull
 /// request carried as `QuickLaunch::pr`, addressed to the project's root.
 fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return None;
     };
     let project = view.project.clone();
     let Some(pr) = selected_pr(app) else {
-        app.flash = Some("no pull request selected".into());
+        app.chrome.flash = Some("no pull request selected".into());
         return None;
     };
     crate::quick_prompt::pr_launch_for(app, &project, &pr)
@@ -481,7 +489,7 @@ fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
 /// puts the modal back on the row (`QuickLaunch::under`), and the launch
 /// closes it onto the new session's card.
 fn open_prompt_for_selected(app: &mut App) {
-    let under = ModalUnder::of(app.overlay.as_ref());
+    let under = ModalUnder::of(app.modals.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
         crate::quick_prompt::open_pr_box(app, launch.with_under(under));
     }
@@ -492,7 +500,7 @@ fn open_prompt_for_selected(app: &mut App) {
 /// hands its pick to that same box with the preset applied; Esc puts the
 /// modal back on the row.
 fn open_preset_for_selected(app: &mut App) {
-    let under = ModalUnder::of(app.overlay.as_ref());
+    let under = ModalUnder::of(app.modals.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
         crate::quick_prompt::open_preset_picker(app, QuickReturn::fresh(launch.with_under(under)));
     }
@@ -502,17 +510,17 @@ fn open_preset_for_selected(app: &mut App) {
 /// request — `n` on the group's row — launching bare on Enter, or through
 /// the MODEL / EFFORT submenus on `→`.
 fn open_harness_picker_for_selected(app: &mut App) {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
     let project = view.project.clone();
     let Some(pr) = selected_pr(app) else {
-        app.flash = Some("no pull request selected".into());
+        app.chrome.flash = Some("no pull request selected".into());
         return;
     };
     // The PROJECT's ROOT WORKTREE: what a PR SESSION create is addressed to.
     let Some(root) = app.root_worktree(&project) else {
-        app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
+        app.chrome.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
         return;
     };
     crate::agent_picker::open_kind_picker(
@@ -525,15 +533,19 @@ fn open_harness_picker_for_selected(app: &mut App) {
 /// modal so Enter and Esc come back to it on the row. A draft a refused
 /// post left for this pull request fills the box.
 fn open_comment_for_selected(app: &mut App) {
-    let Some(Overlay::PullRequests(view)) = &app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &app.modals.overlay else {
         return;
     };
     let view = view.clone();
     let Some(pr) = selected_pr(app) else {
-        app.flash = Some("no pull request selected".into());
+        app.chrome.flash = Some("no pull request selected".into());
         return;
     };
-    let draft = app.pr_comment_drafts.remove(&pr.url).unwrap_or_default();
+    let draft = app
+        .github
+        .pr_comment_drafts
+        .remove(&pr.url)
+        .unwrap_or_default();
     crate::event_loop::reopen_prompt_with(
         app,
         PromptKind::PrComment {
@@ -565,7 +577,7 @@ pub(crate) fn open_in_browser(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// letters type — the modal's own hotkey and `q` among them — and the
 /// verbs are chords; only Esc closes, once the filter is clear.
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
-    let Some(Overlay::PullRequests(view)) = &mut app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &mut app.modals.overlay else {
         return;
     };
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -619,7 +631,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
             }
         }
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Mouse in the PULL REQUESTS MODAL: the wheel moves the cursor over the
@@ -635,7 +647,7 @@ pub(crate) fn handle_mouse(
     mouse_pos: Position,
     out: &mut Vec<ClientRequest>,
 ) {
-    let Some(Overlay::PullRequests(view)) = &mut app.overlay else {
+    let Some(Overlay::PullRequests(view)) = &mut app.modals.overlay else {
         return;
     };
     let over_body = view.body_area.contains(mouse_pos);
@@ -653,6 +665,7 @@ pub(crate) fn handle_mouse(
             let first = view.window_start(list.height as usize);
             // The row math counts the filter's matches, not the whole list.
             let prs: &[OpenPr] = app
+                .github
                 .open_prs
                 .get(&view.project)
                 .map_or(&[], |open| open.list.as_slice());
@@ -669,7 +682,7 @@ pub(crate) fn handle_mouse(
         }
         _ => {}
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// The footer's key line for the modal.
@@ -806,11 +819,11 @@ pub(crate) fn draw(
     .areas(area);
 
     let rows: Vec<OpenPr> = rows(app, &view.project).to_vec();
-    let inflight = app.open_prs_inflight.contains(&view.project);
-    let asked = app.open_prs.contains_key(&view.project);
+    let inflight = app.github.open_prs_inflight.contains(&view.project);
+    let asked = app.github.open_prs.contains_key(&view.project);
     // The last ask came back with nothing — these rows are the last
     // answer that worked, however old — and no second ask is running yet.
-    let stale = app.open_prs_failed.contains(&view.project) && !inflight;
+    let stale = app.github.open_prs_failed.contains(&view.project) && !inflight;
     // The rows the filter leaves, and where the cursor sits among them.
     let visible = visible_rows(&view.query, &rows);
     let cursor = cursor_index(view, &rows);
@@ -897,9 +910,9 @@ pub(crate) fn draw(
     let lines: Vec<Line> = match current {
         Some(pr) => lines(
             pr,
-            app.pr_detail.get(&pr.url),
-            app.pr_detail_failed.contains(&pr.url),
-            app.pr_comment_inflight.contains(&pr.url),
+            app.github.pr_detail.get(&pr.url),
+            app.github.pr_detail_failed.contains(&pr.url),
+            app.github.pr_comment_inflight.contains(&pr.url),
             body_a.width.saturating_sub(2) as usize,
             th,
         ),
@@ -926,7 +939,7 @@ pub(crate) fn draw(
             f,
             body_a,
             (body_title.chars().count() + 2) as u16,
-            app.hover_crumb == Some(HitTarget::ModalBrowser),
+            app.launcher.hover_crumb == Some(HitTarget::ModalBrowser),
             th,
         ),
         None => Rect::default(),
@@ -936,7 +949,7 @@ pub(crate) fn draw(
 
     // Write-back (draw works on a clone): the rects the mouse hit-tests,
     // the pane's size for paging, and the clamped cursor and scroll.
-    if let Some(Overlay::PullRequests(v)) = &mut app.overlay {
+    if let Some(Overlay::PullRequests(v)) = &mut app.modals.overlay {
         v.area = area;
         v.list_area = rows_area;
         v.cursor_row = cursor_row;
@@ -1010,7 +1023,7 @@ mod tests {
             });
         }
         let now = std::time::Instant::now();
-        app.open_prs.insert(
+        app.github.open_prs.insert(
             project.clone(),
             crate::app::OpenPrs {
                 list,
@@ -1032,14 +1045,17 @@ mod tests {
     }
 
     fn view(app: &App) -> &PullRequestsView {
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::PullRequests(v)) => v,
             other => panic!("expected the pull requests modal, got {other:?}"),
         }
     }
 
     fn pending_url(app: &App) -> Option<&str> {
-        app.pending_pr_detail.as_ref().map(|(p, _)| p.url.as_str())
+        app.github
+            .pending_pr_detail
+            .as_ref()
+            .map(|(p, _)| p.url.as_str())
     }
 
     fn screen(app: &mut App, w: u16, h: u16) -> String {
@@ -1047,10 +1063,10 @@ mod tests {
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| {
-            let Some(Overlay::PullRequests(v)) = app.overlay.clone() else {
+            let Some(Overlay::PullRequests(v)) = app.modals.overlay.clone() else {
                 panic!("no pull requests modal");
             };
-            draw(f, app, &v, app.theme, false);
+            draw(f, app, &v, app.chrome.theme, false);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -1078,15 +1094,18 @@ mod tests {
             Some("https://github.com/o/r/pull/42")
         );
         assert_eq!(pending_url(&app), Some("https://github.com/o/r/pull/42"));
-        assert!(!app.pr_refresh_requested, "fresh: nothing to ask");
+        assert!(!app.github.pr_refresh_requested, "fresh: nothing to ask");
 
-        app.overlay = None;
+        app.modals.overlay = None;
         let stale = std::time::Instant::now()
             .checked_sub(FRESH + std::time::Duration::from_secs(1))
             .expect("machine up for a minute");
-        app.open_prs.get_mut(&project).unwrap().at = stale;
+        app.github.open_prs.get_mut(&project).unwrap().at = stale;
         open(&mut app);
-        assert!(app.pr_refresh_requested, "stale: asked on the next turn");
+        assert!(
+            app.github.pr_refresh_requested,
+            "stale: asked on the next turn"
+        );
         assert!(app.open_prs_lookup_due(&project), "past its beat");
     }
 
@@ -1096,11 +1115,13 @@ mod tests {
     fn a_read_body_arms_nothing_and_a_hydrated_one_is_fetched_again() {
         let (mut app, _) = app_with(vec![pr(42, "Fix login", false)], true);
         let url = "https://github.com/o/r/pull/42".to_string();
-        app.pr_detail.insert(url.clone(), detail(42, "Fix login"));
+        app.github
+            .pr_detail
+            .insert(url.clone(), detail(42, "Fix login"));
         open(&mut app);
         assert_eq!(pending_url(&app), None, "read: nothing to ask");
-        app.overlay = None;
-        app.pr_detail_stale.insert(url.clone());
+        app.modals.overlay = None;
+        app.github.pr_detail_stale.insert(url.clone());
         open(&mut app);
         assert_eq!(pending_url(&app), Some(url.as_str()));
     }
@@ -1129,19 +1150,19 @@ mod tests {
         for letter in ['q', 'v'] {
             handle_key(&mut app, key(KeyCode::Char(letter)), &mut Vec::new());
             assert!(
-                matches!(&app.overlay, Some(Overlay::PullRequests(_))),
+                matches!(&app.modals.overlay, Some(Overlay::PullRequests(_))),
                 "{letter} types rather than closing"
             );
         }
         assert_eq!(view(&app).query.as_str(), "qv");
         handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
         assert!(
-            matches!(&app.overlay, Some(Overlay::PullRequests(_))),
+            matches!(&app.modals.overlay, Some(Overlay::PullRequests(_))),
             "the first Esc only clears the filter"
         );
         assert!(view(&app).query.is_empty());
         handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
-        assert!(app.overlay.is_none(), "the second closes");
+        assert!(app.modals.overlay.is_none(), "the second closes");
     }
 
     /// A refresh that reorders the list keeps the cursor on its pull
@@ -1155,8 +1176,8 @@ mod tests {
         );
         open(&mut app);
         handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
-        app.pending_pr_detail = None;
-        app.open_prs.get_mut(&project).unwrap().list = vec![
+        app.github.pending_pr_detail = None;
+        app.github.open_prs.get_mut(&project).unwrap().list = vec![
             pr(43, "New", false),
             pr(42, "Fix login", false),
             pr(41, "Spike", true),
@@ -1165,10 +1186,10 @@ mod tests {
         assert_eq!(view(&app).selected, 2, "still on #41");
         assert_eq!(pending_url(&app), None, "same row: nothing re-armed");
 
-        if let Some(Overlay::PullRequests(v)) = &mut app.overlay {
+        if let Some(Overlay::PullRequests(v)) = &mut app.modals.overlay {
             v.scroll = 5;
         }
-        app.open_prs.get_mut(&project).unwrap().list =
+        app.github.open_prs.get_mut(&project).unwrap().list =
             vec![pr(43, "New", false), pr(42, "Fix login", false)];
         list_changed(&mut app);
         assert_eq!(view(&app).selected, 1, "#41 merged: its neighbour");
@@ -1198,8 +1219,8 @@ mod tests {
             open(&mut app);
             handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
             handle_key(&mut app, key(KeyCode::Enter), &mut Vec::new());
-            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-                panic!("Enter: expected the box, got {:?}", app.overlay);
+            let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+                panic!("Enter: expected the box, got {:?}", app.modals.overlay);
             };
             let PromptKind::QuickPrompt(launch) = &prompt.kind else {
                 panic!("{:?}", prompt.kind);
@@ -1216,10 +1237,10 @@ mod tests {
                 open(&mut app);
                 handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
                 handle_key(&mut app, preset_key, &mut Vec::new());
-                let Some(Overlay::AgentPresets(presets)) = &app.overlay else {
+                let Some(Overlay::AgentPresets(presets)) = &app.modals.overlay else {
                     panic!(
                         "Shift+Tab: expected the preset picker, got {:?}",
-                        app.overlay
+                        app.modals.overlay
                     );
                 };
                 let back = presets.quick.as_ref().expect("a picker for a launch");
@@ -1228,25 +1249,29 @@ mod tests {
             }
             // A PR SESSION runs in the pull request's own checkout: the
             // list's NEW WORKTREE `Tab` has nothing to flip, and says so.
-            app.flash = None;
+            app.chrome.flash = None;
             crate::event_loop::handle_overlay_key(&mut app, key(KeyCode::Tab), &mut Vec::new());
-            let Some(Overlay::AgentPresets(presets)) = &app.overlay else {
-                panic!("Tab keeps the picker up, got {:?}", app.overlay);
+            let Some(Overlay::AgentPresets(presets)) = &app.modals.overlay else {
+                panic!("Tab keeps the picker up, got {:?}", app.modals.overlay);
             };
             assert!(presets.aim.is_none(), "{:?}", presets.aim);
             assert!(
-                app.flash
+                app.chrome
+                    .flash
                     .as_deref()
                     .is_some_and(|f| f.contains("own checkout")),
                 "{:?}",
-                app.flash
+                app.chrome.flash
             );
 
             open(&mut app);
             handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
             handle_key(&mut app, key(KeyCode::Tab), &mut Vec::new());
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("Tab: expected the harness picker, got {:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!(
+                    "Tab: expected the harness picker, got {:?}",
+                    app.modals.overlay
+                );
             };
             assert_eq!(menu.title.as_deref(), Some("New PR session · #41"));
             assert!(!menu.items.is_empty());
@@ -1261,14 +1286,14 @@ mod tests {
             let (mut app, _) = app_with(vec![pr(42, "Fix login", false)], false);
             for launch_key in [KeyCode::Enter, KeyCode::BackTab, KeyCode::Tab] {
                 open(&mut app);
-                app.flash = None;
+                app.chrome.flash = None;
                 handle_key(&mut app, key(launch_key), &mut Vec::new());
                 assert!(
-                    matches!(&app.overlay, Some(Overlay::PullRequests(_))),
+                    matches!(&app.modals.overlay, Some(Overlay::PullRequests(_))),
                     "{launch_key:?}: the modal stays"
                 );
                 assert_eq!(
-                    app.flash.as_deref(),
+                    app.chrome.flash.as_deref(),
                     Some("the project has no ROOT WORKTREE for this PR session"),
                     "{launch_key:?}"
                 );
@@ -1288,8 +1313,11 @@ mod tests {
             open(&mut app);
             handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
             handle_key(&mut app, ctrl('c'), &mut Vec::new());
-            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-                panic!("Ctrl+c: expected the comment box, got {:?}", app.overlay);
+            let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+                panic!(
+                    "Ctrl+c: expected the comment box, got {:?}",
+                    app.modals.overlay
+                );
             };
             assert!(prompt.is_multiline());
             assert_eq!(prompt.title, "Comment on #41 Spike");
@@ -1317,8 +1345,11 @@ mod tests {
             open(&mut app);
             handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
             handle_key(&mut app, ctrl('y'), &mut Vec::new());
-            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-                panic!("Ctrl+y: expected the comment box, got {:?}", app.overlay);
+            let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+                panic!(
+                    "Ctrl+y: expected the comment box, got {:?}",
+                    app.modals.overlay
+                );
             };
             let PromptKind::PrComment { number, back, .. } = &prompt.kind else {
                 panic!("{:?}", prompt.kind);
@@ -1346,8 +1377,8 @@ mod tests {
             open(&mut app);
             handle_key(&mut app, key(KeyCode::Down), &mut Vec::new());
             handle_key(&mut app, key(KeyCode::Enter), &mut Vec::new());
-            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-                panic!("expected the box, got {:?}", app.overlay);
+            let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+                panic!("expected the box, got {:?}", app.modals.overlay);
             };
             let PromptKind::QuickPrompt(launch) = &prompt.kind else {
                 panic!("{:?}", prompt.kind);
@@ -1389,7 +1420,7 @@ mod tests {
                 )),
                 "the PR session is created: {out:?}"
             );
-            assert!(app.overlay.is_none(), "the launch closes the modal");
+            assert!(app.modals.overlay.is_none(), "the launch closes the modal");
         });
     }
 
@@ -1437,7 +1468,7 @@ mod tests {
         assert!(before.contains("reading it…"), "{before}");
         assert!(view(&app).list_area.height > 0, "rects written back");
 
-        app.pr_detail.insert(
+        app.github.pr_detail.insert(
             "https://github.com/o/r/pull/42".into(),
             detail(42, "Fix login"),
         );
@@ -1445,7 +1476,8 @@ mod tests {
         assert!(after.contains("Stops the login bounce."), "{after}");
         assert!(!after.contains("reading it…"), "{after}");
 
-        app.pr_comment_inflight
+        app.github
+            .pr_comment_inflight
             .insert("https://github.com/o/r/pull/42".into());
         let posting = screen(&mut app, 120, 30);
         assert!(posting.contains("posting your comment…"), "{posting}");
@@ -1458,7 +1490,7 @@ mod tests {
         let (mut app, project) = app_with(vec![], true);
         open(&mut app);
         assert!(screen(&mut app, 100, 20).contains("no open pull requests"));
-        app.open_prs.remove(&project);
+        app.github.open_prs.remove(&project);
         assert!(screen(&mut app, 100, 20).contains("asking GitHub…"));
     }
 
@@ -1475,7 +1507,7 @@ mod tests {
         assert!(!fine.contains("couldn't refresh"), "{fine}");
         let first_row = view(&app).list_area.y;
 
-        app.open_prs_failed.insert(project.clone());
+        app.github.open_prs_failed.insert(project.clone());
         let stale = screen(&mut app, 100, 20);
         assert!(stale.contains("couldn't refresh (^r retries)"), "{stale}");
         assert!(stale.contains("#42 Fix login"), "{stale}");
@@ -1485,19 +1517,19 @@ mod tests {
             "the rows' hit area starts under the note"
         );
 
-        app.open_prs_inflight.insert(project.clone());
+        app.github.open_prs_inflight.insert(project.clone());
         // Wide enough for the title to say it in full.
         let retrying = screen(&mut app, 160, 20);
         assert!(!retrying.contains("couldn't refresh"), "{retrying}");
         assert!(retrying.contains("refreshing…"), "{retrying}");
-        app.open_prs_inflight.remove(&project);
+        app.github.open_prs_inflight.remove(&project);
 
-        app.open_prs.get_mut(&project).unwrap().list = vec![];
+        app.github.open_prs.get_mut(&project).unwrap().list = vec![];
         let never = screen(&mut app, 100, 20);
         assert!(never.contains("couldn't ask GitHub"), "{never}");
         assert!(!never.contains("no open pull requests"), "{never}");
 
-        app.open_prs_failed.remove(&project);
+        app.github.open_prs_failed.remove(&project);
         let answered = screen(&mut app, 100, 20);
         assert!(!answered.contains("couldn't"), "{answered}");
         assert!(answered.contains("no open pull requests"), "{answered}");
@@ -1512,7 +1544,7 @@ mod tests {
     #[test]
     fn o_and_the_browser_button_open_the_pull_request_the_same_way() {
         let (mut app, project) = app_with(vec![pr(42, "Fix login", false)], true);
-        app.overlay = Some(Overlay::PullRequests(PullRequestsView::new(
+        app.modals.overlay = Some(Overlay::PullRequests(PullRequestsView::new(
             project,
             "demo".into(),
             DIR.into(),
@@ -1533,8 +1565,11 @@ mod tests {
 
         let mut out = Vec::new();
         handle_key(&mut app, ctrl('o'), &mut out);
-        assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/42"));
-        app.flash = None;
+        assert_eq!(
+            app.chrome.flash.as_deref(),
+            Some("opened github.com/o/r/pull/42")
+        );
+        app.chrome.flash = None;
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: at.x,
@@ -1542,9 +1577,12 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         handle_mouse(&mut app, click, at, &mut out);
-        assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/42"));
+        assert_eq!(
+            app.chrome.flash.as_deref(),
+            Some("opened github.com/o/r/pull/42")
+        );
         assert!(
-            matches!(app.overlay, Some(Overlay::PullRequests(_))),
+            matches!(app.modals.overlay, Some(Overlay::PullRequests(_))),
             "the modal stays up"
         );
     }
@@ -1592,7 +1630,10 @@ mod tests {
         // `v` types, rather than closing.
         handle_key(&mut app, key(KeyCode::Char('v')), &mut Vec::new());
         assert_eq!(view(&app).query.as_str(), "loginv");
-        assert!(matches!(&app.overlay, Some(Overlay::PullRequests(_))));
+        assert!(matches!(
+            &app.modals.overlay,
+            Some(Overlay::PullRequests(_))
+        ));
         handle_key(&mut app, key(KeyCode::Backspace), &mut Vec::new());
 
         let first = selected_pr(&app).unwrap().number;
@@ -1610,7 +1651,10 @@ mod tests {
         // The first Esc clears the filter, the cursor staying put; the
         // second closes.
         handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
-        assert!(matches!(&app.overlay, Some(Overlay::PullRequests(_))));
+        assert!(matches!(
+            &app.modals.overlay,
+            Some(Overlay::PullRequests(_))
+        ));
         assert!(view(&app).query.is_empty());
         assert_eq!(
             selected_pr(&app).unwrap().number,
@@ -1621,7 +1665,7 @@ mod tests {
         assert!(shot.contains("(3)"), "{shot}");
         assert!(shot.contains("type to filter…"), "{shot}");
         handle_key(&mut app, key(KeyCode::Esc), &mut Vec::new());
-        assert!(app.overlay.is_none());
+        assert!(app.modals.overlay.is_none());
     }
 
     /// A filter nothing matches empties the list and says so — nothing
@@ -1657,7 +1701,7 @@ mod tests {
             42,
             "the row is back as the filter widens"
         );
-        if let Some(Overlay::PullRequests(v)) = &mut app.overlay {
+        if let Some(Overlay::PullRequests(v)) = &mut app.modals.overlay {
             v.scroll = 3;
         }
         handle_key(&mut app, ctrl('u'), &mut Vec::new());
@@ -1733,24 +1777,27 @@ mod tests {
 
         click_at(&mut app, 1);
         assert_eq!(selected_pr(&app).unwrap().number, 41);
-        assert_eq!(app.flash, None, "one click only selects");
+        assert_eq!(app.chrome.flash, None, "one click only selects");
         click_at(&mut app, 0);
         assert_eq!(selected_pr(&app).unwrap().number, 42);
-        assert_eq!(app.flash, None, "a click on another row is a single click");
+        assert_eq!(
+            app.chrome.flash, None,
+            "a click on another row is a single click"
+        );
         click_at(&mut app, 0);
         assert_eq!(
-            app.flash.as_deref(),
+            app.chrome.flash.as_deref(),
             Some("opened github.com/o/r/pull/42"),
             "the second click on the row opens it"
         );
         assert!(
-            matches!(app.overlay, Some(Overlay::PullRequests(_))),
+            matches!(app.modals.overlay, Some(Overlay::PullRequests(_))),
             "the modal stays up"
         );
-        app.flash = None;
+        app.chrome.flash = None;
         click_at(&mut app, 0);
         assert_eq!(
-            app.flash, None,
+            app.chrome.flash, None,
             "a double-click is spent: the third click starts over"
         );
     }
@@ -1767,7 +1814,7 @@ mod tests {
         assert!(paste(&mut app, "docs\npass"));
         assert_eq!(view(&app).query.as_str(), "docs pass");
         assert_eq!(selected_pr(&app).unwrap().number, 41);
-        app.overlay = None;
+        app.modals.overlay = None;
         assert!(!paste(&mut app, "x"));
     }
 
@@ -1788,7 +1835,7 @@ mod tests {
         type_str(&mut app, "login");
         select(&mut app, 2);
         assert_eq!(selected_pr(&app).unwrap().number, 40);
-        app.open_prs.get_mut(&project).unwrap().list =
+        app.github.open_prs.get_mut(&project).unwrap().list =
             vec![pr(42, "Fix login", false), pr(41, "Docs pass", false)];
         list_changed(&mut app);
         assert_eq!(
@@ -1812,23 +1859,30 @@ mod tests {
         let (mut app, project) = app_with(vec![pr(42, "Fix login", false)], true);
         open(&mut app);
         handle_key(&mut app, ctrl('r'), &mut Vec::new());
-        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
-        assert!(app.pr_refresh_requested);
+        assert_eq!(
+            app.chrome.flash.as_deref(),
+            Some("refreshing pull requests…")
+        );
+        assert!(app.github.pr_refresh_requested);
         assert!(app.open_prs_lookup_due(&project));
-        app.flash = None;
+        app.chrome.flash = None;
         handle_key(&mut app, ctrl('g'), &mut Vec::new());
         assert!(
-            app.flash
+            app.chrome
+                .flash
                 .as_deref()
                 .is_some_and(|f| f.starts_with("repo path missing on disk")),
             "Ctrl+g reaches the diff fetch: {:?}",
-            app.flash
+            app.chrome.flash
         );
         for letter in "rgoc".chars() {
             handle_key(&mut app, key(KeyCode::Char(letter)), &mut Vec::new());
         }
         assert_eq!(view(&app).query.as_str(), "rgoc");
-        assert!(matches!(&app.overlay, Some(Overlay::PullRequests(_))));
+        assert!(matches!(
+            &app.modals.overlay,
+            Some(Overlay::PullRequests(_))
+        ));
     }
 
     /// No button on a frame too narrow to hold it clear of the title, and
@@ -1836,7 +1890,7 @@ mod tests {
     #[test]
     fn the_browser_button_is_left_off_a_narrow_frame_and_an_empty_list() {
         let (mut app, project) = app_with(vec![pr(42, "Fix login", false)], true);
-        app.overlay = Some(Overlay::PullRequests(PullRequestsView::new(
+        app.modals.overlay = Some(Overlay::PullRequests(PullRequestsView::new(
             project,
             "demo".into(),
             DIR.into(),
@@ -1846,7 +1900,7 @@ mod tests {
         assert_eq!(view(&app).browser_area, Rect::default());
 
         let (mut app, project) = app_with(vec![], true);
-        app.overlay = Some(Overlay::PullRequests(PullRequestsView::new(
+        app.modals.overlay = Some(Overlay::PullRequests(PullRequestsView::new(
             project,
             "demo".into(),
             DIR.into(),

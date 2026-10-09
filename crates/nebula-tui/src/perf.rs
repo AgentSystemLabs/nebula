@@ -65,7 +65,7 @@ impl Perf {
             label,
             handler_us,
             overlay_name(app),
-            app.focus,
+            app.nav.focus,
         );
         self.waiting.push((label, arrived));
     }
@@ -84,7 +84,7 @@ impl Perf {
                 )
             })
             .collect();
-        let (pane, painted, booting) = match &app.term {
+        let (pane, painted, booting) = match &app.pane.term {
             Some(t) => (format!("{:?}", t.sref), t.painted, t.booting),
             None => ("none".to_string(), false, false),
         };
@@ -94,7 +94,7 @@ impl Perf {
             self.micros(began),
             done.duration_since(began).as_micros(),
             overlay_name(app),
-            app.focus,
+            app.nav.focus,
             pane,
             painted,
             booting,
@@ -126,7 +126,7 @@ fn wall_us() -> u128 {
 /// Is the overlay on screen still waiting on a BACKGROUND READ to show what
 /// was asked for? A frame that is, has not settled.
 fn overlay_busy(app: &App) -> bool {
-    match &app.overlay {
+    match &app.modals.overlay {
         Some(Overlay::Diff(v)) => {
             (v.listing.is_some() && v.files.is_empty())
                 || (v.waiting.is_some()
@@ -140,10 +140,10 @@ fn overlay_busy(app: &App) -> bool {
 }
 
 fn overlay_name(app: &App) -> &'static str {
-    if app.vim.is_some() {
+    if app.pane.vim.is_some() {
         return "Editor";
     }
-    match &app.overlay {
+    match &app.modals.overlay {
         None => "none",
         Some(Overlay::Menu(_)) => "Menu",
         Some(Overlay::Confirm(_)) => "Confirm",

@@ -54,12 +54,12 @@ pub fn note(app: &mut App, keys: &[KeyChord], does: Option<&str>) {
     if keys.is_empty() {
         return;
     }
-    app.key_combo = Some(KeyCombo {
+    app.chrome.key_combo = Some(KeyCombo {
         keys: keys.to_vec(),
         does: does.map(str::to_string),
         at: Instant::now(),
     });
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// The second press of a double tap, shown as one combo: `h h` and what
@@ -167,23 +167,26 @@ mod tests {
     fn note_records_the_press_and_replaces_the_last() {
         let mut app = App::new();
         let j = chord(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert!(app.key_combo.is_none(), "nothing pressed yet");
+        assert!(app.chrome.key_combo.is_none(), "nothing pressed yet");
 
-        app.dirty = false;
+        app.chrome.dirty = false;
         note(&mut app, &[j], Some("Move down"));
-        assert_eq!(app.key_combo.as_ref().unwrap().text(), "j - Move down");
-        assert!(app.dirty, "a fresh combo wants a frame");
+        assert_eq!(
+            app.chrome.key_combo.as_ref().unwrap().text(),
+            "j - Move down"
+        );
+        assert!(app.chrome.dirty, "a fresh combo wants a frame");
 
         let k = chord(KeyCode::Char('k'), KeyModifiers::NONE);
         note(&mut app, &[k], None);
         assert_eq!(
-            app.key_combo.as_ref().unwrap().text(),
+            app.chrome.key_combo.as_ref().unwrap().text(),
             "k",
             "newest press wins"
         );
         note(&mut app, &[], Some("nothing"));
         assert_eq!(
-            app.key_combo.as_ref().unwrap().text(),
+            app.chrome.key_combo.as_ref().unwrap().text(),
             "k",
             "an empty press is not a combo"
         );
@@ -194,10 +197,13 @@ mod tests {
         let mut app = App::new();
         let l = chord(KeyCode::Right, KeyModifiers::NONE);
         note_double_tap(&mut app, &l, "enter pane");
-        assert_eq!(app.key_combo.as_ref().unwrap().text(), "→ → - Enter pane");
+        assert_eq!(
+            app.chrome.key_combo.as_ref().unwrap().text(),
+            "→ → - Enter pane"
+        );
         note_double_tap(&mut app, &l, "");
         assert_eq!(
-            app.key_combo.as_ref().unwrap().does.as_deref(),
+            app.chrome.key_combo.as_ref().unwrap().does.as_deref(),
             Some(""),
             "an empty hint capitalizes to nothing rather than panicking"
         );

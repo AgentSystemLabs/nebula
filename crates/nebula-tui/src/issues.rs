@@ -657,7 +657,7 @@ fn day(stamp: &str) -> &str {
 /// project has nothing to list.
 pub(crate) fn open_issues(app: &mut App) {
     let Some(project) = app.selected_project().cloned() else {
-        app.flash = Some("issues: select a project first".into());
+        app.chrome.flash = Some("issues: select a project first".into());
         return;
     };
     let mut view = IssuesView::new(
@@ -666,18 +666,18 @@ pub(crate) fn open_issues(app: &mut App) {
         project.repo_path.clone(),
     );
     view.selected = clamp_selection(0, list_len(app, &project.id));
-    app.overlay = Some(Overlay::Issues(view));
+    app.modals.overlay = Some(Overlay::Issues(view));
     // A list the prefetch landed moments ago is the answer; an older one
     // paints now while a fresh copy lands underneath.
     if !is_fresh(app, &project.id) {
         request_list(app, project.id, project.repo_path);
     }
     schedule_detail(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 fn list_len(app: &App, project: &ProjectId) -> usize {
-    app.issues.get(project).map_or(0, |l| l.list.len())
+    app.github.issues.get(project).map_or(0, |l| l.list.len())
 }
 
 /// Is there a filter to apply — text in the row beyond whitespace?
@@ -720,9 +720,9 @@ fn cursor_index(view: &IssuesView, list: &[Issue]) -> Option<usize> {
 /// with the row's comments asked for as landing on it would.
 pub(crate) fn reopen(app: &mut App, mut view: IssuesView) {
     view.selected = clamp_selection(view.selected as i64, list_len(app, &view.project));
-    app.overlay = Some(Overlay::Issues(view));
+    app.modals.overlay = Some(Overlay::Issues(view));
     schedule_detail(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Ask `gh` for the project's open issues, off the loop. Skipped while
@@ -731,18 +731,18 @@ pub(crate) fn reopen(app: &mut App, mut view: IssuesView) {
 /// left to the backoff — the checkout can come back. Without the loop's
 /// sender installed (the unit tests) nothing is asked.
 fn request_list(app: &mut App, project: ProjectId, dir: PathBuf) {
-    if app.issues_inflight.contains(&project) {
+    if app.github.issues_inflight.contains(&project) {
         return;
     }
     if !dir.is_dir() {
         arm_beat(app, &project, false);
-        app.issues_failed.insert(project);
+        app.github.issues_failed.insert(project);
         return;
     }
-    let Some(tx) = app.issues_tx.clone() else {
+    let Some(tx) = app.github.issues_tx.clone() else {
         return;
     };
-    app.issues_inflight.insert(project.clone());
+    app.github.issues_inflight.insert(project.clone());
     tokio::spawn(async move {
         let list = list(&dir).await;
         let _ = tx.send(IssuesAnswer::List { project, list });
@@ -756,7 +756,7 @@ fn request_list(app: &mut App, project: ProjectId, dir: PathBuf) {
 /// ([`PREFETCH_DEBOUNCE`]). Run wherever the selected project changes —
 /// the project switch, the startup restore — so `i` finds the rows there.
 pub(crate) fn schedule_prefetch(app: &mut App) {
-    app.pending_issues_prefetch = app
+    app.github.pending_issues_prefetch = app
         .selected_project()
         .map(|p| (p.id.clone(), std::time::Instant::now() + PREFETCH_DEBOUNCE));
 }
@@ -765,7 +765,7 @@ pub(crate) fn schedule_prefetch(app: &mut App) {
 /// it is still the selected one and its beat says so. Disarms first, so a
 /// `gh` that never answers can't re-fire on every loop turn.
 pub(crate) fn fire_prefetch(app: &mut App) {
-    let Some((project, _)) = app.pending_issues_prefetch.take() else {
+    let Some((project, _)) = app.github.pending_issues_prefetch.take() else {
         return;
     };
     if app.selected_project().is_some_and(|p| p.id == project) {
@@ -792,7 +792,7 @@ pub(crate) fn reload_selected(app: &mut App) {
     else {
         return;
     };
-    app.issues_failed.remove(&project);
+    app.github.issues_failed.remove(&project);
     request_list(app, project, dir);
 }
 
@@ -835,10 +835,11 @@ pub(crate) fn sweep_target(app: &App) -> Option<(ProjectId, PathBuf)> {
     app.project_rows()
         .into_iter()
         .map(|i| &app.tree.projects[i])
-        .filter(|p| Some(&p.id) != selected.as_ref() && !app.issues_inflight.contains(&p.id))
-        .find(|p| match app.issues_due.get(&p.id) {
+        .filter(|p| Some(&p.id) != selected.as_ref() && !app.github.issues_inflight.contains(&p.id))
+        .find(|p| match app.github.issues_due.get(&p.id) {
             Some(beat) => {
                 let listed_recently = app
+                    .github
                     .issues
                     .get(&p.id)
                     .is_some_and(|l| now < l.at + SWEEP_REFRESH);
@@ -853,10 +854,10 @@ pub(crate) fn sweep_target(app: &App) -> Option<(ProjectId, PathBuf)> {
 /// answer is in flight, not before the timer the last answer armed, and
 /// always for a project never asked about.
 pub(crate) fn prefetch_due(app: &App, project: &ProjectId) -> bool {
-    if app.issues_inflight.contains(project) {
+    if app.github.issues_inflight.contains(project) {
         return false;
     }
-    match app.issues_due.get(project) {
+    match app.github.issues_due.get(project) {
         Some(beat) => std::time::Instant::now() >= beat.due,
         None => true,
     }
@@ -864,7 +865,8 @@ pub(crate) fn prefetch_due(app: &App, project: &ProjectId) -> bool {
 
 /// A list that landed within [`FRESH`]: the modal opens on it as it is.
 fn is_fresh(app: &App, project: &ProjectId) -> bool {
-    app.issues
+    app.github
+        .issues
         .get(project)
         .is_some_and(|l| l.at.elapsed() < FRESH)
 }
@@ -877,13 +879,13 @@ fn arm_beat(app: &mut App, project: &ProjectId, found: bool) {
     let (step, backoff) = if found {
         (REFRESH, None)
     } else {
-        let step = match app.issues_due.get(project).and_then(|b| b.backoff) {
+        let step = match app.github.issues_due.get(project).and_then(|b| b.backoff) {
             Some(prev) => (prev * 2).min(RECHECK_MAX),
             None => RECHECK_MIN,
         };
         (step, Some(step))
     };
-    app.issues_due.insert(
+    app.github.issues_due.insert(
         project.clone(),
         IssuesBeat {
             due: std::time::Instant::now() + step,
@@ -900,9 +902,9 @@ fn arm_beat(app: &mut App, project: &ProjectId, found: bool) {
 pub(crate) fn schedule_detail(app: &mut App) {
     let pending = issue_in_focus(app).and_then(|(issue, dir)| {
         let url = issue.url.clone();
-        if app.issue_detail.contains_key(&url)
-            || app.issue_detail_inflight.contains(&url)
-            || app.issue_detail_failed.contains(&url)
+        if app.github.issue_detail.contains_key(&url)
+            || app.github.issue_detail_inflight.contains(&url)
+            || app.github.issue_detail_failed.contains(&url)
         {
             return None;
         }
@@ -912,24 +914,25 @@ pub(crate) fn schedule_detail(app: &mut App) {
             dir,
         })
     });
-    app.pending_issue_detail = pending.map(|p| (p, std::time::Instant::now() + DETAIL_DEBOUNCE));
+    app.github.pending_issue_detail =
+        pending.map(|p| (p, std::time::Instant::now() + DETAIL_DEBOUNCE));
 }
 
 /// Fire the debounced fetch. Disarms first, so a `gh` that never answers
 /// can't re-fire on every loop turn.
 pub(crate) fn lookup_detail(app: &mut App) {
-    let Some((pending, _)) = app.pending_issue_detail.take() else {
+    let Some((pending, _)) = app.github.pending_issue_detail.take() else {
         return;
     };
     if !pending.dir.is_dir() {
-        app.issue_detail_failed.insert(pending.url);
-        app.dirty = true;
+        app.github.issue_detail_failed.insert(pending.url);
+        app.chrome.dirty = true;
         return;
     }
-    let Some(tx) = app.issues_tx.clone() else {
+    let Some(tx) = app.github.issues_tx.clone() else {
         return;
     };
-    app.issue_detail_inflight.insert(pending.url.clone());
+    app.github.issue_detail_inflight.insert(pending.url.clone());
     tokio::spawn(async move {
         let detail = detail(&pending.dir, pending.number).await;
         let _ = tx.send(IssuesAnswer::Detail {
@@ -949,31 +952,32 @@ pub(crate) fn lookup_detail(app: &mut App) {
 pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
     match answer {
         IssuesAnswer::List { project, list } => {
-            app.issues_inflight.remove(&project);
+            app.github.issues_inflight.remove(&project);
             arm_beat(app, &project, list.as_ref().is_some_and(|l| !l.is_empty()));
             match list {
                 Some(list) => {
-                    let cursor_url = match &app.overlay {
+                    let cursor_url = match &app.modals.overlay {
                         Some(Overlay::Issues(view)) if view.project == project => app
+                            .github
                             .issues
                             .get(&project)
                             .and_then(|l| l.list.get(cursor_index(view, &l.list)?))
                             .map(|i| i.url.clone()),
                         _ => None,
                     };
-                    app.issues_failed.remove(&project);
+                    app.github.issues_failed.remove(&project);
                     let len = list.len();
                     let position = cursor_url
                         .as_ref()
                         .and_then(|url| list.iter().position(|i| &i.url == url));
-                    app.issues.insert(
+                    app.github.issues.insert(
                         project.clone(),
                         IssueList {
                             list,
                             at: std::time::Instant::now(),
                         },
                     );
-                    if let Some(Overlay::Issues(view)) = &mut app.overlay {
+                    if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
                         if view.project == project {
                             view.selected = match position {
                                 Some(i) => i,
@@ -984,20 +988,20 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                     schedule_detail(app);
                 }
                 None => {
-                    if !app.issues.contains_key(&project) {
-                        app.issues_failed.insert(project);
+                    if !app.github.issues.contains_key(&project) {
+                        app.github.issues_failed.insert(project);
                     }
                 }
             }
         }
         IssuesAnswer::Detail { url, detail } => {
-            app.issue_detail_inflight.remove(&url);
+            app.github.issue_detail_inflight.remove(&url);
             match detail {
                 Some(detail) => {
-                    app.issue_detail.insert(url, detail);
+                    app.github.issue_detail.insert(url, detail);
                 }
                 None => {
-                    app.issue_detail_failed.insert(url);
+                    app.github.issue_detail_failed.insert(url);
                 }
             }
         }
@@ -1007,24 +1011,24 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
             text,
             posted,
         } => {
-            app.issue_comment_inflight.remove(&issue.url);
+            app.github.issue_comment_inflight.remove(&issue.url);
             if posted {
                 // The conversation the pane has is one comment short now:
                 // forget it, and the cursor resting on the row reads it
                 // again, with the new comment in.
-                app.issue_detail.remove(&issue.url);
-                app.issue_detail_failed.remove(&issue.url);
-                app.flash = Some(format!("comment posted on #{}", issue.number));
+                app.github.issue_detail.remove(&issue.url);
+                app.github.issue_detail_failed.remove(&issue.url);
+                app.chrome.flash = Some(format!("comment posted on #{}", issue.number));
                 schedule_detail(app);
             } else {
-                app.flash = Some(format!(
+                app.chrome.flash = Some(format!(
                     "couldn't post the comment on #{} — is gh logged in?",
                     issue.number
                 ));
                 // The box comes back with the text for a retry — unless
                 // something else has been opened over the modal meanwhile,
                 // which the flash must not interrupt.
-                if matches!(&app.overlay, None | Some(Overlay::Issues(_))) {
+                if matches!(&app.modals.overlay, None | Some(Overlay::Issues(_))) {
                     bring_box_back(app, view, issue, text);
                 }
             }
@@ -1039,6 +1043,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                 // The row the pane reads from carries the new text at
                 // once; the refresh underneath makes it GitHub's copy.
                 if let Some(row) = app
+                    .github
                     .issues
                     .get_mut(&project)
                     .and_then(|l| l.list.iter_mut().find(|i| i.url == url))
@@ -1046,7 +1051,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                     row.title = text.title;
                     row.body = text.body;
                 }
-                if let Some(Overlay::Issues(view)) = &mut app.overlay {
+                if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
                     if view
                         .editor
                         .as_ref()
@@ -1055,7 +1060,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                         view.editor = None;
                     }
                 }
-                app.flash = Some(format!("issue #{number} updated"));
+                app.chrome.flash = Some(format!("issue #{number} updated"));
                 if let Some(dir) = app
                     .tree
                     .projects
@@ -1070,7 +1075,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                 // The form that sent it shows why and keeps the text; one
                 // that has since gone gets the footer.
                 let mut told = false;
-                if let Some(Overlay::Issues(view)) = &mut app.overlay {
+                if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
                     if let Some(editor) = &mut view.editor {
                         if editor.saving && editor.url == url {
                             editor.saving = false;
@@ -1080,12 +1085,12 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                     }
                 }
                 if !told {
-                    app.flash = Some(format!("couldn't update issue #{number}: {why}"));
+                    app.chrome.flash = Some(format!("couldn't update issue #{number}: {why}"));
                 }
             }
         },
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 // ---- commenting ----
@@ -1093,12 +1098,12 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
 /// `Ctrl+c`: the comment box for the issue under the cursor. The box replaces
 /// the modal; Enter posts and comes back to it, Esc just comes back.
 fn open_comment_for_selected(app: &mut App) {
-    let Some(Overlay::Issues(view)) = &app.overlay else {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
         return;
     };
     let view = view.clone();
     let Some((issue, _)) = selected_issue(app) else {
-        app.flash = Some("no issue selected".into());
+        app.chrome.flash = Some("no issue selected".into());
         return;
     };
     crate::event_loop::open_prompt(
@@ -1127,7 +1132,7 @@ fn bring_box_back(app: &mut App, view: IssuesView, issue: IssueRef, text: String
 pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, text: String) {
     let dir = view.dir.clone();
     if !dir.is_dir() {
-        app.flash = Some(format!(
+        app.chrome.flash = Some(format!(
             "couldn't post the comment on #{}: the checkout isn't on disk",
             issue.number
         ));
@@ -1135,11 +1140,11 @@ pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, tex
         return;
     }
     reopen(app, view.clone());
-    let Some(tx) = app.issues_tx.clone() else {
+    let Some(tx) = app.github.issues_tx.clone() else {
         return;
     };
-    app.issue_comment_inflight.insert(issue.url.clone());
-    app.flash = Some(format!("posting a comment on #{}…", issue.number));
+    app.github.issue_comment_inflight.insert(issue.url.clone());
+    app.chrome.flash = Some(format!("posting a comment on #{}…", issue.number));
     let number = issue.number;
     tokio::spawn(async move {
         let posted = comment(&dir, number, &text).await;
@@ -1155,16 +1160,16 @@ pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, tex
 /// `Ctrl+r` in the modal: ask for the list again now, and the selected issue's
 /// comments over the cached copy. The rows stay until the answer lands.
 fn refresh(app: &mut App) {
-    let Some(Overlay::Issues(view)) = &app.overlay else {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
         return;
     };
     let (project, dir) = (view.project.clone(), view.dir.clone());
-    app.issues_failed.remove(&project);
+    app.github.issues_failed.remove(&project);
     request_list(app, project, dir);
     if let Some((issue, dir)) = selected_issue(app) {
-        if !app.issue_detail_inflight.contains(&issue.url) {
-            app.issue_detail_failed.remove(&issue.url);
-            app.pending_issue_detail = Some((
+        if !app.github.issue_detail_inflight.contains(&issue.url) {
+            app.github.issue_detail_failed.remove(&issue.url);
+            app.github.pending_issue_detail = Some((
                 PendingIssueDetail {
                     url: issue.url.clone(),
                     number: issue.number,
@@ -1174,17 +1179,17 @@ fn refresh(app: &mut App) {
             ));
         }
     }
-    app.flash = Some("refreshing issues…".into());
-    app.dirty = true;
+    app.chrome.flash = Some("refreshing issues…".into());
+    app.chrome.dirty = true;
 }
 
 /// The issue under the cursor and the checkout to ask `gh` from, while the
 /// modal is up and the list has rows.
 fn selected_issue(app: &App) -> Option<(Issue, PathBuf)> {
-    let Some(Overlay::Issues(view)) = &app.overlay else {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
         return None;
     };
-    let list = app.issues.get(&view.project)?.list.as_slice();
+    let list = app.github.issues.get(&view.project)?.list.as_slice();
     let issue = list.get(cursor_index(view, list)?)?;
     Some((issue.clone(), view.dir.clone()))
 }
@@ -1198,7 +1203,7 @@ fn selected_url(app: &App) -> Option<String> {
 /// modal is up, else the PROJECT ISSUES GROUP row under the Worktrees
 /// cursor, asked from the project's checkout.
 fn issue_in_focus(app: &App) -> Option<(Issue, PathBuf)> {
-    if matches!(app.overlay, Some(Overlay::Issues(_))) {
+    if matches!(app.modals.overlay, Some(Overlay::Issues(_))) {
         return selected_issue(app);
     }
     let issue = app.selected_worktree_issue()?.clone();
@@ -1209,26 +1214,31 @@ fn issue_in_focus(app: &App) -> Option<(Issue, PathBuf)> {
 /// Move the cursor to `index` (clamped): the pane rewinds and the row's
 /// comments are asked for once the cursor rests.
 fn select(app: &mut App, index: i64) {
-    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
         return;
     };
-    let len = app.issues.get(&view.project).map_or(0, |l| l.list.len());
+    let len = app
+        .github
+        .issues
+        .get(&view.project)
+        .map_or(0, |l| l.list.len());
     let next = clamp_selection(index, len);
     if next != view.selected {
         view.selected = next;
         view.scroll = 0;
     }
     schedule_detail(app);
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// ↑/↓, the wheel: the cursor `delta` rows through the visible ones —
 /// the filter's matches while one is typed — clamped at either end.
 fn step(app: &mut App, delta: i64) {
-    let Some(Overlay::Issues(view)) = &app.overlay else {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
         return;
     };
     let list = app
+        .github
         .issues
         .get(&view.project)
         .map_or(&[][..], |l| l.list.as_slice());
@@ -1250,10 +1260,11 @@ fn step(app: &mut App, delta: i64) {
 /// filter nothing matches moves nothing: the list says so, the pane has
 /// no row to read, and the next letter or Backspace decides.
 fn query_changed(app: &mut App) {
-    let Some(Overlay::Issues(view)) = &app.overlay else {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
         return;
     };
     let list = app
+        .github
         .issues
         .get(&view.project)
         .map_or(&[][..], |l| l.list.as_slice());
@@ -1266,12 +1277,12 @@ fn query_changed(app: &mut App) {
         Some(index) => select(app, index as i64),
         None => schedule_detail(app),
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Esc: the filter cleared, the cursor staying on the row it was on.
 fn clear_query(app: &mut App) {
-    if let Some(Overlay::Issues(view)) = &mut app.overlay {
+    if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
         view.query.clear();
     }
     query_changed(app);
@@ -1284,10 +1295,10 @@ fn clear_query(app: &mut App) {
 /// edit, and says so where the launch keys do.
 fn open_editor(app: &mut App) {
     let Some((issue, _)) = selected_issue(app) else {
-        app.flash = Some("no issue selected".into());
+        app.chrome.flash = Some("no issue selected".into());
         return;
     };
-    if let Some(Overlay::Issues(view)) = &mut app.overlay {
+    if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
         view.editor = Some(Box::new(IssueEditor::new(&issue)));
     }
 }
@@ -1298,7 +1309,7 @@ fn open_editor(app: &mut App) {
 /// lands. Without the loop's sender installed (the unit tests) nothing
 /// is sent and the form stays as it is.
 fn save_editor(app: &mut App) {
-    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
         return;
     };
     let (project, dir) = (view.project.clone(), view.dir.clone());
@@ -1315,14 +1326,14 @@ fn save_editor(app: &mut App) {
     }
     if text == editor.original {
         view.editor = None;
-        app.flash = Some("issue unchanged".into());
+        app.chrome.flash = Some("issue unchanged".into());
         return;
     }
     if !dir.is_dir() {
         editor.notice = Some("the checkout isn't on disk — gh has nowhere to run".into());
         return;
     }
-    let Some(tx) = app.issues_tx.clone() else {
+    let Some(tx) = app.github.issues_tx.clone() else {
         return;
     };
     editor.saving = true;
@@ -1344,7 +1355,7 @@ fn save_editor(app: &mut App) {
 /// Enter to save, Esc to put the reading pane back unsaved — then the
 /// field's LINE EDITOR keys. A save in flight holds every key but Esc.
 fn handle_editor_key(app: &mut App, key: KeyEvent) {
-    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
         return;
     };
     let Some(editor) = &mut view.editor else {
@@ -1385,7 +1396,7 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) {
     if save {
         save_editor(app);
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// A bracketed paste while the editor is up lands in the field under the
@@ -1393,7 +1404,7 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) {
 /// otherwise in the filter, as one line, narrowing the rows as typing it
 /// would. True whenever the modal is up: the filter is always live.
 pub(crate) fn paste(app: &mut App, text: &str) -> bool {
-    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
         return false;
     };
     if view.editor.is_none() {
@@ -1446,17 +1457,17 @@ fn launch_target(app: &App, project: &ProjectId, issue: &IssueRef) -> Option<Qui
 /// The launch a row describes: the `quick_prompt_kind` SETTING's harness
 /// and defaults, aimed at [`launch_target`], carrying the issue.
 fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
-    let Some(Overlay::Issues(view)) = &app.overlay else {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
         return None;
     };
     let project = view.project.clone();
     let Some((issue, _)) = selected_issue(app) else {
-        app.flash = Some("no issue selected".into());
+        app.chrome.flash = Some("no issue selected".into());
         return None;
     };
     let issue = issue.launch_ref();
     let Some(target) = launch_target(app, &project, &issue) else {
-        app.flash = Some("issues: the project has no worktree to launch into".into());
+        app.chrome.flash = Some("issues: the project has no worktree to launch into".into());
         return None;
     };
     Some(QuickLaunch::from_config(target, &crate::config::Config::load()).with_issue(Some(issue)))
@@ -1467,7 +1478,7 @@ fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
 /// row (`QuickLaunch::under`), and the launch closes it onto the new
 /// session's card.
 fn open_prompt_for_selected(app: &mut App) {
-    let under = ModalUnder::of(app.overlay.as_ref());
+    let under = ModalUnder::of(app.modals.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
         crate::quick_prompt::open_box(app, launch.with_under(under));
     }
@@ -1478,7 +1489,7 @@ fn open_prompt_for_selected(app: &mut App) {
 /// same box with the preset applied — still standing on the modal. Esc (or a
 /// click outside the list) puts the modal back on the row.
 fn open_preset_for_selected(app: &mut App) {
-    let under = ModalUnder::of(app.overlay.as_ref());
+    let under = ModalUnder::of(app.modals.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
         crate::quick_prompt::open_preset_picker(app, QuickReturn::fresh(launch.with_under(under)));
     }
@@ -1491,7 +1502,7 @@ fn launch_for_row(app: &mut App) -> Option<QuickLaunch> {
     let issue = app.selected_worktree_issue()?.launch_ref();
     let project = app.selected_project()?.id.clone();
     let Some(target) = launch_target(app, &project, &issue) else {
-        app.flash = Some("issues: the project has no worktree to launch into".into());
+        app.chrome.flash = Some("issues: the project has no worktree to launch into".into());
         return None;
     };
     Some(QuickLaunch::from_config(target, &crate::config::Config::load()).with_issue(Some(issue)))
@@ -1531,11 +1542,11 @@ pub(crate) fn open_in_browser(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// letters type — the modal's own hotkey and `q` among them — and the
 /// verbs are chords; only Esc closes, once the filter is clear.
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
-    if matches!(&app.overlay, Some(Overlay::Issues(v)) if v.editor.is_some()) {
+    if matches!(&app.modals.overlay, Some(Overlay::Issues(v)) if v.editor.is_some()) {
         handle_editor_key(app, key);
         return;
     }
-    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
         return;
     };
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1546,7 +1557,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         // Two-stage escape, like every fuzzy overlay: a typed filter is
         // cleared before the second Esc closes the modal.
         KeyCode::Esc if !view.query.is_empty() => clear_query(app),
-        KeyCode::Esc => app.overlay = None,
+        KeyCode::Esc => app.modals.overlay = None,
         // Shift+↑/↓ scroll the pane a line; ↑/↓ walk the rows the filter
         // leaves, Ctrl+n/p mirroring them.
         KeyCode::Down if shift => view.scroll_by(1),
@@ -1585,7 +1596,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
             }
         }
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Mouse in the ISSUES MODAL: the wheel moves the cursor over the rows
@@ -1604,7 +1615,7 @@ pub(crate) fn handle_mouse(
     if let Some(Overlay::Issues(IssuesView {
         editor: Some(editor),
         ..
-    })) = &mut app.overlay
+    })) = &mut app.modals.overlay
     {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             if editor.title_area.contains(mouse_pos) {
@@ -1613,10 +1624,10 @@ pub(crate) fn handle_mouse(
                 editor.field = EditField::Body;
             }
         }
-        app.dirty = true;
+        app.chrome.dirty = true;
         return;
     }
-    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
         return;
     };
     let over_body = view.body_area.contains(mouse_pos);
@@ -1635,7 +1646,8 @@ pub(crate) fn handle_mouse(
             // The row math counts the filter's matches, not the whole list.
             let visible = visible_rows(
                 &view.query,
-                app.issues
+                app.github
+                    .issues
                     .get(&view.project)
                     .map_or(&[][..], |l| l.list.as_slice()),
             );
@@ -1645,7 +1657,7 @@ pub(crate) fn handle_mouse(
         }
         _ => {}
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 // ---- drawing ----
@@ -1799,12 +1811,13 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     .areas(area);
 
     let rows: Vec<Issue> = app
+        .github
         .issues
         .get(&view.project)
         .map(|l| l.list.clone())
         .unwrap_or_default();
-    let inflight = app.issues_inflight.contains(&view.project);
-    let failed = app.issues_failed.contains(&view.project);
+    let inflight = app.github.issues_inflight.contains(&view.project);
+    let failed = app.github.issues_failed.contains(&view.project);
     // The rows the filter leaves, and where the cursor sits among them.
     let visible = visible_rows(&view.query, &rows);
     let cursor = cursor_index(view, &rows);
@@ -1843,7 +1856,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     if rows.is_empty() {
         let text = if failed {
             "couldn't list issues — is gh installed and logged in?"
-        } else if inflight || app.issues_tx.is_some() && !app.issues.contains_key(&view.project) {
+        } else if inflight
+            || app.github.issues_tx.is_some() && !app.github.issues.contains_key(&view.project)
+        {
             "asking GitHub…"
         } else {
             "no open issues"
@@ -1897,7 +1912,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     // ---- right: the editor, while it is up ----
     if let Some(editor) = &view.editor {
         let (title_area, body_area, body_view) = draw_editor(f, body_a, editor, th);
-        if let Some(Overlay::Issues(v)) = &mut app.overlay {
+        if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
             v.area = area;
             v.list_area = rows_area;
             v.cursor_row = cursor_row;
@@ -1926,9 +1941,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     let lines: Vec<Line> = match current {
         Some(issue) => lines(
             issue,
-            app.issue_detail.get(&issue.url),
-            app.issue_detail_failed.contains(&issue.url),
-            app.issue_comment_inflight.contains(&issue.url),
+            app.github.issue_detail.get(&issue.url),
+            app.github.issue_detail_failed.contains(&issue.url),
+            app.github.issue_comment_inflight.contains(&issue.url),
             body_a.width.saturating_sub(2) as usize,
             th,
         ),
@@ -1955,7 +1970,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
             f,
             body_a,
             (body_title.chars().count() + 2) as u16,
-            app.hover_crumb == Some(HitTarget::ModalBrowser),
+            app.launcher.hover_crumb == Some(HitTarget::ModalBrowser),
             th,
         ),
         None => Rect::default(),
@@ -1965,7 +1980,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
 
     // Write-back (draw works on a clone): the rects the mouse hit-tests,
     // the pane's size for paging, and the clamped cursor and scroll.
-    if let Some(Overlay::Issues(v)) = &mut app.overlay {
+    if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
         v.area = area;
         v.list_area = rows_area;
         v.cursor_row = cursor_row;
@@ -2290,7 +2305,7 @@ mod tests {
     fn c_opens_the_comment_box_for_the_selected_issue() {
         let mut app = App::new();
         let project = ProjectId("p1".into());
-        app.overlay = Some(Overlay::Issues(IssuesView::new(
+        app.modals.overlay = Some(Overlay::Issues(IssuesView::new(
             project.clone(),
             "demo".into(),
             "/tmp/demo".into(),
@@ -2298,10 +2313,10 @@ mod tests {
         let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         handle_key(&mut app, c, &mut Vec::new());
         assert!(
-            matches!(&app.overlay, Some(Overlay::Issues(_))),
+            matches!(&app.modals.overlay, Some(Overlay::Issues(_))),
             "no rows: the modal stays"
         );
-        assert_eq!(app.flash.as_deref(), Some("no issue selected"));
+        assert_eq!(app.chrome.flash.as_deref(), Some("no issue selected"));
         land_answer(
             &mut app,
             IssuesAnswer::List {
@@ -2311,8 +2326,11 @@ mod tests {
         );
         select(&mut app, 1);
         handle_key(&mut app, c, &mut Vec::new());
-        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-            panic!("c should open the comment box, got {:?}", app.overlay);
+        let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+            panic!(
+                "c should open the comment box, got {:?}",
+                app.modals.overlay
+            );
         };
         assert!(prompt.is_multiline(), "a comment is rarely one line");
         assert_eq!(prompt.title, "Comment on issue #14 · Fix login redirect");
@@ -2347,17 +2365,17 @@ mod tests {
         let fourteen = issue(14, "b").launch_ref();
         post_comment(&mut app, view.clone(), fourteen.clone(), "lgtm".into());
         assert!(
-            matches!(&app.overlay, Some(Overlay::Issues(v)) if v.selected == 1),
+            matches!(&app.modals.overlay, Some(Overlay::Issues(v)) if v.selected == 1),
             "the modal is back on its row: {:?}",
-            app.overlay
+            app.modals.overlay
         );
         // No sender installed: nothing was posted, nothing is in flight.
-        assert!(app.issue_comment_inflight.is_empty());
+        assert!(app.github.issue_comment_inflight.is_empty());
 
         view.dir = "/nonexistent/nebula-issue-comment".into();
         post_comment(&mut app, view, fourteen, "lgtm".into());
-        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-            panic!("the box should come back, got {:?}", app.overlay);
+        let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+            panic!("the box should come back, got {:?}", app.modals.overlay);
         };
         assert_eq!(prompt.input.as_str(), "lgtm");
         assert!(matches!(
@@ -2365,9 +2383,13 @@ mod tests {
             crate::app::PromptKind::IssueComment { .. }
         ));
         assert!(
-            app.flash.as_deref().unwrap().contains("isn't on disk"),
+            app.chrome
+                .flash
+                .as_deref()
+                .unwrap()
+                .contains("isn't on disk"),
             "{:?}",
-            app.flash
+            app.chrome.flash
         );
     }
 
@@ -2379,7 +2401,7 @@ mod tests {
         let mut app = App::new();
         let project = ProjectId("p1".into());
         let view = IssuesView::new(project.clone(), "demo".into(), "/tmp/demo".into());
-        app.overlay = Some(Overlay::Issues(view.clone()));
+        app.modals.overlay = Some(Overlay::Issues(view.clone()));
         land_answer(
             &mut app,
             IssuesAnswer::List {
@@ -2398,7 +2420,7 @@ mod tests {
                 }),
             },
         );
-        app.pending_issue_detail = None;
+        app.github.pending_issue_detail = None;
         let answer = |posted: bool| IssuesAnswer::Comment {
             view: view.clone(),
             issue: fifteen.launch_ref(),
@@ -2406,25 +2428,32 @@ mod tests {
             posted,
         };
 
-        app.issue_comment_inflight.insert(fifteen.url.clone());
+        app.github
+            .issue_comment_inflight
+            .insert(fifteen.url.clone());
         land_answer(&mut app, answer(true));
-        assert!(!app.issue_comment_inflight.contains(&fifteen.url));
+        assert!(!app.github.issue_comment_inflight.contains(&fifteen.url));
         assert!(
-            !app.issue_detail.contains_key(&fifteen.url),
+            !app.github.issue_detail.contains_key(&fifteen.url),
             "the conversation is one comment short: forgotten"
         );
         assert!(
-            app.pending_issue_detail.is_some(),
+            app.github.pending_issue_detail.is_some(),
             "…and asked for again as the cursor rests"
         );
-        assert_eq!(app.flash.as_deref(), Some("comment posted on #15"));
-        assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+        assert_eq!(app.chrome.flash.as_deref(), Some("comment posted on #15"));
+        assert!(matches!(&app.modals.overlay, Some(Overlay::Issues(_))));
 
-        app.issue_comment_inflight.insert(fifteen.url.clone());
+        app.github
+            .issue_comment_inflight
+            .insert(fifteen.url.clone());
         land_answer(&mut app, answer(false));
-        assert!(!app.issue_comment_inflight.contains(&fifteen.url));
-        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-            panic!("a refused post brings the box back, got {:?}", app.overlay);
+        assert!(!app.github.issue_comment_inflight.contains(&fifteen.url));
+        let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+            panic!(
+                "a refused post brings the box back, got {:?}",
+                app.modals.overlay
+            );
         };
         assert_eq!(prompt.input.as_str(), "lgtm");
         assert!(matches!(
@@ -2432,16 +2461,25 @@ mod tests {
             crate::app::PromptKind::IssueComment { .. }
         ));
         assert!(
-            app.flash.as_deref().unwrap().contains("couldn't post"),
+            app.chrome
+                .flash
+                .as_deref()
+                .unwrap()
+                .contains("couldn't post"),
             "{:?}",
-            app.flash
+            app.chrome.flash
         );
 
         // Something else up over the modal: the flash says, the box stays away.
-        app.overlay = Some(Overlay::Help(Default::default()));
+        app.modals.overlay = Some(Overlay::Help(Default::default()));
         land_answer(&mut app, answer(false));
-        assert!(matches!(&app.overlay, Some(Overlay::Help(_))));
-        assert!(app.flash.as_deref().unwrap().contains("couldn't post"));
+        assert!(matches!(&app.modals.overlay, Some(Overlay::Help(_))));
+        assert!(app
+            .chrome
+            .flash
+            .as_deref()
+            .unwrap()
+            .contains("couldn't post"));
     }
 
     #[test]
@@ -2476,7 +2514,7 @@ mod tests {
     fn a_landing_list_follows_the_cursor_by_url() {
         let mut app = App::new();
         let project = ProjectId("p1".into());
-        app.overlay = Some(Overlay::Issues(IssuesView::new(
+        app.modals.overlay = Some(Overlay::Issues(IssuesView::new(
             project.clone(),
             "demo".into(),
             "/tmp/demo".into(),
@@ -2489,7 +2527,7 @@ mod tests {
             },
         );
         select(&mut app, 2);
-        assert!(matches!(&app.overlay, Some(Overlay::Issues(v)) if v.selected == 2));
+        assert!(matches!(&app.modals.overlay, Some(Overlay::Issues(v)) if v.selected == 2));
         land_answer(
             &mut app,
             IssuesAnswer::List {
@@ -2498,7 +2536,7 @@ mod tests {
             },
         );
         assert!(
-            matches!(&app.overlay, Some(Overlay::Issues(v)) if v.selected == 1),
+            matches!(&app.modals.overlay, Some(Overlay::Issues(v)) if v.selected == 1),
             "#13 moved up a row and the cursor followed"
         );
         // A failed refresh keeps the rows; a failed first ask says so.
@@ -2509,8 +2547,8 @@ mod tests {
                 list: None,
             },
         );
-        assert_eq!(app.issues[&project].list.len(), 2);
-        assert!(!app.issues_failed.contains(&project));
+        assert_eq!(app.github.issues[&project].list.len(), 2);
+        assert!(!app.github.issues_failed.contains(&project));
         let other = ProjectId("p2".into());
         land_answer(
             &mut app,
@@ -2519,7 +2557,7 @@ mod tests {
                 list: None,
             },
         );
-        assert!(app.issues_failed.contains(&other));
+        assert!(app.github.issues_failed.contains(&other));
     }
 
     fn seed_project(app: &mut App, id: &str, dir: &str) -> ProjectId {
@@ -2550,24 +2588,24 @@ mod tests {
 
         sweep_others(&mut app);
         assert!(
-            app.issues_failed.contains(&p2),
+            app.github.issues_failed.contains(&p2),
             "not on disk: a miss without a process"
         );
         assert!(
-            !app.issues_failed.contains(&p1),
+            !app.github.issues_failed.contains(&p1),
             "the selected project is the prefetch's, never the sweep's"
         );
         assert_eq!(target(&app), None, "the miss armed its backoff");
 
         let now = std::time::Instant::now();
-        app.issues.insert(
+        app.github.issues.insert(
             p2.clone(),
             IssueList {
                 list: vec![issue(1, "a")],
                 at: now,
             },
         );
-        app.issues_due.insert(
+        app.github.issues_due.insert(
             p2.clone(),
             IssuesBeat {
                 due: now,
@@ -2582,20 +2620,20 @@ mod tests {
         let stale = now
             .checked_sub(SWEEP_REFRESH + std::time::Duration::from_secs(1))
             .expect("machine up for minutes");
-        app.issues.get_mut(&p2).unwrap().at = stale;
+        app.github.issues.get_mut(&p2).unwrap().at = stale;
         assert_eq!(target(&app), Some(p2.clone()), "older than the beat");
 
-        app.issues_due.get_mut(&p2).unwrap().due = now + RECHECK_MAX;
+        app.github.issues_due.get_mut(&p2).unwrap().due = now + RECHECK_MAX;
         assert_eq!(target(&app), None, "its own, longer backoff holds it");
-        app.issues_due.get_mut(&p2).unwrap().due = now;
+        app.github.issues_due.get_mut(&p2).unwrap().due = now;
 
-        app.issues_inflight.insert(p2.clone());
+        app.github.issues_inflight.insert(p2.clone());
         assert_eq!(target(&app), None, "already in flight");
-        app.issues_inflight.clear();
+        app.github.issues_inflight.clear();
         assert_eq!(target(&app), Some(p2.clone()));
 
-        app.issues_due.remove(&p1);
-        app.issues.remove(&p1);
+        app.github.issues_due.remove(&p1);
+        app.github.issues.remove(&p1);
         assert_eq!(
             target(&app),
             Some(p2),
@@ -2613,24 +2651,24 @@ mod tests {
         let project = seed_project(&mut app, "p1", "/nonexistent/nebula-issues-prefetch");
         assert!(prefetch_due(&app, &project), "never asked: due");
         schedule_prefetch(&mut app);
-        let (armed, _) = app.pending_issues_prefetch.clone().expect("armed");
+        let (armed, _) = app.github.pending_issues_prefetch.clone().expect("armed");
         assert_eq!(armed, project);
         assert!(app.issues_prefetch_delay().is_some());
         fire_prefetch(&mut app);
         assert!(
-            app.pending_issues_prefetch.is_none(),
+            app.github.pending_issues_prefetch.is_none(),
             "fires once, then disarms"
         );
         assert!(
-            app.issues_failed.contains(&project),
+            app.github.issues_failed.contains(&project),
             "not on disk: a miss without a process"
         );
         assert!(!prefetch_due(&app, &project), "the miss armed the backoff");
-        assert_eq!(app.issues_due[&project].backoff, Some(RECHECK_MIN));
+        assert_eq!(app.github.issues_due[&project].backoff, Some(RECHECK_MIN));
         // The tick asks nothing while the beat holds.
-        app.issues_failed.clear();
+        app.github.issues_failed.clear();
         refresh_selected(&mut app);
-        assert!(app.issues_failed.is_empty());
+        assert!(app.github.issues_failed.is_empty());
         // No project at all arms nothing.
         let mut empty = App::new();
         schedule_prefetch(&mut empty);
@@ -2646,7 +2684,7 @@ mod tests {
         let mut app = App::new();
         let project = ProjectId("p1".into());
         fn land(app: &mut App, project: &ProjectId, list: Option<Vec<Issue>>) {
-            app.issues_inflight.insert(project.clone());
+            app.github.issues_inflight.insert(project.clone());
             land_answer(
                 app,
                 IssuesAnswer::List {
@@ -2657,25 +2695,28 @@ mod tests {
         }
         let before = std::time::Instant::now();
         land(&mut app, &project, Some(vec![issue(15, "a")]));
-        let beat = app.issues_due[&project];
+        let beat = app.github.issues_due[&project];
         assert_eq!(beat.backoff, None);
         assert!(beat.due >= before + REFRESH, "steady beat");
         assert!(!prefetch_due(&app, &project));
 
         land(&mut app, &project, Some(vec![]));
-        assert_eq!(app.issues_due[&project].backoff, Some(RECHECK_MIN));
+        assert_eq!(app.github.issues_due[&project].backoff, Some(RECHECK_MIN));
         land(&mut app, &project, None);
-        assert_eq!(app.issues_due[&project].backoff, Some(RECHECK_MIN * 2));
+        assert_eq!(
+            app.github.issues_due[&project].backoff,
+            Some(RECHECK_MIN * 2)
+        );
         for _ in 0..10 {
             land(&mut app, &project, None);
         }
-        assert_eq!(app.issues_due[&project].backoff, Some(RECHECK_MAX));
+        assert_eq!(app.github.issues_due[&project].backoff, Some(RECHECK_MAX));
         land(&mut app, &project, Some(vec![issue(15, "a")]));
-        assert_eq!(app.issues_due[&project].backoff, None);
+        assert_eq!(app.github.issues_due[&project].backoff, None);
 
-        app.issues_due.get_mut(&project).unwrap().due = std::time::Instant::now();
+        app.github.issues_due.get_mut(&project).unwrap().due = std::time::Instant::now();
         assert!(prefetch_due(&app, &project), "the timer ran out");
-        app.issues_inflight.insert(project.clone());
+        app.github.issues_inflight.insert(project.clone());
         assert!(!prefetch_due(&app, &project), "never while in flight");
     }
 
@@ -2694,7 +2735,7 @@ mod tests {
             },
         );
         assert!(is_fresh(&app, &project), "an empty answer is an answer");
-        app.issues.get_mut(&project).unwrap().at = std::time::Instant::now()
+        app.github.issues.get_mut(&project).unwrap().at = std::time::Instant::now()
             .checked_sub(FRESH + std::time::Duration::from_secs(1))
             .expect("the clock has run longer than FRESH");
         assert!(!is_fresh(&app, &project));
@@ -2706,7 +2747,7 @@ mod tests {
     fn comments_land_by_url_and_a_miss_is_remembered() {
         let mut app = App::new();
         let url = "https://github.com/o/r/issues/15".to_string();
-        app.issue_detail_inflight.insert(url.clone());
+        app.github.issue_detail_inflight.insert(url.clone());
         land_answer(
             &mut app,
             IssuesAnswer::Detail {
@@ -2714,8 +2755,8 @@ mod tests {
                 detail: None,
             },
         );
-        assert!(app.issue_detail_failed.contains(&url));
-        assert!(!app.issue_detail_inflight.contains(&url));
+        assert!(app.github.issue_detail_failed.contains(&url));
+        assert!(!app.github.issue_detail_inflight.contains(&url));
         land_answer(
             &mut app,
             IssuesAnswer::Detail {
@@ -2726,7 +2767,7 @@ mod tests {
                 }),
             },
         );
-        assert!(app.issue_detail.contains_key(&url));
+        assert!(app.github.issue_detail.contains_key(&url));
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -2736,7 +2777,7 @@ mod tests {
     fn modal_with(rows: Vec<Issue>) -> (App, ProjectId) {
         let mut app = App::new();
         let project = ProjectId("p1".into());
-        app.overlay = Some(Overlay::Issues(IssuesView::new(
+        app.modals.overlay = Some(Overlay::Issues(IssuesView::new(
             project.clone(),
             "demo".into(),
             "/tmp/demo".into(),
@@ -2752,14 +2793,14 @@ mod tests {
     }
 
     fn editor(app: &App) -> Option<&IssueEditor> {
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::Issues(v)) => v.editor.as_deref(),
             _ => None,
         }
     }
 
     fn editor_mut(app: &mut App) -> &mut IssueEditor {
-        match &mut app.overlay {
+        match &mut app.modals.overlay {
             Some(Overlay::Issues(v)) => v.editor.as_deref_mut().expect("editing"),
             other => panic!("no issues modal: {other:?}"),
         }
@@ -2794,11 +2835,11 @@ mod tests {
         );
         assert!(editor(&app).is_none(), "back to the reading pane");
         assert!(
-            matches!(&app.overlay, Some(Overlay::Issues(_))),
+            matches!(&app.modals.overlay, Some(Overlay::Issues(_))),
             "the modal stays up"
         );
         assert_eq!(
-            app.issues[&project].list[0].title, "Fix login redirect",
+            app.github.issues[&project].list[0].title, "Fix login redirect",
             "nothing sent"
         );
         // A plain `e` is the filter's, not the editor's.
@@ -2910,7 +2951,7 @@ mod tests {
         // The walk above left the description's caret on its first
         // character, so the paste lands there — lines kept.
         assert!(editor(&app).unwrap().body.starts_with("c\nd"));
-        let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
             unreachable!()
         };
         view.editor = None;
@@ -2961,7 +3002,7 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(editor(&app).is_none(), "an unchanged form just closes");
-        assert_eq!(app.flash.as_deref(), Some("issue unchanged"));
+        assert_eq!(app.chrome.flash.as_deref(), Some("issue unchanged"));
         // A changed one with no sender installed stays put, unsent.
         handle_key(
             &mut app,
@@ -3025,7 +3066,10 @@ mod tests {
             "Fix the login redirect",
             "the text is kept"
         );
-        assert_eq!(app.issues[&project].list[0].title, "Fix login redirect");
+        assert_eq!(
+            app.github.issues[&project].list[0].title,
+            "Fix login redirect"
+        );
 
         editor_mut(&mut app).saving = true;
         land_answer(
@@ -3041,10 +3085,10 @@ mod tests {
             },
         );
         assert!(editor(&app).is_none(), "saved: the reading pane is back");
-        let row = &app.issues[&project].list[0];
+        let row = &app.github.issues[&project].list[0];
         assert_eq!(row.title, "Fix the login redirect");
         assert_eq!(row.body, "Bounces to /.");
-        assert_eq!(app.flash.as_deref(), Some("issue #15 updated"));
+        assert_eq!(app.chrome.flash.as_deref(), Some("issue #15 updated"));
 
         // A form reopened meanwhile is left alone by a late answer.
         handle_key(
@@ -3064,7 +3108,7 @@ mod tests {
         let e = editor(&app).expect("still editing");
         assert!(e.notice.is_none());
         assert_eq!(
-            app.flash.as_deref(),
+            app.chrome.flash.as_deref(),
             Some("couldn't update issue #15: late")
         );
     }
@@ -3125,10 +3169,10 @@ mod tests {
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| {
-            let Some(Overlay::Issues(v)) = app.overlay.clone() else {
+            let Some(Overlay::Issues(v)) = app.modals.overlay.clone() else {
                 panic!("no issues modal");
             };
-            draw(f, app, &v, app.theme, false);
+            draw(f, app, &v, app.chrome.theme, false);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -3153,7 +3197,7 @@ mod tests {
     }
 
     fn issues_view(app: &App) -> &IssuesView {
-        match &app.overlay {
+        match &app.modals.overlay {
             Some(Overlay::Issues(v)) => v,
             other => panic!("expected the issues modal, got {other:?}"),
         }
@@ -3177,7 +3221,7 @@ mod tests {
             issue(14, "Docs pass"),
             issue(13, "Login page"),
         ]);
-        app.pending_issue_detail = None;
+        app.github.pending_issue_detail = None;
         assert!(footer_hint(issues_view(&app)).starts_with("type to filter"));
         type_str(&mut app, "login");
         assert_eq!(issues_view(&app).query.as_str(), "login");
@@ -3190,7 +3234,7 @@ mod tests {
         let found = cursor_number(&app).expect("a row under the cursor");
         assert_ne!(found, 14);
         assert!(
-            app.pending_issue_detail.is_some(),
+            app.github.pending_issue_detail.is_some(),
             "its comments are asked for"
         );
 
@@ -3201,7 +3245,7 @@ mod tests {
             &mut Vec::new(),
         );
         assert_eq!(issues_view(&app).query.as_str(), "logini");
-        assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+        assert!(matches!(&app.modals.overlay, Some(Overlay::Issues(_))));
         handle_key(
             &mut app,
             key(KeyCode::Backspace, KeyModifiers::NONE),
@@ -3253,7 +3297,7 @@ mod tests {
             key(KeyCode::Esc, KeyModifiers::NONE),
             &mut Vec::new(),
         );
-        assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+        assert!(matches!(&app.modals.overlay, Some(Overlay::Issues(_))));
         assert!(issues_view(&app).query.is_empty());
         assert_eq!(cursor_number(&app), Some(second));
         let shot = screen(&mut app, 120, 40);
@@ -3264,7 +3308,7 @@ mod tests {
             key(KeyCode::Esc, KeyModifiers::NONE),
             &mut Vec::new(),
         );
-        assert!(app.overlay.is_none());
+        assert!(app.modals.overlay.is_none());
     }
 
     /// A filter nothing matches empties the list and says so — nothing
@@ -3290,7 +3334,7 @@ mod tests {
         assert!(shot.contains("no issues match"), "{shot}");
         assert!(shot.contains("(0/2)"), "{shot}");
         assert_eq!(cursor_number(&app), None, "nothing under the cursor");
-        assert!(app.pending_issue_detail.is_none());
+        assert!(app.github.pending_issue_detail.is_none());
         for _ in 0..3 {
             handle_key(
                 &mut app,
@@ -3303,7 +3347,7 @@ mod tests {
             Some(15),
             "the row is back as the filter widens"
         );
-        if let Some(Overlay::Issues(v)) = &mut app.overlay {
+        if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
             v.scroll = 3;
         }
         handle_key(
@@ -3370,8 +3414,11 @@ mod tests {
             "the filter is kept"
         );
         let picked = cursor_number(&app).unwrap();
-        let visible = visible_rows("login", &app.issues[&project].list);
-        assert_eq!(picked, app.issues[&project].list[visible[1].0].number);
+        let visible = visible_rows("login", &app.github.issues[&project].list);
+        assert_eq!(
+            picked,
+            app.github.issues[&project].list[visible[1].0].number
+        );
         assert_ne!(picked, 14);
     }
 
@@ -3422,7 +3469,7 @@ mod tests {
             key(KeyCode::Char('r'), KeyModifiers::CONTROL),
             &mut Vec::new(),
         );
-        assert_eq!(app.flash.as_deref(), Some("refreshing issues…"));
+        assert_eq!(app.chrome.flash.as_deref(), Some("refreshing issues…"));
         for letter in "roce".chars() {
             handle_key(
                 &mut app,
@@ -3432,7 +3479,7 @@ mod tests {
         }
         assert_eq!(issues_view(&app).query.as_str(), "roce");
         assert!(editor(&app).is_none());
-        assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+        assert!(matches!(&app.modals.overlay, Some(Overlay::Issues(_))));
     }
 
     /// `Shift+R` on the grid reloads the issues with the pull requests
@@ -3442,7 +3489,7 @@ mod tests {
     fn reload_asks_for_the_selected_projects_issues_past_the_beat() {
         let mut app = App::new();
         let project = seed_project(&mut app, "p1", "/nonexistent/nebula-issues-reload");
-        app.issues_due.insert(
+        app.github.issues_due.insert(
             project.clone(),
             IssuesBeat {
                 due: std::time::Instant::now() + RECHECK_MAX,
@@ -3450,10 +3497,13 @@ mod tests {
             },
         );
         refresh_selected(&mut app);
-        assert!(app.issues_failed.is_empty(), "the tick waits for the beat");
+        assert!(
+            app.github.issues_failed.is_empty(),
+            "the tick waits for the beat"
+        );
         reload_selected(&mut app);
         assert!(
-            app.issues_failed.contains(&project),
+            app.github.issues_failed.contains(&project),
             "asked at once: not on disk, so a miss without a process"
         );
         reload_selected(&mut App::new());
@@ -3470,10 +3520,10 @@ mod tests {
                 key(KeyCode::Char(letter), KeyModifiers::CONTROL),
                 &mut Vec::new(),
             );
-            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
                 panic!(
                     "^{letter} should open the comment box, got {:?}",
-                    app.overlay
+                    app.modals.overlay
                 );
             };
             assert!(
@@ -3529,7 +3579,7 @@ mod tests {
         let (mut app, _project) = modal_with(vec![issue(15, "Fix login redirect")]);
         let shot = screen(&mut app, 120, 40);
         assert!(shot.contains("↗ open in browser"), "{shot}");
-        let button = match &app.overlay {
+        let button = match &app.modals.overlay {
             Some(Overlay::Issues(v)) => v.browser_area,
             other => panic!("expected the issues modal, got {other:?}"),
         };
@@ -3551,10 +3601,10 @@ mod tests {
             &mut out,
         );
         assert_eq!(
-            app.flash.as_deref(),
+            app.chrome.flash.as_deref(),
             Some("opened github.com/o/r/issues/15")
         );
-        app.flash = None;
+        app.chrome.flash = None;
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: at.x,
@@ -3563,11 +3613,11 @@ mod tests {
         };
         handle_mouse(&mut app, click, at, &mut out);
         assert_eq!(
-            app.flash.as_deref(),
+            app.chrome.flash.as_deref(),
             Some("opened github.com/o/r/issues/15")
         );
         assert!(
-            matches!(app.overlay, Some(Overlay::Issues(_))),
+            matches!(app.modals.overlay, Some(Overlay::Issues(_))),
             "the modal stays up"
         );
 
@@ -3579,7 +3629,7 @@ mod tests {
         );
         let shot = screen(&mut app, 120, 40);
         assert!(!shot.contains("open in browser"), "{shot}");
-        let Some(Overlay::Issues(v)) = &app.overlay else {
+        let Some(Overlay::Issues(v)) = &app.modals.overlay else {
             panic!("no issues modal");
         };
         assert_eq!(v.browser_area, Rect::default());

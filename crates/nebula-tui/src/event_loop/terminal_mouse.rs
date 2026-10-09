@@ -62,8 +62,8 @@ pub(crate) fn forward_mouse(
     release: bool,
     mouse: &MouseEvent,
 ) {
-    if let Some(term) = &app.term {
-        let (col, row) = pane_cell(app.term_area, mouse.column, mouse.row);
+    if let Some(term) = &app.pane.term {
+        let (col, row) = pane_cell(app.pane.term_area, mouse.column, mouse.row);
         out.push(ClientRequest::Input {
             session: term.sref.clone(),
             data: mouse_report(sgr, button, release, col, row),
@@ -75,11 +75,11 @@ pub(crate) fn forward_mouse(
 /// scrolled past on the way (the EDGE AUTO-SCROLL, the wheel) read back
 /// whole whether or not they are still on screen, and wrapped rows join.
 pub(crate) fn selection_text(app: &App) -> Option<String> {
-    let sel = app.term_selection.as_ref()?;
+    let sel = app.pane.term_selection.as_ref()?;
     if !sel.active {
         return None;
     }
-    let screen = app.term.as_ref()?.parser.screen();
+    let screen = app.pane.term.as_ref()?.parser.screen();
     let (rows, cols) = screen.size();
     let end = screen.history_end();
     if rows == 0 || cols == 0 || end == 0 {
@@ -104,13 +104,13 @@ pub(crate) fn selection_text(app: &App) -> Option<String> {
 /// the highlight (it clears on the next click / scroll / keypress). A drag
 /// that never left its starting cell is just a click — drop it.
 pub(crate) fn finish_selection(app: &mut App) {
-    app.dirty = true;
-    app.next_drag_autoscroll = None;
-    let Some(sel) = &mut app.term_selection else {
+    app.chrome.dirty = true;
+    app.pane.next_drag_autoscroll = None;
+    let Some(sel) = &mut app.pane.term_selection else {
         return;
     };
     if !sel.active {
-        app.term_selection = None;
+        app.pane.term_selection = None;
         return;
     }
     sel.dragging = false;
@@ -133,7 +133,7 @@ pub(crate) fn copy_selection(app: &mut App) {
 /// step now, then `drag_autoscroll_tick` on its beat until the pointer is
 /// back inside or the button comes up.
 pub(crate) fn drag_select_to(app: &mut App, pointer: (u16, u16), out: &mut Vec<ClientRequest>) {
-    let Some(sel) = &mut app.term_selection else {
+    let Some(sel) = &mut app.pane.term_selection else {
         return;
     };
     if !sel.dragging {
@@ -141,10 +141,10 @@ pub(crate) fn drag_select_to(app: &mut App, pointer: (u16, u16), out: &mut Vec<C
     }
     sel.pointer = pointer;
     place_drag_head(app);
-    match edge_overshoot(app.term_area, pointer.1) {
-        Some(_) if app.next_drag_autoscroll.is_none() => drag_autoscroll_tick(app, out),
+    match edge_overshoot(app.pane.term_area, pointer.1) {
+        Some(_) if app.pane.next_drag_autoscroll.is_none() => drag_autoscroll_tick(app, out),
         Some(_) => {}
-        None => app.next_drag_autoscroll = None,
+        None => app.pane.next_drag_autoscroll = None,
     }
 }
 
@@ -154,18 +154,23 @@ pub(crate) fn drag_select_to(app: &mut App, pointer: (u16, u16), out: &mut Vec<C
 /// selection is still a selection). Only a head that moved repaints — the
 /// EDGE AUTO-SCROLL calls this on every tick, scrolled or not.
 pub(crate) fn place_drag_head(app: &mut App) {
-    let area = app.term_area;
-    let Some(base) = app.term.as_ref().map(|t| t.parser.screen().history_base()) else {
+    let area = app.pane.term_area;
+    let Some(base) = app
+        .pane
+        .term
+        .as_ref()
+        .map(|t| t.parser.screen().history_base())
+    else {
         return;
     };
-    let Some(sel) = &mut app.term_selection else {
+    let Some(sel) = &mut app.pane.term_selection else {
         return;
     };
     let (col, row) = pane_cell(area, sel.pointer.0, sel.pointer.1);
     let head = (col, base + u64::from(row));
     if sel.head != head {
         sel.head = head;
-        app.dirty = true;
+        app.chrome.dirty = true;
     }
     if sel.head != sel.anchor {
         sel.active = true;
@@ -193,15 +198,15 @@ pub(crate) fn edge_overshoot(area: ratatui::layout::Rect, row: u16) -> Option<(b
 /// (the top of the history, the live bottom) moves nothing and paints
 /// nothing.
 pub(crate) fn drag_autoscroll_tick(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.next_drag_autoscroll = None;
-    let Some(sel) = app.term_selection.filter(|s| s.dragging) else {
+    app.pane.next_drag_autoscroll = None;
+    let Some(sel) = app.pane.term_selection.filter(|s| s.dragging) else {
         return;
     };
-    let Some((up, distance)) = edge_overshoot(app.term_area, sel.pointer.1) else {
+    let Some((up, distance)) = edge_overshoot(app.pane.term_area, sel.pointer.1) else {
         return;
     };
     let lines = usize::from(distance).min(DRAG_AUTOSCROLL_MAX_LINES);
-    let Some(term) = &app.term else {
+    let Some(term) = &app.pane.term else {
         return;
     };
     // A step past the top of the history stops there, and past a history
@@ -214,7 +219,7 @@ pub(crate) fn drag_autoscroll_tick(app: &mut App, out: &mut Vec<ClientRequest>) 
     };
     scroll_pane_to(app, target, out);
     place_drag_head(app);
-    app.next_drag_autoscroll = Some(std::time::Instant::now() + DRAG_AUTOSCROLL_TICK);
+    app.pane.next_drag_autoscroll = Some(std::time::Instant::now() + DRAG_AUTOSCROLL_TICK);
 }
 
 /// Scroll the pane's view of its history to `target` lines above the live
@@ -226,7 +231,7 @@ pub(crate) fn drag_autoscroll_tick(app: &mut App, out: &mut Vec<ClientRequest>) 
 /// moves where it lands. Paints only when the view (or where it is headed)
 /// moved: a step at the top or the live bottom is nothing.
 pub(crate) fn scroll_pane_to(app: &mut App, target: usize, out: &mut Vec<ClientRequest>) {
-    let Some(term) = &mut app.term else {
+    let Some(term) = &mut app.pane.term else {
         return;
     };
     let before = term.scroll_offset();
@@ -239,18 +244,19 @@ pub(crate) fn scroll_pane_to(app: &mut App, target: usize, out: &mut Vec<ClientR
         }
     }
     if app
+        .pane
         .term
         .as_ref()
         .is_some_and(|t| t.scroll_offset() != before)
     {
-        app.dirty = true;
+        app.chrome.dirty = true;
     }
 }
 
 /// Select the maximal run of non-blank cells around `cell` on its row (a
 /// double-click "word": handles identifiers, paths, and URLs alike).
 pub(crate) fn select_word_at(app: &mut App, cell: (u16, u16)) {
-    let Some(term) = &app.term else {
+    let Some(term) = &app.pane.term else {
         return;
     };
     let screen = term.parser.screen();
@@ -276,7 +282,7 @@ pub(crate) fn select_word_at(app: &mut App, cell: (u16, u16)) {
         end += 1;
     }
     let line = screen.history_base() + u64::from(row);
-    app.term_selection = Some(TermSelection {
+    app.pane.term_selection = Some(TermSelection {
         anchor: (start, line),
         head: (end, line),
         dragging: false,
@@ -303,7 +309,7 @@ pub(crate) fn copy_and_flash(app: &mut App, text: &str, label: &str) {
     // Unit tests exercise the copy flows; don't clobber the developer's real
     // clipboard, and don't depend on their terminal or their $SSH_TTY.
     if cfg!(test) {
-        app.flash = Some(label.to_string());
+        app.chrome.flash = Some(label.to_string());
         return;
     }
     let via_terminal = format!("{label} (via terminal)");
@@ -311,8 +317,8 @@ pub(crate) fn copy_and_flash(app: &mut App, text: &str, label: &str) {
     // ten to twenty milliseconds the loop used to spend on mouse-up. It
     // all but never fails here, so the flash says so now, and the rare
     // failure falls back to the terminal's OSC 52 when it is known.
-    if let (false, Some(jobs)) = (app.is_remote, app.view_jobs.clone()) {
-        app.flash = Some(label.to_string());
+    if let (false, Some(jobs)) = (app.chrome.is_remote, app.jobs.view_jobs.clone()) {
+        app.chrome.flash = Some(label.to_string());
         let text = text.to_string();
         jobs.run(move || {
             (!copy_to_clipboard(&text)).then(|| crate::view_jobs::Answer::ClipboardViaTerminal {
@@ -322,12 +328,12 @@ pub(crate) fn copy_and_flash(app: &mut App, text: &str, label: &str) {
         });
         return;
     }
-    if !app.is_remote && copy_to_clipboard(text) {
-        app.flash = Some(label.to_string());
+    if !app.chrome.is_remote && copy_to_clipboard(text) {
+        app.chrome.flash = Some(label.to_string());
         return;
     }
-    app.pending_clipboard = Some(base64_encode(text.as_bytes()));
-    app.flash = Some(via_terminal);
+    app.chrome.pending_clipboard = Some(base64_encode(text.as_bytes()));
+    app.chrome.flash = Some(via_terminal);
 }
 
 /// Base64 (RFC 4648, padded) for OSC 52 payloads.
@@ -463,10 +469,10 @@ pub(crate) fn on_vsplit(bx: u16, area: ratatui::layout::Rect, column: u16, row: 
 /// already in progress): a main-screen splitter, or the file-list border of
 /// the diff / tree modals.
 pub(crate) fn pointer_wants_resize(app: &App, column: u16, row: u16) -> bool {
-    if app.vim.is_some() {
+    if app.pane.vim.is_some() {
         return false;
     }
-    match &app.overlay {
+    match &app.modals.overlay {
         Some(Overlay::Diff(view)) => {
             view.files_drag.is_some() || on_vsplit(view.splitter_x(), view.area, column, row)
         }
@@ -488,7 +494,7 @@ pub(crate) fn update_pointer(app: &mut App, mouse: &MouseEvent) {
     // One hit-test feeds both boundaries and both grips. The modals draw
     // their own file-list edge outside the hit map, so `pointer_wants_resize`
     // still measures that one itself.
-    let on_panels = app.vim.is_none() && app.overlay.is_none();
+    let on_panels = app.pane.vim.is_none() && app.modals.overlay.is_none();
     let hit = on_panels
         .then(|| app.hit_at(mouse.column, mouse.row))
         .flatten();
@@ -496,9 +502,9 @@ pub(crate) fn update_pointer(app: &mut App, mouse: &MouseEvent) {
     // up and down under the cards, side to side beside them — and it is
     // asked first, the two boundaries never sharing a cell.
     let on_pane_edge = on_panels
-        && (app.launcher_pane_drag.is_some()
+        && (app.launcher.launcher_pane_drag.is_some()
             || matches!(&hit, Some(HitTarget::LauncherPaneSplitter)));
-    app.pointer_shape = if on_pane_edge && app.launcher_pane_side().beside() {
+    app.chrome.pointer_shape = if on_pane_edge && app.launcher_pane_side().beside() {
         PointerShape::ColResize
     } else if on_pane_edge {
         PointerShape::RowResize
@@ -507,9 +513,9 @@ pub(crate) fn update_pointer(app: &mut App, mouse: &MouseEvent) {
     } else {
         PointerShape::Default
     };
-    if app.hover_launcher_pane != on_pane_edge {
-        app.hover_launcher_pane = on_pane_edge;
-        app.dirty = true;
+    if app.launcher.hover_launcher_pane != on_pane_edge {
+        app.launcher.hover_launcher_pane = on_pane_edge;
+        app.chrome.dirty = true;
     }
     // The header's PROJECT TABS (each tab, its `×`, the `+` after them)
     // and a full-screen session's `‹ sessions` are the other things on
@@ -557,8 +563,8 @@ pub(crate) fn update_pointer(app: &mut App, mouse: &MouseEvent) {
             ratatui::layout::Position::new(mouse.column, mouse.row),
         )
     });
-    if app.hover_crumb != crumb {
-        app.hover_crumb = crumb;
-        app.dirty = true;
+    if app.launcher.hover_crumb != crumb {
+        app.launcher.hover_crumb = crumb;
+        app.chrome.dirty = true;
     }
 }

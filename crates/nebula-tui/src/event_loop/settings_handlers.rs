@@ -85,7 +85,7 @@ pub(crate) fn run_settings_cmd(app: &mut App, cmd: SettingsCmd) {
     match cmd {
         SettingsCmd::Close => close_settings(app),
         SettingsCmd::Tab(next) => {
-            app.settings_tab = next;
+            app.modals.settings_tab = next;
             let row = app.settings_row(next);
             if let Some(view) = settings_mut(app) {
                 view.tab = next;
@@ -127,7 +127,7 @@ pub(crate) fn run_settings_cmd(app: &mut App, cmd: SettingsCmd) {
         }
         SettingsCmd::ResetHotkey => {
             if edit_keymap(app, |keymap| keymap.reset(selected)) {
-                let label = app.keymap.display_at(selected);
+                let label = app.chrome.keymap.display_at(selected);
                 if let Some(view) = settings_mut(app) {
                     view.info(format!("reset to the default binding: {label}"));
                 }
@@ -149,7 +149,7 @@ pub(crate) fn run_settings_cmd(app: &mut App, cmd: SettingsCmd) {
             // The confirm replaces the overlay; both of its exits put the
             // settings back on screen (see `reset_settings` and the Esc
             // arm of the Confirm handler).
-            app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+            app.modals.overlay = Some(Overlay::Confirm(ConfirmDialog {
                 title: "Reset settings".into(),
                 message: "Every setting goes back to its default: theme, editor, agent \
                           defaults,\ntimeouts, the grid's layout, every project's settings, \
@@ -165,7 +165,7 @@ pub(crate) fn run_settings_cmd(app: &mut App, cmd: SettingsCmd) {
 
 /// The open settings overlay, for handlers that already know it's up.
 pub(crate) fn settings(app: &App) -> Option<&SettingsView> {
-    match &app.overlay {
+    match &app.modals.overlay {
         Some(Overlay::Settings(view)) => Some(view),
         _ => None,
     }
@@ -173,7 +173,7 @@ pub(crate) fn settings(app: &App) -> Option<&SettingsView> {
 
 /// `settings`, mutably.
 pub(crate) fn settings_mut(app: &mut App) -> Option<&mut SettingsView> {
-    match &mut app.overlay {
+    match &mut app.modals.overlay {
         Some(Overlay::Settings(view)) => Some(view),
         _ => None,
     }
@@ -216,7 +216,7 @@ pub(crate) fn capture_hotkey(app: &mut App, key: KeyEvent) {
         return;
     }
     let chord = crate::keymap::KeyChord::from_event(&key);
-    let conflicts = app.keymap.conflicts(capture.action, &chord);
+    let conflicts = app.chrome.keymap.conflicts(capture.action, &chord);
     if !conflicts.is_empty() {
         // Warn before stealing: the user gets to see who currently owns
         // the key and decide, instead of finding out when that action
@@ -293,14 +293,14 @@ pub(crate) fn save_keymap(app: &mut App, keymap: crate::keymap::Keymap) -> bool 
     if !save_config(app, &cfg) {
         return false;
     }
-    app.keymap = keymap;
+    app.chrome.keymap = keymap;
     true
 }
 
 /// Clone the live keymap, let `edit` change it, and persist the result.
 /// False means the write failed and the live keymap is untouched.
 pub(crate) fn edit_keymap(app: &mut App, edit: impl FnOnce(&mut crate::keymap::Keymap)) -> bool {
-    let mut keymap = app.keymap.clone();
+    let mut keymap = app.chrome.keymap.clone();
     edit(&mut keymap);
     save_keymap(app, keymap)
 }
@@ -328,7 +328,7 @@ pub(crate) fn save_config(app: &mut App, cfg: &crate::config::Config) -> bool {
     match cfg.save() {
         Ok(()) => true,
         Err(err) => {
-            app.flash = Some(format!("couldn't save settings: {err}"));
+            app.chrome.flash = Some(format!("couldn't save settings: {err}"));
             false
         }
     }
@@ -404,17 +404,17 @@ pub(crate) fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i
 /// the settings overlay so a new setting can't reach one and miss the
 /// other — the overlay is a live editor, not a restart-to-apply screen.
 pub(crate) fn apply_config(app: &mut App, cfg: &crate::config::Config) {
-    app.theme = cfg.theme();
-    app.animations = cfg.animations;
-    app.black_background = cfg.black_background;
-    app.card_issue_number = cfg.card_issue_number;
-    app.show_all_worktrees = cfg.show_all_worktrees;
-    app.hide_card_marks = cfg.hide_card_marks;
-    app.highlight_current_card = cfg.highlight_current_card;
-    app.launcher_pane_at = cfg.pane_side();
-    app.launcher_list = cfg.list_layout();
-    app.launcher_nested = cfg.nested_layout();
-    app.launcher_all_open = cfg.expand_all_worktrees;
+    app.chrome.theme = cfg.theme();
+    app.chrome.animations = cfg.animations;
+    app.chrome.black_background = cfg.black_background;
+    app.launcher.card_issue_number = cfg.card_issue_number;
+    app.launcher.show_all_worktrees = cfg.show_all_worktrees;
+    app.launcher.hide_card_marks = cfg.hide_card_marks;
+    app.launcher.highlight_current_card = cfg.highlight_current_card;
+    app.launcher.launcher_pane_at = cfg.pane_side();
+    app.launcher.launcher_list = cfg.list_layout();
+    app.launcher.launcher_nested = cfg.nested_layout();
+    app.launcher.launcher_all_open = cfg.expand_all_worktrees;
     set_hide_draft_prs(app, cfg.hide_draft_prs);
 }
 
@@ -428,12 +428,12 @@ pub(crate) fn reset_settings(app: &mut App) {
     match result {
         Ok(cfg) => {
             apply_config(app, &cfg);
-            app.keymap = cfg.keymap();
+            app.chrome.keymap = cfg.keymap();
             if let Some(view) = settings_mut(app) {
                 view.info("every setting is back to its default");
             }
         }
-        Err(err) => app.flash = Some(format!("couldn't reset settings: {err}")),
+        Err(err) => app.chrome.flash = Some(format!("couldn't reset settings: {err}")),
     }
 }
 
@@ -458,14 +458,14 @@ pub(crate) fn open_harness_settings(app: &mut App, kind: AgentKind, custom: Opti
         _ => kind.as_str().to_string(),
     };
     let tab = agents_tab();
-    app.settings_tab = tab;
+    app.modals.settings_tab = tab;
     if let Some((_, row)) = locate_agent(&id, HarnessField::Enabled) {
-        if let Some(slot) = app.settings_selected.get_mut(tab) {
+        if let Some(slot) = app.modals.settings_selected.get_mut(tab) {
             *slot = row;
         }
     }
-    app.settings_on_tabs = false;
-    app.overlay = Some(Overlay::Settings(SettingsView::new(
+    app.modals.settings_on_tabs = false;
+    app.modals.overlay = Some(Overlay::Settings(SettingsView::new(
         tab,
         app.settings_row(tab),
         false,
@@ -477,11 +477,11 @@ pub(crate) fn open_harness_settings(app: &mut App, kind: AgentKind, custom: Opti
 /// checks the memory's age first; this one is for mid-visit round trips
 /// (the reset confirmation) where the position can't have gone stale.
 pub(crate) fn reopen_settings(app: &mut App) {
-    let tab = app.settings_tab;
-    app.overlay = Some(Overlay::Settings(SettingsView::new(
+    let tab = app.modals.settings_tab;
+    app.modals.overlay = Some(Overlay::Settings(SettingsView::new(
         tab,
         app.settings_row(tab),
-        app.settings_on_tabs,
+        app.modals.settings_on_tabs,
     )));
 }
 
@@ -489,7 +489,7 @@ pub(crate) fn reopen_settings(app: &mut App) {
 /// position (see `open_settings`). Both ways out — Esc/`q`/`s` and a click
 /// outside the modal — go through here.
 pub(crate) fn close_settings(app: &mut App) {
-    app.overlay = None;
+    app.modals.overlay = None;
     app.note_settings_closed();
 }
 
@@ -505,13 +505,13 @@ pub(crate) fn close_settings(app: &mut App) {
 /// pane catches up on the next move, as it does after the ROOT WORKTREE
 /// toggle.
 pub(crate) fn set_hide_draft_prs(app: &mut App, hidden: bool) -> bool {
-    if app.hide_draft_prs == hidden {
+    if app.launcher.hide_draft_prs == hidden {
         return false;
     }
     let was = app.selected_worktree_pr().cloned();
     let checkout = app.selected_worktree().map(|w| w.id.clone());
-    app.hide_draft_prs = hidden;
-    app.dirty = true;
+    app.launcher.hide_draft_prs = hidden;
+    app.chrome.dirty = true;
     refresh_palette(app);
     // A checkout on a draft's branch nests under it while the draft is
     // listed and is a plain row while it is not: either way it stays
@@ -521,11 +521,11 @@ pub(crate) fn set_hide_draft_prs(app: &mut App, hidden: bool) -> bool {
         return false;
     };
     if let Some(i) = app.open_pr_row_of(&was.url) {
-        app.sel_worktree = i;
+        app.nav.sel_worktree = i;
         return false;
     }
     let last = app.worktree_row_count().saturating_sub(1);
-    app.sel_worktree = app.sel_worktree.min(last);
+    app.nav.sel_worktree = app.nav.sel_worktree.min(last);
     schedule_pr_detail(app);
     app.selected_worktree().is_some()
 }
@@ -540,7 +540,7 @@ pub(crate) fn set_hide_draft_prs(app: &mut App, hidden: bool) -> bool {
 /// group, and it may belong to another worktree.
 pub(crate) fn toggle_hide_draft_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
     let mut cfg = crate::config::Config::load();
-    cfg.hide_draft_prs = !app.hide_draft_prs;
+    cfg.hide_draft_prs = !app.launcher.hide_draft_prs;
     if !save_config(app, &cfg) {
         return;
     }
@@ -548,7 +548,7 @@ pub(crate) fn toggle_hide_draft_prs(app: &mut App, out: &mut Vec<ClientRequest>)
         restore_session(app, out);
         fire_pending_attach(app, out);
     }
-    app.flash = Some(if cfg.hide_draft_prs {
+    app.chrome.flash = Some(if cfg.hide_draft_prs {
         "draft pull requests hidden (Settings → Appearance)".into()
     } else {
         "draft pull requests shown".into()

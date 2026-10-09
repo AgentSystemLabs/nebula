@@ -3,24 +3,24 @@
 use super::*;
 
 pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
-    if matches!(&app.overlay, Some(Overlay::Settings(_))) {
+    if matches!(&app.modals.overlay, Some(Overlay::Settings(_))) {
         handle_settings_key(app, key);
         return;
     }
-    if matches!(&app.overlay, Some(Overlay::FileTabs(_))) {
+    if matches!(&app.modals.overlay, Some(Overlay::FileTabs(_))) {
         crate::file_tabs::handle_key(app, key);
         return;
     }
     // The chord that dropped the PROJECT DROPDOWN (`⌘P`) puts it away
     // again, rather than landing in its type-ahead as a `p`.
-    if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_project_picker())
+    if matches!(&app.modals.overlay, Some(Overlay::Menu(m)) if m.is_project_picker())
         && drops_project_dropdown(app, &crate::keymap::KeyChord::from_event(&key))
     {
-        app.overlay = None;
-        app.dirty = true;
+        app.modals.overlay = None;
+        app.chrome.dirty = true;
         return;
     }
-    let Some(overlay) = &app.overlay else {
+    let Some(overlay) = &app.modals.overlay else {
         return;
     };
     match overlay {
@@ -47,7 +47,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
 
 fn handle_help_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -56,7 +56,7 @@ fn handle_help_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 key.code,
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
             ) {
-                app.overlay = None;
+                app.modals.overlay = None;
             }
         }
         _ => unreachable!("overlay dispatcher passed the wrong overlay"),
@@ -65,12 +65,12 @@ fn handle_help_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
 
 fn handle_metrics_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
         Overlay::Metrics(view) => match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => app.overlay = None,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => app.modals.overlay = None,
             KeyCode::Char('j') | KeyCode::Down => {
                 view.selected = clamp_selection(view.selected as i64 + (1), view.rows.len());
             }
@@ -86,7 +86,7 @@ fn handle_metrics_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
 
 fn handle_hosts_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -113,7 +113,7 @@ fn handle_hosts_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) 
                 return;
             }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => app.overlay = None,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => app.modals.overlay = None,
                 KeyCode::Char('j') | KeyCode::Down => {
                     view.selected = clamp_selection(view.selected as i64 + (1), view.hosts.len());
                 }
@@ -149,7 +149,7 @@ fn handle_hosts_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) 
 
 fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -182,7 +182,7 @@ fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             {
                 let query = format!("{}{c}", menu.filter_query());
                 if !menu.type_filter(c) {
-                    app.flash = Some(format!("no row matches '{query}'"));
+                    app.chrome.flash = Some(format!("no row matches '{query}'"));
                 }
             }
             KeyCode::Backspace if menu.filter.is_some() => menu.pop_filter(),
@@ -198,10 +198,10 @@ fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Some(parent) => *menu = *parent,
                 None => match menu_quick_return(menu) {
                     Some(back) if back.from_box => {
-                        app.overlay = None;
+                        app.modals.overlay = None;
                         crate::quick_prompt::reopen(app, back.launch, &back.text);
                     }
-                    _ => app.overlay = None,
+                    _ => app.modals.overlay = None,
                 },
             },
             KeyCode::Char('j') | KeyCode::Down => {
@@ -238,7 +238,7 @@ fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
 
 fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -276,9 +276,9 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
                 // that costs nothing: the box is parked as a DRAFT, and the
                 // next QUICK PROMPT opens on it.
                 let parked = crate::quick_prompt::draft_of(prompt);
-                app.overlay = None;
+                app.modals.overlay = None;
                 if let Some(draft) = parked {
-                    app.quick_draft = Some(draft);
+                    app.modals.quick_draft = Some(draft);
                 }
                 if back_to_settings {
                     reopen_settings(app);
@@ -306,7 +306,7 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
                 if let Some(path) = prompt.hovered_path() {
                     prompt.input.set_text(path);
                 }
-                app.overlay = None;
+                app.modals.overlay = None;
                 submit_prompt(app, prompt, out);
             }
             // The LAUNCHER VIEW's box chords: `^P` the project, `^T` the
@@ -406,7 +406,7 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
 
 fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -422,7 +422,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 let PendingAction::ThenDeleteWorktree { first, .. } = confirm.action.clone() else {
                     unreachable!("guarded above");
                 };
-                app.overlay = None;
+                app.modals.overlay = None;
                 run_pending_action(app, *first, out);
             }
             KeyCode::Esc | KeyCode::Char('n') => {
@@ -431,7 +431,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 // not the panels.
                 let to_settings = matches!(confirm.action, PendingAction::ResetSettings);
                 if let PendingAction::LocateProjectPath { id, .. } = &confirm.action {
-                    app.dismissed_repath_projects.insert(id.clone());
+                    app.launcher.dismissed_repath_projects.insert(id.clone());
                 }
                 let to_presets = match &confirm.action {
                     PendingAction::DeleteAgentPreset {
@@ -441,7 +441,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     } => Some((*index, worktree.clone(), quick.clone())),
                     _ => None,
                 };
-                app.overlay = None;
+                app.modals.overlay = None;
                 if to_settings {
                     reopen_settings(app);
                 } else if let Some((index, worktree, quick)) = to_presets {
@@ -455,7 +455,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             }
             KeyCode::Enter | KeyCode::Char('y') => {
                 let action = confirm.action.clone();
-                app.overlay = None;
+                app.modals.overlay = None;
                 run_pending_action(app, action, out);
             }
             // Ctrl+C twice always gets out. The gate exists to catch a
@@ -466,8 +466,8 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && confirm.action == PendingAction::Quit =>
             {
-                app.overlay = None;
-                app.should_quit = true;
+                app.modals.overlay = None;
+                app.chrome.should_quit = true;
             }
             _ => {}
         },
@@ -477,7 +477,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
 
 fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -495,7 +495,7 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     view.filter.clear();
                     activate::diff_filter_changed(view);
                 }
-                KeyCode::Esc => app.overlay = None,
+                KeyCode::Esc => app.modals.overlay = None,
                 KeyCode::Char('d') if ctrl => {
                     activate::diff_file(view, view.cursor() as i64 + half)
                 }
@@ -523,7 +523,7 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // file; remembered for the next open, like the list's width.
                 KeyCode::Char('t') if ctrl => {
                     activate::diff_tree_toggled(view);
-                    app.diff_tree = view.tree.is_some();
+                    app.modals.diff_tree = view.tree.is_some();
                 }
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
@@ -557,7 +557,7 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
 
 fn handle_palette_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -570,7 +570,7 @@ fn handle_palette_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     palette.query.clear();
                     palette.apply_filter();
                 }
-                KeyCode::Esc => app.overlay = None,
+                KeyCode::Esc => app.modals.overlay = None,
                 // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
                 KeyCode::Down => palette.select(palette.selected as i64 + 1),
                 KeyCode::Up => palette.select(palette.selected as i64 - 1),
@@ -601,7 +601,7 @@ fn handle_palette_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
 
 fn handle_files_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -614,7 +614,7 @@ fn handle_files_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) 
                     finder.query.clear();
                     finder.apply_filter();
                 }
-                KeyCode::Esc => app.overlay = None,
+                KeyCode::Esc => app.modals.overlay = None,
                 // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
                 KeyCode::Down => finder.select(finder.selected as i64 + 1),
                 KeyCode::Up => finder.select(finder.selected as i64 - 1),
@@ -628,7 +628,7 @@ fn handle_files_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) 
                 // root) to the clipboard — ready to paste into an agent.
                 KeyCode::Char('y') if ctrl => {
                     if let Some(path) = finder.selected_path().map(str::to_string) {
-                        app.overlay = None;
+                        app.modals.overlay = None;
                         let label = format!("copied {path}");
                         copy_and_flash(app, &path, &label);
                     }
@@ -648,7 +648,7 @@ fn handle_files_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) 
 
 fn handle_grep_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -661,7 +661,7 @@ fn handle_grep_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     view.query.clear();
                     view.run_search();
                 }
-                KeyCode::Esc => app.overlay = None,
+                KeyCode::Esc => app.modals.overlay = None,
                 // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
                 KeyCode::Down => view.select(view.selected as i64 + 1),
                 KeyCode::Up => view.select(view.selected as i64 - 1),
@@ -685,7 +685,7 @@ fn handle_grep_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
 
 fn handle_tree_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
     match overlay {
@@ -701,7 +701,7 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     view.filter.clear();
                     view.apply_filter();
                 }
-                KeyCode::Esc => app.overlay = None,
+                KeyCode::Esc => app.modals.overlay = None,
                 // The preview scrolls on the diff-modal keys: ⇧↑/↓ lines,
                 // Ctrl+d/u half pages, PageUp/Down, Home/End.
                 KeyCode::Char('d') if ctrl => view.scroll_by(half),
@@ -734,7 +734,7 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // root) to the clipboard — ready to paste into an agent.
                 KeyCode::Char('y') if ctrl => {
                     if let Some(path) = view.selected_node().map(|n| n.path.clone()) {
-                        app.overlay = None;
+                        app.modals.overlay = None;
                         let label = format!("copied {path}");
                         copy_and_flash(app, &path, &label);
                     }

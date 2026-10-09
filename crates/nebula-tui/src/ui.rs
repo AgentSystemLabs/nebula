@@ -208,30 +208,30 @@ const MIN_PREVIEW_TEXT_W: usize = 16;
 pub fn draw(f: &mut Frame, app: &mut App) {
     // A frame asks where the cursor is a dozen times over and moves it
     // none of them: the ROWS MEMO works it out once.
-    app.rows_memo.arm();
+    app.chrome.rows_memo.arm();
     draw_screen(f, app);
-    app.rows_memo.disarm();
-    if app.black_background {
+    app.chrome.rows_memo.disarm();
+    if app.chrome.black_background {
         let area = f.area();
         draw_black_background(f.buffer_mut(), area);
     }
 }
 
 fn draw_screen(f: &mut Frame, app: &mut App) {
-    app.hits.clear();
-    app.tail_cards.clear();
-    app.host_cursor = None;
-    app.welcome_on_screen = false;
+    app.chrome.hits.clear();
+    app.pane.tail_cards.clear();
+    app.pane.host_cursor = None;
+    app.chrome.welcome_on_screen = false;
 
     // The bar gets a blank row above it so it breathes off the panel
     // borders, matching the terminal's own padding below the last row.
     let [body, footer] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(f.area());
 
-    if app.collapsed {
+    if app.pane.collapsed {
         draw_terminal(f, app, body);
-        if app.focus == Focus::Terminal {
-            draw_focus_tint(f.buffer_mut(), body, app.theme);
+        if app.nav.focus == Focus::Terminal {
+            draw_focus_tint(f.buffer_mut(), body, app.chrome.theme);
         }
         draw_footer(f, app, footer);
         draw_overlay(f, app);
@@ -251,7 +251,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
     if app.launcher_active() {
         // `launcher_view::draw` takes `body_area` for the grid's half, so
         // the whole body is kept here for the pane drag to measure against.
-        app.launcher_body = body;
+        app.launcher.launcher_body = body;
         let (view_a, pane_a) = app.launcher_split(body);
         let side = app.launcher_pane_side();
         // The pane's edge facing the cards is draggable, as the panels'
@@ -260,7 +260,7 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         // grab zone (`launcher::pane_grab_zone`), registered first so they win
         // `hit_at`'s first-match scan against a card that lands there.
         if let Some(pane_a) = pane_a {
-            app.hits.push((
+            app.chrome.hits.push((
                 crate::launcher::pane_grab_zone(side, pane_a),
                 HitTarget::LauncherPaneSplitter,
             ));
@@ -268,8 +268,8 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
         launcher_view::draw(f, app, view_a);
         if let Some(pane_a) = pane_a {
             draw_terminal(f, app, crate::launcher::pane_content(side, pane_a));
-            if app.focus == Focus::Terminal {
-                draw_focus_tint(f.buffer_mut(), pane_a, app.theme);
+            if app.nav.focus == Focus::Terminal {
+                draw_focus_tint(f.buffer_mut(), pane_a, app.chrome.theme);
             }
             draw_launcher_pane_grip(f.buffer_mut(), app, side, pane_a);
         }
@@ -292,12 +292,12 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
 /// tree browser — embedded in its preview pane (whose block the tree arm
 /// already drew).
 fn draw_vim(f: &mut Frame, app: &mut App) {
-    let th = app.theme;
-    let Some(vim) = &app.vim else {
+    let th = app.chrome.theme;
+    let Some(vim) = &app.pane.vim else {
         return;
     };
     if vim.embedded {
-        let pane = match &app.overlay {
+        let pane = match &app.modals.overlay {
             Some(Overlay::Tree(view)) => Some(view.preview_area),
             Some(Overlay::FileTabs(view)) => Some(view.body_area),
             _ => None,
@@ -312,9 +312,9 @@ fn draw_vim(f: &mut Frame, app: &mut App) {
             );
             // Every key goes to the editor while it is up, so the host
             // cursor follows it rather than the pane underneath.
-            app.host_cursor = pty_cursor_cell(vim.parser.screen(), inner);
+            app.pane.host_cursor = pty_cursor_cell(vim.parser.screen(), inner);
             // Write-back: the post-draw sync resizes the PTY to the pane.
-            if let Some(vim) = &mut app.vim {
+            if let Some(vim) = &mut app.pane.vim {
                 vim.area = inner;
             }
             return;
@@ -345,9 +345,9 @@ fn draw_vim(f: &mut Frame, app: &mut App) {
         tui_term::widget::PseudoTerminal::new(vim.parser.screen()),
         inner,
     );
-    app.host_cursor = pty_cursor_cell(vim.parser.screen(), inner);
+    app.pane.host_cursor = pty_cursor_cell(vim.parser.screen(), inner);
     // Write-back: the post-draw sync resizes the PTY to the drawn rect.
-    if let Some(vim) = &mut app.vim {
+    if let Some(vim) = &mut app.pane.vim {
         vim.area = inner;
     }
 }
@@ -463,7 +463,7 @@ fn draw_multiline_prompt(
     prompt: &PromptDialog,
     backdrop: bool,
 ) -> Rect {
-    let th = app.theme;
+    let th = app.chrome.theme;
     // The QUICK PROMPT carries one row the other task boxes do not — where
     // the launch lands — and takes it in height rather than out of the
     // editor. Its frame turns green while Enter will cut a fresh worktree
@@ -620,7 +620,7 @@ fn draw_multiline_prompt(
     if backdrop {
         return branch_area;
     }
-    if let Some(Overlay::Prompt(p)) = &mut app.overlay {
+    if let Some(Overlay::Prompt(p)) = &mut app.modals.overlay {
         p.area = area;
         p.editor_area = editor_inner;
         p.toggle_area = toggle_area;
@@ -632,8 +632,8 @@ fn draw_multiline_prompt(
 }
 
 fn draw_overlay(f: &mut Frame, app: &mut App) {
-    let th = app.theme;
-    let Some(overlay) = app.overlay.clone() else {
+    let th = app.chrome.theme;
+    let Some(overlay) = app.modals.overlay.clone() else {
         return;
     };
     // A box opened from the ISSUES MODAL or the PULL REQUESTS MODAL stands
@@ -765,7 +765,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 f.render_widget(Paragraph::new(Span::styled(text, style)), row);
             }
             // Record the drawn area for click hit-testing.
-            if let Some(Overlay::Menu(m)) = &mut app.overlay {
+            if let Some(Overlay::Menu(m)) = &mut app.modals.overlay {
                 m.area = area;
             }
         }
@@ -825,7 +825,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             lines.push(legend);
             f.render_widget(Paragraph::new(lines), inner);
             // Record the drawn area for click hit-testing.
-            if let Some(Overlay::Confirm(c)) = &mut app.overlay {
+            if let Some(Overlay::Confirm(c)) = &mut app.modals.overlay {
                 c.area = area;
             }
         }
@@ -943,7 +943,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 );
             }
             // Record the listing and dialog rects for click hit-testing.
-            if let Some(Overlay::Prompt(p)) = &mut app.overlay {
+            if let Some(Overlay::Prompt(p)) = &mut app.modals.overlay {
                 p.list_area = list_area;
                 p.area = area;
             }
@@ -1085,13 +1085,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     Act(actions) => {
                         let full = actions
                             .iter()
-                            .map(|a| app.keymap.shown_label(*a))
+                            .map(|a| app.chrome.keymap.shown_label(*a))
                             .collect::<Vec<_>>()
                             .join(" / ");
                         if actions.len() != 1 || full.chars().count() <= HELP_KEY_W {
                             return full;
                         }
                         let chords: Vec<String> = app
+                            .chrome
                             .keymap
                             .shown_chords(actions[0])
                             .iter()
@@ -1160,7 +1161,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(column(LEFT, left_a.width)), left_a);
             f.render_widget(Paragraph::new(column(RIGHT, right_a.width)), right_a);
             // Record the drawn area for click hit-testing.
-            if let Some(Overlay::Help(h)) = &mut app.overlay {
+            if let Some(Overlay::Help(h)) = &mut app.modals.overlay {
                 h.area = area;
             }
         }
@@ -1310,10 +1311,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         let value = if selected && capturing {
                             "press a key…".to_string()
                         } else {
-                            app.keymap.display_at(*i)
+                            app.chrome.keymap.display_at(*i)
                         };
-                        let reach = app.keymap.reach_at(*i);
-                        let ambiguous = app.keymap.is_ambiguous(*i);
+                        let reach = app.chrome.keymap.reach_at(*i);
+                        let ambiguous = app.chrome.keymap.is_ambiguous(*i);
                         let mut label_style = Style::default();
                         let mut value_style =
                             Style::default().fg(if reach.is_fine() && !ambiguous {
@@ -1362,7 +1363,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     // urgent thing to say about it.
                     let shadowed = view
                         .is_hotkeys()
-                        .then(|| app.keymap.shadowed_by(view.selected))
+                        .then(|| app.chrome.keymap.shadowed_by(view.selected))
                         .filter(|names| !names.is_empty());
                     match shadowed {
                         Some(names) => lines.push(Line::from(Span::styled(
@@ -1398,7 +1399,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 dim,
             )));
             f.render_widget(Paragraph::new(lines), inner);
-            if let Some(Overlay::Settings(v)) = &mut app.overlay {
+            if let Some(Overlay::Settings(v)) = &mut app.modals.overlay {
                 v.area = area;
                 v.tab_hits = hits;
                 v.first_row = first_row;
@@ -1679,7 +1680,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let area = centered_rect(f.area(), MEMORY_W, height);
             let inner = render_modal_frame(f, area, " Memory ", th);
             f.render_widget(Paragraph::new(lines), inner);
-            if let Some(Overlay::Metrics(v)) = &mut app.overlay {
+            if let Some(Overlay::Metrics(v)) = &mut app.modals.overlay {
                 v.area = area;
                 v.scroll = scroll;
                 v.selected = selected;
@@ -1884,7 +1885,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // Write-back (draw works on a clone): page size for key paging,
             // scroll re-clamped so resizes never strand the view.
-            if let Some(Overlay::Diff(v)) = &mut app.overlay {
+            if let Some(Overlay::Diff(v)) = &mut app.modals.overlay {
                 v.view_height = diff_inner.height;
                 v.scroll = scroll;
                 v.list_area = list_inner;
@@ -2020,7 +2021,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     quiet,
                     // No ONE-SHOT SWEEP in a list the user just summoned:
                     // it is for the change nobody was looking at.
-                    sweep_ramp(status, false, th, app.animations),
+                    sweep_ramp(status, false, th, app.chrome.animations),
                     app.sweep_phase(),
                     // A pull request in trouble paints its title in its
                     // row's red — the end-to-end red its sidebar row wears.
@@ -2061,7 +2062,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // Write-back (draw works on a clone): rects for mouse
             // hit-testing.
-            if let Some(Overlay::Palette(p)) = &mut app.overlay {
+            if let Some(Overlay::Palette(p)) = &mut app.modals.overlay {
                 p.area = area;
                 p.list_area = list_inner;
             }
@@ -2112,7 +2113,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // Write-back (draw works on a clone): rects for mouse
             // hit-testing.
-            if let Some(Overlay::Files(fin)) = &mut app.overlay {
+            if let Some(Overlay::Files(fin)) = &mut app.modals.overlay {
                 fin.area = area;
                 fin.list_area = list_inner;
             }
@@ -2189,7 +2190,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // Write-back (draw works on a clone): rects for mouse
             // hit-testing.
-            if let Some(Overlay::Grep(v)) = &mut app.overlay {
+            if let Some(Overlay::Grep(v)) = &mut app.modals.overlay {
                 v.area = area;
                 v.list_area = list_inner;
             }
@@ -2265,7 +2266,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // Write-back (draw works on a clone): rects for mouse
             // hit-testing, plus the clamped cursor.
-            if let Some(Overlay::Hosts(v)) = &mut app.overlay {
+            if let Some(Overlay::Hosts(v)) = &mut app.modals.overlay {
                 v.area = area;
                 v.list_area = inner;
                 v.selected = selected;
@@ -2310,7 +2311,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 width: inner.width,
                 height: inner.height.saturating_sub(3),
             };
-            let editing = app.vim.as_ref().is_some_and(|v| v.embedded);
+            let editing = app.pane.vim.as_ref().is_some_and(|v| v.embedded);
             // A markdown tab shows the rendered page — flowed for this
             // width, kept on the view between draws — unless `m` asked
             // for the source. No gutter: rendered rows aren't source lines.
@@ -2370,7 +2371,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // the pane for the embedded editor, the page size for paging,
             // the scroll re-clamped so resizes never strand the view, the
             // shown line count and the flowed page for the next draw.
-            if let Some(Overlay::FileTabs(v)) = &mut app.overlay {
+            if let Some(Overlay::FileTabs(v)) = &mut app.modals.overlay {
                 v.area = area;
                 v.tab_hits = hits;
                 v.body_area = body;
@@ -2459,7 +2460,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // Right: the selected node's preview, syntax-highlighted and
             // scrolled — or the embedded editor, which draw_vim paints into
             // this pane after us.
-            let editing = app.vim.as_ref().is_some_and(|v| v.embedded);
+            let editing = app.pane.vim.as_ref().is_some_and(|v| v.embedded);
             let sel_path = view.selected_node().map(|n| n.path.as_str()).unwrap_or("");
             let title = if editing {
                 format!(
@@ -2529,7 +2530,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // Write-back (draw works on a clone): page size for key paging,
             // scroll re-clamped so resizes never strand the view, preview
             // rect for the embedded editor.
-            if let Some(Overlay::Tree(v)) = &mut app.overlay {
+            if let Some(Overlay::Tree(v)) = &mut app.modals.overlay {
                 v.view_height = preview_inner.height;
                 v.scroll = scroll;
                 v.preview_line_count = line_count;
@@ -2548,7 +2549,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 /// An action's primary chord, for a footer hint. Unbound reads as `—`,
 /// which is the truth: that verb has no key right now.
 fn key_hint(app: &App, action: crate::keymap::Action) -> String {
-    app.keymap
+    app.chrome
+        .keymap
         .shown_first(action)
         .map(|c| c.display())
         .unwrap_or_else(|| "—".into())
@@ -2754,7 +2756,7 @@ fn draw_launcher_pane_grip(
     /// Rows it runs down a pane beside the cards: a cell is about twice as
     /// tall as it is wide, so half the width reads as the same handle.
     const GRIP_H: u16 = GRIP_W / 2;
-    let th = app.theme;
+    let th = app.chrome.theme;
     let edge = crate::launcher::pane_edge(side, pane);
     let (cells, rule, grip, len): (Vec<(u16, u16)>, _, _, _) = if side.beside() {
         let cells = (edge.y..edge.y + edge.height).map(|y| (edge.x, y));
@@ -2780,7 +2782,7 @@ fn draw_launcher_pane_grip(
     if span < len + 2 {
         return; // no room for the grip and rule either side of it
     }
-    let active = app.launcher_pane_drag.is_some() || app.hover_launcher_pane;
+    let active = app.launcher.launcher_pane_drag.is_some() || app.launcher.hover_launcher_pane;
     let fg = if active { th.accent } else { th.muted };
     let from = usize::from((span - len) / 2);
     for &at in &cells[from..from + usize::from(len)] {
@@ -2943,7 +2945,7 @@ pub(crate) fn browser_button(
 /// `event_loop::update_pointer` puts in `App::hover_crumb` — the modals
 /// keep their rects outside the hit map, as they do their list edges.
 pub(crate) fn browser_button_under(app: &App, pos: Position) -> Option<HitTarget> {
-    let button = match &app.overlay {
+    let button = match &app.modals.overlay {
         Some(Overlay::PullRequests(v)) => v.browser_area,
         Some(Overlay::Issues(v)) => v.browser_area,
         _ => return None,
@@ -3225,16 +3227,16 @@ fn render_button<'a>(
 /// on the PR ROW (`App::previewed_pr`): headline, description, then the
 /// conversation, scrolled by `pr_preview_scroll`.
 ///
-/// The line count is written back to `app.pr_preview_lines` so the scroll
+/// The line count is written back to `app.github.pr_preview_lines` so the scroll
 /// handlers know how far down they may go — the pane is the only thing that
 /// knows how wide the prose wrapped.
 fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let Some(pr) = app.previewed_pr() else {
         return;
     };
-    let detail = app.pr_detail.get(&pr.url).cloned();
-    let failed = app.pr_detail_failed.contains(&pr.url);
+    let detail = app.github.pr_detail.get(&pr.url).cloned();
+    let failed = app.github.pr_detail_failed.contains(&pr.url);
 
     let left = vec![
         Span::styled(" · ".to_string(), Style::default().fg(th.dim)),
@@ -3260,12 +3262,12 @@ fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         width: inner.width.saturating_sub(1),
         ..inner
     };
-    app.term_area = inner;
-    app.hits.push((inner, HitTarget::TerminalPane));
+    app.pane.term_area = inner;
+    app.chrome.hits.push((inner, HitTarget::TerminalPane));
     // Nothing in this pane is a PTY, so the link/file scanners have nothing
     // to find — clear them or ⌥click would still hit last frame's hits.
-    app.term_links = Vec::new();
-    app.term_file_links = Vec::new();
+    app.pane.term_links = Vec::new();
+    app.pane.term_file_links = Vec::new();
 
     // The placeholders wrap through the same helper the body does: the pane
     // is as narrow as the user drags it, and ratatui clips an overwide line
@@ -3295,13 +3297,13 @@ fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         )),
         (None, false) => placeholder("reading it…"),
     };
-    app.pr_preview_lines = lines.len();
+    app.github.pr_preview_lines = lines.len();
     // Clamp here rather than in the handlers: the pane is what knows how
     // many rows the prose wrapped to, and a narrower window can strand the
     // offset past the end.
     let max = (lines.len() as u16).saturating_sub(inner.height.max(1));
-    let scroll = app.pr_preview_scroll.min(max);
-    app.pr_preview_scroll = scroll;
+    let scroll = app.github.pr_preview_scroll.min(max);
+    app.github.pr_preview_scroll = scroll;
     let shown: Vec<Line> = lines.into_iter().skip(scroll as usize).collect();
     f.render_widget(Paragraph::new(shown), inner);
 }
@@ -3314,7 +3316,7 @@ fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 /// wait for before the first paint; only the comments are fetched on the
 /// rest, and `issues::lines` says so until they land.
 fn draw_issue_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let Some(issue) = app.previewed_issue().cloned() else {
         return;
     };
@@ -3328,27 +3330,27 @@ fn draw_issue_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         width: inner.width.saturating_sub(1),
         ..inner
     };
-    app.term_area = inner;
-    app.hits.push((inner, HitTarget::TerminalPane));
+    app.pane.term_area = inner;
+    app.chrome.hits.push((inner, HitTarget::TerminalPane));
     // Nothing in this pane is a PTY, so the link/file scanners have nothing
     // to find — clear them or ⌥click would still hit last frame's hits.
-    app.term_links = Vec::new();
-    app.term_file_links = Vec::new();
+    app.pane.term_links = Vec::new();
+    app.pane.term_file_links = Vec::new();
 
     let lines = crate::issues::lines(
         &issue,
-        app.issue_detail.get(&issue.url),
-        app.issue_detail_failed.contains(&issue.url),
-        app.issue_comment_inflight.contains(&issue.url),
+        app.github.issue_detail.get(&issue.url),
+        app.github.issue_detail_failed.contains(&issue.url),
+        app.github.issue_comment_inflight.contains(&issue.url),
         inner.width as usize,
         th,
     );
-    app.pr_preview_lines = lines.len();
+    app.github.pr_preview_lines = lines.len();
     // Clamp here, as the pull request's pane does: this is what knows how
     // many rows the prose wrapped to.
     let max = (lines.len() as u16).saturating_sub(inner.height.max(1));
-    let scroll = app.pr_preview_scroll.min(max);
-    app.pr_preview_scroll = scroll;
+    let scroll = app.github.pr_preview_scroll.min(max);
+    app.github.pr_preview_scroll = scroll;
     let shown: Vec<Line> = lines.into_iter().skip(scroll as usize).collect();
     f.render_widget(Paragraph::new(shown), inner);
 }
@@ -3361,7 +3363,7 @@ fn draw_issue_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 /// with the keys that open it. Nothing here is a PTY: no cursor, no
 /// scrollback, nothing to lock the keyboard into.
 fn draw_cloud_session(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let Some(cloud) = app.previewed_cloud() else {
         return;
     };
@@ -3375,11 +3377,11 @@ fn draw_cloud_session(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         width: inner.width.saturating_sub(1),
         ..inner
     };
-    app.term_area = inner;
+    app.pane.term_area = inner;
     // Nothing in this pane is a PTY, so the link/file scanners have nothing
     // to find — clear them or ⌥click would still hit last frame's hits.
-    app.term_links = Vec::new();
-    app.term_file_links = Vec::new();
+    app.pane.term_links = Vec::new();
+    app.pane.term_file_links = Vec::new();
 
     let w = (inner.width as usize).saturating_sub(2).max(20);
     let prose = |text: &str, style: Style| -> Vec<Line<'static>> {
@@ -3418,7 +3420,7 @@ fn draw_cloud_session(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         if row < inner.height {
             let width = (chunk.len() as u16 + 1).min(inner.width);
             let link = Rect::new(inner.x, inner.y + row, width, 1);
-            app.hits.push((link, HitTarget::CloudSessionLink));
+            app.chrome.hits.push((link, HitTarget::CloudSessionLink));
         }
         lines.push(Line::from(Span::styled(format!(" {text}"), link_style)));
     }
@@ -3441,7 +3443,7 @@ fn draw_cloud_session(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         format!(" {}", cloud.cloud_session_id),
         Style::default().fg(th.dim),
     )));
-    app.hits.push((inner, HitTarget::TerminalPane));
+    app.chrome.hits.push((inner, HitTarget::TerminalPane));
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -3526,8 +3528,8 @@ fn pty_cursor_cell(screen: &vt100::Screen, area: Rect) -> Option<Position> {
 }
 
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
-    let th = app.theme;
-    let focused = app.focus == Focus::Terminal;
+    let th = app.chrome.theme;
+    let focused = app.nav.focus == Focus::Terminal;
     // A cursor is resting on an open pull request — the Worktrees cursor
     // on a PROJECT OPEN PRS GROUP row, or the focused Sessions cursor on
     // the PR ROW: the pane reads it. The attachment underneath stays live —
@@ -3558,7 +3560,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         left.push(Span::styled(" · ".to_string(), Style::default().fg(th.dim)));
         left.push(Span::styled(name, Style::default().fg(th.muted)));
     }
-    let right = match &app.term {
+    let right = match &app.pane.term {
         Some(t) if t.exited => Some(Span::styled(
             "exited".to_string(),
             Style::default().fg(th.err).add_modifier(Modifier::BOLD),
@@ -3584,7 +3586,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         // The LAUNCHER VIEW's pane says nothing of the lock: its header's
         // right end is the CLOSE BUTTON, and the accent rule under the
         // strip already says the keys are in there.
-        Some(_) if app.term_locked && !app.launcher_active() => Some(Span::styled(
+        Some(_) if app.pane.term_locked && !app.launcher_active() => Some(Span::styled(
             "INPUT".to_string(),
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         )),
@@ -3598,7 +3600,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     // cursor itself, so the panels' ` · <attached>` is not added beside
     // it: with the pane on a terminal the attachment IS that terminal,
     // and the SESSION tab has to go on saying what it would come back to.
-    let inner = if app.launcher_active() && app.collapsed {
+    let inner = if app.launcher_active() && app.pane.collapsed {
         launcher_view::crumb_frame(f, app, area)
     } else if app.launcher_active() {
         launcher_view::pane_frame(f, app, area, right, focused)
@@ -3611,10 +3613,10 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         width: inner.width.saturating_sub(1),
         ..inner
     };
-    app.term_area = inner;
-    app.hits.push((inner, HitTarget::TerminalPane));
+    app.pane.term_area = inner;
+    app.chrome.hits.push((inner, HitTarget::TerminalPane));
 
-    let links = match &app.term {
+    let links = match &app.pane.term {
         // Refused: the DAEMON would not start this session, so no screen is
         // coming. Say why in full, wrapped, where the boot notice would
         // otherwise wait forever: the reason usually ends in what to do.
@@ -3663,10 +3665,10 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             let screen = term.parser.screen();
             let widget = tui_term::widget::PseudoTerminal::new(screen);
             f.render_widget(widget, inner);
-            app.host_cursor = pty_cursor_cell(screen, inner);
+            app.pane.host_cursor = pty_cursor_cell(screen, inner);
             // Selection highlight: overlay REVERSED on the selected cells
             // (stream selection — full rows between the endpoints).
-            if let Some(sel) = app.term_selection.filter(|s| s.active) {
+            if let Some(sel) = app.pane.term_selection.filter(|s| s.active) {
                 let ((start_col, start_line), (end_col, end_line)) = sel.bounds();
                 let reversed = Style::default().add_modifier(Modifier::REVERSED);
                 let last_col = inner.width.saturating_sub(1);
@@ -3760,12 +3762,12 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         let seg = Rect::new(inner.x + c0, inner.y + row, c1 - c0 + 1, 1).intersection(inner);
         f.buffer_mut().set_style(seg, underline);
     }
-    app.term_links = links;
-    app.term_file_links = file_links;
+    app.pane.term_links = links;
+    app.pane.term_file_links = file_links;
 }
 
 fn attached_session_name(app: &App) -> Option<String> {
-    match &app.term.as_ref()?.sref {
+    match &app.pane.term.as_ref()?.sref {
         SessionRef::Agent(id) => app
             .tree
             .agents
@@ -3785,7 +3787,7 @@ fn attached_session_name(app: &App) -> Option<String> {
 /// segment matching the focused panel is highlighted. Sessions/Terminal
 /// focus both highlight the session segment.
 fn breadcrumb(app: &App) -> Vec<Span<'static>> {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let seg = |name: &str, active: bool| {
         Span::styled(
             truncate(name, 20),
@@ -3802,10 +3804,10 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     let Some(project) = app.selected_project() else {
         return spans;
     };
-    spans.push(seg(&project.name, app.focus == Focus::Projects));
+    spans.push(seg(&project.name, app.nav.focus == Focus::Projects));
     if let Some(worktree) = app.selected_worktree() {
         spans.push(sep());
-        spans.push(seg(&worktree.branch, app.focus == Focus::Worktrees));
+        spans.push(seg(&worktree.branch, app.nav.focus == Focus::Worktrees));
         // A folded worktree's header (the NESTED layout) is where the
         // cursor is: the trail stops at the checkout, never naming the
         // card its fold hides.
@@ -3820,7 +3822,7 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
             };
             spans.push(seg(
                 &name,
-                matches!(app.focus, Focus::Sessions | Focus::Terminal),
+                matches!(app.nav.focus, Focus::Sessions | Focus::Terminal),
             ));
         }
     }
@@ -3851,7 +3853,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
 /// once the press has aged out (`key_combo::LINGER`; the loop clears it),
 /// so the row stays the breathing space it was.
 fn draw_key_combo(f: &mut Frame, app: &App, area: Rect) {
-    let Some(combo) = &app.key_combo else {
+    let Some(combo) = &app.chrome.key_combo else {
         return;
     };
     if area.height < 2 || area.width == 0 {
@@ -3862,7 +3864,7 @@ fn draw_key_combo(f: &mut Frame, app: &App, area: Rect) {
         height: 1,
         ..area
     };
-    let th = app.theme;
+    let th = app.chrome.theme;
     let cap = Style::default()
         .fg(th.accent)
         .bg(th.sel_bg)
@@ -3889,24 +3891,24 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
         height: area.height.min(1),
         ..area
     };
-    let th = app.theme;
+    let th = app.chrome.theme;
     // The hint branches below build with `dim`; lift to muted at the end
     // so hints read as secondary, not disabled (flash/warn stays as-is).
-    let conn = match app.conn {
+    let conn = match app.chrome.conn {
         ConnState::Connected => Span::styled("⏻ connected", Style::default().fg(th.ok)),
         ConnState::Disconnected => Span::styled("✗ disconnected", Style::default().fg(th.err)),
     };
     // The NESTED layout's KEY BAR, when it is what the hints are: its
     // keys and their words, drawn apart further down.
     let mut key_bar: Option<Vec<(String, &'static str)>> = None;
-    let hints = if let Some(flash) = &app.flash {
+    let hints = if let Some(flash) = &app.chrome.flash {
         Span::styled(flash.clone(), Style::default().fg(th.warn))
-    } else if app.vim.is_some() {
+    } else if app.pane.vim.is_some() {
         Span::styled(
             ":wq / :q to finish  Ctrl+Q: force close",
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::Grep(view)) = &app.overlay {
+    } else if let Some(Overlay::Grep(view)) = &app.modals.overlay {
         Span::styled(
             format!(
                 "type: search  ↑/↓: move  Enter: edit in {}  Ctrl+u: clear  Esc: clear/close",
@@ -3914,7 +3916,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::Diff(view)) = &app.overlay {
+    } else if let Some(Overlay::Diff(view)) = &app.modals.overlay {
         Span::styled(
             if view.tree.is_some() {
                 "type: filter  ↑/↓: move  ←/→: fold  ⇧↑/↓: scroll  Ctrl+d/u: half list  Ctrl+t: flat list  Ctrl+u: clear filter  Esc: clear/close"
@@ -3923,12 +3925,12 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             },
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::FileTabs(view)) = &app.overlay {
+    } else if let Some(Overlay::FileTabs(view)) = &app.modals.overlay {
         Span::styled(
-            file_tabs_keys_hint(view, app.vim.as_ref().is_some_and(|v| v.embedded)),
+            file_tabs_keys_hint(view, app.pane.vim.as_ref().is_some_and(|v| v.embedded)),
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::Tree(view)) = &app.overlay {
+    } else if let Some(Overlay::Tree(view)) = &app.modals.overlay {
         let md = markdown_toggle_hint("Ctrl+r", view.markdown, view.pretty);
         Span::styled(
             format!(
@@ -3937,7 +3939,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::Files(view)) = &app.overlay {
+    } else if let Some(Overlay::Files(view)) = &app.modals.overlay {
         // A markdown selection is read first (the FILE TABS); the hint
         // says so rather than promising the editor.
         let enter = if view
@@ -3954,25 +3956,25 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::Palette(_))) {
+    } else if matches!(&app.modals.overlay, Some(Overlay::Palette(_))) {
         Span::styled(
             "type: search  ↑/↓: move  Enter: open  Ctrl+u: clear  Esc: clear/close",
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::Settings(_))) {
+    } else if matches!(&app.modals.overlay, Some(Overlay::Settings(_))) {
         Span::styled(
-            match &app.overlay {
+            match &app.modals.overlay {
                 Some(Overlay::Settings(view)) => settings_keys_hint(view),
                 _ => "",
             },
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::Metrics(_))) {
+    } else if matches!(&app.modals.overlay, Some(Overlay::Metrics(_))) {
         Span::styled(
             "↑/↓: select  Enter: open session  Esc: close  (refreshes every 2s)",
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::Hosts(view)) = &app.overlay {
+    } else if let Some(Overlay::Hosts(view)) = &app.modals.overlay {
         Span::styled(
             if view.input.is_some() {
                 "type user@host [dir]  Enter: connect (restarts nebula over ssh)  Esc: cancel"
@@ -3981,45 +3983,46 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             },
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::AgentPresets(view)) = &app.overlay {
+    } else if let Some(Overlay::AgentPresets(view)) = &app.modals.overlay {
         Span::styled(
             crate::preset_overlays::footer_hint(view),
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::AgentPresetEditor(_))) {
+    } else if matches!(&app.modals.overlay, Some(Overlay::AgentPresetEditor(_))) {
         Span::styled(
             "Tab/↑↓: next field  ←/→: cycle  Shift+Enter/^J: newline  Enter: save  Esc: back to list",
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::Issues(view)) = &app.overlay {
+    } else if let Some(Overlay::Issues(view)) = &app.modals.overlay {
         Span::styled(
             crate::issues::footer_hint(view),
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
+    } else if matches!(&app.modals.overlay, Some(Overlay::PullRequests(_))) {
         Span::styled(crate::pr_modal::footer_hint(), Style::default().fg(th.dim))
-    } else if let Some(Overlay::BranchSwitch(view)) = &app.overlay {
+    } else if let Some(Overlay::BranchSwitch(view)) = &app.modals.overlay {
         Span::styled(
             crate::branch_switch::footer_hint(view),
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_project_picker()) {
+    } else if matches!(&app.modals.overlay, Some(Overlay::Menu(m)) if m.is_project_picker()) {
         Span::styled(
             "type: filter  Enter: open the project  ↑/↓: move  Esc: close",
             Style::default().fg(th.dim),
         )
-    } else if let Some(hint) = app.overlay.as_ref().and_then(|o| match o {
+    } else if let Some(hint) = app.modals.overlay.as_ref().and_then(|o| match o {
         Overlay::Menu(m) => menu_footer_hint(m),
         _ => None,
     }) {
         Span::styled(hint, Style::default().fg(th.dim))
-    } else if matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::QuickPrompt(_)))
+    } else if matches!(&app.modals.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::QuickPrompt(_)))
     {
         // `^P`, `^O`, `Tab` and `^N` are on the box itself now, each
         // beside the thing it changes — a third copy down here was most
         // of what made this screen read as a wall of chords. A box
         // standing on a modal goes back to it.
         let hint = match app
+            .modals
             .overlay
             .as_ref()
             .and_then(crate::quick_prompt::modal_under)
@@ -4033,12 +4036,12 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             None => "Enter: launch  ⇧Tab: preset  Esc: back to sessions",
         };
         Span::styled(hint, Style::default().fg(th.dim))
-    } else if matches!(&app.overlay, Some(Overlay::ProjectPicker(_))) {
+    } else if matches!(&app.modals.overlay, Some(Overlay::ProjectPicker(_))) {
         Span::styled(
             "type: filter projects  ↑/↓: move  Enter: aim the box there  Esc: clear/back to the box",
             Style::default().fg(th.dim),
         )
-    } else if app.overlay.is_some() {
+    } else if app.modals.overlay.is_some() {
         Span::styled("Esc: close  Enter: confirm", Style::default().fg(th.dim))
     } else if app.splash_showing() {
         // The splash covers the panels, so every panel hotkey is dead here.
@@ -4065,8 +4068,8 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(th.dim),
         )
     } else if app.launcher_grid()
-        && app.focus != Focus::Terminal
-        && app.launcher_tab_cursor.is_some()
+        && app.nav.focus != Focus::Terminal
+        && app.launcher.launcher_tab_cursor.is_some()
     {
         // The LAUNCHER VIEW's PROJECT TABS holding the keys (`k`,`k` off
         // the top row of cards): walking the header's cursor, which
@@ -4085,7 +4088,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Style::default().fg(th.dim),
         )
-    } else if app.launcher_grid() && app.focus != Focus::Terminal {
+    } else if app.launcher_grid() && app.nav.focus != Focus::Terminal {
         // The LAUNCHER VIEW's GRID: walking the cards, opening the one
         // under the cursor, and the PROJECT TABS beside them. Not while
         // the pane under it has the keys — those are the pane's own
@@ -4098,7 +4101,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             k(Action::MoveUp),
             k(Action::FocusRight),
         );
-        if app.launcher_nested && !app.show_archived {
+        if app.launcher.launcher_nested && !app.launcher.show_archived {
             // The NESTED layout walks with `j`/`k`, and its three verbs
             // are the whole bar: the pull request's key is on the DETAIL
             // STRIP, beside the pull request it opens.
@@ -4111,7 +4114,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             Span::raw("")
         } else {
             Span::styled(
-                if app.show_archived {
+                if app.launcher.show_archived {
                     // The ARCHIVED VIEW is a different list with different
                     // verbs on it: there is nothing to attach, prompt or
                     // archive there, only the two a card in it takes.
@@ -4149,7 +4152,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
         // overlay is: these are the first place a rebound key would start
         // lying.
         let k = |a| key_hint(app, a);
-        let text = match app.focus {
+        let text = match app.nav.focus {
             // The pane is the CLOUD SESSION PANEL: there is no terminal to
             // type into, and Enter hands the session to the browser.
             Focus::Terminal if app.previewed_cloud().is_some() => format!(
@@ -4157,15 +4160,15 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 k(Action::Activate),
                 k(Action::FocusLeft)
             ),
-            Focus::Terminal if app.term.as_ref().is_some_and(|t| t.exited) => {
+            Focus::Terminal if app.pane.term.as_ref().is_some_and(|t| t.exited) => {
                 "session exited — Esc: back to sessions".to_string()
             }
-            Focus::Terminal if app.term_locked => format!(
+            Focus::Terminal if app.pane.term_locked => format!(
                 "{}: {}  {}  ⌥click: open link",
                 // The pane under the cards is left by the fold's own key
                 // (`^``: back to the card, again: fold the pane).
                 if app.launcher_grid() {
-                    app.keymap
+                    app.chrome.keymap
                         .chords(Action::ToggleLauncherPane)
                         .iter()
                         .find(|c| !crate::key_combo::is_text_key(c))
@@ -4173,13 +4176,13 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     None
                 }
-                .or_else(|| app.keymap.first(Action::UnlockTerminal).map(|c| c.display()))
+                .or_else(|| app.chrome.keymap.first(Action::UnlockTerminal).map(|c| c.display()))
                 .unwrap_or_else(|| "^q".into()),
                 // The LAUNCHER VIEW has its grid of sessions to go back to,
                 // and a full-screen session comes back down to its pane.
                 if app.launcher_grid() {
                     "back to the card"
-                } else if app.launcher_active() && app.collapsed {
+                } else if app.launcher_active() && app.pane.collapsed {
                     "normal size"
                 } else {
                     "sessions"
@@ -4192,7 +4195,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
                     "drag: select+copy"
                 },
             ),
-            Focus::Terminal if app.term.is_some() => format!(
+            Focus::Terminal if app.pane.term.is_some() => format!(
                 "{}: type into terminal  {}: sessions",
                 k(Action::Activate),
                 k(Action::FocusLeft)
@@ -4303,14 +4306,14 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // (The version nameplate is spliced in at the front further down, once
     // the width left for the hints is known.)
     let mut spans = vec![Span::raw(" ")];
-    if app.is_remote {
+    if app.chrome.is_remote {
         spans.push(Span::styled(
-            truncate(&app.hostname, 24),
+            truncate(&app.chrome.hostname, 24),
             Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
     }
-    if matches!(app.conn, ConnState::Disconnected) {
+    if matches!(app.chrome.conn, ConnState::Disconnected) {
         spans.push(conn);
         spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
     }
@@ -4369,12 +4372,16 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // a newer one exists" belongs beside it rather than anywhere else on
     // the bar. It is part of the plate for the yield below — a flash that
     // would be clipped drops both.
-    let update = app.update_available.as_ref().map(|v| format!(" ⇡ v{v}"));
+    let update = app
+        .chrome
+        .update_available
+        .as_ref()
+        .map(|v| format!(" ⇡ v{v}"));
     let plate_w = plate.chars().count()
         + update.as_ref().map_or(0, |u| u.chars().count())
         + "  ·  ".chars().count();
     let body_w: usize = spans.iter().map(|s| s.width()).sum();
-    if app.flash.is_none() || body_w + plate_w <= left.width as usize {
+    if app.chrome.flash.is_none() || body_w + plate_w <= left.width as usize {
         let mut plate_spans = vec![Span::styled(plate, Style::default().fg(th.dim))];
         if let Some(update) = update {
             plate_spans.push(Span::styled(
@@ -4398,7 +4405,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
         // header's buttons are. Only the words are the target, laid where
         // the right alignment puts them, not the padding beside them.
         let span = Span::styled(usage, Style::default().fg(th.dim));
-        let span = if app.hover_crumb == Some(HitTarget::FooterUsage) {
+        let span = if app.launcher.hover_crumb == Some(HitTarget::FooterUsage) {
             span.style(
                 Style::default()
                     .fg(th.text)
@@ -4408,7 +4415,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
             span
         };
         let width = (span.width() as u16).min(right.width);
-        app.hits.push((
+        app.chrome.hits.push((
             Rect {
                 x: right.x + right.width - width,
                 width,
@@ -4427,7 +4434,7 @@ fn draw_footer_bar(f: &mut Frame, app: &mut App, area: Rect) {
 /// and nebula's total memory footprint (TUI + daemon + every session's
 /// process subtree). None until the first metrics reply arrives.
 fn footer_usage(app: &App) -> Option<String> {
-    let m = app.last_metrics.as_ref()?;
+    let m = app.jobs.last_metrics.as_ref()?;
     // Prewarm-pool spares are agent CLIs but not agents anyone opened;
     // they get their own count so the agent figure matches the sidebar.
     let spares = m.sessions.iter().filter(|s| s.prewarm.is_some()).count();
@@ -4438,7 +4445,7 @@ fn footer_usage(app: &App) -> Option<String> {
         .count();
     let terms = m.sessions.len() - agents - spares;
     let total = m.daemon_rss_bytes
-        + app.client_rss_bytes
+        + app.jobs.client_rss_bytes
         + m.sessions.iter().map(|s| s.rss_bytes).sum::<u64>();
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     let warm = if spares > 0 {
@@ -4841,10 +4848,10 @@ mod tests {
         let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
         term.parser.process(b"\x1b[?25l");
         term.parser.process(lines.join("\r\n").as_bytes());
-        app.term = Some(term);
+        app.pane.term = Some(term);
         // Lines 17–18, through column 3 of the last: rows 2–3 of the pane
         // at the live tail.
-        app.term_selection = Some(TermSelection {
+        app.pane.term_selection = Some(TermSelection {
             anchor: (0, 17),
             head: (3, 18),
             dragging: true,
@@ -4879,10 +4886,10 @@ mod tests {
         );
         // Scrolled back two lines: line 17 is the bottom row, line 18 is
         // below the screen.
-        app.term.as_mut().unwrap().set_scroll(2);
+        app.pane.term.as_mut().unwrap().set_scroll(2);
         assert_eq!(reversed_rows(&mut app), vec![(7, (1..=20).collect())]);
         // Scrolled past the selection: nothing to paint.
-        app.term.as_mut().unwrap().set_scroll(5);
+        app.pane.term.as_mut().unwrap().set_scroll(5);
         assert!(reversed_rows(&mut app).is_empty());
     }
 
@@ -4901,7 +4908,7 @@ mod tests {
         term.refused = Some(
             "the checkout for 'feat' is gone from disk (/x/feat). Recreate it: git worktree add /x/feat feat".into(),
         );
-        app.term = Some(term);
+        app.pane.term = Some(term);
         let area = Rect::new(0, 0, 44, 16);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(44, 16)).unwrap();
@@ -4938,15 +4945,19 @@ mod tests {
         };
         let mut app = App::new();
         assert!(resets(&mut app) > 0, "off: the terminal's background shows");
-        app.black_background = true;
+        app.chrome.black_background = true;
         assert_eq!(resets(&mut app), 0, "on: every default cell goes black");
 
         let area = Rect::new(0, 0, 2, 1);
         let mut buf = ratatui::buffer::Buffer::empty(area);
-        buf[(1, 0)].bg = app.theme.sel_bg;
+        buf[(1, 0)].bg = app.chrome.theme.sel_bg;
         draw_black_background(&mut buf, area);
         assert_eq!(buf[(0, 0)].bg, crate::theme::BLACK_BACKGROUND);
-        assert_eq!(buf[(1, 0)].bg, app.theme.sel_bg, "a fill stays on top");
+        assert_eq!(
+            buf[(1, 0)].bg,
+            app.chrome.theme.sel_bg,
+            "a fill stays on top"
+        );
     }
 
     #[test]

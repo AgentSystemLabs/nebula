@@ -47,7 +47,7 @@ fn remove(
     out: &mut Vec<ClientRequest>,
     make: impl FnOnce(u64) -> ClientRequest,
 ) {
-    app.deleting.insert(id.clone());
+    app.requests.deleting.insert(id.clone());
     handle_server_event(app, ServerEvent::EntityRemoved { id }, out);
     let undo = PendingIntent::Undo(Undo::Reinsert {
         index,
@@ -218,13 +218,13 @@ fn id_of(entity: &Entity) -> EntityId {
 /// DAEMON has not answered yet? Then it was on its way before the delete
 /// was, and showing it would bring the row back for a frame.
 pub(super) fn is_deleting(app: &App, entity: &Entity) -> bool {
-    !app.deleting.is_empty() && app.deleting.contains(&id_of(entity))
+    !app.requests.deleting.is_empty() && app.requests.deleting.contains(&id_of(entity))
 }
 
 /// The DAEMON did it: the row as it was is no longer needed.
 pub(super) fn settled(app: &mut App, undo: Undo) {
     if let Undo::Reinsert { entity, .. } = undo {
-        app.deleting.remove(&id_of(&entity));
+        app.requests.deleting.remove(&id_of(&entity));
     }
 }
 
@@ -233,7 +233,7 @@ pub(super) fn undo(app: &mut App, undo: Undo, out: &mut Vec<ClientRequest>) {
     let entity = match undo {
         Undo::Restore(entity) => *entity,
         Undo::Reinsert { index, entity } => {
-            app.deleting.remove(&id_of(&entity));
+            app.requests.deleting.remove(&id_of(&entity));
             // In its old place, so the list reads as it did; the upsert
             // below then finds the row and only refreshes it.
             match &*entity {
@@ -308,7 +308,7 @@ mod tests {
             },
         );
         assert_eq!(agent_name(&app, "a1"), Some(was), "the refusal undid it");
-        assert_eq!(app.flash.as_deref(), Some("name is taken"));
+        assert_eq!(app.chrome.flash.as_deref(), Some("name is taken"));
     }
 
     /// An empty name is refused by the DAEMON, in its words: nothing is
@@ -333,7 +333,7 @@ mod tests {
     fn a_deleted_row_stays_down_until_the_daemon_answers() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.focus = Focus::Sessions;
+        app.nav.focus = Focus::Sessions;
         let straggler = Entity::Agent(app.tree.agents[0].clone());
         let mut out = Vec::new();
 
@@ -358,7 +358,7 @@ mod tests {
                 created: None,
             },
         );
-        assert!(app.deleting.is_empty(), "the Ack ends the wait");
+        assert!(app.requests.deleting.is_empty(), "the Ack ends the wait");
     }
 
     /// A delete the DAEMON refuses puts the row back where it was.
@@ -386,7 +386,7 @@ mod tests {
             },
         );
         assert_eq!(order(&app), before, "back, and first again");
-        assert!(app.deleting.is_empty());
+        assert!(app.requests.deleting.is_empty());
     }
 
     /// Unarchive is the archive's mirror: the row is back among the live
