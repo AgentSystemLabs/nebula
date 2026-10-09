@@ -374,8 +374,9 @@ mod tests {
     }
 
     /// A branch that already has a checkout is taken as it stands, no git
-    /// involved (the test project is no repo, so a cut would fail), and a
-    /// start point for it is refused rather than dropped.
+    /// involved (the test project is no repo, so a cut would fail). Plain
+    /// `nebula worktree --base` keeps that legacy reuse, while spawn
+    /// refuses a named base it cannot apply to an existing checkout.
     #[tokio::test]
     async fn a_branch_with_a_worktree_is_reused_not_cut() {
         let daemon = daemon();
@@ -386,8 +387,14 @@ mod tests {
             .unwrap();
         assert_eq!(worktree.id, WorktreeId("feat".into()));
 
-        let err = daemon
+        let worktree = daemon
             .worktree_on_branch(&project, "feat", Some("main"))
+            .await
+            .unwrap();
+        assert_eq!(worktree.id, WorktreeId("feat".into()));
+
+        let err = daemon
+            .worktree_on_branch_for_spawn(&project, "feat", Some("main"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already has a worktree"), "{err}");
