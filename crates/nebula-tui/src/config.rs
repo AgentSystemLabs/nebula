@@ -3700,6 +3700,21 @@ mod tests {
         assert!(!legacy.hide_draft_prs);
     }
 
+    #[test]
+    fn source_control_graph_defaults_off_and_toggles_on_the_appearance_tab() {
+        let mut cfg = Config::default();
+        assert!(!cfg.source_control_graph);
+        assert_eq!(cfg.value_label(SettingKind::SourceControlGraph), "off");
+
+        let (tab, row) = locate(SettingKind::SourceControlGraph).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.source_control_graph);
+        assert_eq!(cfg.value_label(SettingKind::SourceControlGraph), "on");
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.source_control_graph);
+    }
+
     /// CARD PROMPT: retired with every card carrying its last prompt. The
     /// key an older build wrote (`hide_card_prompt`, off by default) still
     /// loads to what it wrote and is written back as stored, but no tab
