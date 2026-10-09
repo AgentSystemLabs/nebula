@@ -59,6 +59,11 @@ pub struct Screen {
     attrs: crate::attrs::Attrs,
     saved_attrs: crate::attrs::Attrs,
 
+    // Nebula patch: OSC 8 hyperlinks. `link` is the one open now (0 is
+    // none); a cell stores its link as an index into `links`, 1-based.
+    link: u16,
+    links: Vec<String>,
+
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
@@ -77,6 +82,9 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+
+            link: 0,
+            links: Vec::new(),
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -627,6 +635,13 @@ impl Screen {
         self.grid().visible_cell(crate::grid::Pos { row, col })
     }
 
+    /// Returns the OSC 8 hyperlink `cell` was printed under (Nebula patch).
+    #[must_use]
+    pub fn hyperlink(&self, cell: &crate::Cell) -> Option<&str> {
+        let idx = usize::from(cell.link()).checked_sub(1)?;
+        self.links.get(idx).map(String::as_str)
+    }
+
     /// Returns whether the text in row `row` should wrap to the next line.
     #[must_use]
     pub fn row_wrapped(&self, row: u16) -> bool {
@@ -798,6 +813,7 @@ impl Screen {
         let pos = self.grid().pos();
         let size = self.grid().size();
         let attrs = self.attrs;
+        let link = self.link;
 
         let width = c.width();
         if width.is_none() && (u32::from(c)) < 256 {
@@ -960,7 +976,7 @@ impl Screen {
                     // wide character, so it must have the second half of the
                     // wide character after it.
                     .unwrap();
-                next_cell.set(' ', attrs);
+                next_cell.set(' ', attrs, link);
             }
 
             let cell = self
@@ -971,7 +987,7 @@ impl Screen {
                 // called col_wrap() immediately before this, which ensures
                 // that self.grid().pos().col has a valid value.
                 .unwrap();
-            cell.set(c, attrs);
+            cell.set(c, attrs, link);
             self.grid_mut().col_inc(1);
             if width > 1 {
                 let pos = self.grid().pos();
@@ -1084,6 +1100,32 @@ impl Screen {
     // ESC M
     pub(crate) fn ri(&mut self) {
         self.grid_mut().row_dec_scroll(1);
+    }
+
+    // OSC 8 ; params ; URI: cells printed from here on link to `uri`; an
+    // empty one ends the link. The same URI keeps one table slot, so a TUI
+    // repainting its links every frame doesn't grow the table. A URI with a
+    // control character is dropped: a renderer re-emits the URI to the host
+    // terminal, and an ESC or BEL in it would end the sequence early.
+    pub(crate) fn set_hyperlink(&mut self, uri: &str) {
+        if uri.is_empty() || uri.chars().any(char::is_control) {
+            self.link = 0;
+            return;
+        }
+        if let Some(i) = self.links.iter().rposition(|l| l == uri) {
+            // i < links.len() <= u16::MAX, so i + 1 fits
+            self.link = u16::try_from(i + 1).unwrap();
+            return;
+        }
+        // ponytail: once 65535 distinct URIs are in the table, new ones
+        // print as plain text; evict unreferenced entries if that is hit.
+        self.link = match u16::try_from(self.links.len() + 1) {
+            Ok(id) => {
+                self.links.push(uri.to_string());
+                id
+            }
+            Err(_) => 0,
+        };
     }
 
     // ESC c
