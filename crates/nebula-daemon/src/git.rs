@@ -1078,26 +1078,27 @@ mod tests {
         assert_ne!(head, landed);
     }
 
-    /// A named base is refused for a branch that already exists without a
-    /// worktree — a kept branch of a deleted checkout — instead of being
-    /// dropped by the check-out-the-existing-branch fallback.
+    /// A named base on a branch that already exists without a worktree — a
+    /// kept branch of a deleted checkout — keeps the long-standing fallback:
+    /// check out the existing branch and ignore the base.
     #[tokio::test]
-    async fn a_named_base_is_refused_for_a_branch_that_already_exists() {
+    async fn a_named_base_on_an_existing_branch_checks_out_that_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         init_repo(&repo).await;
         git(&repo, &["tag", "v1"]).await.unwrap();
+        git(&repo, &["commit", "--allow-empty", "-m", "hotfix"])
+            .await
+            .unwrap();
+        let hotfix_head = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
         git(&repo, &["branch", "hotfix"]).await.unwrap();
 
-        let err = add_worktree_off_ref(&repo, "hotfix", "v1")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("already exists"), "{err}");
-        assert!(
-            !worktree_dir(&repo, "hotfix").exists(),
-            "nothing is checked out"
-        );
+        let wt = add_worktree_off_ref(&repo, "hotfix", "v1").await.unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        let base = git(&repo, &["rev-parse", "v1"]).await.unwrap();
+        assert_eq!(head, hotfix_head, "the existing branch is checked out");
+        assert_ne!(head, base, "the named base is ignored");
     }
 
     /// The `worktree_base_branch` SETTING says `main` while the checkout's
