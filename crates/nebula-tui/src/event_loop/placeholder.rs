@@ -215,6 +215,7 @@ pub(super) fn stage_agent(
         status_changed_at: now_ms(),
         alive: false,
         issue_url: None,
+        role: nebula_core::AgentRole::Worker,
         recent_prompts: Vec::new(),
     });
     if let Some(i) = project.and_then(|id| {
@@ -690,6 +691,7 @@ mod tests {
             status_changed_at: crate::app::now_ms(),
             alive: true,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         }
     }

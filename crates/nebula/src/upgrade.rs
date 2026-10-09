@@ -412,16 +412,16 @@ mod tests {
         let newer = tempfile::tempdir().unwrap();
         fake_nebula(
             newer.path(),
-            "#!/bin/sh\ncase \"$1\" in\n  _protocol-version) echo 48 ;;\n  _protocol-min-compatible-version) echo 47 ;;\n  *) exit 1 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  _protocol-version) echo 49 ;;\n  _protocol-min-compatible-version) echo 49 ;;\n  *) exit 1 ;;\nesac\n",
         );
         let path = std::env::join_paths([newer.path()]).unwrap();
 
-        assert_eq!(protocol_range_on_path(&path, empty.path()), Some((47, 48)));
+        assert_eq!(protocol_range_on_path(&path, empty.path()), Some((49, 49)));
         assert!(protocol_range_is_compatible((
             MIN_COMPATIBLE_PROTOCOL,
             PROTOCOL_VERSION
         )));
-        assert!(protocol_range_is_compatible((47, 48)));
+        assert!(protocol_range_is_compatible((49, 50)));
         assert!(!protocol_range_is_compatible((
             PROTOCOL_VERSION + 1,
             PROTOCOL_VERSION + 1

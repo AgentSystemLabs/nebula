@@ -104,6 +104,7 @@ pub(crate) struct CreateAgentSpec {
     /// The GitHub issue an ISSUE SESSION was launched for (see
     /// `pr_scope::issue_rule`). Persisted like `pr_url`.
     pub issue_url: Option<String>,
+    pub role: nebula_core::AgentRole,
 }
 
 /// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
@@ -2373,6 +2374,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
             })
             .await
             .unwrap_err();
@@ -2391,6 +2393,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
             })
             .await
             .unwrap_err();
@@ -2409,6 +2412,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
             })
             .await
             .unwrap_err();
@@ -2427,6 +2431,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
             })
             .await
             .unwrap_err();
@@ -2448,6 +2453,7 @@ mod tests {
             starting_prompt: None,
             pr_url: Some("https://github.com/o/r/pull/7".into()),
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
         };
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
@@ -2612,6 +2618,7 @@ mod tests {
             starting_prompt: Some("Fix it".into()),
             pr_url: None,
             issue_url: Some("https://github.com/o/r/issues/15".into()),
+            role: nebula_core::AgentRole::Worker,
         };
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
@@ -2635,6 +2642,7 @@ mod tests {
         assert!(cloud.to_string().contains("not supported for Claude Cloud"));
         let not_an_issue = CreateAgentSpec {
             issue_url: Some("https://github.com/o/r/pull/7".into()),
+            role: nebula_core::AgentRole::Worker,
             ..spec(AgentKind::Codex, None)
         };
         let err = daemon.create_agent(not_an_issue).await.unwrap_err();
@@ -2656,6 +2664,7 @@ mod tests {
             starting_prompt: starting.map(String::from),
             pr_url: None,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
         };
         // Validation runs before the worktree lookup, so an unknown
         // worktree is fine here and every failure is the prompt's own.
@@ -2764,6 +2773,7 @@ mod tests {
             starting_prompt: task.map(String::from),
             pr_url: None,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
         };
 
         let created = |mut events: broadcast::Receiver<ServerEvent>| {
@@ -2894,6 +2904,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             })
             .unwrap();
@@ -3042,6 +3053,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
             })
             .await
             .unwrap()
@@ -3183,6 +3195,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
             })
             .await
             .unwrap()
@@ -3285,6 +3298,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    role: nebula_core::AgentRole::Worker,
                     recent_prompts: Vec::new(),
                 },
                 true,

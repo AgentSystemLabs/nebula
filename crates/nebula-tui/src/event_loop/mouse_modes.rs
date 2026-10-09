@@ -70,6 +70,7 @@ fn handle_overlay_mouse(
             crate::branch_switch::handle_mouse(app, mouse, mouse_pos);
             true
         }
+        Overlay::Review(_) => crate::review_modal::handle_mouse(app, mouse),
         Overlay::Hosts(_) => handle_hosts_mouse(app, mouse, mouse_pos, out),
         Overlay::FileTabs(_) => {
             crate::file_tabs::handle_mouse(app, mouse, mouse_pos);
@@ -766,6 +767,9 @@ fn handle_left_click_target(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clie
         // the card, and the issue in the browser, through the very
         // `open_issue` `⇧I` runs.
         Some(HitTarget::LauncherCardIssue(id)) => launcher::click_issue(app, &id, out),
+        Some(HitTarget::OrchestratorChip(sref)) => {
+            open_session(app, sref, out);
+        }
         // `‹ sessions` in a full-screen session's header: back
         // down to the pane beside the grid, the same way `^q`
         // goes back.

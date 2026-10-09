@@ -1,5 +1,6 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, TerminalTab, Worktree,
+    Agent, AgentKind, AgentRole, AgentStatus, Entity, EntityId, Link, Project, TerminalTab,
+    Worktree,
 };
 use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorktreeId};
 use serde::{Deserialize, Serialize};
@@ -9,14 +10,14 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 48;
+pub const PROTOCOL_VERSION: u32 = 49;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
 /// Compatibility is a range overlap: two peers can talk when each peer's
 /// `[MIN_COMPATIBLE_PROTOCOL, PROTOCOL_VERSION]` range includes at least one
 /// version the other peer also supports.
-pub const MIN_COMPATIBLE_PROTOCOL: u32 = 48;
+pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -172,6 +173,10 @@ pub enum ClientRequest {
         /// since a spare booted bare never got it.
         #[serde(default)]
         issue_url: Option<String>,
+        /// Special role for the row. Only an orchestrator row may use the
+        /// privileged orchestrator command surface.
+        #[serde(default)]
+        role: AgentRole,
     },
     /// Create a local AGENT of any kind from an OPEN PRS row — a PR
     /// SESSION. It never runs in the ROOT WORKTREE: the daemon finds the
@@ -304,6 +309,55 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
         paths: Vec<PathBuf>,
+    },
+    /// Privileged orchestrator command: list the whole daemon tree in one
+    /// bounded model-readable response. The daemon refuses this unless
+    /// `caller` is the persisted orchestrator row.
+    OrchestratorList {
+        req_id: u64,
+        caller: AgentId,
+    },
+    /// Privileged orchestrator command: read a bounded tail of a session's
+    /// output. This is recent output only, not transcript export.
+    OrchestratorRead {
+        req_id: u64,
+        caller: AgentId,
+        session: SessionRef,
+        max_bytes: u32,
+    },
+    /// Privileged orchestrator command: send a follow-up prompt to another
+    /// local agent through the same PTY path as the TUI follow-up composer.
+    OrchestratorSend {
+        req_id: u64,
+        caller: AgentId,
+        target: AgentId,
+        message: String,
+    },
+    /// Privileged orchestrator command: start an agent in any project and
+    /// worktree. `worktree` reuses an existing checkout; otherwise `branch`
+    /// is found or cut in `project`.
+    OrchestratorSpawn {
+        req_id: u64,
+        caller: AgentId,
+        project: ProjectId,
+        worktree: Option<WorktreeId>,
+        branch: Option<String>,
+        base: Option<String>,
+        name: String,
+        kind: AgentKind,
+        #[serde(default)]
+        custom_harness: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        starting_prompt: String,
+    },
+    /// Privileged orchestrator command: ask every TUI client to open the
+    /// tabbed review modal.
+    OrchestratorOpenReview {
+        req_id: u64,
+        caller: AgentId,
+        sessions: Vec<SessionRef>,
+        tabs: Vec<ReviewTabKind>,
     },
     /// Kills the PTY, sets archived=1.
     ArchiveAgent {
@@ -513,6 +567,15 @@ pub enum EnterOutcome {
     NextLaunch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewTabKind {
+    Terminal,
+    Diff,
+    History,
+    PullRequest,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerEvent {
     HelloOk {
@@ -547,6 +610,22 @@ pub enum ServerEvent {
     Error {
         req_id: Option<u64>,
         message: String,
+    },
+    /// Reply to `OrchestratorList`.
+    OrchestratorList {
+        req_id: u64,
+        projects: Vec<Project>,
+        worktrees: Vec<Worktree>,
+        agents: Vec<Agent>,
+        terminals: Vec<TerminalTab>,
+        links: Vec<Link>,
+    },
+    /// Broadcast by `OrchestratorOpenReview`: clients open a local review
+    /// modal for these sessions and tabs.
+    ReviewOpened {
+        opener: AgentId,
+        sessions: Vec<SessionRef>,
+        tabs: Vec<ReviewTabKind>,
     },
     /// An `Attach` the DAEMON could not honour: the session's process was
     /// not running and could not be started (its checkout is gone from

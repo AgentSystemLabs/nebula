@@ -70,6 +70,16 @@ fn parse_agent_kind(s: &str) -> Result<nebula_core::AgentKind, String> {
     })
 }
 
+fn parse_review_tab(s: &str) -> Result<nebula_core::ReviewTabKind, String> {
+    match s {
+        "terminal" => Ok(nebula_core::ReviewTabKind::Terminal),
+        "diff" => Ok(nebula_core::ReviewTabKind::Diff),
+        "history" => Ok(nebula_core::ReviewTabKind::History),
+        "pr" | "pull-request" | "pull_request" => Ok(nebula_core::ReviewTabKind::PullRequest),
+        _ => Err("expected terminal, diff, history or pr".into()),
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// Register a git checkout as a project.
@@ -198,6 +208,16 @@ pub(crate) enum Command {
         /// The files to show, relative to the current directory or absolute.
         #[arg(required = true, num_args = 1.., value_name = "FILE")]
         files: Vec<String>,
+    },
+    /// Coordinate projects from the orchestrator session.
+    ///
+    /// These commands are for the pinned orchestrator agent only. They are
+    /// refused by the daemon unless the current NEBULA_AGENT_ID belongs to
+    /// the persisted orchestrator row.
+    #[command(after_help = ORCHESTRATOR_EXAMPLES)]
+    Orchestrator {
+        #[command(subcommand)]
+        command: OrchestratorCommand,
     },
     /// Back up, restore or locate this machine's settings.
     ///
@@ -340,6 +360,59 @@ pub(crate) enum Command {
     RestartVersion,
 }
 
+#[derive(Subcommand)]
+pub(crate) enum OrchestratorCommand {
+    /// List every project, worktree and session.
+    List {
+        /// Print JSON instead of compact text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read recent bounded output from a session.
+    Read {
+        /// Agent id, or terminal:<id> for a terminal.
+        session: String,
+        /// Max bytes to read from the PTY ring (capped by the daemon).
+        #[arg(long, default_value_t = 8192)]
+        bytes: u32,
+    },
+    /// Send a follow-up prompt to another local agent.
+    Send {
+        /// Target agent id.
+        session: String,
+        /// Prompt text; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        prompt: Vec<String>,
+    },
+    /// Spawn an agent in any project or worktree.
+    Spawn {
+        /// Project id or visible project name.
+        #[arg(long)]
+        project: String,
+        /// Worktree id or branch. Existing checkouts are reused; a missing
+        /// branch is cut using nebula's normal worktree base rules.
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Start point when a new worktree has to be cut.
+        #[arg(long)]
+        base: Option<String>,
+        /// Harness for the new session.
+        #[arg(long, value_name = "KIND", value_parser = parse_agent_kind, default_value = "claude")]
+        kind: nebula_core::AgentKind,
+        /// Prompt text; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        task: Vec<String>,
+    },
+    /// Open the tabbed review modal in every attached TUI.
+    Review {
+        /// Agent id, or terminal:<id> for a terminal.
+        session: String,
+        /// Tabs to open. Repeats allowed; default is terminal, diff, history, pr.
+        #[arg(long = "tab", value_parser = parse_review_tab)]
+        tabs: Vec<nebula_core::ReviewTabKind>,
+    },
+}
+
 const ADD_EXAMPLES: &str = "\
 Examples:
   nebula add .                     add the repo you are standing in
@@ -387,6 +460,14 @@ Examples:
   nebula open README.md                one tab
   nebula open mockup.png flow.mmd      image and diagram previews
   nebula open src/main.rs docs/keys.md a tab each, in this order";
+
+const ORCHESTRATOR_EXAMPLES: &str = "\
+Examples:
+  nebula orchestrator list --json
+  nebula orchestrator read agent-2 --bytes 12000
+  nebula orchestrator send agent-2 \"continue after the test failure\"
+  nebula orchestrator spawn --project nebula --worktree fix-auth \"fix the login redirect\"
+  nebula orchestrator review agent-2 --tab diff --tab terminal";
 
 const BROWSER_EXAMPLES: &str = "\
 Examples:

@@ -1239,6 +1239,7 @@ pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec
             cloud_prompt,
             starting_prompt,
             issue_url,
+            role: nebula_core::AgentRole::Worker,
         },
     });
     // The create consumes (or, off-spec, discards) the worktree's warm

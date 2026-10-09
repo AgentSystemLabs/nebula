@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use nebula_core::{AgentKind, EntityId, ProjectId};
+use nebula_core::{AgentKind, AgentRole, EntityId, ProjectId};
 
 use crate::registry::{CreateAgentSpec, Daemon};
 
@@ -303,6 +303,7 @@ impl Daemon {
             starting_prompt,
             pr_url: Some(pr_url),
             issue_url: None,
+            role: AgentRole::Worker,
         })
         .await
     }

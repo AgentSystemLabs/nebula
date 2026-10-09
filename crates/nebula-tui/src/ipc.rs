@@ -4,7 +4,9 @@
 use anyhow::{bail, Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
-    env, paths, AgentId, AgentKind, ClientRequest, EnterOutcome, ServerEvent, PROTOCOL_VERSION,
+    env, paths, Agent, AgentId, AgentKind, ClientRequest, EnterOutcome, Link, Project, ProjectId,
+    ReviewTabKind, ServerEvent, SessionRef, TerminalId, TerminalTab, Worktree, WorktreeId,
+    PROTOCOL_VERSION,
 };
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -455,6 +457,285 @@ pub async fn open_files_for_current_agent(files: &[String]) -> Result<()> {
          each, with a preview and an editor. Don't paste their contents into your reply; carry on."
     );
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct OrchestratorTree {
+    projects: Vec<Project>,
+    worktrees: Vec<Worktree>,
+    agents: Vec<Agent>,
+    terminals: Vec<TerminalTab>,
+    links: Vec<Link>,
+}
+
+async fn orchestrator_connection() -> Result<(AgentId, Connection)> {
+    let agent_id = AgentId(current_agent_id("orchestrator")?);
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running");
+    };
+    Ok((agent_id, handshake(stream).await?))
+}
+
+async fn fetch_orchestrator_tree(
+    caller: &AgentId,
+    conn: &mut Connection,
+) -> Result<OrchestratorTree> {
+    let req_id = ONE_SHOT_REQ_ID;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::OrchestratorList {
+            req_id,
+            caller: caller.clone(),
+        },
+    )
+    .await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::OrchestratorList {
+                req_id: r,
+                projects,
+                worktrees,
+                agents,
+                terminals,
+                links,
+            }) if r == req_id => {
+                return Ok(OrchestratorTree {
+                    projects,
+                    worktrees,
+                    agents,
+                    terminals,
+                    links,
+                });
+            }
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
+            Some(_) => continue,
+            None => bail!("{CLOSED_BEFORE_REPLY}"),
+        }
+    }
+}
+
+pub async fn orchestrator_list(json: bool) -> Result<()> {
+    let (caller, mut conn) = orchestrator_connection().await?;
+    let tree = fetch_orchestrator_tree(&caller, &mut conn).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "projects": tree.projects,
+                "worktrees": tree.worktrees,
+                "agents": tree.agents,
+                "terminals": tree.terminals,
+                "links": tree.links,
+            }))?
+        );
+    } else {
+        print_orchestrator_tree(&tree);
+    }
+    Ok(())
+}
+
+pub async fn orchestrator_read(session: &str, bytes: u32) -> Result<()> {
+    let (caller, mut conn) = orchestrator_connection().await?;
+    let session = parse_session_ref(session);
+    let req_id = ONE_SHOT_REQ_ID;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::OrchestratorRead {
+            req_id,
+            caller,
+            session: session.clone(),
+            max_bytes: bytes,
+        },
+    )
+    .await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::OutputTail {
+                req_id: r,
+                session: _,
+                tail,
+            }) if r == req_id => {
+                match tail {
+                    Some(tail) => print!("{}", String::from_utf8_lossy(&tail.data)),
+                    None => println!("(session is not live)"),
+                }
+                return Ok(());
+            }
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
+            Some(_) => continue,
+            None => bail!("{CLOSED_BEFORE_REPLY}"),
+        }
+    }
+}
+
+pub async fn orchestrator_send(session: &str, prompt: &str) -> Result<()> {
+    let target = AgentId(session.to_string());
+    let (caller, mut conn) = orchestrator_connection().await?;
+    let req_id = ONE_SHOT_REQ_ID;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::OrchestratorSend {
+            req_id,
+            caller,
+            target: target.clone(),
+            message: prompt.to_string(),
+        },
+    )
+    .await?;
+    await_ack(&mut conn, req_id).await?;
+    println!("sent to {}", target);
+    Ok(())
+}
+
+pub async fn orchestrator_spawn(
+    project: &str,
+    worktree: Option<&str>,
+    base: Option<String>,
+    kind: AgentKind,
+    task: &str,
+) -> Result<()> {
+    let (caller, mut conn) = orchestrator_connection().await?;
+    let tree = fetch_orchestrator_tree(&caller, &mut conn).await?;
+    let project_id = resolve_project(&tree, project)?;
+    let (worktree_id, branch) = match worktree {
+        Some(target) => resolve_worktree_or_branch(&tree, &project_id, target),
+        None => (None, None),
+    };
+    let req_id = ONE_SHOT_REQ_ID + 1;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::OrchestratorSpawn {
+            req_id,
+            caller,
+            project: project_id,
+            worktree: worktree_id,
+            branch,
+            base,
+            name: String::new(),
+            kind,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            starting_prompt: task.to_string(),
+        },
+    )
+    .await?;
+    await_ack(&mut conn, req_id).await?;
+    println!("started a new {} session for that task", kind.as_str());
+    Ok(())
+}
+
+pub async fn orchestrator_review(session: &str, tabs: Vec<ReviewTabKind>) -> Result<()> {
+    let (caller, mut conn) = orchestrator_connection().await?;
+    let req_id = ONE_SHOT_REQ_ID;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::OrchestratorOpenReview {
+            req_id,
+            caller,
+            sessions: vec![parse_session_ref(session)],
+            tabs,
+        },
+    )
+    .await?;
+    await_ack(&mut conn, req_id).await?;
+    println!("opened review in nebula");
+    Ok(())
+}
+
+fn parse_session_ref(raw: &str) -> SessionRef {
+    if let Some(id) = raw
+        .strip_prefix("terminal:")
+        .or_else(|| raw.strip_prefix("term:"))
+    {
+        SessionRef::Terminal(TerminalId(id.to_string()))
+    } else {
+        SessionRef::Agent(AgentId(raw.to_string()))
+    }
+}
+
+fn resolve_project(tree: &OrchestratorTree, raw: &str) -> Result<ProjectId> {
+    let matches = tree
+        .projects
+        .iter()
+        .filter(|p| p.id.as_str() == raw || p.name == raw)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [project] => Ok(project.id.clone()),
+        [] => bail!("project not found: {raw}"),
+        _ => bail!("project name is ambiguous: {raw}; use its id"),
+    }
+}
+
+fn resolve_worktree_or_branch(
+    tree: &OrchestratorTree,
+    project: &ProjectId,
+    raw: &str,
+) -> (Option<WorktreeId>, Option<String>) {
+    match tree
+        .worktrees
+        .iter()
+        .find(|w| &w.project_id == project && (w.id.as_str() == raw || w.branch == raw))
+    {
+        Some(worktree) => (Some(worktree.id.clone()), None),
+        None => (None, Some(raw.to_string())),
+    }
+}
+
+fn print_orchestrator_tree(tree: &OrchestratorTree) {
+    for project in &tree.projects {
+        println!(
+            "project {} name={} path={}",
+            project.id,
+            project.name,
+            project.repo_path.display()
+        );
+        for worktree in tree.worktrees.iter().filter(|w| w.project_id == project.id) {
+            println!(
+                "  worktree {} branch={}{} path={}",
+                worktree.id,
+                worktree.branch,
+                if worktree.is_main { " root" } else { "" },
+                worktree.path.display()
+            );
+            for agent in tree.agents.iter().filter(|a| a.worktree_id == worktree.id) {
+                println!(
+                    "    agent {} name={} kind={} status={}{}{} role={}",
+                    agent.id,
+                    agent.name,
+                    agent.kind.as_str(),
+                    agent.status.as_str(),
+                    if agent.alive { " alive" } else { "" },
+                    if agent.unseen { " unseen" } else { "" },
+                    agent.role.as_str()
+                );
+            }
+            for term in tree
+                .terminals
+                .iter()
+                .filter(|t| t.worktree_id == worktree.id)
+            {
+                println!(
+                    "    terminal {} name={}{}{}",
+                    term.id,
+                    term.name,
+                    if term.alive { " alive" } else { "" },
+                    if term.run_command.is_some() {
+                        " run"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+    }
 }
 
 /// CLI: `nebula worktree [name] [--base <ref>]` from inside an agent

@@ -6,7 +6,7 @@ mod upgrade;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand};
+use cli::{Cli, Command, ConfigCommand, OrchestratorCommand};
 use std::path::Path;
 
 fn main() -> Result<()> {
@@ -55,6 +55,31 @@ fn main() -> Result<()> {
             base,
         }) => nebula_tui::run_spawn(task.join(" "), kind, worktree, base),
         Some(Command::Open { files }) => nebula_tui::run_open(files),
+        Some(Command::Orchestrator { command }) => match command {
+            OrchestratorCommand::List { json } => nebula_tui::run_orchestrator_list(json),
+            OrchestratorCommand::Read { session, bytes } => {
+                nebula_tui::run_orchestrator_read(&session, bytes)
+            }
+            OrchestratorCommand::Send { session, prompt } => {
+                nebula_tui::run_orchestrator_send(&session, prompt.join(" "))
+            }
+            OrchestratorCommand::Spawn {
+                project,
+                worktree,
+                base,
+                kind,
+                task,
+            } => nebula_tui::run_orchestrator_spawn(
+                &project,
+                worktree.as_deref(),
+                base,
+                kind,
+                task.join(" "),
+            ),
+            OrchestratorCommand::Review { session, tabs } => {
+                nebula_tui::run_orchestrator_review(&session, tabs)
+            }
+        },
         Some(Command::Browser {
             port,
             bind,

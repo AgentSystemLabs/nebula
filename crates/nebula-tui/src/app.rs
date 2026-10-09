@@ -122,6 +122,8 @@ pub enum HitTarget {
     /// (`event_loop::launcher::click_thread_pr`) and leaves the cursor and
     /// the pane where they were.
     LauncherThreadPr(WorktreeId),
+    /// A session chip in the ORCHESTRATOR view's attention strip.
+    OrchestratorChip(SessionRef),
     /// The `‹ sessions` crumb in a full-screen session's header
     /// (LAUNCHER VIEW): a click leaves the session for the grid, as `^q`
     /// does.
@@ -2134,6 +2136,8 @@ pub enum Overlay {
     PullRequests(crate::pr_modal::PullRequestsView),
     /// `c`: the BRANCH SWITCHER — the ROOT WORKTREE onto another branch.
     BranchSwitch(crate::branch_switch::BranchSwitchView),
+    /// Tabbed review opened by the orchestrator.
+    Review(crate::review_modal::ReviewView),
     /// `^P` in the LAUNCHER VIEW's box: the PROJECT PICKER.
     ProjectPicker(crate::launcher::ProjectPicker),
 }
@@ -6083,6 +6087,7 @@ mod tests {
                 status_changed_at: 1_000 * (i as i64 + 1),
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             })
             .collect();
@@ -6375,6 +6380,7 @@ mod tests {
             sort_order: 0,
             alive: true,
             issue_url: None,
+            role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         });
         app.tree.agents.push(Agent {
@@ -6608,6 +6614,7 @@ mod tests {
                 status_changed_at: 100 * (i as i64 + 1),
                 alive: true,
                 issue_url: None,
+                role: nebula_core::AgentRole::Worker,
                 recent_prompts: Vec::new(),
             });
         }

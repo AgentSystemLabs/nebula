@@ -238,6 +238,7 @@ impl ClientConnection {
                 cloud_prompt,
                 starting_prompt,
                 issue_url,
+                role,
             } => {
                 self.handle_create_agent(
                     req_id,
@@ -251,6 +252,7 @@ impl ClientConnection {
                     cloud_prompt,
                     starting_prompt,
                     issue_url,
+                    role,
                 )
                 .await;
                 Ok(true)
@@ -334,6 +336,111 @@ impl ClientConnection {
             ClientRequest::OpenFiles { req_id, id, paths } => {
                 let result = self
                     .blocking_daemon(move |daemon| daemon.open_files(&id, paths))
+                    .await;
+                reply_done(&self.out_tx, req_id, result).await;
+                Ok(true)
+            }
+            ClientRequest::OrchestratorList { req_id, caller } => {
+                let result = self
+                    .blocking_daemon(move |daemon| daemon.orchestrator_tree(&caller))
+                    .await;
+                match result {
+                    Ok((projects, worktrees, agents, terminals, links)) => {
+                        self.send(ServerEvent::OrchestratorList {
+                            req_id,
+                            projects,
+                            worktrees,
+                            agents,
+                            terminals,
+                            links,
+                        })
+                        .await;
+                    }
+                    Err(err) => reply_done(&self.out_tx, req_id, Err(err)).await,
+                }
+                Ok(true)
+            }
+            ClientRequest::OrchestratorRead {
+                req_id,
+                caller,
+                session,
+                max_bytes,
+            } => {
+                let reply_session = session.clone();
+                let result = self
+                    .blocking_daemon(move |daemon| {
+                        daemon.orchestrator_read(&caller, &session, max_bytes)
+                    })
+                    .await;
+                match result {
+                    Ok(tail) => {
+                        self.send(ServerEvent::OutputTail {
+                            req_id,
+                            session: reply_session,
+                            tail,
+                        })
+                        .await;
+                    }
+                    Err(err) => reply_done(&self.out_tx, req_id, Err(err)).await,
+                }
+                Ok(true)
+            }
+            ClientRequest::OrchestratorSend {
+                req_id,
+                caller,
+                target,
+                message,
+            } => {
+                let result = self.daemon.orchestrator_send(&caller, &target, &message);
+                reply_done(&self.out_tx, req_id, result).await;
+                Ok(true)
+            }
+            ClientRequest::OrchestratorSpawn {
+                req_id,
+                caller,
+                project,
+                worktree,
+                branch,
+                base,
+                name,
+                kind,
+                custom_harness,
+                model,
+                effort,
+                starting_prompt,
+            } => {
+                let daemon = self.daemon.clone();
+                let out_tx = self.out_tx.clone();
+                tokio::spawn(async move {
+                    let result = daemon
+                        .orchestrator_spawn(
+                            &caller,
+                            &project,
+                            worktree,
+                            branch,
+                            base,
+                            name,
+                            kind,
+                            custom_harness,
+                            model,
+                            effort,
+                            starting_prompt,
+                        )
+                        .await;
+                    reply(&out_tx, req_id, result.map(Some)).await;
+                });
+                Ok(true)
+            }
+            ClientRequest::OrchestratorOpenReview {
+                req_id,
+                caller,
+                sessions,
+                tabs,
+            } => {
+                let result = self
+                    .blocking_daemon(move |daemon| {
+                        daemon.orchestrator_open_review(&caller, sessions, tabs)
+                    })
                     .await;
                 reply_done(&self.out_tx, req_id, result).await;
                 Ok(true)
@@ -628,6 +735,7 @@ impl ClientConnection {
         cloud_prompt: Option<String>,
         starting_prompt: Option<String>,
         issue_url: Option<String>,
+        role: nebula_core::AgentRole,
     ) {
         // Logged by mode only — never the task, prompt text or issue URL.
         let launch_mode = match (&cloud_prompt, &starting_prompt, &issue_url) {
@@ -650,6 +758,7 @@ impl ClientConnection {
                 starting_prompt,
                 pr_url: None,
                 issue_url,
+                role,
             })
             .await;
         if let Some(launch_mode) = launch_mode {
