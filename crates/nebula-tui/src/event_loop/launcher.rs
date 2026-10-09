@@ -1906,6 +1906,9 @@ pub(super) fn open_project(app: &mut App, id: &ProjectId, out: &mut Vec<ClientRe
     };
     let land = last_focused(app, &card).or_else(|| card.sessions.first().map(|a| a.id.clone()));
     select_project(app, id);
+    if super::prompt_for_missing_project_path(app, id) {
+        return;
+    }
     if let Some(id) = land {
         select(app, id, out);
         return;
