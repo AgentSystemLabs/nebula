@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cargo:
+    name: cargo (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Rust stable
+        # Cargo 1.83 cannot parse some edition-2024 transitive dependencies.
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Use Rust stable
+        run: rustup default stable
+
+      - name: Cache cargo and target directories
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+      - name: Test workspace
+        run: |
+          # This e2e_tui mouse-drag/autoscroll test hangs under the headless
+          # GitHub Actions PTY, while the rest of the workspace remains gated.
+          cargo test --workspace --locked -- --skip tui_drag_past_the_pane_top_autoscrolls_and_copies_the_run

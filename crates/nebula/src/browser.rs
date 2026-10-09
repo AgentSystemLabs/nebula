@@ -193,6 +193,15 @@ pub(crate) fn free_port(bind: IpAddr) -> Result<u16> {
     Ok(port)
 }
 
+#[cfg(test)]
+pub(crate) fn port_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static PORT_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    PORT_TEST_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn spawn_ttyd(exe: &OsStr, port: u16, opts: &BrowserOpts) -> Result<Child> {
     Command::new("ttyd")
         .args(ttyd_args(port, opts))
@@ -347,6 +356,7 @@ mod tests {
     /// port of its own instead of an error.
     #[test]
     fn a_busy_default_port_steps_aside_instead_of_failing() {
+        let _port_guard = port_test_guard();
         // Stand on the default the way another checkout's ttyd would.
         let held = TcpListener::bind(SocketAddr::new(DEFAULT_BIND, DEFAULT_PORT));
         let Ok(held) = held else {
@@ -369,6 +379,7 @@ mod tests {
     /// which is what the Makefile's per-worktree dev instances ask for.
     #[test]
     fn port_zero_means_any_free_port() {
+        let _port_guard = port_test_guard();
         let port = resolve_port(Some(0), DEFAULT_BIND).expect("picks one");
         assert_ne!(port, 0);
         // And it is genuinely free — we can take it ourselves right after.
@@ -379,8 +390,9 @@ mod tests {
     /// break `ssh -L 9000:localhost:9000` set up against that number.
     #[test]
     fn an_explicit_port_that_is_taken_is_an_error() {
-        let held = free_port(DEFAULT_BIND).unwrap();
-        let _guard = TcpListener::bind(SocketAddr::new(DEFAULT_BIND, held)).unwrap();
+        let _port_guard = port_test_guard();
+        let _guard = TcpListener::bind(SocketAddr::new(DEFAULT_BIND, 0)).unwrap();
+        let held = _guard.local_addr().unwrap().port();
         let err = resolve_port(Some(held), DEFAULT_BIND)
             .unwrap_err()
             .to_string();
@@ -469,8 +481,9 @@ mod tests {
     /// logic would otherwise still be looking at loopback.
     #[test]
     fn a_port_taken_on_every_interface_is_not_free_for_a_public_bind() {
-        let port = free_port(PUBLIC_BIND).unwrap();
-        let _guard = TcpListener::bind(SocketAddr::new(PUBLIC_BIND, port)).unwrap();
+        let _port_guard = port_test_guard();
+        let _guard = TcpListener::bind(SocketAddr::new(PUBLIC_BIND, 0)).unwrap();
+        let port = _guard.local_addr().unwrap().port();
         let err = resolve_port(Some(port), PUBLIC_BIND)
             .unwrap_err()
             .to_string();

@@ -32,9 +32,9 @@ const CTRL_E: &[u8] = &[0x05];
 
 /// A row only the PROJECT's own menu carries.
 const PROJECT_MENU_ROW: &str = "Remove from list";
-/// Terminal pane input-locked: keys forward to the PTY. The footer spells
-/// chords the compact way `KeyChord::display` does — `^q`, not `Ctrl+q`.
-const FOOTER_TERMINAL_LOCKED: &str = "^q: sessions";
+/// Terminal pane input-locked inside the launcher grid: keys forward to the
+/// PTY, and the footer offers the launcher-pane hatch back to the card.
+const FOOTER_TERMINAL_LOCKED: &str = "back to the card";
 
 struct TuiHarness {
     writer: Box<dyn Write + Send>,
@@ -898,7 +898,8 @@ fn tui_drag_past_the_pane_top_autoscrolls_and_copies_the_run() {
     let (header_row, content_top, row58, col58) = {
         let parser = tui.parser.lock().unwrap();
         let screen = parser.screen();
-        let (header_row, _) = find_text(screen, "SESSION").expect("the pane header");
+        let (header_row, _) = find_text(screen, "SESSION")
+            .unwrap_or_else(|| panic!("the pane header:\n{}", tui.screen_text()));
         let (row58, col58) = find_text(screen, "row 58").expect("row 58 on screen");
         (header_row, header_row + 2, row58, col58)
     };
