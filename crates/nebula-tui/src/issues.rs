@@ -245,7 +245,7 @@ pub enum IssuesAnswer {
     /// box's state rides along so a refusal can bring it back with the
     /// text, on the modal's row.
     Comment {
-        view: IssuesView,
+        view: Box<IssuesView>,
         issue: IssueRef,
         text: String,
         posted: bool,
@@ -1033,7 +1033,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                 // something else has been opened over the modal meanwhile,
                 // which the flash must not interrupt.
                 if matches!(&app.modals.overlay, None | Some(Overlay::Issues(_))) {
-                    bring_box_back(app, view, issue, text);
+                    bring_box_back(app, *view, issue, text);
                 }
             }
         }
@@ -1153,7 +1153,7 @@ pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, tex
     tokio::spawn(async move {
         let posted = comment(&dir, number, &text).await;
         let _ = tx.send(IssuesAnswer::Comment {
-            view,
+            view: Box::new(view),
             issue,
             text,
             posted,
@@ -2425,7 +2425,7 @@ mod tests {
         );
         app.github.pending_issue_detail = None;
         let answer = |posted: bool| IssuesAnswer::Comment {
-            view: view.clone(),
+            view: Box::new(view.clone()),
             issue: fifteen.launch_ref(),
             text: "lgtm".into(),
             posted,
@@ -3385,7 +3385,7 @@ mod tests {
     /// filter stays. A paste lands in the filter as one line.
     #[test]
     fn a_row_click_counts_the_matches_not_the_list() {
-        let (mut app, project) = modal_with(vec![
+        let (mut app, _project) = modal_with(vec![
             issue(15, "Fix login redirect"),
             issue(14, "Docs pass"),
             issue(13, "Login page"),

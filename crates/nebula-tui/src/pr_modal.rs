@@ -810,17 +810,20 @@ pub(crate) fn draw(
     .areas(area);
 
     let rows: Vec<OpenPr> = rows(app, &view.project).to_vec();
+    let mut list_view = view.clone();
+    rebuild_list(&mut list_view, &rows);
+    list_view.list.move_to_item(view.selected);
     let inflight = app.github.open_prs_inflight.contains(&view.project);
     let asked = app.github.open_prs.contains_key(&view.project);
     // The last ask came back with nothing — these rows are the last
     // answer that worked, however old — and no second ask is running yet.
     let stale = app.github.open_prs_failed.contains(&view.project) && !inflight;
-    let cursor = cursor_index(view, &rows);
+    let cursor = cursor_index(&list_view, &rows);
 
     // ---- left: the list ----
     // The count reads `matches/all` while a filter is on.
-    let count = if has_query(view) {
-        format!("{}/{}", view.list.matches.len(), rows.len())
+    let count = if has_query(&list_view) {
+        format!("{}/{}", list_view.list.matches.len(), rows.len())
     } else {
         rows.len().to_string()
     };
@@ -842,7 +845,7 @@ pub(crate) fn draw(
     f.render_widget(block, list_a);
     // The always-live filter on the list's first line, the rows under it.
     if let Some(query_area) = row_rect(list_inner, 0) {
-        let line = search_line(&view.list.query, "type to filter…", query_area, th);
+        let line = search_line(&list_view.list.query, "type to filter…", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
     let mut rows_area = crate::ui::below_first_row(list_inner);
@@ -867,20 +870,27 @@ pub(crate) fn draw(
         } else if !stale {
             empty_list_row(f, rows_area, "no open pull requests", th);
         }
-    } else if view.list.matches.is_empty() {
+    } else if list_view.list.matches.is_empty() {
         empty_list_row(f, rows_area, "no pull requests match", th);
     }
-    let start = view.list.window_start(rows_area.height as usize);
+    let start = list_view.list.window_start(rows_area.height as usize);
     let budget = (rows_area.width as usize).saturating_sub(2);
-    for (row, (i, m)) in view.list.matches.iter().enumerate().skip(start).enumerate() {
+    for (row, (i, m)) in list_view
+        .list
+        .matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .enumerate()
+    {
         let Some(row_area) = row_rect(rows_area, row) else {
             break;
         };
         render_row(
             f,
             row_area,
-            row_spans(&view.list.items[m.item], &m.positions, budget, th),
-            i == view.list.cursor,
+            row_spans(&list_view.list.items[m.item], &m.positions, budget, th),
+            i == list_view.list.cursor,
             !backdrop,
             th,
         );
@@ -937,6 +947,7 @@ pub(crate) fn draw(
     // the pane's size for paging, and the clamped cursor and scroll.
     if let Some(Overlay::PullRequests(v)) = &mut app.modals.overlay {
         v.area = area;
+        v.list = list_view.list;
         v.list.list_area = rows_area;
         v.list.sync_scroll(rows_area.height as usize);
         v.body_area = body_inner;
@@ -1342,7 +1353,7 @@ mod tests {
             };
             assert_eq!(*number, 41);
             assert_eq!(
-                back.as_ref().map(|v| v.query.as_str()),
+                back.as_ref().map(|v| v.list.query.as_str()),
                 Some(""),
                 "not typed into the filter"
             );

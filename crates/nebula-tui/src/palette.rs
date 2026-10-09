@@ -397,6 +397,7 @@ fn build_palette_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_input::TextInput;
     use nebula_core::{AgentKind, Worktree};
 
     fn agent(id: &str, wt: &str, status: AgentStatus, unseen: bool, stamp: i64) -> Agent {

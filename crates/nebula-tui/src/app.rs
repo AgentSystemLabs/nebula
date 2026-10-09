@@ -1724,7 +1724,7 @@ impl GrepView {
         }
     }
 
-    fn set_hits(&mut self, hits: Vec<crate::grep_search::GrepHit>) {
+    pub(crate) fn set_hits(&mut self, hits: Vec<crate::grep_search::GrepHit>) {
         let len = hits.len();
         self.list.items = hits;
         self.list.matches = (0..len)

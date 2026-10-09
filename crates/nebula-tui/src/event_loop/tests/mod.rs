@@ -2323,11 +2323,11 @@ fn the_palette_finds_open_prs_by_title_and_reads_them_in_the_pane() {
     {
         let p = palette(&app);
         assert_eq!(
-            p.items[p.matches[p.selected].item].text, "demo/#9 Number the lines",
+            p.list.items[p.list.matches[p.list.cursor].item].text, "demo/#9 Number the lines",
             "the project paths it, like every other row"
         );
         assert_eq!(
-            p.items[p.matches[p.selected].item].crumb,
+            p.list.items[p.list.matches[p.list.cursor].item].crumb,
             Some((0, 4)),
             "drawn with its project in front: `demo/#9 Number the lines`"
         );
@@ -2488,10 +2488,11 @@ fn palette_pull_request_rows_say_draft_or_ready_for_review_and_follow_the_refres
     // marked ready for review: the word flips, the cursor stays.
     if let Some(Overlay::Palette(p)) = &mut app.modals.overlay {
         let row = p
+            .list
             .matches
             .iter()
             .position(|m| {
-                p.items[m.item].target
+                p.list.items[m.item].target
                     == PaletteTarget::PullRequest {
                         project: pid.clone(),
                         url: pr_url(9),
@@ -2575,13 +2576,14 @@ fn palette_query_terms_match_independently_across_a_space() {
         press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
     }
     let p = palette(&app);
-    assert_eq!(p.query, "demo #7", "the space reaches the query");
+    assert_eq!(p.list.query, "demo #7", "the space reaches the query");
     // The one hit, on a line of its own — nothing listed above it just
     // to hold it.
     let texts: Vec<&str> = p
+        .list
         .matches
         .iter()
-        .map(|m| p.items[m.item].text.as_str())
+        .map(|m| p.list.items[m.item].text.as_str())
         .collect();
     assert_eq!(texts, vec!["demo/#7 Attach links to worktrees"]);
 }
@@ -4292,13 +4294,17 @@ fn palette_query_edits_like_a_line_and_refilters() {
     press(&mut app, KeyCode::Char('b'), KeyModifiers::ALT, &mut out);
     press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
     let matched = |app: &App| match &app.modals.overlay {
-        Some(Overlay::Palette(p)) => p.matches.len(),
+        Some(Overlay::Palette(p)) => p.list.matches.len(),
         other => panic!("expected palette, got {other:?}"),
     };
     let Some(Overlay::Palette(p)) = &app.modals.overlay else {
         panic!("palette closed")
     };
-    assert_eq!(p.query.as_str(), "xdemo", "⌥← moves, it does not type 'b'");
+    assert_eq!(
+        p.list.query.as_str(),
+        "xdemo",
+        "⌥← moves, it does not type 'b'"
+    );
     assert_eq!(matched(&app), 0, "the edit re-ran the filter");
 
     // Ctrl+W kills the word back to an empty query, which matches all.
@@ -4317,7 +4323,7 @@ fn palette_query_edits_like_a_line_and_refilters() {
     let Some(Overlay::Palette(p)) = &app.modals.overlay else {
         panic!("palette closed")
     };
-    assert_eq!(p.query.as_str(), "");
+    assert_eq!(p.list.query.as_str(), "");
     assert!(matched(&app) > 0, "clearing the query restores every row");
 }
 
@@ -11910,6 +11916,7 @@ fn slash_opens_palette_listing_projects_then_worktrees_then_sessions() {
     let mut out = Vec::new();
     press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
     let texts: Vec<&str> = palette(&app)
+        .list
         .items
         .iter()
         .map(|i| i.text.as_str())
@@ -11930,9 +11937,10 @@ fn slash_opens_palette_listing_projects_then_worktrees_then_sessions() {
     // flat — the projects and worktrees wait for a query.
     let p = palette(&app);
     let shown: Vec<&str> = p
+        .list
         .matches
         .iter()
-        .map(|m| p.items[m.item].text.as_str())
+        .map(|m| p.list.items[m.item].text.as_str())
         .collect();
     assert_eq!(shown, ["demo/main/agent-1", "nebula/feat-x/codex-1"]);
     assert!(out.is_empty(), "opening the palette sends nothing");
@@ -11951,6 +11959,7 @@ fn palette_never_lists_archived_sessions() {
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
         let listed: Vec<&str> = palette(&app)
+            .list
             .items
             .iter()
             .map(|i| i.text.as_str())
@@ -11974,21 +11983,22 @@ fn palette_typing_filters_best_match_first_and_esc_is_two_stage() {
     }
     {
         let p = palette(&app);
-        assert_eq!(p.query, "main");
-        let top = &p.items[p.matches[p.selected].item];
+        assert_eq!(p.list.query, "main");
+        let top = &p.list.items[p.list.matches[p.list.cursor].item];
         // Same boundary match; the attention order breaks the tie, and
         // for two never-run rows that is build order — the worktree
         // before its session.
         assert_eq!(top.text, "demo/main");
         assert!(p
+            .list
             .matches
             .iter()
-            .all(|m| p.items[m.item].text.contains("main")));
+            .all(|m| p.list.items[m.item].text.contains("main")));
     }
     // First Esc clears the query, second closes.
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-    assert_eq!(palette(&app).query, "");
-    assert!(!palette(&app).matches.is_empty());
+    assert_eq!(palette(&app).list.query, "");
+    assert!(!palette(&app).list.matches.is_empty());
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
     assert!(app.modals.overlay.is_none());
     assert!(out.is_empty(), "browsing the palette sends nothing");
@@ -12564,7 +12574,7 @@ fn palette_rebuilds_when_the_tree_changes_under_it() {
     seed_tree(&mut app);
     let mut out = Vec::new();
     press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
-    assert_eq!(palette(&app).items.len(), 3);
+    assert_eq!(palette(&app).list.items.len(), 3);
     // Park the cursor on the session row before the tree churns.
     press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
@@ -12581,7 +12591,7 @@ fn palette_rebuilds_when_the_tree_changes_under_it() {
         },
     );
     assert!(
-        palette(&app).items.iter().any(|i| i.text == "fresh"),
+        palette(&app).list.items.iter().any(|i| i.text == "fresh"),
         "an upsert lands in the open palette"
     );
     assert_eq!(
@@ -12596,7 +12606,7 @@ fn palette_rebuilds_when_the_tree_changes_under_it() {
         },
     );
     assert!(
-        !palette(&app).items.iter().any(|i| i.text == "fresh"),
+        !palette(&app).list.items.iter().any(|i| i.text == "fresh"),
         "a removal drops out of the open palette"
     );
 }
@@ -12635,7 +12645,7 @@ fn palette_renders_with_kind_glyphs_and_column_headers() {
     let text = buffer_text(&terminal);
     assert!(text.contains("▸ demo/main"), "worktree glyph row:\n{text}");
     // Rects for mouse hit-testing were written back during the draw.
-    assert!(palette(&app).list_area.width > 0);
+    assert!(palette(&app).list.list_area.width > 0);
 }
 
 /// A palette row wears the status its panel row wears: the session's
@@ -13975,18 +13985,22 @@ fn f_opens_file_finder_listing_tracked_and_untracked() {
         let mut out = Vec::new();
 
         press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
-        let files = &finder(&app).files;
+        let files = &finder(&app).list.items;
         assert!(files.contains(&"a.txt".to_string()), "{files:?}");
         assert!(files.contains(&"fresh.txt".to_string()), "{files:?}");
         // The empty query shows everything.
-        assert_eq!(finder(&app).matches.len(), files.len());
+        assert_eq!(finder(&app).list.matches.len(), files.len());
         assert!(out.is_empty(), "opening the finder sends nothing");
 
         // Typing narrows to the fuzzy matches.
         for c in ['f', 'r'] {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
         }
-        assert_eq!(finder(&app).matches.len(), 1, "fr matches only fresh.txt");
+        assert_eq!(
+            finder(&app).list.matches.len(),
+            1,
+            "fr matches only fresh.txt"
+        );
         assert_eq!(finder(&app).selected_path(), Some("fresh.txt"));
 
         // Enter opens the selection in the editor modal; the finder stays
@@ -14165,10 +14179,14 @@ fn file_finder_escape_clears_query_then_closes() {
     )));
     let mut out = Vec::new();
     press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
-    assert_eq!(finder(&app).matches.len(), 1, "b matches only beta.rs");
+    assert_eq!(finder(&app).list.matches.len(), 1, "b matches only beta.rs");
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-    assert_eq!(finder(&app).query, "", "first Esc clears the query");
-    assert_eq!(finder(&app).matches.len(), 2, "cleared query shows all");
+    assert_eq!(finder(&app).list.query, "", "first Esc clears the query");
+    assert_eq!(
+        finder(&app).list.matches.len(),
+        2,
+        "cleared query shows all"
+    );
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
     assert!(app.modals.overlay.is_none(), "second Esc closes the finder");
 }
@@ -14229,7 +14247,7 @@ fn file_finder_renders_query_row_and_matches() {
     assert!(text.contains("src/alpha.rs"), "rows rendered:\n{text}");
     let fin = finder(&app);
     assert!(fin.area.width > 0, "draw writes hit-test area");
-    assert!(fin.list_area.height > 0, "draw writes list area");
+    assert!(fin.list.list_area.height > 0, "draw writes list area");
 }
 
 // ---- `b` tree browser ----
@@ -14243,7 +14261,8 @@ fn tree_view(app: &App) -> &crate::tree_browser::TreeBrowser {
 
 fn tree_rows(app: &App) -> Vec<String> {
     let v = tree_view(app);
-    v.rows
+    v.list
+        .items
         .iter()
         .map(|r| v.nodes[r.node].path.clone())
         .collect()
@@ -14310,7 +14329,7 @@ fn ctrl_r_flips_a_markdown_preview_between_the_page_and_its_source() {
         KeyModifiers::CONTROL,
         &mut out,
     );
-    assert_eq!(tree_view(&app).filter.as_str(), "a.t", "not typed");
+    assert_eq!(tree_view(&app).list.query.as_str(), "a.t", "not typed");
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
     for c in ['n', 'o', 't'] {
         press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
@@ -14393,7 +14412,11 @@ fn t_opens_tree_browser_folds_dirs_and_filters_hierarchies() {
     // Two-stage escape: clear the filter (restoring the folded tree),
     // then close.
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-    assert_eq!(tree_view(&app).filter, "", "first Esc clears the filter");
+    assert_eq!(
+        tree_view(&app).list.query,
+        "",
+        "first Esc clears the filter"
+    );
     assert_eq!(tree_rows(&app), vec!["src", "a.txt"]);
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
     assert!(
@@ -14424,7 +14447,7 @@ fn tree_browser_ctrl_u_clears_filter() {
         KeyModifiers::CONTROL,
         &mut out,
     );
-    assert_eq!(tree_view(&app).filter, "", "Ctrl+u clears the filter");
+    assert_eq!(tree_view(&app).list.query, "", "Ctrl+u clears the filter");
     assert_eq!(
         tree_rows(&app),
         vec!["src", "a.txt"],
@@ -14439,7 +14462,7 @@ fn tree_browser_ctrl_u_clears_filter() {
         KeyModifiers::CONTROL,
         &mut out,
     );
-    assert_eq!(tree_view(&app).filter, "");
+    assert_eq!(tree_view(&app).list.query, "");
     assert!(
         matches!(app.modals.overlay, Some(Overlay::Tree(_))),
         "the browser stays open"
@@ -14473,7 +14496,7 @@ fn tree_browser_renders_tree_and_preview_panes() {
     assert!(text.contains("orig"), "preview rendered:\n{text}");
     let v = tree_view(&app);
     assert!(v.area.width > 0, "draw writes hit-test area");
-    assert!(v.list_area.height > 0, "draw writes list area");
+    assert!(v.list.list_area.height > 0, "draw writes list area");
     assert!(v.view_height > 0, "draw writes preview page size");
 }
 
@@ -14570,8 +14593,8 @@ fn fake_grep_view(hits: Vec<crate::grep_search::GrepHit>) -> GrepView {
         "main".into(),
         "vim".into(),
     );
-    view.query = "zz".into();
-    view.hits = hits;
+    view.list.query = "zz".into();
+    view.set_hits(hits);
     view
 }
 
@@ -14585,23 +14608,26 @@ fn shift_f_opens_grep_and_typing_searches() {
     let mut out = Vec::new();
 
     press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
-    assert!(grep_view(&app).hits.is_empty(), "opens with no results");
+    assert!(
+        grep_view(&app).list.items.is_empty(),
+        "opens with no results"
+    );
     assert!(out.is_empty(), "opening the overlay sends nothing");
 
     for c in "needle".chars() {
         press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
     }
     let view = grep_view(&app);
-    assert_eq!(view.hits.len(), 1, "{:?}", view.hits);
-    assert_eq!(view.hits[0].path, "hay.txt");
-    assert_eq!(view.hits[0].line, 2);
-    assert_eq!(view.hits[0].text, "needle here");
+    assert_eq!(view.list.items.len(), 1, "{:?}", view.list.items);
+    assert_eq!(view.list.items[0].path, "hay.txt");
+    assert_eq!(view.list.items[0].line, 2);
+    assert_eq!(view.list.items[0].text, "needle here");
 
     // Two-stage escape: clear the query, then close.
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-    assert_eq!(grep_view(&app).query, "", "first Esc clears the query");
+    assert_eq!(grep_view(&app).list.query, "", "first Esc clears the query");
     assert!(
-        grep_view(&app).hits.is_empty(),
+        grep_view(&app).list.items.is_empty(),
         "cleared query shows no hits"
     );
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
@@ -14780,7 +14806,7 @@ fn grep_overlay_renders_hits_and_editor_modal_renders_on_top() {
     assert!(text.contains("let zz = 1;"), "hit text:\n{text}");
     let view = grep_view(&app);
     assert!(view.area.width > 0, "draw writes hit-test area");
-    assert!(view.list_area.height > 0, "draw writes list area");
+    assert!(view.list.list_area.height > 0, "draw writes list area");
 
     // Spawn an editor modal: it draws on top and gets its rect written
     // back for the PTY resize sync.
@@ -15566,7 +15592,7 @@ fn every_project_has_a_row_and_a_palette_path() {
     assert_eq!(app.project_rows().len(), 2, "demo and secret");
 
     let palette = Palette::new(&app.tree, false, &app.github.open_prs, false);
-    let texts: Vec<&str> = palette.items.iter().map(|i| i.text.as_str()).collect();
+    let texts: Vec<&str> = palette.list.items.iter().map(|i| i.text.as_str()).collect();
     assert_eq!(
         texts,
         [
@@ -15642,7 +15668,7 @@ fn jumping_to_another_projects_pr_selects_it() {
     {
         let p = palette(&app);
         assert_eq!(
-            p.items[p.matches[p.selected].item].text, "secret/#3 Hush the logs",
+            p.list.items[p.list.matches[p.list.cursor].item].text, "secret/#3 Hush the logs",
             "pathed under its project like every other row"
         );
     }
@@ -19997,8 +20023,8 @@ fn drawn_list_area(app: &mut App) -> ratatui::layout::Rect {
     let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
     terminal.draw(|f| ui::draw(f, app)).unwrap();
     match &app.modals.overlay {
-        Some(Overlay::Palette(v)) => v.list_area,
-        Some(Overlay::Files(v)) => v.list_area,
+        Some(Overlay::Palette(v)) => v.list.list_area,
+        Some(Overlay::Files(v)) => v.list.list_area,
         Some(Overlay::AgentPresets(v)) => v.list_area,
         Some(Overlay::Menu(v)) => {
             // A menu's rows sit inside its border.
@@ -20256,7 +20282,7 @@ fn a_click_on_a_list_row_is_enter_on_it() {
                 // session, under the project header drawn above it:
                 // walk up to the first row before counting down.
                 if let Some(Overlay::Palette(p)) = &by_keys.modals.overlay {
-                    for _ in 0..p.selected {
+                    for _ in 0..p.list.cursor {
                         press(&mut by_keys, KeyCode::Up, KeyModifiers::NONE, &mut keys_out);
                     }
                 }
