@@ -83,6 +83,18 @@ pub enum Answer {
         ticket: u64,
         preview: Box<crate::tree_browser::Preview>,
     },
+    /// The DIFF VIEWER's GRAPH (`git_log::read_log`).
+    Log {
+        ticket: u64,
+        result: Result<crate::git_log::LogRead, String>,
+    },
+    /// The files of a commit unfolded in the GRAPH.
+    CommitFiles {
+        /// The `DiffView::id` that asked.
+        view: u64,
+        sha: String,
+        result: Result<Vec<DiffFile>, String>,
+    },
     /// [`STALE_GRACE`] is up on `ticket`.
     Slow { ticket: u64 },
     /// The system clipboard could not be written off the loop: hand the

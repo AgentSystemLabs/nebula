@@ -15,6 +15,7 @@ pub mod file_tabs;
 pub mod filter_list;
 pub mod fuzzy;
 pub mod git_diff;
+pub mod git_log;
 pub mod grep_search;
 pub mod hosts;
 pub mod ipc;

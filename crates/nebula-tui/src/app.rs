@@ -1149,6 +1149,19 @@ pub struct DiffView {
     /// the tree's — `selected` and `matches` stay current underneath, so
     /// toggling back lands on a list that is already right.
     pub tree: Option<crate::diff_tree::DiffTree>,
+    /// The GRAPH section under the CHANGES (`git_log`); `None` when the
+    /// graph setting is off, or in a view that has no checkout history of
+    /// its own (a pull request's).
+    pub log: Option<crate::git_log::GitLog>,
+    /// Where the sidebar's cursor is: on a section header, among the
+    /// changed files (`selected` / the tree's), or in the GRAPH.
+    pub place: Place,
+    /// The sections unfolded under their headers.
+    pub changes_open: bool,
+    pub graph_open: bool,
+    /// The reader has moved the cursor: what lands from now on leaves it
+    /// where they put it (`settle`).
+    pub touched: bool,
     /// Diffs side by side (`Ctrl+s` flips it), remembered across opens.
     /// A narrow pane falls back to the unified diff.
     pub split: bool,
@@ -1168,7 +1181,142 @@ pub const DIFF_CACHE_ENTRY_MAX: usize = 512 * 1024;
 /// this width are too clipped to read.
 pub const MIN_SPLIT_W: u16 = 90;
 
+/// Where the DIFF VIEWER's cursor is in its SOURCE CONTROL sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    ChangesHeader,
+    Changes,
+    GraphHeader,
+    Graph,
+}
+
 impl DiffView {
+    /// What the right pane should be showing (`shown`'s key): the cursor's
+    /// changed file, a section header's `git status`, or the cursor's GRAPH
+    /// row.
+    pub fn selected_key(&self) -> Option<String> {
+        match self.place {
+            Place::Changes => self.selected_file().map(|f| f.path.clone()),
+            Place::Graph => self.log.as_ref()?.selected_key(),
+            _ => Some(crate::git_log::WORKING.to_string()),
+        }
+    }
+
+    /// The CHANGES rows under their header: none while it is folded.
+    fn changes_len(&self) -> usize {
+        if self.changes_open {
+            self.row_count()
+        } else {
+            0
+        }
+    }
+
+    /// How many rows the sidebar has: each section's header and, unfolded,
+    /// its rows.
+    pub fn side_len(&self) -> usize {
+        let graph = match &self.log {
+            Some(log) if self.graph_open => 1 + log.rows.len(),
+            Some(_) => 1,
+            None => 0,
+        };
+        1 + self.changes_len() + graph
+    }
+
+    /// The cursor's row in the sidebar.
+    pub fn side_cursor(&self) -> usize {
+        match self.place {
+            Place::ChangesHeader => 0,
+            Place::Changes => 1 + self.cursor(),
+            Place::GraphHeader => 1 + self.changes_len(),
+            Place::Graph => 2 + self.changes_len() + self.log.as_ref().map_or(0, |l| l.selected),
+        }
+    }
+
+    /// What sidebar row `index` is: its place, and its row in that list.
+    pub fn side_row(&self, index: usize) -> Option<(Place, usize)> {
+        let changes = self.changes_len();
+        match index {
+            0 => Some((Place::ChangesHeader, 0)),
+            i if i <= changes => Some((Place::Changes, i - 1)),
+            i if i >= self.side_len() => None,
+            i if i == changes + 1 => Some((Place::GraphHeader, 0)),
+            i => Some((Place::Graph, i - changes - 2)),
+        }
+    }
+
+    /// Move the sidebar cursor to row `index` (clamped), across the
+    /// sections, stepping over the graph's connecting lines the way it
+    /// moves. True when it moved (the caller reloads the pane).
+    pub fn side_select(&mut self, index: i64) -> bool {
+        let before = (self.place, self.side_cursor());
+        let last = self.side_len().saturating_sub(1) as i64;
+        let down = index >= before.1 as i64;
+        let Some((place, row)) = self.side_row(index.clamp(0, last) as usize) else {
+            return false;
+        };
+        match place {
+            Place::Changes => {
+                self.select(row as i64);
+            }
+            Place::Graph => {
+                if let Some(log) = &mut self.log {
+                    log.select_toward(row, down);
+                }
+            }
+            _ => {}
+        }
+        self.place = place;
+        let moved = (self.place, self.side_cursor()) != before;
+        self.touched |= moved;
+        moved
+    }
+
+    /// Put a cursor the reader has not moved where opening the modal
+    /// should: on the first changed file, or with none, on HEAD's commit.
+    /// Nothing moves while the changes are still being read. True when it
+    /// moved.
+    pub fn settle(&mut self) -> bool {
+        if self.touched || self.listing.is_some() {
+            return false;
+        }
+        let before = (self.place, self.side_cursor());
+        let changes = self.row_count();
+        let graph = self
+            .log
+            .as_mut()
+            .filter(|l| l.rows.iter().any(|r| r.entry.selectable()));
+        if changes > 0 {
+            self.place = Place::Changes;
+        } else if let Some(log) = graph {
+            log.go_home();
+            self.place = Place::Graph;
+        } else {
+            self.place = Place::ChangesHeader;
+        }
+        (self.place, self.side_cursor()) != before
+    }
+
+    /// Fold or unfold the section whose header the cursor is on (`open`
+    /// None flips it). True when that changed anything.
+    pub fn fold_section(&mut self, open: Option<bool>) -> bool {
+        let section = match self.place {
+            Place::ChangesHeader => &mut self.changes_open,
+            Place::GraphHeader => &mut self.graph_open,
+            _ => return false,
+        };
+        let want = open.unwrap_or(!*section);
+        let changed = want != *section;
+        *section = want;
+        changed
+    }
+
+    /// `←`/`→` fold and unfold: on a header, a GRAPH row and the tree.
+    /// Everywhere else (the flat list of changes) they move the filter's
+    /// caret.
+    pub fn folds_on_arrows(&self) -> bool {
+        self.place != Place::Changes || self.tree.is_some()
+    }
+
     /// A view up before its file list is: `g` opens this at once and
     /// `event_loop::land_view_answer` fills it when `git status` answers.
     pub fn opening(
@@ -1269,6 +1417,11 @@ impl DiffView {
             shown: None,
             cache: Vec::new(),
             tree: None,
+            log: None,
+            place: Place::Changes,
+            changes_open: true,
+            graph_open: true,
+            touched: false,
             split: true,
             split_rows: None,
             split_shown: false,
@@ -1327,8 +1480,12 @@ impl DiffView {
     }
 
     /// The file behind the current selection, if any row is visible — and,
-    /// in the tree, if that row is a file's.
+    /// in the tree, if that row is a file's. None while the cursor is
+    /// outside the CHANGES.
     pub fn selected_file(&self) -> Option<&DiffFile> {
+        if self.place != Place::Changes {
+            return None;
+        }
         match &self.tree {
             Some(tree) => self.files.get(tree.selected_file()?),
             None => self.files.get(self.matches.get(self.selected)?.file),

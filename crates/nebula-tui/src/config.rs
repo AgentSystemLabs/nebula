@@ -402,6 +402,7 @@ pub enum SettingKind {
     BlackBackground,
     HideCardMarks,
     HighlightCurrentCard,
+    SourceControlGraph,
     SessionPane,
     WorktreeLayout,
     ExpandAllWorktrees,
@@ -510,6 +511,7 @@ impl SettingKind {
             SettingKind::HighlightCurrentCard => (2026, 9, 28),
             SettingKind::AskBeforeArchive => (2026, 10, 3),
             SettingKind::ConfirmDragMove => (2026, 10, 2),
+            SettingKind::SourceControlGraph => (2026, 10, 9),
         }
     }
 
@@ -711,6 +713,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::HideDraftPrs,
                 label: "Draft pull requests",
                 hint: "Show or hide draft pull requests in / search; checkouts always stay",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::SourceControlGraph,
+                label: "Show commit graph",
+                hint: "Add the read-only git commit graph under the g diff view's changed files",
                 group: "",
             },
         ]),
@@ -1125,6 +1133,10 @@ pub struct Config {
     /// the SESSIONS PANEL — those describe work you have, not work you are
     /// browsing. Off by default: a config predating the key hides nothing.
     pub hide_draft_prs: bool,
+    /// SOURCE CONTROL GRAPH: when on, the `g` DIFF VIEWER reads a
+    /// read-only commit graph under the changed files. Off by default, and
+    /// with it off the DIFF VIEWER does not run `git log` or `rev-list`.
+    pub source_control_graph: bool,
     /// RETIRED with the line counts always drawn. Through 0.37 the **Card
     /// line counts** SETTING (Settings → Appearance, off by default)
     /// switched each card's `+3 files` to `+3 files +120 -45`. Every card
@@ -1467,6 +1479,7 @@ impl Default for Config {
             hide_card_prompt: false,
             card_issue_number: true,
             hide_draft_prs: false,
+            source_control_graph: false,
             card_line_changes: false,
             skip_session_naming: false,
             confirm_on_archive: false,
@@ -2309,6 +2322,7 @@ impl Config {
             SettingKind::ExpandAllWorktrees => on_off(self.expand_all_worktrees).into(),
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
+            SettingKind::SourceControlGraph => on_off(self.source_control_graph).into(),
             // A project row with no project to speak of: what one without
             // an entry would show.
             SettingKind::RunCommand | SettingKind::OpenCommand => {
@@ -2428,6 +2442,9 @@ impl Config {
             }
             SettingKind::HideDraftPrs => {
                 self.hide_draft_prs = !self.hide_draft_prs;
+            }
+            SettingKind::SourceControlGraph => {
+                self.source_control_graph = !self.source_control_graph;
             }
             // One project's, not the file's, and typed: see `set_project_text`.
             SettingKind::RunCommand | SettingKind::OpenCommand => {}
