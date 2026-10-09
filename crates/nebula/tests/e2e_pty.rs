@@ -3310,6 +3310,91 @@ async fn create_agent_runs_the_shells_own_claude_and_archive_clears_its_job() {
     wait_for_exit(&mut daemon);
 }
 
+/// Some shell tools (Iris is the real report) autostart from .zshrc/.bashrc
+/// by checking only "interactive shell + stdin is a TTY" and then `exec`ing
+/// themselves. A `$SHELL -l -i -c <agent>` whose stdin is the session PTY
+/// never reaches `<agent>`. Nebula keeps the login shell interactive for rc
+/// files, but makes stdin non-TTY until the launch line itself reopens the
+/// PTY, so aliases/functions from rc still work and the agent gets a real
+/// terminal.
+#[tokio::test]
+async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let dir = env.tmp.path().to_path_buf();
+
+    let rc = dir.join("rc.sh");
+    std::fs::write(
+        &rc,
+        format!(
+            concat!(
+                "case $- in *i*) interactive=1;; *) interactive=0;; esac\n",
+                "if [ \"$interactive\" = 1 ] && [ -t 0 ]; then\n",
+                "  exec sh -c 'echo iris-autostarted > \"{d}/iris\"; sleep 600'\n",
+                "fi\n",
+                "claude() {{\n",
+                "  if [ -t 0 ]; then tty=tty; else tty=notty; fi\n",
+                "  echo \"claude $tty $*\" > '{d}/claude-ran'\n",
+                "  sleep 600\n",
+                "}}\n",
+            ),
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    let shell = dir.join("iris-shell.sh");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\nexec /bin/bash -i -c \". '{}'; $4\"\n",
+            rc.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&shell);
+
+    let mut daemon = env.spawn_daemon_with_shell(&shell);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "iris-safe", 2).await;
+
+    let marker = dir.join("claude-ran");
+    tokio::time::timeout(SLOW_TIMEOUT, async {
+        loop {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(POLL_STEP).await;
+        }
+    })
+    .await
+    .expect("the rc-defined claude function should run");
+    let ran = std::fs::read_to_string(&marker).unwrap();
+    assert!(
+        ran.starts_with("claude tty --append-system-prompt "),
+        "{ran:?}"
+    );
+    assert!(
+        !dir.join("iris").exists(),
+        "the rc autostart hook should not have taken over the PTY"
+    );
+
+    write_frame(
+        &mut c,
+        &ClientRequest::ArchiveAgent {
+            req_id: 3,
+            id: agent_id,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// One PrewarmWorktreeSessions must revive every dead session under the
 /// worktree — no Attach involved — so the TUI can boot a worktree's
 /// sessions the moment the user's selection rests on it. Archived agents
