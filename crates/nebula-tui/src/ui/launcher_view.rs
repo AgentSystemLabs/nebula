@@ -4077,7 +4077,7 @@ mod tests {
     #[test]
     fn a_terminal_cards_tail_paints_like_a_small_terminal() {
         use crate::terminal_tail::parse_tail;
-        let th = App::new().theme;
+        let th = App::new().chrome.theme;
         let r = Rect::new(0, 0, 12, 1);
         let paint = |data: &[u8], alive: bool| {
             let mut buf = Buffer::empty(r);

@@ -3291,6 +3291,7 @@ impl Default for NavigationState {
     }
 }
 
+#[derive(Default)]
 pub struct PaneState {
     pub term: Option<AttachedTerm>,
     /// Screens of the sessions the pane showed most recently, most recent
@@ -3378,34 +3379,7 @@ pub struct PaneState {
     pub vim_generation: u64,
 }
 
-impl Default for PaneState {
-    fn default() -> Self {
-        Self {
-            term: None,
-            term_cache: Vec::new(),
-            terminal_tails: HashMap::new(),
-            tail_cards: Vec::new(),
-            term_locked: false,
-            term_area: Rect::default(),
-            host_cursor: None,
-            collapsed: false,
-            pending_attach: None,
-            attached_sref: None,
-            term_selection: None,
-            next_drag_autoscroll: None,
-            term_mouse_grab: None,
-            last_term_click: None,
-            last_session_click: None,
-            last_pane_edge_click: None,
-            term_links: Vec::new(),
-            term_file_links: Vec::new(),
-            vim: None,
-            vim_tx: None,
-            vim_generation: 0,
-        }
-    }
-}
-
+#[derive(Default)]
 pub struct LauncherState {
     pub show_archived: bool,
     /// The Worktrees panel's OPEN PRS group folded down to its header (a
@@ -3622,51 +3596,6 @@ pub struct LauncherState {
     /// (`launcher_view::card_tint`). Mirrors the config, refreshed at
     /// startup and when the settings overlay applies a change.
     pub highlight_current_card: bool,
-}
-
-impl Default for LauncherState {
-    fn default() -> Self {
-        Self {
-            show_archived: false,
-            open_prs_collapsed: false,
-            issues_collapsed: false,
-            hide_draft_prs: false,
-            launcher_unaimed: false,
-            launcher_pane_h: None,
-            launcher_pane_w: None,
-            launcher_pane_at: crate::launcher::PaneSide::default(),
-            launcher_list: false,
-            launcher_nested: false,
-            launcher_folded: std::collections::HashSet::new(),
-            launcher_thread_open: std::collections::HashSet::new(),
-            launcher_all_open: false,
-            launcher_pane_hidden: false,
-            launcher_expanded: None,
-            launcher_open_bands: HashMap::new(),
-            launcher_scroll: 0,
-            launcher_scroll_held: false,
-            launcher_scroll_on: None,
-            launcher_scroll_in: None,
-            launcher_reveal: false,
-            launcher_pane_drag: None,
-            card_drag: None,
-            hover_launcher_pane: false,
-            hover_crumb: None,
-            launcher_tabs: Vec::new(),
-            dismissed_repath_projects: std::collections::HashSet::new(),
-            #[cfg(test)]
-            prompt_missing_project_paths: false,
-            projects_closed: false,
-            launcher_tab_cursor: None,
-            launcher_tabs_more: Vec::new(),
-            launch_repo: None,
-            launcher_body: Rect::default(),
-            show_all_worktrees: false,
-            card_issue_number: false,
-            hide_card_marks: false,
-            highlight_current_card: false,
-        }
-    }
 }
 
 pub struct ChromeState {
@@ -3934,6 +3863,7 @@ impl Default for RequestState {
     }
 }
 
+#[derive(Default)]
 pub struct GithubState {
     /// What `gh pr view` last said about each worktree's branch: `Some(pr)`
     /// when one exists, `None` when the lookup came back empty (no PR, no
@@ -4079,48 +4009,7 @@ pub struct GithubState {
     pub issues_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::issues::IssuesAnswer>>,
 }
 
-impl Default for GithubState {
-    fn default() -> Self {
-        Self {
-            pull_requests: HashMap::new(),
-            merge_landed: HashMap::new(),
-            pr_seen: HashMap::new(),
-            pr_inflight: std::collections::HashSet::new(),
-            pr_recheck: HashMap::new(),
-            open_prs: HashMap::new(),
-            open_prs_inflight: std::collections::HashSet::new(),
-            open_prs_failed: std::collections::HashSet::new(),
-            pr_detail: HashMap::new(),
-            pr_detail_inflight: std::collections::HashSet::new(),
-            pr_detail_failed: std::collections::HashSet::new(),
-            pending_pr_detail: None,
-            pr_refresh_requested: false,
-            pr_preview_scroll: 0,
-            pr_preview_lines: 0,
-            pr_diff_inflight: None,
-            pr_diff_refreshing: std::collections::HashSet::new(),
-            pr_diff_tx: None,
-            pr_comment_inflight: std::collections::HashSet::new(),
-            pr_comment_drafts: HashMap::new(),
-            pr_comment_tx: None,
-            pr_cache: None,
-            pr_cache_dirty: false,
-            pr_detail_stale: std::collections::HashSet::new(),
-            issues: HashMap::new(),
-            issues_inflight: std::collections::HashSet::new(),
-            issues_failed: std::collections::HashSet::new(),
-            issues_due: HashMap::new(),
-            pending_issues_prefetch: None,
-            issue_detail: HashMap::new(),
-            issue_detail_inflight: std::collections::HashSet::new(),
-            issue_detail_failed: std::collections::HashSet::new(),
-            issue_comment_inflight: std::collections::HashSet::new(),
-            pending_issue_detail: None,
-            issues_tx: None,
-        }
-    }
-}
-
+#[derive(Default)]
 pub struct JobState {
     /// Changed-file count of the selected worktree's checkout (staged +
     /// unstaged + untracked), the worktree panel's bottom badge. Keyed by
@@ -4171,24 +4060,6 @@ pub struct JobState {
     /// This TUI process's own RSS, sampled alongside each metrics request
     /// (the daemon can't see us).
     pub client_rss_bytes: u64,
-}
-
-impl Default for JobState {
-    fn default() -> Self {
-        Self {
-            git_changes: None,
-            git_changes_inflight: None,
-            worktree_changes: HashMap::new(),
-            worktree_changes_inflight: None,
-            worktree_lines: HashMap::new(),
-            view_jobs: None,
-            diff_probe: None,
-            changed_files: None,
-            branch_switch: Default::default(),
-            last_metrics: None,
-            client_rss_bytes: 0,
-        }
-    }
 }
 
 pub struct App {

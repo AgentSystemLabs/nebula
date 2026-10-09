@@ -3670,16 +3670,21 @@ mod tests {
             assert_eq!(tab_state(&by_key).0.as_deref(), Some("demo"));
             assert!(
                 by_key
+                    .chrome
                     .flash
                     .as_deref()
                     .is_some_and(|f| f.contains("no project tab 9")),
                 "{:?}",
-                by_key.flash
+                by_key.chrome.flash
             );
 
             let before = tab_state(&by_key);
             key(&mut by_key, KeyCode::Char('w'), KeyModifiers::NONE);
-            assert!(by_key.overlay.is_none(), "w opened {:?}", by_key.overlay);
+            assert!(
+                by_key.modals.overlay.is_none(),
+                "w opened {:?}",
+                by_key.modals.overlay
+            );
             assert_eq!(tab_state(&by_key), before);
         });
     }
@@ -4047,8 +4052,11 @@ mod tests {
                 assert_eq!(app.nav.focus, Focus::Sessions, "the keys are the cards'");
                 assert!(!app.pane.term_locked);
             }
-            assert_eq!(by_click.launcher_unaimed, by_key.launcher_unaimed);
-            assert_eq!(by_click.flash, by_key.flash);
+            assert_eq!(
+                by_click.launcher.launcher_unaimed,
+                by_key.launcher.launcher_unaimed
+            );
+            assert_eq!(by_click.chrome.flash, by_key.chrome.flash);
         });
     }
 
@@ -4144,7 +4152,7 @@ mod tests {
     fn an_empty_worktree_is_a_band_the_cursor_walks_onto() {
         with_default_config(|| {
             let mut off = with_empty_band();
-            off.show_all_worktrees = false;
+            off.launcher.show_all_worktrees = false;
             let screen = screen_text(&draw_tall(&mut off));
             assert!(!screen.contains("idle"), "{screen}");
 
@@ -4198,7 +4206,7 @@ mod tests {
             draw_tall(&mut by_key);
             keys(&mut by_key, &[KeyCode::Char('j'), KeyCode::Char('j')]);
             let sent = key(&mut by_key, KeyCode::Char('d'), KeyModifiers::NONE);
-            assert!(is_worktree_confirm(&by_key), "{:?}", by_key.overlay);
+            assert!(is_worktree_confirm(&by_key), "{:?}", by_key.modals.overlay);
             assert!(sent.is_empty(), "asked first: {sent:?}");
 
             let mut by_click = with_empty_band();
@@ -4210,7 +4218,7 @@ mod tests {
                 area.x + 4,
                 area.y + 1,
             );
-            let at = match &by_click.overlay {
+            let at = match &by_click.modals.overlay {
                 Some(Overlay::Menu(menu)) => menu
                     .items
                     .iter()
@@ -4222,7 +4230,11 @@ mod tests {
                 key(&mut by_click, KeyCode::Down, KeyModifiers::NONE);
             }
             key(&mut by_click, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(is_worktree_confirm(&by_click), "{:?}", by_click.overlay);
+            assert!(
+                is_worktree_confirm(&by_click),
+                "{:?}",
+                by_click.modals.overlay
+            );
             let id = |app: &App| app.selected_worktree().map(|w| w.id.clone());
             assert_eq!(id(&by_click), id(&by_key));
         });
@@ -4272,16 +4284,17 @@ mod tests {
             assert!(
                 is_worktree_confirm(&by_key),
                 "{:?} / {:?}",
-                by_key.overlay,
-                by_key.flash
+                by_key.modals.overlay,
+                by_key.chrome.flash
             );
-            assert_eq!(by_key.flash, None);
+            assert_eq!(by_key.chrome.flash, None);
             assert!(sent.is_empty(), "asked first: {sent:?}");
 
             let mut drawn = with_empty_band_on_a_pull_request();
             draw_tall(&mut drawn);
             let band = band_area(&drawn, 2);
             let pr = drawn
+                .chrome
                 .hits
                 .iter()
                 .find(|(_, hit)| *hit == HitTarget::LauncherBandPr(WorktreeId("w3".into())))
@@ -4296,7 +4309,7 @@ mod tests {
                     x,
                     y,
                 );
-                let at = match &by_click.overlay {
+                let at = match &by_click.modals.overlay {
                     Some(Overlay::Menu(menu)) => menu
                         .items
                         .iter()
@@ -4308,7 +4321,11 @@ mod tests {
                     key(&mut by_click, KeyCode::Down, KeyModifiers::NONE);
                 }
                 key(&mut by_click, KeyCode::Enter, KeyModifiers::NONE);
-                assert!(is_worktree_confirm(&by_click), "{:?}", by_click.overlay);
+                assert!(
+                    is_worktree_confirm(&by_click),
+                    "{:?}",
+                    by_click.modals.overlay
+                );
             }
         });
     }
@@ -5666,7 +5683,11 @@ mod tests {
             );
 
             cmd_p(&mut by_key);
-            assert!(by_key.overlay.is_none(), "{:?}", by_key.overlay);
+            assert!(
+                by_key.modals.overlay.is_none(),
+                "{:?}",
+                by_key.modals.overlay
+            );
 
             // Inside the pane under the cards.
             let mut app = two_sessions();
@@ -6151,7 +6172,7 @@ mod tests {
             let (x, y) = crumb_cell(&by_click, HitTarget::LauncherWelcomePrompt);
             let cap = &terminal.backend().buffer()[(x + 7, y)];
             assert_eq!(cap.symbol(), "p", "{text}");
-            assert_eq!(cap.bg, by_click.theme.accent, "the key is a key cap");
+            assert_eq!(cap.bg, by_click.chrome.theme.accent, "the key is a key cap");
             assert!(by_click.welcome_active(), "the nebula ticks while it is up");
 
             mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
@@ -6205,9 +6226,9 @@ mod tests {
             assert!(!app.welcome_active(), "animations off: a still frame");
 
             let mut small = on_an_empty_project();
-            small.animations = false;
+            small.chrome.animations = false;
             let terminal = draw_at(&mut small, 40, 12);
-            let grid = crate::launcher::grid(small.body_area).area;
+            let grid = crate::launcher::grid(small.chrome.body_area).area;
             let (_, key_y) = crumb_cell(&small, HitTarget::LauncherWelcomePrompt);
             assert!(row(&terminal, key_y - 2).contains("Welcome to nebula"));
             let specks =
@@ -6516,11 +6537,17 @@ mod tests {
             let mut next = two_sessions();
             super::super::restore_ui_state(&mut next, &json);
             assert_eq!(tab_state(&next).0.as_deref(), Some("web"));
-            assert_eq!(next.launcher_expanded, web, "the relaunch opens web's band");
+            assert_eq!(
+                next.launcher.launcher_expanded, web,
+                "the relaunch opens web's band"
+            );
             draw(&mut next);
             key(&mut next, KeyCode::Char(']'), KeyModifiers::NONE);
             assert_eq!(tab_state(&next).0.as_deref(), Some("demo"));
-            assert_eq!(next.launcher_expanded, demo, "and demo's, a tab away");
+            assert_eq!(
+                next.launcher.launcher_expanded, demo,
+                "and demo's, a tab away"
+            );
         });
     }
 
@@ -6657,13 +6684,19 @@ mod tests {
             assert!(by_key.tree.projects.iter().any(|p| p.name == "demo"));
 
             key(&mut by_key, KeyCode::Char('x'), KeyModifiers::NONE);
-            assert!(by_key.launcher_tabs.is_empty(), "the last tab closes");
-            assert!(by_key.projects_closed);
+            assert!(
+                by_key.launcher.launcher_tabs.is_empty(),
+                "the last tab closes"
+            );
+            assert!(by_key.launcher.projects_closed);
             assert!(!by_key.launcher_active() && by_key.splash_showing());
-            assert_eq!(by_key.flash.as_deref(), Some(super::LAST_TAB));
+            assert_eq!(by_key.chrome.flash.as_deref(), Some(super::LAST_TAB));
             assert_eq!(by_key.tree.projects.len(), 2, "no project went");
             draw(&mut by_key);
-            assert!(by_key.launcher_tabs.is_empty(), "the draw gives none back");
+            assert!(
+                by_key.launcher.launcher_tabs.is_empty(),
+                "the draw gives none back"
+            );
         });
     }
 
@@ -6703,7 +6736,7 @@ mod tests {
             let mut next = two_sessions();
             super::super::restore_ui_state(&mut next, &json);
             draw(&mut next);
-            assert!(next.projects_closed && next.launcher_tabs.is_empty());
+            assert!(next.launcher.projects_closed && next.launcher.launcher_tabs.is_empty());
 
             // `+`: every project, none ticked; picking one reopens it.
             key(&mut app, KeyCode::Char('+'), KeyModifiers::NONE);
@@ -7123,7 +7156,10 @@ mod tests {
 
             assert_eq!(tab_state(&by_key), tab_state(&by_click));
             assert_eq!(pane(&by_key), pane(&by_click));
-            assert_eq!(by_key.launcher_tab_cursor, by_click.launcher_tab_cursor);
+            assert_eq!(
+                by_key.launcher.launcher_tab_cursor,
+                by_click.launcher.launcher_tab_cursor
+            );
             assert_eq!(selected(&by_key).as_deref(), Some("a1"), "the card left");
 
             // Onto the other tab: `h` and Enter, or a click on it.
@@ -7139,7 +7175,10 @@ mod tests {
 
             assert_eq!(tab_state(&by_key), tab_state(&by_click));
             assert_eq!(pane(&by_key), pane(&by_click));
-            assert_eq!(by_key.launcher_tab_cursor, by_click.launcher_tab_cursor);
+            assert_eq!(
+                by_key.launcher.launcher_tab_cursor,
+                by_click.launcher.launcher_tab_cursor
+            );
             assert_eq!(tab_state(&by_key).0.as_deref(), Some("web"));
 
             let mut app = two_tabs();
@@ -7207,7 +7246,7 @@ mod tests {
             let mut by_x = two_tabs();
             keys(&mut by_x, &up);
             key(&mut by_x, KeyCode::Char('x'), KeyModifiers::NONE);
-            assert_eq!(by_x.launcher_tabs, [ProjectId("p1".into())]);
+            assert_eq!(by_x.launcher.launcher_tabs, [ProjectId("p1".into())]);
 
             for code in [KeyCode::Backspace, KeyCode::Delete, KeyCode::Char('d')] {
                 let mut app = two_tabs();
@@ -7243,7 +7282,10 @@ mod tests {
                 key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
                 assert!(app.modals.overlay.is_none());
                 assert_eq!(tab_state(&app), tab_state(&by_x), "{code:?} Enter is x");
-                assert_eq!(app.launcher.launcher_tab_cursor, by_x.launcher_tab_cursor);
+                assert_eq!(
+                    app.launcher.launcher_tab_cursor,
+                    by_x.launcher.launcher_tab_cursor
+                );
                 assert_eq!(
                     app.launcher.launcher_tab_cursor,
                     Some(ProjectId("p1".into()))
@@ -7321,7 +7363,7 @@ mod tests {
             let mut next = two_sessions();
             super::super::restore_ui_state(&mut next, &json);
             assert_eq!(
-                next.launcher_tabs,
+                next.launcher.launcher_tabs,
                 [ProjectId("p2".into()), ProjectId("p1".into())]
             );
             draw(&mut next);
@@ -7417,6 +7459,7 @@ mod tests {
             full_screen(&mut by_click);
             draw(&mut by_click);
             let (rect, _) = by_click
+                .chrome
                 .hits
                 .iter()
                 .find(|(_, hit)| *hit == HitTarget::LauncherCrumb)
@@ -7424,9 +7467,9 @@ mod tests {
             let (x, y) = (rect.x + 1, rect.y);
             mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
 
-            assert_eq!(by_click.focus, by_key.focus);
-            assert_eq!(by_click.collapsed, by_key.collapsed);
-            assert_eq!(by_click.term_locked, by_key.term_locked);
+            assert_eq!(by_click.nav.focus, by_key.nav.focus);
+            assert_eq!(by_click.pane.collapsed, by_key.pane.collapsed);
+            assert_eq!(by_click.pane.term_locked, by_key.pane.term_locked);
             assert_eq!(selected(&by_click), selected(&by_key));
         });
     }
@@ -7518,9 +7561,9 @@ mod tests {
                 mouse(app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
             };
             let same = |a: &App, b: &App| {
-                assert_eq!(a.collapsed, b.collapsed);
-                assert_eq!(a.focus, b.focus);
-                assert_eq!(a.term_locked, b.term_locked);
+                assert_eq!(a.pane.collapsed, b.pane.collapsed);
+                assert_eq!(a.nav.focus, b.nav.focus);
+                assert_eq!(a.pane.term_locked, b.pane.term_locked);
                 assert_eq!(pane(a), pane(b));
             };
 
@@ -7530,7 +7573,7 @@ mod tests {
             click(&mut by_click);
             let mut by_key = entered();
             key(&mut by_key, KeyCode::Char('f'), KeyModifiers::CONTROL);
-            assert!(by_click.collapsed);
+            assert!(by_click.pane.collapsed);
             same(&by_click, &by_key);
 
             let head = buffer_text(&draw(&mut by_click));
@@ -7538,7 +7581,7 @@ mod tests {
             click(&mut by_click);
             draw(&mut by_key);
             key(&mut by_key, KeyCode::Char('f'), KeyModifiers::CONTROL);
-            assert!(!by_click.collapsed);
+            assert!(!by_click.pane.collapsed);
             same(&by_click, &by_key);
         });
     }
@@ -8084,10 +8127,10 @@ mod tests {
 
             assert_eq!(selected(&by_click), selected(&by_key));
             assert_eq!(pane(&by_click), pane(&by_key));
-            assert_eq!(by_click.focus, by_key.focus);
-            assert_eq!(by_click.sel_project, by_key.sel_project);
+            assert_eq!(by_click.nav.focus, by_key.nav.focus);
+            assert_eq!(by_click.nav.sel_project, by_key.nav.sel_project);
             assert_ne!(
-                by_click.focus,
+                by_click.nav.focus,
                 Focus::Terminal,
                 "a click aims, it does not attach"
             );
@@ -8095,16 +8138,16 @@ mod tests {
             keys(&mut by_key, &[KeyCode::Enter, KeyCode::Enter]);
             mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
             assert_eq!(
-                by_click.focus,
+                by_click.nav.focus,
                 Focus::Terminal,
                 "the second click is Enter: into the pane"
             );
-            assert_eq!(by_click.term_locked, by_key.term_locked);
+            assert_eq!(by_click.pane.term_locked, by_key.pane.term_locked);
             assert_eq!(
-                by_click.collapsed, by_key.collapsed,
+                by_click.pane.collapsed, by_key.pane.collapsed,
                 "the pane beside the grid either way"
             );
-            assert!(!by_click.collapsed, "not full-screen");
+            assert!(!by_click.pane.collapsed, "not full-screen");
         });
     }
 
@@ -8119,54 +8162,63 @@ mod tests {
             let mut by_key = two_sessions();
             draw(&mut by_key);
             key(&mut by_key, KeyCode::Char('~'), KeyModifiers::NONE);
-            assert!(by_key.launcher_pane_hidden, "^~ folded the pane away");
+            assert!(
+                by_key.launcher.launcher_pane_hidden,
+                "^~ folded the pane away"
+            );
             to_feat(&mut by_key);
             assert!(
-                by_key.launcher_pane_hidden,
+                by_key.launcher.launcher_pane_hidden,
                 "walking the grid leaves the fold be"
             );
             key(&mut by_key, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(!by_key.launcher_pane_hidden, "Enter brought the pane back");
             assert!(
-                !by_key.collapsed,
+                !by_key.launcher.launcher_pane_hidden,
+                "Enter brought the pane back"
+            );
+            assert!(
+                !by_key.pane.collapsed,
                 "the pane beside the grid, not full-screen"
             );
-            assert_eq!(by_key.focus, Focus::Terminal, "and the keys are in it");
+            assert_eq!(by_key.nav.focus, Focus::Terminal, "and the keys are in it");
 
             let mut by_click = two_sessions();
             draw(&mut by_click);
             key(&mut by_click, KeyCode::Char('~'), KeyModifiers::NONE);
-            assert!(by_click.launcher_pane_hidden);
+            assert!(by_click.launcher.launcher_pane_hidden);
             key(&mut by_click, KeyCode::Esc, KeyModifiers::NONE);
             draw(&mut by_click);
             let (x, y) = row_cell(&by_click, 0);
             mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
             assert!(
-                !by_click.launcher_pane_hidden,
+                !by_click.launcher.launcher_pane_hidden,
                 "one click on a card always brings the folded pane back"
             );
-            assert!(!by_click.launcher_unaimed, "on the card clicked");
+            assert!(!by_click.launcher.launcher_unaimed, "on the card clicked");
             assert_eq!(
-                by_click.focus,
+                by_click.nav.focus,
                 Focus::Sessions,
                 "and the keys stay on the cards until the second click"
             );
             mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
 
             assert!(
-                !by_click.launcher_pane_hidden,
+                !by_click.launcher.launcher_pane_hidden,
                 "the second click brought the pane back"
             );
             assert_eq!(
-                by_click.collapsed, by_key.collapsed,
+                by_click.pane.collapsed, by_key.pane.collapsed,
                 "the pane beside the grid either way"
             );
-            assert!(!by_click.collapsed, "not full-screen");
-            assert_eq!(by_click.focus, by_key.focus, "and the keys are in it");
+            assert!(!by_click.pane.collapsed, "not full-screen");
+            assert_eq!(
+                by_click.nav.focus, by_key.nav.focus,
+                "and the keys are in it"
+            );
             assert_eq!(pane(&by_click), pane(&by_key));
             assert_eq!(
-                by_click.launcher_expanded.is_some(),
-                by_key.launcher_expanded.is_some()
+                by_click.launcher.launcher_expanded.is_some(),
+                by_key.launcher.launcher_expanded.is_some()
             );
             let text = buffer_text(&draw(&mut by_click));
             assert_eq!(
@@ -8179,9 +8231,9 @@ mod tests {
             let (x, y) = row_cell(&by_click, 0);
             mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
             mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
-            assert!(!by_click.launcher_pane_hidden, "the pane stayed");
-            assert!(!by_click.collapsed, "and never took the whole screen");
-            assert_eq!(by_click.focus, Focus::Terminal);
+            assert!(!by_click.launcher.launcher_pane_hidden, "the pane stayed");
+            assert!(!by_click.pane.collapsed, "and never took the whole screen");
+            assert_eq!(by_click.nav.focus, Focus::Terminal);
         });
     }
 
@@ -8227,9 +8279,9 @@ mod tests {
                 "both buttons land on the same card"
             );
             assert!(
-                matches!(by_right.overlay, Some(Overlay::Menu(_))),
+                matches!(by_right.modals.overlay, Some(Overlay::Menu(_))),
                 "and the right one opens its menu: {:?}",
-                by_right.overlay
+                by_right.modals.overlay
             );
         });
     }
@@ -9122,9 +9174,13 @@ mod tests {
         with_default_config(|| {
             let mut by_key = card_on_a_pull_request();
             let sent = key(&mut by_key, KeyCode::Char('V'), KeyModifiers::SHIFT);
-            assert!(by_key.overlay.is_none(), "{:?}", by_key.overlay);
+            assert!(
+                by_key.modals.overlay.is_none(),
+                "{:?}",
+                by_key.modals.overlay
+            );
             assert_eq!(
-                by_key.flash.as_deref(),
+                by_key.chrome.flash.as_deref(),
                 Some("opened github.com/o/demo/pull/42")
             );
             assert!(
@@ -9139,10 +9195,14 @@ mod tests {
                 key(&mut by_menu, KeyCode::Down, KeyModifiers::NONE);
             }
             let sent_by_menu = key(&mut by_menu, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(by_menu.overlay.is_none(), "{:?}", by_menu.overlay);
-            assert_eq!(by_menu.flash, by_key.flash);
+            assert!(
+                by_menu.modals.overlay.is_none(),
+                "{:?}",
+                by_menu.modals.overlay
+            );
+            assert_eq!(by_menu.chrome.flash, by_key.chrome.flash);
             assert_eq!(format!("{sent_by_menu:?}"), format!("{sent:?}"));
-            assert_eq!(by_menu.pr_seen, by_key.pr_seen);
+            assert_eq!(by_menu.github.pr_seen, by_key.github.pr_seen);
         });
     }
 
@@ -9307,9 +9367,13 @@ mod tests {
             );
 
             let sent = click_at(&mut by_click, line.x + 3, line.y);
-            assert!(by_click.overlay.is_none(), "{:?}", by_click.overlay);
+            assert!(
+                by_click.modals.overlay.is_none(),
+                "{:?}",
+                by_click.modals.overlay
+            );
             assert_eq!(
-                by_click.flash.as_deref(),
+                by_click.chrome.flash.as_deref(),
                 Some("opened github.com/o/demo/pull/42")
             );
             assert!(
@@ -9317,9 +9381,13 @@ mod tests {
                     .any(|r| matches!(r, ClientRequest::MarkPrSeen { url, .. } if url == PR_42)),
                 "the pull request is marked read: {sent:?}"
             );
-            assert_eq!(by_click.pr_seen, by_key.pr_seen);
-            assert_eq!(by_click.flash, by_key.flash);
-            assert_eq!(by_click.focus, Focus::Sessions, "the keys stay on the grid");
+            assert_eq!(by_click.github.pr_seen, by_key.github.pr_seen);
+            assert_eq!(by_click.chrome.flash, by_key.chrome.flash);
+            assert_eq!(
+                by_click.nav.focus,
+                Focus::Sessions,
+                "the keys stay on the grid"
+            );
             assert_eq!(
                 by_click.selected_session().map(|a| a.id.clone()),
                 by_key.selected_session().map(|a| a.id.clone())
@@ -9595,7 +9663,11 @@ mod tests {
             // And Enter in the box is the launch, on the card's settings.
             type_text(&mut by_key, "tidy the nav");
             let sent = key(&mut by_key, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(by_key.overlay.is_none(), "{:?}", by_key.overlay);
+            assert!(
+                by_key.modals.overlay.is_none(),
+                "{:?}",
+                by_key.modals.overlay
+            );
             match sent.as_slice() {
                 [ClientRequest::CreateAgent {
                     worktree,
@@ -9711,9 +9783,13 @@ mod tests {
         with_default_config(|| {
             let mut by_key = card_from_an_issue();
             let sent = key(&mut by_key, KeyCode::Char('I'), KeyModifiers::SHIFT);
-            assert!(by_key.overlay.is_none(), "{:?}", by_key.overlay);
+            assert!(
+                by_key.modals.overlay.is_none(),
+                "{:?}",
+                by_key.modals.overlay
+            );
             assert_eq!(
-                by_key.flash.as_deref(),
+                by_key.chrome.flash.as_deref(),
                 Some("opened github.com/o/demo/issues/15")
             );
 
@@ -9723,8 +9799,12 @@ mod tests {
                 key(&mut by_menu, KeyCode::Down, KeyModifiers::NONE);
             }
             let sent_by_menu = key(&mut by_menu, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(by_menu.overlay.is_none(), "{:?}", by_menu.overlay);
-            assert_eq!(by_menu.flash, by_key.flash);
+            assert!(
+                by_menu.modals.overlay.is_none(),
+                "{:?}",
+                by_menu.modals.overlay
+            );
+            assert_eq!(by_menu.chrome.flash, by_key.chrome.flash);
             assert_eq!(format!("{sent_by_menu:?}"), format!("{sent:?}"));
         });
     }
@@ -9742,10 +9822,10 @@ mod tests {
             let sent_by_key = key(&mut by_key, KeyCode::Char('I'), KeyModifiers::SHIFT);
 
             let mut by_click = card_from_an_issue();
-            by_click.card_issue_number = true;
+            by_click.launcher.card_issue_number = true;
             // The aim let go of, so the click is what puts it back.
             keys(&mut by_click, &[KeyCode::Esc, KeyCode::Esc]);
-            assert!(by_click.launcher_unaimed);
+            assert!(by_click.launcher.launcher_unaimed);
             draw(&mut by_click);
             let chip = by_click
                 .hit_rect(&HitTarget::LauncherCardIssue(id.clone()))
@@ -9760,15 +9840,26 @@ mod tests {
             );
 
             let sent = click_at(&mut by_click, chip.x, chip.y);
-            assert!(by_click.overlay.is_none(), "{:?}", by_click.overlay);
-            assert_eq!(by_click.flash, by_key.flash);
+            assert!(
+                by_click.modals.overlay.is_none(),
+                "{:?}",
+                by_click.modals.overlay
+            );
+            assert_eq!(by_click.chrome.flash, by_key.chrome.flash);
             assert_eq!(
-                by_click.flash.as_deref(),
+                by_click.chrome.flash.as_deref(),
                 Some("opened github.com/o/demo/issues/15")
             );
-            assert!(!by_click.launcher_unaimed, "the cursor is back on the card");
+            assert!(
+                !by_click.launcher.launcher_unaimed,
+                "the cursor is back on the card"
+            );
             assert_eq!(by_click.selected_session().map(|a| a.id), Some(id));
-            assert_eq!(by_click.focus, Focus::Sessions, "the keys stay on the grid");
+            assert_eq!(
+                by_click.nav.focus,
+                Focus::Sessions,
+                "the keys stay on the grid"
+            );
             assert_eq!(
                 sent.iter()
                     .filter(|r| format!("{r:?}").contains("issues/15"))
@@ -10207,41 +10298,57 @@ mod tests {
             let mut by_click = two_sessions();
             draw(&mut by_click);
             let (x, y) = air(&by_click);
-            by_click.flash = None;
-            let was = by_click.sel_session;
+            by_click.chrome.flash = None;
+            let was = by_click.nav.sel_session;
             mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
             assert!(
-                !by_click.launcher_unaimed,
+                !by_click.launcher.launcher_unaimed,
                 "the click on the air let the card go"
             );
-            assert_eq!(by_click.flash, None, "and it said something about it");
-            assert_eq!(by_click.sel_session, was, "it moved the cursor");
-            assert_eq!(by_click.focus, Focus::Sessions, "the keys are the grid's");
+            assert_eq!(
+                by_click.chrome.flash, None,
+                "and it said something about it"
+            );
+            assert_eq!(by_click.nav.sel_session, was, "it moved the cursor");
+            assert_eq!(
+                by_click.nav.focus,
+                Focus::Sessions,
+                "the keys are the grid's"
+            );
 
             let mut by_key = two_sessions();
             draw(&mut by_key);
-            by_key.flash = None;
+            by_key.chrome.flash = None;
             key(&mut by_key, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(by_key.launcher_unaimed, "Esc lets the card go");
-            assert_eq!(by_key.flash.as_deref(), Some(super::UNAIMED));
+            assert!(by_key.launcher.launcher_unaimed, "Esc lets the card go");
+            assert_eq!(by_key.chrome.flash.as_deref(), Some(super::UNAIMED));
 
             // With the band open, Esc closes it first, and only the
             // second press lets the card go.
             let mut by_key = two_sessions();
             draw(&mut by_key);
             key(&mut by_key, KeyCode::Tab, KeyModifiers::NONE);
-            assert!(by_key.launcher_expanded.is_some(), "Tab opened the band");
-            by_key.flash = None;
+            assert!(
+                by_key.launcher.launcher_expanded.is_some(),
+                "Tab opened the band"
+            );
+            by_key.chrome.flash = None;
             key(&mut by_key, KeyCode::Esc, KeyModifiers::NONE);
             assert!(
-                by_key.launcher_expanded.is_none(),
+                by_key.launcher.launcher_expanded.is_none(),
                 "the first Esc closes the band"
             );
-            assert!(!by_key.launcher_unaimed, "with the band still aimed at");
-            assert_eq!(by_key.flash, None);
+            assert!(
+                !by_key.launcher.launcher_unaimed,
+                "with the band still aimed at"
+            );
+            assert_eq!(by_key.chrome.flash, None);
             key(&mut by_key, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(by_key.launcher_unaimed, "the second lets the card go");
-            assert_eq!(by_key.flash.as_deref(), Some(super::UNAIMED));
+            assert!(
+                by_key.launcher.launcher_unaimed,
+                "the second lets the card go"
+            );
+            assert_eq!(by_key.chrome.flash.as_deref(), Some(super::UNAIMED));
         });
     }
 
@@ -11714,7 +11821,7 @@ mod tests {
                 reading(&child),
                 Some(SessionRef::Terminal(TerminalId("t1".into())))
             );
-            assert_eq!(child.focus, Focus::Terminal);
+            assert_eq!(child.nav.focus, Focus::Terminal);
         });
     }
 
@@ -12122,11 +12229,11 @@ mod tests {
         seed_running(&mut back, "a3", "w2", "later");
         super::super::restore_ui_state(&mut back, &json);
         assert_eq!(
-            back.launcher_folded,
+            back.launcher.launcher_folded,
             [WorktreeId("w2".into())].into_iter().collect()
         );
         assert_eq!(
-            back.launcher_thread_open,
+            back.launcher.launcher_thread_open,
             [WorktreeId("w1".into())].into_iter().collect()
         );
 
@@ -12134,15 +12241,19 @@ mod tests {
         blob.as_object_mut().unwrap().remove("launcher_folded");
         blob.as_object_mut().unwrap().remove("launcher_thread_open");
         super::super::restore_ui_state(&mut back, &blob.to_string());
-        assert!(back.launcher_folded.is_empty());
-        assert!(back.launcher_thread_open.is_empty());
+        assert!(back.launcher.launcher_folded.is_empty());
+        assert!(back.launcher.launcher_thread_open.is_empty());
         draw_tall(&mut back);
         assert!(
-            back.launcher_folded.contains(&WorktreeId("w2".into())),
+            back.launcher
+                .launcher_folded
+                .contains(&WorktreeId("w2".into())),
             "feat starts collapsed"
         );
         assert!(
-            back.launcher_thread_open.contains(&WorktreeId("w1".into())),
+            back.launcher
+                .launcher_thread_open
+                .contains(&WorktreeId("w1".into())),
             "the selection starts open"
         );
     }

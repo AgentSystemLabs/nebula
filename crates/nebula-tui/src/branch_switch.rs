@@ -3261,7 +3261,7 @@ mod tests {
 
     #[test]
     fn a_wide_subject_never_pushes_the_tag_and_age_off_the_row() {
-        let th = App::new().theme;
+        let th = App::new().chrome.theme;
         let mut branch = remote("origin/修复-login");
         branch.subject =
             "✨ 修复登录重定向 ✨ 修复登录重定向 ✨ 修复登录重定向 ✨ 修复登录重定向".into();

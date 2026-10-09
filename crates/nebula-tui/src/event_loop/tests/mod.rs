@@ -762,7 +762,7 @@ fn the_editor_modal_takes_the_host_cursor_over_the_pane() {
     .unwrap();
     vim.kill();
     // Row 2, column 4 of the editor's grid.
-    vim.process(b"\x1b[3;5H");
+    vim.parser.process(b"\x1b[3;5H");
     app.pane.vim = Some(vim);
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
     draw_frame(&mut terminal, &mut app).unwrap();
@@ -913,9 +913,9 @@ fn ghostty_tab_is_silent_without_ghostty_or_over_ssh() {
     assert_eq!(app.chrome.flash, None, "no Ghostty.app: not a word");
 
     let mut empty = App::new();
-    empty.flash = None;
+    empty.chrome.flash = None;
     open_ghostty_tab_with(&mut empty, None);
-    assert_eq!(empty.flash, None, "nor a select-first nudge");
+    assert_eq!(empty.chrome.flash, None, "nor a select-first nudge");
 
     app.chrome.is_remote = true;
     open_ghostty_tab_with(&mut app, Some(GHOSTTY.into()));
@@ -3513,10 +3513,10 @@ fn the_diff_tree_survives_a_refresh_and_a_relaunch() {
     let mut next = App::new();
     seed_tree(&mut next);
     restore_ui_state(&mut next, &json);
-    assert!(next.diff_tree);
+    assert!(next.modals.diff_tree);
     // A blob from before the tree existed keeps the flat list.
     restore_ui_state(&mut next, "{\"show_archived\":false,\"collapsed\":false}");
-    assert!(!next.diff_tree);
+    assert!(!next.modals.diff_tree);
 }
 
 /// A diff `gh` couldn't fetch flashes and leaves the modal shut, and a
@@ -3794,12 +3794,17 @@ fn the_snapshot_prunes_cached_rows_the_tree_no_longer_has() {
     let p1 = nebula_core::ProjectId("p1".into());
     let gone_w = nebula_core::WorktreeId("w-gone".into());
     let gone_p = nebula_core::ProjectId("p-gone".into());
-    fresh.pull_requests.insert(w1.clone(), Some(cached_pr(7)));
     fresh
+        .github
+        .pull_requests
+        .insert(w1.clone(), Some(cached_pr(7)));
+    fresh
+        .github
         .pull_requests
         .insert(gone_w.clone(), Some(cached_pr(8)));
     let now = std::time::Instant::now();
     fresh
+        .github
         .pr_recheck
         .insert(gone_w.clone(), (now, PR_RECHECK_MIN));
     let open = |list| crate::app::OpenPrs {
@@ -3809,16 +3814,19 @@ fn the_snapshot_prunes_cached_rows_the_tree_no_longer_has() {
         step: OPEN_PRS_REFRESH,
     };
     fresh
+        .github
         .open_prs
         .insert(p1.clone(), open(vec![cached_open(9)]));
     fresh
+        .github
         .open_prs
         .insert(gone_p.clone(), open(vec![cached_open(10)]));
     for number in [7, 8, 9, 10] {
         fresh
+            .github
             .pr_detail
             .insert(pr_url(number), a_detail(number, "body", Vec::new()));
-        fresh.pr_detail_stale.insert(pr_url(number));
+        fresh.github.pr_detail_stale.insert(pr_url(number));
     }
 
     hse(
@@ -3833,16 +3841,16 @@ fn the_snapshot_prunes_cached_rows_the_tree_no_longer_has() {
             ui_state: None,
         },
     );
-    assert!(fresh.pull_requests.contains_key(&w1));
-    assert!(!fresh.pull_requests.contains_key(&gone_w));
-    assert!(!fresh.pr_recheck.contains_key(&gone_w));
-    assert!(fresh.open_prs.contains_key(&p1));
-    assert!(!fresh.open_prs.contains_key(&gone_p));
-    let mut kept: Vec<u64> = fresh.pr_detail.values().map(|d| d.number).collect();
+    assert!(fresh.github.pull_requests.contains_key(&w1));
+    assert!(!fresh.github.pull_requests.contains_key(&gone_w));
+    assert!(!fresh.github.pr_recheck.contains_key(&gone_w));
+    assert!(fresh.github.open_prs.contains_key(&p1));
+    assert!(!fresh.github.open_prs.contains_key(&gone_p));
+    let mut kept: Vec<u64> = fresh.github.pr_detail.values().map(|d| d.number).collect();
     kept.sort();
     assert_eq!(kept, [7, 9], "bodies follow their rows");
-    assert!(!fresh.pr_detail_stale.contains(&pr_url(8)));
-    assert!(fresh.pr_cache_dirty);
+    assert!(!fresh.github.pr_detail_stale.contains(&pr_url(8)));
+    assert!(fresh.github.pr_cache_dirty);
 }
 
 /// The background pass over the projects the cursor is not on: the
@@ -4754,11 +4762,14 @@ fn keepwarm_refires_for_selected_worktree_and_rearms() {
         );
 
         let mut empty = App::new();
-        empty.next_keepwarm = Some(std::time::Instant::now());
+        empty.requests.next_keepwarm = Some(std::time::Instant::now());
         out.clear();
         fire_keepwarm(&mut empty, &mut out);
         assert!(out.is_empty(), "nothing selected, nothing to keep warm");
-        assert!(empty.next_keepwarm.is_none(), "disarms without a worktree");
+        assert!(
+            empty.requests.next_keepwarm.is_none(),
+            "disarms without a worktree"
+        );
     })
 }
 
@@ -4790,7 +4801,7 @@ fn snapshot_arms_prewarm_for_selected_worktree() {
     seed_tree(&mut app);
     let tree = app.tree.clone();
     let mut fresh = App::new();
-    assert!(fresh.pending_prewarm.is_none());
+    assert!(fresh.requests.pending_prewarm.is_none());
     hse(
         &mut fresh,
         ServerEvent::Snapshot {
@@ -4803,7 +4814,11 @@ fn snapshot_arms_prewarm_for_selected_worktree() {
             ui_state: None,
         },
     );
-    let (armed, _) = fresh.pending_prewarm.clone().expect("prewarm armed");
+    let (armed, _) = fresh
+        .requests
+        .pending_prewarm
+        .clone()
+        .expect("prewarm armed");
     assert_eq!(armed, nebula_core::WorktreeId("w1".into()));
 }
 
@@ -4839,7 +4854,7 @@ fn snapshot_reattaches_the_remembered_session() {
             &mut out,
         );
     assert_eq!(
-        fresh.term.as_ref().map(|t| t.sref.clone()),
+        fresh.pane.term.as_ref().map(|t| t.sref.clone()),
         Some(a1.clone())
     );
     assert!(
@@ -4848,8 +4863,8 @@ fn snapshot_reattaches_the_remembered_session() {
         "expected an Attach for a1, got {out:?}"
     );
     // The cursor stays on the grid: this is a preview, not Enter.
-    assert_eq!(fresh.focus, Focus::Sessions);
-    assert!(!fresh.term_locked);
+    assert_eq!(fresh.nav.focus, Focus::Sessions);
+    assert!(!fresh.pane.term_locked);
 
     // No blob (first launch) or a blob whose session is gone: nothing
     // to bring back, so the pane stays blank rather than guessing.
@@ -8432,7 +8447,7 @@ fn archived_collapse_is_global_across_worktrees() {
     let mut restored = App::new();
     seed_tree(&mut restored);
     restore_ui_state(&mut restored, &json);
-    assert!(restored.show_archived);
+    assert!(restored.launcher.show_archived);
 }
 
 #[test]
@@ -9806,14 +9821,17 @@ fn ui_state_roundtrip_includes_the_issues_fold() {
 
     let mut restored = App::new();
     restore_ui_state(&mut restored, &json);
-    assert!(restored.issues_collapsed);
+    assert!(restored.launcher.issues_collapsed);
 
     let mut legacy = App::new();
     restore_ui_state(
         &mut legacy,
         r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false}"#,
     );
-    assert!(!legacy.issues_collapsed, "old blobs keep the group open");
+    assert!(
+        !legacy.launcher.issues_collapsed,
+        "old blobs keep the group open"
+    );
 }
 
 /// The fold is remembered like the ARCHIVED toggle: it rides the
@@ -9828,14 +9846,17 @@ fn ui_state_roundtrip_includes_the_open_prs_fold() {
 
     let mut restored = App::new();
     restore_ui_state(&mut restored, &json);
-    assert!(restored.open_prs_collapsed);
+    assert!(restored.launcher.open_prs_collapsed);
 
     let mut legacy = App::new();
     restore_ui_state(
         &mut legacy,
         r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false}"#,
     );
-    assert!(!legacy.open_prs_collapsed, "old blobs keep the group open");
+    assert!(
+        !legacy.launcher.open_prs_collapsed,
+        "old blobs keep the group open"
+    );
 }
 
 fn project(id: &str, name: &str, sort_order: i64) -> nebula_core::Entity {
@@ -13302,9 +13323,9 @@ fn rebinding_an_action_takes_effect_and_persists() {
         assert!(matches!(app.modals.overlay, Some(Overlay::Help(_))));
         // …and the old one no longer does.
         let mut fresh = App::new();
-        fresh.keymap = crate::config::Config::load().keymap();
+        fresh.chrome.keymap = crate::config::Config::load().keymap();
         press(&mut fresh, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
-        assert!(fresh.overlay.is_none(), "? is unbound now");
+        assert!(fresh.modals.overlay.is_none(), "? is unbound now");
     });
 }
 
@@ -20085,9 +20106,13 @@ fn a_context_menu_row_is_its_hotkey() {
             MenuAction::DeleteWorktree(WorktreeId("w1".into())),
             &mut out,
         );
-        assert!(by_menu.overlay.is_none(), "{:?}", by_menu.overlay);
+        assert!(
+            by_menu.modals.overlay.is_none(),
+            "{:?}",
+            by_menu.modals.overlay
+        );
         assert_eq!(
-            by_menu.flash.as_deref(),
+            by_menu.chrome.flash.as_deref(),
             Some("cannot delete the main checkout")
         );
 
@@ -20167,7 +20192,7 @@ fn a_click_into_the_pane_is_enter_on_it() {
             &mut mouse_out,
         );
         // The press arms a drag-selection, which a key has no part in.
-        by_mouse.term_selection = None;
+        by_mouse.pane.term_selection = None;
 
         assert!(
             mouse_out
@@ -20175,7 +20200,7 @@ fn a_click_into_the_pane_is_enter_on_it() {
                 .any(|r| matches!(r, ClientRequest::Attach { .. })),
             "the waiting attach goes out with the click: {mouse_out:?}"
         );
-        assert!(by_mouse.pending_attach.is_none());
+        assert!(by_mouse.pane.pending_attach.is_none());
         assert_eq!(
             ui_digest(&by_mouse, &mouse_out),
             ui_digest(&by_keys, &keys_out)
@@ -20230,7 +20255,7 @@ fn a_click_on_a_list_row_is_enter_on_it() {
                 // The palette opens with its cursor on the top
                 // session, under the project header drawn above it:
                 // walk up to the first row before counting down.
-                if let Some(Overlay::Palette(p)) = &by_keys.overlay {
+                if let Some(Overlay::Palette(p)) = &by_keys.modals.overlay {
                     for _ in 0..p.selected {
                         press(&mut by_keys, KeyCode::Up, KeyModifiers::NONE, &mut keys_out);
                     }
@@ -20296,11 +20321,11 @@ fn a_click_on_a_finder_row_is_enter_on_it() {
     click(&mut by_mouse, list.x + 1, list.y, &mut mouse_out);
 
     assert!(
-        matches!(&by_mouse.overlay, Some(Overlay::FileTabs(_))),
+        matches!(&by_mouse.modals.overlay, Some(Overlay::FileTabs(_))),
         "the reader, not the editor: {:?}",
-        by_mouse.overlay
+        by_mouse.modals.overlay
     );
-    assert!(by_mouse.vim.is_none());
+    assert!(by_mouse.pane.vim.is_none());
     assert_eq!(
         ui_digest(&by_mouse, &mouse_out),
         ui_digest(&by_keys, &keys_out)

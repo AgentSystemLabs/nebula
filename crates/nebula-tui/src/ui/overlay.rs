@@ -694,6 +694,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &mut App, view: crate::app::Setting
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_settings_body_lines(
     lines: &mut Vec<Line<'static>>,
     app: &App,
@@ -1003,7 +1004,7 @@ fn metrics_rows(
             sref: Some(m.session.clone()),
         });
     }
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.bytes));
     append_warm_spares(&mut rows, spares);
     rows.push(MetricsRow {
         name: "nebula daemon".into(),
@@ -1028,7 +1029,7 @@ fn append_warm_spares(rows: &mut Vec<MetricsRow>, mut spares: Vec<MetricsRow>) {
     if spares.is_empty() {
         return;
     }
-    spares.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    spares.sort_by_key(|row| std::cmp::Reverse(row.bytes));
     let count = spares.len();
     rows.push(MetricsRow {
         name: format!("warm spares ({count})"),

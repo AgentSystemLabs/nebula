@@ -2672,7 +2672,7 @@ mod tests {
         // No project at all arms nothing.
         let mut empty = App::new();
         schedule_prefetch(&mut empty);
-        assert!(empty.pending_issues_prefetch.is_none());
+        assert!(empty.github.pending_issues_prefetch.is_none());
         assert!(empty.issues_prefetch_delay().is_none());
     }
 
@@ -2857,7 +2857,7 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(editor(&empty).is_none());
-        assert_eq!(empty.flash.as_deref(), Some("no issue selected"));
+        assert_eq!(empty.chrome.flash.as_deref(), Some("no issue selected"));
     }
 
     /// Tab moves the caret between the two fields and ↑/↓ do too once
