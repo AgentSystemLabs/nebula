@@ -1096,6 +1096,7 @@ impl Daemon {
         self: &Arc<Self>,
         project_id: &ProjectId,
         raw_name: &str,
+        selections: &[nebula_core::WorkspaceCheckoutSelection],
     ) -> Result<(Worktree, Vec<nebula_core::WorkspaceRepository>)> {
         let name = raw_name.trim();
         validate_workspace_name(name).await?;
@@ -1124,12 +1125,77 @@ impl Daemon {
             bail!("workspace folder already exists: {}", folder.display());
         }
         let branch = format!("pilot/{name}");
+        let mut selected_by_repository = std::collections::HashMap::new();
+        for selection in selections {
+            let branch = match &selection.checkout {
+                nebula_core::WorkspaceCheckout::PullRequest { number, url, head } => {
+                    if *number == 0
+                        || !(url.starts_with("https://") || url.starts_with("http://"))
+                        || head.is_empty()
+                        || head.contains(['\\', '\0', '\n', '\r'])
+                    {
+                        bail!(
+                            "invalid pull request selection for repository `{}`",
+                            selection.repository
+                        );
+                    }
+                    head
+                }
+                nebula_core::WorkspaceCheckout::LocalBranch { branch } => branch,
+            };
+            let valid_branch = tokio::process::Command::new("git")
+                .args(["check-ref-format", "--branch", branch.as_str()])
+                .status()
+                .await
+                .is_ok_and(|status| status.success());
+            if !valid_branch {
+                bail!(
+                    "selection for repository `{}` has an invalid branch `{branch}`",
+                    selection.repository
+                );
+            }
+            if selected_by_repository
+                .insert(selection.repository.clone(), selection)
+                .is_some()
+            {
+                bail!(
+                    "repository `{}` has more than one pull request selected",
+                    selection.repository
+                );
+            }
+        }
+        for repository in selected_by_repository.keys() {
+            if !members.iter().any(|member| &member.name == repository) {
+                bail!("repository `{repository}` is not registered in this project");
+            }
+        }
         for member in &members {
+            if selected_by_repository
+                .get(&member.name)
+                .is_some_and(|selection| {
+                    matches!(
+                        selection.checkout,
+                        nebula_core::WorkspaceCheckout::PullRequest { .. }
+                    )
+                })
+            {
+                continue;
+            }
             let _ = git::refresh_origin(&member.path).await;
         }
         for member in &members {
-            if git::branch_exists(&member.path, &branch).await {
-                bail!("repository `{}` already has branch `{branch}`; delete the kept branch before reusing this workspace name", member.name);
+            let target_branch =
+                selected_by_repository
+                    .get(&member.name)
+                    .map_or(branch.as_str(), |selection| match &selection.checkout {
+                        nebula_core::WorkspaceCheckout::PullRequest { head, .. } => head,
+                        nebula_core::WorkspaceCheckout::LocalBranch { branch } => branch,
+                    });
+            if git::branch_checked_out(&member.path, target_branch).await
+                || (selected_by_repository.get(&member.name).is_none()
+                    && git::branch_exists(&member.path, target_branch).await)
+            {
+                bail!("repository `{}` already has branch `{target_branch}` checked out or reserved; choose another checkout", member.name);
             }
         }
 
@@ -1160,19 +1226,41 @@ impl Daemon {
         let config = crate::config::Config::load();
         for member in members {
             let destination = folder.join(&member.name);
-            let creation = match git::add_worktree_at(
-                &member.path,
-                &branch,
-                &destination,
-                config.worktree_base_branch().as_deref(),
-                true,
-            )
-            .await
-            {
+            let selection = selected_by_repository
+                .get(&member.name)
+                .map(|selection| &selection.checkout);
+            let created = match selection {
+                Some(nebula_core::WorkspaceCheckout::PullRequest { number, url, head }) => {
+                    git::add_pr_worktree_at(&member.path, *number, head, &destination)
+                        .await
+                        .map(|path| (path, Some(format!("PR #{number} · {url}")), true))
+                }
+                Some(nebula_core::WorkspaceCheckout::LocalBranch { branch }) => {
+                    git::add_local_branch_worktree_at(&member.path, branch, &destination)
+                        .await
+                        .map(|path| (path, Some(format!("local branch {branch}")), true))
+                }
+                None => git::add_worktree_at(
+                    &member.path,
+                    &branch,
+                    &destination,
+                    config.worktree_base_branch().as_deref(),
+                    true,
+                )
+                .await
+                .map(|creation| (creation.path, creation.base, creation.fetch_succeeded)),
+            };
+            let (path, base, fetch_succeeded) = match created {
                 Ok(creation) => creation,
                 Err(error) => {
-                    let message =
-                        format!("repository `{}`: create {branch}: {error:#}", member.name);
+                    let message = format!(
+                        "repository `{}`: create {}: {error:#}",
+                        member.name,
+                        selection.map_or(branch.as_str(), |selection| match selection {
+                            nebula_core::WorkspaceCheckout::PullRequest { head, .. } => head,
+                            nebula_core::WorkspaceCheckout::LocalBranch { branch } => branch,
+                        })
+                    );
                     let mut attempted = report.clone();
                     attempted.push(nebula_core::WorkspaceRepository {
                         id: WorktreeId::generate(),
@@ -1181,7 +1269,17 @@ impl Daemon {
                         base: None,
                         fetch_succeeded: false,
                         warning: None,
-                        branch: None,
+                        branch: Some(selection.map_or_else(
+                            || branch.clone(),
+                            |selection| match selection {
+                                nebula_core::WorkspaceCheckout::PullRequest { head, .. } => {
+                                    head.clone()
+                                }
+                                nebula_core::WorkspaceCheckout::LocalBranch { branch } => {
+                                    branch.clone()
+                                }
+                            },
+                        )),
                         changed_files: None,
                     });
                     let (leftovers, remaining) = self
@@ -1229,27 +1327,33 @@ impl Daemon {
             let root = Worktree {
                 id: WorktreeId::generate(),
                 project_id: project_id.clone(),
-                path: destination.clone(),
-                branch: branch.clone(),
+                path: path.clone(),
+                branch: selection.map_or_else(
+                    || branch.clone(),
+                    |selection| match selection {
+                        nebula_core::WorkspaceCheckout::PullRequest { head, .. } => head.clone(),
+                        nebula_core::WorkspaceCheckout::LocalBranch { branch } => branch.clone(),
+                    },
+                ),
                 is_main: false,
                 sort_order: 0,
             };
             let mut repository = nebula_core::WorkspaceRepository {
                 id: root.id.clone(),
                 name: member.name.clone(),
-                path: destination.clone(),
-                base: creation.base,
-                fetch_succeeded: creation.fetch_succeeded,
+                path: path.clone(),
+                base,
+                fetch_succeeded,
                 warning: None,
-                branch: Some(branch.clone()),
-                changed_files: git::changed_file_count(&destination).await.ok(),
+                branch: Some(root.branch.clone()),
+                changed_files: git::changed_file_count(&path).await.ok(),
             };
             // Persist the new member before running hooks, so a daemon
             // interruption during a slow hook can still diagnose and gate it.
             self.store.insert_workspace_repository(
                 &workspace.id,
                 project_id,
-                &branch,
+                &root.branch,
                 &repository,
             )?;
             report.push(repository.clone());
@@ -1258,8 +1362,8 @@ impl Daemon {
                 WorktreeHook::Create,
                 HookContext {
                     repo: &member.path,
-                    worktree: &destination,
-                    branch: &branch,
+                    worktree: &path,
+                    branch: &root.branch,
                     id: &root.id,
                 },
             )
@@ -1581,14 +1685,11 @@ impl Daemon {
             // Preflight proved this branch absent in every member before
             // creation started, so any matching ref is owned by this attempt,
             // including a git add that failed after creating its branch.
-            if git::branch_exists(&project_repo.path, &workspace.branch).await {
-                if let Err(error) = git::delete_branch(&project_repo.path, &workspace.branch).await
-                {
-                    leftovers.push(format!(
-                        "{} branch {}: {error:#}",
-                        repository.name, workspace.branch
-                    ));
-                    remaining.push(format!("{} branch {}", repository.name, workspace.branch));
+            let branch = repository.branch.as_deref().unwrap_or(&workspace.branch);
+            if git::branch_exists(&project_repo.path, branch).await {
+                if let Err(error) = git::delete_branch(&project_repo.path, branch).await {
+                    leftovers.push(format!("{} branch {}: {error:#}", repository.name, branch));
+                    remaining.push(format!("{} branch {}", repository.name, branch));
                     continue;
                 }
             }
@@ -5620,6 +5721,193 @@ mod tests {
                 token: String::new(),
             },
         )
+    }
+
+    async fn test_git_ok(dir: &Path, args: &[&str]) {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn creating_a_workspace_from_a_local_pr_branch_finishes_when_origin_is_slow() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let daemon = test_daemon();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("api");
+        std::fs::create_dir(&repo).unwrap();
+        crate::git::init(&repo).await.unwrap();
+        for (key, value) in [("user.email", "test@example.com"), ("user.name", "test")] {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", key, value])
+                .status()
+                .await
+                .unwrap();
+        }
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .status()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "feature/login"])
+            .status()
+            .await
+            .unwrap();
+
+        let slow_ssh = root.path().join("slow-ssh");
+        std::fs::write(&slow_ssh, "#!/bin/sh\nsleep 10\n").unwrap();
+        std::fs::set_permissions(&slow_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let slow_ssh = slow_ssh.to_string_lossy().into_owned();
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@example.invalid/repo.git",
+            ])
+            .status()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "core.sshCommand", &slow_ssh])
+            .status()
+            .await
+            .unwrap();
+
+        let project = Project {
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: root.path().into(),
+            sort_order: 0,
+        };
+        let repository = nebula_core::ProjectRepository {
+            project_id: project.id.clone(),
+            name: "api".into(),
+            path: repo,
+            branch: "main".into(),
+            changed_files: None,
+        };
+        daemon
+            .store
+            .insert_project_with_repositories(&project, &[repository])
+            .unwrap();
+        let selection = nebula_core::WorkspaceCheckoutSelection {
+            repository: "api".into(),
+            checkout: nebula_core::WorkspaceCheckout::PullRequest {
+                number: 7,
+                url: "https://github.com/example/api/pull/7".into(),
+                head: "feature/login".into(),
+            },
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            daemon.create_session_workspace(&project.id, "review-pr", &[selection]),
+        )
+        .await
+        .expect("the selected local PR branch must not keep the workspace creating")
+        .unwrap();
+
+        let workspace = daemon
+            .store
+            .session_workspace(&result.0.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.state, WorkspaceState::Ready);
+        assert_eq!(result.1[0].branch.as_deref(), Some("feature/login"));
+    }
+
+    #[tokio::test]
+    async fn creating_a_workspace_from_a_remote_only_pr_branch_finishes_ready() {
+        let daemon = test_daemon();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("api");
+        let origin = root.path().join("origin.git");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&origin).unwrap();
+        crate::git::init(&repo).await.unwrap();
+        test_git_ok(&repo, &["config", "user.email", "test@example.com"]).await;
+        test_git_ok(&repo, &["config", "user.name", "test"]).await;
+        test_git_ok(&repo, &["commit", "--allow-empty", "-m", "init"]).await;
+        test_git_ok(&origin, &["init", "--bare", "-b", "main"]).await;
+        let origin_url = origin.to_string_lossy().into_owned();
+        test_git_ok(&repo, &["remote", "add", "origin", &origin_url]).await;
+        test_git_ok(&repo, &["push", "-u", "origin", "main"]).await;
+        test_git_ok(&repo, &["checkout", "-b", "feature/login"]).await;
+        test_git_ok(&repo, &["commit", "--allow-empty", "-m", "login fix"]).await;
+        test_git_ok(&repo, &["push", "-u", "origin", "feature/login"]).await;
+        test_git_ok(&repo, &["checkout", "main"]).await;
+        test_git_ok(&repo, &["branch", "-D", "feature/login"]).await;
+
+        let project = Project {
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: root.path().into(),
+            sort_order: 0,
+        };
+        let repository = nebula_core::ProjectRepository {
+            project_id: project.id.clone(),
+            name: "api".into(),
+            path: repo.clone(),
+            branch: "main".into(),
+            changed_files: None,
+        };
+        daemon
+            .store
+            .insert_project_with_repositories(&project, &[repository])
+            .unwrap();
+        let selection = nebula_core::WorkspaceCheckoutSelection {
+            repository: "api".into(),
+            checkout: nebula_core::WorkspaceCheckout::PullRequest {
+                number: 7,
+                url: "https://github.com/example/api/pull/7".into(),
+                head: "feature/login".into(),
+            },
+        };
+
+        let (created, repositories) = tokio::time::timeout(
+            Duration::from_secs(5),
+            daemon.create_session_workspace(&project.id, "remote-pr", &[selection]),
+        )
+        .await
+        .expect("remote-only PR selection must not remain in creating")
+        .unwrap();
+
+        assert_eq!(
+            daemon
+                .store
+                .session_workspace(&created.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkspaceState::Ready
+        );
+        assert_eq!(repositories[0].branch.as_deref(), Some("feature/login"));
+        assert!(repositories[0].path.is_dir());
+        assert!(git::local_branch_exists(&repo, "feature/login").await);
     }
 
     #[test]

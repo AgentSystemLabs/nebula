@@ -91,47 +91,48 @@ pub(super) fn submit(
         }
         QuickTarget::NewSessionWorkspace { project, name } => {
             app.bring_tab_forward(&project);
-            let placeholder = WorktreeId::generate();
-            if let Some(project_row) = app
-                .tree
-                .projects
-                .iter()
-                .find(|row| row.id == project)
-                .cloned()
-            {
-                app.tree.worktrees.push(nebula_core::Worktree {
-                    id: placeholder.clone(),
-                    project_id: project_row.id.clone(),
-                    path: project_row.repo_path.join("worktrees").join(&name),
-                    branch: format!("pilot/{name}"),
-                    is_main: false,
-                    sort_order: i64::MAX,
-                });
-                app.tree
-                    .session_workspaces
-                    .push(nebula_core::SessionWorkspace {
-                        worktree_id: placeholder.clone(),
-                        name: name.clone(),
-                        state: nebula_core::WorkspaceState::Creating,
-                        failure: None,
-                        repositories: Vec::new(),
+            if app.workspace_pr_tx.is_none() {
+                let placeholder = WorktreeId::generate();
+                if let Some(project_row) = app.tree.projects.iter().find(|row| row.id == project) {
+                    app.tree.worktrees.push(nebula_core::Worktree {
+                        id: placeholder.clone(),
+                        project_id: project_row.id.clone(),
+                        path: project_row.repo_path.join("worktrees").join(&name),
+                        branch: format!("pilot/{name}"),
+                        is_main: false,
+                        sort_order: i64::MAX,
                     });
+                    app.tree
+                        .session_workspaces
+                        .push(nebula_core::SessionWorkspace {
+                            worktree_id: placeholder.clone(),
+                            name: name.clone(),
+                            state: nebula_core::WorkspaceState::Creating,
+                            failure: None,
+                            repositories: Vec::new(),
+                        });
+                }
+                send_with_follow(
+                    app,
+                    out,
+                    PendingIntent::CreateSessionWorkspaceAndLaunch {
+                        launch,
+                        text,
+                        focus: focus_pane,
+                        follow: !stay,
+                        placeholder,
+                    },
+                    !stay,
+                    |req_id| ClientRequest::CreateSessionWorkspace {
+                        req_id,
+                        project,
+                        name,
+                    },
+                );
+                return;
             }
-            send_with_follow(
-                app,
-                out,
-                PendingIntent::CreateSessionWorkspaceAndLaunch {
-                    launch,
-                    text,
-                    focus: focus_pane,
-                    placeholder,
-                },
-                !stay,
-                |req_id| ClientRequest::CreateSessionWorkspace {
-                    req_id,
-                    project,
-                    name,
-                },
+            crate::workspace_pr_picker::open_for_launch(
+                app, project, name, launch, text, focus_pane, !stay, out,
             );
         }
     }
@@ -539,7 +540,11 @@ mod tests {
                 app.tree.worktrees.iter().any(|w| w.branch == branch),
                 "the stand-in workspace is up"
             );
-            assert_eq!(app.tree.agents.len(), 2, "and its session");
+            assert_eq!(
+                app.tree.agents.len(),
+                1,
+                "workspace creation only; launch follows its acknowledgement"
+            );
             assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
             assert_eq!(cursor(&app), Some(AgentId("a1".into())));
             assert_eq!(pane(&app), card);

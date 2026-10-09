@@ -311,7 +311,28 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let daemon = daemon.clone();
                     let out_tx = out_tx.clone();
                     tokio::spawn(async move {
-                        match daemon.create_session_workspace(&project, &name).await {
+                        match daemon.create_session_workspace(&project, &name, &[]).await {
+                            Ok((workspace, repositories)) => {
+                                let _ = out_tx.send(ServerEvent::SessionWorkspaceCreated {
+                                    req_id,
+                                    workspace,
+                                    repositories,
+                                }).await;
+                            }
+                            Err(error) => {
+                                let _ = out_tx.send(ServerEvent::Error {
+                                    req_id: Some(req_id),
+                                    message: format!("{error:#}"),
+                                }).await;
+                            }
+                        }
+                    });
+                }
+                ClientRequest::CreateSessionWorkspaceWithSelections { req_id, project, name, selections } => {
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        match daemon.create_session_workspace(&project, &name, &selections).await {
                             Ok((workspace, repositories)) => {
                                 let _ = out_tx.send(ServerEvent::SessionWorkspaceCreated {
                                     req_id,

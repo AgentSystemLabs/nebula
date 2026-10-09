@@ -69,6 +69,32 @@ pub(super) fn stage_worktree(
     worktree
 }
 
+/// Put up the stand-in workspace row while the daemon creates the member
+/// checkouts. Its shape mirrors the ordinary workspace submission path.
+pub(super) fn stage_session_workspace(app: &mut App, project: ProjectId, name: &str) -> WorktreeId {
+    let id = WorktreeId::generate();
+    if let Some(project_row) = app.tree.projects.iter().find(|row| row.id == project) {
+        app.tree.worktrees.push(Worktree {
+            id: id.clone(),
+            project_id: project,
+            path: project_row.repo_path.join("worktrees").join(name),
+            branch: format!("pilot/{name}"),
+            is_main: false,
+            sort_order: i64::MAX,
+        });
+        app.tree
+            .session_workspaces
+            .push(nebula_core::SessionWorkspace {
+                worktree_id: id.clone(),
+                name: name.to_string(),
+                state: nebula_core::WorkspaceState::Creating,
+                failure: None,
+                repositories: Vec::new(),
+            });
+    }
+    id
+}
+
 /// The checkout row alone, under an id this client made, selecting
 /// nothing.
 fn push_worktree(app: &mut App, project: ProjectId, branch: String) -> WorktreeId {

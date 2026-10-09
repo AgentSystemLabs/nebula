@@ -37,6 +37,14 @@ mod optimistic;
 mod pacing;
 mod placeholder;
 mod quick_launch;
+
+pub(crate) fn stage_session_workspace_placeholder(
+    app: &mut App,
+    project: ProjectId,
+    name: &str,
+) -> WorktreeId {
+    placeholder::stage_session_workspace(app, project, name)
+}
 mod release_watch;
 use focus_walk::{
     double_tapped, enter_terminal_pane, land_click_focus, walk_focus_back, walk_focus_forward,
@@ -314,6 +322,9 @@ async fn main_loop(
         nebula_core::ProjectId,
         Option<Vec<crate::pull_request::OpenPr>>,
     )>();
+    let (workspace_pr_tx, mut workspace_pr_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::app::WorkspacePrAnswer>();
+    app.workspace_pr_tx = Some(workspace_pr_tx);
     // One pull request's body and conversation, for the preview pane.
     let (detail_tx, mut detail_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Option<crate::pull_request::PrDetail>)>();
@@ -626,6 +637,11 @@ async fn main_loop(
                 if let Some((project, list)) = answer {
                     note_open_prs_answer(&mut app, project, list, &mut out);
                     refresh_palette(&mut app);
+                }
+            }
+            answer = workspace_pr_rx.recv() => {
+                if let Some(answer) = answer {
+                    crate::workspace_pr_picker::land(&mut app, answer);
                 }
             }
             _ = tokio::time::sleep_until(next_update_check), if update_interval.is_some() => {
@@ -5872,6 +5888,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         Overlay::PullRequests(_) => crate::pr_modal::handle_key(app, key, out),
         Overlay::BranchSwitch(_) => crate::branch_switch::handle_key(app, key),
         Overlay::ProjectPicker(_) => launcher::handle_picker_key(app, key),
+        Overlay::WorkspacePrPicker(_) => crate::workspace_pr_picker::handle_key(app, key, out),
         Overlay::Menu(menu) => match key.code {
             // `?` (and `s` where no filter eats letters) on a row that
             // starts a session jumps to that harness's Agents section,
@@ -7116,44 +7133,42 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             }
             let focus = app.focus;
             app.bring_tab_forward(project);
-            let placeholder = WorktreeId::generate();
-            let project_row = app
-                .tree
-                .projects
-                .iter()
-                .find(|row| row.id == *project)
-                .cloned();
-            if let Some(project_row) = project_row {
-                app.tree.worktrees.push(nebula_core::Worktree {
-                    id: placeholder.clone(),
-                    project_id: project_row.id.clone(),
-                    path: project_row.repo_path.join("worktrees").join(&name),
-                    branch: format!("pilot/{name}"),
-                    is_main: false,
-                    sort_order: i64::MAX,
-                });
-                app.tree
-                    .session_workspaces
-                    .push(nebula_core::SessionWorkspace {
-                        worktree_id: placeholder.clone(),
-                        name: name.clone(),
-                        state: nebula_core::WorkspaceState::Creating,
-                        failure: None,
-                        repositories: Vec::new(),
+            if app.workspace_pr_tx.is_none() {
+                let placeholder = WorktreeId::generate();
+                if let Some(project_row) = app.tree.projects.iter().find(|row| row.id == *project) {
+                    app.tree.worktrees.push(nebula_core::Worktree {
+                        id: placeholder.clone(),
+                        project_id: project_row.id.clone(),
+                        path: project_row.repo_path.join("worktrees").join(&name),
+                        branch: format!("pilot/{name}"),
+                        is_main: false,
+                        sort_order: i64::MAX,
                     });
+                    app.tree
+                        .session_workspaces
+                        .push(nebula_core::SessionWorkspace {
+                            worktree_id: placeholder.clone(),
+                            name: name.clone(),
+                            state: nebula_core::WorkspaceState::Creating,
+                            failure: None,
+                            repositories: Vec::new(),
+                        });
+                }
+                let req_id = app.alloc_req_id(PendingIntent::CreateSessionWorkspace {
+                    project: project.clone(),
+                    name: name.clone(),
+                    focus,
+                    placeholder,
+                });
+                app.flash = Some(format!("creating session workspace {name}…"));
+                out.push(ClientRequest::CreateSessionWorkspace {
+                    req_id,
+                    project: project.clone(),
+                    name,
+                });
+                return;
             }
-            let req_id = app.alloc_req_id(PendingIntent::CreateSessionWorkspace {
-                project: project.clone(),
-                name: name.clone(),
-                focus,
-                placeholder,
-            });
-            app.flash = Some(format!("creating session workspace {name}…"));
-            out.push(ClientRequest::CreateSessionWorkspace {
-                req_id,
-                project: project.clone(),
-                name,
-            });
+            crate::workspace_pr_picker::open(app, project.clone(), name, focus, out);
         }
         PromptKind::ClaudeCloudTask {
             worktree,
@@ -10503,7 +10518,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     id: repository.id.clone(),
                     project_id: workspace.project_id.clone(),
                     path: repository.path.clone(),
-                    branch: workspace.branch.clone(),
+                    branch: repository
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| workspace.branch.clone()),
                     is_main: false,
                     sort_order: 0,
                 });
@@ -10521,6 +10539,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     launch,
                     text,
                     focus,
+                    follow: launch_follow,
                     ..
                 }) => {
                     app.tree
@@ -10540,7 +10559,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         launch,
                         text,
                         workspace.id,
-                        follow,
+                        follow && launch_follow,
                         focus,
                         out,
                     );
@@ -31561,6 +31580,25 @@ diff --git a/src/c.rs b/src/c.rs
                 Some("AgentPresets"),
             ),
             (
+                "WorkspacePrPicker",
+                |app| {
+                    app.overlay = Some(Overlay::WorkspacePrPicker(crate::app::WorkspacePrPicker {
+                        project: ProjectId("p1".into()),
+                        project_name: "project".into(),
+                        name: "feature".into(),
+                        focus: Focus::Sessions,
+                        repositories: vec![],
+                        loads: vec![],
+                        selected: vec![],
+                        repository_index: 0,
+                        option_index: 0,
+                        launch: None,
+                        area: ratatui::layout::Rect::default(),
+                    }));
+                },
+                None,
+            ),
+            (
                 // Owes the LAUNCHER VIEW's box back, as a picker opened from
                 // the QUICK PROMPT does.
                 "ProjectPicker",
@@ -31713,6 +31751,7 @@ diff --git a/src/c.rs b/src/c.rs
             Overlay::PullRequests(_) => "PullRequests",
             Overlay::BranchSwitch(_) => "BranchSwitch",
             Overlay::ProjectPicker(_) => "ProjectPicker",
+            Overlay::WorkspacePrPicker(_) => "WorkspacePrPicker",
         }
     }
 
@@ -31746,7 +31785,7 @@ diff --git a/src/c.rs b/src/c.rs
             assert_eq!(unique, seen, "two rows for the same variant");
             assert_eq!(
                 seen.len(),
-                17,
+                18,
                 "an available variant came or went: {seen:?}"
             );
         });

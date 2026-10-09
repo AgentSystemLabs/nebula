@@ -668,7 +668,7 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
-            params![repository.id.as_str(), project_id.as_str(), repository.path.to_string_lossy(), branch, now_ms()],
+            params![repository.id.as_str(), project_id.as_str(), repository.path.to_string_lossy(), repository.branch.as_deref().unwrap_or(branch), now_ms()],
         )?;
         tx.execute(
             "INSERT INTO workspace_repositories (worktree_id, id, name, path, base, fetch_succeeded, warning, branch, changed_files) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",

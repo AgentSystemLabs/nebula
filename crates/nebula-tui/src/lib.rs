@@ -47,6 +47,7 @@ pub mod ui;
 pub mod update_check;
 pub mod view_jobs;
 pub mod vim_term;
+pub mod workspace_pr_picker;
 
 use anyhow::Result;
 

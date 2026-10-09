@@ -2271,6 +2271,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         }
         Overlay::Issues(view) => crate::issues::draw(f, app, &view, th, false),
         Overlay::PullRequests(view) => crate::pr_modal::draw(f, app, &view, th, false),
+        Overlay::WorkspacePrPicker(view) => crate::workspace_pr_picker::draw(f, app, &view, th),
         Overlay::BranchSwitch(view) => crate::branch_switch::draw(f, app, &view, th),
         Overlay::FileTabs(mut view) => {
             // The TREE BROWSER's footprint: the editor Enter opens wants the

@@ -1917,6 +1917,35 @@ pub enum Overlay {
     BranchSwitch(crate::branch_switch::BranchSwitchView),
     /// `^P` in the LAUNCHER VIEW's box: the PROJECT PICKER.
     ProjectPicker(crate::launcher::ProjectPicker),
+    /// Per-repository pull-request choices before creating a session workspace.
+    WorkspacePrPicker(WorkspacePrPicker),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspacePrLoadState {
+    Loading,
+    Loaded {
+        prs: Vec<crate::pull_request::OpenPr>,
+        branches: Vec<String>,
+    },
+    Failed,
+}
+
+/// A PR-aware creation step. Each repository has its own optional selection;
+/// `None` explicitly means create from the configured base branch.
+#[derive(Debug, Clone)]
+pub struct WorkspacePrPicker {
+    pub project: ProjectId,
+    pub project_name: String,
+    pub name: String,
+    pub focus: Focus,
+    pub repositories: Vec<nebula_core::ProjectRepository>,
+    pub loads: Vec<WorkspacePrLoadState>,
+    pub selected: Vec<Option<nebula_core::WorkspaceCheckoutSelection>>,
+    pub repository_index: usize,
+    pub option_index: usize,
+    pub launch: Option<(crate::quick_prompt::QuickLaunch, String, bool, bool)>,
+    pub area: Rect,
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -2080,6 +2109,7 @@ pub enum PendingIntent {
         launch: crate::quick_prompt::QuickLaunch,
         text: String,
         focus: bool,
+        follow: bool,
         placeholder: WorktreeId,
     },
     /// The NEW WORKTREE modal's create. The stand-in row `placeholder`
@@ -3039,6 +3069,14 @@ pub struct OpenPrs {
     pub step: std::time::Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkspacePrAnswer {
+    pub project: ProjectId,
+    pub repository: String,
+    pub prs: Option<Vec<OpenPr>>,
+    pub branches: Option<Vec<String>>,
+}
+
 /// What a debounced pull-request detail fetch needs: which PR, and the
 /// checkout to run `gh` from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3738,6 +3776,8 @@ pub struct App {
     /// `couldn't refresh` rather than pass it off as current; the next
     /// answer that lands clears it.
     pub open_prs_failed: std::collections::HashSet<ProjectId>,
+    /// Results from per-repository PR enumeration for workspace creation.
+    pub workspace_pr_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkspacePrAnswer>>,
     /// Bodies and conversations of the pull requests the cursor has rested
     /// on, keyed by URL. A second API call on top of the list, so it is
     /// fetched only for the row actually being read and kept for the whole
@@ -4035,6 +4075,7 @@ impl App {
             open_prs: HashMap::new(),
             open_prs_inflight: std::collections::HashSet::new(),
             open_prs_failed: std::collections::HashSet::new(),
+            workspace_pr_tx: None,
             pr_detail: HashMap::new(),
             pr_detail_inflight: std::collections::HashSet::new(),
             pr_detail_failed: std::collections::HashSet::new(),

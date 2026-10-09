@@ -433,6 +433,11 @@ async fn add_worktree_inner_at(
 /// worktree lock, so a stalled connection must not hold every worktree op
 /// with it.
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Reusing an existing PR branch must remain quick when its remote is
+/// unavailable. A short refresh still keeps the common online path current.
+const LOCAL_PR_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+/// A PR branch fetch and, when needed, its PR-ref fallback share one budget.
+const PR_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The start point for a new branch when the caller named none: the
 /// remote's default branch, fetched first, so it is what `origin` has
@@ -494,6 +499,11 @@ async fn local_branch(repo: &Path, name: &str) -> bool {
         .is_ok()
 }
 
+/// Whether `repo` already has a local branch named `name`.
+pub async fn local_branch_exists(repo: &Path, name: &str) -> bool {
+    local_branch(repo, name).await
+}
+
 /// Whether either local or cached origin branch refs contain `name`.
 pub async fn branch_exists(repo: &Path, name: &str) -> bool {
     let local = format!("refs/heads/{name}");
@@ -512,6 +522,13 @@ pub async fn branch_exists(repo: &Path, name: &str) -> bool {
         refs.lines()
             .any(|reference| reference.ends_with(&format!("/{name}")))
     })
+}
+
+/// Whether a local branch is currently attached to any worktree in the repo.
+pub async fn branch_checked_out(repo: &Path, name: &str) -> bool {
+    list_worktrees(repo)
+        .await
+        .is_ok_and(|worktrees| worktrees.iter().any(|worktree| worktree.branch == name))
 }
 
 /// Delete a branch created by a failed grouped-workspace attempt. Callers
@@ -539,24 +556,90 @@ async fn fetch_origin(repo: &Path) -> Result<()> {
 /// connection or a credential prompt with no tty degrades to the local
 /// fallback instead of wedging the worktree lock.
 async fn git_remote(repo: &Path, args: &[&str]) -> Result<String> {
-    let run = Command::new("git")
+    git_remote_with_timeout(repo, args, REMOTE_TIMEOUT).await
+}
+
+/// The remote command with an explicit deadline. Run it in its own process
+/// group: timing out only the `git` parent can leave `ssh`/credential helpers
+/// alive with the pipes open, so `.output()` never finishes and workspace
+/// creation appears to hang forever.
+async fn git_remote_with_timeout(repo: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+    use std::process::Stdio;
+
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(args)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
         .kill_on_drop(true)
-        .output();
-    let output = match tokio::time::timeout(REMOTE_TIMEOUT, run).await {
+        .process_group(0);
+    let child = command.spawn().map_err(spawn_err)?;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow!("git remote command has no process id"))?;
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    let output = match tokio::time::timeout(timeout, &mut output).await {
         Ok(output) => output.map_err(spawn_err)?,
-        Err(_) => bail!(
-            "git {} did not finish within {}s",
-            args.join(" "),
-            REMOTE_TIMEOUT.as_secs()
-        ),
+        Err(_) => {
+            // `process_group(0)` gives git its own process group; signal all
+            // descendants as well as git so inherited output pipes close.
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = output.await;
+            bail!(
+                "git {} did not finish within {}s",
+                args.join(" "),
+                timeout.as_secs_f32()
+            );
+        }
     };
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Fetch a PR head branch, falling back to GitHub's PR ref when it is from a
+/// fork. Both attempts share one deadline, so a failed branch fetch cannot
+/// double the time the workspace spends in `creating`.
+async fn fetch_pr_tip(
+    repo: &Path,
+    number: u64,
+    head: &str,
+    timeout: Duration,
+) -> Result<(Option<String>, bool)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let pr_ref = format!("refs/pull/{number}/head");
+    let first_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match git_remote_with_timeout(repo, &["fetch", "origin", head], first_budget).await {
+        Ok(_) => Ok((
+            origin_branch(repo, head).await.or(fetched_tip(repo).await),
+            false,
+        )),
+        Err(branch_error) => {
+            let fallback_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if fallback_budget.is_zero() {
+                bail!(
+                    "could not fetch pull request #{number} ({head}) within {}s: {branch_error:#}",
+                    timeout.as_secs_f32()
+                );
+            }
+            match git_remote_with_timeout(repo, &["fetch", "origin", &pr_ref], fallback_budget)
+                .await
+            {
+                Ok(_) => Ok((fetched_tip(repo).await, true)),
+                Err(pr_error) => bail!(
+                    "could not fetch pull request #{number} ({head}): {pr_error:#} \
+                     (branch: {branch_error:#})"
+                ),
+            }
+        }
+    }
 }
 
 /// `origin/HEAD` as a short ref (`origin/main`). A repo whose remote was
@@ -590,12 +673,12 @@ async fn origin_head(repo: &Path) -> Option<String> {
 }
 
 /// Check pull request `number`'s head branch `head` out into a new worktree
-/// in the WORKTREE DIR layout — where every PR SESSION for it runs. Pure
-/// git, two routes: a same-repo PR's branch is fetched from `origin` and
-/// checked out tracking it (so a plain `git push` lands on the PR); a fork's
-/// branch is not on `origin`, so the PR ref itself (`refs/pull/N/head`)
-/// seeds a local branch of that name. A branch that already exists locally
-/// is checked out as is — `add_worktree`'s own fallback — even offline.
+/// in the WORKTREE DIR layout — where every PR SESSION for it runs. A local
+/// branch is immediately reusable, with a short best-effort refresh to keep
+/// it current without making creation wait on an unavailable remote. A
+/// remote-only same-repo PR branch is fetched from `origin` and checked out
+/// tracking it; a fork's branch is seeded from `refs/pull/N/head`. Remote
+/// fetches share a bounded timeout.
 ///
 /// A fork's `head` arrives under its owner's name (`givemeurhats/main` —
 /// the client's `checkout_branch`), so it is never a branch `origin` has,
@@ -607,6 +690,22 @@ async fn origin_head(repo: &Path) -> Option<String> {
 /// request, which a bare branch name never did for a fork — the
 /// checkout's own PR ROW, its merge and its unread count hang on that.
 pub async fn add_pr_worktree(repo: &Path, number: u64, head: &str) -> Result<PathBuf> {
+    let path = worktree_dir(repo, head);
+    add_pr_worktree_at(repo, number, head, &path).await
+}
+
+/// PR checkout at a caller-selected destination, used by multi-repository
+/// session workspaces. Fork refs are tracked via the PR ref. For a branch
+/// already local, refreshing and fast-forwarding are best-effort.
+pub async fn add_pr_worktree_at(
+    repo: &Path,
+    number: u64,
+    head: &str,
+    destination: &Path,
+) -> Result<PathBuf> {
+    if std::fs::symlink_metadata(destination).is_ok() {
+        bail!("worktree path already exists: {}", destination.display());
+    }
     let local = git(
         repo,
         &[
@@ -618,51 +717,82 @@ pub async fn add_pr_worktree(repo: &Path, number: u64, head: &str) -> Result<Pat
     )
     .await
     .is_ok();
+    // The user picked this existing branch deliberately. Reusing it should
+    // not wait for a network fetch: with a slow/offline origin, the old path
+    // could spend up to two remote timeouts before reaching this same
+    // checkout. A local selection is usable as-is; refresh is not required
+    // to make the requested worktree.
+    if local {
+        let pr_ref = format!("refs/pull/{number}/head");
+        let fetched = tokio::time::timeout(
+            LOCAL_PR_FETCH_TIMEOUT,
+            fetch_pr_tip(repo, number, head, LOCAL_PR_FETCH_TIMEOUT),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let destination_arg = destination.to_string_lossy().into_owned();
+        git(repo, &["worktree", "add", &destination_arg, head]).await?;
+        if let Some((tip, from_pr_ref)) = fetched {
+            if from_pr_ref {
+                track_pr_ref(repo, head, &pr_ref).await;
+            }
+            if let Some(tip) = tip {
+                if let Err(error) = git(destination, &["merge", "--ff-only", "--quiet", &tip]).await
+                {
+                    tracing::info!(
+                        branch = head,
+                        error = %error,
+                        "a pull request's existing branch was not fast-forwarded to its fetched tip"
+                    );
+                }
+            }
+        }
+        return Ok(destination.to_path_buf());
+    }
     // Both fetches talk to the remote under the DAEMON's worktree lock, so
     // they are bounded (`git_remote`): a stalled connection must not hold
     // every worktree op — and this launch's stand-in rows — with it.
     let pr_ref = format!("refs/pull/{number}/head");
-    let mut from_pr_ref = false;
-    let base = match git_remote(repo, &["fetch", "origin", head]).await {
-        // The remote-tracking ref when the clone keeps one, so the new
-        // branch tracks it; a single-branch clone's fetch writes only
-        // FETCH_HEAD, and the tip it names is the base then.
-        Ok(_) => match origin_branch(repo, head).await {
-            Some(remote) => Some(remote),
-            None => fetched_tip(repo).await,
-        },
-        Err(branch_err) => match git_remote(repo, &["fetch", "origin", &pr_ref]).await {
-            Ok(_) => {
-                from_pr_ref = true;
-                fetched_tip(repo).await
-            }
-            Err(_) if local => None,
-            Err(pr_err) => bail!(
-                "could not fetch pull request #{number} ({head}) from origin: {pr_err} \
-                 (branch: {branch_err})"
-            ),
-        },
-    };
-    let path = add_worktree(repo, head, base.as_deref()).await?;
+    let (base, from_pr_ref) = fetch_pr_tip(repo, number, head, PR_FETCH_TIMEOUT).await?;
+    let path = add_worktree_inner_at(
+        repo,
+        head,
+        destination,
+        base.as_deref(),
+        !from_pr_ref,
+        false,
+    )
+    .await?;
     if from_pr_ref {
         track_pr_ref(repo, head, &pr_ref).await;
     }
-    // A branch that was already here — this pull request reviewed before,
-    // its worktree deleted since (a delete keeps the branch) — came up as
-    // it was left, which is behind whatever the author pushed meanwhile:
-    // the session would review commits `gh pr diff` no longer shows. The
-    // checkout is seconds old and clean, so it fast-forwards to the
-    // fetched tip; a branch with commits of its own is left as it is.
-    if let (true, Some(tip)) = (local, base.as_deref()) {
-        if let Err(error) = git(&path, &["merge", "--ff-only", "--quiet", tip]).await {
-            tracing::info!(
-                branch = head,
-                error = %error,
-                "a pull request's existing branch was not fast-forwarded to its fetched tip"
-            );
-        }
-    }
     Ok(path)
+}
+
+/// Check out an existing local branch into a caller-selected worktree path.
+/// The caller must ensure the branch is not already attached to another
+/// worktree; Git remains the final guard against a concurrent checkout.
+pub async fn add_local_branch_worktree_at(
+    repo: &Path,
+    branch: &str,
+    destination: &Path,
+) -> Result<PathBuf> {
+    if std::fs::symlink_metadata(destination).is_ok() {
+        bail!("worktree path already exists: {}", destination.display());
+    }
+    if !local_branch(repo, branch).await {
+        bail!("local branch does not exist: {branch}");
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let destination = destination.to_string_lossy().into_owned();
+    git(repo, &["worktree", "add", &destination, branch]).await?;
+    Ok(PathBuf::from(destination))
 }
 
 /// The commit the fetch that just ran brought in, by SHA rather than as
@@ -855,6 +985,30 @@ mod tests {
     async fn changed_file_count_reports_a_missing_member_checkout_as_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(changed_file_count(&tmp.path().join("gone")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn existing_local_branch_can_be_checked_out_in_a_new_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        git(&repo, &["branch", "feature/login"]).await.unwrap();
+
+        let destination = tmp.path().join("worktrees").join("login");
+        let path = add_local_branch_worktree_at(&repo, "feature/login", &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(path, destination);
+        assert_eq!(
+            git(&path, &["branch", "--show-current"])
+                .await
+                .unwrap()
+                .trim(),
+            "feature/login"
+        );
+        assert!(branch_checked_out(&repo, "feature/login").await);
     }
 
     /// A rebase parks HEAD on the commits it replays, so for as long as it
@@ -1281,6 +1435,149 @@ mod tests {
             pushed.trim(),
             "what the pull request holds now"
         );
+    }
+
+    /// Choosing a PR whose branch is already local must not leave workspace
+    /// creation waiting on a stalled remote. The local checkout should be
+    /// usable while the remote is unavailable, and a fetch attempt is capped.
+    #[tokio::test]
+    async fn add_pr_worktree_uses_a_local_branch_when_the_remote_stalls() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        git(&repo, &["branch", "feat-x"]).await.unwrap();
+        let ssh = tmp.path().join("slow-ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nsleep 10\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = ssh.to_string_lossy().into_owned();
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@example.invalid/repo.git",
+            ],
+        )
+        .await
+        .unwrap();
+        git(&repo, &["config", "core.sshCommand", &ssh])
+            .await
+            .unwrap();
+
+        let destination = tmp.path().join("worktrees").join("feat-x");
+        let started = tokio::time::Instant::now();
+        let path = tokio::time::timeout(
+            Duration::from_secs(5),
+            add_pr_worktree_at(&repo, 7, "feat-x", &destination),
+        )
+        .await
+        .expect("a stalled remote must not hold the local PR checkout")
+        .unwrap();
+
+        assert_eq!(path, destination);
+        assert_eq!(
+            git(&path, &["branch", "--show-current"])
+                .await
+                .unwrap()
+                .trim(),
+            "feat-x"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A transport helper can spawn a child that inherits git's stdout/stderr.
+    /// Killing only git leaves those pipes open, so `wait_with_output` hangs
+    /// after its timeout. The whole process group must be reaped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_timeout_kills_helpers_that_inherit_git_output_pipes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let ssh = tmp.path().join("slow-ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nsleep 10 &\nwait\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = ssh.to_string_lossy().into_owned();
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@example.invalid/repo.git",
+            ],
+        )
+        .await
+        .unwrap();
+        git(&repo, &["config", "core.sshCommand", &ssh])
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            git_remote_with_timeout(&repo, &["fetch", "origin"], Duration::from_millis(100)),
+        )
+        .await
+        .expect("remote helper descendants must not keep output pipes open")
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("did not finish within"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_only_pr_fetch_fails_instead_of_waiting_on_a_stalled_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let ssh = tmp.path().join("slow-ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nsleep 10 &\nwait\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = ssh.to_string_lossy().into_owned();
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@example.invalid/repo.git",
+            ],
+        )
+        .await
+        .unwrap();
+        git(&repo, &["config", "core.sshCommand", &ssh])
+            .await
+            .unwrap();
+
+        let destination = tmp.path().join("worktrees").join("remote-pr");
+        let result = tokio::time::timeout(
+            PR_FETCH_TIMEOUT + Duration::from_secs(3),
+            add_pr_worktree_at(&repo, 7, "feature/remote-only", &destination),
+        )
+        .await
+        .expect("remote-only PR fetches must be bounded")
+        .unwrap_err();
+
+        assert!(
+            result.to_string().contains("did not finish within"),
+            "{result:#}"
+        );
+        assert!(!destination.exists());
     }
 
     /// A fork's pull request from its own `main`: the client names the

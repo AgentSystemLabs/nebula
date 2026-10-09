@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 50;
+pub const PROTOCOL_VERSION: u32 = 51;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -103,6 +103,15 @@ pub enum ClientRequest {
         req_id: u64,
         project: ProjectId,
         name: String,
+    },
+    /// Create a session workspace with one or more repository checkouts
+    /// based on selected pull requests or local branches. Unselected
+    /// repositories use the usual configured base branch.
+    CreateSessionWorkspaceWithSelections {
+        req_id: u64,
+        project: ProjectId,
+        name: String,
+        selections: Vec<WorkspaceCheckoutSelection>,
     },
     /// Close an entire session workspace after the daemon has verified that
     /// its repository worktrees and workspace folder contain no user data.
@@ -369,6 +378,26 @@ pub enum ClientRequest {
     },
 
     Shutdown,
+}
+
+/// A checkout selected for one registered repository while creating a
+/// multi-repository session workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceCheckoutSelection {
+    pub repository: String,
+    pub checkout: WorkspaceCheckout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceCheckout {
+    PullRequest {
+        number: u64,
+        url: String,
+        head: String,
+    },
+    LocalBranch {
+        branch: String,
+    },
 }
 
 /// How much of a pull request's conversation the user had already seen the
