@@ -870,7 +870,16 @@ mod tests {
             "kill waited {:?}",
             started.elapsed()
         );
-        let status = daemon.0.try_wait().unwrap().expect("daemon exited");
+        let status = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(status) = daemon.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "daemon exited");
+                tokio::time::sleep(POLL_STEP).await;
+            }
+        };
         assert_eq!(status.signal(), Some(SIGTERM), "{status:?}");
     }
 
