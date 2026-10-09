@@ -4,7 +4,7 @@ use super::*;
 
 pub(crate) fn open_follow_up(app: &mut App, id: AgentId, text: String) {
     open_prompt(app, PromptKind::FollowUp { id });
-    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+    if let Some(Overlay::Prompt(prompt)) = &mut app.modals.overlay {
         prompt.input = crate::text_input::TextInput::multiline_with_text(text);
     }
 }
@@ -220,7 +220,7 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
     if let Some(name) = highlight {
         dialog.hover = dialog.dirs.iter().position(|d| d.name == name);
     }
-    app.overlay = Some(Overlay::Prompt(dialog));
+    app.modals.overlay = Some(Overlay::Prompt(dialog));
 }
 
 pub(crate) fn repath_prefill(old_path: &std::path::Path) -> String {
@@ -240,16 +240,16 @@ pub(crate) fn repath_prefill(old_path: &std::path::Path) -> String {
 
 pub(crate) fn prompt_for_missing_project_path(app: &mut App, id: &ProjectId) -> bool {
     #[cfg(test)]
-    if !app.prompt_missing_project_paths {
+    if !app.launcher.prompt_missing_project_paths {
         return false;
     }
     let Some(project) = app.tree.projects.iter().find(|p| &p.id == id) else {
         return false;
     };
-    if project.repo_path.exists() || app.dismissed_repath_projects.contains(id) {
+    if project.repo_path.exists() || app.launcher.dismissed_repath_projects.contains(id) {
         return false;
     }
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+    app.modals.overlay = Some(Overlay::Confirm(ConfirmDialog {
         title: "Project folder not found".into(),
         message: format!(
             "The original directory for '{}' is no longer found:\n{}\n\nPoint this project to its new folder?",
@@ -262,7 +262,7 @@ pub(crate) fn prompt_for_missing_project_path(app: &mut App, id: &ProjectId) -> 
         },
         area: ratatui::layout::Rect::default(),
     }));
-    app.dirty = true;
+    app.chrome.dirty = true;
     true
 }
 
@@ -273,7 +273,7 @@ pub(crate) fn add_project_prefill(app: &App) -> String {
     let home = nebula_core::env::home_dir();
     let parent = app
         .launch_repo_name()
-        .and(app.launch_repo.as_deref())
+        .and(app.launcher.launch_repo.as_deref())
         .and_then(std::path::Path::parent);
     match (parent, home.as_deref()) {
         (Some(parent), Some(home)) => match parent.strip_prefix(home) {

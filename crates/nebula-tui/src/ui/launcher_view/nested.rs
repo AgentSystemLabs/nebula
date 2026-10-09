@@ -127,9 +127,9 @@ pub(super) fn draw_bands(
     cursor: Option<usize>,
     scroll: u16,
 ) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let window = panel.window();
-    let keys = app.focus != Focus::Terminal && app.launcher_tab_cursor.is_none();
+    let keys = app.nav.focus != Focus::Terminal && app.launcher.launcher_tab_cursor.is_none();
     for (index, band) in bands.iter().enumerate() {
         let pb = &panel.bands[index];
         let order = crate::launcher::thread_order(band);
@@ -146,13 +146,15 @@ pub(super) fn draw_bands(
             };
             if let Some(placed) = crate::launcher::place(window, scroll, row) {
                 draw_empty(f.buffer_mut(), app, placed.rect, band, on && keys);
-                app.hits.push((placed.rect, HitTarget::LauncherBand(index)));
+                app.chrome
+                    .hits
+                    .push((placed.rect, HitTarget::LauncherBand(index)));
             }
             continue;
         }
         let children = order.len() - 1;
         let merged = app.worktree_wears_merge(&band.worktree);
-        let merge_sweeps = merged && app.animations && app.merge_is_fresh(&band.worktree);
+        let merge_sweeps = merged && app.chrome.animations && app.merge_is_fresh(&band.worktree);
         for (n, &card_index) in order.iter().enumerate() {
             let Some(placed) = pb
                 .cell(card_index)
@@ -162,7 +164,7 @@ pub(super) fn draw_bands(
             };
             let child = n > 0;
             if !child && children > 0 {
-                app.hits.push((
+                app.chrome.hits.push((
                     Rect {
                         width: placed.rect.width.min(1),
                         ..placed.rect
@@ -191,10 +193,11 @@ pub(super) fn draw_bands(
                 &band.cards[card_index],
             );
             if let Some(rect) = pr_hit {
-                app.hits
+                app.chrome
+                    .hits
                     .push((rect, HitTarget::LauncherThreadPr(band.worktree.clone())));
             }
-            app.hits.push((
+            app.chrome.hits.push((
                 placed.rect,
                 HitTarget::LauncherCard(CardRef {
                     band: index,
@@ -204,13 +207,15 @@ pub(super) fn draw_bands(
         }
     }
     draw_panel_edge_marks(f, panel, scroll, th);
-    app.hits.push((g.area, HitTarget::PanelBg(Focus::Sessions)));
+    app.chrome
+        .hits
+        .push((g.area, HitTarget::PanelBg(Focus::Sessions)));
 }
 
 /// An empty worktree (**Show all worktrees**): one line, in the title
 /// column the roots use, saying what can be done there.
 fn draw_empty(buf: &mut Buffer, app: &App, r: Rect, band: &Band, lit: bool) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let mut text = String::from(EMPTY_BAND_HINT);
     if !band.is_main {
         text.push_str(EMPTY_BAND_DELETE);
@@ -315,7 +320,7 @@ fn fill_selected(buf: &mut Buffer, r: Rect, th: Theme) {
 /// and the dim age, both fixed width and right-aligned on every row.
 /// Returns where the `#42` landed, for its hit.
 fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Option<Rect> {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let width = usize::from(r.width);
     if width == 0 || r.height == 0 {
         return None;
@@ -378,7 +383,7 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         let fold = HitTarget::LauncherBandFold(row.band_index);
         let caret_fg = if row.selected && row.keys {
             th.accent
-        } else if app.hover_crumb.as_ref() == Some(&fold) {
+        } else if app.launcher.hover_crumb.as_ref() == Some(&fold) {
             gray::BRIGHT
         } else {
             gray::DIM
@@ -595,7 +600,7 @@ pub(super) fn draw_strip(
     bands: &[Band],
     cursor: Option<usize>,
 ) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(th.edge));
@@ -613,7 +618,9 @@ pub(super) fn draw_strip(
             Paragraph::new(Span::styled("nothing selected — j/k picks a row", dim)),
             inner,
         );
-        app.hits.push((area, HitTarget::PanelBg(Focus::Sessions)));
+        app.chrome
+            .hits
+            .push((area, HitTarget::PanelBg(Focus::Sessions)));
         return;
     };
     let card = crate::launcher::card_cursor(app, band).and_then(|i| band.cards.get(i));
@@ -700,8 +707,11 @@ pub(super) fn draw_strip(
     ];
     f.render_widget(Paragraph::new(lines), inner);
     if let Some(rect) = pr_hit.filter(|r| r.width > 0 && inner.height > 3) {
-        app.hits
+        app.chrome
+            .hits
             .push((rect, HitTarget::LauncherThreadPr(band.worktree.clone())));
     }
-    app.hits.push((area, HitTarget::PanelBg(Focus::Sessions)));
+    app.chrome
+        .hits
+        .push((area, HitTarget::PanelBg(Focus::Sessions)));
 }

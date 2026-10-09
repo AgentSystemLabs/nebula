@@ -18,9 +18,9 @@ use std::time::Duration;
 /// lock is a commitment to this session, so a debounced attach stops
 /// waiting: keystrokes are about to need it.
 pub(super) fn enter_terminal_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.focus = Focus::Terminal;
-    if app.term.as_ref().is_some_and(|t| !t.exited) {
-        app.term_locked = true;
+    app.nav.focus = Focus::Terminal;
+    if app.pane.term.as_ref().is_some_and(|t| !t.exited) {
+        app.pane.term_locked = true;
         fire_pending_attach(app, out);
     }
 }
@@ -50,8 +50,8 @@ pub(super) fn double_tapped(
         crate::key_combo::note_double_tap(app, chord, does);
         return true;
     }
-    app.edge_tap = Some((action, now));
-    app.flash = Some(format!("{} again: {does}", chord.display()));
+    app.chrome.edge_tap = Some((action, now));
+    app.chrome.flash = Some(format!("{} again: {does}", chord.display()));
     false
 }
 
@@ -63,9 +63,9 @@ pub(super) fn double_tapped(
 /// going to type at the agent, and the preview under the Sessions cursor
 /// is already the session they picked.
 pub(super) fn walk_focus_forward(app: &mut App, out: &mut Vec<ClientRequest>) {
-    match app.next_visible_focus(app.focus) {
+    match app.next_visible_focus(app.nav.focus) {
         Focus::Terminal => enter_terminal_pane(app, out),
-        next => app.focus = next,
+        next => app.nav.focus = next,
     }
 }
 
@@ -76,7 +76,7 @@ pub(super) fn walk_focus_forward(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// forever, with nothing to stop against. Forward is the way into the
 /// pane, and Ctrl+→ crosses into it without taking the input lock.
 pub(super) fn walk_focus_back(app: &mut App) {
-    app.focus = app.previous_visible_focus(app.focus);
+    app.nav.focus = app.previous_visible_focus(app.nav.focus);
 }
 
 /// Where the click that dismissed a modal lands: on the focus of whatever
@@ -102,8 +102,8 @@ pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut V
             | HitTarget::LauncherBandMore(_)
             | HitTarget::LauncherBandFold(_)
             | HitTarget::LauncherThreadPr(_),
-        ) => app.focus = Focus::Sessions,
-        Some(HitTarget::PanelBg(focus)) => app.focus = focus,
+        ) => app.nav.focus = Focus::Sessions,
+        Some(HitTarget::PanelBg(focus)) => app.nav.focus = focus,
         Some(HitTarget::TerminalPane | HitTarget::CloudSessionLink) => {
             enter_terminal_pane(app, out)
         }

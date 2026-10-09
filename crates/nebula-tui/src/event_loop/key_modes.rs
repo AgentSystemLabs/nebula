@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // The editor modal sits above every overlay: all keys forward to it —
     // vim needs Esc — except Ctrl+Q, the same hatch the terminal lock uses.
-    if app.vim.is_some() {
+    if app.pane.vim.is_some() {
         handle_vim_key(app, key);
         return;
     }
@@ -16,7 +16,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
     // typed filter or an open submenu peels first), and a click outside
     // needs a mouse; Ctrl+Q is the one press that always lands back on the
     // panels, the same promise it makes inside a LOCKED PANE.
-    if app.overlay.is_some() {
+    if app.modals.overlay.is_some() {
         let chord = crate::keymap::KeyChord::from_event(&key);
         if chord == HARDWIRED_UNLOCK {
             crate::key_combo::note(app, &[chord], Some("Force close"));
@@ -40,7 +40,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
     // letters, and `a` in a prompt must not archive the session being
     // prompted. Only the panel walk gets through (Tab / ⇧Tab), and Esc
     // folds the card back up.
-    if app.focus == Focus::Sessions && app.follow_up_live() && follow_up_key(app, key, out) {
+    if app.nav.focus == Focus::Sessions && app.follow_up_live() && follow_up_key(app, key, out) {
         return;
     }
 
@@ -56,7 +56,7 @@ fn handle_locked_pane_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequ
     // the escape hatches. Enter locks; an unlocked pane falls through to
     // the grid's keys, so the user always has a way back that isn't a
     // hatch.
-    if app.focus == Focus::Terminal && app.term.is_some() && app.term_locked {
+    if app.nav.focus == Focus::Terminal && app.pane.term.is_some() && app.pane.term_locked {
         // Ctrl+q is the primary hatch: a plain control byte (0x11) that
         // every emulator delivers — Terminal.app included, no kitty protocol
         // needed — unbound in macOS and unused by Claude Code. The inner
@@ -71,14 +71,17 @@ fn handle_locked_pane_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequ
         // a locked session would trap you in it with no way back.
         let chord = crate::keymap::KeyChord::from_event(&key);
         let is_hatch = chord == HARDWIRED_UNLOCK
-            || app.keymap.lookup(crate::keymap::Scope::Terminal, &chord)
+            || app
+                .chrome
+                .keymap
+                .lookup(crate::keymap::Scope::Terminal, &chord)
                 == Some(crate::keymap::Action::UnlockTerminal);
         // `^F` full-screens the pane under the cards and brings it back
         // down; in a full-screen session the hatches and the pane fold's
         // `^`` bring it back down too, rather than straight out to the
         // grid — the keys stay in the session, now in its pane.
         let zooms = toggles_full_screen(app, &chord)
-            || (app.collapsed && (is_hatch || folds_launcher_pane(app, &chord)));
+            || (app.pane.collapsed && (is_hatch || folds_launcher_pane(app, &chord)));
         if app.launcher_active() && zooms {
             let did = launcher::toggle_full_screen(app, out);
             crate::key_combo::note(app, &[chord], Some(did));
@@ -123,18 +126,18 @@ fn handle_locked_pane_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequ
             launcher::open_project_menu(app);
             return true;
         }
-        let exited = app.term.as_ref().is_some_and(|t| t.exited);
+        let exited = app.pane.term.as_ref().is_some_and(|t| t.exited);
         // A stand-in pane (QUICK PROMPT, checkout still being cut) has no
         // PTY behind it: the keystroke has nowhere to go until the real
         // session attaches, and must not land in the previous one.
         let stand_in = app.pane_shows_placeholder();
         if !exited {
-            if let Some(term) = &mut app.term {
+            if let Some(term) = &mut app.pane.term {
                 // Typing changes the content under a persisted selection
                 // highlight — drop it. Not one still being dragged: the
                 // button is down, and only its release ends that.
-                if !app.term_selection.is_some_and(|s| s.dragging) {
-                    app.term_selection = None;
+                if !app.pane.term_selection.is_some_and(|s| s.dragging) {
+                    app.pane.term_selection = None;
                 }
                 // Typing exits scroll mode (tmux behavior).
                 if term.scroll_offset() > 0 {
@@ -169,12 +172,12 @@ fn handle_preview_scroll_key(app: &mut App, key: KeyEvent) -> bool {
     // move a project, and ↑/↓ have to keep walking the list itself. From
     // either list that can rest on one; a focused pane keeps its keys for
     // the PTY.
-    if app.reading_url().is_some() && matches!(app.focus, Focus::Worktrees | Focus::Sessions) {
-        let page = app.term_area.height.max(1);
+    if app.reading_url().is_some() && matches!(app.nav.focus, Focus::Worktrees | Focus::Sessions) {
+        let page = app.pane.term_area.height.max(1);
         let max = app.pr_preview_max_scroll();
         let scrolled = match key.code {
-            KeyCode::PageDown => Some(app.pr_preview_scroll.saturating_add(page).min(max)),
-            KeyCode::PageUp => Some(app.pr_preview_scroll.saturating_sub(page)),
+            KeyCode::PageDown => Some(app.github.pr_preview_scroll.saturating_add(page).min(max)),
+            KeyCode::PageUp => Some(app.github.pr_preview_scroll.saturating_sub(page)),
             KeyCode::Home => Some(0),
             KeyCode::End => Some(max),
             _ => None,
@@ -190,8 +193,8 @@ fn handle_preview_scroll_key(app: &mut App, key: KeyEvent) -> bool {
                 &[crate::keymap::KeyChord::from_event(&key)],
                 Some(does),
             );
-            app.dirty |= app.pr_preview_scroll != to;
-            app.pr_preview_scroll = to;
+            app.chrome.dirty |= app.github.pr_preview_scroll != to;
+            app.github.pr_preview_scroll = to;
             return true;
         }
     }
@@ -206,8 +209,11 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
     // A double tap is two of the same key in a row: whatever else arrives
     // in between — bound or not — breaks it, so the arm is taken here and
     // only the edge arms below put one back.
-    let armed = app.edge_tap.take();
-    let action = app.keymap.lookup(crate::keymap::Scope::Global, &chord);
+    let armed = app.chrome.edge_tap.take();
+    let action = app
+        .chrome
+        .keymap
+        .lookup(crate::keymap::Scope::Global, &chord);
     // The KEY COMBO DISPLAY: the key and the label of what it fired — an
     // unbound key shows bare, so a watcher sees it did nothing. Noted
     // before the dispatch so a double tap's second press can restate the
@@ -222,9 +228,9 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
     // action, so the lookup above found nothing and the `else` below would
     // drop it.
     if action.is_none() && app.launcher_grid() && key.code == KeyCode::Esc {
-        if app.launcher_tab_cursor.is_some() {
+        if app.launcher.launcher_tab_cursor.is_some() {
             crate::key_combo::note(app, &[chord], Some("Back to the cards"));
-        } else if !app.launcher_unaimed {
+        } else if !app.launcher.launcher_unaimed {
             crate::key_combo::note(app, &[chord], Some("Unselect the card"));
         }
         launcher::escape(app);
@@ -237,7 +243,7 @@ fn handle_global_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
     // rows still selected under it, so only the keys that open a project,
     // or put up nothing but a modal, mean anything. The rest would walk or
     // attach rows nobody can see.
-    if app.projects_closed && !opens_from_closed_splash(action) {
+    if app.launcher.projects_closed && !opens_from_closed_splash(action) {
         return;
     }
     // The LAUNCHER VIEW's GRID takes the keys that walk it and open a
@@ -310,8 +316,8 @@ fn handle_navigation_action(
 ) {
     use crate::keymap::Action;
     match action {
-        Action::Quit => app.overlay = Some(Overlay::Confirm(confirm_quit())),
-        Action::Help => app.overlay = Some(Overlay::Help(HelpView::default())),
+        Action::Quit => app.modals.overlay = Some(Overlay::Confirm(confirm_quit())),
+        Action::Help => app.modals.overlay = Some(Overlay::Help(HelpView::default())),
         Action::Settings => open_settings(app),
         Action::Metrics => open_metrics(app, out),
         // Tab walks forward and stops dead at the terminal pane —
@@ -338,7 +344,7 @@ fn handle_navigation_action(
         Action::Issues => crate::issues::open_issues(app),
         Action::PullRequests => crate::pr_modal::open(app),
         Action::SwitchBranch => crate::branch_switch::open_branch_switch(app),
-        Action::FocusRight => match app.focus {
+        Action::FocusRight => match app.nav.focus {
             Focus::Sessions => {
                 if double_tapped(app, action, armed, &chord, "enter pane") {
                     walk_focus_forward(app, out);
@@ -347,7 +353,7 @@ fn handle_navigation_action(
             // Standing in the pane unlocked: l,l takes the lock, as Tab
             // does. A dead or empty pane has nothing to lock into.
             Focus::Terminal => {
-                let live = app.term.as_ref().is_some_and(|t| !t.exited);
+                let live = app.pane.term.as_ref().is_some_and(|t| !t.exited);
                 if live && double_tapped(app, action, armed, &chord, "type into terminal") {
                     walk_focus_forward(app, out);
                 }
@@ -361,7 +367,7 @@ fn handle_navigation_action(
         // where there are no cards to have a pane under.
         Action::ToggleLauncherPane if app.launcher_active() => launcher::toggle_pane(app),
         Action::ToggleLauncherPane => {
-            app.flash = Some("no cards to fold a pane under — add a project first".into())
+            app.chrome.flash = Some("no cards to fold a pane under — add a project first".into())
         }
         // Full-screen, and back down. The grid takes this key itself
         // (`launcher::handle_action`), as does a LOCKED PANE; it reaches
@@ -371,27 +377,27 @@ fn handle_navigation_action(
             launcher::toggle_full_screen(app, out);
         }
         Action::ToggleFullScreen => {
-            app.flash = Some("no session to full-screen — add a project first".into())
+            app.chrome.flash = Some("no session to full-screen — add a project first".into())
         }
         // The strip across the LAUNCHER PANE's header. The grid takes this
         // key itself (`launcher::handle_action`); it reaches here over a
         // full-screen session, which has no strip, and before the first
         // project, where there is no pane at all.
         Action::PaneTabs if app.launcher_active() => {
-            app.flash = Some(launcher::NO_PANE_HERE.into())
+            app.chrome.flash = Some(launcher::NO_PANE_HERE.into())
         }
-        Action::PaneTabs => app.flash = Some("no pane here — add a project first".into()),
+        Action::PaneTabs => app.chrome.flash = Some("no pane here — add a project first".into()),
         // The header's PROJECT TABS. The grid takes these keys itself
         // (`launcher::handle_action`); they reach here with a session
         // full-screen over it, where the header is not on screen.
         // Every tab closed: `+` drops the same PROJECT DROPDOWN the
         // header's `+` does.
-        Action::ProjectDropdown if app.projects_closed => launcher::open_project_menu(app),
+        Action::ProjectDropdown if app.launcher.projects_closed => launcher::open_project_menu(app),
         Action::NextProjectTab
         | Action::PrevProjectTab
         | Action::CloseProjectTab
         | Action::SelectProjectTab(_)
-        | Action::ProjectDropdown => app.flash = Some(launcher::NO_TABS_HERE.into()),
+        | Action::ProjectDropdown => app.chrome.flash = Some(launcher::NO_TABS_HERE.into()),
         Action::MoveDown => move_selection(app, 1, out),
         Action::MoveUp => move_selection(app, -1, out),
         // Ctrl+d / Ctrl+u jump the cursor half a panel at a time in the
@@ -405,7 +411,7 @@ fn handle_navigation_action(
         // ^u for itself, and Projects is short enough that the keys stay
         // unclaimed there.
         Action::HalfPageDown | Action::HalfPageUp => {
-            let page = match app.focus {
+            let page = match app.nav.focus {
                 Focus::Worktrees => app.worktrees_half_page() as i64,
                 Focus::Sessions => app.sessions_half_page() as i64,
                 _ => 0,
@@ -433,8 +439,8 @@ fn handle_create_or_rename_action(
         // The first-run SPLASH, started inside a git repo: Enter opens it —
         // the one-key way from a fresh install to a project.
         Action::Activate if app.splash_showing() => open_launch_repo(app, out),
-        Action::Activate => match app.focus {
-            Focus::Projects => app.focus = app.next_visible_focus(Focus::Projects),
+        Action::Activate => match app.nav.focus {
+            Focus::Projects => app.nav.focus = app.next_visible_focus(Focus::Projects),
             // An open-PR row leads out of nebula, so Enter hands it to the
             // browser and stays put; a checkout hands focus one column right.
             Focus::Worktrees => activate::worktrees_row(app, out),
@@ -452,7 +458,7 @@ fn handle_create_or_rename_action(
         // (With a project anywhere the GRID has this key — it is the box
         // — and only gets here full-screen over a session.)
         Action::New if !app.launcher_active() => open_prompt(app, PromptKind::AddProject),
-        Action::New => match app.focus {
+        Action::New => match app.nav.focus {
             Focus::Projects => open_prompt(app, PromptKind::AddProject),
             Focus::Worktrees => {
                 if app.selected_worktree_pr().is_some() {
@@ -470,7 +476,7 @@ fn handle_create_or_rename_action(
             }
             Focus::Terminal => {}
         },
-        Action::Rename => match app.focus {
+        Action::Rename => match app.nav.focus {
             Focus::Sessions => match app.selected_session_row() {
                 Some(SessionRow::Agent(a)) => {
                     open_prompt(app, PromptKind::RenameAgent { id: a.id })
@@ -521,37 +527,38 @@ fn handle_session_state_action(
         // has, so it is not scoped to a row.
         Action::RefreshPullRequests => refresh_pull_requests(app),
         Action::Archive => {
-            if app.focus == Focus::Sessions {
+            if app.nav.focus == Focus::Sessions {
                 match app.selected_session_row() {
                     Some(SessionRow::Agent(a)) if !a.archived => {
                         // With the confirm off, one card per press of
                         // `a`, however long it is held.
                         if archive_agent(app, a.id, out) {
                             release_watch::arm(
-                                &mut app.release_watch,
+                                &mut app.chrome.release_watch,
                                 chord,
                                 std::time::Instant::now(),
                             );
                         }
                     }
                     Some(SessionRow::Terminal(_)) => {
-                        app.flash = Some("terminals can't be archived — d closes them".into());
+                        app.chrome.flash =
+                            Some("terminals can't be archived — d closes them".into());
                     }
                     Some(SessionRow::Link(_)) => {
-                        app.flash = Some("links can't be archived — d deletes them".into());
+                        app.chrome.flash = Some("links can't be archived — d deletes them".into());
                     }
                     _ => {}
                 }
             }
         }
         Action::Unarchive => {
-            if app.focus == Focus::Sessions {
+            if app.nav.focus == Focus::Sessions {
                 if let Some(a) = app.selected_session() {
                     if a.archived {
                         activate::unarchive(app, a.id, out);
                         // One card per press of `u`, however long it is held.
                         release_watch::arm(
-                            &mut app.release_watch,
+                            &mut app.chrome.release_watch,
                             chord,
                             std::time::Instant::now(),
                         );
@@ -563,19 +570,19 @@ fn handle_session_state_action(
         // reaches here from the menu and with a session full-screen over
         // the view, where there are no cards to swap.
         Action::ToggleArchived => {
-            if app.focus == Focus::Sessions {
+            if app.nav.focus == Focus::Sessions {
                 toggle_archived(app, out);
             }
         }
         // Fuzzy-search palette over every project / worktree / session.
         // The config read is per-open so edits apply without restarting.
         Action::Palette => {
-            if app.focus != Focus::Terminal {
-                app.overlay = Some(Overlay::Palette(Palette::new(
+            if app.nav.focus != Focus::Terminal {
+                app.modals.overlay = Some(Overlay::Palette(Palette::new(
                     &app.tree,
                     crate::config::Config::load().palette_enter_attaches,
-                    &app.open_prs,
-                    app.hide_draft_prs,
+                    &app.github.open_prs,
+                    app.launcher.hide_draft_prs,
                 )));
             }
         }
@@ -599,7 +606,7 @@ fn handle_session_state_action(
         // or fold it back up. Sessions only — the other panels have no
         // card to expand, and Space stays unbound there.
         Action::FollowUp => {
-            if app.focus == Focus::Sessions {
+            if app.nav.focus == Focus::Sessions {
                 activate::follow_up(app);
             }
         }

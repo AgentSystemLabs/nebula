@@ -162,7 +162,7 @@ pub(crate) fn held_return(overlay: &Overlay) -> Option<QuickReturn> {
 /// box comes back on its own rather than raising it again.
 pub(crate) fn restack(app: &App, launch: &mut QuickLaunch) {
     if launch.under.is_some() {
-        launch.under = ModalUnder::of(app.overlay.as_ref());
+        launch.under = ModalUnder::of(app.modals.overlay.as_ref());
     }
 }
 
@@ -246,7 +246,7 @@ pub(crate) fn draft_of_return(back: &QuickReturn) -> Option<QuickDraft> {
 /// way the slot is emptied: the draft is in this box now, and clearing it
 /// here and pressing Esc is how it is thrown away.
 pub(crate) fn open_box(app: &mut App, launch: QuickLaunch) {
-    let (launch, restored) = match app.quick_draft.take() {
+    let (launch, restored) = match app.modals.quick_draft.take() {
         // What the box stands on is where it is opened now, never where
         // the parked one was.
         Some(draft) if draft.launch.aimed_like(&launch) => (
@@ -260,7 +260,7 @@ pub(crate) fn open_box(app: &mut App, launch: QuickLaunch) {
         None => (launch, None),
     };
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
-    if let (Some(input), Some(Overlay::Prompt(prompt))) = (restored, &mut app.overlay) {
+    if let (Some(input), Some(Overlay::Prompt(prompt))) = (restored, &mut app.modals.overlay) {
         prompt.input = input;
     }
 }
@@ -272,9 +272,9 @@ pub(crate) fn open_box(app: &mut App, launch: QuickLaunch) {
 /// overrides it the way [`open_box`]'s same-aim rule would; the slot is
 /// emptied all the same, the text being in this box now.
 pub(crate) fn open_picked_box(app: &mut App, launch: QuickLaunch) {
-    let restored = app.quick_draft.take().map(|draft| draft.input);
+    let restored = app.modals.quick_draft.take().map(|draft| draft.input);
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
-    if let (Some(input), Some(Overlay::Prompt(prompt))) = (restored, &mut app.overlay) {
+    if let (Some(input), Some(Overlay::Prompt(prompt))) = (restored, &mut app.modals.overlay) {
         prompt.input = input;
     }
 }
@@ -552,9 +552,9 @@ pub(crate) fn open_quick_prompt(app: &mut App) {
         crate::issues::open_prompt_for_row(app);
         return;
     }
-    if app.focus == Focus::Worktrees {
+    if app.nav.focus == Focus::Worktrees {
         let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
-            app.flash = Some("quick prompt: select a project first".into());
+            app.chrome.flash = Some("quick prompt: select a project first".into());
             return;
         };
         let branch = crate::branch_name::random_name(&app.project_branches(&project));
@@ -562,13 +562,13 @@ pub(crate) fn open_quick_prompt(app: &mut App) {
         return;
     }
     let Some(worktree) = app.selected_worktree().map(|w| w.id.clone()) else {
-        app.flash = Some("quick prompt: select a worktree first".into());
+        app.chrome.flash = Some("quick prompt: select a worktree first".into());
         return;
     };
     // The stand-in a previous `p` put up: git is still cutting it, and
     // the box would only be refused at Enter.
     if app.is_placeholder_worktree(&worktree) {
-        app.flash = Some("quick prompt: worktree is still being created".into());
+        app.chrome.flash = Some("quick prompt: worktree is still being created".into());
         return;
     }
     open_for(app, QuickTarget::Worktree(worktree));
@@ -604,10 +604,10 @@ pub(crate) fn open_pr_box(app: &mut App, launch: QuickLaunch) {
     // The text of a launch the DAEMON refused while another modal was up
     // (`App::parked_pr_prompt`): this box is where it was headed.
     let url = launch.pr.as_ref().map(|pr| pr.url.clone());
-    let parked = match app.parked_pr_prompt.take() {
+    let parked = match app.modals.parked_pr_prompt.take() {
         Some((for_url, text)) if Some(&for_url) == url.as_ref() => Some(text),
         other => {
-            app.parked_pr_prompt = other;
+            app.modals.parked_pr_prompt = other;
             None
         }
     };
@@ -640,7 +640,7 @@ pub(crate) fn pr_launch_for(
     pr: &OpenPr,
 ) -> Option<QuickLaunch> {
     let Some(root) = app.root_worktree(project) else {
-        app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
+        app.chrome.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
         return None;
     };
     Some(
@@ -667,7 +667,7 @@ pub(crate) fn picker_context(app: &App, launch: &QuickLaunch) -> Option<Worktree
 /// either way; that is the whole point of the round trip.
 pub(crate) fn reopen(app: &mut App, launch: QuickLaunch, text: &str) {
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
-    if let Some(crate::app::Overlay::Prompt(prompt)) = &mut app.overlay {
+    if let Some(crate::app::Overlay::Prompt(prompt)) = &mut app.modals.overlay {
         prompt.input.insert_str(text);
     }
 }
@@ -701,7 +701,7 @@ pub(crate) fn backdrop_box(back: &QuickReturn) -> PromptDialog {
 /// typed text and the caret exactly where they were.
 pub(crate) fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
     if launch.pr.is_some() {
-        app.flash =
+        app.chrome.flash =
             Some("quick prompt: a PR session runs in the pull request's own checkout".into());
         return;
     }
@@ -734,11 +734,11 @@ pub(crate) fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: Tex
         },
     };
     match target {
-        Err(msg) => app.flash = Some(msg.into()),
+        Err(msg) => app.chrome.flash = Some(msg.into()),
         Ok(target) => {
             let launch = QuickLaunch { target, ..launch };
             crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
-            if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+            if let Some(Overlay::Prompt(prompt)) = &mut app.modals.overlay {
                 prompt.input = input;
             }
         }
@@ -767,7 +767,7 @@ pub(crate) fn target_branch(app: &App, launch: &QuickLaunch) -> Option<String> {
 /// (a launch spec has one source).
 pub(crate) fn open_launch_picker(app: &mut App, back: QuickReturn) {
     let Some(context) = picker_context(app, &back.launch) else {
-        app.flash = Some("project no longer exists".into());
+        app.chrome.flash = Some("project no longer exists".into());
         return;
     };
     crate::agent_picker::open_kind_picker(
@@ -791,13 +791,13 @@ pub(crate) fn open_preset_picker(app: &mut App, back: QuickReturn) {
         .and_then(|p| presets.iter().position(|row| row.name == p.name))
         .unwrap_or(0);
     let Some(context) = picker_context(app, &back.launch) else {
-        app.flash = Some("project no longer exists".into());
+        app.chrome.flash = Some("project no longer exists".into());
         return;
     };
     let mut view = crate::preset_overlays::AgentPresetsView::new(context, presets);
     view.selected = selected;
     view.quick = Some(back);
-    app.overlay = Some(Overlay::AgentPresets(view));
+    app.modals.overlay = Some(Overlay::AgentPresets(view));
 }
 
 /// `e` on a PROJECT OPEN PRS GROUP row: the saved AGENT PRESETS as a

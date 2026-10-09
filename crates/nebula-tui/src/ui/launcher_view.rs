@@ -60,7 +60,7 @@ const ADD_EMPTY: &str = "+ open a project";
 /// lot instead (`event_loop::launcher::open_session`, the `collapsed` arm
 /// of `ui::draw`).
 pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
-    app.body_area = body;
+    app.chrome.body_area = body;
     app.settle_launcher_focus();
     // The project the grid is on gets its tab, whichever way it was
     // opened, before the header lays the tabs out.
@@ -74,7 +74,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     // air over it: the list scrolls in what is left, and the keys walk
     // the same list (`App::body_area`).
     let (body, strip) = nested_strip_split(app, body, &bands);
-    app.body_area = body;
+    app.chrome.body_area = body;
     let g = crate::launcher::bands_layout(body);
     let cursor = wearing(app, crate::launcher::band_cursor(app, &bands));
     let count = HeadCount::of(&bands);
@@ -83,7 +83,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
         // Nothing archived is not nothing at all: the hero's "type a
         // task" would be advice about the wrong list, so the ARCHIVED
         // VIEW gets the plain empty line and the way back out of it.
-        if app.show_archived {
+        if app.launcher.show_archived {
             draw_list_empty(f, app, g.area, NO_ARCHIVED);
         } else {
             draw_empty(f, app, g.area);
@@ -102,7 +102,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
     let panel = app.panel_layout(&bands);
     let scroll = settle_panel_scroll(app, &panel, &bands, cursor);
     draw_head(f, app, body, count, panel.hidden(scroll));
-    if app.launcher_nested {
+    if app.launcher.launcher_nested {
         nested::draw_bands(f, app, &g, &panel, &bands, cursor, scroll);
         if let Some(strip) = strip {
             nested::draw_strip(f, app, strip, &bands, cursor);
@@ -128,7 +128,10 @@ fn nested_strip_split(
 ) -> (Rect, Option<Rect>) {
     use crate::launcher::{HEAD_H, PAD_X};
     let taken = nested::STRIP_H + 1;
-    if !app.launcher_nested || bands.is_empty() || body.height < HEAD_H + taken + STRIP_MIN_LIST {
+    if !app.launcher.launcher_nested
+        || bands.is_empty()
+        || body.height < HEAD_H + taken + STRIP_MIN_LIST
+    {
         return (body, None);
     }
     let strip = Rect {
@@ -164,24 +167,27 @@ fn settle_panel_scroll(
     bands: &[crate::launcher::Band],
     cursor: Option<usize>,
 ) -> u16 {
-    if app.launcher_scroll_in != app.launcher_expanded {
-        app.launcher_scroll = 0;
-        app.launcher_scroll_held = false;
-        app.launcher_scroll_in = app.launcher_expanded.clone();
+    if app.launcher.launcher_scroll_in != app.launcher.launcher_expanded {
+        app.launcher.launcher_scroll = 0;
+        app.launcher.launcher_scroll_held = false;
+        app.launcher.launcher_scroll_in = app.launcher.launcher_expanded.clone();
     }
-    let mut scroll = panel.clamp(app.launcher_scroll);
+    let mut scroll = panel.clamp(app.launcher.launcher_scroll);
     if let Some(index) = cursor {
         let band = &bands[index];
         let at = crate::launcher::card_cursor(app, band);
         let on = at.and_then(|i| band.cards.get(i)).map(|c| c.sref());
-        if app.launcher_reveal || !app.launcher_scroll_held || app.launcher_scroll_on != on {
+        if app.launcher.launcher_reveal
+            || !app.launcher.launcher_scroll_held
+            || app.launcher.launcher_scroll_on != on
+        {
             scroll = panel.reveal(scroll, index, at);
-            app.launcher_scroll_held = false;
-            app.launcher_scroll_on = on;
+            app.launcher.launcher_scroll_held = false;
+            app.launcher.launcher_scroll_on = on;
         }
     }
-    app.launcher_reveal = false;
-    app.launcher_scroll = scroll;
+    app.launcher.launcher_reveal = false;
+    app.launcher.launcher_scroll = scroll;
     scroll
 }
 
@@ -215,7 +221,7 @@ const NO_ARCHIVED: &str = "nothing archived in this project — ⇧A back to the
 /// time — so a narrow window, or the PANE down the right of the cards,
 /// costs the counts before it costs a project's name.
 fn draw_head(f: &mut Frame, app: &mut App, body: Rect, count: HeadCount, hidden: Hidden) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     if let Some(r) = row_rect(body, 1) {
         let r = pad_x(r);
         let tabs = head_tabs(app, r);
@@ -232,7 +238,7 @@ fn draw_head(f: &mut Frame, app: &mut App, body: Rect, count: HeadCount, hidden:
         for (span, hit) in right {
             let width = span.width() as u16;
             if let Some(hit) = hit {
-                app.hits.push((Rect { x, width, ..r }, hit));
+                app.chrome.hits.push((Rect { x, width, ..r }, hit));
             }
             x += width;
             spans.push(span);
@@ -286,9 +292,9 @@ fn draw_head(f: &mut Frame, app: &mut App, body: Rect, count: HeadCount, hidden:
 /// is always drawn, whole wherever there is room for it, so the header
 /// always says which project the grid is on.
 fn head_tabs(app: &mut App, r: Rect) -> Vec<Span<'static>> {
-    let th = app.theme;
-    let hover = app.hover_crumb.clone();
-    let sweep = app.animations.then(|| app.sweep_phase());
+    let th = app.chrome.theme;
+    let hover = app.launcher.hover_crumb.clone();
+    let sweep = app.chrome.animations.then(|| app.sweep_phase());
     let tabs = crate::launcher::project_tabs(app);
     let room = r.width as usize;
     let add = if tabs.is_empty() { ADD_EMPTY } else { ADD };
@@ -316,7 +322,7 @@ fn head_tabs(app: &mut App, r: Rect) -> Vec<Span<'static>> {
     let fit = fit_tabs(&sizes, lit, budget, |more| {
         more_chip(more.len(), tally_of(&tabs, more), false, None, th).width()
     });
-    app.launcher_tabs_more = fit.more.iter().map(|&i| tabs[i].id.clone()).collect();
+    app.launcher.launcher_tabs_more = fit.more.iter().map(|&i| tabs[i].id.clone()).collect();
 
     // The `+` leads the row, on the side a project it opens lands on: a
     // button after the last tab would read as appending one there.
@@ -373,7 +379,7 @@ fn head_tabs(app: &mut App, r: Rect) -> Vec<Span<'static>> {
     for tab in row {
         let width = u16::try_from(tab.width()).unwrap_or(u16::MAX);
         if let Some(hit) = tab.hit {
-            app.hits.push((
+            app.chrome.hits.push((
                 Rect {
                     x,
                     width,
@@ -695,7 +701,7 @@ fn head_count(
                 // Nothing about a word says it is a button, so the one
                 // under the pointer is underlined, as the header's tabs
                 // are.
-                if hit.is_some() && app.hover_crumb == hit {
+                if hit.is_some() && app.launcher.hover_crumb == hit {
                     style = style.add_modifier(Modifier::UNDERLINED);
                 }
                 (Span::styled(text, style), hit)
@@ -737,7 +743,7 @@ fn head_count(
 /// none — under the ARCHIVED VIEW's own word there, so the header says
 /// which of the two lists is on screen without a second line to read.
 fn count_words(app: &App, count: HeadCount) -> String {
-    let noun = if app.show_archived {
+    let noun = if app.launcher.show_archived {
         "archived session"
     } else {
         "session"
@@ -827,7 +833,7 @@ fn draw_bands(
     cursor: Option<usize>,
     scroll: u16,
 ) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let window = panel.window();
     // One CONFIG.JSON read for the whole frame, and only if some card on
     // it runs a CUSTOM harness whose label lives in there — a screenful
@@ -837,7 +843,7 @@ fn draw_bands(
     // under the cursor keeps its bold branch — it still says which
     // checkout the pane reads — but the accent goes with the keys, so
     // only the one thing holding them is lit.
-    let keys = app.focus != Focus::Terminal && app.launcher_tab_cursor.is_none();
+    let keys = app.nav.focus != Focus::Terminal && app.launcher.launcher_tab_cursor.is_none();
     // The band the selection is on, aimed at or let go of: its row
     // follows its remembered card either way, so Esc scrolls nothing.
     let aimed = crate::launcher::band_cursor(app, bands);
@@ -896,10 +902,10 @@ fn draw_bands(
                         None => pb.content.as_ref().map_or(0, |c| c.more),
                     },
                     expanded: pb.open,
-                    list: app.launcher_list,
+                    list: app.launcher.launcher_list,
                 },
             );
-            app.hits.extend(hits);
+            app.chrome.hits.extend(hits);
         }
         if band.cards.is_empty() {
             draw_empty_band(f, app, g, pb, band, (window, scroll), on && keys);
@@ -912,7 +918,7 @@ fn draw_bands(
         // cursor on it (`HitTarget::LauncherCard`), and a card drawn cut
         // is clicked on the rows of it there are: the landing scrolls
         // the rest of it into view (`settle_panel_scroll`).
-        if app.launcher_list {
+        if app.launcher.launcher_list {
             draw_list_band(
                 f,
                 app,
@@ -972,8 +978,8 @@ fn draw_bands(
                         draw_any_card(buf, &*app, r, card, selected, keys, th, &mut cfg)
                     });
                     note_tail_card(app, card);
-                    app.hits.extend(card_issue_hit(app, card, placed));
-                    app.hits.push((
+                    app.chrome.hits.extend(card_issue_hit(app, card, placed));
+                    app.chrome.hits.push((
                         placed.rect,
                         HitTarget::LauncherCard(crate::launcher::CardRef {
                             band: index,
@@ -1015,8 +1021,9 @@ fn draw_bands(
                         )
                     });
                     note_tail_card(app, card);
-                    app.hits.extend(card_issue_hit(app, card, placed));
-                    app.hits
+                    app.chrome.hits.extend(card_issue_hit(app, card, placed));
+                    app.chrome
+                        .hits
                         .push((placed.rect, HitTarget::LauncherCard(slot.at)));
                 }
                 // The arrows only on a row drawn whole: they stand beside
@@ -1047,10 +1054,12 @@ fn draw_bands(
         }
     }
     draw_panel_edge_marks(f, panel, scroll, th);
-    app.hits.extend(band_areas);
+    app.chrome.hits.extend(band_areas);
     // Last, so the bands themselves win `hit_at`'s first-match scan and
     // only the air between them falls through to the grid.
-    app.hits.push((g.area, HitTarget::PanelBg(Focus::Sessions)));
+    app.chrome
+        .hits
+        .push((g.area, HitTarget::PanelBg(Focus::Sessions)));
 }
 
 /// What an EMPTY BAND says under its rule, the root's without the delete
@@ -1072,7 +1081,7 @@ fn draw_empty_band(
     (window, scroll): (Rect, u16),
     lit: bool,
 ) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let row = Rect {
         y: pb.rule_y + crate::launcher::BAND_RULE_H,
         height: crate::launcher::EMPTY_BAND_ROW_H,
@@ -1184,7 +1193,7 @@ fn draw_strip_arrows(
     // the top of the whole panel, before the window and its scroll.
     let y = top + CARD_H / 2;
     let mut arrow = |hit: HitTarget, x: u16, glyph_x: u16, glyph: &str| {
-        let hovered = app.hover_crumb.as_ref() == Some(&hit);
+        let hovered = app.launcher.hover_crumb.as_ref() == Some(&hit);
         let style = if lit || hovered {
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         } else {
@@ -1208,7 +1217,7 @@ fn draw_strip_arrows(
         }
         .intersection(frame);
         if target.width > 0 {
-            app.hits.push((target, hit));
+            app.chrome.hits.push((target, hit));
         }
     };
     if strip.before > 0 {
@@ -1246,9 +1255,9 @@ fn draw_strip_more(
         lit,
         centered,
     } = more;
-    let th = app.theme;
+    let th = app.chrome.theme;
     let hit = HitTarget::LauncherBandMore(index);
-    let hovered = app.hover_crumb.as_ref() == Some(&hit);
+    let hovered = app.launcher.hover_crumb.as_ref() == Some(&hit);
     let key = super::key_hint(app, crate::keymap::Action::FocusNext);
     let (words, does) = (
         format!("▾ {hidden} more · "),
@@ -1275,7 +1284,7 @@ fn draw_strip_more(
     };
     let at = Rect { x, width: w, ..r };
     f.render_widget(Paragraph::new(line), at);
-    app.hits.push((at, hit));
+    app.chrome.hits.push((at, hit));
 }
 
 /// What [`draw_strip_more`] says, and where: the band it is under, how
@@ -1379,7 +1388,7 @@ fn draw_list_band(
             cfg,
         );
         note_tail_card(app, card);
-        app.hits.push((
+        app.chrome.hits.push((
             placed.rect,
             HitTarget::LauncherCard(crate::launcher::CardRef {
                 band: index,
@@ -1422,7 +1431,7 @@ fn draw_list_row(
     (name_col, runs_col): (usize, usize),
     cfg: &mut Option<crate::config::Config>,
 ) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let width = usize::from(r.width);
     // A bar rather than the rule's `❯`: a shell's own glyph is `❯`, one
     // column over, and the two would read as one mark.
@@ -1601,7 +1610,7 @@ fn draw_any_card(
 /// shell printed since ([`App::tail_cards`], `event_loop::request_terminal_tails`).
 fn note_tail_card(app: &mut App, card: &crate::launcher::Card) {
     if let crate::launcher::Card::Terminal(t) = card {
-        app.tail_cards.push(t.id.clone());
+        app.pane.tail_cards.push(t.id.clone());
     }
 }
 
@@ -1656,7 +1665,7 @@ fn draw_band_rule(
     band: &crate::launcher::Band,
     rule: BandRule,
 ) -> Vec<(Rect, HitTarget)> {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let width = usize::from(r.width);
     let BandRule {
         on,
@@ -1667,7 +1676,7 @@ fn draw_band_rule(
     } = rule;
     // A session card dragged over this band: the rule lights and says
     // the release moves the card here.
-    let drop = app.card_drag.as_ref().is_some_and(|d| {
+    let drop = app.launcher.card_drag.as_ref().is_some_and(|d| {
         d.active && d.over_tab.is_none() && d.over.as_ref() == Some(&band.worktree)
     });
     let edge = if lit || drop { th.accent } else { th.edge };
@@ -1702,7 +1711,8 @@ fn draw_band_rule(
         // takes for itself (`event_loop::launcher::handle_action`). With
         // every band open at once (**Expand all worktrees**) Tab has
         // nothing to open or fold, and no band says it does.
-        let nothing_to_open = app.launcher_all_open || (rule.list && !expanded && more == 0);
+        let nothing_to_open =
+            app.launcher.launcher_all_open || (rule.list && !expanded && more == 0);
         if lit && !nothing_to_open {
             let key = super::key_hint(app, crate::keymap::Action::FocusNext);
             let does = if expanded {
@@ -1809,7 +1819,8 @@ fn draw_band_rule(
                 spare,
                 Some((format!(" {}", pr.badge()), look.badge)),
             );
-            let hovered = app.hover_crumb == Some(HitTarget::LauncherBandPr(band.worktree.clone()));
+            let hovered =
+                app.launcher.hover_crumb == Some(HitTarget::LauncherBandPr(band.worktree.clone()));
             if hovered {
                 if let Some(label) = spans.get_mut(1) {
                     label.style = label.style.add_modifier(Modifier::UNDERLINED);
@@ -1887,7 +1898,7 @@ fn draw_chip(
         return;
     }
     // HIDE CARD MARKS drops the glyph, and the name starts where it was.
-    let glyph = if app.hide_card_marks {
+    let glyph = if app.launcher.hide_card_marks {
         ""
     } else if t.run_command.is_some() {
         "▶ "
@@ -1985,6 +1996,7 @@ fn terminal_tail_lines(
 ) -> Vec<crate::terminal_tail::TailRow> {
     let sref = nebula_core::SessionRef::Terminal(t.id.clone());
     if let Some(term) = app
+        .pane
         .term
         .as_ref()
         .filter(|term| term.sref == sref && term.painted)
@@ -1994,7 +2006,8 @@ fn terminal_tail_lines(
             crate::launcher::PROMPT_LINES,
         );
     }
-    app.terminal_tails
+    app.pane
+        .terminal_tails
         .get(&t.id)
         .map(|tail| tail.lines.clone())
         .unwrap_or_default()
@@ -2042,7 +2055,7 @@ fn selected_card_block(
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
         .border_style(Style::default().fg(th.accent));
-    let fill = if app.highlight_current_card {
+    let fill = if app.launcher.highlight_current_card {
         card_tint(app, status, th)
     } else if focused {
         th.sel_bg
@@ -2061,11 +2074,11 @@ fn selected_card_block(
 /// hold the keys.
 fn card_tint(app: &App, status: Option<Color>, th: Theme) -> Color {
     let (color, level) = match status {
-        Some(c) if app.animations => (c, tint_level(app.sweep_phase())),
+        Some(c) if app.chrome.animations => (c, tint_level(app.sweep_phase())),
         Some(c) => (c, TINT_PEAK),
         None => (th.accent, TINT_STILL),
     };
-    let away = if app.launcher_tab_cursor.is_none() {
+    let away = if app.launcher.launcher_tab_cursor.is_none() {
         1.0
     } else {
         0.6
@@ -2266,7 +2279,7 @@ fn draw_card(
             let harness = truncate(&harness, room);
             let pad = width - label_w - harness.chars().count();
             let mut style = Style::default().fg(quiet_or(th.accent));
-            if app.hover_crumb == Some(HitTarget::LauncherCardIssue(a.id.clone())) {
+            if app.launcher.hover_crumb == Some(HitTarget::LauncherCardIssue(a.id.clone())) {
                 style = style.add_modifier(Modifier::UNDERLINED);
             }
             second = vec![
@@ -2285,7 +2298,7 @@ fn draw_card(
     lines.extend(prompt_lines(
         crate::launcher::last_prompt(a).unwrap_or_default(),
         width,
-        (!app.hide_card_marks).then(|| quiet_or(dim)),
+        (!app.launcher.hide_card_marks).then(|| quiet_or(dim)),
         quiet_or(prompt),
     ));
 
@@ -2302,7 +2315,7 @@ fn draw_card(
 /// started from, while the `card_issue_number` setting is on. None on
 /// every other card, and on every card with the setting off.
 fn card_issue_label(app: &App, a: &nebula_core::Agent) -> Option<String> {
-    if !app.card_issue_number {
+    if !app.launcher.card_issue_number {
         return None;
     }
     a.issue_number().map(|n| format!("#{n}"))
@@ -2414,7 +2427,12 @@ fn session_look(app: &App, a: &nebula_core::Agent, selected: bool, th: Theme) ->
     let ramp = if pending || cold || archived {
         None
     } else {
-        sweep_ramp(Some(a.status), app.agent_fresh_done(a), th, app.animations)
+        sweep_ramp(
+            Some(a.status),
+            app.agent_fresh_done(a),
+            th,
+            app.chrome.animations,
+        )
     };
     // An archived name is not the loud thing on the screen any more: it
     // gives up the bold with the rest of the card's weight and sits one
@@ -2460,18 +2478,20 @@ fn session_look(app: &App, a: &nebula_core::Agent, selected: bool, th: Theme) ->
 /// still knows where the cursor is; it simply draws no card as selected,
 /// which is what says the box `p` opens will ask where its session lands.
 fn wearing(app: &App, cursor: Option<usize>) -> Option<usize> {
-    (!app.launcher_unaimed).then_some(cursor).flatten()
+    (!app.launcher.launcher_unaimed).then_some(cursor).flatten()
 }
 
 /// What the ARCHIVED VIEW shows with no cards at all — one line where the
 /// grid would be, rather than the live list's hero, which is about
 /// starting a session and has nothing to say here.
 fn draw_list_empty(f: &mut Frame, app: &mut App, area: Rect, what: &str) {
-    app.hits.push((area, HitTarget::PanelBg(Focus::Sessions)));
-    if app.overlay.is_some() {
+    app.chrome
+        .hits
+        .push((area, HitTarget::PanelBg(Focus::Sessions)));
+    if app.modals.overlay.is_some() {
         return;
     }
-    let th = app.theme;
+    let th = app.chrome.theme;
     if let Some(r) = row_rect(area, 1) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -2614,18 +2634,20 @@ const SKY_MIN_H: u16 = 10;
 fn draw_empty(f: &mut Frame, app: &mut App, area: Rect) {
     // Under the box (or any modal) the welcome would only peek out around
     // its edges in fragments; the box is saying the same thing.
-    if app.overlay.is_some() {
-        app.hits.push((area, HitTarget::PanelBg(Focus::Sessions)));
+    if app.modals.overlay.is_some() {
+        app.chrome
+            .hits
+            .push((area, HitTarget::PanelBg(Focus::Sessions)));
         return;
     }
-    let th = app.theme;
-    let t = crate::splash::scene_time(app, app.splash_epoch);
+    let th = app.chrome.theme;
+    let t = crate::splash::scene_time(app, app.chrome.splash_epoch);
     let mut welcome = vec![Span::styled("Welcome to ", Style::default().fg(th.text))];
     welcome.extend(crate::splash::wordmark_word("nebula", t));
     // The key line is a button, and marked as one under the pointer the
     // way the header's are.
     let mut words = Style::default().fg(th.muted);
-    if app.hover_crumb == Some(HitTarget::LauncherWelcomePrompt) {
+    if app.launcher.hover_crumb == Some(HitTarget::LauncherWelcomePrompt) {
         words = words.add_modifier(Modifier::UNDERLINED);
     }
     let key = super::key_hint(app, crate::keymap::Action::QuickPrompt);
@@ -2670,7 +2692,7 @@ fn draw_empty(f: &mut Frame, app: &mut App, area: Rect) {
         crate::splash::draw_sky(f.buffer_mut(), area, clear, t, th.accent);
     }
     // Even with no sky, the name's shine moves.
-    app.welcome_on_screen = true;
+    app.chrome.welcome_on_screen = true;
     f.render_widget(Paragraph::new(lines).centered(), text);
     // Ahead of the background, so it wins `hit_at`'s first-match scan.
     let key_row = Rect {
@@ -2680,8 +2702,12 @@ fn draw_empty(f: &mut Frame, app: &mut App, area: Rect) {
         height: 1,
     }
     .intersection(area);
-    app.hits.push((key_row, HitTarget::LauncherWelcomePrompt));
-    app.hits.push((area, HitTarget::PanelBg(Focus::Sessions)));
+    app.chrome
+        .hits
+        .push((key_row, HitTarget::LauncherWelcomePrompt));
+    app.chrome
+        .hits
+        .push((area, HitTarget::PanelBg(Focus::Sessions)));
 }
 
 /// One tab in the PANE's TAB STRIP, or in the header's PROJECT TABS: what
@@ -2730,16 +2756,16 @@ fn header_button(
     hit: HitTarget,
     lit: ratatui::style::Color,
 ) {
-    let fg = if app.hover_crumb.as_ref() == Some(&hit) {
+    let fg = if app.launcher.hover_crumb.as_ref() == Some(&hit) {
         lit
     } else {
-        app.theme.muted
+        app.chrome.theme.muted
     };
     f.render_widget(
         Paragraph::new(Span::styled(glyph, Style::default().fg(fg))),
         rect,
     );
-    app.hits.push((rect, hit));
+    app.chrome.hits.push((rect, hit));
 }
 
 /// The PANE's own header in the LAUNCHER VIEW: what the pane is reading
@@ -2756,7 +2782,7 @@ pub(super) fn pane_frame(
     right: Option<Span<'static>>,
     focused: bool,
 ) -> Rect {
-    let th = app.theme;
+    let th = app.chrome.theme;
     if let Some(r) = row_rect(area, 1) {
         let r = pad_x(r);
         // The CLOSE BUTTON holds the right end of the row, the SIDE
@@ -2782,7 +2808,7 @@ pub(super) fn pane_frame(
         for tab in tabs {
             let width = u16::try_from(tab.width()).unwrap_or(u16::MAX);
             if let Some(hit) = tab.hit {
-                app.hits.push((
+                app.chrome.hits.push((
                     Rect {
                         x,
                         y: r.y,
@@ -2831,7 +2857,7 @@ pub(super) fn pane_frame(
                 };
                 // Lit under the pointer as the header's other buttons are:
                 // a half-filled square does not say it is one until then.
-                let fg = if app.hover_crumb == Some(HitTarget::LauncherPaneSide) {
+                let fg = if app.launcher.hover_crumb == Some(HitTarget::LauncherPaneSide) {
                     th.accent
                 } else {
                     th.muted
@@ -2840,7 +2866,7 @@ pub(super) fn pane_frame(
                     Paragraph::new(Span::styled(glyph, Style::default().fg(fg))),
                     side,
                 );
-                app.hits.push((side, HitTarget::LauncherPaneSide));
+                app.chrome.hits.push((side, HitTarget::LauncherPaneSide));
                 x += side_w;
             }
             let close = Rect {
@@ -2850,7 +2876,7 @@ pub(super) fn pane_frame(
             };
             // Marked under the pointer the way the PROJECT TABS' `×` is:
             // nothing about a cross says it is a button until then.
-            let fg = if app.hover_crumb == Some(HitTarget::LauncherPaneClose) {
+            let fg = if app.launcher.hover_crumb == Some(HitTarget::LauncherPaneClose) {
                 th.err
             } else {
                 th.muted
@@ -2859,7 +2885,7 @@ pub(super) fn pane_frame(
                 Paragraph::new(Span::styled(PANE_CLOSE, Style::default().fg(fg))),
                 close,
             );
-            app.hits.push((close, HitTarget::LauncherPaneClose));
+            app.chrome.hits.push((close, HitTarget::LauncherPaneClose));
         }
     }
     draw_rule(f, area, 2, if focused { th.accent } else { th.edge });
@@ -2878,7 +2904,7 @@ pub(super) fn pane_frame(
 /// something the grid no longer lists — a card just archived out from
 /// under it — the attached session's own name, muted.
 fn pane_title(app: &App, room: usize) -> Vec<PaneTab> {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let bands = crate::launcher::bands(app);
     let at = crate::launcher::cursor(app, &bands);
     let card = at.and_then(|at| crate::launcher::card_at(&bands, at));
@@ -2908,7 +2934,12 @@ fn pane_title(app: &App, room: usize) -> Vec<PaneTab> {
             ]));
         }
         None => {
-            if let Some(name) = app.term.as_ref().and_then(|t| attached_name(app, &t.sref)) {
+            if let Some(name) = app
+                .pane
+                .term
+                .as_ref()
+                .and_then(|t| attached_name(app, &t.sref))
+            {
                 tabs.push(PaneTab::plain(vec![Span::styled(
                     truncate(&name, name_room),
                     Style::default().fg(th.muted),
@@ -2972,7 +3003,7 @@ fn attached_name(app: &App, sref: &nebula_core::SessionRef) -> Option<String> {
 /// BUTTON. Returns the rect the PTY
 /// draws in, as `terminal_frame` does.
 pub(super) fn crumb_frame(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
-    let th = app.theme;
+    let th = app.chrome.theme;
     if let Some(r) = row_rect(area, 1) {
         let r = pad_x(r);
         // The NORMAL-SIZE BUTTON holds the right end of the row, where the
@@ -3002,13 +3033,13 @@ pub(super) fn crumb_frame(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
         // The hatch out of a full-screen session is a button too, and
         // wears the same underline while the pointer is on it.
         let mut style = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
-        if app.hover_crumb.as_ref() == Some(&HitTarget::LauncherCrumb) {
+        if app.launcher.hover_crumb.as_ref() == Some(&HitTarget::LauncherCrumb) {
             style = style.add_modifier(Modifier::UNDERLINED);
         }
         let mut spans = vec![Span::styled(back.clone(), style)];
         // Only the crumb itself is the button — a click anywhere else on
         // the header row belongs to the pane.
-        app.hits.push((
+        app.chrome.hits.push((
             Rect {
                 width: back.chars().count() as u16,
                 height: 1,
@@ -3017,6 +3048,7 @@ pub(super) fn crumb_frame(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
             HitTarget::LauncherCrumb,
         ));
         let row = app
+            .pane
             .term
             .as_ref()
             .map(|t| t.sref.clone())
@@ -3061,7 +3093,7 @@ pub(super) fn crumb_frame(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
             );
         }
     }
-    let focused = app.focus == Focus::Terminal;
+    let focused = app.nav.focus == Focus::Terminal;
     draw_rule(f, area, 2, if focused { th.accent } else { th.edge });
     Rect {
         y: area.y + 3,
@@ -3471,7 +3503,7 @@ fn picker_rect(frame: Rect, over: Option<Rect>, matches: usize) -> Rect {
 /// with the typed letters lit, the path dim after it. Drawn over the box it was opened from
 /// (`ui::draw_overlay` puts that box down first), inset inside it.
 pub(super) fn draw_project_picker(f: &mut Frame, app: &mut App, picker: &ProjectPicker) {
-    let th = app.theme;
+    let th = app.chrome.theme;
     let over = picker_over_box(app, picker).then(|| box_rect(f.area()));
     let area = picker_rect(f.area(), over, picker.matches.len());
     let title = if picker.query.is_empty() {
@@ -3515,7 +3547,7 @@ pub(super) fn draw_project_picker(f: &mut Frame, app: &mut App, picker: &Project
         }
         render_row(f, row_area, spans, i == selected, true, th);
     }
-    if let Some(Overlay::ProjectPicker(p)) = &mut app.overlay {
+    if let Some(Overlay::ProjectPicker(p)) = &mut app.modals.overlay {
         p.area = area;
         p.list_area = list;
         p.selected = selected;
@@ -3827,7 +3859,7 @@ mod tests {
     /// Aim the SESSIONS cursor at the session with this id, whichever
     /// row of the panels' list it happens to be on.
     fn aim_at(app: &mut App, id: &str) {
-        app.sel_session = app
+        app.nav.sel_session = app
             .visible_session_rows()
             .iter()
             .position(|row| matches!(row, crate::app::SessionRow::Agent(a) if a.id.0 == id))
@@ -3845,7 +3877,7 @@ mod tests {
         use crate::launcher::{BAND_RULE_H, BELOW_MARK_H, CARD_H, GAP_Y, HEAD_H};
         let mut app = a_crowded_tree(9);
         select(&mut app, "api");
-        app.launcher_expanded = Some(nebula_core::WorktreeId("w0".into()));
+        app.launcher.launcher_expanded = Some(nebula_core::WorktreeId("w0".into()));
         // The cursor on the grid's first card, the way a project opens:
         // everything missing is under the fold.
         let first = crate::launcher::rows(&app)[0].agent.id.0.clone();
@@ -3895,7 +3927,7 @@ mod tests {
         use nebula_core::{TerminalId, TerminalTab, WorktreeId};
         let mut app = a_crowded_tree(9);
         select(&mut app, "api");
-        app.launcher_expanded = Some(WorktreeId("w0".into()));
+        app.launcher.launcher_expanded = Some(WorktreeId("w0".into()));
         for i in 1..=3 {
             app.tree.terminals.push(TerminalTab {
                 id: TerminalId(format!("t{i}")),
@@ -3906,7 +3938,7 @@ mod tests {
                 run_command: None,
             });
         }
-        app.sel_session = app
+        app.nav.sel_session = app
             .visible_session_rows()
             .iter()
             .position(|row| matches!(row, crate::app::SessionRow::Terminal(t) if t.id.0 == "t1"))
@@ -3914,7 +3946,7 @@ mod tests {
         let body = Rect::new(0, 0, 100, 58);
         let lines = drawn_lines(&mut app, body);
         assert_eq!(
-            app.launcher_scroll, 2,
+            app.launcher.launcher_scroll, 2,
             "two rows, the least that shows the cursor's card"
         );
         let head = &lines[1];
@@ -3971,7 +4003,7 @@ mod tests {
             alive: true,
             run_command: None,
         });
-        app.terminal_tails.insert(
+        app.pane.terminal_tails.insert(
             TerminalId("t1".into()),
             TerminalTail {
                 lines: vec!["$ npm test".into(), "ok 12 tests".into()],
@@ -3980,7 +4012,7 @@ mod tests {
         );
         // The band open: the terminal's card is under the session's
         // rather than off the end of its one-column strip.
-        app.launcher_expanded = Some(WorktreeId("w0".into()));
+        app.launcher.launcher_expanded = Some(WorktreeId("w0".into()));
         let body = Rect::new(0, 0, 100, 30);
         let lines = drawn_lines(&mut app, body);
         let row = lines
@@ -4004,6 +4036,7 @@ mod tests {
         );
         assert!(!lines[row].contains("exited"), "alive: {:?}", lines[row]);
         let widths: Vec<u16> = app
+            .chrome
             .hits
             .iter()
             .filter(|(_, h)| matches!(h, HitTarget::LauncherCard(_)))
@@ -4016,7 +4049,7 @@ mod tests {
             "the terminal's card spans two columns"
         );
         assert_eq!(
-            app.tail_cards,
+            app.pane.tail_cards,
             vec![TerminalId("t1".into())],
             "the frame notes the terminal for the grid's next ask"
         );
@@ -4044,7 +4077,7 @@ mod tests {
     #[test]
     fn a_terminal_cards_tail_paints_like_a_small_terminal() {
         use crate::terminal_tail::parse_tail;
-        let th = App::new().theme;
+        let th = App::new().chrome.theme;
         let r = Rect::new(0, 0, 12, 1);
         let paint = |data: &[u8], alive: bool| {
             let mut buf = Buffer::empty(r);
@@ -4117,7 +4150,7 @@ mod tests {
                 run_command: run.map(Into::into),
             });
         }
-        app.launcher_expanded = Some(WorktreeId("w0".into()));
+        app.launcher.launcher_expanded = Some(WorktreeId("w0".into()));
         let body = Rect::new(0, 0, 100, 40);
         let row_of = |lines: &[String], name: &str| -> String {
             lines
@@ -4135,7 +4168,7 @@ mod tests {
         assert!(prompt.contains("› fix the login redirect"), "{prompt:?}");
         let mark_col = prompt.find('›').unwrap();
 
-        app.hide_card_marks = true;
+        app.launcher.hide_card_marks = true;
         let lines = drawn_lines(&mut app, body);
         let shell = row_of(&lines, "shell-1");
         let run = row_of(&lines, "dev-srv");
@@ -4231,12 +4264,13 @@ mod tests {
         let lines = drawn_lines(&mut app, body);
         assert!(!runs_row(&lines).contains("#15"), "off by default");
         assert!(!app
+            .chrome
             .hits
             .iter()
             .any(|(_, h)| matches!(h, HitTarget::LauncherCardIssue(_))));
 
-        app.card_issue_number = true;
-        app.hits.clear();
+        app.launcher.card_issue_number = true;
+        app.chrome.hits.clear();
         let lines = drawn_lines(&mut app, body);
         let row = runs_row(&lines);
         assert!(row.contains("claude"), "{row:?}");
@@ -4323,16 +4357,16 @@ mod tests {
                 ..one.clone()
             })
             .collect();
-        app.launcher_expanded = None;
+        app.launcher.launcher_expanded = None;
         app
     }
 
     /// Put the cursor on the band of checkout `id`, at the band level.
     fn aim_at_band(app: &mut App, id: &str) {
-        app.sel_worktree = app
+        app.nav.sel_worktree = app
             .worktree_row_of(&nebula_core::WorktreeId(id.into()))
             .expect("a row for the checkout");
-        app.launcher_expanded = None;
+        app.launcher.launcher_expanded = None;
     }
 
     /// The air under the last whole band says how many more are down
@@ -4399,7 +4433,7 @@ mod tests {
     /// index and a turn starting anywhere reorders the rows, so a test
     /// that starts one has to say again which project the grid is on.
     fn select(app: &mut App, name: &str) {
-        app.sel_project = app
+        app.nav.sel_project = app
             .project_rows()
             .iter()
             .position(|i| app.tree.projects[*i].name == name)
@@ -4413,7 +4447,7 @@ mod tests {
     #[test]
     fn the_header_says_how_many_cards_it_could_not_fit() {
         let app = App::new();
-        let th = app.theme;
+        let th = app.chrome.theme;
         let mark = |hidden| row_text(&count_spans(&app, 9, hidden, 80, th));
 
         assert_eq!(mark(Hidden::default()), "9 sessions", "nothing is missing");
@@ -4441,7 +4475,7 @@ mod tests {
         let mut app = a_tree();
         select(&mut app, "api");
         let id = app.selected_project().expect("api").id.clone();
-        app.issues.insert(
+        app.github.issues.insert(
             id,
             crate::issues::IssueList {
                 list: vec![crate::issues::Issue {
@@ -4457,7 +4491,7 @@ mod tests {
                 at: std::time::Instant::now(),
             },
         );
-        let th = app.theme;
+        let th = app.chrome.theme;
         let hidden = Hidden { above: 0, below: 5 };
         let mark_w = "  ↓ 5 hidden".chars().count();
         for width in 0..=120usize {
@@ -4507,7 +4541,7 @@ mod tests {
     fn a_tabbed_tree() -> App {
         let mut app = a_tree();
         select(&mut app, "api");
-        app.launcher_tabs = vec![ProjectId("p1".into()), ProjectId("p0".into())];
+        app.launcher.launcher_tabs = vec![ProjectId("p1".into()), ProjectId("p0".into())];
         app
     }
 
@@ -4515,7 +4549,7 @@ mod tests {
 
     /// The header's buttons, in the order they were laid down.
     fn head_hits(app: &App) -> Vec<HitTarget> {
-        app.hits.iter().map(|(_, h)| h.clone()).collect()
+        app.chrome.hits.iter().map(|(_, h)| h.clone()).collect()
     }
 
     /// The header is a `+` and then the open projects as tabs, the newest
@@ -4526,8 +4560,8 @@ mod tests {
     fn the_header_is_the_open_projects_as_tabs() {
         let r = Rect::new(0, 0, 80, 1);
         let mut app = a_tabbed_tree();
-        let th = app.theme;
-        app.hits.clear();
+        let th = app.chrome.theme;
+        app.chrome.hits.clear();
         let spans = head_tabs(&mut app, r);
         let text = row_text(&spans);
         assert_eq!(text, " +   web ×   api × ");
@@ -4544,6 +4578,7 @@ mod tests {
         );
         // Each tab's rect is its own name and never the `×` beside it.
         let (rect, _) = app
+            .chrome
             .hits
             .iter()
             .find(|(_, h)| *h == HitTarget::LauncherTab(api.clone()))
@@ -4562,8 +4597,8 @@ mod tests {
         assert_eq!(flat.style.bg, None);
 
         // With nothing open, the `+` says what it does.
-        app.launcher_tabs.clear();
-        app.hits.clear();
+        app.launcher.launcher_tabs.clear();
+        app.chrome.hits.clear();
         let spans = head_tabs(&mut app, r);
         assert_eq!(row_text(&spans), " + open a project ");
         assert_eq!(head_hits(&app), vec![HitTarget::LauncherTabAdd]);
@@ -4578,7 +4613,7 @@ mod tests {
         use nebula_core::{AgentId, AgentStatus};
         let r = Rect::new(0, 0, 80, 1);
         let mut app = a_tabbed_tree();
-        let th = app.theme;
+        let th = app.chrome.theme;
         // api: one asking, one mid-turn; web: one finished unread.
         let mut asking = app.tree.agents[0].clone();
         asking.id = AgentId("a9".into());
@@ -4587,7 +4622,7 @@ mod tests {
         app.tree.agents[0].status = AgentStatus::Running;
         app.tree.agents[1].unseen = true;
         select(&mut app, "api");
-        app.hits.clear();
+        app.chrome.hits.clear();
         let spans = head_tabs(&mut app, r);
         assert_eq!(row_text(&spans), " +   web ●1 ×   api ●1 ●1 × ");
         let dots: Vec<(String, Option<Color>)> = spans
@@ -4611,7 +4646,7 @@ mod tests {
     fn a_lone_tab_has_a_cross() {
         let r = Rect::new(0, 0, 80, 1);
         let mut app = a_tabbed_tree();
-        app.launcher_tabs = vec![ProjectId("p0".into())];
+        app.launcher.launcher_tabs = vec![ProjectId("p0".into())];
         let spans = head_tabs(&mut app, r);
         assert_eq!(row_text(&spans), " +   api × ");
         assert!(head_hits(&app)
@@ -4619,7 +4654,7 @@ mod tests {
             .any(|h| matches!(h, HitTarget::LauncherTabClose(_))));
 
         let mut app = a_tabbed_tree();
-        app.hits.clear();
+        app.chrome.hits.clear();
         let spans = head_tabs(&mut app, r);
         assert_eq!(row_text(&spans), " +   web ×   api × ");
     }
@@ -4632,9 +4667,9 @@ mod tests {
         use nebula_core::AgentStatus;
         let r = Rect::new(0, 0, 80, 1);
         let mut app = a_tabbed_tree();
-        app.hits.clear();
+        app.chrome.hits.clear();
         head_tabs(&mut app, r);
-        let quiet = std::mem::take(&mut app.hits);
+        let quiet = std::mem::take(&mut app.chrome.hits);
         for a in &mut app.tree.agents {
             a.status = AgentStatus::Running;
         }
@@ -4645,7 +4680,7 @@ mod tests {
             !busy.iter().any(|s| s.content == "web"),
             "swept a cell at a time"
         );
-        let busy_hits = std::mem::take(&mut app.hits);
+        let busy_hits = std::mem::take(&mut app.chrome.hits);
         let first_tab = |hits: &[(Rect, HitTarget)]| {
             hits.iter()
                 .find(|(_, h)| matches!(h, HitTarget::LauncherTab(_)))
@@ -4680,7 +4715,7 @@ mod tests {
     fn the_pointer_marks_the_tab_it_rests_on() {
         let r = Rect::new(0, 0, 80, 1);
         let mut app = a_tabbed_tree();
-        let th = app.theme;
+        let th = app.chrome.theme;
         let web = ProjectId("p1".into());
         let underlined = |spans: &[Span<'static>]| -> Vec<String> {
             spans
@@ -4691,13 +4726,13 @@ mod tests {
         };
         assert!(underlined(&head_tabs(&mut app, r)).is_empty());
 
-        app.hover_crumb = Some(HitTarget::LauncherTab(web.clone()));
+        app.launcher.hover_crumb = Some(HitTarget::LauncherTab(web.clone()));
         assert_eq!(underlined(&head_tabs(&mut app, r)), ["web"]);
 
-        app.hover_crumb = Some(HitTarget::LauncherTabAdd);
+        app.launcher.hover_crumb = Some(HitTarget::LauncherTabAdd);
         assert_eq!(underlined(&head_tabs(&mut app, r)), ["+"]);
 
-        app.hover_crumb = Some(HitTarget::LauncherTabClose(web));
+        app.launcher.hover_crumb = Some(HitTarget::LauncherTabClose(web));
         let spans = head_tabs(&mut app, r);
         assert!(underlined(&spans).is_empty());
         let crosses: Vec<Option<Color>> = spans
@@ -4726,11 +4761,11 @@ mod tests {
             });
         }
         // Every project open, `api` — the oldest opened — last.
-        app.launcher_tabs = (0..9).rev().map(|i| ProjectId(format!("p{i}"))).collect();
+        app.launcher.launcher_tabs = (0..9).rev().map(|i| ProjectId(format!("p{i}"))).collect();
         select(&mut app, "api");
         for width in 5..=160u16 {
             let r = Rect::new(0, 0, width, 1);
-            app.hits.clear();
+            app.chrome.hits.clear();
             let spans = head_tabs(&mut app, r);
             let text = row_text(&spans);
             let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -4740,7 +4775,7 @@ mod tests {
                 .iter()
                 .filter(|h| matches!(h, HitTarget::LauncherTab(_)))
                 .count();
-            let more = app.launcher_tabs_more.len();
+            let more = app.launcher.launcher_tabs_more.len();
             if drawn + more > 0 {
                 assert_eq!(drawn + more, 9, "{width}: a tab went missing: {text:?}");
             }
@@ -4762,7 +4797,7 @@ mod tests {
         let r = Rect::new(0, 0, 400, 1);
         let text = row_text(&head_tabs(&mut app, r));
         assert!(!text.contains("more"), "{text:?}");
-        assert!(app.launcher_tabs_more.is_empty());
+        assert!(app.launcher.launcher_tabs_more.is_empty());
     }
 
     /// The tabs give way in steps, each giving up less than the next: the
@@ -4808,7 +4843,7 @@ mod tests {
     fn the_more_chip_carries_the_dots_of_the_tabs_it_holds() {
         use nebula_core::AgentStatus;
         let mut app = a_tabbed_tree();
-        let th = app.theme;
+        let th = app.chrome.theme;
         let web = ProjectId("p1".into());
         for p in &mut app.tree.projects {
             if p.id == web {
@@ -4818,7 +4853,7 @@ mod tests {
         // web: one waiting on you.
         app.tree.agents[1].status = AgentStatus::NeedsFeedback;
         select(&mut app, "api");
-        app.hits.clear();
+        app.chrome.hits.clear();
         let spans = head_tabs(&mut app, Rect::new(0, 0, 30, 1));
         let text = row_text(&spans);
         assert!(!text.contains("website"), "{text:?}");
@@ -4826,7 +4861,7 @@ mod tests {
         assert!(text.contains("1 more ●1 ▾"), "{text:?}");
         let dot = spans.iter().find(|s| s.content == " ●1").expect("a dot");
         assert_eq!(dot.style.fg, Some(th.err), "web's red, on the chip");
-        assert_eq!(app.launcher_tabs_more, vec![web]);
+        assert_eq!(app.launcher.launcher_tabs_more, vec![web]);
         assert!(head_hits(&app).contains(&HitTarget::LauncherTabMore));
     }
 
@@ -4841,11 +4876,11 @@ mod tests {
                 p.name = "website-frontend".into();
             }
         }
-        app.hits.clear();
+        app.chrome.hits.clear();
         let text = row_text(&head_tabs(&mut app, Rect::new(0, 0, 30, 1)));
         assert_eq!(text, " +   website-frontend  api × ");
         assert!(!head_hits(&app).contains(&HitTarget::LauncherTabClose(web)));
-        assert!(app.launcher_tabs_more.is_empty());
+        assert!(app.launcher.launcher_tabs_more.is_empty());
     }
 
     /// The prompt header keeps the toggle whatever else it has to drop,
@@ -5056,7 +5091,7 @@ mod tests {
     #[test]
     fn a_band_paints_its_checkout_in_the_scope_color() {
         let app = App::new();
-        let th = app.theme;
+        let th = app.chrome.theme;
         let root = rule_row(&app, &a_band(true, "main"), 44);
         let worktree = rule_row(&app, &a_band(false, "feat-x"), 44);
         assert_eq!(painted(&root, 0, th.root), "⌂ main");
@@ -5077,8 +5112,8 @@ mod tests {
     fn a_band_counts_its_checkouts_changes_behind_the_branch() {
         use nebula_core::WorktreeId;
         let mut app = App::new();
-        let th = app.theme;
-        app.worktree_changes.insert(
+        let th = app.chrome.theme;
+        app.jobs.worktree_changes.insert(
             WorktreeId("w1".into()),
             (Some(3), std::time::Instant::now()),
         );
@@ -5106,7 +5141,7 @@ mod tests {
     #[test]
     fn the_band_the_keys_are_on_marks_itself_and_says_what_enter_does() {
         let app = App::new();
-        let th = app.theme;
+        let th = app.chrome.theme;
         let key = crate::ui::key_hint(&app, crate::keymap::Action::FocusNext);
         let mut band = a_band(true, "main");
         let card = band.cards[0].clone();
@@ -5227,7 +5262,7 @@ mod tests {
         };
         let th = Theme::by_name("amber");
         let mut app = App::new();
-        app.theme = th;
+        app.chrome.theme = th;
         let frame = |agent: Agent, selected: bool, focused: bool| {
             let row = LauncherRow {
                 agent,
@@ -5339,7 +5374,7 @@ mod tests {
         };
         let th = Theme::by_name("coral");
         let mut app = App::new();
-        app.theme = th;
+        app.chrome.theme = th;
         let fill = |app: &App, selected: bool, focused: bool| {
             let area = Rect::new(0, 0, 40, crate::launcher::CARD_H);
             let mut terminal =
@@ -5394,7 +5429,7 @@ mod tests {
         };
         let th = Theme::by_name("coral");
         let mut app = App::new();
-        app.theme = th;
+        app.chrome.theme = th;
         let draw = |app: &App, focused: bool| {
             let area = Rect::new(0, 0, 40, crate::launcher::CARD_H);
             let mut terminal =
@@ -5407,13 +5442,13 @@ mod tests {
         };
 
         // Off: the plain gray fill, dimmed off the grid.
-        app.focus = Focus::Terminal;
+        app.nav.focus = Focus::Terminal;
         let buf = draw(&app, false);
         assert_eq!(buf.cell((20, 1)).unwrap().bg, th.sel_bg_dim);
 
         // On: a faint wash of the running yellow, frame and all, while
         // the pane has the keys.
-        app.highlight_current_card = true;
+        app.launcher.highlight_current_card = true;
         let buf = draw(&app, false);
         let fill = buf.cell((20, 2)).unwrap().bg;
         assert_eq!(buf.cell((0, 0)).unwrap().bg, fill);
@@ -5445,14 +5480,14 @@ mod tests {
             buf.cell((20, 2)).unwrap().bg
         };
         assert_eq!(idle_card(&app), dim_toward_black(th.accent, TINT_STILL));
-        app.animations = false;
+        app.chrome.animations = false;
         assert_eq!(
             draw(&app, false).cell((20, 2)).unwrap().bg,
             dim_toward_black(th.warn, TINT_PEAK)
         );
 
         // The PROJECT TABS holding the keys fade it further.
-        app.launcher_tab_cursor = Some(nebula_core::ProjectId("p1".into()));
+        app.launcher.launcher_tab_cursor = Some(nebula_core::ProjectId("p1".into()));
         assert_eq!(
             draw(&app, false).cell((20, 2)).unwrap().bg,
             dim_toward_black(th.warn, TINT_PEAK * 0.6)
@@ -5467,12 +5502,12 @@ mod tests {
     fn card_line_counts_follow_the_file_count_in_green_and_red() {
         use nebula_core::WorktreeId;
         let mut app = App::new();
-        let th = app.theme;
-        app.worktree_changes.insert(
+        let th = app.chrome.theme;
+        app.jobs.worktree_changes.insert(
             WorktreeId("w1".into()),
             (Some(3), std::time::Instant::now()),
         );
-        app.worktree_lines.insert(
+        app.jobs.worktree_lines.insert(
             WorktreeId("w1".into()),
             crate::git_diff::LineChanges {
                 added: 120,

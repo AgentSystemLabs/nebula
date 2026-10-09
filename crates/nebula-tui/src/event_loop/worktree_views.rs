@@ -3,7 +3,7 @@
 use super::*;
 
 pub(crate) fn open_launch_repo(app: &mut App, out: &mut Vec<ClientRequest>) {
-    match app.launch_repo.clone() {
+    match app.launcher.launch_repo.clone() {
         Some(path) => open_folder(app, path, out),
         None => open_prompt(app, PromptKind::AddProject),
     }
@@ -17,7 +17,7 @@ pub(crate) fn open_launch_repo(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// whether to `git init` it.
 pub(crate) fn open_folder(app: &mut App, path: std::path::PathBuf, out: &mut Vec<ClientRequest>) {
     if !path.exists() {
-        app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+        app.modals.overlay = Some(Overlay::Confirm(ConfirmDialog {
             title: "Create directory".into(),
             message: format!(
                 "{} doesn't exist, would you like to create it?",
@@ -35,11 +35,11 @@ pub(crate) fn open_folder(app: &mut App, path: std::path::PathBuf, out: &mut Vec
         .map(|p| (p.id.clone(), p.name.clone()));
     if let Some((id, name)) = known {
         launcher::open_project(app, &id, out);
-        app.flash = Some(format!("{name} is already a project — opened it"));
+        app.chrome.flash = Some(format!("{name} is already a project — opened it"));
         return;
     }
     if canon.is_dir() && !in_git_repo(&canon) {
-        app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+        app.modals.overlay = Some(Overlay::Confirm(ConfirmDialog {
             title: "Not a git repository".into(),
             message: format!(
                 "{} isn't a git repository — nebula projects are. Run git init in it?",
@@ -79,7 +79,7 @@ pub(crate) fn open_repo_in_browser(app: &mut App) {
         .filter(|path| path.is_dir())
         .or_else(|| app.selected_project().map(|p| p.repo_path.clone()));
     let Some(root) = root else {
-        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        app.chrome.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
     // Not open_link: this is a repo page, never a PR row to mark read.
@@ -90,12 +90,12 @@ pub(crate) fn open_repo_in_browser(app: &mut App) {
     };
     // Which page it is takes a `git remote get-url` to know: asked off the
     // loop, with the outcome flashed when it lands.
-    match app.view_jobs.clone() {
+    match app.jobs.view_jobs.clone() {
         Some(jobs) => {
-            app.flash = Some("opening the repository's page…".into());
+            app.chrome.flash = Some("opening the repository's page…".into());
             jobs.run(move || Some(crate::view_jobs::Answer::Flash(open())));
         }
-        None => app.flash = Some(open()),
+        None => app.chrome.flash = Some(open()),
     }
 }
 
@@ -111,7 +111,7 @@ pub(crate) fn open_ghostty_tab(app: &mut App) {
 }
 
 pub(crate) fn open_ghostty_tab_with(app: &mut App, ghostty: Option<std::path::PathBuf>) {
-    let Some(ghostty) = ghostty.filter(|_| !app.is_remote) else {
+    let Some(ghostty) = ghostty.filter(|_| !app.chrome.is_remote) else {
         return;
     };
     let dir = app
@@ -119,14 +119,14 @@ pub(crate) fn open_ghostty_tab_with(app: &mut App, ghostty: Option<std::path::Pa
         .map(|w| w.path.clone())
         .or_else(|| app.selected_project().map(|p| p.repo_path.clone()));
     let Some(dir) = dir else {
-        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        app.chrome.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
     if !dir.is_dir() {
-        app.flash = Some(format!("path missing on disk: {}", dir.display()));
+        app.chrome.flash = Some(format!("path missing on disk: {}", dir.display()));
         return;
     }
-    app.flash = Some(if open_in_app(&ghostty, &dir) {
+    app.chrome.flash = Some(if open_in_app(&ghostty, &dir) {
         format!("opened a Ghostty tab in {}", dir.display())
     } else {
         format!("couldn't open a Ghostty tab in {}", dir.display())
@@ -165,11 +165,11 @@ pub(crate) fn open_in_app(bundle: &std::path::Path, path: &std::path::Path) -> b
 /// or stop it when it is already up.
 pub(crate) fn toggle_run(app: &mut App, out: &mut Vec<ClientRequest>) {
     if app.selected_worktree_pr().is_some() {
-        app.flash = Some("a pull request has no checkout to run — pick a worktree".into());
+        app.chrome.flash = Some("a pull request has no checkout to run — pick a worktree".into());
         return;
     }
     let Some(w) = app.selected_worktree().cloned() else {
-        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        app.chrome.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
     toggle_run_in(app, &w, out);
@@ -182,7 +182,7 @@ pub(crate) fn toggle_run_in(
     out: &mut Vec<ClientRequest>,
 ) {
     if app.is_placeholder_worktree(&worktree.id) {
-        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        app.chrome.flash = Some(WORKTREE_STILL_CREATING.into());
         return;
     }
     let start = !app.worktree_running(&worktree.id);
@@ -209,11 +209,11 @@ pub(crate) fn toggle_run_in(
 /// `Shift+Enter` / `Shift+O`: fire the selected checkout's OPEN COMMAND.
 pub(crate) fn open_selected_worktree(app: &mut App) {
     if app.selected_worktree_pr().is_some() {
-        app.flash = Some("a pull request has no checkout to open — pick a worktree".into());
+        app.chrome.flash = Some("a pull request has no checkout to open — pick a worktree".into());
         return;
     }
     let Some(w) = app.selected_worktree().cloned() else {
-        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        app.chrome.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
     open_worktree(app, &w);
@@ -239,11 +239,11 @@ pub(crate) fn open_worktree(app: &mut App, worktree: &nebula_core::Worktree) {
     let command = match open_command_for(&worktree.path, &main) {
         Ok(command) => command,
         Err(msg) => {
-            app.flash = Some(msg);
+            app.chrome.flash = Some(msg);
             return;
         }
     };
-    app.flash = Some(match spawn_open_command(&command, &worktree.path) {
+    app.chrome.flash = Some(match spawn_open_command(&command, &worktree.path) {
         Ok(()) => format!("↗ {command}"),
         Err(e) => format!("couldn't run {command}: {e}"),
     });
@@ -308,16 +308,16 @@ pub(crate) fn spawn_open_command(command: &str, cwd: &std::path::Path) -> std::i
 /// read it. Flashes and returns None when no worktree is selected or its
 /// path is gone from disk.
 pub(crate) fn selected_checkout(app: &mut App) -> Option<(std::path::PathBuf, String)> {
-    // Clone before touching app.overlay — selected_worktree borrows app.
+    // Clone before touching app.modals.overlay — selected_worktree borrows app.
     let Some((path, branch)) = app
         .selected_worktree()
         .map(|w| (w.path.clone(), w.branch.clone()))
     else {
-        app.flash = Some("no worktree selected".into());
+        app.chrome.flash = Some("no worktree selected".into());
         return None;
     };
     if !path.is_dir() {
-        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+        app.chrome.flash = Some(format!("worktree path missing on disk: {}", path.display()));
         return None;
     }
     Some((path, branch))
@@ -334,12 +334,12 @@ pub(crate) fn load_worktree_files(
     let files = match crate::git_diff::list_files(path) {
         Ok(files) => files,
         Err(msg) => {
-            app.flash = Some(msg);
+            app.chrome.flash = Some(msg);
             return None;
         }
     };
     if files.is_empty() {
-        app.flash = Some(format!("no files in {branch}"));
+        app.chrome.flash = Some(format!("no files in {branch}"));
         return None;
     }
     let editor = crate::config::Config::load().editor_command();
@@ -365,25 +365,25 @@ pub(crate) fn open_diff_view(app: &mut App) {
     let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
-    let Some(jobs) = app.view_jobs.clone() else {
+    let Some(jobs) = app.jobs.view_jobs.clone() else {
         // No loop to land an answer on (unit tests): read inline.
         match crate::git_diff::read_listing(&path) {
             Ok(listing) => show_diff_listing(app, path, branch, listing),
-            Err(msg) => app.flash = Some(msg),
+            Err(msg) => app.chrome.flash = Some(msg),
         }
         return;
     };
     let ticket = crate::view_jobs::ticket();
     let selected = app.selected_worktree().map(|w| w.id.clone());
     let known_clean =
-        matches!(&app.git_changes, Some((id, Some(0))) if Some(id) == selected.as_ref());
+        matches!(&app.jobs.git_changes, Some((id, Some(0))) if Some(id) == selected.as_ref());
     if known_clean {
-        app.flash = Some(format!("no changes in {branch}"));
-        app.diff_probe = Some((ticket, path.clone(), branch));
+        app.chrome.flash = Some(format!("no changes in {branch}"));
+        app.jobs.diff_probe = Some((ticket, path.clone(), branch));
     } else {
         let mut view = DiffView::opening(path.clone(), branch, jobs.clone(), ticket);
-        view.files_width = app.diff_files_width;
-        if app.diff_tree {
+        view.files_width = app.modals.diff_files_width;
+        if app.modals.diff_tree {
             view.toggle_tree();
         }
         // The badge's last `git status` — two seconds old at most — is the
@@ -391,6 +391,7 @@ pub(crate) fn open_diff_view(app: &mut App) {
         // diff is being read while the `git status` below checks them, not
         // after it. `fill_view` reconciles the two when that lands.
         let polled = app
+            .jobs
             .changed_files
             .as_ref()
             .filter(|(id, files)| Some(id) == selected.as_ref() && !files.is_empty());
@@ -398,7 +399,7 @@ pub(crate) fn open_diff_view(app: &mut App) {
             view.replace_files(files.clone());
             crate::git_diff::load_selected_diff(&mut view);
         }
-        app.overlay = Some(Overlay::Diff(view));
+        app.modals.overlay = Some(Overlay::Diff(view));
     }
     jobs.run(move || {
         Some(crate::view_jobs::Answer::DiffListing {
@@ -417,18 +418,18 @@ pub(crate) fn show_diff_listing(
     listing: crate::view_jobs::DiffListing,
 ) {
     if listing.files.is_empty() {
-        app.flash = Some(format!("no changes in {branch}"));
+        app.chrome.flash = Some(format!("no changes in {branch}"));
         return;
     }
     let mut view = DiffView::new(path, branch, Vec::new(), true);
-    view.jobs = app.view_jobs.clone();
-    view.files_width = app.diff_files_width;
+    view.jobs = app.jobs.view_jobs.clone();
+    view.files_width = app.modals.diff_files_width;
     crate::git_diff::fill_view(&mut view, listing);
     // After the marks: the tree opens on the first unreviewed file too.
-    if app.diff_tree && view.toggle_tree() {
+    if app.modals.diff_tree && view.toggle_tree() {
         crate::git_diff::load_selected_diff(&mut view);
     }
-    app.overlay = Some(Overlay::Diff(view));
+    app.modals.overlay = Some(Overlay::Diff(view));
 }
 
 /// Fuzzy file finder over every tracked + untracked file of the selected
@@ -437,7 +438,7 @@ pub(crate) fn show_diff_listing(
 /// `Shift+H`: destinations remembered by `nebula ssh`, newest first. Opens even
 /// when empty — the modal's hint is how the feature introduces itself.
 pub(crate) fn open_hosts_picker(app: &mut App) {
-    app.overlay = Some(Overlay::Hosts(crate::app::HostsView::new(
+    app.modals.overlay = Some(Overlay::Hosts(crate::app::HostsView::new(
         crate::hosts::load(),
     )));
 }
@@ -448,10 +449,10 @@ pub(crate) fn open_file_finder(app: &mut App) {
     };
     // The modal is up on this keypress, taking what is typed; the list
     // lands when `git ls-files` answers (`land_view_answer`).
-    if let Some(jobs) = app.view_jobs.clone() {
+    if let Some(jobs) = app.jobs.view_jobs.clone() {
         let editor = crate::config::Config::load().editor_command();
         let ticket = request_worktree_files(&jobs, &path);
-        app.overlay = Some(Overlay::Files(FileFinder::opening(
+        app.modals.overlay = Some(Overlay::Files(FileFinder::opening(
             path, branch, editor, ticket,
         )));
         return;
@@ -459,7 +460,7 @@ pub(crate) fn open_file_finder(app: &mut App) {
     let Some((files, editor)) = load_worktree_files(app, &path, &branch) else {
         return;
     };
-    app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
+    app.modals.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
 }
 
 /// Ask for a checkout's file listing off the loop; the ticket is what the
@@ -485,10 +486,10 @@ pub(crate) fn open_tree_browser(app: &mut App) {
         return;
     };
     // Up on this keypress; the tree lands when `git ls-files` answers.
-    if let Some(jobs) = app.view_jobs.clone() {
+    if let Some(jobs) = app.jobs.view_jobs.clone() {
         let editor = crate::config::Config::load().editor_command();
         let ticket = request_worktree_files(&jobs, &path);
-        app.overlay = Some(Overlay::Tree(TreeBrowser::opening(
+        app.modals.overlay = Some(Overlay::Tree(TreeBrowser::opening(
             path, branch, editor, jobs, ticket,
         )));
         return;
@@ -496,7 +497,7 @@ pub(crate) fn open_tree_browser(app: &mut App) {
     let Some((files, editor)) = load_worktree_files(app, &path, &branch) else {
         return;
     };
-    app.overlay = Some(Overlay::Tree(TreeBrowser::new(path, branch, editor, files)));
+    app.modals.overlay = Some(Overlay::Tree(TreeBrowser::new(path, branch, editor, files)));
 }
 
 /// Find-in-files (`F`): live `git grep` over the selected worktree; Enter
@@ -507,8 +508,8 @@ pub(crate) fn open_grep_view(app: &mut App) {
     };
     let editor = crate::config::Config::load().editor_command();
     let mut view = GrepView::new(path, branch, editor);
-    view.jobs = app.view_jobs.clone();
-    app.overlay = Some(Overlay::Grep(view));
+    view.jobs = app.jobs.view_jobs.clone();
+    app.modals.overlay = Some(Overlay::Grep(view));
 }
 
 /// A BACKGROUND READ came back (`view_jobs`): hand it to the view that
@@ -519,7 +520,7 @@ pub(crate) fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) 
     use crate::view_jobs::Answer;
     match answer {
         Answer::Grep { ticket, result } => {
-            if let Some(Overlay::Grep(view)) = &mut app.overlay {
+            if let Some(Overlay::Grep(view)) = &mut app.modals.overlay {
                 view.land(ticket, result);
             }
         }
@@ -532,29 +533,29 @@ pub(crate) fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) 
             diff,
             prefetch,
         } => {
-            if let Some(Overlay::Diff(view)) = &mut app.overlay {
+            if let Some(Overlay::Diff(view)) = &mut app.modals.overlay {
                 crate::git_diff::land_diff(view, id, ticket, &path, diff, prefetch);
             }
         }
-        Answer::Preview { ticket, preview } => match &mut app.overlay {
+        Answer::Preview { ticket, preview } => match &mut app.modals.overlay {
             Some(Overlay::Tree(view)) => view.land_preview(ticket, *preview),
             Some(Overlay::FileTabs(view)) => view.land_preview(ticket, *preview),
             _ => {}
         },
         Answer::ClipboardViaTerminal { payload, flash } => {
-            app.pending_clipboard = Some(payload);
-            app.flash = Some(flash);
+            app.chrome.pending_clipboard = Some(payload);
+            app.chrome.flash = Some(flash);
         }
-        Answer::Flash(message) => app.flash = Some(message),
+        Answer::Flash(message) => app.chrome.flash = Some(message),
         Answer::ClientRss(bytes) => land_client_rss(app, bytes),
-        Answer::Slow { ticket } => match &mut app.overlay {
+        Answer::Slow { ticket } => match &mut app.modals.overlay {
             Some(Overlay::Diff(view)) => crate::git_diff::diff_slow(view, ticket),
             Some(Overlay::Tree(view)) => view.preview_slow(ticket),
             Some(Overlay::FileTabs(view)) => view.preview_slow(ticket),
             _ => {}
         },
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// `git ls-files` came back for the FILE FINDER or the TREE BROWSER that
@@ -562,7 +563,7 @@ pub(crate) fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) 
 /// not list, closes the modal with the reason — what `f` and `b` used to
 /// say instead of opening.
 pub(crate) fn land_worktree_files(app: &mut App, ticket: u64, result: Result<Vec<String>, String>) {
-    let branch = match &app.overlay {
+    let branch = match &app.modals.overlay {
         Some(Overlay::Files(finder)) if finder.listing == Some(ticket) => finder.branch.clone(),
         Some(Overlay::Tree(view)) if view.listing == Some(ticket) => view.branch.clone(),
         _ => return,
@@ -570,17 +571,17 @@ pub(crate) fn land_worktree_files(app: &mut App, ticket: u64, result: Result<Vec
     let files = match result {
         Ok(files) if !files.is_empty() => files,
         Ok(_) => {
-            app.overlay = None;
-            app.flash = Some(format!("no files in {branch}"));
+            app.modals.overlay = None;
+            app.chrome.flash = Some(format!("no files in {branch}"));
             return;
         }
         Err(msg) => {
-            app.overlay = None;
-            app.flash = Some(msg);
+            app.modals.overlay = None;
+            app.chrome.flash = Some(msg);
             return;
         }
     };
-    match &mut app.overlay {
+    match &mut app.modals.overlay {
         Some(Overlay::Files(finder)) => finder.set_files(files),
         Some(Overlay::Tree(view)) => view.set_files(files),
         _ => {}
@@ -596,36 +597,36 @@ pub(crate) fn land_diff_listing(
     ticket: u64,
     result: Result<crate::view_jobs::DiffListing, String>,
 ) {
-    let probe = match &app.diff_probe {
-        Some((probed, ..)) if *probed == ticket => app.diff_probe.take(),
+    let probe = match &app.jobs.diff_probe {
+        Some((probed, ..)) if *probed == ticket => app.jobs.diff_probe.take(),
         _ => None,
     };
     if let Some((_, path, branch)) = probe {
         if let Ok(listing) = result {
-            if !listing.files.is_empty() && app.overlay.is_none() && app.vim.is_none() {
-                app.flash = None;
+            if !listing.files.is_empty() && app.modals.overlay.is_none() && app.pane.vim.is_none() {
+                app.chrome.flash = None;
                 show_diff_listing(app, path, branch, listing);
             }
         }
         return;
     }
-    let branch = match &app.overlay {
+    let branch = match &app.modals.overlay {
         Some(Overlay::Diff(view)) if view.listing == Some(ticket) => view.branch.clone(),
         _ => return,
     };
     match result {
         Ok(listing) if !listing.files.is_empty() => {
-            if let Some(Overlay::Diff(view)) = &mut app.overlay {
+            if let Some(Overlay::Diff(view)) = &mut app.modals.overlay {
                 crate::git_diff::fill_view(view, listing);
             }
         }
         Ok(_) => {
-            app.overlay = None;
-            app.flash = Some(format!("no changes in {branch}"));
+            app.modals.overlay = None;
+            app.chrome.flash = Some(format!("no changes in {branch}"));
         }
         Err(msg) => {
-            app.overlay = None;
-            app.flash = Some(msg);
+            app.modals.overlay = None;
+            app.chrome.flash = Some(msg);
         }
     }
 }
@@ -635,7 +636,7 @@ pub(crate) fn land_diff_listing(
 /// editor opens, so quitting the editor is a single Esc; with it off the
 /// overlay stays open underneath and quitting lands back on the results.
 pub(crate) fn open_selected_hit_in_editor(app: &mut App) {
-    let Some(Overlay::Grep(view)) = &app.overlay else {
+    let Some(Overlay::Grep(view)) = &app.modals.overlay else {
         return;
     };
     let Some(hit) = view.selected_hit() else {
@@ -656,7 +657,7 @@ pub(crate) fn open_selected_hit_in_editor(app: &mut App) {
 /// results on screen rather than dismiss them for nothing.
 pub(crate) fn close_finder_behind_editor(app: &mut App) {
     if crate::config::Config::load().close_finder_on_open {
-        app.overlay = None;
+        app.modals.overlay = None;
     }
 }
 
@@ -672,18 +673,27 @@ pub(crate) fn spawn_editor_modal(
     line: u64,
     size: (u16, u16),
 ) -> bool {
-    let Some(tx) = app.vim_tx.clone() else {
+    let Some(tx) = app.pane.vim_tx.clone() else {
         return false;
     };
     let (cols, rows) = size;
-    app.vim_generation += 1;
-    match VimTerm::spawn_editor(editor, root, file, line, cols, rows, app.vim_generation, tx) {
+    app.pane.vim_generation += 1;
+    match VimTerm::spawn_editor(
+        editor,
+        root,
+        file,
+        line,
+        cols,
+        rows,
+        app.pane.vim_generation,
+        tx,
+    ) {
         Ok(vim) => {
-            app.vim = Some(vim);
+            app.pane.vim = Some(vim);
             true
         }
         Err(msg) => {
-            app.flash = Some(msg);
+            app.chrome.flash = Some(msg);
             false
         }
     }
@@ -698,7 +708,7 @@ pub(crate) fn spawn_editor_modal(
 /// — since a `.md` is usually opened to be read; anything else goes
 /// straight to the editor modal.
 pub(crate) fn open_selected_file(app: &mut App) {
-    let Some(Overlay::Files(finder)) = &app.overlay else {
+    let Some(Overlay::Files(finder)) = &app.modals.overlay else {
         return;
     };
     let Some(path) = finder.selected_path().map(str::to_string) else {
@@ -714,7 +724,7 @@ pub(crate) fn open_selected_file(app: &mut App) {
 }
 
 pub(crate) fn open_selected_file_in_editor(app: &mut App) {
-    let Some(Overlay::Files(finder)) = &app.overlay else {
+    let Some(Overlay::Files(finder)) = &app.modals.overlay else {
         return;
     };
     let Some(path) = finder.selected_path().map(str::to_string) else {
@@ -732,7 +742,7 @@ pub(crate) fn open_selected_file_in_editor(app: &mut App) {
 /// preview pane — the pane becomes vim, keys flow to it, and quitting lands
 /// back on the tree with the preview reloaded.
 pub(crate) fn open_selected_tree_file_in_editor(app: &mut App) {
-    let Some(Overlay::Tree(view)) = &app.overlay else {
+    let Some(Overlay::Tree(view)) = &app.modals.overlay else {
         return;
     };
     let Some(path) = view
@@ -751,7 +761,7 @@ pub(crate) fn open_selected_tree_file_in_editor(app: &mut App) {
         vim_size_guess(app) // never drawn yet
     };
     if spawn_editor_modal(app, &editor, &root, &path, 1, size) {
-        if let Some(vim) = &mut app.vim {
+        if let Some(vim) = &mut app.pane.vim {
             vim.embedded = true;
         }
     }
@@ -761,8 +771,8 @@ pub(crate) fn open_selected_tree_file_in_editor(app: &mut App) {
 /// from the last-drawn body rect (`VIM_MODAL_PCT` of the frame, minus the
 /// border). `sync_vim_size` trues it up after the real draw.
 pub(crate) fn vim_size_guess(app: &App) -> (u16, u16) {
-    let frame_w = app.body_area.width;
-    let frame_h = app.body_area.height + 2; // + footer row and its padding
+    let frame_w = app.chrome.body_area.width;
+    let frame_h = app.chrome.body_area.height + 2; // + footer row and its padding
     let cols = (frame_w * ui::VIM_MODAL_PCT.0 / 100)
         .saturating_sub(2)
         .max(MIN_PANE_DIM);
@@ -780,11 +790,11 @@ pub(crate) fn vim_size_guess(app: &App) -> (u16, u16) {
 /// and the page has no row for it.
 pub(crate) fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
     let Some(root) = attached_worktree_root(app) else {
-        app.flash = Some("no worktree for this session".into());
+        app.chrome.flash = Some("no worktree for this session".into());
         return;
     };
     let Some(file) = resolve_file_link(&root, path) else {
-        app.flash = Some(format!("file not found: {path}"));
+        app.chrome.flash = Some(format!("file not found: {path}"));
         return;
     };
     if crate::markdown::is_markdown_path(&file) {
@@ -801,7 +811,7 @@ pub(crate) fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
 /// Worktree root of the attached agent or shell; falls back to the
 /// selected worktree when nothing is attached (or it isn't in the tree yet).
 pub(crate) fn attached_worktree_root(app: &App) -> Option<std::path::PathBuf> {
-    let worktree_id = app.term.as_ref().and_then(|t| match &t.sref {
+    let worktree_id = app.pane.term.as_ref().and_then(|t| match &t.sref {
         SessionRef::Agent(id) => app
             .tree
             .agents

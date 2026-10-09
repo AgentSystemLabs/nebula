@@ -4,7 +4,7 @@ use super::*;
 
 pub(crate) fn submit_prompt_now(app: &mut App, kind: PromptKind, out: &mut Vec<ClientRequest>) {
     open_prompt(app, kind);
-    if let Some(Overlay::Prompt(prompt)) = app.overlay.take() {
+    if let Some(Overlay::Prompt(prompt)) = app.modals.overlay.take() {
         submit_prompt(app, prompt, out);
     }
 }
@@ -79,8 +79,8 @@ fn prompt_value_or_cancel(app: &mut App, prompt: PromptDialog) -> Option<(Prompt
             None
         };
         if let Some(error) = error {
-            app.flash = Some(error);
-            app.overlay = Some(Overlay::Prompt(prompt));
+            app.chrome.flash = Some(error);
+            app.modals.overlay = Some(Overlay::Prompt(prompt));
             return None;
         }
     }
@@ -116,7 +116,7 @@ fn prompt_value_or_cancel(app: &mut App, prompt: PromptDialog) -> Option<(Prompt
             }
             _ => {}
         }
-        app.flash = Some("cancelled: empty input".into());
+        app.chrome.flash = Some("cancelled: empty input".into());
         return None;
     }
     Some((prompt, value))
@@ -160,7 +160,7 @@ fn dispatch_prompt(
             // The row first, selected as the Ack would leave it, so the
             // panel never waits on the DAEMON's fetch and `git worktree
             // add`. An Error takes it down and hands this box back.
-            let focus = app.focus;
+            let focus = app.nav.focus;
             app.bring_tab_forward(&project);
             let placeholder =
                 placeholder::stage_worktree(app, project.clone(), branch.clone(), out);
@@ -313,7 +313,7 @@ pub(crate) fn run_pending_action(
 ) {
     match action {
         PendingAction::LocateProjectPath { id, old_path } => {
-            app.dismissed_repath_projects.remove(&id);
+            app.launcher.dismissed_repath_projects.remove(&id);
             open_prompt(app, PromptKind::SetProjectPath { id, old_path });
         }
         PendingAction::CreateProjectDir(path) | PendingAction::InitProjectRepo(path) => {
@@ -384,8 +384,10 @@ pub(crate) fn run_pending_action(
             if index < presets.len() {
                 let removed = presets.remove(index);
                 match crate::agent_presets::save(&presets) {
-                    Ok(()) => app.flash = Some(format!("deleted preset '{}'", removed.name)),
-                    Err(err) => app.flash = Some(format!("could not save agent presets: {err}")),
+                    Ok(()) => app.chrome.flash = Some(format!("deleted preset '{}'", removed.name)),
+                    Err(err) => {
+                        app.chrome.flash = Some(format!("could not save agent presets: {err}"))
+                    }
                 }
             }
             crate::preset_overlays::reopen_presets_list(
@@ -396,7 +398,7 @@ pub(crate) fn run_pending_action(
             );
         }
         PendingAction::ResetSettings => reset_settings(app),
-        PendingAction::Quit => app.should_quit = true,
+        PendingAction::Quit => app.chrome.should_quit = true,
     }
 }
 
@@ -481,7 +483,7 @@ pub(crate) fn with_worktree_offer(
         return dialog;
     }
     let force = crate::config::Config::load().delete_empty_worktree;
-    if app.show_all_worktrees && !force {
+    if app.launcher.show_all_worktrees && !force {
         return dialog;
     }
     let archived = app
@@ -568,7 +570,7 @@ pub(crate) fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<C
         MenuAction::UnarchiveAgent(id) => activate::unarchive(app, id, out),
         MenuAction::DeleteAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(confirm_delete_agent_in(app, &a)));
+                app.modals.overlay = Some(Overlay::Confirm(confirm_delete_agent_in(app, &a)));
             }
         }
         MenuAction::NewAgent(worktree) => open_new_agent_picker(app, worktree),
@@ -576,7 +578,7 @@ pub(crate) fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<C
         MenuAction::RenameTerminal(id) => open_prompt(app, PromptKind::RenameTerminal { id }),
         MenuAction::CloseTerminal(id) => {
             if let Some(t) = app.tree.terminals.iter().find(|t| t.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(confirm_close_terminal_in(app, &t)));
+                app.modals.overlay = Some(Overlay::Confirm(confirm_close_terminal_in(app, &t)));
             }
         }
         MenuAction::NewAgentOfKind {
@@ -726,7 +728,7 @@ pub(crate) fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<C
         MenuAction::OpenProject(id) => launcher::open_project(app, &id, out),
         MenuAction::RemoveProject(id) => {
             if let Some(p) = app.tree.projects.iter().find(|p| p.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(confirm_remove_project(&p.name, id)));
+                app.modals.overlay = Some(Overlay::Confirm(confirm_remove_project(&p.name, id)));
             }
         }
         MenuAction::ToggleArchived => toggle_archived(app, out),

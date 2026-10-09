@@ -18,7 +18,7 @@ use crate::app::{App, Overlay};
 
 /// The box `overlay` was last drawn in.
 ///
-/// `ui::draw_overlay` matches on a *clone* of `app.overlay`, so each arm
+/// `ui::draw_overlay` matches on a *clone* of `app.modals.overlay`, so each arm
 /// writes its rect back into the live overlay when it is done; a variant
 /// that has not been drawn yet still holds the zero rect it was built with.
 pub(crate) fn overlay_area(overlay: &Overlay) -> Rect {
@@ -62,7 +62,7 @@ pub(crate) fn click_is_outside(overlay: &Overlay, pos: Position) -> bool {
 /// AGENT PRESETS list in QUICK PROMPT picker mode hands the box back with
 /// its text, and the PRESET EDITOR backs out to its list.
 pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
-    match &app.overlay {
+    match &app.modals.overlay {
         None => {}
         // Closing the SETTINGS OVERLAY stamps the row to reopen on, however
         // it closes.
@@ -75,7 +75,7 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
         // would only clear a typed query first.
         Some(Overlay::ProjectPicker(picker)) => {
             let back = picker.back.clone();
-            app.overlay = None;
+            app.modals.overlay = None;
             crate::quick_prompt::reopen(app, back.launch, &back.text);
         }
         // Nothing to unwind on the way out.
@@ -90,7 +90,7 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
             | Overlay::Metrics(_)
             | Overlay::Hosts(_)
             | Overlay::BranchSwitch(_),
-        ) => app.overlay = None,
+        ) => app.modals.overlay = None,
         // Confirm, Prompt, the AGENT PRESETS list and the PRESET EDITOR each
         // have a side effect on the way out that their own Esc already
         // spells out; none of the four stages it. The ISSUES MODAL's Esc
@@ -119,13 +119,13 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// that leaves one of them. Nothing can trap the user in it: the strip's
 /// Ctrl+Q is unconditional.
 pub(crate) fn force_close(app: &mut App) -> bool {
-    if let Some(Overlay::FileTabs(view)) = &mut app.overlay {
+    if let Some(Overlay::FileTabs(view)) = &mut app.modals.overlay {
         if !view.on_tabs {
             view.on_tabs = true;
             return true;
         }
     }
-    let Some(overlay) = &app.overlay else {
+    let Some(overlay) = &app.modals.overlay else {
         return false;
     };
     // The one thing the unlock does hand back: a QUICK PROMPT's typed text,
@@ -134,10 +134,10 @@ pub(crate) fn force_close(app: &mut App) -> bool {
     let parked = quick_draft(overlay);
     match overlay {
         Overlay::Settings(_) => crate::event_loop::close_settings(app),
-        _ => app.overlay = None,
+        _ => app.modals.overlay = None,
     }
     if let Some(draft) = parked {
-        app.quick_draft = Some(draft);
+        app.modals.quick_draft = Some(draft);
     }
     true
 }
@@ -157,7 +157,7 @@ fn quick_draft(overlay: &Overlay) -> Option<crate::quick_prompt::QuickDraft> {
 /// NEW SESSION PICKER, which owes a box it never showed
 /// (`QuickReturn::from_box`).
 fn close_menu(app: &mut App) {
-    let Some(Overlay::Menu(menu)) = &mut app.overlay else {
+    let Some(Overlay::Menu(menu)) = &mut app.modals.overlay else {
         return;
     };
     // The return trip is pinned to the root picker's rows, so walk up first.
@@ -165,7 +165,7 @@ fn close_menu(app: &mut App) {
         *menu = *parent;
     }
     let back = crate::event_loop::menu_quick_return(menu).filter(|back| back.from_box);
-    app.overlay = None;
+    app.modals.overlay = None;
     if let Some(back) = back {
         crate::quick_prompt::reopen(app, back.launch, &back.text);
     }

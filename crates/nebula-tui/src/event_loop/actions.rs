@@ -5,13 +5,13 @@ use super::*;
 pub(crate) fn handle_vim_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl && key.code == KeyCode::Char('q') {
-        if let Some(vim) = &mut app.vim {
+        if let Some(vim) = &mut app.pane.vim {
             vim.kill();
         }
         close_vim(app);
         return;
     }
-    if let Some(vim) = &mut app.vim {
+    if let Some(vim) = &mut app.pane.vim {
         if let Some(data) = keys::encode_key(&key, 0) {
             vim.input(&data);
         }
@@ -30,7 +30,7 @@ pub(crate) fn handle_vim_key(app: &mut App, key: KeyEvent) {
 /// key can arm the RELEASE WATCH.
 pub(crate) fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) -> bool {
     if let Some(band) = crate::launcher::nested_thread(app, &SessionRef::Agent(id.clone())) {
-        app.overlay = Some(Overlay::Confirm(confirm_archive_thread(&band)));
+        app.modals.overlay = Some(Overlay::Confirm(confirm_archive_thread(&band)));
         return false;
     }
     if !crate::config::Config::load().ask_before_archive {
@@ -38,7 +38,7 @@ pub(crate) fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequ
         return true;
     }
     if let Some(a) = app.tree.agents.iter().find(|a| a.id == id) {
-        app.overlay = Some(Overlay::Confirm(confirm_archive_agent(&a.name, id)));
+        app.modals.overlay = Some(Overlay::Confirm(confirm_archive_agent(&a.name, id)));
     }
     false
 }
@@ -162,12 +162,12 @@ pub(crate) fn toggle_open_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
     // group folds, and leaves them again when it opens: the cursor keeps
     // the checkout, wherever the fold puts it.
     let checkout = app.selected_worktree().map(|w| w.id.clone());
-    app.open_prs_collapsed = !app.open_prs_collapsed;
+    app.launcher.open_prs_collapsed = !app.launcher.open_prs_collapsed;
     follow_checkout(app, checkout.as_ref());
     if on_pr {
         // The last checkout — not the last row, which with an ISSUES
         // group open below would be an issue.
-        app.sel_worktree = last_checkout_row(app);
+        app.nav.sel_worktree = last_checkout_row(app);
         if app.selected_worktree().is_some() {
             restore_session(app, out);
             // A fold is an explicit act, like an archive: the row the
@@ -177,7 +177,7 @@ pub(crate) fn toggle_open_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
         }
         schedule_pr_detail(app);
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// The last checkout row of the Worktrees panel — where a fold lands a
@@ -197,15 +197,15 @@ pub(crate) fn last_checkout_row(app: &App) -> usize {
 /// comes back the way the OPEN PRS fold brings it back.
 pub(crate) fn toggle_issues(app: &mut App, out: &mut Vec<ClientRequest>) {
     let on_issue = app.selected_worktree_issue().is_some();
-    app.issues_collapsed = !app.issues_collapsed;
+    app.launcher.issues_collapsed = !app.launcher.issues_collapsed;
     if on_issue {
-        app.sel_worktree = app.worktree_row_count().saturating_sub(1);
+        app.nav.sel_worktree = app.worktree_row_count().saturating_sub(1);
         if app.selected_worktree().is_some() {
             restore_session(app, out);
             fire_pending_attach(app, out);
         }
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// Re-seat the Worktrees cursor on checkout `id` after the rows regrouped
@@ -217,9 +217,9 @@ pub(crate) fn toggle_issues(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// left for the caller's own landing.
 pub(crate) fn follow_checkout(app: &mut App, id: Option<&WorktreeId>) {
     if let Some(i) = id.and_then(|id| app.worktree_row_of(id)) {
-        if app.sel_worktree != i {
-            app.sel_worktree = i;
-            app.dirty = true;
+        if app.nav.sel_worktree != i {
+            app.nav.sel_worktree = i;
+            app.chrome.dirty = true;
         }
     }
 }
@@ -230,7 +230,7 @@ pub(crate) fn follow_checkout(app: &mut App, id: Option<&WorktreeId>) {
 /// attaches it, so one keypress lands in a ready shell.
 pub(crate) fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
     let Some(worktree) = worktree_in_context(app) else {
-        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        app.chrome.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
     create_terminal(app, worktree, out);
@@ -239,7 +239,7 @@ pub(crate) fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientReq
 /// Ask the daemon for a shell terminal in `worktree`; the Ack attaches it.
 pub(crate) fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequest>) {
     if app.is_placeholder_worktree(&worktree) {
-        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        app.chrome.flash = Some(WORKTREE_STILL_CREATING.into());
         return;
     }
     worked_in(app, &worktree);
@@ -261,7 +261,7 @@ pub(crate) fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec
 /// The worktree the selection stands for: the selected one, or the selected
 /// project's main checkout (root) when the Projects panel has focus.
 pub(crate) fn worktree_in_context(app: &App) -> Option<WorktreeId> {
-    match app.focus {
+    match app.nav.focus {
         Focus::Projects => app
             .selected_project()
             .and_then(|p| app.root_worktree(&p.id)),
@@ -270,10 +270,10 @@ pub(crate) fn worktree_in_context(app: &App) -> Option<WorktreeId> {
 }
 
 pub(crate) fn open_delete_confirm(app: &mut App) {
-    match app.focus {
+    match app.nav.focus {
         Focus::Projects => {
             if let Some(p) = app.selected_project() {
-                app.overlay = Some(Overlay::Confirm(confirm_remove_project(
+                app.modals.overlay = Some(Overlay::Confirm(confirm_remove_project(
                     &p.name,
                     p.id.clone(),
                 )));
@@ -290,10 +290,10 @@ pub(crate) fn open_delete_confirm(app: &mut App) {
             Some(id) => activate::delete_worktree(app, &id),
             None => match app.selected_session_row() {
                 Some(SessionRow::Agent(a)) => {
-                    app.overlay = Some(Overlay::Confirm(confirm_delete_agent_in(app, &a)));
+                    app.modals.overlay = Some(Overlay::Confirm(confirm_delete_agent_in(app, &a)));
                 }
                 Some(SessionRow::Terminal(t)) => {
-                    app.overlay = Some(Overlay::Confirm(confirm_close_terminal_in(app, &t)));
+                    app.modals.overlay = Some(Overlay::Confirm(confirm_close_terminal_in(app, &t)));
                 }
                 Some(SessionRow::Link(l)) => delete_link(app, &l),
                 None => {}
@@ -353,7 +353,9 @@ pub(crate) fn confirm_remove_project(name: &str, id: ProjectId) -> ConfirmDialog
 pub(crate) fn edit_link(app: &mut App, row: &LinkRow) {
     match row.id() {
         Some(id) => open_prompt(app, PromptKind::EditLink { id: id.clone() }),
-        None => app.flash = Some("the pull request comes from git and can't be edited".into()),
+        None => {
+            app.chrome.flash = Some("the pull request comes from git and can't be edited".into())
+        }
     }
 }
 
@@ -362,10 +364,11 @@ pub(crate) fn edit_link(app: &mut App, row: &LinkRow) {
 /// lookup.
 pub(crate) fn delete_link(app: &mut App, row: &LinkRow) {
     let Some(id) = row.id() else {
-        app.flash = Some("the pull request link can't be deleted — it comes from git".into());
+        app.chrome.flash =
+            Some("the pull request link can't be deleted — it comes from git".into());
         return;
     };
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+    app.modals.overlay = Some(Overlay::Confirm(ConfirmDialog {
         title: "Delete link".into(),
         message: format!(
             "Delete link '{}'? Nothing it points at is touched.",
@@ -400,7 +403,7 @@ pub(crate) fn bulk_confirm_listing(names: &[String]) -> String {
 /// of the selected project, or all sessions the panel shows. The dialog
 /// itemizes the casualties so the blast radius is unmistakable.
 pub(crate) fn open_delete_all_confirm(app: &mut App) {
-    match app.focus {
+    match app.nav.focus {
         Focus::Worktrees => {
             let doomed: Vec<&nebula_core::Worktree> = app
                 .visible_worktrees()
@@ -408,7 +411,7 @@ pub(crate) fn open_delete_all_confirm(app: &mut App) {
                 .filter(|w| !w.is_main)
                 .collect();
             if doomed.is_empty() {
-                app.flash = Some("no deletable worktrees (the main checkout stays)".into());
+                app.chrome.flash = Some("no deletable worktrees (the main checkout stays)".into());
                 return;
             }
             let killed = app
@@ -425,7 +428,7 @@ pub(crate) fn open_delete_all_confirm(app: &mut App) {
                     .count();
             let names: Vec<String> = doomed.iter().map(|w| w.branch.clone()).collect();
             let ids: Vec<WorktreeId> = doomed.iter().map(|w| w.id.clone()).collect();
-            app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+            app.modals.overlay = Some(Overlay::Confirm(ConfirmDialog {
                 title: format!("Delete ALL {} worktree(s)", ids.len()),
                 message: format!(
                     "Delete these {} worktree(s) from disk? {killed} session(s) will be killed.\n{}\nThe main checkout stays.",
@@ -441,7 +444,7 @@ pub(crate) fn open_delete_all_confirm(app: &mut App) {
             // rows only when the archived toggle has them visible.
             let doomed = app.visible_session_rows();
             if doomed.is_empty() {
-                app.flash = Some("no sessions to delete".into());
+                app.chrome.flash = Some("no sessions to delete".into());
                 return;
             }
             // Links are bookmarks, not sessions: `D` never touches them.
@@ -450,7 +453,7 @@ pub(crate) fn open_delete_all_confirm(app: &mut App) {
                 .filter(|r| r.as_link().is_none())
                 .collect();
             if doomed.is_empty() {
-                app.flash = Some("no sessions to delete".into());
+                app.chrome.flash = Some("no sessions to delete".into());
                 return;
             }
             let names: Vec<String> = doomed.iter().map(|r| r.name().to_string()).collect();
@@ -484,7 +487,7 @@ pub(crate) fn open_delete_all_confirm(app: &mut App) {
                 Some(wt) => with_worktree_offer(app, dialog, &wt, live_taken),
                 None => dialog,
             };
-            app.overlay = Some(Overlay::Confirm(dialog));
+            app.modals.overlay = Some(Overlay::Confirm(dialog));
         }
         Focus::Projects | Focus::Terminal => {}
     }
@@ -629,7 +632,7 @@ pub(crate) fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
     if items.is_empty() {
         return;
     }
-    app.overlay = Some(Overlay::Menu(ContextMenu {
+    app.modals.overlay = Some(Overlay::Menu(ContextMenu {
         title: None,
         items,
         at: Some(at),
@@ -653,7 +656,7 @@ pub(crate) fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
     // A stand-in checkout is not a place the DAEMON knows yet; better to
     // say so here than after a kind and a model were picked.
     if app.is_placeholder_worktree(&worktree) {
-        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        app.chrome.flash = Some(WORKTREE_STILL_CREATING.into());
         return;
     }
     // Only the AGENT KINDS still enabled in the SETTINGS OVERLAY's Agents
@@ -677,7 +680,7 @@ pub(crate) fn open_pr_agent_picker(app: &mut App) {
         return;
     };
     let Some(worktree) = selected_project_main_worktree(app) else {
-        app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
+        app.chrome.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
         return;
     };
     agent_picker::open_kind_picker(app, KindPicker::pr_session(worktree, &pr));
@@ -914,8 +917,8 @@ pub(crate) fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
                 }
                 // And drafts to hide — or, once hidden, a way back that
                 // doesn't need the list to still hold one.
-                if app.hide_draft_prs || app.all_open_prs().iter().any(|pr| pr.is_draft) {
-                    let label = if app.hide_draft_prs {
+                if app.launcher.hide_draft_prs || app.all_open_prs().iter().any(|pr| pr.is_draft) {
+                    let label = if app.launcher.hide_draft_prs {
                         "Show draft PRs"
                     } else {
                         "Hide draft PRs"
@@ -975,6 +978,6 @@ pub(crate) fn select_session_row(
     debounce: Duration,
     out: &mut Vec<ClientRequest>,
 ) {
-    app.sel_session = i;
+    app.nav.sel_session = i;
     preview_inner(app, debounce, out);
 }

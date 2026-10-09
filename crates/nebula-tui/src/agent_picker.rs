@@ -111,7 +111,7 @@ pub(crate) fn enabled_harnesses_or_flash(app: &mut App, cfg: &Config) -> Option<
         .map(|(kind, custom)| HarnessRow { kind, custom })
         .collect();
     if rows.is_empty() {
-        app.flash = Some(NO_HARNESS_FLASH.into());
+        app.chrome.flash = Some(NO_HARNESS_FLASH.into());
         return None;
     }
     Some(rows)
@@ -203,7 +203,7 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
         quick.as_deref(),
         harness_label,
     );
-    app.overlay = Some(Overlay::Menu(ContextMenu {
+    app.modals.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some(title),
         items,
         at: None,
@@ -351,8 +351,8 @@ mod tests {
             let worktree = WorktreeId("w1".into());
             let mut app = App::new();
             open_kind_picker(&mut app, KindPicker::new_session(worktree));
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("{:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("{:?}", app.modals.overlay);
             };
             let names = labels(menu);
             assert_eq!(names.last(), Some(&"Agy"));
@@ -383,8 +383,8 @@ mod tests {
             let worktree = WorktreeId("w1".into());
             let mut app = App::new();
             open_kind_picker(&mut app, KindPicker::new_session(worktree.clone()));
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("{:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("{:?}", app.modals.overlay);
             };
             assert!(labels(menu).contains(&"Agy"));
 
@@ -394,8 +394,8 @@ mod tests {
             cfg.save().unwrap();
 
             open_kind_picker(&mut app, KindPicker::new_session(worktree));
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("{:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("{:?}", app.modals.overlay);
             };
             assert!(!labels(menu).contains(&"Agy"), "{:?}", labels(menu));
 
@@ -430,8 +430,8 @@ mod tests {
             assert!(offered.starts_with(&["Claude", "Cursor"]), "{offered:?}");
 
             open_kind_picker(&mut app, KindPicker::new_session(worktree.clone()));
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("{:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("{:?}", app.modals.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("New session"));
             assert_eq!(labels(menu), offered);
@@ -441,8 +441,8 @@ mod tests {
                 &mut app,
                 KindPicker::pr_session(worktree.clone(), &open_pr()),
             );
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("{:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("{:?}", app.modals.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("New PR session · #7"));
             assert_eq!(labels(menu), offered);
@@ -472,8 +472,8 @@ mod tests {
                 &mut app,
                 KindPicker::quick_prompt(worktree.clone(), back.clone()),
             );
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("{:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("{:?}", app.modals.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("Quick prompt agent"));
             assert_eq!(labels(menu), offered);
@@ -497,8 +497,8 @@ mod tests {
                     },
                 ),
             );
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("{:?}", app.overlay);
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("{:?}", app.modals.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("New session"));
             assert_eq!(labels(menu), offered);
@@ -542,7 +542,7 @@ mod tests {
                     from_box: true,
                 };
                 open_kind_picker(app, KindPicker::quick_prompt(worktree.clone(), back));
-                match &app.overlay {
+                match &app.modals.overlay {
                     Some(Overlay::Menu(menu)) => menu.clone(),
                     other => panic!("{other:?}"),
                 }
@@ -576,7 +576,7 @@ mod tests {
         let worktree = WorktreeId("w1".into());
         let pr = open_pr();
         fn hover_of(app: &App) -> usize {
-            match &app.overlay {
+            match &app.modals.overlay {
                 Some(Overlay::Menu(menu)) => menu.hover,
                 other => panic!("expected a picker, got {other:?}"),
             }
@@ -631,8 +631,8 @@ mod tests {
             || {
                 let mut app = App::new();
                 open_kind_picker(&mut app, KindPicker::new_session(worktree.clone()));
-                let Some(Overlay::Menu(menu)) = &app.overlay else {
-                    panic!("{:?}", app.overlay);
+                let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                    panic!("{:?}", app.modals.overlay);
                 };
                 assert_eq!(
                     labels(menu),
@@ -656,8 +656,8 @@ mod tests {
                 let worktree = WorktreeId("w1".into());
                 let mut app = App::new();
                 open_kind_picker(&mut app, KindPicker::new_session(worktree.clone()));
-                assert!(app.overlay.is_none(), "{:?}", app.overlay);
-                assert_eq!(app.flash.as_deref(), Some(NO_HARNESS_FLASH));
+                assert!(app.modals.overlay.is_none(), "{:?}", app.modals.overlay);
+                assert_eq!(app.chrome.flash.as_deref(), Some(NO_HARNESS_FLASH));
                 assert!(pr_session_menu_rows(worktree, &open_pr()).is_empty());
             },
         );

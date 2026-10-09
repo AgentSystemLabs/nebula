@@ -88,7 +88,7 @@ pub fn rows(app: &App) -> Vec<LauncherRow> {
     // two lists never mix — a grid of cards has no room for a group
     // header to fold, and an archived card answers to none of the keys a
     // live one does.
-    let want_archived = app.show_archived;
+    let want_archived = app.launcher.show_archived;
     let mut rows: Vec<LauncherRow> = app
         .tree
         .agents
@@ -104,7 +104,7 @@ pub fn rows(app: &App) -> Vec<LauncherRow> {
     // A stable pass over the top of it, so the launch just fired is the
     // top left card from the moment its row arrives — see
     // `App::just_launched`.
-    if let Some(id) = &app.just_launched {
+    if let Some(id) = &app.requests.just_launched {
         rows.sort_by_key(|r| &r.agent.id != id);
     }
     rows
@@ -166,7 +166,7 @@ fn row_of(
 /// row on the same head branch, which the selected project has before
 /// its own lookup lands.
 fn row_pr(app: &App, worktree: &WorktreeId, project: &ProjectId, branch: &str) -> Option<RowPr> {
-    if let Some(Some(pr)) = app.pull_requests.get(worktree) {
+    if let Some(Some(pr)) = app.github.pull_requests.get(worktree) {
         return Some(RowPr {
             number: pr.number,
             title: pr.title.clone(),
@@ -175,7 +175,7 @@ fn row_pr(app: &App, worktree: &WorktreeId, project: &ProjectId, branch: &str) -
             trouble: pr.trouble(),
         });
     }
-    let listed = app.open_prs.get(project)?;
+    let listed = app.github.open_prs.get(project)?;
     let pr = listed.list.iter().find(|pr| pr.head == branch)?;
     Some(RowPr {
         number: pr.number,
@@ -284,7 +284,7 @@ pub fn bands(app: &App) -> Vec<Band> {
             .cloned()
             .map(Card::Session)
             .collect();
-        if !app.show_archived {
+        if !app.launcher.show_archived {
             cards.extend(
                 app.tree
                     .terminals
@@ -294,7 +294,7 @@ pub fn bands(app: &App) -> Vec<Band> {
                     .map(Card::Terminal),
             );
         }
-        if cards.is_empty() && (app.show_archived || !app.show_all_worktrees) {
+        if cards.is_empty() && (app.launcher.show_archived || !app.launcher.show_all_worktrees) {
             continue;
         }
         let band = Band {
@@ -305,7 +305,7 @@ pub fn bands(app: &App) -> Vec<Band> {
             pr: row_pr(app, &w.id, &project.id, &w.branch),
             cards: Vec::new(),
         };
-        if app.launcher_nested && w.is_main && !cards.is_empty() {
+        if app.launcher.launcher_nested && w.is_main && !cards.is_empty() {
             out.extend(cards.into_iter().map(|card| Band {
                 solo: true,
                 cards: vec![card],
@@ -323,7 +323,7 @@ pub fn bands(app: &App) -> Vec<Band> {
     }
     // The NESTED layout is a list of threads, the one that moved last on
     // top. Stable, so threads that never moved keep the checkouts' order.
-    if app.launcher_nested {
+    if app.launcher.launcher_nested {
         out.sort_by_key(|band| std::cmp::Reverse(thread_activity(band)));
     }
     out
@@ -1370,7 +1370,7 @@ pub fn thread_activity(band: &Band) -> i64 {
 /// in it. None on a child, on a thread that is only its root, in the
 /// other layouts and in the ARCHIVED VIEW, where either takes one card.
 pub fn nested_thread(app: &App, sref: &SessionRef) -> Option<Band> {
-    if !app.launcher_nested || app.show_archived {
+    if !app.launcher.launcher_nested || app.launcher.show_archived {
         return None;
     }
     bands(app).into_iter().find(|band| {
@@ -1733,7 +1733,8 @@ pub struct ProjectTab {
 /// prunes it.
 pub fn project_tabs(app: &App) -> Vec<ProjectTab> {
     let active = app.selected_project().map(|p| p.id.clone());
-    app.launcher_tabs
+    app.launcher
+        .launcher_tabs
         .iter()
         .filter_map(|id| {
             let p = app.tree.projects.iter().find(|p| &p.id == id)?;
@@ -1742,8 +1743,8 @@ pub fn project_tabs(app: &App) -> Vec<ProjectTab> {
                 name: p.name.clone(),
                 tally: project_tally(app, id),
                 active: active.as_ref() == Some(id),
-                focused: app.launcher_tab_cursor.as_ref() == Some(id),
-                drop: app.card_drag.as_ref().is_some_and(|d| {
+                focused: app.launcher.launcher_tab_cursor.as_ref() == Some(id),
+                drop: app.launcher.card_drag.as_ref().is_some_and(|d| {
                     d.active && d.over.is_some() && d.over_tab.as_ref() == Some(id)
                 }),
             })
@@ -1771,7 +1772,7 @@ pub fn checkout_for(app: &App, project: &ProjectId) -> Option<WorktreeId> {
         .filter(|p| &p.id == project)
         .and_then(|_| app.selected_worktree())
         .map(|w| w.id.clone());
-    let remembered = app.last_worktree_for_project.get(project).cloned();
+    let remembered = app.nav.last_worktree_for_project.get(project).cloned();
     let mut checkouts = app
         .tree
         .worktrees
@@ -2160,7 +2161,7 @@ mod tests {
             "off: what runs"
         );
 
-        app.show_all_worktrees = true;
+        app.launcher.show_all_worktrees = true;
         let bands = super::bands(&app);
         let idle = bands
             .iter()
@@ -2178,7 +2179,7 @@ mod tests {
             EMPTY_BAND_H
         );
 
-        app.show_archived = true;
+        app.launcher.show_archived = true;
         assert!(
             !branches(&app).contains(&"idle".to_string()),
             "archived view"
@@ -2213,7 +2214,7 @@ mod tests {
 
         // Switched to `web`, and the list is its one session instead —
         // the same cursor, one tab over.
-        app.sel_project = web_row(&app);
+        app.nav.sel_project = web_row(&app);
         assert_eq!(names(&super::rows(&app)), ["tidy-css"]);
 
         app.tree.agents[2].archived = true;
@@ -2301,12 +2302,12 @@ mod tests {
             "its own stamp puts it under every working session"
         );
 
-        app.just_launched = Some(AgentId("a5".into()));
+        app.requests.just_launched = Some(AgentId("a5".into()));
         assert_eq!(names(&rows(&app))[0], "poll-ci", "the launch leads");
 
         // Its first turn starts: the stamp holds it there on its own, so
         // the card does not move as the flag is dropped.
-        app.just_launched = None;
+        app.requests.just_launched = None;
         app.tree.agents[new_row].status = AgentStatus::Running;
         app.tree.agents[new_row].status_changed_at = now;
         assert_eq!(names(&rows(&app))[0], "poll-ci", "and keeps leading");
@@ -2341,7 +2342,7 @@ mod tests {
         let mut app = app();
         assert!(rows(&app).iter().all(|r| r.pr.is_none()));
 
-        app.pull_requests.insert(
+        app.github.pull_requests.insert(
             WorktreeId("w2".into()),
             Some(PullRequest {
                 number: 42,
@@ -2361,8 +2362,8 @@ mod tests {
         let mut app = self::app();
         // The open list is `web`'s, so the level has to be in `web` to
         // hold a row that reads it.
-        app.sel_project = web_row(&app);
-        app.open_prs.insert(
+        app.nav.sel_project = web_row(&app);
+        app.github.open_prs.insert(
             ProjectId("p2".into()),
             crate::app::OpenPrs {
                 list: vec![crate::pull_request::OpenPr {
@@ -2476,7 +2477,8 @@ mod tests {
         let api = ProjectId("p1".into());
         let root = QuickTarget::Worktree(WorktreeId("w1".into()));
         let feat = QuickTarget::Worktree(WorktreeId("w2".into()));
-        app.last_worktree_for_project
+        app.nav
+            .last_worktree_for_project
             .insert(api.clone(), WorktreeId("w2".into()));
         assert_eq!(
             target_for(&app, &api, false),
@@ -2484,7 +2486,7 @@ mod tests {
             "the cursor opens on the root's band, not the remembered one"
         );
         // The cursor on api's other checkout: the box goes there.
-        app.sel_worktree = app
+        app.nav.sel_worktree = app
             .worktree_rows()
             .iter()
             .position(|r| r.checkout().is_some_and(|w| w.id.0 == "w2"))
@@ -2496,9 +2498,9 @@ mod tests {
             "the checkout under the cursor"
         );
         // Collapsed or open, the band the cursor is on reads the same.
-        app.launcher_expanded = None;
+        app.launcher.launcher_expanded = None;
         assert_eq!(target_for(&app, &api, false), feat, "on the band");
-        app.launcher_expanded = Some(WorktreeId("w2".into()));
+        app.launcher.launcher_expanded = Some(WorktreeId("w2".into()));
         // Another project's box reads its own root, not this cursor.
         assert_eq!(
             target_for(&app, &ProjectId("p2".into()), false),
@@ -2506,9 +2508,9 @@ mod tests {
             "web's root"
         );
         // The aim let go: nothing under the cursor, so the root.
-        app.launcher_unaimed = true;
+        app.launcher.launcher_unaimed = true;
         assert_eq!(target_for(&app, &api, false), root, "unaimed");
-        app.launcher_unaimed = false;
+        app.launcher.launcher_unaimed = false;
         assert!(matches!(
             target_for(&app, &api, true),
             QuickTarget::NewWorktree { ref project, .. } if *project == api
@@ -2615,13 +2617,13 @@ mod tests {
         app.settle_project_tabs();
         assert_eq!(ids(&app), ["api"], "the project the view opened on");
 
-        app.sel_project = web_row(&app);
+        app.nav.sel_project = web_row(&app);
         app.settle_project_tabs();
         assert_eq!(ids(&app), ["web", "api"], "the newest opened leads");
 
         // Back to `api`: it is already open, so nothing moves — only which
         // tab is lit.
-        app.sel_project = app
+        app.nav.sel_project = app
             .project_rows()
             .iter()
             .position(|i| app.tree.projects[*i].id.0 == "p1")

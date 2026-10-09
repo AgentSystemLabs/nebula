@@ -206,7 +206,7 @@ pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io
 /// entry is armed to be re-asked as soon as its beat allows — see
 /// [`install`].
 pub fn hydrate(app: &mut App) {
-    let Some(store) = app.pr_cache.as_ref().and_then(PrCache::load_store) else {
+    let Some(store) = app.github.pr_cache.as_ref().and_then(PrCache::load_store) else {
         return;
     };
     install(app, store);
@@ -229,12 +229,12 @@ pub fn hydrate(app: &mut App) {
 ///   have fetched a missing body fetches a fresh copy over the top.
 pub fn install(app: &mut App, store: Store) {
     for (worktree, pr) in store.worktrees {
-        app.pull_requests.entry(worktree).or_insert(Some(pr));
+        app.github.pull_requests.entry(worktree).or_insert(Some(pr));
     }
     let now = std::time::Instant::now();
     let at = now.checked_sub(OPEN_PRS_MIN_AGE).unwrap_or(now);
     for (project, list) in store.projects {
-        if app.open_prs.contains_key(&project) {
+        if app.github.open_prs.contains_key(&project) {
             continue;
         }
         let step = if list.is_empty() {
@@ -242,7 +242,7 @@ pub fn install(app: &mut App, store: Store) {
         } else {
             OPEN_PRS_REFRESH
         };
-        app.open_prs.insert(
+        app.github.open_prs.insert(
             project,
             OpenPrs {
                 list,
@@ -253,13 +253,13 @@ pub fn install(app: &mut App, store: Store) {
         );
     }
     for (url, detail) in store.details {
-        if app.pr_detail.contains_key(&url) {
+        if app.github.pr_detail.contains_key(&url) {
             continue;
         }
-        app.pr_detail.insert(url.clone(), detail);
-        app.pr_detail_stale.insert(url);
+        app.github.pr_detail.insert(url.clone(), detail);
+        app.github.pr_detail_stale.insert(url);
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// The document as the app would write it now.
@@ -268,16 +268,18 @@ pub fn snapshot(app: &App) -> Store {
         version: VERSION,
         saved_at: now_secs(),
         worktrees: app
+            .github
             .pull_requests
             .iter()
             .filter_map(|(worktree, pr)| Some((worktree.clone(), pr.clone()?)))
             .collect(),
         projects: app
+            .github
             .open_prs
             .iter()
             .map(|(project, open)| (project.clone(), open.list.clone()))
             .collect(),
-        details: app.pr_detail.clone(),
+        details: app.github.pr_detail.clone(),
     }
 }
 
@@ -287,10 +289,10 @@ pub fn snapshot(app: &App) -> Store {
 /// taken, so the caller — the loop, off-thread; the quit path, inline —
 /// only ever writes once per change.
 pub fn take_flush(app: &mut App) -> Option<(PrCache, Store, HashSet<String>)> {
-    if !std::mem::take(&mut app.pr_cache_dirty) {
+    if !std::mem::take(&mut app.github.pr_cache_dirty) {
         return None;
     }
-    let cache = app.pr_cache.clone()?;
+    let cache = app.github.pr_cache.clone()?;
     Some((cache, snapshot(app), app.live_pr_urls()))
 }
 
@@ -308,7 +310,7 @@ pub fn write_all(cache: &PrCache, store: &Store, live: &HashSet<String>) {
 /// diff with files in it is worth keeping: an empty one is a flash, not a
 /// modal, and would be re-fetched to find that out anyway.
 pub fn remember_diff(app: &App, url: &str, diff: &str) {
-    let Some(cache) = &app.pr_cache else {
+    let Some(cache) = &app.github.pr_cache else {
         return;
     };
     if crate::pull_request::split_unified_diff(diff).is_empty() {
@@ -322,7 +324,7 @@ pub fn remember_diff(app: &App, url: &str, diff: &str) {
 /// The diff last read for `url`, when the app has a cache and kept one.
 /// Read on the loop: it is a local file, and `g` is waiting on it.
 pub fn recall_diff(app: &App, url: &str) -> Option<String> {
-    app.pr_cache.as_ref()?.load_diff(url)
+    app.github.pr_cache.as_ref()?.load_diff(url)
 }
 
 #[cfg(test)]
@@ -464,19 +466,20 @@ mod tests {
     fn hydration_paints_rows_and_arms_their_refresh() {
         let mut app = App::new();
         // A lookup that already answered for w1 wins over the cache.
-        app.pull_requests
+        app.github
+            .pull_requests
             .insert(WorktreeId("w1".into()), Some(pr(70, STATE_OPEN)));
         install(&mut app, store());
 
         assert_eq!(
-            app.pull_requests[&WorktreeId("w1".into())]
+            app.github.pull_requests[&WorktreeId("w1".into())]
                 .as_ref()
                 .map(|p| p.number),
             Some(70),
             "the live answer stays"
         );
         assert_eq!(
-            app.pull_requests[&WorktreeId("w2".into())]
+            app.github.pull_requests[&WorktreeId("w2".into())]
                 .as_ref()
                 .map(|p| p.badge()),
             Some("merged"),
@@ -489,22 +492,22 @@ mod tests {
 
         let p1 = ProjectId("p1".into());
         let p2 = ProjectId("p2".into());
-        assert_eq!(app.open_prs[&p1].list.len(), 2);
+        assert_eq!(app.github.open_prs[&p1].list.len(), 2);
         assert!(app.open_prs_lookup_due(&p1), "hydrated lists are due");
-        assert_eq!(app.open_prs[&p1].step, OPEN_PRS_REFRESH);
+        assert_eq!(app.github.open_prs[&p1].step, OPEN_PRS_REFRESH);
         assert_eq!(
-            app.open_prs[&p2].step, OPEN_PRS_RECHECK_MIN,
+            app.github.open_prs[&p2].step, OPEN_PRS_RECHECK_MIN,
             "an empty list resumes the backoff, not the steady beat"
         );
         assert!(
-            app.open_prs[&p1].at + OPEN_PRS_MIN_AGE <= std::time::Instant::now(),
+            app.github.open_prs[&p1].at + OPEN_PRS_MIN_AGE <= std::time::Instant::now(),
             "old enough that arriving at the project re-asks at once"
         );
 
         let url = detail(7).url;
-        assert!(app.pr_detail.contains_key(&url));
-        assert!(app.pr_detail_stale.contains(&url));
-        assert!(app.dirty);
+        assert!(app.github.pr_detail.contains_key(&url));
+        assert!(app.github.pr_detail_stale.contains(&url));
+        assert!(app.chrome.dirty);
     }
 
     /// What is written is what the app knows, minus the checkouts known to
@@ -513,7 +516,9 @@ mod tests {
     fn the_snapshot_writes_found_rows_only() {
         let mut app = App::new();
         install(&mut app, store());
-        app.pull_requests.insert(WorktreeId("w3".into()), None);
+        app.github
+            .pull_requests
+            .insert(WorktreeId("w3".into()), None);
         let snap = snapshot(&app);
         assert_eq!(snap.version, VERSION);
         let mut ids: Vec<&str> = snap.worktrees.keys().map(|w| w.as_str()).collect();
@@ -527,14 +532,14 @@ mod tests {
     #[test]
     fn a_flush_is_taken_once_per_change() {
         let mut app = App::new();
-        app.pr_cache_dirty = true;
+        app.github.pr_cache_dirty = true;
         assert!(take_flush(&mut app).is_none(), "no cache, nothing to write");
-        assert!(!app.pr_cache_dirty, "but the flag is spent");
+        assert!(!app.github.pr_cache_dirty, "but the flag is spent");
 
         let (_dir, cache) = cache();
-        app.pr_cache = Some(cache.clone());
+        app.github.pr_cache = Some(cache.clone());
         assert!(take_flush(&mut app).is_none(), "clean");
-        app.pr_cache_dirty = true;
+        app.github.pr_cache_dirty = true;
         let (to, store, _live) = take_flush(&mut app).expect("dirty");
         assert_eq!(to, cache);
         assert_eq!(store.version, VERSION);
@@ -599,7 +604,7 @@ mod tests {
         assert!(recall_diff(&app, url).is_none(), "no cache, nothing kept");
 
         let (_dir, cache) = cache();
-        app.pr_cache = Some(cache);
+        app.github.pr_cache = Some(cache);
         remember_diff(&app, url, "");
         assert!(
             recall_diff(&app, url).is_none(),

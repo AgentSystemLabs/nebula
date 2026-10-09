@@ -31,13 +31,13 @@ pub(crate) fn paste_into_overlay(app: &mut App, text: &str) -> bool {
     // The ISSUE EDITOR's field under the caret, or either modal's `/`
     // FILTER ROW while it has the caret — resolved against the rows, so
     // the cursor lands on the best match as a typed letter's would.
-    if matches!(&app.overlay, Some(Overlay::Issues(_))) {
+    if matches!(&app.modals.overlay, Some(Overlay::Issues(_))) {
         return crate::issues::paste(app, text);
     }
-    if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
+    if matches!(&app.modals.overlay, Some(Overlay::PullRequests(_))) {
         return crate::pr_modal::paste(app, text);
     }
-    let Some(overlay) = &mut app.overlay else {
+    let Some(overlay) = &mut app.modals.overlay else {
         return false;
     };
     match overlay {
@@ -46,7 +46,11 @@ pub(crate) fn paste_into_overlay(app: &mut App, text: &str) -> bool {
         // to a local agent takes a dropped file as a copy it can find.
         Overlay::Prompt(prompt) => {
             let text = match prompt.kind.reaches_local_agent() {
-                true => staged_drop(app.attachments_dir.as_deref(), text, &mut app.flash),
+                true => staged_drop(
+                    app.modals.attachments_dir.as_deref(),
+                    text,
+                    &mut app.chrome.flash,
+                ),
                 false => text.to_string(),
             };
             prompt.input.insert_str(&text);
@@ -95,7 +99,7 @@ pub(crate) fn paste_into_overlay(app: &mut App, text: &str) -> bool {
         }
         _ => return false,
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
     true
 }
 
@@ -105,15 +109,19 @@ pub(crate) fn paste_into_overlay(app: &mut App, text: &str) -> bool {
 /// the box, newlines and all. False when no card is expanded, so the paste
 /// falls through to the terminal pane.
 pub(crate) fn paste_into_follow_up(app: &mut App, text: &str) -> bool {
-    if app.focus != Focus::Sessions || !app.follow_up_live() {
+    if app.nav.focus != Focus::Sessions || !app.follow_up_live() {
         return false;
     }
-    let Some(follow_up) = &mut app.follow_up else {
+    let Some(follow_up) = &mut app.modals.follow_up else {
         return false;
     };
-    let text = staged_drop(app.attachments_dir.as_deref(), text, &mut app.flash);
+    let text = staged_drop(
+        app.modals.attachments_dir.as_deref(),
+        text,
+        &mut app.chrome.flash,
+    );
     follow_up.input.insert_str(&text);
-    app.dirty = true;
+    app.chrome.dirty = true;
     true
 }
 
@@ -164,11 +172,12 @@ pub(crate) fn follow_up_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRe
     }
     match key.code {
         KeyCode::Esc => {
-            app.follow_up = None;
-            app.dirty = true;
+            app.modals.follow_up = None;
+            app.chrome.dirty = true;
         }
         KeyCode::Enter
             if !app
+                .modals
                 .follow_up
                 .as_ref()
                 .is_some_and(|f| f.input.takes_newline(&key)) =>
@@ -176,9 +185,9 @@ pub(crate) fn follow_up_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRe
             send_follow_up(app, out);
         }
         _ => {
-            if let Some(follow_up) = &mut app.follow_up {
+            if let Some(follow_up) = &mut app.modals.follow_up {
                 if follow_up.input.handle_key(&key).consumed() {
-                    app.dirty = true;
+                    app.chrome.dirty = true;
                 }
             }
         }
@@ -203,7 +212,7 @@ pub(crate) fn follow_up_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRe
 /// CLI that boot starts is seconds from reading anything, so the prompt
 /// would be typed into a process that never saw it.
 pub(crate) fn send_follow_up(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some(follow_up) = &app.follow_up else {
+    let Some(follow_up) = &app.modals.follow_up else {
         return;
     };
     let text = follow_up.input.as_str().trim().to_string();
@@ -218,9 +227,9 @@ pub(crate) fn send_follow_up(app: &mut App, out: &mut Vec<ClientRequest>) {
         attach_now(app, SessionRef::Agent(id.clone()), out);
     }
     if !matches!(send_turn(app, &id, &text, out), TurnSent::Booting) {
-        app.follow_up = None;
+        app.modals.follow_up = None;
     }
-    app.dirty = true;
+    app.chrome.dirty = true;
 }
 
 /// What one follow-up send did.
@@ -264,7 +273,7 @@ pub(crate) fn send_turn(
     let sref = SessionRef::Agent(id.clone());
     if !agent.alive {
         attach_now(app, sref, out);
-        app.flash = Some(format!(
+        app.chrome.flash = Some(format!(
             "starting {} — press Enter again once it is up",
             agent.name
         ));
@@ -284,7 +293,7 @@ pub(crate) fn send_turn(
         session: sref,
         data: b"\r".to_vec(),
     });
-    app.flash = Some(format!("sent to {}", agent.name));
+    app.chrome.flash = Some(format!("sent to {}", agent.name));
     TurnSent::Sent
 }
 
@@ -295,7 +304,7 @@ pub(crate) fn send_turn(
 pub(crate) fn typed_into(app: &mut App, session: &SessionRef) {
     if let Some(project) = app
         .project_of_session(session)
-        .filter(|p| app.launcher_tabs.first() != Some(*p))
+        .filter(|p| app.launcher.launcher_tabs.first() != Some(*p))
         .cloned()
     {
         app.bring_tab_forward(&project);
