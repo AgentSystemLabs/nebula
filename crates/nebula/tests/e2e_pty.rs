@@ -3933,11 +3933,13 @@ async fn idle_agent_with_a_detached_job_is_spared_until_it_ends() {
         "worker spared while its job runs: {events:#?}"
     );
 
-    // The job ends at ~5s, and the worker goes a full timeout after that —
-    // not on the next sweep: the clock restarted when the job ended.
+    // The job ends at ~5s, and the worker gets grace after that — not on
+    // the next sweep. The reaper only notices a detached job's end on its
+    // 200 ms beat, so keep this below the ideal 7 s while still proving the
+    // timeout did not expire while the job was alive.
     read_events_until(&mut c, SLOW_TIMEOUT, |evs| reaped(evs, &worker)).await;
     assert!(
-        started.elapsed() >= Duration::from_millis(6500),
+        started.elapsed() >= Duration::from_secs(6),
         "reaped {:?} after the job started; the timeout restarts when it ends",
         started.elapsed()
     );

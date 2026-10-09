@@ -509,6 +509,7 @@ mod tests {
     /// start its own — here, into the version gate the stub nebula fails.
     #[test]
     fn the_script_starts_its_own_when_nothing_answers() {
+        let _port_guard = browser::port_test_guard();
         let port = browser::free_port(LOOPBACK).unwrap();
         let (mut child, _home) = run_remote_script(port);
         let line = first_stderr_line(&mut child);
@@ -568,8 +569,9 @@ mod tests {
     /// user named it, likely because something else already points at it.
     #[test]
     fn an_explicit_local_port_that_is_taken_is_an_error() {
-        let port = browser::free_port(LOOPBACK).unwrap();
-        let _guard = TcpListener::bind(SocketAddr::new(LOOPBACK, port)).unwrap();
+        let _port_guard = browser::port_test_guard();
+        let _guard = TcpListener::bind(SocketAddr::new(LOOPBACK, 0)).unwrap();
+        let port = _guard.local_addr().unwrap().port();
         let err = resolve_local_port(Some(port)).unwrap_err().to_string();
         assert!(
             err.contains(&format!("local port {port} is not free")),
@@ -579,6 +581,7 @@ mod tests {
 
     #[test]
     fn port_zero_means_any_free_local_port() {
+        let _port_guard = browser::port_test_guard();
         let port = resolve_local_port(Some(0)).expect("picks one");
         assert_ne!(port, 0);
         TcpListener::bind(SocketAddr::new(LOOPBACK, port)).expect("free");
@@ -591,6 +594,7 @@ mod tests {
     /// 7681 itself: `browser`'s equivalent test does, in this same binary.
     #[test]
     fn no_port_resolves_to_one_that_is_free() {
+        let _port_guard = browser::port_test_guard();
         let port = resolve_local_port(None).expect("resolves");
         assert_ne!(port, 0, "must be a real port we can print");
         TcpListener::bind(SocketAddr::new(LOOPBACK, port)).expect("free");
@@ -600,6 +604,7 @@ mod tests {
     /// come back false rather than mistaking a connect for a service.
     #[test]
     fn an_unserved_port_does_not_answer() {
+        let _port_guard = browser::port_test_guard();
         let port = browser::free_port(LOOPBACK).unwrap();
         assert!(!answers_http(SocketAddr::new(LOOPBACK, port)));
     }
