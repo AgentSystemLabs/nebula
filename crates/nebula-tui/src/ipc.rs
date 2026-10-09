@@ -5,8 +5,8 @@ use anyhow::{bail, Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
     env, paths, Agent, AgentId, AgentKind, ClientRequest, EnterOutcome, Link, Project, ProjectId,
-    ReviewTabKind, ServerEvent, SessionRef, TerminalId, TerminalTab, Worktree, WorktreeId,
-    PROTOCOL_VERSION,
+    ReviewTabKind, ServerEvent, SessionRef, SessionSummary, TerminalId, TerminalTab, Worktree,
+    WorktreeId, PROTOCOL_VERSION,
 };
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -14,6 +14,7 @@ use tokio::net::UnixStream;
 /// Request id for the one-shot CLIs: each opens a fresh connection, sends a
 /// single request and waits for its reply, so there is never a second id.
 const ONE_SHOT_REQ_ID: u64 = 1;
+const SESSION_CONTEXT_PROTOCOL: u32 = 50;
 /// The daemon hung up mid-request — the message every one-shot client shows.
 const CLOSED_BEFORE_REPLY: &str = "daemon closed the connection before replying";
 /// How often the connect and shutdown waits re-check the daemon.
@@ -22,6 +23,7 @@ const POLL_STEP: Duration = Duration::from_millis(50);
 pub struct Connection {
     pub stream: UnixStream,
     pub daemon_pid: u32,
+    pub protocol_version: u32,
 }
 
 /// Connect, auto-spawning `current_exe() daemon` when nothing is listening.
@@ -122,7 +124,11 @@ async fn handshake(mut stream: UnixStream) -> Result<Connection> {
             daemon_pid,
         }) => {
             if nebula_core::protocol_compatible_with(protocol_version) {
-                Ok(Connection { stream, daemon_pid })
+                Ok(Connection {
+                    stream,
+                    daemon_pid,
+                    protocol_version,
+                })
             } else {
                 bail!(version_skew_message(protocol_version, listener_pid))
             }
@@ -291,6 +297,16 @@ async fn await_reply(conn: &mut Connection, req_id: u64) -> Result<Reply> {
     }
 }
 
+fn require_protocol(conn: &Connection, needed: u32, command: &str) -> Result<()> {
+    if conn.protocol_version < needed {
+        bail!(
+            "`nebula {command}` needs daemon protocol v{needed}, but the running daemon speaks v{} — run `nebula kill` and relaunch",
+            conn.protocol_version
+        );
+    }
+    Ok(())
+}
+
 /// [`await_reply`] for the callers where the daemon declining *is* the
 /// failure: its message becomes the error.
 async fn await_ack(conn: &mut Connection, req_id: u64) -> Result<()> {
@@ -457,6 +473,151 @@ pub async fn open_files_for_current_agent(files: &[String]) -> Result<()> {
          each, with a preview and an editor. Don't paste their contents into your reply; carry on."
     );
     Ok(())
+}
+
+async fn session_context_connection(command: &str) -> Result<Connection> {
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running");
+    };
+    let conn = handshake(stream).await?;
+    require_protocol(&conn, SESSION_CONTEXT_PROTOCOL, command)?;
+    Ok(conn)
+}
+
+async fn fetch_sessions(conn: &mut Connection) -> Result<Vec<SessionSummary>> {
+    let req_id = ONE_SHOT_REQ_ID;
+    write_frame(&mut conn.stream, &ClientRequest::ListSessions { req_id }).await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::SessionList {
+                req_id: r,
+                sessions,
+            }) if r == req_id => return Ok(sessions),
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
+            Some(_) => continue,
+            None => bail!("{CLOSED_BEFORE_REPLY}"),
+        }
+    }
+}
+
+pub async fn list_sessions(json: bool) -> Result<()> {
+    let mut conn = session_context_connection("sessions").await?;
+    let sessions = fetch_sessions(&mut conn).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "sessions": sessions }))?
+        );
+    } else {
+        print_session_summaries(&sessions);
+    }
+    Ok(())
+}
+
+pub async fn read_session(session: &str, lines: u32) -> Result<()> {
+    let mut conn = session_context_connection("read").await?;
+    let req_id = ONE_SHOT_REQ_ID;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::ReadSession {
+            req_id,
+            target: session.to_string(),
+            max_lines: lines,
+        },
+    )
+    .await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::SessionText {
+                req_id: r, text, ..
+            }) if r == req_id => {
+                print!("{text}");
+                return Ok(());
+            }
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
+            Some(_) => continue,
+            None => bail!("{CLOSED_BEFORE_REPLY}"),
+        }
+    }
+}
+
+pub async fn ask_session(
+    session: &str,
+    question: &str,
+    timeout_secs: u64,
+    wait: bool,
+) -> Result<()> {
+    let mut conn = session_context_connection("ask").await?;
+    let question = question.trim();
+    if question.is_empty() {
+        bail!("question is empty");
+    }
+    let caller = env::non_empty(env::AGENT_ID).map(AgentId);
+    let timeout_ms = timeout_secs.saturating_mul(1000);
+    let req_id = ONE_SHOT_REQ_ID;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::AskSession {
+            req_id,
+            caller,
+            target: session.to_string(),
+            question: question.to_string(),
+            timeout_ms,
+            wait,
+        },
+    )
+    .await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::SessionAnswer {
+                req_id: r, answer, ..
+            }) if r == req_id => {
+                println!("{answer}");
+                return Ok(());
+            }
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
+            Some(_) => continue,
+            None => bail!("{CLOSED_BEFORE_REPLY}"),
+        }
+    }
+}
+
+fn print_session_summaries(sessions: &[SessionSummary]) {
+    for session in sessions {
+        println!(
+            "{} name={} project={} branch={} worktree={} harness={} status={}{} summary={}",
+            session.id,
+            shell_word(&session.name),
+            shell_word(&session.project),
+            shell_word(&session.branch),
+            session.worktree.display(),
+            session.harness,
+            session.status,
+            if session.alive { " alive" } else { "" },
+            shell_word(&session.summary)
+        );
+    }
+}
+
+fn shell_word(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+    {
+        value.to_string()
+    } else {
+        format!("{value:?}")
+    }
 }
 
 #[derive(Debug, Clone)]

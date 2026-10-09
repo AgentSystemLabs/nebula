@@ -514,6 +514,7 @@ fn agent_spawn_command_with(
         if guidance {
             first.push(CLAUDE_WORKTREE_GUIDANCE.to_string());
             first.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE.to_string());
+            first.push(crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE.to_string());
             first.push(crate::open_files::CLAUDE_OPEN_GUIDANCE.to_string());
         }
         if let Some(prompt) = additional_system_prompt {
@@ -551,6 +552,7 @@ fn push_system_prompt(
     if guidance {
         system_prompt.push(CLAUDE_WORKTREE_GUIDANCE);
         system_prompt.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE);
+        system_prompt.push(crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE);
         system_prompt.push(crate::open_files::CLAUDE_OPEN_GUIDANCE);
     }
     if let Some(prompt) = additional {

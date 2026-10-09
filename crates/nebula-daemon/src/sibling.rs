@@ -35,6 +35,16 @@ run `nebula worktree <name>` for those. This session is unaffected by a spawn ei
 with whatever else the user asked, and if starting the session was the whole request, tell the user \
 in one line that it is running. If the command fails, report the error.";
 
+/// What nebula appends to Claude and pi so every session can consult other
+/// sessions when the user names them, without becoming the orchestrator.
+pub const CLAUDE_SESSION_CONTEXT_GUIDANCE: &str = "[nebula] When the user refers to another nebula \
+session by name/id or asks you to get context from or ask another session, use the shell commands \
+`nebula sessions`, `nebula read <session> [--lines N]`, and `nebula ask <session> \"<question>\" \
+[--timeout S]` instead of guessing from your own context. Use `sessions --json` when you need an \
+exact id; `read` is for recent context, and `ask` sends a concise labelled question to that session \
+and prints its answer. Do not use these commands to spawn or move worktrees; follow the spawn and \
+worktree guidance for that.";
+
 /// `nebula spawn --worktree <branch> [--base <ref>]`: the branch whose
 /// worktree the new session starts in, and where a new branch is cut from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

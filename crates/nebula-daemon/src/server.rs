@@ -445,6 +445,75 @@ impl ClientConnection {
                 reply_done(&self.out_tx, req_id, result).await;
                 Ok(true)
             }
+            ClientRequest::ListSessions { req_id } => {
+                let result = self
+                    .blocking_daemon(move |daemon| daemon.session_summaries())
+                    .await;
+                match result {
+                    Ok(sessions) => {
+                        self.send(ServerEvent::SessionList { req_id, sessions })
+                            .await;
+                    }
+                    Err(err) => reply_done(&self.out_tx, req_id, Err(err)).await,
+                }
+                Ok(true)
+            }
+            ClientRequest::ReadSession {
+                req_id,
+                target,
+                max_lines,
+            } => {
+                let result = self
+                    .blocking_daemon(move |daemon| daemon.read_session_context(&target, max_lines))
+                    .await;
+                match result {
+                    Ok(read) => {
+                        self.send(ServerEvent::SessionText {
+                            req_id,
+                            session: read.session,
+                            text: read.text,
+                        })
+                        .await;
+                    }
+                    Err(err) => reply_done(&self.out_tx, req_id, Err(err)).await,
+                }
+                Ok(true)
+            }
+            ClientRequest::AskSession {
+                req_id,
+                caller,
+                target,
+                question,
+                timeout_ms,
+                wait,
+            } => {
+                let daemon = self.daemon.clone();
+                let out_tx = self.out_tx.clone();
+                tokio::spawn(async move {
+                    let result = daemon
+                        .ask_session(
+                            caller,
+                            &target,
+                            &question,
+                            std::time::Duration::from_millis(timeout_ms),
+                            wait,
+                        )
+                        .await;
+                    match result {
+                        Ok((session, answer)) => {
+                            let _ = out_tx
+                                .send(ServerEvent::SessionAnswer {
+                                    req_id,
+                                    session,
+                                    answer,
+                                })
+                                .await;
+                        }
+                        Err(err) => reply_done(&out_tx, req_id, Err(err)).await,
+                    }
+                });
+                Ok(true)
+            }
             ClientRequest::EnterWorktree {
                 req_id,
                 id,

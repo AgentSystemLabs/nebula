@@ -209,6 +209,50 @@ pub(crate) enum Command {
         #[arg(required = true, num_args = 1.., value_name = "FILE")]
         files: Vec<String>,
     },
+    /// List every session across every project.
+    ///
+    /// Prints the session id/name, project, worktree branch, harness, status
+    /// and a one-line recent summary. Agents run this when you refer to
+    /// another nebula session by name and they need its exact id.
+    #[command(after_help = SESSIONS_EXAMPLES)]
+    Sessions {
+        /// Print JSON instead of compact text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read another session's recent context.
+    ///
+    /// Resolves a session by id or unambiguous fuzzy name, then prints clean
+    /// recent conversation text. Claude transcript text is preferred when
+    /// available; otherwise nebula falls back to stripped PTY scrollback.
+    #[command(after_help = READ_EXAMPLES)]
+    Read {
+        /// Session id or unambiguous fuzzy name.
+        session: String,
+        /// Number of recent text lines to print.
+        #[arg(long, default_value_t = 200)]
+        lines: u32,
+    },
+    /// Ask another session a question and print its answer.
+    ///
+    /// Sends a labelled prompt into the target agent, waits for that turn to
+    /// finish, and prints only the answer text captured from the target's
+    /// output. If the target is busy, the default is to wait until it is idle
+    /// before sending; --no-wait fails fast instead.
+    #[command(after_help = ASK_EXAMPLES)]
+    Ask {
+        /// Target agent id or unambiguous fuzzy name.
+        session: String,
+        /// Question text; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        question: Vec<String>,
+        /// Total seconds to wait for queueing and the answer turn.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Fail instead of queueing when the target is currently busy.
+        #[arg(long)]
+        no_wait: bool,
+    },
     /// Coordinate projects from the orchestrator session.
     ///
     /// These commands are for the pinned orchestrator agent only. They are
@@ -460,6 +504,22 @@ Examples:
   nebula open README.md                one tab
   nebula open mockup.png flow.mmd      image and diagram previews
   nebula open src/main.rs docs/keys.md a tab each, in this order";
+
+const SESSIONS_EXAMPLES: &str = "\
+Examples:
+  nebula sessions
+  nebula sessions --json";
+
+const READ_EXAMPLES: &str = "\
+Examples:
+  nebula read research
+  nebula read 01HZY8QHA4AYM7M4XTA2G3KC9B --lines 80";
+
+const ASK_EXAMPLES: &str = "\
+Examples:
+  nebula ask research \"which library did you recommend?\"
+  nebula ask \"feature spike\" \"summarize your Redis findings\" --timeout 60
+  nebula ask research \"are you idle?\" --no-wait";
 
 const ORCHESTRATOR_EXAMPLES: &str = "\
 Examples:

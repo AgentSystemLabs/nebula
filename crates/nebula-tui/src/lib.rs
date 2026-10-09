@@ -117,6 +117,18 @@ pub fn run_spawn(
     ))
 }
 
+pub fn run_sessions(json: bool) -> Result<()> {
+    runtime()?.block_on(ipc::list_sessions(json))
+}
+
+pub fn run_read_session(session: &str, lines: u32) -> Result<()> {
+    runtime()?.block_on(ipc::read_session(session, lines))
+}
+
+pub fn run_ask_session(session: &str, question: String, timeout: u64, wait: bool) -> Result<()> {
+    runtime()?.block_on(ipc::ask_session(session, &question, timeout, wait))
+}
+
 pub fn run_orchestrator_list(json: bool) -> Result<()> {
     runtime()?.block_on(ipc::orchestrator_list(json))
 }

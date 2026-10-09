@@ -151,6 +151,9 @@ const CLAUDE_ALLOW_RULES: &[&str] = &[
     "Bash(nebula worktree:*)",
     "Bash(nebula spawn:*)",
     "Bash(nebula open:*)",
+    "Bash(nebula sessions:*)",
+    "Bash(nebula read:*)",
+    "Bash(nebula ask:*)",
 ];
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
