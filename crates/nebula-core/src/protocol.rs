@@ -10,14 +10,14 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 48;
+pub const PROTOCOL_VERSION: u32 = 49;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
 /// Compatibility is a range overlap: two peers can talk when each peer's
 /// `[MIN_COMPATIBLE_PROTOCOL, PROTOCOL_VERSION]` range includes at least one
 /// version the other peer also supports.
-pub const MIN_COMPATIBLE_PROTOCOL: u32 = 48;
+pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,

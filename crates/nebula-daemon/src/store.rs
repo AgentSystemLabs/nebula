@@ -328,6 +328,10 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE temp.worktree_home;
     DROP TABLE temp.worktree_merge;
     ",
+    // 29: privileged orchestrator role. Existing agents are ordinary workers.
+    "
+    ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'worker';
+    ",
 ];
 
 pub struct Store {
@@ -530,8 +534,8 @@ impl Store {
         issue_url: Option<&str>,
     ) -> Result<()> {
         self.conn.lock().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url, custom_harness)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url, custom_harness, role)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -552,6 +556,7 @@ impl Store {
                 pr_url,
                 issue_url,
                 a.custom_harness,
+                a.role.as_str(),
             ],
         )?;
         Ok(())
@@ -1076,7 +1081,7 @@ const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_orde
 const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
                              archived_at, unseen, cloud_session_id, recent_prompts, custom_harness, \
-                             issue_url";
+                             issue_url, role";
 const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order, run_command";
 const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
 
@@ -1120,7 +1125,11 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         cloud_session_id: r.get(13)?,
         alive: false,
         issue_url: r.get(16)?,
-        role: nebula_core::AgentRole::Worker,
+        role: r
+            .get::<_, Option<String>>(17)?
+            .as_deref()
+            .and_then(nebula_core::AgentRole::parse)
+            .unwrap_or_default(),
         recent_prompts: parse_prompts(r.get::<_, Option<String>>(14)?.as_deref()),
         custom_harness: r.get(15)?,
     })
