@@ -9,9 +9,9 @@ use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, PromptEntry,
     TerminalId, TerminalTab, Worktree, WorktreeId, RECENT_PROMPTS_KEPT,
 };
+use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 const MIGRATIONS: &[&str] = &[
     // 1: initial schema
@@ -363,7 +363,7 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         // Rebuild-style migrations DROP a parent table (14 rebuilds
         // projects); with enforcement on, the DROP's implicit delete would
@@ -389,7 +389,6 @@ impl Store {
     fn delete_by_id(&self, table: &'static str, id: &str) -> Result<()> {
         self.conn
             .lock()
-            .unwrap()
             .execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
         Ok(())
     }
@@ -397,7 +396,7 @@ impl Store {
     // ---- projects ----
 
     pub fn insert_project(&self, p: &Project) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![p.id.as_str(), p.name, p.repo_path.to_string_lossy(), p.sort_order, now_ms()],
         )?;
@@ -406,7 +405,7 @@ impl Store {
 
     /// Sort slot for a newly added project: after everything else.
     pub fn next_project_sort_order(&self) -> Result<i64> {
-        Ok(self.conn.lock().unwrap().query_row(
+        Ok(self.conn.lock().query_row(
             "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM projects",
             [],
             |r| r.get(0),
@@ -414,7 +413,7 @@ impl Store {
     }
 
     pub fn rename_project(&self, id: &ProjectId, name: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE projects SET name = ?2 WHERE id = ?1",
             params![id.as_str(), name],
         )?;
@@ -431,7 +430,7 @@ impl Store {
         name: &str,
         worktrees: &[(WorktreeId, PathBuf)],
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE projects SET repo_path = ?2, name = ?3 WHERE id = ?1",
@@ -454,7 +453,7 @@ impl Store {
     /// The project row registered for the repo at `path`, if any — one
     /// repo is one project (`repo_path` is UNIQUE).
     pub fn project_by_path(&self, path: &Path) -> Result<Option<ProjectId>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id FROM projects WHERE repo_path = ?1")?;
         let mut rows = stmt.query(params![path.to_string_lossy()])?;
         Ok(rows
@@ -467,7 +466,7 @@ impl Store {
     // ---- worktrees ----
 
     pub fn insert_worktree(&self, w: &Worktree) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -488,7 +487,7 @@ impl Store {
     }
 
     pub fn update_worktree_branch(&self, id: &WorktreeId, branch: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE worktrees SET branch = ?2 WHERE id = ?1",
             params![id.as_str(), branch],
         )?;
@@ -498,7 +497,7 @@ impl Store {
     /// Root-ness is derived from git's own checkout list on every reconcile
     /// rather than frozen at insert time, so it needs to be writable.
     pub fn set_worktree_main(&self, id: &WorktreeId, is_main: bool) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE worktrees SET is_main = ?2 WHERE id = ?1",
             params![id.as_str(), is_main as i64],
         )?;
@@ -530,7 +529,7 @@ impl Store {
         pr_url: Option<&str>,
         issue_url: Option<&str>,
     ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url, custom_harness)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
@@ -571,7 +570,7 @@ impl Store {
     }
 
     fn agent_text_column(&self, id: &AgentId, column: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!("SELECT {column} FROM agents WHERE id = ?1"))?;
         let mut rows = stmt.query(params![id.as_str()])?;
         match rows.next()? {
@@ -583,7 +582,7 @@ impl Store {
     /// User rename: always applies, and retires any pending auto-title so a
     /// late agent attempt can't clobber the user's choice.
     pub fn rename_agent(&self, id: &AgentId, name: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE agents SET name = ?2, auto_title_pending = 0 WHERE id = ?1",
             params![id.as_str(), name],
         )?;
@@ -594,7 +593,7 @@ impl Store {
     /// (single atomic conditional update — concurrent attempts can't both
     /// win). Returns whether the rename was applied.
     pub fn rename_agent_if_auto_pending(&self, id: &AgentId, name: &str) -> Result<bool> {
-        let changed = self.conn.lock().unwrap().execute(
+        let changed = self.conn.lock().execute(
             "UPDATE agents SET name = ?2, auto_title_pending = 0 WHERE id = ?1 AND auto_title_pending = 1",
             params![id.as_str(), name],
         )?;
@@ -607,7 +606,6 @@ impl Store {
         let pending: Option<i64> = self
             .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT auto_title_pending FROM agents WHERE id = ?1",
                 params![id.as_str()],
@@ -627,7 +625,7 @@ impl Store {
     /// newest [`RECENT_PROMPTS_KEPT`]. Returns whether a row was there to
     /// take it.
     pub fn push_prompt(&self, id: &AgentId, entry: &PromptEntry) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT recent_prompts FROM agents WHERE id = ?1")?;
         let mut rows = stmt.query(params![id.as_str()])?;
         let Some(row) = rows.next()? else {
@@ -649,7 +647,7 @@ impl Store {
     }
 
     pub fn agent_claude_title(&self, id: &AgentId) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT claude_title FROM agents WHERE id = ?1")?;
         let mut rows = stmt.query(params![id.as_str()])?;
         match rows.next()? {
@@ -665,7 +663,7 @@ impl Store {
     /// name the user set in nebula since is never undone by re-reading
     /// Claude's older title. Returns whether anything changed.
     pub fn adopt_claude_title(&self, id: &AgentId, title: &str) -> Result<bool> {
-        let changed = self.conn.lock().unwrap().execute(
+        let changed = self.conn.lock().execute(
             "UPDATE agents SET name = ?2, claude_title = ?2, auto_title_pending = 0 \
              WHERE id = ?1 AND (claude_title IS NULL OR claude_title != ?2)",
             params![id.as_str(), title],
@@ -676,7 +674,7 @@ impl Store {
     /// Everything the hook reply needs to decide whether to push the row's
     /// name into Claude (`TitleState::to_push`); `None` for an unknown id.
     pub fn agent_title_state(&self, id: &AgentId) -> Result<Option<TitleState>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT name, claude_title, auto_title_pending, kind, custom_harness FROM agents WHERE id = ?1",
         )?;
@@ -694,7 +692,7 @@ impl Store {
     }
 
     pub fn set_agent_worktree(&self, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE agents SET worktree_id = ?2 WHERE id = ?1",
             params![id.as_str(), worktree_id.as_str()],
         )?;
@@ -707,7 +705,7 @@ impl Store {
         let archived_at = if archived { now_ms() } else { 0 };
         // An archived row is out of sight by definition: nothing left to
         // go and read, so its unseen-finish flag goes with it.
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE agents SET archived = ?2, archived_at = ?3,
                     unseen = CASE WHEN ?2 THEN 0 ELSE unseen END
              WHERE id = ?1",
@@ -729,7 +727,7 @@ impl Store {
     /// it: they are out of sight already.
     pub fn set_agent_status(&self, id: &AgentId, status: AgentStatus) -> Result<(i64, bool)> {
         let stamp = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE agents SET status = ?2, status_changed_at = ?3,
                     unseen = CASE
@@ -755,7 +753,7 @@ impl Store {
     /// Returns whether the flag was actually set, so the caller can skip
     /// broadcasting a row that didn't change.
     pub fn mark_agent_seen(&self, id: &AgentId) -> Result<bool> {
-        let changed = self.conn.lock().unwrap().execute(
+        let changed = self.conn.lock().execute(
             "UPDATE agents SET unseen = 0 WHERE id = ?1 AND unseen = 1",
             params![id.as_str()],
         )?;
@@ -767,7 +765,7 @@ impl Store {
         id: &AgentId,
         cloud_session_id: Option<&str>,
     ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE agents SET cloud_session_id = ?2 WHERE id = ?1",
             params![id.as_str(), cloud_session_id],
         )?;
@@ -775,7 +773,7 @@ impl Store {
     }
 
     pub fn set_agent_session_id(&self, id: &AgentId, session_id: Option<&str>) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE agents SET claude_session_id = ?2 WHERE id = ?1",
             params![id.as_str(), session_id],
         )?;
@@ -783,7 +781,7 @@ impl Store {
     }
 
     pub fn set_agent_model(&self, id: &AgentId, model: Option<&str>) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE agents SET model = ?2 WHERE id = ?1",
             params![id.as_str(), model],
         )?;
@@ -801,7 +799,7 @@ impl Store {
         &self,
         carried: &std::collections::HashSet<AgentId>,
     ) -> Result<Vec<AgentId>> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let ids: Vec<AgentId> = tx
             .prepare("SELECT id FROM agents WHERE status IN ('running', 'needs_feedback')")?
@@ -824,8 +822,8 @@ impl Store {
     /// Fold the WAL into the database and hold the connection, so nothing
     /// writes while the guard lives — an IN-PLACE RESTART execs with it
     /// held, and the new image opens a database no write is halfway into.
-    pub fn quiesce(&self) -> std::sync::MutexGuard<'_, Connection> {
-        let conn = self.conn.lock().unwrap();
+    pub fn quiesce(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        let conn = self.conn.lock();
         if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
             tracing::warn!(error = %e, "wal checkpoint before restart failed");
         }
@@ -835,7 +833,7 @@ impl Store {
     // ---- terminals ----
 
     pub fn insert_terminal(&self, t: &TerminalTab) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "INSERT INTO terminals (id, worktree_id, name, sort_order, created_at, run_command) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![t.id.as_str(), t.worktree_id.as_str(), t.name, t.sort_order, now_ms(), t.run_command],
         )?;
@@ -843,7 +841,7 @@ impl Store {
     }
 
     pub fn rename_terminal(&self, id: &TerminalId, name: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE terminals SET name = ?2 WHERE id = ?1",
             params![id.as_str(), name],
         )?;
@@ -857,7 +855,7 @@ impl Store {
     /// Point a RUN TERMINAL at the command it runs next: `.nebula.json` is
     /// read fresh at every `r`, so a restart picks up an edited file.
     pub fn set_terminal_run_command(&self, id: &TerminalId, command: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE terminals SET run_command = ?2 WHERE id = ?1",
             params![id.as_str(), command],
         )?;
@@ -871,7 +869,7 @@ impl Store {
     /// edited and deleted.
     #[cfg(test)]
     pub fn insert_link(&self, l: &Link) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "INSERT INTO links (id, worktree_id, url, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 l.id.as_str(),
@@ -887,7 +885,7 @@ impl Store {
     /// Sort slot for a new link: after everything else on its worktree.
     #[cfg(test)]
     pub fn next_link_sort_order(&self, worktree_id: &WorktreeId) -> Result<i64> {
-        Ok(self.conn.lock().unwrap().query_row(
+        Ok(self.conn.lock().query_row(
             "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM links WHERE worktree_id = ?1",
             params![worktree_id.as_str()],
             |r| r.get(0),
@@ -895,7 +893,7 @@ impl Store {
     }
 
     pub fn set_link_url(&self, id: &LinkId, url: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "UPDATE links SET url = ?2 WHERE id = ?1",
             params![id.as_str(), url],
         )?;
@@ -907,7 +905,7 @@ impl Store {
     }
 
     pub fn get_link(&self, id: &LinkId) -> Result<Option<Link>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!("SELECT {LINK_COLUMNS} FROM links WHERE id = ?1"))?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(row_to_link).transpose()?)
@@ -915,7 +913,7 @@ impl Store {
 
     /// Every link, in per-worktree list order.
     pub fn load_links(&self) -> Result<Vec<Link>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let links = conn
             .prepare(&format!(
                 "SELECT {LINK_COLUMNS} FROM links ORDER BY worktree_id, sort_order, created_at"
@@ -931,7 +929,7 @@ impl Store {
     /// `marker`. Idempotent, and an empty marker is a real answer: it says
     /// the PR was opened while nobody had posted on it yet.
     pub fn mark_pr_seen(&self, url: &str, marker: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "INSERT INTO pr_seen (url, marker, seen_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(url) DO UPDATE SET marker = excluded.marker, seen_at = excluded.seen_at",
             params![url, marker, now_ms()],
@@ -940,7 +938,7 @@ impl Store {
     }
 
     pub fn load_pr_seen(&self) -> Result<Vec<PrSeen>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let seen = conn
             .prepare("SELECT url, marker FROM pr_seen")?
             .query_map([], |r| {
@@ -956,7 +954,7 @@ impl Store {
     // ---- point lookups ----
 
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!(
             "SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"
         ))?;
@@ -965,7 +963,7 @@ impl Store {
     }
 
     pub fn get_worktree(&self, id: &WorktreeId) -> Result<Option<Worktree>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!(
             "SELECT {WORKTREE_COLUMNS} FROM worktrees WHERE id = ?1"
         ))?;
@@ -974,7 +972,7 @@ impl Store {
     }
 
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt =
             conn.prepare(&format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"))?;
         let mut rows = stmt.query(params![id.as_str()])?;
@@ -982,7 +980,7 @@ impl Store {
     }
 
     pub fn get_terminal(&self, id: &TerminalId) -> Result<Option<TerminalTab>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!(
             "SELECT {TERMINAL_COLUMNS} FROM terminals WHERE id = ?1"
         ))?;
@@ -991,7 +989,7 @@ impl Store {
     }
 
     pub fn count_terminals(&self, worktree_id: &WorktreeId) -> Result<i64> {
-        Ok(self.conn.lock().unwrap().query_row(
+        Ok(self.conn.lock().query_row(
             "SELECT COUNT(*) FROM terminals WHERE worktree_id = ?1",
             params![worktree_id.as_str()],
             |r| r.get(0),
@@ -1001,7 +999,7 @@ impl Store {
     /// The worktree's RUN TERMINALS, oldest first. The DAEMON keeps one per
     /// worktree; a list, so a stray second row can still be found and stopped.
     pub fn run_terminals_in(&self, worktree_id: &WorktreeId) -> Result<Vec<TerminalTab>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!(
             "SELECT {TERMINAL_COLUMNS} FROM terminals WHERE worktree_id = ?1 AND run_command IS NOT NULL ORDER BY created_at"
         ))?;
@@ -1014,7 +1012,7 @@ impl Store {
     // ---- whole tree ----
 
     pub fn load_tree(&self) -> Result<TreeRows> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
 
         let projects = conn
             .prepare(&format!(
@@ -1050,7 +1048,7 @@ impl Store {
     // ---- ui state ----
 
     pub fn save_ui_state(&self, json: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn.lock().execute(
             "INSERT INTO ui_state (id, json) VALUES (1, ?1)
              ON CONFLICT(id) DO UPDATE SET json = excluded.json",
             params![json],
@@ -1059,7 +1057,7 @@ impl Store {
     }
 
     pub fn load_ui_state(&self) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT json FROM ui_state WHERE id = 1")?;
         let mut rows = stmt.query([])?;
         Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
@@ -1457,7 +1455,7 @@ mod tests {
         // The project survived the walk; neither the original table name nor
         // the renamed one is left behind.
         assert_eq!(store.load_tree().unwrap().0.len(), 1);
-        let conn = store.conn.lock().unwrap();
+        let conn = store.conn.lock();
         let tables: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('notes', 'todos')",
@@ -1518,7 +1516,6 @@ mod tests {
         let version: i64 = store
             .conn
             .lock()
-            .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
@@ -1600,7 +1597,6 @@ mod tests {
         let columns: Vec<String> = store
             .conn
             .lock()
-            .unwrap()
             .prepare("PRAGMA table_info(projects)")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(1))
@@ -1676,7 +1672,6 @@ mod tests {
         store
             .conn
             .lock()
-            .unwrap()
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(0))
@@ -1791,7 +1786,6 @@ mod tests {
         let version: i64 = store
             .conn
             .lock()
-            .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
@@ -2324,7 +2318,7 @@ mod tests {
             submitted_at: 2_001,
         };
         {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.conn.lock();
             let json = serde_json::to_string(&vec![injected, typed.clone()]).unwrap();
             conn.execute(
                 "UPDATE agents SET recent_prompts = ?2 WHERE id = ?1",

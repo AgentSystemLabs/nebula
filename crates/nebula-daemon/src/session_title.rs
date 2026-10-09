@@ -196,16 +196,13 @@ impl Daemon {
     /// Every hook payload names the transcript; remember it so a window
     /// title change can find the persisted title without a hook.
     pub fn note_transcript(&self, id: &AgentId, transcript: TranscriptRef) {
-        self.transcripts
-            .lock()
-            .unwrap()
-            .insert(id.clone(), transcript);
+        self.transcripts.lock().insert(id.clone(), transcript);
     }
 
     /// Read the title Claude holds for `id` and adopt it if Claude changed
     /// it since the last sync. Returns whether the row changed.
     pub fn sync_claude_title(self: &Arc<Self>, id: &AgentId) -> bool {
-        let transcript = self.transcripts.lock().unwrap().get(id).cloned();
+        let transcript = self.transcripts.lock().get(id).cloned();
         let Some(transcript) = transcript else {
             return false;
         };
@@ -243,7 +240,7 @@ impl Daemon {
         if known.as_deref() == Some(text) {
             return;
         }
-        if !self.transcripts.lock().unwrap().contains_key(id) {
+        if !self.transcripts.lock().contains_key(id) {
             return;
         }
         let daemon = self.clone();
