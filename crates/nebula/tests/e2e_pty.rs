@@ -3878,6 +3878,71 @@ fn wait_for_exit(daemon: &mut DaemonProc) {
     }
 }
 
+/// A daemon started from inside a Claude Code session (`nebula` typed in
+/// an agent's tool shell) must not hand that session's identity to the
+/// agents it starts: an inherited `CLAUDE_CODE_CHILD_SESSION` turns the
+/// agent's own transcript off, and Claude Code's `GIT_EDITOR=true` breaks a
+/// bare `git commit`. A user setting under the same prefix still comes
+/// through.
+#[tokio::test]
+async fn agents_never_inherit_the_claude_session_the_daemon_started_in() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let env_dir = env.tmp.path().join("agent-env");
+    std::fs::create_dir_all(&env_dir).unwrap();
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nenv | grep -E '^(NEBULA_|CLAUDE|AI_AGENT|GIT_EDITOR|COREPACK_)' > '{}'/$NEBULA_AGENT_ID.env\nexec sleep 600\n",
+            env_dir.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+    let _daemon = env.spawn_daemon_with(
+        script.to_str().unwrap(),
+        &[
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDE_CODE_SESSION_ID", "host-session"),
+            ("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/host.sock"),
+            ("CLAUDE_PID", "1"),
+            ("AI_AGENT", "claude-code"),
+            ("GIT_EDITOR", "true"),
+            ("COREPACK_ENABLE_AUTO_PIN", "0"),
+            ("CLAUDE_CODE_USE_BEDROCK", "1"),
+        ],
+    );
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "agent-1", 2).await;
+
+    let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent_id.0))).await;
+    for name in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_PID",
+        "AI_AGENT",
+        "GIT_EDITOR",
+        "COREPACK_ENABLE_AUTO_PIN",
+    ] {
+        assert!(
+            !agent_env.contains_key(name),
+            "{name} leaked: {agent_env:?}"
+        );
+    }
+    assert_eq!(
+        agent_env.get("CLAUDE_CODE_USE_BEDROCK").map(String::as_str),
+        Some("1"),
+        "a user setting is kept: {agent_env:?}"
+    );
+}
+
 /// Poll the env dump the fake agent CLI writes on boot, returning the
 /// NEBULA_* variables the real CLI's hooks (and `nebula rename`) would see.
 async fn read_env_file(path: &Path) -> std::collections::HashMap<String, String> {
