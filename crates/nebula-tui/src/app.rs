@@ -1535,15 +1535,7 @@ impl DiffView {
 
 // The `/` PALETTE lives in `palette.rs`; re-exported so the callers and
 // tests that always reached it through `app::` keep working.
-pub use crate::palette::{Palette, PaletteItem, PaletteMatch, PaletteTarget};
-
-/// One visible row of the file finder: an index into `files` plus the char
-/// positions of the path the query matched, for highlighting.
-#[derive(Debug, Clone)]
-pub struct FinderMatch {
-    pub file: usize,
-    pub positions: Vec<usize>,
-}
+pub use crate::palette::{Palette, PaletteItem, PaletteTarget};
 
 /// Fuzzy file finder over every file of the selected worktree (`f`).
 #[derive(Debug, Clone)]
@@ -1555,20 +1547,10 @@ pub struct FileFinder {
     /// Editor command Enter launches (NEBULA_EDITOR, then the `editor`
     /// setting, default vim), captured at open time.
     pub editor: String,
-    /// Paths relative to `root`, in git listing order.
-    pub files: Vec<String>,
-    /// Type-to-filter query over `files`; always live.
-    pub query: TextInput,
-    /// Visible rows: `files` narrowed by `query`, best matches first
-    /// (listing order when the query is empty).
-    pub matches: Vec<FinderMatch>,
-    /// Index into `matches` (not `files`).
-    pub selected: usize,
+    /// Paths plus the live fuzzy query/cursor over them.
+    pub list: crate::filter_list::FilterList<String>,
     /// Whole modal rect, written back during draw so clicks outside close.
     pub area: Rect,
-    /// Screen rect of the result rows (query row excluded), written back
-    /// during draw so clicks can hit-test rows.
-    pub list_area: Rect,
     /// The `git ls-files` this finder opened ahead of, by ticket
     /// (`view_jobs`): the list is empty and says `listing files…` until
     /// [`FileFinder::set_files`]. None once the listing is in hand — and
@@ -1582,12 +1564,8 @@ impl FileFinder {
             root,
             branch,
             editor,
-            files,
-            query: TextInput::new(),
-            matches: Vec::new(),
-            selected: 0,
+            list: crate::filter_list::FilterList::new(files),
             area: Rect::default(),
-            list_area: Rect::default(),
             listing: None,
         };
         finder.apply_filter();
@@ -1605,7 +1583,7 @@ impl FileFinder {
 
     /// The listing landed: rank it by whatever the query holds by now.
     pub fn set_files(&mut self, files: Vec<String>) {
-        self.files = files;
+        self.list.items = files;
         self.listing = None;
         self.apply_filter();
     }
@@ -1613,29 +1591,24 @@ impl FileFinder {
     /// First visible row of the result list's stateless follow-window for a
     /// list of `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.selected, height)
+        self.list.window_start(height)
     }
 
     /// Clamped absolute selection in the filtered list.
     pub fn select(&mut self, index: i64) {
-        self.selected = clamp_selection(index, self.matches.len());
+        self.list.select(index);
     }
 
     /// The path behind the current selection, if any row is visible.
     pub fn selected_path(&self) -> Option<&str> {
-        self.files
-            .get(self.matches.get(self.selected)?.file)
-            .map(String::as_str)
+        self.list.selected().map(String::as_str)
     }
 
     /// Recompute `matches` from `query` and reset the selection to the top
     /// row. Best matches first, listing order when the query is empty.
     pub fn apply_filter(&mut self) {
-        self.matches = crate::fuzzy::rank(&self.query, self.files.iter().map(String::as_str))
-            .into_iter()
-            .map(|(file, positions)| FinderMatch { file, positions })
-            .collect();
-        self.selected = 0;
+        self.list.apply_filter(|path| path.clone());
+        self.list.cursor = 0;
     }
 }
 
@@ -1649,21 +1622,15 @@ pub struct GrepView {
     /// Editor command Enter launches (NEBULA_EDITOR, then the `editor`
     /// setting, default vim), captured at open time.
     pub editor: String,
-    /// The search text; every edit re-runs the grep.
-    pub query: TextInput,
-    /// Current results, best-first in git grep order (path, then line).
-    pub hits: Vec<crate::grep_search::GrepHit>,
+    /// Search text plus current results/cursor. Grep results are already
+    /// produced in display order, so matches are a 1:1 projection.
+    pub list: crate::filter_list::FilterList<crate::grep_search::GrepHit>,
     /// The search stopped at the result cap — the title says so.
     pub truncated: bool,
     /// A failed grep's message, shown in the list area until the next edit.
     pub error: Option<String>,
-    /// Index into `hits`.
-    pub selected: usize,
     /// Whole modal rect, written back during draw so clicks outside close.
     pub area: Rect,
-    /// Screen rect of the result rows (query row excluded), written back
-    /// during draw so clicks can hit-test rows.
-    pub list_area: Rect,
     /// BACKGROUND READS: with it, a search runs off the loop and lands in
     /// [`GrepView::land`]; without (a view built by a test), inline.
     pub jobs: Option<crate::view_jobs::Jobs>,
@@ -1680,13 +1647,10 @@ impl GrepView {
             root,
             branch,
             editor,
-            query: TextInput::new(),
-            hits: Vec::new(),
+            list: crate::filter_list::FilterList::default(),
             truncated: false,
             error: None,
-            selected: 0,
             area: Rect::default(),
-            list_area: Rect::default(),
             jobs: None,
             waiting: None,
             cancel: crate::view_jobs::Cancel::default(),
@@ -1696,18 +1660,18 @@ impl GrepView {
     /// Re-run the grep for the current query and reset the selection to the
     /// top row. Queries under `MIN_QUERY_LEN` just clear the results.
     pub fn run_search(&mut self) {
-        self.selected = 0;
+        self.list.cursor = 0;
         self.error = None;
         // Whatever was being searched for is no longer the query.
         self.cancel.cancel();
         self.waiting = None;
-        if self.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
-            self.hits.clear();
+        if self.list.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
+            self.set_hits(Vec::new());
             self.truncated = false;
             return;
         }
         let Some(jobs) = &self.jobs else {
-            let result = crate::grep_search::search(&self.root, &self.query);
+            let result = crate::grep_search::search(&self.root, &self.list.query);
             self.show(result);
             return;
         };
@@ -1716,7 +1680,7 @@ impl GrepView {
         self.cancel = crate::view_jobs::Cancel::default();
         let (root, query, cancel) = (
             self.root.clone(),
-            self.query.to_string(),
+            self.list.query.to_string(),
             self.cancel.clone(),
         );
         jobs.run(move || {
@@ -1746,34 +1710,49 @@ impl GrepView {
     }
 
     fn show(&mut self, result: Result<(Vec<crate::grep_search::GrepHit>, bool), String>) {
-        self.selected = 0;
+        self.list.cursor = 0;
         match result {
             Ok((hits, truncated)) => {
-                self.hits = hits;
+                self.set_hits(hits);
                 self.truncated = truncated;
             }
             Err(msg) => {
-                self.hits.clear();
+                self.set_hits(Vec::new());
                 self.truncated = false;
                 self.error = Some(msg);
             }
         }
     }
 
+    pub(crate) fn set_hits(&mut self, hits: Vec<crate::grep_search::GrepHit>) {
+        let len = hits.len();
+        self.list.items = hits;
+        self.list.matches = (0..len)
+            .map(|item| crate::filter_list::FilterMatch {
+                item,
+                positions: Vec::new(),
+            })
+            .collect();
+        self.list.cursor = self
+            .list
+            .cursor
+            .min(self.list.matches.len().saturating_sub(1));
+    }
+
     /// First visible row of the result list's stateless follow-window for a
     /// list of `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.selected, height)
+        self.list.window_start(height)
     }
 
     /// Clamped absolute selection.
     pub fn select(&mut self, index: i64) {
-        self.selected = clamp_selection(index, self.hits.len());
+        self.list.select(index);
     }
 
     /// The hit behind the current selection, if any row is visible.
     pub fn selected_hit(&self) -> Option<&crate::grep_search::GrepHit> {
-        self.hits.get(self.selected)
+        self.list.selected()
     }
 }
 

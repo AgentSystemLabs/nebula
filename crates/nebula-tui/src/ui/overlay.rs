@@ -1403,29 +1403,40 @@ fn draw_diff_file_list(
 fn draw_palette_overlay(f: &mut Frame, app: &mut App, palette: crate::palette::Palette) {
     let th = app.chrome.theme;
     let area = centered_rect(f.area(), PALETTE_SIZE.0, PALETTE_SIZE.1);
-    let title = if palette.query.is_empty() {
+    let title = if palette.list.query.is_empty() {
         " Jump to ".to_string()
     } else {
-        format!(" Jump to ({}/{}) ", palette.hits(), palette.items.len())
+        format!(
+            " Jump to ({}/{}) ",
+            palette.hits(),
+            palette.list.items.len()
+        )
     };
     let inner = render_modal_frame(f, area, title, th);
 
     // First row: the always-on fuzzy query input.
     if let Some(query_area) = row_rect(inner, 0) {
-        let line = search_line(&palette.query, "type to search…", query_area, th);
+        let line = search_line(&palette.list.query, "type to search…", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
     let list_inner = below_first_row(inner);
 
-    if palette.matches.is_empty() {
+    if palette.list.matches.is_empty() {
         empty_list_row(f, list_inner, NO_MATCHES, th);
     }
-    let start = palette.window_start(list_inner.height as usize);
-    for (row, (i, m)) in palette.matches.iter().enumerate().skip(start).enumerate() {
+    let start = palette.list.window_start(list_inner.height as usize);
+    for (row, (i, m)) in palette
+        .list
+        .matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .enumerate()
+    {
         let Some(row_area) = row_rect(list_inner, row) else {
             break;
         };
-        let item = &palette.items[m.item];
+        let item = &palette.list.items[m.item];
         // Kind lives in the glyph's shape; its color — and the
         // hollow variant standing in for the panels' `○` — come
         // from the same status the row carries in its panel, so a
@@ -1565,14 +1576,15 @@ fn draw_palette_overlay(f: &mut Frame, app: &mut App, palette: crate::palette::P
             spans.push(Span::raw(" ".repeat(width - used - tail_w)));
             spans.push(Span::styled(tail, Style::default().fg(th.dim)));
         }
-        render_row(f, row_area, spans, i == palette.selected, true, th);
+        render_row(f, row_area, spans, i == palette.list.cursor, true, th);
     }
 
     // Write-back (draw works on a clone): rects for mouse
     // hit-testing.
     if let Some(Overlay::Palette(p)) = &mut app.modals.overlay {
         p.area = area;
-        p.list_area = list_inner;
+        p.list.list_area = list_inner;
+        p.list.sync_scroll(list_inner.height as usize);
     }
 }
 
@@ -1583,56 +1595,68 @@ fn draw_files_overlay(f: &mut Frame, app: &mut App, finder: crate::app::FileFind
     // "no files", which is not what is known yet.
     let title = if finder.listing.is_some() {
         format!(" Find file — {} (listing…) ", finder.branch)
-    } else if finder.query.is_empty() {
-        format!(" Find file — {} ({}) ", finder.branch, finder.files.len())
+    } else if finder.list.query.is_empty() {
+        format!(
+            " Find file — {} ({}) ",
+            finder.branch,
+            finder.list.items.len()
+        )
     } else {
         format!(
             " Find file — {} ({}/{}) ",
             finder.branch,
-            finder.matches.len(),
-            finder.files.len()
+            finder.list.matches.len(),
+            finder.list.items.len()
         )
     };
     let inner = render_modal_frame(f, area, title, th);
 
     // First row: the always-on fuzzy query input.
     if let Some(query_area) = row_rect(inner, 0) {
-        let line = search_line(&finder.query, "type to filter…", query_area, th);
+        let line = search_line(&finder.list.query, "type to filter…", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
     let list_inner = below_first_row(inner);
 
     if finder.listing.is_some() {
         empty_list_row(f, list_inner, "listing files…", th);
-    } else if finder.matches.is_empty() {
+    } else if finder.list.matches.is_empty() {
         empty_list_row(f, list_inner, NO_MATCHES, th);
     }
-    let start = finder.window_start(list_inner.height as usize);
-    for (row, (i, m)) in finder.matches.iter().enumerate().skip(start).enumerate() {
+    let start = finder.list.window_start(list_inner.height as usize);
+    for (row, (i, m)) in finder
+        .list
+        .matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .enumerate()
+    {
         let Some(row_area) = row_rect(list_inner, row) else {
             break;
         };
-        let path = &finder.files[m.file];
+        let path = &finder.list.items[m.item];
         let budget = (list_inner.width as usize).saturating_sub(2);
         let shown = truncate(path, budget);
         let positions = visible_positions(&m.positions, &shown, path);
         let mut spans = vec![Span::raw(" ")];
         spans.extend(fuzzy_highlight_spans(&shown, positions, th));
-        render_row(f, row_area, spans, i == finder.selected, true, th);
+        render_row(f, row_area, spans, i == finder.list.cursor, true, th);
     }
 
     // Write-back (draw works on a clone): rects for mouse
     // hit-testing.
     if let Some(Overlay::Files(fin)) = &mut app.modals.overlay {
         fin.area = area;
-        fin.list_area = list_inner;
+        fin.list.list_area = list_inner;
+        fin.list.sync_scroll(list_inner.height as usize);
     }
 }
 
 fn draw_grep_overlay(f: &mut Frame, app: &mut App, view: crate::app::GrepView) {
     let th = app.chrome.theme;
     let area = centered_rect_pct(f.area(), GREP_MODAL_PCT.0, GREP_MODAL_PCT.1);
-    let title = if view.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
+    let title = if view.list.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
         format!(" Find in files — {} ", view.branch)
     } else if view.waiting.is_some() {
         format!(" Find in files — {} (searching…) ", view.branch)
@@ -1640,20 +1664,20 @@ fn draw_grep_overlay(f: &mut Frame, app: &mut App, view: crate::app::GrepView) {
         format!(
             " Find in files — {} ({}+ hits) ",
             view.branch,
-            view.hits.len()
+            view.list.items.len()
         )
     } else {
         format!(
             " Find in files — {} ({} hits) ",
             view.branch,
-            view.hits.len()
+            view.list.items.len()
         )
     };
     let inner = render_modal_frame(f, area, title, th);
 
     // First row: the always-live grep query.
     if let Some(query_area) = row_rect(inner, 0) {
-        let line = search_line(&view.query, "type to search…", query_area, th);
+        let line = search_line(&view.list.query, "type to search…", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
     let list_inner = below_first_row(inner);
@@ -1661,7 +1685,7 @@ fn draw_grep_overlay(f: &mut Frame, app: &mut App, view: crate::app::GrepView) {
     // Placeholder row: error, too-short query, or an empty result.
     let placeholder = if let Some(err) = &view.error {
         Some(Span::styled(err.clone(), Style::default().fg(th.err)))
-    } else if view.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
+    } else if view.list.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
         Some(Span::styled(
             format!(
                 "type at least {} characters to search",
@@ -1669,7 +1693,7 @@ fn draw_grep_overlay(f: &mut Frame, app: &mut App, view: crate::app::GrepView) {
             ),
             Style::default().fg(th.dim),
         ))
-    } else if view.hits.is_empty() && view.waiting.is_none() {
+    } else if view.list.items.is_empty() && view.waiting.is_none() {
         Some(Span::styled(NO_MATCHES, Style::default().fg(th.dim)))
     } else {
         None
@@ -1678,8 +1702,8 @@ fn draw_grep_overlay(f: &mut Frame, app: &mut App, view: crate::app::GrepView) {
         f.render_widget(Paragraph::new(span), row_area);
     }
 
-    let start = view.window_start(list_inner.height as usize);
-    for (row, (i, hit)) in view.hits.iter().enumerate().skip(start).enumerate() {
+    let start = view.list.window_start(list_inner.height as usize);
+    for (row, (i, hit)) in view.list.items.iter().enumerate().skip(start).enumerate() {
         let Some(row_area) = row_rect(list_inner, row) else {
             break;
         };
@@ -1697,14 +1721,15 @@ fn draw_grep_overlay(f: &mut Frame, app: &mut App, view: crate::app::GrepView) {
             spans.push(Span::raw("  "));
             spans.push(Span::raw(truncate(&hit.text, budget - loc_len - 2)));
         }
-        render_row(f, row_area, spans, i == view.selected, true, th);
+        render_row(f, row_area, spans, i == view.list.cursor, true, th);
     }
 
     // Write-back (draw works on a clone): rects for mouse
     // hit-testing.
     if let Some(Overlay::Grep(v)) = &mut app.modals.overlay {
         v.area = area;
-        v.list_area = list_inner;
+        v.list.list_area = list_inner;
+        v.list.sync_scroll(list_inner.height as usize);
     }
 }
 
@@ -1955,7 +1980,7 @@ fn draw_tree_overlay(f: &mut Frame, app: &mut App, mut view: crate::tree_browser
     // selected row visible.
     let tree_title = if view.listing.is_some() {
         format!("Tree — {} (listing…)", view.branch)
-    } else if view.filter.is_empty() {
+    } else if view.list.query.is_empty() {
         format!("Tree — {} ({})", view.branch, view.file_count)
     } else {
         format!(
@@ -1969,27 +1994,28 @@ fn draw_tree_overlay(f: &mut Frame, app: &mut App, mut view: crate::tree_browser
 
     // First row: the always-on fuzzy filter input.
     if let Some(filter_area) = row_rect(tree_inner, 0) {
-        let line = search_line(&view.filter, "type to filter…", filter_area, th);
+        let line = search_line(&view.list.query, "type to filter…", filter_area, th);
         f.render_widget(Paragraph::new(line), filter_area);
     }
     let list_inner = below_first_row(tree_inner);
 
     if view.listing.is_some() {
         empty_list_row(f, list_inner, "listing files…", th);
-    } else if view.rows.is_empty() {
+    } else if view.list.matches.is_empty() {
         empty_list_row(f, list_inner, NO_MATCHES, th);
     }
-    let start = view.window_start(list_inner.height as usize);
-    for (row, (i, r)) in view.rows.iter().enumerate().skip(start).enumerate() {
+    let start = view.list.window_start(list_inner.height as usize);
+    for (row, (i, m)) in view.list.matches.iter().enumerate().skip(start).enumerate() {
         let Some(row_area) = row_rect(list_inner, row) else {
             break;
         };
+        let r = &view.list.items[m.item];
         let node = &view.nodes[r.node];
         let indent = "  ".repeat(node.depth);
         // Directories fold; a live filter forces them all open.
         let marker = if !node.is_dir {
             "  "
-        } else if !view.filter.is_empty() || view.expanded[r.node] {
+        } else if !view.list.query.is_empty() || view.expanded[r.node] {
             "▾ "
         } else {
             "▸ "
@@ -2006,7 +2032,7 @@ fn draw_tree_overlay(f: &mut Frame, app: &mut App, mut view: crate::tree_browser
         } else {
             spans.extend(fuzzy_highlight_spans(&shown, positions, th));
         }
-        render_row(f, row_area, spans, i == view.selected, true, th);
+        render_row(f, row_area, spans, i == view.list.cursor, true, th);
     }
 
     // Right: the selected node's preview, syntax-highlighted and
@@ -2089,7 +2115,8 @@ fn draw_tree_overlay(f: &mut Frame, app: &mut App, mut view: crate::tree_browser
         if rendered.is_some() {
             v.rendered = rendered;
         }
-        v.list_area = list_inner;
+        v.list.list_area = list_inner;
+        v.list.sync_scroll(list_inner.height as usize);
         v.preview_area = preview_inner;
         v.area = area;
         v.files_width = files_w;

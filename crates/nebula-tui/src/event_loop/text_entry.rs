@@ -57,7 +57,7 @@ pub(crate) fn paste_into_overlay(app: &mut App, text: &str) -> bool {
             prompt.refresh_dirs();
         }
         Overlay::Palette(palette) => {
-            palette.query.insert_str(text);
+            palette.list.query.insert_str(text);
             palette.apply_filter();
         }
         Overlay::ProjectPicker(picker) => {
@@ -65,15 +65,15 @@ pub(crate) fn paste_into_overlay(app: &mut App, text: &str) -> bool {
             picker.apply_filter();
         }
         Overlay::Files(finder) => {
-            finder.query.insert_str(text);
+            finder.list.query.insert_str(text);
             finder.apply_filter();
         }
         Overlay::Grep(view) => {
-            view.query.insert_str(text);
+            view.list.query.insert_str(text);
             view.run_search();
         }
         Overlay::Tree(view) => {
-            view.filter.insert_str(text);
+            view.list.query.insert_str(text);
             view.apply_filter();
         }
         Overlay::Diff(view) => {

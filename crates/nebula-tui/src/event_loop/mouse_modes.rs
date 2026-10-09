@@ -320,20 +320,16 @@ fn handle_palette_mouse(
     if let Some(Overlay::Palette(palette)) = &mut app.modals.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                palette.select(palette.selected as i64 - 1);
+                palette.list.step(-1);
                 app.chrome.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                palette.select(palette.selected as i64 + 1);
+                palette.list.step(1);
                 app.chrome.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let list = palette.list_area;
-                let first = palette.window_start(list.height as usize);
-                if let Some(index) =
-                    crate::list_hit::row_at(list, first, palette.matches.len(), mouse_pos)
-                {
-                    palette.select(index as i64);
+                if let Some(index) = palette.list.hit(mouse_pos) {
+                    palette.list.select(index as i64);
                     activate::palette_row(app, None, out);
                 }
                 app.chrome.dirty = true;
@@ -359,20 +355,16 @@ fn handle_files_mouse(
     if let Some(Overlay::Files(finder)) = &mut app.modals.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                finder.select(finder.selected as i64 - 1);
+                finder.list.step(-1);
                 app.chrome.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                finder.select(finder.selected as i64 + 1);
+                finder.list.step(1);
                 app.chrome.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let list = finder.list_area;
-                let first = finder.window_start(list.height as usize);
-                if let Some(index) =
-                    crate::list_hit::row_at(list, first, finder.matches.len(), mouse_pos)
-                {
-                    finder.select(index as i64);
+                if let Some(index) = finder.list.hit(mouse_pos) {
+                    finder.list.select(index as i64);
                     // Enter on that row — the FILE TABS reader for a
                     // markdown file, the editor for anything else. The
                     // click used to call the editor half directly, and so
@@ -402,20 +394,16 @@ fn handle_grep_mouse(
     if let Some(Overlay::Grep(view)) = &mut app.modals.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                view.select(view.selected as i64 - 1);
+                view.list.step(-1);
                 app.chrome.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                view.select(view.selected as i64 + 1);
+                view.list.step(1);
                 app.chrome.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let list = view.list_area;
-                let first = view.window_start(list.height as usize);
-                if let Some(index) =
-                    crate::list_hit::row_at(list, first, view.hits.len(), mouse_pos)
-                {
-                    view.select(index as i64);
+                if let Some(index) = view.list.hit(mouse_pos) {
+                    view.list.select(index as i64);
                     open_selected_hit_in_editor(app);
                 }
                 app.chrome.dirty = true;
@@ -455,11 +443,7 @@ fn handle_tree_mouse(
                     view.files_drag = Some(bx as i32 - mouse.column as i32);
                     return true;
                 }
-                let list = view.list_area;
-                let first = view.window_start(list.height as usize);
-                if let Some(index) =
-                    crate::list_hit::row_at(list, first, view.rows.len(), mouse_pos)
-                {
+                if let Some(index) = view.list.hit(mouse_pos) {
                     view.select(index as i64);
                     view.toggle_row(index); // no-op on files / under a filter
                 }

@@ -2,13 +2,11 @@
 //! right, with an always-live fuzzy filter that narrows the tree to the
 //! matching files and the hierarchies containing them.
 
-use crate::app::{
-    clamp_files_width, clamp_selection, max_scroll, scrolled_by, window_start, DEFAULT_DIFF_FILES_W,
-};
+use crate::app::{clamp_files_width, max_scroll, scrolled_by, DEFAULT_DIFF_FILES_W};
+use crate::filter_list::{FilterList, FilterMatch};
 use crate::git_diff::cap_lines;
 use crate::markdown::{self, Rendered};
 use crate::syntax::{Highlighter, TokenKind};
-use crate::text_input::TextInput;
 use ratatui::layout::Rect;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -87,7 +85,7 @@ pub(crate) fn file_preview(
 
 /// One visible row: a node index plus the char positions of the node's
 /// `name` the filter matched, for highlighting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeRow {
     pub node: usize,
     pub positions: Vec<usize>,
@@ -109,20 +107,15 @@ pub struct TreeBrowser {
     /// Per-node expansion, honored only while the filter is empty — a live
     /// filter force-expands every hierarchy it keeps.
     pub expanded: Vec<bool>,
-    /// Type-to-filter query over file paths; always live.
-    pub filter: TextInput,
+    /// Visible rows plus the live type-to-filter query over file paths.
+    pub list: FilterList<TreeRow>,
     /// Total file (non-directory) count, for the title.
     pub file_count: usize,
     /// Files matching the filter, for the title.
     pub match_count: usize,
-    /// Visible rows in tree order: everything expanded when the filter is
-    /// empty, else the matching files plus their ancestor directories.
-    pub rows: Vec<TreeRow>,
     /// Row of the best-scoring file under a live filter, where a filter
     /// edit parks the selection.
     pub best_row: Option<usize>,
-    /// Index into `rows`.
-    pub selected: usize,
     /// Preview text of the selected node (reloaded on selection change):
     /// file contents, or a child listing for a directory.
     pub preview: String,
@@ -147,9 +140,6 @@ pub struct TreeBrowser {
     /// Inner height of the preview pane, written back during draw (the
     /// `DiffView::view_height` pattern) so paging tracks resizes.
     pub view_height: u16,
-    /// Screen rect of the tree rows (filter row excluded), written back
-    /// during draw so clicks can hit-test rows.
-    pub list_area: Rect,
     /// Inner rect of the preview pane, written back during draw; the
     /// embedded editor spawns and renders at this size.
     pub preview_area: Rect,
@@ -203,10 +193,10 @@ impl TreeBrowser {
         self.file_count = file_count;
         self.listing = None;
         self.rebuild_rows();
-        self.selected = self
+        self.list.cursor = self
             .best_row
             .unwrap_or(0)
-            .min(self.rows.len().saturating_sub(1));
+            .min(self.list.matches.len().saturating_sub(1));
         self.load_preview();
     }
 
@@ -220,12 +210,10 @@ impl TreeBrowser {
             nodes,
             top,
             expanded,
-            filter: TextInput::new(),
+            list: FilterList::default(),
             file_count,
             match_count: file_count,
-            rows: Vec::new(),
             best_row: None,
-            selected: 0,
             preview: String::new(),
             preview_lines: Vec::new(),
             preview_line_count: 0,
@@ -235,7 +223,6 @@ impl TreeBrowser {
             rendered: None,
             scroll: 0,
             view_height: 0,
-            list_area: Rect::default(),
             preview_area: Rect::default(),
             area: Rect::default(),
             files_width: DEFAULT_DIFF_FILES_W,
@@ -276,21 +263,21 @@ impl TreeBrowser {
     /// First visible row of the tree's stateless follow-window for a list of
     /// `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.selected, height)
+        self.list.window_start(height)
     }
 
     /// Clamped absolute selection; reloads the preview when it moved.
     pub fn select(&mut self, index: i64) {
-        let clamped = clamp_selection(index, self.rows.len());
-        if clamped != self.selected {
-            self.selected = clamped;
+        let before = self.list.cursor;
+        self.list.select(index);
+        if self.list.cursor != before {
             self.load_preview();
         }
     }
 
     /// The node behind the current selection, if any row is visible.
     pub fn selected_node(&self) -> Option<&TreeNode> {
-        self.nodes.get(self.rows.get(self.selected)?.node)
+        self.nodes.get(self.list.selected()?.node)
     }
 
     pub fn selected_is_dir(&self) -> bool {
@@ -301,25 +288,30 @@ impl TreeBrowser {
     /// selection on that row. No-op on files and under a live filter (the
     /// filtered tree is forced open).
     pub fn toggle_row(&mut self, row: usize) {
-        if !self.filter.is_empty() {
+        if !self.list.query.is_empty() {
             return;
         }
-        let Some(node) = self.rows.get(row).map(|r| r.node) else {
+        let Some(node) = self
+            .list
+            .matches
+            .get(row)
+            .map(|m| self.list.items[m.item].node)
+        else {
             return;
         };
         if !self.nodes[node].is_dir {
             return;
         }
-        let before = self.rows.get(self.selected).map(|r| r.node);
+        let before = self.list.selected().map(|r| r.node);
         self.expanded[node] = !self.expanded[node];
         self.rebuild_rows();
         // Keep the selection on the node it was on; a selection that sat
         // inside the folded subtree falls back to the toggled directory.
-        self.selected = before
-            .and_then(|n| self.rows.iter().position(|r| r.node == n))
-            .or_else(|| self.rows.iter().position(|r| r.node == node))
+        self.list.cursor = before
+            .and_then(|n| self.list.items.iter().position(|r| r.node == n))
+            .or_else(|| self.list.items.iter().position(|r| r.node == node))
             .unwrap_or(0);
-        if self.rows.get(self.selected).map(|r| r.node) != before {
+        if self.list.selected().map(|r| r.node) != before {
             self.load_preview();
         }
     }
@@ -327,17 +319,17 @@ impl TreeBrowser {
     /// → expands a collapsed dir; on an expanded dir it steps into the
     /// first child.
     pub fn expand_selected(&mut self) {
-        let Some(node) = self.rows.get(self.selected).map(|r| r.node) else {
+        let Some(node) = self.list.selected().map(|r| r.node) else {
             return;
         };
         if !self.nodes[node].is_dir {
             return;
         }
-        if !self.filter.is_empty() || self.expanded[node] {
+        if !self.list.query.is_empty() || self.expanded[node] {
             // Already open (a live filter forces every dir open): the first
             // child is the next row.
             if !self.nodes[node].children.is_empty() {
-                self.select(self.selected as i64 + 1);
+                self.select(self.list.cursor as i64 + 1);
             }
             return;
         }
@@ -348,17 +340,17 @@ impl TreeBrowser {
 
     /// ← collapses an expanded dir; anywhere else it jumps to the parent row.
     pub fn collapse_selected(&mut self) {
-        let Some(node) = self.rows.get(self.selected).map(|r| r.node) else {
+        let Some(node) = self.list.selected().map(|r| r.node) else {
             return;
         };
-        if self.filter.is_empty() && self.nodes[node].is_dir && self.expanded[node] {
+        if self.list.query.is_empty() && self.nodes[node].is_dir && self.expanded[node] {
             self.expanded[node] = false;
             // Only rows below the selection changed; it still points at `node`.
             self.rebuild_rows();
             return;
         }
         if let Some(parent) = self.nodes[node].parent {
-            if let Some(row) = self.rows.iter().position(|r| r.node == parent) {
+            if let Some(row) = self.list.items.iter().position(|r| r.node == parent) {
                 self.select(row as i64);
             }
         }
@@ -368,13 +360,13 @@ impl TreeBrowser {
     /// best-scoring file (top row when the filter is empty), reloading the
     /// preview when the selected node changed.
     pub fn apply_filter(&mut self) {
-        let before = self.rows.get(self.selected).map(|r| r.node);
+        let before = self.list.selected().map(|r| r.node);
         self.rebuild_rows();
-        self.selected = self
+        self.list.cursor = self
             .best_row
             .unwrap_or(0)
-            .min(self.rows.len().saturating_sub(1));
-        if self.rows.get(self.selected).map(|r| r.node) != before {
+            .min(self.list.matches.len().saturating_sub(1));
+        if self.list.selected().map(|r| r.node) != before {
             self.load_preview();
         }
     }
@@ -383,8 +375,15 @@ impl TreeBrowser {
     /// the expansion state; otherwise every file whose path fuzzy-matches is
     /// kept along with its ancestor directories, all forced open.
     fn rebuild_rows(&mut self) {
-        let visible = visible_rows(&self.nodes, &self.top, &self.expanded, &self.filter);
-        self.rows = visible.rows;
+        let visible = visible_rows(&self.nodes, &self.top, &self.expanded, &self.list.query);
+        let len = visible.rows.len();
+        self.list.items = visible.rows;
+        self.list.matches = (0..len)
+            .map(|item| FilterMatch {
+                item,
+                positions: self.list.items[item].positions.clone(),
+            })
+            .collect();
         self.best_row = visible.best_row;
         self.match_count = visible.match_count.unwrap_or(self.file_count);
     }
@@ -724,7 +723,8 @@ mod tests {
     }
 
     fn visible_paths(b: &TreeBrowser) -> Vec<&str> {
-        b.rows
+        b.list
+            .items
             .iter()
             .map(|r| b.nodes[r.node].path.as_str())
             .collect()
@@ -736,7 +736,7 @@ mod tests {
         assert_eq!(b.file_count, 4);
         // Collapsed by default: only top-level rows, dir before file.
         assert_eq!(visible_paths(&b), vec!["a", "b.txt"]);
-        assert!(b.nodes[b.rows[0].node].is_dir);
+        assert!(b.nodes[b.list.items[0].node].is_dir);
     }
 
     #[test]
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn filter_keeps_matching_files_and_their_hierarchies() {
         let mut b = browser(&["a/sub/z.rs", "a/x.rs", "other/w.rs"]);
-        b.filter = "z".into();
+        b.list.query = "z".into();
         b.apply_filter();
         // Only z.rs matches; its ancestors appear, "other" does not.
         assert_eq!(visible_paths(&b), vec!["a", "a/sub", "a/sub/z.rs"]);
@@ -786,10 +786,15 @@ mod tests {
     #[test]
     fn filter_matches_full_paths_and_highlights_the_name() {
         let mut b = browser(&["a/sub/z.rs", "a/x.rs"]);
-        b.filter = "az".into(); // 'a' hits the dir prefix, 'z' hits the name
+        b.list.query = "az".into(); // 'a' hits the dir prefix, 'z' hits the name
         b.apply_filter();
         assert_eq!(b.match_count, 1);
-        let row = b.rows.iter().find(|r| !b.nodes[r.node].is_dir).unwrap();
+        let row = b
+            .list
+            .items
+            .iter()
+            .find(|r| !b.nodes[r.node].is_dir)
+            .unwrap();
         assert_eq!(b.nodes[row.node].path, "a/sub/z.rs");
         // Only the in-name hit ('z' at char 0 of "z.rs") is lit.
         assert_eq!(row.positions, vec![0]);
@@ -798,10 +803,10 @@ mod tests {
     #[test]
     fn clearing_the_filter_restores_the_expansion_state() {
         let mut b = browser(&["a/x.rs", "b.txt"]);
-        b.filter = "rs".into();
+        b.list.query = "rs".into();
         b.apply_filter();
         assert_eq!(visible_paths(&b), vec!["a", "a/x.rs"]);
-        b.filter.clear();
+        b.list.query.clear();
         b.apply_filter();
         // "a" was never manually expanded, so it folds back up.
         assert_eq!(visible_paths(&b), vec!["a", "b.txt"]);
@@ -824,11 +829,11 @@ mod tests {
             "vim".into(),
             vec!["src/lib.rs".into(), "gone.txt".into()],
         );
-        b.filter = "lib".into();
+        b.list.query = "lib".into();
         b.apply_filter();
         assert_eq!(b.preview, "hello\nworld");
         assert_eq!(b.preview_line_count, 2);
-        b.filter = "gone".into();
+        b.list.query = "gone".into();
         b.apply_filter();
         assert!(
             b.preview.starts_with("couldn't read file:"),
