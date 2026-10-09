@@ -15,9 +15,6 @@ use nebula_core::{
 
 use crate::registry::{CreateAgentSpec, Daemon};
 
-const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
-
 pub const CLAUDE_ORCHESTRATOR_GUIDANCE: &str = "[nebula] You are the pinned ORCHESTRATOR \
 session for nebula. Your job is to coordinate work across every project, worktree and session \
 without making the user click through them. You have these orchestrator-only commands; the daemon \
@@ -94,13 +91,7 @@ impl Daemon {
         let sref = SessionRef::Agent(target.clone());
         let session =
             self.ensure_session(&sref, crate::pty::DEFAULT_COLS, crate::pty::DEFAULT_ROWS)?;
-        let data = if text.contains('\n') {
-            bracketed(text)
-        } else {
-            text.as_bytes().to_vec()
-        };
-        session.write_input(&data)?;
-        session.write_input(b"\r")?;
+        crate::session_context::write_prompt(&session, text)?;
         Ok(())
     }
 
@@ -111,8 +102,7 @@ impl Daemon {
         max_bytes: u32,
     ) -> Result<Option<OutputTail>> {
         self.require_orchestrator(caller)?;
-        let max = max_bytes.min(256 * 1024) as usize;
-        Ok(self.session(session).map(|s| s.tail(max, None)))
+        Ok(self.read_output_tail_clean(session, max_bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -266,13 +256,6 @@ fn validate_message(message: &str) -> Result<&str> {
         );
     }
     Ok(text)
-}
-
-fn bracketed(text: &str) -> Vec<u8> {
-    let mut data = PASTE_START.to_vec();
-    data.extend_from_slice(text.as_bytes());
-    data.extend_from_slice(PASTE_END);
-    data
 }
 
 fn slugify_branch(raw: &str) -> String {

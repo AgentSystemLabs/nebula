@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 49;
+pub const PROTOCOL_VERSION: u32 = 50;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -359,6 +359,28 @@ pub enum ClientRequest {
         sessions: Vec<SessionRef>,
         tabs: Vec<ReviewTabKind>,
     },
+    /// Agent-readable list of every session across every project.
+    ListSessions {
+        req_id: u64,
+    },
+    /// Agent-readable recent context for one session, addressed by id or
+    /// fuzzy name. Prefers harness transcripts when the daemon knows one.
+    ReadSession {
+        req_id: u64,
+        target: String,
+        max_lines: u32,
+    },
+    /// Send a labelled question to another local agent, optionally waiting
+    /// for it to become idle first, and answer with clean text from that
+    /// turn's output.
+    AskSession {
+        req_id: u64,
+        caller: Option<AgentId>,
+        target: String,
+        question: String,
+        timeout_ms: u64,
+        wait: bool,
+    },
     /// Kills the PTY, sets archived=1.
     ArchiveAgent {
         req_id: u64,
@@ -543,6 +565,27 @@ pub struct OutputTail {
     pub data: Vec<u8>,
 }
 
+/// One row in the agent-readable `nebula sessions` listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session: SessionRef,
+    pub id: String,
+    pub name: String,
+    pub project_id: ProjectId,
+    pub project: String,
+    pub worktree_id: WorktreeId,
+    pub worktree: PathBuf,
+    pub branch: String,
+    /// The agent harness (`claude`, `codex`, ...), or `terminal`.
+    pub harness: String,
+    /// Model-facing status: `idle`, `running`, `needs_feedback`,
+    /// `terminated`, or `disconnected`.
+    pub status: String,
+    pub alive: bool,
+    /// One-line recent context: newest user prompt when known, else title.
+    pub summary: String,
+}
+
 /// Daemon-side half of the metrics modal's data; the client stacks its own
 /// RSS on top. Session subtrees are daemon descendants, so `daemon_rss_bytes`
 /// counts the daemon process alone — the total stays double-count-free.
@@ -619,6 +662,23 @@ pub enum ServerEvent {
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
         links: Vec<Link>,
+    },
+    /// Reply to `ListSessions`.
+    SessionList {
+        req_id: u64,
+        sessions: Vec<SessionSummary>,
+    },
+    /// Reply to `ReadSession`.
+    SessionText {
+        req_id: u64,
+        session: SessionRef,
+        text: String,
+    },
+    /// Reply to `AskSession`.
+    SessionAnswer {
+        req_id: u64,
+        session: AgentId,
+        answer: String,
     },
     /// Broadcast by `OrchestratorOpenReview`: clients open a local review
     /// modal for these sessions and tabs.

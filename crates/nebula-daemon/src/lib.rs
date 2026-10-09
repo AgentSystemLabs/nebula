@@ -13,6 +13,7 @@ pub mod prompt_history;
 pub mod pty;
 pub mod registry;
 pub mod server;
+pub mod session_context;
 pub mod session_model;
 pub mod session_title;
 pub mod sibling;

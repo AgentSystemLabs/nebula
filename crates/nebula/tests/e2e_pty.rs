@@ -4907,6 +4907,161 @@ async fn nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree() {
     let _ = daemon.kill();
 }
 
+/// `nebula ask` sends a labelled question to another local agent, waits on
+/// the ordinary status hooks, queues behind a busy turn, and times out
+/// clearly when the target never becomes idle.
+#[tokio::test]
+async fn nebula_ask_cli_round_trips_queues_and_times_out() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let env_dir = env.tmp.path().join("agent-env");
+    let log_dir = env.tmp.path().join("agent-log");
+    std::fs::create_dir_all(&env_dir).unwrap();
+    std::fs::create_dir_all(&log_dir).unwrap();
+
+    let script = env.tmp.path().join("answer-agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "env | grep '^NEBULA_' > '{env_dir}'/$NEBULA_AGENT_ID.env\n",
+                "while IFS= read -r line; do\n",
+                "  case \"$line\" in\n",
+                "    *'[question from session'*)\n",
+                "      echo \"$line\" >> '{log_dir}'/$NEBULA_AGENT_ID.questions\n",
+                "      curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" ",
+                "-H 'Content-Type: application/json' -d '{{\"session_id\":\"ask-sid\",\"prompt\":\"ask\"}}' ",
+                "\"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\" ",
+                ">/dev/null 2>&1\n",
+                "      ;;\n",
+                "  esac\n",
+                "  case \"$line\" in\n",
+                "    *'Answer concisely;'*)\n",
+                "      echo 'Research answer: use serde_json.'\n",
+                "      curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" ",
+                "-H 'Content-Type: application/json' -d '{{\"session_id\":\"ask-sid\"}}' ",
+                "\"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=Stop\" ",
+                ">/dev/null 2>&1\n",
+                "      ;;\n",
+                "  esac\n",
+                "done\n",
+            ),
+            env_dir = env_dir.display(),
+            log_dir = log_dir.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let caller = create_agent_get_id(&mut c, &worktree.id, "feature", 2).await;
+    let target = create_agent_get_id(&mut c, &worktree.id, "research", 3).await;
+    let target_env = read_env_file(&env_dir.join(format!("{}.env", target.0))).await;
+    read_env_file(&env_dir.join(format!("{}.env", caller.0))).await;
+
+    let ask = |args: &[&str]| agent_cli(&env, &caller, args);
+    let out = ask(&[
+        "ask",
+        "research",
+        "which library should the feature use?",
+        "--timeout",
+        "5",
+    ]);
+    assert!(out.status.success(), "ask failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Research answer: use serde_json."),
+        "stdout: {stdout}"
+    );
+
+    let port: u16 = target_env[env::API_URL]
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let token = target_env[env::API_TOKEN].clone();
+    let hook = |event: &str| format!("/api/hooks/claude?agentId={}&hookEvent={event}", target.0);
+    let target_log = log_dir.join(format!("{}.questions", target.0));
+    let question_count = || {
+        std::fs::read_to_string(&target_log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    let before_busy = question_count();
+
+    let (status, _) = hook_post_json(
+        port,
+        &hook("UserPromptSubmit"),
+        &token,
+        r#"{"session_id":"ask-sid","prompt":"busy"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status, .. }
+                if agent == &target && *status == nebula_core::AgentStatus::Running)
+        })
+    })
+    .await;
+
+    let mut queued = env.cli();
+    let queued = queued
+        .args([
+            "ask",
+            "research",
+            "answer after your current turn",
+            "--timeout",
+            "5",
+        ])
+        .env(env::AGENT_ID, &caller.0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        question_count(),
+        before_busy,
+        "busy target should not receive the queued question yet"
+    );
+    let (status, _) =
+        hook_post_json(port, &hook("Stop"), &token, r#"{"session_id":"ask-sid"}"#).await;
+    assert_eq!(status, 200);
+    let out = queued.wait_with_output().unwrap();
+    assert!(out.status.success(), "queued ask failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Research answer: use serde_json."),
+        "queued stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let (status, _) = hook_post_json(
+        port,
+        &hook("UserPromptSubmit"),
+        &token,
+        r#"{"session_id":"ask-sid","prompt":"stuck"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let out = ask(&["ask", "--timeout", "1", "research", "will this time out?"]);
+    assert!(!out.status.success(), "timeout ask should fail: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("timed out"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// Run the `nebula` CLI the way a hook would inside an agent session: the
 /// test daemon's runtime dir plus the session's `NEBULA_AGENT_ID`.
 fn agent_cli(
