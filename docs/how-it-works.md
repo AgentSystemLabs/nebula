@@ -280,7 +280,12 @@
   session in the directory its transcript recorded, the old checkout. Cursor and OpenCode resume silent
   and wait for your next prompt (`opencode --session <id> --prompt "<note>"` loads the session but never
   submits the note); Muse reboots fresh with no note (no resume flag mapped). The restart is the only way there: an agent CLI can't `cd` out of the
-  directory it was started in.
+  directory it was started in. When the restart can't bring the conversation back — no session id stored, a
+  Claude session id with no transcript behind it, or a resume that dies within its first seconds and is
+  restarted fresh — the
+  CLIs that take the note (Claude, Codex, Pi) open instead on one saying the conversation could not be
+  carried over, and the agent asks you to restate the request rather than guessing at it. (Pi creates a
+  missing session instead of failing, so a lost Pi session is not detected.)
 - **Ask the agent for another session and it starts one.** Tell a Claude session "start a new nebula
   session that fixes the login redirect" and it runs `nebula spawn "<task>"`: the daemon starts a second
   agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse|grok|opencode`
