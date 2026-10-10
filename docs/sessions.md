@@ -329,7 +329,40 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   confirmed ahead of it; a check that fails or runs out of time says so rather than reading as
   clean. The dialog itself waits for the check (the footer says `checking 'feat' for work in
   progress…`), so it opens once, already filled in; only a check still out after five seconds
-  opens it early, with `Checking…` (`Esc` cancels throughout). Each band is a
+  opens it early, with `Checking…` (`Esc` cancels throughout), and `Enter`, `k` and `D` wait for
+  the answer. The check's git half also runs in the background for every empty band, one band per
+  git tick, so the band says before you press anything what a delete would lose, in place of
+  `nothing running`: `✓ clean · merged` (nothing destroyed, and the branch has landed),
+  `✓ clean · detached`, `↑4 unmerged` (the branch holds commits its base lacks — a delete keeps
+  the branch, and them), and, in the warning color for what a delete destroys,
+  `⚠ 3 modified · 2 untracked`, `⚠ 6 unpushed in submodules` (submodule commits — checked out, on
+  a local branch or tag, or stashed — that exist only in this worktree's own submodule store,
+  which the delete takes) and `⚠ detached · 2 unreachable`.
+  A git at work in the checkout — `git submodule update` still cloning, a fetch, a rebase or a
+  merge — or one stopped part-way (a rebase waiting on a conflict) reads `⋯ git submodule update
+  running` or `⋯ git rebase in progress` instead, dim (a stopped one that also holds what a delete
+  destroys says both, warned: `⚠ 2 modified · git rebase in progress`): the checkout is in flux, which is no error,
+  and the band is read again on the next tick; a delete confirm then keeps the branch whatever
+  it found. Only a read git cannot explain says `? can't read submodule lib/a · retrying` (or
+  `? can't read git state · retrying`), retried on the next few ticks and then at the usual pace;
+  the confirm shows git's own words.
+  A band read before its first answer says `nothing running` as before. **Merged** here counts by
+  content, not ancestry: a branch landed by a squash merge, a rebase-and-merge or a cherry-pick
+  reads merged — wider than `git branch --merged`, which knows only ancestry; a squash-merged
+  branch whose lines the base has changed again since reads `unmerged` (the squash test's merge
+  conflicts), the safe way round. The confirm then
+  decides the branch: a landed one is deleted with the checkout (`Its branch has landed on
+  origin/main and is deleted with it.`, `[Enter/y] delete both   [k] keep branch`) unless
+  **Delete landed branch** (Settings → Sessions, on by default) is off; one with unlanded commits
+  is kept (`4 commits are on this branch and not on origin/main.`, `[Enter/y] keep branch   [D]
+  delete branch too`); a card's delete that takes its emptied worktree offers the same `k` or `D`.
+  The delete takes the branch and tip the check judged, and only while the tip is still that
+  commit, so a commit made while the confirm was open keeps the branch. The base, origin's
+  default branch, the root's branch and a branch another checkout has out are never deleted,
+  and a checkout that switched branches since the confirm keeps both. The confirm (not the band) also names
+  the gitignored files `git worktree remove --force` would take that are not build output —
+  `⚠ 2 ignored files are deleted too: .env, .claude/settings.local.json` — leaving out `target/`,
+  `node_modules/`, `dist/` and the like. Each band is a
   titled rule over one row of cards: the rule names the checkout in its scope color (`↳ feat`,
   `⌂ main` for the root — the project is the grid's own scope, named once in the header), with
   that checkout's uncommitted changes right behind the branch in the warning color (`↳ feat +3

@@ -409,6 +409,12 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
 
 fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
+    // The branch keys a band's own delete offers, once its check has said
+    // where the branch stands.
+    let branch_keys = match &app.modals.overlay {
+        Some(Overlay::Confirm(c)) => crate::delete_check::branch_keys(app, &c.action),
+        _ => None,
+    };
     let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
@@ -455,6 +461,38 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                         index,
                     );
                 }
+            }
+            // A worktree delete decides the branch — a band's own `d`, or
+            // a card's delete taking its emptied worktree: `k` keeps a
+            // landed one the confirm would delete, `D` deletes one it would
+            // keep. Offered only once the check has said where the branch
+            // stands, so neither runs ahead of it.
+            KeyCode::Char(c @ ('k' | 'D')) if branch_keys.is_some() => {
+                let action = confirm.action.clone();
+                let Some(id) = crate::delete_check::branch_decided_by(&action).cloned() else {
+                    unreachable!("branch keys are a worktree delete's");
+                };
+                let delete_branch = match (c, branch_keys) {
+                    ('k', Some(crate::delete_check::BranchKeys::DeleteByDefault)) => None,
+                    ('D', Some(crate::delete_check::BranchKeys::KeepByDefault { unlanded })) => {
+                        let tip = crate::delete_check::judged_tip(app, &id);
+                        if let (Some(tip), true) = (&tip, unlanded > 0) {
+                            app.chrome.flash = Some(format!(
+                                "deleting branch '{}' too — its {unlanded} unlanded commit(s) go with it",
+                                tip.name
+                            ));
+                        }
+                        tip
+                    }
+                    // The other key of the pair is not on this dialog.
+                    _ => return,
+                };
+                app.modals.overlay = None;
+                if let PendingAction::ThenDeleteWorktree { first, .. } = action {
+                    // The card goes first, as `Enter` takes it.
+                    run_pending_action(app, *first, out);
+                }
+                delete_worktree_and_settle_with(app, id, delete_branch, out);
             }
             KeyCode::Enter | KeyCode::Char('y') => {
                 // A worktree delete waits for its DELETE CHECK: the user

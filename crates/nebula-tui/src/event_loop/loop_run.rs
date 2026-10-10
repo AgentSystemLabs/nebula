@@ -169,6 +169,8 @@ macro_rules! main_loop_body {
             _ = tokio::time::sleep_until(next_git_poll) => {
                 request_git_changes(&mut app, &git_tx);
                 sweep_git_changes(&mut app, &sweep_git_tx);
+                // And one idle band's DELETE CHECK, for its line.
+                crate::band_safety::sweep(&mut app, &mut out);
                 // Rides the git tick rather than the repaint, so walking the
                 // worktree list with j/k can't spawn a `gh` per row passed —
                 // only whatever the selection is resting on when it fires,

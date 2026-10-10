@@ -4381,6 +4381,9 @@ pub struct JobState {
     pub worktree_changes: HashMap<WorktreeId, (Option<usize>, std::time::Instant)>,
     /// The checkout the sweep is reading right now; its answer clears it.
     pub worktree_changes_inflight: Option<WorktreeId>,
+    /// The DELETE CHECK's git half for each idle band, and when it was
+    /// read: what its line says a delete would lose (`band_safety`).
+    pub band_checks: crate::band_safety::BandChecks,
     /// The lines added and removed in each checkout, read beside its
     /// changed-file count: what its cards print after `+3 files`. Only a
     /// checkout with changed lines has an entry.

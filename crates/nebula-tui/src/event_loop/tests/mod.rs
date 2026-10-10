@@ -22476,7 +22476,7 @@ fn delete_feat_with_check() -> (App, u64) {
     );
     crate::delete_check::sync(&mut app, &mut out);
     let req_id = match out.as_slice() {
-        [ClientRequest::CheckWorktree { req_id, id }] if id.0 == "w2" => *req_id,
+        [ClientRequest::CheckWorktree { req_id, id, .. }] if id.0 == "w2" => *req_id,
         other => panic!("the confirm asks for one check: {other:?}"),
     };
     (app, req_id)
@@ -22567,6 +22567,12 @@ fn a_worktree_delete_dialog_opens_immediately_while_checking() {
                 id: WorktreeId("w2".into()),
                 check: nebula_core::WorktreeCheck {
                     changes: 2,
+                    base: Some("origin/main".into()),
+                    landing: Some(nebula_core::WorktreeLanding {
+                        branch_landed: true,
+                        branch: Some(feat_tip()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             },
@@ -22576,18 +22582,19 @@ fn a_worktree_delete_dialog_opens_immediately_while_checking() {
             screen.contains("from disk?") && screen.contains("2 uncommitted changes"),
             "{screen}"
         );
+        assert!(screen.contains("[k] keep branch"), "{screen}");
         assert!(!screen.contains("Checking 'feat'"), "{screen}");
         assert_eq!(app.chrome.flash, None);
     });
 }
 
-/// Enter and `y` wait for the check; Esc cancels immediately.
+/// Enter, `y`, `k` and `D` wait for the check; Esc cancels immediately.
 #[test]
 fn a_confirm_waiting_on_its_check_chooses_nothing_but_cancel() {
     with_default_config(|| {
         let (mut app, _) = delete_feat_with_check();
         let mut out = Vec::new();
-        for key in ['x', 'D', 'y'] {
+        for key in ['k', 'D', 'y'] {
             press(&mut app, KeyCode::Char(key), KeyModifiers::NONE, &mut out);
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
@@ -22688,6 +22695,263 @@ fn an_older_daemon_gets_no_check_and_the_old_confirm() {
         assert!(out
             .iter()
             .any(|r| matches!(r, ClientRequest::DeleteWorktree { .. })));
+    });
+}
+
+/// [`delete_feat_with_check`], answered: the branch has landed, or holds
+/// `ahead` commits origin/main lacks.
+fn delete_feat_checked(ahead: u32) -> App {
+    let (mut app, req_id) = delete_feat_with_check();
+    hse(
+        &mut app,
+        ServerEvent::WorktreeChecked {
+            req_id,
+            id: WorktreeId("w2".into()),
+            check: nebula_core::WorktreeCheck {
+                ahead,
+                base: Some("origin/main".into()),
+                landing: Some(nebula_core::WorktreeLanding {
+                    branch_landed: ahead == 0,
+                    branch: Some(feat_tip()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        },
+    );
+    app
+}
+
+/// The branch and tip [`delete_feat_checked`]'s check judged.
+fn feat_tip() -> nebula_core::BranchTip {
+    nebula_core::BranchTip {
+        name: "feat".into(),
+        oid: "f00d".into(),
+    }
+}
+
+/// Whether the one `DeleteWorktree` in `out` takes the branch — always
+/// the one the check judged, at its tip.
+fn deleted_branch(out: &[ClientRequest]) -> bool {
+    match out
+        .iter()
+        .filter_map(|r| match r {
+            ClientRequest::DeleteWorktree {
+                id, delete_branch, ..
+            } if id.0 == "w2" => Some(delete_branch.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [one] => {
+            if let Some(tip) = one {
+                assert_eq!(tip, &feat_tip(), "the judged branch and tip");
+            }
+            one.is_some()
+        }
+        other => panic!("one worktree delete: {other:?} in {out:?}"),
+    }
+}
+
+/// A landed branch goes with its worktree: the confirm says so, `Enter`
+/// deletes both, and `k` keeps the branch.
+#[test]
+fn a_landed_branch_goes_with_its_worktree_unless_k_keeps_it() {
+    with_default_config(|| {
+        let mut app = delete_feat_checked(0);
+        let screen = confirm_screen(&mut app);
+        for words in [
+            "Checked: nothing is running in it, uncommitted, or unlanded.",
+            "Its branch has landed on origin/main and is deleted with it.",
+            "[Enter/y] delete both   [k] keep branch   [Esc/n] cancel",
+        ] {
+            assert!(screen.contains(words), "{words:?} in:\n{screen}");
+        }
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('D'), KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "D is not this dialog's: {out:?}");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(deleted_branch(&out));
+
+        let mut app = delete_feat_checked(0);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        assert!(app.modals.overlay.is_none());
+        assert!(!deleted_branch(&out));
+    });
+}
+
+/// A branch with unlanded commits is kept by default; `D` discards it,
+/// the footer saying how many commits go with it.
+#[test]
+fn an_unlanded_branch_is_kept_unless_d_discards_it() {
+    with_default_config(|| {
+        let mut app = delete_feat_checked(4);
+        let screen = confirm_screen(&mut app);
+        for words in [
+            "4 commits are on this branch and not on origin/main.",
+            "[Enter/y] keep branch   [D] delete branch too   [Esc/n] cancel",
+        ] {
+            assert!(screen.contains(words), "{words:?} in:\n{screen}");
+        }
+        assert!(
+            !screen.contains("lacks (the branch keeps them)"),
+            "{screen}"
+        );
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(!deleted_branch(&out));
+
+        let mut app = delete_feat_checked(4);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "k is not this dialog's: {out:?}");
+        press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT, &mut out);
+        assert!(deleted_branch(&out));
+        assert!(app
+            .chrome
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("4 unlanded commit(s)")));
+    });
+}
+
+/// **Delete landed branch** off keeps even a landed branch unless `D`.
+#[test]
+fn delete_landed_branch_off_keeps_a_landed_branch_by_default() {
+    with_config_json(r#"{"delete_landed_branch": false}"#, || {
+        let mut app = delete_feat_checked(0);
+        let screen = confirm_screen(&mut app);
+        assert!(
+            screen.contains("Its branch has landed on origin/main.")
+                && screen.contains("[Enter/y] keep branch   [D] delete branch too"),
+            "{screen}"
+        );
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(!deleted_branch(&out));
+
+        let mut app = delete_feat_checked(0);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT, &mut out);
+        assert!(deleted_branch(&out));
+    });
+}
+
+/// A daemon at the DELETE CHECK's protocol but older than the branch's
+/// gets the confirm it always did: no branch keys, and no branch in the
+/// delete, whatever the check carried.
+#[test]
+fn a_daemon_before_branch_landing_gets_the_old_confirm() {
+    with_default_config(|| {
+        let mut app = parity_tree();
+        app.requests.daemon_protocol = nebula_core::BRANCH_LANDING_PROTOCOL - 1;
+        let mut out = Vec::new();
+        let row = app.worktree_row_of(&WorktreeId("w2".into())).unwrap();
+        select_worktree_row(&mut app, row, &mut out);
+        app.nav.focus = Focus::Worktrees;
+        out.clear();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        crate::delete_check::sync(&mut app, &mut out);
+        let req_id = match out.as_slice() {
+            [ClientRequest::CheckWorktree {
+                req_id,
+                git_only: false,
+                ..
+            }] => *req_id,
+            other => panic!("{other:?}"),
+        };
+        out.clear();
+        hse(
+            &mut app,
+            ServerEvent::WorktreeChecked {
+                req_id,
+                id: WorktreeId("w2".into()),
+                check: nebula_core::WorktreeCheck {
+                    base: Some("origin/main".into()),
+                    landing: Some(nebula_core::WorktreeLanding {
+                        branch_landed: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            },
+        );
+        let screen = confirm_screen(&mut app);
+        assert!(
+            screen.contains("[Enter/y] confirm   [Esc/n] cancel") && !screen.contains("[k]"),
+            "{screen}"
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(!deleted_branch(&out));
+    });
+}
+
+/// A card's delete that takes its emptied worktree decides the branch
+/// too: a landed one goes with it by default, and `k` keeps it — after
+/// the card's own delete, as `Enter` runs them.
+#[test]
+fn a_card_delete_taking_its_worktree_keeps_the_branch_on_k() {
+    with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+        let mut app = App::new();
+        seed_emptiable_tree(&mut app);
+        upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+        app.nav.focus = Focus::Sessions;
+        app.nav.sel_worktree = app
+            .visible_worktrees()
+            .iter()
+            .position(|w| w.id.0 == "w2")
+            .unwrap();
+        app.nav.sel_session = 0;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
+                if matches!(c.action, PendingAction::ThenDeleteWorktree { .. })),
+            "{:?}",
+            app.modals.overlay
+        );
+        crate::delete_check::sync(&mut app, &mut out);
+        let req_id = match out.as_slice() {
+            [ClientRequest::CheckWorktree { req_id, .. }] => *req_id,
+            other => panic!("{other:?}"),
+        };
+        out.clear();
+        hse(
+            &mut app,
+            ServerEvent::WorktreeChecked {
+                req_id,
+                id: WorktreeId("w2".into()),
+                check: nebula_core::WorktreeCheck {
+                    base: Some("origin/main".into()),
+                    landing: Some(nebula_core::WorktreeLanding {
+                        branch_landed: true,
+                        branch: Some(feat_tip()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            },
+        );
+        let screen = confirm_screen(&mut app);
+        assert!(
+            screen.contains("[k] keep branch")
+                && screen.contains("Its branch has landed on origin/main and is deleted with it."),
+            "{screen}"
+        );
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        assert!(app.modals.overlay.is_none());
+        let card = out
+            .iter()
+            .position(|r| !matches!(r, ClientRequest::DeleteWorktree { .. }))
+            .expect("the card's own delete");
+        let worktree = out
+            .iter()
+            .position(|r| matches!(r, ClientRequest::DeleteWorktree { .. }))
+            .expect("the worktree's");
+        assert!(card < worktree, "{out:?}");
+        assert!(!deleted_branch(&out));
     });
 }
 

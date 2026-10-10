@@ -455,6 +455,21 @@ impl Daemon {
     }
 
     pub async fn delete_worktree(self: &Arc<Self>, id: &WorktreeId, force: bool) -> Result<()> {
+        self.delete_worktree_and_branch(id, force, None).await
+    }
+
+    /// Delete a worktree, and with `delete_branch` the branch the confirm
+    /// judged too ([`Self::delete_checked_out_branch`]) — by its name and
+    /// tip, never by what the checkout or its row says now: the row's
+    /// branch follows an in-place switch within seconds. A branch that
+    /// cannot go is a warning, never an Error for the request — the
+    /// checkout is already gone.
+    pub async fn delete_worktree_and_branch(
+        self: &Arc<Self>,
+        id: &WorktreeId,
+        force: bool,
+        delete_branch: Option<nebula_core::BranchTip>,
+    ) -> Result<()> {
         let ops = self.worktree_ops.lock().await;
         let worktree_lookup = id.clone();
         let worktree = self
@@ -470,11 +485,36 @@ impl Daemon {
             .await?
             .context("project not found")?;
 
+        // The checkout must still be on the branch the confirm judged: one
+        // switched since (or detached) keeps every branch.
+        let branch = match delete_branch {
+            Some(tip) => match git::current_branch(&worktree.path).await {
+                Some(out) if out == tip.name => Some(tip),
+                now => {
+                    self.warn_clients(format!(
+                        "kept branch '{}': the checkout moved to {} since the confirm",
+                        tip.name,
+                        now.map_or_else(|| "a detached HEAD".to_string(), |b| format!("'{b}'"))
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+
         // Kill sessions living in this worktree.
         let (_, _, agents, terminals) = self.store_blocking(|store| store.load_tree()).await?;
         self.kill_sessions_in(std::slice::from_ref(id), &agents, &terminals);
 
         git::remove_worktree(&project.repo_path, &worktree.path, force).await?;
+        if let Some(tip) = branch {
+            if let Err(e) = self
+                .delete_checked_out_branch(&project.repo_path, &tip)
+                .await
+            {
+                self.warn_clients(format!("kept branch '{}': {e:#}", tip.name));
+            }
+        }
         let delete_id = id.clone();
         self.store_blocking(move |store| store.delete_worktree(&delete_id))
             .await?;
@@ -495,6 +535,31 @@ impl Daemon {
         Ok(())
     }
 
+    /// Delete the branch the confirm judged once its worktree is gone —
+    /// only while its tip is still the commit the confirm saw (an atomic
+    /// compare-and-delete, so a commit made while the dialog was open, by
+    /// a subagent say, keeps it). Never the base, origin's default branch
+    /// or the root's, and never one another checkout has out, whatever
+    /// the confirm said.
+    async fn delete_checked_out_branch(
+        &self,
+        repo: &Path,
+        tip: &nebula_core::BranchTip,
+    ) -> Result<()> {
+        let configured = crate::config::Config::load()
+            .worktree_base_branch()
+            .map(str::to_string);
+        let base = git::comparison_base(repo, configured.as_deref()).await;
+        if git::protected_branch(repo, &tip.name, base.as_deref()).await {
+            bail!("it is the base, default or root branch");
+        }
+        let checkouts = git::list_worktrees(repo).await?;
+        if let Some(other) = checkouts.iter().find(|w| w.branch == tip.name) {
+            bail!("{} has it checked out", other.path.display());
+        }
+        git::delete_branch_at(repo, tip).await
+    }
+
     /// The DELETE CHECK on a worktree: what taking it off disk would
     /// interrupt or lose, for the confirm a client shows first
     /// ([`crate::worktree_check`]). Reads only, and outside the worktree
@@ -502,10 +567,12 @@ impl Daemon {
     ///
     /// `client` is the asking client's pid, when the socket says it: its
     /// own process tree (the TUI, its background git reads) is spared.
+    /// `git_only` skips the process sweep — an idle band's line.
     pub async fn check_worktree(
         self: &Arc<Self>,
         id: &WorktreeId,
         client: Option<u32>,
+        git_only: bool,
     ) -> Result<WorktreeCheck> {
         let lookup = id.clone();
         let worktree = self
@@ -517,8 +584,13 @@ impl Daemon {
             .store_blocking(move |store| store.get_project(&project_lookup))
             .await?
             .context("project not found")?;
-        let mut spare = self.own_session_pids(id).await?;
-        spare.extend(self.nebula_helper_pids(client).await?);
+        let spare = if git_only {
+            None
+        } else {
+            let mut spare = self.own_session_pids(id).await?;
+            spare.extend(self.nebula_helper_pids(client).await?);
+            Some(spare)
+        };
         let base = crate::config::Config::load()
             .worktree_base_branch()
             .map(str::to_string);

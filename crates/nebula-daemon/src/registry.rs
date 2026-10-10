@@ -4499,12 +4499,12 @@ mod tests {
         seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
         let id = WorktreeId("feat".into());
 
-        let clean = daemon.check_worktree(&id, None).await.unwrap();
+        let clean = daemon.check_worktree(&id, None, false).await.unwrap();
         assert!(!clean.has_findings(), "{clean:?}");
 
         std::fs::write(wt.join("draft.txt"), "half done").unwrap();
         let worker = Worker::start(&wt);
-        let check = daemon.check_worktree(&id, None).await;
+        let check = daemon.check_worktree(&id, None, false).await;
         drop(worker);
         let check = check.unwrap();
         assert_eq!(check.changes, 1, "{check:?}");
@@ -4513,6 +4513,191 @@ mod tests {
             check.processes.iter().any(|p| p.name.contains("sleep")),
             "{check:?}"
         );
+    }
+
+    /// A band's check is the git half alone: no process sweep, and the
+    /// branch's landing — here, a branch with nothing of its own, which
+    /// has landed, then one with a commit, which has not.
+    #[tokio::test]
+    async fn a_git_only_check_reads_the_branch_and_skips_the_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
+        let id = WorktreeId("feat".into());
+
+        let worker = Worker::start(&wt);
+        let check = daemon.check_worktree(&id, None, true).await;
+        drop(worker);
+        let check = check.unwrap();
+        assert!(check.processes.is_empty(), "{check:?}");
+        let landing = check.landing.clone().expect("a landing");
+        assert!(landing.branch_landed, "{check:?}");
+
+        std::fs::write(wt.join("work.txt"), "w").unwrap();
+        git_in(&wt, &["add", "work.txt"]);
+        git_in(&wt, &["commit", "-m", "work"]);
+        std::fs::write(wt.join("new.txt"), "x").unwrap();
+        let check = daemon.check_worktree(&id, None, true).await.unwrap();
+        assert_eq!(check.ahead, 1);
+        assert_eq!(
+            (check.changes, check.landing.as_ref().unwrap().untracked),
+            (1, 1)
+        );
+        assert!(!check.landing.unwrap().branch_landed);
+    }
+
+    /// `delete_branch` takes the branch the confirm judged — landed or not,
+    /// the confirm being the decision — and only that branch at that tip:
+    /// not after the checkout switched branches (which the worktree sync
+    /// writes into the row within seconds), not after a commit landed on
+    /// it, not while another checkout has it out, and nothing from a
+    /// detached HEAD. Each keeps the branch with a warning.
+    #[tokio::test]
+    async fn a_delete_takes_only_the_branch_and_tip_the_confirm_judged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let daemon = test_daemon();
+        let project = project_at(&daemon, &repo);
+        let branch_exists = |name: &str| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{name}"),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let commit = |wt: &Path, file: &str| {
+            std::fs::write(wt.join(file), file).unwrap();
+            git_in(wt, &["add", file]);
+            git_in(wt, &["commit", "-m", file]);
+        };
+        let cut = |name: &str, commits: usize| {
+            let wt = root.join("repo-worktrees").join(name);
+            git_in(
+                &repo,
+                &["worktree", "add", &wt.to_string_lossy(), "-b", name],
+            );
+            for i in 0..commits {
+                commit(&wt, &format!("c{i}.txt"));
+            }
+            seed_worktree(&daemon, "p", name, &wt.to_string_lossy(), false);
+            (WorktreeId(name.into()), wt)
+        };
+        // What a confirm hands back: the tip its check judged.
+        let judged = |id: &WorktreeId| {
+            let daemon = daemon.clone();
+            let id = id.clone();
+            async move {
+                let check = daemon.check_worktree(&id, None, true).await.unwrap();
+                check.branch_tip().cloned().expect("on a branch")
+            }
+        };
+        let mut events = daemon.events.subscribe();
+        let warned = |events: &mut broadcast::Receiver<ServerEvent>, words: &str| {
+            let warnings = drain_warnings(events);
+            assert!(
+                warnings.iter().any(|w| w.contains(words)),
+                "{words:?} in {warnings:?}"
+            );
+        };
+
+        // Landed, and unlanded with `D`: both go.
+        let (landed, _) = cut("landed", 0);
+        let tip = judged(&landed).await;
+        daemon
+            .delete_worktree_and_branch(&landed, true, Some(tip))
+            .await
+            .unwrap();
+        assert!(!branch_exists("landed"));
+        let (discarded, _) = cut("discarded", 2);
+        let tip = judged(&discarded).await;
+        daemon
+            .delete_worktree_and_branch(&discarded, true, Some(tip))
+            .await
+            .unwrap();
+        assert!(!branch_exists("discarded"));
+
+        // None keeps the branch, as every delete did before.
+        let (kept, _) = cut("kept", 0);
+        daemon
+            .delete_worktree_and_branch(&kept, true, None)
+            .await
+            .unwrap();
+        assert!(branch_exists("kept"));
+
+        // The checkout switched to a new branch and committed there, and
+        // the worktree sync moved the row onto it: neither goes.
+        let (moved, wt) = cut("moved", 0);
+        let tip = judged(&moved).await;
+        git_in(&wt, &["switch", "-q", "-c", "elsewhere"]);
+        commit(&wt, "new.txt");
+        daemon.sync_project_worktrees(&project).await.unwrap();
+        let row = daemon.store.get_worktree(&moved).unwrap().unwrap();
+        assert_eq!(row.branch, "elsewhere", "the sync follows the switch");
+        daemon
+            .delete_worktree_and_branch(&moved, true, Some(tip))
+            .await
+            .unwrap();
+        assert!(branch_exists("moved") && branch_exists("elsewhere"));
+        warned(&mut events, "kept branch 'moved'");
+
+        // A commit landed while the confirm was open: kept.
+        let (late, wt) = cut("late", 0);
+        let tip = judged(&late).await;
+        commit(&wt, "late.txt");
+        daemon
+            .delete_worktree_and_branch(&late, true, Some(tip))
+            .await
+            .unwrap();
+        assert!(branch_exists("late"));
+        warned(&mut events, "kept branch 'late'");
+
+        // Another checkout has it out: kept.
+        let (shared, _) = cut("shared", 0);
+        let tip = judged(&shared).await;
+        let other = root.join("elsewhere-shared");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--force",
+                &other.to_string_lossy(),
+                "shared",
+            ],
+        );
+        daemon
+            .delete_worktree_and_branch(&shared, true, Some(tip))
+            .await
+            .unwrap();
+        assert!(branch_exists("shared"));
+        warned(&mut events, "has it checked out");
+
+        // Detached since the confirm: nothing goes.
+        let (detached, wt) = cut("detached", 0);
+        let tip = judged(&detached).await;
+        git_in(&wt, &["checkout", "-q", "--detach"]);
+        daemon
+            .delete_worktree_and_branch(&detached, true, Some(tip))
+            .await
+            .unwrap();
+        assert!(branch_exists("detached"));
+        assert!(branch_exists("main"));
     }
 
     /// A process working in `dir` the way an agent's build does: below a

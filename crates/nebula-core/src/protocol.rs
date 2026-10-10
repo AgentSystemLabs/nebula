@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 53;
+pub const PROTOCOL_VERSION: u32 = 54;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -29,6 +29,13 @@ pub const CHECK_WORKTREE_PROTOCOL: u32 = 51;
 /// leaves it off the check it sends an older client, whose reply is then
 /// byte for byte what it always was.
 pub const WORKTREE_LOCK_PROTOCOL: u32 = 53;
+
+/// First protocol whose daemon says where a checkout's branch stands
+/// (`WorktreeCheck::landing`), answers a `git_only` `CheckWorktree` for a
+/// band, and deletes a branch with its worktree (`DeleteWorktree`'s
+/// `delete_branch`). An older daemon is sent neither field, and its
+/// confirm and bands read as they did.
+pub const BRANCH_LANDING_PROTOCOL: u32 = 54;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -133,15 +140,34 @@ pub enum ClientRequest {
         req_id: u64,
         id: WorktreeId,
         force: bool,
+        /// Delete this branch too, once the checkout is gone — the branch
+        /// and tip the confirm judged (`WorktreeLanding::branch`), deleted
+        /// only if its tip is still that commit (an atomic compare-and-
+        /// delete), so a commit made while the confirm was open keeps it.
+        /// Never the base, origin's default or the root's branch, one
+        /// another checkout has out, or a branch the checkout is no longer
+        /// on; each keeps the branch with a warning. None keeps the
+        /// branch, as every older client's delete did. Omitted from the
+        /// frame when None, so an older daemon decodes what it always got;
+        /// sent only to one at [`BRANCH_LANDING_PROTOCOL`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delete_branch: Option<BranchTip>,
     },
     /// What deleting this worktree would interrupt or lose — the DELETE
     /// CHECK a confirm shows before the checkout leaves the disk. Answered
     /// by `ServerEvent::WorktreeChecked` with the same req_id (not an Ack),
-    /// or an `Error`. Reads only: nothing is touched. Gated on
-    /// [`CHECK_WORKTREE_PROTOCOL`].
+    /// or an `Error`. Reads only: no ref, checkout or file moves (the
+    /// squash-merge test may write a merged tree's objects to the store).
+    /// Gated on [`CHECK_WORKTREE_PROTOCOL`].
     CheckWorktree {
         req_id: u64,
         id: WorktreeId,
+        /// The git half alone, no process sweep: what an idle band's line
+        /// shows (the sweep stays with the confirm). Omitted from the
+        /// frame when false; sent true only to a daemon at
+        /// [`BRANCH_LANDING_PROTOCOL`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        git_only: bool,
     },
     /// Opt-in cleanup for a linked worktree whose PR was detected as merged.
     /// The daemon re-checks the safety invariants before touching disk:
@@ -626,7 +652,7 @@ pub struct MetricsSnapshot {
 /// it just now (`ClientRequest::CheckWorktree`). Every part is best effort
 /// and says so when it could not look: a check that failed is not a clean
 /// bill of health.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct WorktreeCheck {
     /// Processes whose working directory is inside the checkout — a build,
     /// an editor, a shell, the tool calls of an agent whose own session
@@ -642,7 +668,10 @@ pub struct WorktreeCheck {
     /// worked on" when it is a moment ago. None with no changes.
     pub newest_change_ms: Option<i64>,
     /// Commits HEAD has that `base` lacks. The branch keeps them after the
-    /// checkout goes, unless `detached`.
+    /// checkout goes, unless `detached`. Counted by content since
+    /// [`BRANCH_LANDING_PROTOCOL`] (`git cherry`, and a squash merge's
+    /// whole diff), so a branch landed by squash, rebase or cherry-pick
+    /// counts none; by ancestry before it.
     pub ahead: u32,
     /// What `ahead` was counted against (`origin/main`); None when nothing
     /// could be found to compare with.
@@ -656,11 +685,100 @@ pub struct WorktreeCheck {
     /// locked with, empty when none was given. Whoever locked it — a
     /// person, an agent, a CI tool — asked git to keep it, and git's own
     /// `worktree remove` refuses it; a delete unlocks it first, so the
-    /// confirm says so. Kept last and left off the wire when None: an
-    /// older client decodes the shorter check it always did, and the
-    /// daemon clears it for one (`WORKTREE_LOCK_PROTOCOL`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// confirm says so. Sent to a client at [`WORKTREE_LOCK_PROTOCOL`]
+    /// or later; see the `Serialize` impl for how the trailing fields
+    /// stay readable to older ones.
+    #[serde(default)]
     pub locked: Option<String>,
+    /// Where the branch stands and what else only this checkout holds.
+    /// Sent to a client at [`BRANCH_LANDING_PROTOCOL`] or later.
+    #[serde(default)]
+    pub landing: Option<WorktreeLanding>,
+}
+
+/// The frame is the fields in order, as a derive would write them, except
+/// that the optional fields later protocols added (`locked`, `landing`)
+/// are cut from the end while they are None. A client older than a field
+/// stops reading before it, so the daemon clears what such a client cannot
+/// decode and the frame comes out the length it knows. Only a None run at
+/// the END goes: one in the middle keeps its place, or the fields after it
+/// would be read into the wrong slots.
+impl Serialize for WorktreeCheck {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let trailing = if self.landing.is_some() {
+            2
+        } else {
+            usize::from(self.locked.is_some())
+        };
+        let mut s = serializer.serialize_struct("WorktreeCheck", 8 + trailing)?;
+        s.serialize_field("processes", &self.processes)?;
+        s.serialize_field("process_error", &self.process_error)?;
+        s.serialize_field("changes", &self.changes)?;
+        s.serialize_field("newest_change_ms", &self.newest_change_ms)?;
+        s.serialize_field("ahead", &self.ahead)?;
+        s.serialize_field("base", &self.base)?;
+        s.serialize_field("detached", &self.detached)?;
+        s.serialize_field("git_error", &self.git_error)?;
+        if trailing >= 1 {
+            s.serialize_field("locked", &self.locked)?;
+        }
+        if trailing >= 2 {
+            s.serialize_field("landing", &self.landing)?;
+        }
+        s.end()
+    }
+}
+
+/// The part of a [`WorktreeCheck`] a band's line and a confirm's branch
+/// choice read ([`BRANCH_LANDING_PROTOCOL`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeLanding {
+    /// The checkout is on a branch every commit of which is on its base
+    /// by content (`ahead` is 0), and that branch is not the base, the
+    /// default branch or the root's: deleting it loses nothing.
+    pub branch_landed: bool,
+    /// How many of `changes` are untracked files (`??`); the rest are
+    /// modified, added, deleted or submodules.
+    pub untracked: u32,
+    /// Commits checked out in the checkout's submodules that no remote
+    /// holds and the root checkout's submodules do not have: they live
+    /// only in this worktree's submodule store, which the delete takes.
+    pub submodule_unpushed: u32,
+    /// The branch the checkout is on and its tip, as the check found
+    /// them; None on a detached HEAD. What a confirm hands back in
+    /// `DeleteWorktree::delete_branch`, so the delete takes exactly what
+    /// was judged.
+    pub branch: Option<BranchTip>,
+    /// Gitignored files and folders in the checkout that are not build
+    /// output (`.env`, `.claude/settings.local.json`): `git worktree
+    /// remove --force` deletes them, and `git status` never shows them.
+    /// The first few by name; read by a confirm's check only, never a
+    /// band's.
+    pub ignored_files: Vec<String>,
+    /// How many there are in all, `ignored_files` being the first few.
+    pub ignored_total: u32,
+    /// When `git_error` is a submodule's — git could not read its store,
+    /// as in the middle of a `git submodule update` — that submodule's
+    /// path in the checkout (or its name), so a band can say which. None
+    /// for any other failure.
+    pub failed_submodule: Option<String>,
+    /// A git operation under way in the checkout (`submodule update`,
+    /// `rebase`): its state is in flux, so a band says so rather than
+    /// reading it, and a confirm keeps the branch whatever it found.
+    pub git_op: Option<String>,
+    /// `git_op` is a running git process (it will end on its own), not
+    /// one paused mid-way in the checkout's state (a stopped rebase).
+    pub git_op_live: bool,
+}
+
+/// A local branch and the commit its tip was at.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchTip {
+    /// The short name (`feat`, not `refs/heads/feat`).
+    pub name: String,
+    /// The full object id of its tip.
+    pub oid: String,
 }
 
 /// One process `WorktreeCheck` found working inside a checkout.
@@ -681,6 +799,25 @@ impl WorktreeCheck {
             || self.ahead > 0
             || self.git_error.is_some()
             || self.locked.is_some()
+            || self.submodule_unpushed() > 0
+            || self.ignored_total() > 0
+    }
+
+    /// The branch and tip the check judged, when it said.
+    pub fn branch_tip(&self) -> Option<&BranchTip> {
+        self.landing.as_ref()?.branch.as_ref()
+    }
+
+    /// Submodule commits the delete would take with it; 0 from a daemon
+    /// too old to look.
+    pub fn submodule_unpushed(&self) -> u32 {
+        self.landing.as_ref().map_or(0, |l| l.submodule_unpushed)
+    }
+
+    /// Gitignored files a delete takes too that are not build output; 0
+    /// from a band's check, which does not look.
+    pub fn ignored_total(&self) -> u32 {
+        self.landing.as_ref().map_or(0, |l| l.ignored_total)
     }
 }
 
@@ -873,6 +1010,10 @@ mod tests {
 
     #[test]
     fn protocol_compatibility_accepts_current_and_additive_peers() {
+        const {
+            assert!(BRANCH_LANDING_PROTOCOL > CHECK_WORKTREE_PROTOCOL);
+            assert!(BRANCH_LANDING_PROTOCOL <= PROTOCOL_VERSION);
+        }
         assert!(protocol_compatible_with(PROTOCOL_VERSION));
         assert!(protocol_compatible_with(PROTOCOL_VERSION + 1));
         assert!(!protocol_compatible_with(MIN_COMPATIBLE_PROTOCOL - 1));
@@ -928,5 +1069,138 @@ mod tests {
         let back: WorktreeCheck =
             rmp_serde::from_slice(&rmp_serde::to_vec(&locked).unwrap()).unwrap();
         assert_eq!(back, locked);
+    }
+
+    /// The 51 shapes of the requests and the check that grew trailing
+    /// fields at [`BRANCH_LANDING_PROTOCOL`] — what an older peer encodes
+    /// and decodes.
+    mod v51 {
+        use crate::ids::WorktreeId;
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        pub struct DeleteWorktree {
+            pub req_id: u64,
+            pub id: WorktreeId,
+            pub force: bool,
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        pub struct CheckWorktree {
+            pub req_id: u64,
+            pub id: WorktreeId,
+        }
+
+        #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+        pub struct Check {
+            pub processes: Vec<super::WorktreeProcess>,
+            pub process_error: Option<String>,
+            pub changes: u32,
+            pub newest_change_ms: Option<i64>,
+            pub ahead: u32,
+            pub base: Option<String>,
+            pub detached: bool,
+            pub git_error: Option<String>,
+        }
+    }
+
+    fn fields_of<T: Serialize>(v: &T) -> Vec<u8> {
+        rmp_serde::to_vec(v).unwrap()
+    }
+
+    /// A request as a 51 peer would decode its variant: the variant's
+    /// name, and its body read as the 51 shape `T`.
+    fn variant_body<T: serde::de::DeserializeOwned>(req: &ClientRequest) -> (String, T) {
+        let map: std::collections::HashMap<String, T> =
+            rmp_serde::from_slice(&fields_of(req)).unwrap();
+        map.into_iter().next().unwrap()
+    }
+
+    /// A request or check that leaves its new field at its default is the
+    /// byte-for-byte frame a 51 peer reads; a 51 peer's frame decodes
+    /// with the new fields at their defaults.
+    #[test]
+    fn branch_landing_fields_are_invisible_to_an_older_peer_when_unset() {
+        let id = WorktreeId("w".into());
+        let new = ClientRequest::DeleteWorktree {
+            req_id: 1,
+            id: id.clone(),
+            force: true,
+            delete_branch: None,
+        };
+        let (name, old): (String, v51::DeleteWorktree) = variant_body(&new);
+        assert_eq!(
+            old,
+            v51::DeleteWorktree {
+                req_id: 1,
+                id: id.clone(),
+                force: true,
+            }
+        );
+        let back: ClientRequest = rmp_serde::from_slice(&fields_of(
+            &[(name, old)]
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            back,
+            ClientRequest::DeleteWorktree {
+                delete_branch: None,
+                ..
+            }
+        ));
+        let new = ClientRequest::CheckWorktree {
+            req_id: 2,
+            id: id.clone(),
+            git_only: false,
+        };
+        let (_, old): (String, v51::CheckWorktree) = variant_body(&new);
+        assert_eq!(old, v51::CheckWorktree { req_id: 2, id });
+
+        let check = WorktreeCheck {
+            changes: 2,
+            ahead: 1,
+            base: Some("origin/main".into()),
+            ..WorktreeCheck::default()
+        };
+        let old: v51::Check = rmp_serde::from_slice(&fields_of(&check)).unwrap();
+        assert_eq!((old.changes, old.ahead), (2, 1));
+        let back: WorktreeCheck = rmp_serde::from_slice(&fields_of(&old)).unwrap();
+        assert_eq!(back, check, "a 51 daemon's check reads with no landing");
+
+        let landed = WorktreeCheck {
+            landing: Some(WorktreeLanding {
+                branch_landed: true,
+                untracked: 1,
+                submodule_unpushed: 6,
+                branch: Some(BranchTip {
+                    name: "feat".into(),
+                    oid: "0123".into(),
+                }),
+                ignored_files: vec![".env".into()],
+                ignored_total: 1,
+                failed_submodule: None,
+                git_op: Some("rebase".into()),
+                git_op_live: false,
+            }),
+            ..check
+        };
+        let back: WorktreeCheck = rmp_serde::from_slice(&fields_of(&landed)).unwrap();
+        assert_eq!(back, landed);
+        assert_eq!(landed.locked, None);
+        // A lock and a landing together, and a 53 client's cut of it.
+        let both = WorktreeCheck {
+            locked: Some("kept".into()),
+            ..landed.clone()
+        };
+        let back: WorktreeCheck = rmp_serde::from_slice(&fields_of(&both)).unwrap();
+        assert_eq!(back, both);
+        let lock_only = WorktreeCheck {
+            landing: None,
+            ..both
+        };
+        let back: WorktreeCheck = rmp_serde::from_slice(&fields_of(&lock_only)).unwrap();
+        assert_eq!(back, lock_only);
     }
 }

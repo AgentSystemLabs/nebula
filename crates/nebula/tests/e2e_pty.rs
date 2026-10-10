@@ -525,6 +525,7 @@ async fn full_crud_attach_and_restart_persistence() {
         &ClientRequest::CheckWorktree {
             req_id: 50,
             id: feature_wt_id.clone(),
+            git_only: false,
         },
     )
     .await
@@ -549,14 +550,30 @@ async fn full_crud_attach_and_restart_persistence() {
         "{check:?}"
     );
     assert!(feature_wt_path.exists(), "a check touches nothing");
+    let landing = check.landing.as_ref().expect("this client speaks landing");
+    assert!(
+        landing.branch_landed && landing.untracked == 1,
+        "no commits of its own: landed — {check:?}"
+    );
 
-    // ---- DeleteWorktree removes it from disk ----
+    // ---- DeleteWorktree removes it from disk, and its landed branch ----
+    let branch_exists = || {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/feature-x"])
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(branch_exists());
     write_frame(
         &mut c,
         &ClientRequest::DeleteWorktree {
             req_id: 5,
             id: feature_wt_id.clone(),
             force: true,
+            delete_branch: Some(check.branch_tip().cloned().expect("on feature-x")),
         },
     )
     .await
@@ -567,6 +584,7 @@ async fn full_crud_attach_and_restart_persistence() {
         "DeleteWorktree failed: {events:#?}"
     );
     assert!(!feature_wt_path.exists(), "worktree dir removed from disk");
+    assert!(!branch_exists(), "the landed branch went with it");
 
     // ---- restart: tree persists, boot sweep marks nothing (agents fresh) ----
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();

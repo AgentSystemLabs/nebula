@@ -429,8 +429,20 @@ pub(crate) fn delete_worktree_and_settle(
     id: WorktreeId,
     out: &mut Vec<ClientRequest>,
 ) {
+    let delete_branch = crate::delete_check::default_delete_branch(app, &id);
+    delete_worktree_and_settle_with(app, id, delete_branch, out);
+}
+
+/// [`delete_worktree_and_settle`] with the branch's fate decided by a key
+/// in the confirm (`k` keeps it, `D` deletes it) rather than its default.
+pub(crate) fn delete_worktree_and_settle_with(
+    app: &mut App,
+    id: WorktreeId,
+    delete_branch: Option<nebula_core::BranchTip>,
+    out: &mut Vec<ClientRequest>,
+) {
     let before = selection_snapshot(app);
-    delete_worktree(app, id, out);
+    delete_worktree_with(app, id, delete_branch, out);
     reconcile_selection(app, before, out);
 }
 
@@ -539,7 +551,26 @@ pub(crate) fn confirm_close_terminal_in(app: &App, t: &nebula_core::TerminalTab)
 /// in the background — `git worktree remove` can take seconds). The
 /// eventual EntityRemoved is a no-op; an Error for this req_id restores the
 /// rows via the rollback stashed in the intent.
+/// The branch goes too when its DELETE CHECK found it landed and the
+/// **Delete landed branch** setting is on
+/// ([`crate::delete_check::default_delete_branch`]).
 pub(crate) fn delete_worktree(app: &mut App, id: WorktreeId, out: &mut Vec<ClientRequest>) {
+    let delete_branch = crate::delete_check::default_delete_branch(app, &id);
+    delete_worktree_with(app, id, delete_branch, out);
+}
+
+/// [`delete_worktree`], the branch's fate given: `Some` deletes that
+/// branch too, at the tip the confirm judged.
+/// Never sent to a DAEMON too old to read it, which would refuse the
+/// whole request.
+pub(crate) fn delete_worktree_with(
+    app: &mut App,
+    id: WorktreeId,
+    delete_branch: Option<nebula_core::BranchTip>,
+    out: &mut Vec<ClientRequest>,
+) {
+    let delete_branch = delete_branch
+        .filter(|_| app.requests.daemon_protocol >= nebula_core::BRANCH_LANDING_PROTOCOL);
     let intent = match remove_worktree_rows(app, &id) {
         Some(rollback) => PendingIntent::DeleteWorktree(rollback),
         None => PendingIntent::None,
@@ -548,6 +579,7 @@ pub(crate) fn delete_worktree(app: &mut App, id: WorktreeId, out: &mut Vec<Clien
         req_id,
         id,
         force: true,
+        delete_branch,
     });
 }
 

@@ -1067,11 +1067,48 @@ fn draw_bands(
         .push((g.area, HitTarget::PanelBg(Focus::Sessions)));
 }
 
-/// What an EMPTY BAND says under its rule — that nothing runs there, then
-/// its keys — the root's without the delete it refuses.
-const EMPTY_BAND_IDLE: &str = "nothing running";
-const EMPTY_BAND_KEYS: &str = "p: new session · t: terminal";
+/// What an EMPTY BAND says under its rule, the root's without the delete
+/// it refuses. Once its DELETE CHECK has been read, the verdict
+/// (`band_safety`) stands in place of `nothing running`.
+pub(super) const EMPTY_BAND_IDLE: &str = "nothing running";
+const EMPTY_BAND_KEYS: &str = " · p: new session · t: terminal";
 const EMPTY_BAND_DELETE: &str = " · d: delete worktree";
+
+/// What an EMPTY BAND's line opens with, and its color: the checkout's
+/// DELETE CHECK verdict once one has been read — in the warning color when
+/// a delete would destroy something — else `nothing running`. The root's
+/// band, never deleted, says nothing of it. `fg` is the rest of the line's.
+pub(super) fn empty_band_lead(
+    app: &App,
+    band: &crate::launcher::Band,
+    fg: ratatui::style::Color,
+    lit: bool,
+) -> (String, ratatui::style::Color) {
+    let th = app.chrome.theme;
+    let verdict = (!band.is_main)
+        .then(|| crate::band_safety::band_verdict(app, &band.worktree))
+        .flatten();
+    match verdict {
+        Some(v) => {
+            let color = match v.tone {
+                crate::band_safety::Tone::Warn => th.warn,
+                crate::band_safety::Tone::Ahead if !lit => th.text,
+                _ => fg,
+            };
+            (v.text, color)
+        }
+        None => (EMPTY_BAND_IDLE.to_string(), fg),
+    }
+}
+
+/// The keys an EMPTY BAND's line lists after its lead.
+pub(super) fn empty_band_keys(band: &crate::launcher::Band) -> String {
+    let mut keys = String::from(EMPTY_BAND_KEYS);
+    if !band.is_main {
+        keys.push_str(EMPTY_BAND_DELETE);
+    }
+    keys
+}
 
 /// The line under an EMPTY BAND's rule — a checkout with nothing running
 /// in it, drawn only with **Show all worktrees** on — in place of the row
@@ -1096,16 +1133,14 @@ fn draw_empty_band(
     let Some(placed) = crate::launcher::place(window, scroll, row) else {
         return;
     };
-    let mut text = format!("{EMPTY_BAND_IDLE} · {EMPTY_BAND_KEYS}");
-    if !band.is_main {
-        text.push_str(EMPTY_BAND_DELETE);
-    }
     let fg = if lit { th.accent } else { th.dim };
+    let (lead, lead_fg) = empty_band_lead(app, band, fg, lit);
+    let keys = empty_band_keys(band);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {text}"),
-            Style::default().fg(fg),
-        ))),
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("  {lead}"), Style::default().fg(lead_fg)),
+            Span::styled(keys, Style::default().fg(fg)),
+        ])),
         placed.rect,
     );
 }
