@@ -65,6 +65,13 @@ pub const CLAUDE_CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
 /// its hooks.
 pub const CODEX_HOME: &str = "CODEX_HOME";
 
+/// The pane's PTY device (`/dev/ttys003`), named by the login-shell stdin
+/// shim before the rc files run on `/dev/null` and reopened as stdin just
+/// before the command — `/dev/tty` would do on Linux, but macOS kqueue
+/// refuses it (`EINVAL`), which Bun's (Claude Code's) stdin watcher dies
+/// on. Unset again before the command runs, so no child inherits it.
+pub const PANE_TTY: &str = "NEBULA_PANE_TTY";
+
 /// Env vars that identify an agent session to the daemon. They are set on
 /// every agent PTY and must never leak into plain terminals.
 pub const AGENT_SESSION_VARS: &[&str] = &[AGENT_ID, API_URL, API_TOKEN];
