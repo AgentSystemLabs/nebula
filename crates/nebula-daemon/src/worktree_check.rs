@@ -12,7 +12,7 @@
 //! which commits HEAD has that its base lacks.
 
 use crate::git;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use nebula_core::{WorktreeCheck, WorktreeProcess};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -169,7 +169,7 @@ fn process_cwds() -> Result<Vec<(u32, String, PathBuf)>> {
     // lsof exits 1 when some process could not be read (another user's);
     // what it did print is still good. Nothing at all is a failure.
     if out.stdout.is_empty() && !out.status.success() {
-        bail!(
+        anyhow::bail!(
             "lsof failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
