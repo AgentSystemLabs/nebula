@@ -8,6 +8,7 @@ pub mod claude_catalogue;
 pub mod completion;
 pub mod config;
 pub mod cursor_catalogue;
+pub mod delete_check;
 pub mod diff_tree;
 pub mod dropped_files;
 pub mod event_loop;

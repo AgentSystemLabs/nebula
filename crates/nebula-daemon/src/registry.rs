@@ -13,11 +13,11 @@ use nebula_core::env;
 use nebula_core::project_file::{self, ProjectCommand};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, LinkId, PrewarmInfo,
-    Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Worktree, WorktreeId,
-    MAX_CLOUD_PROMPT_BYTES,
+    Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Worktree, WorktreeCheck,
+    WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -4122,6 +4122,111 @@ mod tests {
 
         assert!(!wt.exists());
         assert!(drain_warnings(&mut events).is_empty());
+    }
+
+    /// The DELETE CHECK sees what nebula's rows cannot: a process working
+    /// in the checkout from outside any of its sessions, and edits nobody
+    /// committed.
+    #[tokio::test]
+    async fn check_worktree_reports_outside_processes_and_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
+        let id = WorktreeId("feat".into());
+
+        let clean = daemon.check_worktree(&id, None).await.unwrap();
+        assert!(!clean.has_findings(), "{clean:?}");
+
+        std::fs::write(wt.join("draft.txt"), "half done").unwrap();
+        let worker = Worker::start(&wt);
+        let check = daemon.check_worktree(&id, None).await;
+        drop(worker);
+        let check = check.unwrap();
+        assert_eq!(check.changes, 1, "{check:?}");
+        assert!(check.newest_change_ms.is_some());
+        assert!(
+            check.processes.iter().any(|p| p.name.contains("sleep")),
+            "{check:?}"
+        );
+    }
+
+    /// A process working in `dir` the way an agent's build does: below a
+    /// shell, never a direct child of the DAEMON — in a unit test the
+    /// daemon is this process, and its direct children are the helpers
+    /// the check spares. Killed with its whole group on drop.
+    struct Worker(std::process::Child);
+
+    impl Worker {
+        fn start(dir: &Path) -> Self {
+            use std::os::unix::process::CommandExt;
+            let child = std::process::Command::new("sh")
+                .args(["-c", "sleep 30; true"])
+                .current_dir(dir)
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::pty::children_of(child.id()).is_none_or(|kids| kids.is_empty()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the worker's sleep never started"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Self(child)
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let group = nix::unistd::Pid::from_raw(self.0.id() as i32);
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The opt-in merged-worktree cleanup already waits for idle sessions
+    /// and a clean checkout; it also waits for a process working there
+    /// from outside them.
+    #[tokio::test]
+    async fn merged_cleanup_skips_a_checkout_a_process_is_working_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
+        let id = WorktreeId("feat".into());
+        let head = git::head_sha(&wt).await.unwrap();
+        let url = "https://github.com/o/r/pull/1";
+
+        let worker = Worker::start(&wt);
+        let refused = daemon
+            .cleanup_merged_worktree(&id, "feat", 1, url, &head)
+            .await;
+        drop(worker);
+        let err = refused.expect_err("a process is working in it");
+        assert!(err.to_string().contains("is working in it"), "{err:#}");
+        assert!(wt.exists());
+
+        daemon
+            .cleanup_merged_worktree(&id, "feat", 1, url, &head)
+            .await
+            .unwrap();
+        assert!(!wt.exists());
     }
 
     fn git_in(repo: &Path, args: &[&str]) {

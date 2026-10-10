@@ -168,6 +168,36 @@ fn detached_job_in_table(table: &str, root: u32) -> bool {
         .any(|row| row.session_leader)
 }
 
+/// Every pid in the subtrees rooted at `roots`, the roots included — what
+/// the sessions they lead would take down with them. None when `ps` fails.
+pub(crate) fn subtree_pids(roots: &[u32]) -> Option<HashSet<u32>> {
+    Some(subtree_pids_in_table(&ps_table()?, roots))
+}
+
+/// The direct children of `pid`. None when `ps` fails.
+pub(crate) fn children_of(pid: u32) -> Option<Vec<u32>> {
+    Some(children_in_table(&ps_table()?, pid))
+}
+
+/// Pure core of [`children_of`] over a [`ps_table`].
+fn children_in_table(table: &str, pid: u32) -> Vec<u32> {
+    parse_ps_table(table)
+        .iter()
+        .filter(|row| row.ppid == pid)
+        .map(|row| row.pid)
+        .collect()
+}
+
+/// Pure core of [`subtree_pids`] over a [`ps_table`].
+fn subtree_pids_in_table(table: &str, roots: &[u32]) -> HashSet<u32> {
+    let rows = parse_ps_table(table);
+    let mut pids: HashSet<u32> = roots.iter().copied().collect();
+    for &root in roots {
+        pids.extend(descendants(&rows, root).iter().map(|row| row.pid));
+    }
+    pids
+}
+
 /// Broadcast to attached clients (and, later, the status machine).
 #[derive(Clone, Debug)]
 pub enum PtyEvent {
@@ -1218,6 +1248,33 @@ mod tests {
         assert_eq!(process_groups_in_table(table, 20), vec![20, 21]);
         // A failed sweep still names the leader's own group.
         assert_eq!(process_groups_in_table("", 20), vec![20]);
+    }
+
+    /// The DELETE CHECK spares a worktree's own sessions and everything
+    /// under them — they are counted already, and go down with it.
+    #[test]
+    fn subtree_pids_take_each_root_and_everything_below_it() {
+        let table = "\
+ 20    10    20
+ 21    20    21
+ 22    21    21
+ 30    10    30
+ 31    30    30
+ 99     1    99
+";
+        let mut got: Vec<u32> = subtree_pids_in_table(table, &[20, 30])
+            .into_iter()
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![20, 21, 22, 30, 31]);
+        assert_eq!(
+            subtree_pids_in_table("", &[20])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+        assert_eq!(children_in_table(table, 10), vec![20, 30]);
+        assert!(children_in_table(table, 22).is_empty());
     }
 
     /// The reaper's "still working?" question is whether anything under the

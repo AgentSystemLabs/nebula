@@ -518,6 +518,38 @@ async fn full_crud_attach_and_restart_persistence() {
         .expect("worktree upsert carries its path");
     assert!(feature_wt_path.exists(), "worktree dir created on disk");
 
+    // ---- CheckWorktree: the DELETE CHECK sees an uncommitted file ----
+    std::fs::write(feature_wt_path.join("draft.txt"), "half done").unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::CheckWorktree {
+            req_id: 50,
+            id: feature_wt_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::WorktreeChecked { req_id: 50, .. }))
+    })
+    .await;
+    let check = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::WorktreeChecked {
+                req_id: 50, check, ..
+            } => Some(check.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("CheckWorktree unanswered: {events:#?}"));
+    assert_eq!(check.changes, 1, "{check:?}");
+    assert!(
+        check.process_error.is_none() && check.git_error.is_none(),
+        "{check:?}"
+    );
+    assert!(feature_wt_path.exists(), "a check touches nothing");
+
     // ---- DeleteWorktree removes it from disk ----
     write_frame(
         &mut c,

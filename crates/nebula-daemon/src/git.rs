@@ -573,6 +573,107 @@ pub async fn status_porcelain(repo: &Path) -> Result<String> {
     .await
 }
 
+/// The paths `git status` reports in a checkout — uncommitted edits,
+/// untracked files, and submodules with changes or new commits of their
+/// own — relative to it. NUL-separated porcelain, so a name with a space
+/// or a newline survives; a rename reports its new name only.
+pub async fn changed_paths(worktree: &Path) -> Result<Vec<PathBuf>> {
+    let out = git(
+        worktree,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    )
+    .await?;
+    Ok(parse_status_z(&out))
+}
+
+/// Pure core of [`changed_paths`].
+fn parse_status_z(out: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut entries = out.split('\0').filter(|e| !e.is_empty());
+    while let Some(entry) = entries.next() {
+        let Some((xy, path)) = entry.split_at_checked(3) else {
+            continue;
+        };
+        paths.push(PathBuf::from(path));
+        // A rename or copy is followed by the name it came from.
+        if xy.starts_with(['R', 'C']) {
+            entries.next();
+        }
+    }
+    paths
+}
+
+/// What a checkout's commits are measured against when the DELETE CHECK
+/// asks what it holds that its base lacks: the WORKTREE BASE BRANCH
+/// setting when the repo has it (origin's copy first, as a cut takes it),
+/// else origin's default branch, else the ROOT WORKTREE's branch. Local
+/// refs only — nothing is fetched to answer a confirm.
+pub async fn comparison_base(repo: &Path, configured: Option<&str>) -> Option<String> {
+    if let Some(name) = configured {
+        if let Some(remote) = origin_branch(repo, name).await {
+            return Some(remote);
+        }
+        if local_branch(repo, name).await {
+            return Some(name.to_string());
+        }
+    }
+    if let Ok(out) = git(
+        repo,
+        &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .await
+    {
+        let short = out.trim();
+        if !short.is_empty() {
+            return Some(short.to_string());
+        }
+    }
+    git(repo, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .await
+        .ok()
+        .map(|out| out.trim().to_string())
+        .filter(|branch| !branch.is_empty())
+}
+
+/// How many commits the checkout's HEAD has that `base` lacks.
+pub async fn commits_ahead(worktree: &Path, base: &str) -> Result<u32> {
+    let range = format!("{base}..HEAD");
+    count(git(worktree, &["rev-list", "--count", &range]).await?)
+}
+
+/// Is the checkout's HEAD detached — on no branch at all?
+pub async fn head_detached(worktree: &Path) -> bool {
+    git(worktree, &["symbolic-ref", "-q", "HEAD"])
+        .await
+        .is_err()
+}
+
+/// How many of HEAD's commits no branch and no remote-tracking ref holds:
+/// on a detached HEAD, what only the reflog would keep once the checkout
+/// is gone.
+pub async fn unreferenced_commits(worktree: &Path) -> Result<u32> {
+    count(
+        git(
+            worktree,
+            &[
+                "rev-list",
+                "--count",
+                "HEAD",
+                "--not",
+                "--branches",
+                "--remotes",
+            ],
+        )
+        .await?,
+    )
+}
+
+fn count(out: String) -> Result<u32> {
+    out.trim()
+        .parse()
+        .map_err(|_| anyhow!("git printed no count: {}", out.trim()))
+}
+
 pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> Result<()> {
     // Checkout already gone (manual rm -rf): `git worktree remove` would fail,
     // but the user's intent is already satisfied — just drop git's stale
@@ -1283,5 +1384,68 @@ mod tests {
 
         assert!(remove_worktree(&repo, &wt, false).await.is_err());
         remove_worktree(&repo, &wt, true).await.unwrap();
+    }
+
+    #[test]
+    fn status_z_keeps_odd_names_and_drops_rename_sources() {
+        let out = " M src/a b.rs\0R  new.rs\0old.rs\0?? notes/\0 M sub\0";
+        assert_eq!(
+            parse_status_z(out),
+            ["src/a b.rs", "new.rs", "notes/", "sub"].map(PathBuf::from)
+        );
+        assert!(parse_status_z("").is_empty());
+    }
+
+    /// The DELETE CHECK's git half on a real checkout: edits and untracked
+    /// files are counted, commits are measured against the base, and a
+    /// detached HEAD's commits are the ones nothing else holds.
+    #[tokio::test]
+    async fn delete_check_git_reads_changes_commits_and_detached_heads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+
+        assert!(changed_paths(&wt).await.unwrap().is_empty());
+        let base = comparison_base(&repo, None).await;
+        assert_eq!(
+            base.as_deref(),
+            Some("main"),
+            "no origin: the root's branch"
+        );
+        assert_eq!(commits_ahead(&wt, "main").await.unwrap(), 0);
+
+        std::fs::write(wt.join("new.txt"), "x").unwrap();
+        assert_eq!(
+            changed_paths(&wt).await.unwrap(),
+            [PathBuf::from("new.txt")]
+        );
+        git(&wt, &["add", "."]).await.unwrap();
+        git(&wt, &["commit", "-m", "work"]).await.unwrap();
+        assert_eq!(commits_ahead(&wt, "main").await.unwrap(), 1);
+        assert!(!head_detached(&wt).await);
+        assert_eq!(
+            unreferenced_commits(&wt).await.unwrap(),
+            0,
+            "the branch holds it"
+        );
+
+        git(&wt, &["checkout", "--detach"]).await.unwrap();
+        git(&wt, &["commit", "--allow-empty", "-m", "loose"])
+            .await
+            .unwrap();
+        assert!(head_detached(&wt).await);
+        assert_eq!(unreferenced_commits(&wt).await.unwrap(), 1);
+
+        assert_eq!(
+            comparison_base(&repo, Some("feature")).await.as_deref(),
+            Some("feature"),
+            "a configured base the repo has wins"
+        );
+        assert_eq!(
+            comparison_base(&repo, Some("nope")).await.as_deref(),
+            Some("main")
+        );
     }
 }

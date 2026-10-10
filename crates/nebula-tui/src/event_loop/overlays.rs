@@ -409,6 +409,25 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
 
 fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
+    // A confirm held unshown for its DELETE CHECK takes only a cancel
+    // (`Esc`, or `n` where `n` cancels) and `Enter` / `y`, which wait for
+    // the check below: nothing is chosen in a dialog nobody has seen —
+    // not even the card-only `n` of a delete that offers the worktree.
+    if crate::delete_check::held(app) {
+        let three_way = matches!(
+            &app.modals.overlay,
+            Some(Overlay::Confirm(c))
+                if matches!(c.action, PendingAction::ThenDeleteWorktree { offered: true, .. })
+        );
+        let passes = match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('y') => true,
+            KeyCode::Char('n') => !three_way,
+            _ => false,
+        };
+        if !passes {
+            return;
+        }
+    }
     let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
@@ -457,7 +476,16 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 }
             }
             KeyCode::Enter | KeyCode::Char('y') => {
+                // A worktree delete waits for its DELETE CHECK: the user
+                // confirms what it found, never ahead of it.
                 let action = confirm.action.clone();
+                if let Some(branch) = crate::delete_check::still_checking(app, &action) {
+                    crate::delete_check::say_status(
+                        app,
+                        format!("still checking '{branch}' for work in progress — a moment"),
+                    );
+                    return;
+                }
                 app.modals.overlay = None;
                 run_pending_action(app, action, out);
             }
