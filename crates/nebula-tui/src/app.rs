@@ -3520,6 +3520,14 @@ pub struct PaneState {
     /// boot a CLI — walking the grid past four cards must not cold-spawn
     /// four agents and abandon three of them.
     pub pending_attach: Option<(SessionRef, std::time::Instant)>,
+    /// Set by the main loop, which draws: an attach asked for before the
+    /// pane has a size waits for the next frame (`attach_after_draw`)
+    /// instead of sizing the PTY to the fallback grid. Off in unit tests,
+    /// which attach at once.
+    pub size_before_attach: bool,
+    /// The attach held for the next frame: sent after it at the pane's
+    /// drawn size, or at the fallback grid when no pane was drawn.
+    pub attach_after_draw: Option<SessionRef>,
     /// What this connection is attached to daemon-side. Lags `term.sref`
     /// while an attach waits out its debounce, so the Detach that precedes
     /// the next Attach names the session the daemon actually holds.

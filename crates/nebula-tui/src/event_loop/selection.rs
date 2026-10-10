@@ -913,7 +913,30 @@ pub(crate) fn attach_inner(
 
 /// Move the daemon-side attachment to `sref`, releasing whatever it held.
 /// Idempotent, so every caller can just ask for the session it wants.
+///
+/// Before the pane has a size, the main loop holds the attach for one
+/// frame (`size_before_attach`): sized to the fallback grid and then to
+/// the drawn pane, the PTY would bounce back to its own size — a change an
+/// app reading its size off SIGWINCH never sees, so it never repaints what
+/// a wrapped replay lost.
 pub(crate) fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    if app.pane.size_before_attach && !pane_usable(app.pane.term_area) {
+        app.pane.attach_after_draw = Some(sref);
+        app.chrome.dirty = true;
+        return;
+    }
+    attach_sized(app, sref, out);
+}
+
+/// The frame a held attach waited for is drawn: send it, sized to the pane
+/// that frame drew, or to the fallback grid when it drew none.
+pub(crate) fn send_held_attach(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if let Some(sref) = app.pane.attach_after_draw.take() {
+        attach_sized(app, sref, out);
+    }
+}
+
+fn attach_sized(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     if app.pane.attached_sref.as_ref() == Some(&sref) {
         return;
     }
