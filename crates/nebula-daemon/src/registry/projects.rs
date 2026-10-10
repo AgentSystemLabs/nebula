@@ -567,12 +567,13 @@ impl Daemon {
     ///
     /// `client` is the asking client's pid, when the socket says it: its
     /// own process tree (the TUI, its background git reads) is spared.
-    /// `git_only` skips the process sweep — an idle band's line.
+    /// `band` is an idle band's line: the same check, less the
+    /// gitignored files a confirm alone lists.
     pub async fn check_worktree(
         self: &Arc<Self>,
         id: &WorktreeId,
         client: Option<u32>,
-        git_only: bool,
+        band: bool,
     ) -> Result<WorktreeCheck> {
         let lookup = id.clone();
         let worktree = self
@@ -584,17 +585,18 @@ impl Daemon {
             .store_blocking(move |store| store.get_project(&project_lookup))
             .await?
             .context("project not found")?;
-        let spare = if git_only {
-            None
-        } else {
-            let mut spare = self.own_session_pids(id).await?;
-            spare.extend(self.nebula_helper_pids(client).await?);
-            Some(spare)
-        };
+        // An idle band has no sessions of its own, but may hold a
+        // prewarmed spare; spared the same way, so a band says "in use"
+        // only for work nebula does not already show.
+        let mut spare = self.own_session_pids(id).await?;
+        spare.extend(self.nebula_helper_pids(client).await?);
         let base = crate::config::Config::load()
             .worktree_base_branch()
             .map(str::to_string);
-        Ok(crate::worktree_check::check(&project.repo_path, &worktree.path, spare, base).await)
+        Ok(
+            crate::worktree_check::check(&project.repo_path, &worktree.path, spare, base, band)
+                .await,
+        )
     }
 
     /// Every pid the worktree's own sessions lead or run, prewarmed spares

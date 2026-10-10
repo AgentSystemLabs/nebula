@@ -525,7 +525,7 @@ async fn full_crud_attach_and_restart_persistence() {
         &ClientRequest::CheckWorktree {
             req_id: 50,
             id: feature_wt_id.clone(),
-            git_only: false,
+            band: false,
         },
     )
     .await

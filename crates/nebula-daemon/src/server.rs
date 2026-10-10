@@ -235,12 +235,8 @@ impl ClientConnection {
                 self.spawn_delete_worktree(req_id, id, force, delete_branch);
                 Ok(true)
             }
-            ClientRequest::CheckWorktree {
-                req_id,
-                id,
-                git_only,
-            } => {
-                self.spawn_check_worktree(req_id, id, git_only);
+            ClientRequest::CheckWorktree { req_id, id, band } => {
+                self.spawn_check_worktree(req_id, id, band);
                 Ok(true)
             }
             ClientRequest::CleanupMergedWorktree {
@@ -928,7 +924,7 @@ impl ClientConnection {
         });
     }
 
-    fn spawn_check_worktree(&self, req_id: u64, id: nebula_core::WorktreeId, git_only: bool) {
+    fn spawn_check_worktree(&self, req_id: u64, id: nebula_core::WorktreeId, band: bool) {
         // `git status` on a big checkout and an `lsof` of every process are
         // each a fraction of a second; off the request loop, like a delete.
         let daemon = self.daemon.clone();
@@ -938,7 +934,7 @@ impl ClientConnection {
         let reads_lock = self.client_protocol >= nebula_core::WORKTREE_LOCK_PROTOCOL;
         let landing = self.client_protocol >= nebula_core::BRANCH_LANDING_PROTOCOL;
         tokio::spawn(async move {
-            let ev = match daemon.check_worktree(&id, client, git_only).await {
+            let ev = match daemon.check_worktree(&id, client, band).await {
                 Ok(mut check) => {
                     if !reads_lock {
                         check.locked = None;

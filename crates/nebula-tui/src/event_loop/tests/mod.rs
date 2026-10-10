@@ -22857,7 +22857,7 @@ fn a_daemon_before_branch_landing_gets_the_old_confirm() {
         let req_id = match out.as_slice() {
             [ClientRequest::CheckWorktree {
                 req_id,
-                git_only: false,
+                band: false,
                 ..
             }] => *req_id,
             other => panic!("{other:?}"),

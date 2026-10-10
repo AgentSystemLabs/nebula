@@ -330,7 +330,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   clean. The dialog itself waits for the check (the footer says `checking 'feat' for work in
   progress…`), so it opens once, already filled in; only a check still out after five seconds
   opens it early, with `Checking…` (`Esc` cancels throughout), and `Enter`, `k` and `D` wait for
-  the answer. The check's git half also runs in the background for every empty band, one band per
+  the answer. The check also runs in the background for every empty band (less the ignored files), one band per
   git tick, so the band says before you press anything what a delete would lose, in place of
   `nothing running`: `✓ clean · merged` (nothing destroyed, and the branch has landed),
   `✓ clean · detached`, `↑4 unmerged` (the branch holds commits its base lacks — a delete keeps
@@ -338,6 +338,11 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   `⚠ 3 modified · 2 untracked`, `⚠ 6 unpushed in submodules` (submodule commits — checked out, on
   a local branch or tag, or stashed — that exist only in this worktree's own submodule store,
   which the delete takes) and `⚠ detached · 2 unreachable`.
+  A band's `0 sessions` counts nebula's own sessions only, so a process outside them with its
+  working directory in the checkout — a build, a shell, a tool's scratch run — puts `● in use by
+  just, cargo` ahead of the verdict (`● in use by zsh · clean · detached`), or after a warning
+  (`⚠ 3 modified · in use by cargo`). Like the rest of the line it is read every 30 s or so, so a
+  process that has just exited may still be named; the confirm checks again.
   A git at work in the checkout — `git submodule update` still cloning, a fetch, a rebase or a
   merge — or one stopped part-way (a rebase waiting on a conflict) reads `⋯ git submodule update
   running` or `⋯ git rebase in progress` instead, dim (a stopped one that also holds what a delete

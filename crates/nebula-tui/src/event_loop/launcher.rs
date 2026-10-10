@@ -4160,9 +4160,9 @@ mod tests {
                 [ClientRequest::CheckWorktree {
                     req_id,
                     id,
-                    git_only: true,
+                    band: true,
                 }] if id.0 == "w3" => *req_id,
-                other => panic!("one git-only check of the idle band: {other:?}"),
+                other => panic!("one band check of the idle band: {other:?}"),
             };
             out.clear();
             crate::band_safety::sweep(&mut app, &mut out);

@@ -25,50 +25,35 @@ const IGNORED_NAMED: usize = 3;
 /// Run the DELETE CHECK on `worktree`, a checkout of `repo`. `spare` is
 /// every pid the worktree's own sessions lead or run — the confirm counts
 /// those already and they go down with it — and `configured_base` the
-/// WORKTREE BASE BRANCH setting. `spare` None is an idle band's check:
-/// the git half, with the sweep used only to see whether a git is at
-/// work in the checkout, and no process listed.
+/// WORKTREE BASE BRANCH setting. `band` is an idle band's check, asked
+/// every rotation: it skips the gitignored files, a confirm's question
+/// only, and keeps the rest — the processes at work in the checkout
+/// included, which is how a band says it is in use.
 pub async fn check(
     repo: &Path,
     worktree: &Path,
-    spare: Option<HashSet<u32>>,
+    spare: HashSet<u32>,
     configured_base: Option<String>,
+    band: bool,
 ) -> WorktreeCheck {
     if !worktree.exists() {
         // Already gone: a delete only drops the row, and loses nothing.
         return WorktreeCheck::default();
     }
-    let Some(spare) = spare else {
-        // A band's check: the git half, and whether a git is at work in
-        // the checkout (a `git submodule update` still cloning, a rebase)
-        // — then its state is in flux, which the band says instead of
-        // reading it. The sweep runs first, so this check's own gits are
-        // not in it (and they only read, which the sweep ignores).
-        let dir = worktree.to_path_buf();
-        let sweep = tokio::task::spawn_blocking(move || processes_in(&dir, &HashSet::new())).await;
-        let mut check = git_half(repo, worktree, configured_base, false).await;
-        let live = match sweep {
-            Ok(Ok(processes)) => live_git_op(&processes).await,
-            _ => None,
-        };
-        let op = match live {
-            Some(op) => Some((op, true)),
-            None => paused_git_op(worktree).map(|op| (op, false)),
-        };
-        note_op(&mut check, op);
-        return check;
-    };
     // The sweep first, then git: run side by side, the daemon's own
     // `git -C <checkout>` (and the submodule gits under it) would be in
     // the sweep, working in the checkout.
     let dir = worktree.to_path_buf();
     let sweep = tokio::task::spawn_blocking(move || processes_in(&dir, &spare)).await;
-    let mut check = git_half(repo, worktree, configured_base, true).await;
+    let mut check = git_half(repo, worktree, configured_base, !band).await;
     match sweep {
         Ok(Ok(processes)) => check.processes = processes,
         Ok(Err(e)) => check.process_error = Some(format!("{e:#}")),
         Err(e) => check.process_error = Some(format!("process sweep failed: {e}")),
     }
+    // A git at work in the checkout (a `git submodule update` still
+    // cloning, a rebase) puts its state in flux, which a band says
+    // instead of reading it.
     let op = match live_git_op(&check.processes).await {
         Some(op) => Some((op, true)),
         None => paused_git_op(worktree).map(|op| (op, false)),
@@ -391,8 +376,7 @@ fn process_cwds() -> Result<Vec<(u32, String, PathBuf)>> {
 /// Every process this user can see, with its working directory: one
 /// `lsof` asked for the `cwd` of everything, under a tenth of a second
 /// to a few hundred ms on a busy Mac. It runs once per confirm, and once
-/// per idle band's check (at most one each git tick), to see a git at
-/// work in the checkout.
+/// per idle band's check (at most one each git tick).
 #[cfg(not(target_os = "linux"))]
 fn process_cwds() -> Result<Vec<(u32, String, PathBuf)>> {
     let out = std::process::Command::new("lsof")
@@ -556,7 +540,7 @@ mod tests {
         assert!(run(&["commit", "-q", "-am", "main"]));
         assert!(run(&["switch", "-q", "feat"]));
         assert!(!run(&["rebase", "-q", "main"]), "conflicts and stops");
-        let check = check(&repo, &repo, None, None).await;
+        let check = check(&repo, &repo, HashSet::new(), None, true).await;
         let landing = check.landing.expect("a landing");
         assert_eq!(landing.git_op.as_deref(), Some("rebase"));
         assert!(!landing.git_op_live);
@@ -634,14 +618,14 @@ mod tests {
             .unwrap();
         let mut seen = None;
         for _ in 0..40 {
-            let band = check(&repo, &wt, None, None).await;
+            let band = check(&repo, &wt, HashSet::new(), None, true).await;
             if let Some(op) = band.landing.and_then(|l| l.git_op_live.then_some(l.git_op)) {
                 seen = op;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let confirm = check(&repo, &wt, Some(HashSet::new()), None).await;
+        let confirm = check(&repo, &wt, HashSet::new(), None, false).await;
         // The update and the clone under it, before the repo goes.
         let group = nix::unistd::Pid::from_raw(update.id() as i32);
         let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
@@ -678,7 +662,7 @@ mod tests {
             .join("half");
         std::fs::create_dir_all(broken.join("objects")).unwrap();
         std::fs::write(broken.join("HEAD"), "not a ref\n").unwrap();
-        let check = check(&repo, &repo, None, None).await;
+        let check = check(&repo, &repo, HashSet::new(), None, true).await;
         assert!(check.git_error.is_some(), "{check:?}");
         let landing = check.landing.expect("a landing");
         assert_eq!(landing.failed_submodule.as_deref(), Some("half"));
@@ -688,7 +672,7 @@ mod tests {
     async fn a_missing_checkout_checks_clean() {
         let tmp = tempfile::tempdir().unwrap();
         let gone = tmp.path().join("gone");
-        let check = check(tmp.path(), &gone, Some(HashSet::new()), None).await;
+        let check = check(tmp.path(), &gone, HashSet::new(), None, false).await;
         assert!(!check.has_findings(), "{check:?}");
     }
 }

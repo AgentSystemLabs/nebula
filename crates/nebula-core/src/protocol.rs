@@ -31,8 +31,8 @@ pub const CHECK_WORKTREE_PROTOCOL: u32 = 51;
 pub const WORKTREE_LOCK_PROTOCOL: u32 = 53;
 
 /// First protocol whose daemon says where a checkout's branch stands
-/// (`WorktreeCheck::landing`), answers a `git_only` `CheckWorktree` for a
-/// band, and deletes a branch with its worktree (`DeleteWorktree`'s
+/// (`WorktreeCheck::landing`), answers a `band` `CheckWorktree` for an
+/// idle band's line, and deletes a branch with its worktree (`DeleteWorktree`'s
 /// `delete_branch`). An older daemon is sent neither field, and its
 /// confirm and bands read as they did.
 pub const BRANCH_LANDING_PROTOCOL: u32 = 54;
@@ -162,12 +162,12 @@ pub enum ClientRequest {
     CheckWorktree {
         req_id: u64,
         id: WorktreeId,
-        /// The git half alone, no process sweep: what an idle band's line
-        /// shows (the sweep stays with the confirm). Omitted from the
+        /// An idle band's check, asked every rotation: the same check less
+        /// the gitignored files only a confirm lists. Omitted from the
         /// frame when false; sent true only to a daemon at
         /// [`BRANCH_LANDING_PROTOCOL`].
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        git_only: bool,
+        band: bool,
     },
     /// Opt-in cleanup for a linked worktree whose PR was detected as merged.
     /// The daemon re-checks the safety invariants before touching disk:
@@ -1153,7 +1153,7 @@ mod tests {
         let new = ClientRequest::CheckWorktree {
             req_id: 2,
             id: id.clone(),
-            git_only: false,
+            band: false,
         };
         let (_, old): (String, v51::CheckWorktree) = variant_body(&new);
         assert_eq!(old, v51::CheckWorktree { req_id: 2, id });

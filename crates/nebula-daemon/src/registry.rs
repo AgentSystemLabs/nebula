@@ -4515,11 +4515,12 @@ mod tests {
         );
     }
 
-    /// A band's check is the git half alone: no process sweep, and the
-    /// branch's landing — here, a branch with nothing of its own, which
-    /// has landed, then one with a commit, which has not.
+    /// A band's check names a process working in the checkout, as a
+    /// confirm's does, and says where the branch stands — here, a branch
+    /// with nothing of its own, which has landed, then one with a commit,
+    /// which has not.
     #[tokio::test]
-    async fn a_git_only_check_reads_the_branch_and_skips_the_sweep() {
+    async fn a_band_check_reads_the_branch_and_names_outside_work() {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let repo = init_repo(&root);
@@ -4537,7 +4538,10 @@ mod tests {
         let check = daemon.check_worktree(&id, None, true).await;
         drop(worker);
         let check = check.unwrap();
-        assert!(check.processes.is_empty(), "{check:?}");
+        assert!(
+            check.processes.iter().any(|p| p.name.contains("sleep")),
+            "{check:?}"
+        );
         let landing = check.landing.clone().expect("a landing");
         assert!(landing.branch_landed, "{check:?}");
 

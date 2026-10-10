@@ -3,8 +3,8 @@
 //! An EMPTY BAND used to read `nothing running` whether its checkout was a
 //! merged leftover or the only copy of a day's work, so every one needed a
 //! `d` — or a question to an agent — before it could be cleared. Each idle
-//! band now carries the DELETE CHECK's git half (`ClientRequest::CheckWorktree`
-//! with `git_only`; the process sweep stays with the confirm), asked in the
+//! band now carries the DELETE CHECK (`ClientRequest::CheckWorktree` with
+//! `band`, which leaves out the gitignored files), asked in the
 //! background on the git tick: one band per tick, the least recently read
 //! first, at most one in flight, and none read again sooner than
 //! [`FRESH_FOR`]. Its verdict takes the place of `nothing running`, in
@@ -15,7 +15,12 @@
 //! - `↑4 unmerged` — the branch holds commits its base lacks (a delete
 //!   keeps the branch, and them);
 //! - `⚠ 3 modified · 2 untracked`, `⚠ 6 unpushed in submodules`,
-//!   `⚠ detached · 2 unreachable` — what a delete destroys.
+//!   `⚠ detached · 2 unreachable` — what a delete destroys;
+//! - `● in use by just, cargo` — a process outside nebula's sessions has
+//!   its working directory in the checkout (a build, a shell, a tool's
+//!   scratch run): `0 sessions` alone never says that. It leads the git
+//!   verdict, `● in use by zsh · clean · detached`, and follows a warning,
+//!   `⚠ 3 modified · in use by cargo`.
 //!
 //! "Merged" is counted by content, not ancestry: a branch landed by squash
 //! merge, rebase or cherry-pick reads merged. Before the first read a band
@@ -95,7 +100,7 @@ pub(crate) fn sweep(app: &mut App, out: &mut Vec<ClientRequest>) {
     out.push(ClientRequest::CheckWorktree {
         req_id,
         id: id.clone(),
-        git_only: true,
+        band: true,
     });
     app.jobs.band_checks.inflight = Some((req_id, id, Instant::now()));
 }
@@ -204,6 +209,9 @@ pub(crate) enum Tone {
     Ahead,
     /// What a delete destroys: the warning color.
     Warn,
+    /// Something outside nebula's sessions is working in the checkout:
+    /// the warning color, though a delete would not destroy it.
+    InUse,
 }
 
 /// What a band's line says about its checkout.
@@ -213,10 +221,59 @@ pub(crate) struct Verdict {
     pub tone: Tone,
 }
 
+/// Process names a band lists before it says "+N".
+const IN_USE_NAMED: usize = 2;
+
 /// The band's verdict on `check`: None when there is nothing to say — a
 /// daemon that did not say where the branch stands, or a branch that is
-/// its base's own.
+/// its base's own, with nothing at work in it.
 pub(crate) fn verdict(check: &WorktreeCheck) -> Option<Verdict> {
+    let git = git_verdict(check);
+    if check.landing.is_none() || check.processes.is_empty() || git_running(check) {
+        // A git at work names itself (`⋯ git submodule update running`).
+        return git;
+    }
+    let in_use = format!("in use by {}", process_names(check));
+    Some(match git {
+        Some(v) if v.tone == Tone::Warn => Verdict {
+            text: format!("{} · {in_use}", v.text),
+            tone: Tone::Warn,
+        },
+        Some(v) => Verdict {
+            text: format!("● {in_use} · {}", v.text.trim_start_matches("✓ ")),
+            tone: Tone::InUse,
+        },
+        None => Verdict {
+            text: format!("● {in_use}"),
+            tone: Tone::InUse,
+        },
+    })
+}
+
+/// The distinct names of the processes at work in the checkout, in pid
+/// order, the first [`IN_USE_NAMED`] of them and how many more.
+fn process_names(check: &WorktreeCheck) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for p in &check.processes {
+        let name = if p.name.is_empty() {
+            "?"
+        } else {
+            p.name.as_str()
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let more = names.len().saturating_sub(IN_USE_NAMED);
+    let mut text = names[..names.len().min(IN_USE_NAMED)].join(", ");
+    if more > 0 {
+        text.push_str(&format!(" +{more}"));
+    }
+    text
+}
+
+/// What git alone says of the checkout.
+fn git_verdict(check: &WorktreeCheck) -> Option<Verdict> {
     let landing = check.landing.as_ref()?;
     // A git at work: the checkout is in flux, and that is what there is to
     // say — not an error, and not a warning. One stopped part-way (a
@@ -463,6 +520,76 @@ mod tests {
         assert_eq!(
             text(&with(WorktreeLanding::default(), failed)),
             Some(("? can't read git state · retrying".into(), Tone::Clean))
+        );
+    }
+
+    fn working(names: &[&str]) -> Vec<nebula_core::WorktreeProcess> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| nebula_core::WorktreeProcess {
+                pid: 100 + i as u32,
+                name: (*name).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_process_outside_nebula_says_the_checkout_is_in_use() {
+        let in_use = WorktreeCheck {
+            detached: true,
+            processes: working(&["just"]),
+            ..WorktreeCheck::default()
+        };
+        assert_eq!(
+            text(&with(WorktreeLanding::default(), in_use)),
+            Some(("● in use by just · clean · detached".into(), Tone::InUse)),
+            "a clean checkout something is working in reads in use, not ✓"
+        );
+        let unlanded = WorktreeCheck {
+            processes: working(&["zsh"]),
+            ..WorktreeCheck::default()
+        };
+        assert_eq!(
+            text(&with(WorktreeLanding::default(), unlanded)),
+            Some(("● in use by zsh".into(), Tone::InUse)),
+            "in use even when git has nothing to say"
+        );
+        let dirty = WorktreeCheck {
+            changes: 3,
+            processes: working(&["cargo", "rustc", "rustc", "cc", "ld"]),
+            ..WorktreeCheck::default()
+        };
+        assert_eq!(
+            text(&with(WorktreeLanding::default(), dirty)),
+            Some((
+                "⚠ 3 modified · in use by cargo, rustc +2".into(),
+                Tone::Warn
+            )),
+            "what a delete destroys leads; names are distinct"
+        );
+        let live = WorktreeLanding {
+            git_op: Some("submodule update".into()),
+            git_op_live: true,
+            ..WorktreeLanding::default()
+        };
+        let cloning = WorktreeCheck {
+            processes: working(&["git"]),
+            ..WorktreeCheck::default()
+        };
+        assert_eq!(
+            text(&with(live, cloning)),
+            Some(("⋯ git submodule update running".into(), Tone::Clean)),
+            "a git at work names itself"
+        );
+        let no_landing = WorktreeCheck {
+            processes: working(&["just"]),
+            ..WorktreeCheck::default()
+        };
+        assert_eq!(
+            text(&no_landing),
+            None,
+            "an older daemon's check says nothing"
         );
     }
 }
