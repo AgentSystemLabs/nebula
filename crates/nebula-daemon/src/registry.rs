@@ -59,16 +59,27 @@ struct ResumeWatch {
 /// `$SHELL -l -i -c <cmd>`: a login *and* interactive shell, so zsh sources
 /// ~/.zprofile and ~/.zshrc both and the child sees the PATH the user's
 /// terminal has. CLI probes use it directly, and PTY launches wrap it through
-/// [`LOGIN_SHELL_STDIN_SHIM`] below so rc-file startup sees stdin as non-TTY
+/// [`login_shell_stdin_shim`] below so rc-file startup sees stdin as non-TTY
 /// until nebula's command is about to run.
 const LOGIN_SHELL_ARGS: [&str; 3] = ["-l", "-i", "-c"];
 /// Tiny POSIX wrapper for PTY launches: keep stdout/stderr on the PTY, but
 /// give the login shell `/dev/null` as stdin while it sources rc files.
 /// Shell startup tools that auto-`exec` only when stdin is a TTY (Iris-style
 /// autocomplete launchers) then leave the `-c` payload alone. The payload
-/// reopens `/dev/tty` before starting the agent, so the CLI itself remains
-/// fully interactive.
-const LOGIN_SHELL_STDIN_SHIM: &str = "exec </dev/null; exec \"$@\"";
+/// reopens the PTY by the device path named here ([`reopen_pane_tty`])
+/// before starting the agent, so the CLI itself remains fully interactive.
+fn login_shell_stdin_shim() -> String {
+    let var = env::PANE_TTY;
+    format!("{var}=$(tty) || {var}=/dev/tty; export {var}; exec </dev/null; exec \"$@\"")
+}
+/// The payload's first step: stdin back on the pane's PTY, by its device
+/// path rather than `/dev/tty` — Claude Code (Bun) watches stdin with
+/// kqueue, which on macOS refuses `/dev/tty` with `EINVAL`, and the CLI
+/// exits on the spot.
+fn reopen_pane_tty() -> String {
+    let var = env::PANE_TTY;
+    format!("exec <\"${var}\"; unset {var}; ")
+}
 /// Cap on one CLI probe. A heavy rc file costs ~1s; a hung one must not
 /// stall a create forever, so on timeout the CLI is assumed present and
 /// the spawn itself gets to report.
@@ -815,7 +826,7 @@ fn resolve_harness_in(
 }
 
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
-/// 'exec </dev/tty; unset …; export …; prog args'`) so the child gets the
+/// 'exec <"$NEBULA_PANE_TTY"; unset …; export …; prog args'`) so the child gets the
 /// user's real environment — ~/.zprofile and ~/.zshrc on zsh — rather than
 /// the daemon's.
 ///
@@ -833,7 +844,7 @@ fn resolve_harness_in(
 /// than one group.
 ///
 /// The wrapper process feeds `/dev/null` to the shell while those files run,
-/// then the prelude reopens `/dev/tty` and restates what the pane is *after*
+/// then the prelude reopens the PTY and restates what the pane is *after*
 /// startup:
 /// `TERM` and `COLORTERM` name nebula's own grid — 24-bit colour whatever
 /// the host terminal — and `NO_COLOR` / `FORCE_COLOR` are dropped. A
@@ -856,7 +867,8 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
 /// TERMINAL's `.nebula.json` `run`, pipes and `&&` and all — behind the
 /// same prelude.
 fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
-    let mut cmdline = String::from("exec </dev/tty; unset");
+    let mut cmdline = reopen_pane_tty();
+    cmdline.push_str("unset");
     for name in env::PANE_COLOR_OVERRIDES {
         cmdline.push(' ');
         cmdline.push_str(name);
@@ -867,7 +879,7 @@ fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
     cmdline.push_str(env::PANE_COLORTERM);
     cmdline.push_str("; ");
     cmdline.push_str(line);
-    let mut args = vec!["-c".to_string(), LOGIN_SHELL_STDIN_SHIM.to_string()];
+    let mut args = vec!["-c".to_string(), login_shell_stdin_shim()];
     args.push("nebula-login-shell".to_string());
     args.push(shell.to_string());
     args.extend(LOGIN_SHELL_ARGS.iter().map(|s| s.to_string()));
@@ -2028,24 +2040,27 @@ mod tests {
             args,
             vec![
                 "-c",
-                LOGIN_SHELL_STDIN_SHIM,
+                &login_shell_stdin_shim(),
                 "nebula-login-shell",
                 "/bin/zsh",
                 "-l",
                 "-i",
                 "-c",
-                &format!("exec </dev/tty; {PANE_ENV} claude '--resume' 'sid-1'")
+                &format!("{}{PANE_ENV} claude '--resume' 'sid-1'", reopen_pane_tty())
             ]
         );
         // Single quotes in an arg survive the wrapping.
         let (_, args) = login_shell_wrap("/bin/zsh", "echo", &["it's".to_string()]);
         assert_eq!(
             args[7],
-            format!(r"exec </dev/tty; {PANE_ENV} echo 'it'\''s'")
+            format!(r"{}{PANE_ENV} echo 'it'\''s'", reopen_pane_tty())
         );
         // A command word that isn't a plain name is quoted like an argument.
         let (_, args) = login_shell_wrap("/bin/zsh", "my tool", &[]);
-        assert_eq!(args[7], format!("exec </dev/tty; {PANE_ENV} 'my tool'"));
+        assert_eq!(
+            args[7],
+            format!("{}{PANE_ENV} 'my tool'", reopen_pane_tty())
+        );
     }
 
     /// The command word resolves through the shell, so an alias or function
@@ -2065,7 +2080,7 @@ mod tests {
             .arg(format!(
                 "claude() {{ printf 'routed %s' \"$*\"; }}; {}",
                 args[7]
-                    .strip_prefix("exec </dev/tty; ")
+                    .strip_prefix(reopen_pane_tty().as_str())
                     .expect("launch line restores the PTY before the command")
             ))
             .output()
@@ -2102,7 +2117,7 @@ mod tests {
         let mut zsh_args = args[4..7].to_vec();
         zsh_args.push(
             args[7]
-                .strip_prefix("exec </dev/tty; ")
+                .strip_prefix(reopen_pane_tty().as_str())
                 .expect("launch line restores the PTY before the command")
                 .to_string(),
         );
@@ -2143,7 +2158,7 @@ mod tests {
             .arg("-c")
             .arg(
                 args[7]
-                    .strip_prefix("exec </dev/tty; ")
+                    .strip_prefix(reopen_pane_tty().as_str())
                     .expect("launch line restores the PTY before the command"),
             )
             .env("NO_COLOR", "1")
