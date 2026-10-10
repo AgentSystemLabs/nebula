@@ -253,6 +253,11 @@ pub struct PtySession {
     cursor: Mutex<Option<CursorTracker>>,
 }
 
+/// How long [`PtySession::jiggle`] holds the shrunken size. An app that
+/// reads its size a moment after SIGWINCH ignores a jiggle with no hold
+/// and repaints after one held 50 ms.
+const JIGGLE_HOLD: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub struct SpawnSpec {
     pub program: String,
     pub args: Vec<String>,
@@ -442,19 +447,35 @@ impl PtySession {
         Ok(())
     }
 
-    /// Resize on attach. The kernel only delivers SIGWINCH on a *change*, so
-    /// when the requested size equals the current one, jiggle (rows-1 then
-    /// back) to force a full-screen repaint — the dtach trick.
-    pub fn resize_with_jiggle(&self, cols: u16, rows: u16) -> Result<()> {
-        let same = { *self.last_size.lock() == (cols, rows) };
-        if same && rows > 1 {
-            let master = self.master.lock();
-            master.resize(pty_size(cols, rows - 1))?;
-            master.resize(pty_size(cols, rows))?;
-            Ok(())
-        } else {
-            self.resize(cols, rows)
+    /// Resize on attach, forcing a full-screen repaint. The kernel only
+    /// delivers SIGWINCH on a *change*: a new size is one, and the size the
+    /// session already has gets a [`Self::jiggle`] instead, off the
+    /// caller's task since it waits out [`JIGGLE_HOLD`].
+    pub fn resize_forcing_repaint(self: &Arc<Self>, cols: u16, rows: u16) -> Result<()> {
+        if *self.last_size.lock() != (cols, rows) {
+            return self.resize(cols, rows);
         }
+        let session = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = session.jiggle().await;
+        });
+        Ok(())
+    }
+
+    /// The dtach trick: one row less, then back. The shrunken size holds
+    /// for [`JIGGLE_HOLD`] — an app that reads its size a moment after the
+    /// signal would otherwise read it back already — and the size put back
+    /// is the session's by then, so a real resize meanwhile is kept.
+    async fn jiggle(&self) -> Result<()> {
+        let (cols, rows) = *self.last_size.lock();
+        if rows < 2 {
+            return Ok(());
+        }
+        self.master.lock().resize(pty_size(cols, rows - 1))?;
+        tokio::time::sleep(JIGGLE_HOLD).await;
+        let (cols, rows) = *self.last_size.lock();
+        self.master.lock().resize(pty_size(cols, rows))?;
+        Ok(())
     }
 
     /// SIGHUP the child, then SIGKILL every process group under it if it
@@ -1098,6 +1119,95 @@ mod tests {
         .expect("title event within 10s");
         assert_eq!(title, "✳ Fix Login");
         assert_eq!(session.window_title().as_deref(), Some("✳ Fix Login"));
+        session.kill();
+    }
+
+    /// A jiggle holds the shrunken size long enough for a child that reads
+    /// its size off SIGWINCH (`stty size` here) to
+    /// see 29 rows of a 30-row pane, and the pane ends back at 30.
+    #[tokio::test]
+    async fn a_jiggle_lets_the_child_see_the_shrunken_size() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "trap 'stty size' WINCH; printf ready; while :; do sleep 0.01; done".into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: 80,
+                rows: 30,
+            },
+        )
+        .unwrap();
+        let seen = |needle: &'static str| {
+            let session = session.clone();
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let (_, bytes) = session.snapshot(None);
+                        if String::from_utf8_lossy(&bytes).contains(needle) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .is_ok()
+            }
+        };
+        assert!(seen("ready").await, "the child came up");
+        session.jiggle().await.unwrap();
+        assert!(seen("29 80").await, "the child read the shrunken size");
+        assert_eq!(*session.last_size.lock(), (80, 30), "and the pane is back");
+        session.kill();
+    }
+
+    /// A real resize that lands while a jiggle holds the shrunken size is
+    /// the size the pane ends at: the jiggle puts back the session's size
+    /// as it stands then, never the one it started from.
+    #[tokio::test]
+    async fn a_resize_during_the_jiggle_is_kept() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "trap 'stty size' WINCH; printf 'ready\\n'; while :; do sleep 0.01; done"
+                        .into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: 80,
+                rows: 30,
+            },
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !String::from_utf8_lossy(&session.snapshot(None).1).contains("ready") {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the child came up");
+        session.resize_forcing_repaint(80, 30).unwrap();
+        tokio::time::sleep(JIGGLE_HOLD / 4).await;
+        session.resize(100, 40).unwrap();
+        tokio::time::sleep(JIGGLE_HOLD * 3).await;
+        let out = String::from_utf8_lossy(&session.snapshot(None).1).into_owned();
+        let last = out.split(['\r', '\n']).map(str::trim).rfind(|l| {
+            l.split(' ').count() == 2 && l.chars().all(|c| c.is_ascii_digit() || c == ' ')
+        });
+        assert_eq!(
+            last,
+            Some("40 100"),
+            "the last size the child read: {out:?}"
+        );
         session.kill();
     }
 
