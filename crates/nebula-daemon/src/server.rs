@@ -40,6 +40,13 @@ pub async fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
 }
 
 async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
+    // Who is asking, when the OS says: the DELETE CHECK spares the asking
+    // client's own processes.
+    let peer_pid = stream
+        .peer_cred()
+        .ok()
+        .and_then(|cred| cred.pid())
+        .and_then(|pid| u32::try_from(pid).ok());
     let (read_half, write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
 
@@ -57,6 +64,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     });
 
     let mut client = ClientConnection::new(daemon, out_tx);
+    client.peer_pid = peer_pid;
     let result: Result<()> = async {
         while let Some(req) = read_frame::<ClientRequest, _>(&mut reader).await? {
             if !client.handle_request(req).await? {
@@ -79,6 +87,8 @@ struct ClientConnection {
     attached: HashMap<SessionRef, tokio::task::JoinHandle<()>>,
     subscription: Option<tokio::task::JoinHandle<()>>,
     handshaken: bool,
+    /// The client process, when the socket's credentials name it.
+    peer_pid: Option<u32>,
 }
 
 impl ClientConnection {
@@ -89,6 +99,7 @@ impl ClientConnection {
             attached: HashMap::new(),
             subscription: None,
             handshaken: false,
+            peer_pid: None,
         }
     }
 
@@ -213,6 +224,10 @@ impl ClientConnection {
             }
             ClientRequest::DeleteWorktree { req_id, id, force } => {
                 self.spawn_delete_worktree(req_id, id, force);
+                Ok(true)
+            }
+            ClientRequest::CheckWorktree { req_id, id } => {
+                self.spawn_check_worktree(req_id, id);
                 Ok(true)
             }
             ClientRequest::CleanupMergedWorktree {
@@ -878,6 +893,24 @@ impl ClientConnection {
         let out_tx = self.out_tx.clone();
         tokio::spawn(async move {
             reply_done(&out_tx, req_id, daemon.delete_worktree(&id, force).await).await;
+        });
+    }
+
+    fn spawn_check_worktree(&self, req_id: u64, id: nebula_core::WorktreeId) {
+        // `git status` on a big checkout and an `lsof` of every process are
+        // each a fraction of a second; off the request loop, like a delete.
+        let daemon = self.daemon.clone();
+        let out_tx = self.out_tx.clone();
+        let client = self.peer_pid;
+        tokio::spawn(async move {
+            let ev = match daemon.check_worktree(&id, client).await {
+                Ok(check) => ServerEvent::WorktreeChecked { req_id, id, check },
+                Err(e) => ServerEvent::Error {
+                    req_id: Some(req_id),
+                    message: format!("{e:#}"),
+                },
+            };
+            let _ = out_tx.send(ev).await;
         });
     }
 

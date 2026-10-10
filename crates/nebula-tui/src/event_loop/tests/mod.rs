@@ -21944,3 +21944,321 @@ fn archived_sessions_keep_the_question_with_show_all_worktrees_on() {
         );
     });
 }
+
+/// `d` on the band of `feat` in [`parity_tree`], with the DELETE CHECK the
+/// loop's next turn sends: the app, and that check's req_id.
+fn delete_feat_with_check() -> (App, u64) {
+    let mut app = parity_tree();
+    let mut out = Vec::new();
+    let row = app
+        .worktree_row_of(&WorktreeId("w2".into()))
+        .expect("feat is a row");
+    select_worktree_row(&mut app, row, &mut out);
+    app.nav.focus = Focus::Worktrees;
+    out.clear();
+    press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+    assert!(
+        matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
+            if c.action == PendingAction::DeleteWorktree(WorktreeId("w2".into()))),
+        "{:?}",
+        app.modals.overlay
+    );
+    crate::delete_check::sync(&mut app, &mut out);
+    let req_id = match out.as_slice() {
+        [ClientRequest::CheckWorktree { req_id, id }] if id.0 == "w2" => *req_id,
+        other => panic!("the confirm asks for one check: {other:?}"),
+    };
+    (app, req_id)
+}
+
+fn confirm_screen(app: &mut App) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+    terminal.draw(|f| ui::draw(f, app)).unwrap();
+    buffer_text(&terminal)
+}
+
+/// The DELETE CHECK: a confirm that would take a worktree off disk asks
+/// the DAEMON what it still holds, Enter waits for the answer, and the
+/// answer is listed under the question before anything is deleted — a
+/// band that reads "nothing running" can still have an agent building in
+/// it from another checkout.
+#[test]
+fn a_worktree_delete_waits_for_its_check_and_lists_what_it_found() {
+    with_default_config(|| {
+        let (mut app, req_id) = delete_feat_with_check();
+        let mut out = Vec::new();
+        crate::delete_check::sync(&mut app, &mut out);
+        assert!(out.is_empty(), "asked once per confirm: {out:?}");
+        // A check that has not answered within SHOW_AFTER: the dialog
+        // shows with "Checking…".
+        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
+        assert!(confirm_screen(&mut app).contains("Checking 'feat' for work in progress"));
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            out.is_empty(),
+            "nothing deleted ahead of the check: {out:?}"
+        );
+        assert!(matches!(app.modals.overlay, Some(Overlay::Confirm(_))));
+        assert_eq!(
+            app.chrome.flash.as_deref(),
+            Some("still checking 'feat' for work in progress — a moment")
+        );
+
+        hse(
+            &mut app,
+            ServerEvent::WorktreeChecked {
+                req_id,
+                id: WorktreeId("w2".into()),
+                check: nebula_core::WorktreeCheck {
+                    processes: vec![nebula_core::WorktreeProcess {
+                        pid: 4242,
+                        name: "cargo".into(),
+                    }],
+                    changes: 2,
+                    ahead: 1,
+                    base: Some("origin/main".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert!(!app.requests.pending.contains_key(&req_id));
+        let screen = confirm_screen(&mut app);
+        for finding in [
+            "1 process is working in it: cargo (4242)",
+            "2 uncommitted changes",
+            "1 commit origin/main lacks (the branch keeps them)",
+        ] {
+            assert!(screen.contains(finding), "{finding:?} in:\n{screen}");
+        }
+
+        assert_eq!(app.chrome.flash, None, "the wait's footer line is down");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            out.iter().any(|r| matches!(r,
+                ClientRequest::DeleteWorktree { id, .. } if id.0 == "w2")),
+            "confirmed with the findings in view: {out:?}"
+        );
+    });
+}
+
+/// A check that answers within SHOW_AFTER opens the dialog once, already
+/// filled in: until the answer nothing is drawn but a footer line, and
+/// once shown its text does not change — the first frame is the last
+/// word, not a "Checking…" body that grows into another dialog.
+#[test]
+fn a_fast_check_opens_the_dialog_once_and_filled_in() {
+    with_default_config(|| {
+        let (mut app, req_id) = delete_feat_with_check();
+        let held = confirm_screen(&mut app);
+        assert!(!held.contains("from disk?"), "no dialog yet:\n{held}");
+        assert!(
+            held.contains("checking 'feat' for work in progress"),
+            "{held}"
+        );
+
+        hse(
+            &mut app,
+            ServerEvent::WorktreeChecked {
+                req_id,
+                id: WorktreeId("w2".into()),
+                check: nebula_core::WorktreeCheck {
+                    changes: 2,
+                    ..Default::default()
+                },
+            },
+        );
+        let shown = confirm_screen(&mut app);
+        assert!(
+            shown.contains("from disk?") && shown.contains("2 uncommitted changes"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("checking 'feat'"),
+            "the footer line is down"
+        );
+        assert!(!shown.contains("Checking 'feat'"), "{shown}");
+        assert_eq!(app.chrome.flash, None);
+        assert_eq!(confirm_screen(&mut app), shown, "the same dialog");
+    });
+}
+
+/// A check that has not answered by SHOW_AFTER: the event loop wakes then,
+/// and the dialog shows with "Checking…" so the user sees why Enter waits.
+#[test]
+fn a_slow_check_reveals_the_dialog_at_show_after() {
+    with_default_config(|| {
+        let (mut app, _) = delete_feat_with_check();
+        let reveal = crate::delete_check::reveal_at(&app).expect("held");
+        let wait = reveal.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wait > crate::delete_check::SHOW_AFTER - std::time::Duration::from_secs(1),
+            "{wait:?}"
+        );
+        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
+        assert!(crate::delete_check::reveal_at(&app).is_none());
+        let screen = confirm_screen(&mut app);
+        assert!(
+            screen.contains("from disk?") && screen.contains("Checking 'feat'"),
+            "{screen}"
+        );
+    });
+}
+
+/// While the check is out the dialog chooses nothing: held unshown, only a
+/// cancel gets through (Enter waits, saying so); shown with "Checking…",
+/// Enter and `y` still wait for the answer. Esc cancels throughout, and
+/// takes the footer line down with it.
+#[test]
+fn a_confirm_waiting_on_its_check_chooses_nothing_but_cancel() {
+    with_default_config(|| {
+        let (mut app, _) = delete_feat_with_check();
+        let mut out = Vec::new();
+        for key in ['x', 'D', 'y'] {
+            press(&mut app, KeyCode::Char(key), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(matches!(app.modals.overlay, Some(Overlay::Confirm(_))));
+
+        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(matches!(app.modals.overlay, Some(Overlay::Confirm(_))));
+
+        let (mut app, _) = delete_feat_with_check();
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.modals.overlay.is_none(), "Esc cancels a held confirm");
+        crate::delete_check::sync(&mut app, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(app.chrome.flash, None, "and takes its footer line down");
+    });
+}
+
+/// A check the DAEMON could not run says so in the confirm — never read
+/// as a clean bill of health, never a footer error — and stops holding
+/// Enter.
+#[test]
+fn a_failed_worktree_check_says_so_and_lets_the_confirm_through() {
+    with_default_config(|| {
+        let (mut app, req_id) = delete_feat_with_check();
+        hse(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: "worktree not found".into(),
+            },
+        );
+        assert_eq!(app.chrome.flash, None);
+        assert!(confirm_screen(&mut app).contains("Could not check 'feat': worktree not found"));
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out
+            .iter()
+            .any(|r| matches!(r, ClientRequest::DeleteWorktree { .. })));
+    });
+}
+
+/// Closing the confirm forgets its check: a late answer is dropped, and
+/// reopening asks afresh rather than showing a stale reading.
+#[test]
+fn reopening_a_worktree_delete_checks_again() {
+    with_default_config(|| {
+        let (mut app, first) = delete_feat_with_check();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        crate::delete_check::sync(&mut app, &mut out);
+        assert!(out.is_empty());
+        // Its error, landing after the confirm closed, is no footer flash.
+        hse(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(first),
+                message: "git failed".into(),
+            },
+        );
+        assert_eq!(app.chrome.flash, None);
+        hse(
+            &mut app,
+            ServerEvent::WorktreeChecked {
+                req_id: first,
+                id: WorktreeId("w2".into()),
+                check: Default::default(),
+            },
+        );
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        crate::delete_check::sync(&mut app, &mut out);
+        match out.as_slice() {
+            [ClientRequest::CheckWorktree { req_id, .. }] => assert_ne!(*req_id, first),
+            other => panic!("asked again: {other:?}"),
+        }
+        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
+        assert!(confirm_screen(&mut app).contains("Checking 'feat'"));
+    });
+}
+
+/// A DAEMON older than the check is never sent it, and its confirm works
+/// exactly as before.
+#[test]
+fn an_older_daemon_gets_no_check_and_the_old_confirm() {
+    with_default_config(|| {
+        let mut app = parity_tree();
+        app.requests.daemon_protocol = nebula_core::CHECK_WORKTREE_PROTOCOL - 1;
+        let mut out = Vec::new();
+        let row = app.worktree_row_of(&WorktreeId("w2".into())).unwrap();
+        select_worktree_row(&mut app, row, &mut out);
+        app.nav.focus = Focus::Worktrees;
+        out.clear();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        crate::delete_check::sync(&mut app, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out
+            .iter()
+            .any(|r| matches!(r, ClientRequest::DeleteWorktree { .. })));
+    });
+}
+
+/// The card's own delete that offers to take the emptied worktree too is
+/// checked the same way; once shown, its "no, the card only" never waits,
+/// since it deletes no checkout — but nothing is chosen in a dialog still
+/// held unshown for its check.
+#[test]
+fn a_card_delete_that_offers_the_worktree_checks_it_but_n_never_waits() {
+    with_default_config(|| {
+        let mut app = App::new();
+        seed_emptiable_tree(&mut app);
+        upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+        app.nav.focus = Focus::Sessions;
+        app.nav.sel_worktree = app
+            .visible_worktrees()
+            .iter()
+            .position(|w| w.id.0 == "w2")
+            .unwrap();
+        app.nav.sel_session = 0;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        crate::delete_check::sync(&mut app, &mut out);
+        assert!(
+            matches!(out.as_slice(), [ClientRequest::CheckWorktree { id, .. }] if id.0 == "w2"),
+            "{out:?}"
+        );
+        out.clear();
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "not chosen unseen: {out:?}");
+        assert!(matches!(app.modals.overlay, Some(Overlay::Confirm(_))));
+        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "yes-to-both waits for the check: {out:?}");
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::DeleteAgent { .. }))
+                && !out
+                    .iter()
+                    .any(|r| matches!(r, ClientRequest::DeleteWorktree { .. })),
+            "{out:?}"
+        );
+    });
+}

@@ -4048,6 +4048,11 @@ pub struct RequestState {
     /// (`event_loop::optimistic`): an upsert of one of them is a straggler
     /// from before the delete, and is ignored rather than shown.
     pub deleting: std::collections::HashSet<nebula_core::EntityId>,
+    /// The protocol the connected DAEMON speaks: requests newer than it
+    /// are not sent. This build's own until the connection says otherwise.
+    pub daemon_protocol: u32,
+    /// The DELETE CHECKS behind the open confirm (`delete_check`).
+    pub delete_checks: crate::delete_check::DeleteChecks,
 }
 
 impl Default for RequestState {
@@ -4064,6 +4069,8 @@ impl Default for RequestState {
             pending_prewarm: None,
             next_keepwarm: None,
             deleting: std::collections::HashSet::new(),
+            daemon_protocol: nebula_core::PROTOCOL_VERSION,
+            delete_checks: Default::default(),
         }
     }
 }
