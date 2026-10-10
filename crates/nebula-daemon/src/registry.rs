@@ -3840,6 +3840,53 @@ mod tests {
         assert!(rt.is_main, "the surviving root row keeps the badge");
     }
 
+    /// A checkout deleted out from under git (`rm -rf`, Finder, a disk
+    /// sweep) stays in `git worktree list` until someone prunes it: marked
+    /// `prunable`, or — if it was locked, as Claude Code's worktrees are —
+    /// not even that. It is gone all the same, so its row goes too, and the
+    /// repo itself is left as it was.
+    #[tokio::test]
+    async fn reconcile_drops_a_row_whose_checkout_was_deleted_without_git() {
+        for locked in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let repo = init_repo(&root);
+            let feat = root.join("repo-worktrees").join("feat");
+            git_in(
+                &repo,
+                &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
+            );
+            if locked {
+                git_in(&repo, &["worktree", "lock", &feat.to_string_lossy()]);
+            }
+
+            let daemon = test_daemon();
+            let project = project_at(&daemon, &repo);
+            daemon.sync_project_worktrees(&project).await.unwrap();
+            let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+            assert!(worktrees.iter().any(|w| w.branch == "feat"), "adopted");
+
+            std::fs::remove_dir_all(&feat).unwrap();
+            daemon.sync_project_worktrees(&project).await.unwrap();
+
+            let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+            assert!(
+                worktrees.iter().all(|w| w.branch != "feat"),
+                "locked={locked}: the deleted checkout's row is gone: {worktrees:#?}"
+            );
+            // nebula does not prune or unlock for the user.
+            let listed = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "list", "--porcelain"])
+                .output()
+                .unwrap();
+            let listed = String::from_utf8_lossy(&listed.stdout);
+            let mark = if locked { "locked" } else { "prunable" };
+            assert!(listed.contains(mark), "locked={locked}: {listed}");
+        }
+    }
+
     /// A fresh repo with one commit, at a canonical path (the macOS
     /// tempdir is a symlink, and git reports worktrees canonically).
     fn init_repo(root: &Path) -> PathBuf {

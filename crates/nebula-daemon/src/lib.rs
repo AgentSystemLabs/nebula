@@ -278,7 +278,7 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
         let daemon = daemon.clone();
         tokio::spawn(async move {
             let mut interval = env_interval(env::WORKTREE_SYNC_MS, 2_000);
-            let mut seen: std::collections::HashMap<nebula_core::ProjectId, std::time::SystemTime> =
+            let mut seen: std::collections::HashMap<nebula_core::ProjectId, WorktreeStamp> =
                 std::collections::HashMap::new();
             loop {
                 tokio::select! {
@@ -391,23 +391,49 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
     Ok(())
 }
 
-/// Latest mtime across the git files a worktree change touches: the
-/// `.git/worktrees` registry (add/remove/prune), each linked checkout's
-/// `HEAD` (branch switch inside it), and the root `.git/HEAD` (branch
-/// switch on the main checkout). Any of these moving forward means the
-/// stored rows may be stale.
-fn worktree_probe_stamp(repo_path: &std::path::Path) -> Option<std::time::SystemTime> {
+/// What the sync loop compares between ticks to decide whether a project's
+/// worktree rows may be stale.
+#[derive(Debug, Clone, PartialEq)]
+struct WorktreeStamp {
+    /// Latest mtime across the git files a worktree change touches: the
+    /// `.git/worktrees` registry (add/remove/prune), each linked checkout's
+    /// `HEAD` (branch switch inside it), and the root `.git/HEAD` (branch
+    /// switch on the main checkout).
+    latest: std::time::SystemTime,
+    /// Registry entries whose checkout directory is gone. Deleting a checkout
+    /// without `git worktree remove` (`rm -rf`, Finder, a disk sweep) touches
+    /// none of the files above, so without this the row outlives its
+    /// directory until some unrelated git operation moves an mtime.
+    gone: Vec<std::ffi::OsString>,
+}
+
+/// Fingerprint the git state a worktree change shows up in. Any change to it
+/// means the stored rows may be stale.
+fn worktree_probe_stamp(repo_path: &std::path::Path) -> Option<WorktreeStamp> {
     let git_dir = git_common_dir(repo_path)?;
     let mtime = |p: std::path::PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let mut stamps: Vec<std::time::SystemTime> = Vec::new();
+    let mut gone = Vec::new();
     stamps.extend(mtime(git_dir.join("HEAD")));
     stamps.extend(mtime(git_dir.join("worktrees")));
     if let Ok(dir) = std::fs::read_dir(git_dir.join("worktrees")) {
         for entry in dir.flatten() {
-            stamps.extend(mtime(entry.path().join("HEAD")));
+            let admin = entry.path();
+            stamps.extend(mtime(admin.join("HEAD")));
+            // `gitdir` names the checkout's `.git` file — git's own test for
+            // calling an entry prunable is that this path no longer exists.
+            if let Ok(target) = std::fs::read_to_string(admin.join("gitdir")) {
+                if !rebase_on(&admin, target.trim()).exists() {
+                    gone.push(entry.file_name());
+                }
+            }
         }
     }
-    stamps.into_iter().max()
+    gone.sort();
+    Some(WorktreeStamp {
+        latest: stamps.into_iter().max()?,
+        gone,
+    })
 }
 
 /// The `.git` holding the repo's shared HEAD and per-worktree HEADs — the
@@ -533,6 +559,32 @@ mod probe_tests {
             worktree_probe_stamp(&repo),
             "and it is the same fingerprint the repo's own checkout reports"
         );
+    }
+
+    /// Deleting a linked checkout's directory outside git moves no mtime the
+    /// probe reads, so the fingerprint itself has to change or the sync never
+    /// runs and the row outlives the directory.
+    #[test]
+    fn probe_changes_when_a_checkout_is_deleted_without_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let feat = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
+        );
+
+        let before = worktree_probe_stamp(&repo).unwrap();
+        assert!(before.gone.is_empty());
+        std::fs::remove_dir_all(&feat).unwrap();
+        let after = worktree_probe_stamp(&repo).unwrap();
+        assert_eq!(after.latest, before.latest, "no watched mtime moved");
+        assert_eq!(after.gone, vec![std::ffi::OsString::from("feat")]);
+        assert_ne!(after, before);
     }
 
     /// A directory that is not a checkout at all has no fingerprint. The sync
