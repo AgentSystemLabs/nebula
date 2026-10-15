@@ -293,8 +293,8 @@
   one you asked from stays in its own checkout. Claude learns this from the same appended system
   prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission. Two sessions in one
   checkout share its files, index and branch, so a spawn says when it lands in a SHARED WORKTREE
-  and names the live sessions already there; if that checkout also has uncommitted changes the
-  spawn is refused, starting nothing, unless the agent adds `--same-worktree` — the refusal tells
+  and names the live sessions already there; if that checkout also has uncommitted changes (not
+  counting the hook files nebula itself writes there) the spawn is refused, starting nothing, unless the agent adds `--same-worktree` — the refusal tells
   it to use `--worktree <branch>` instead. A long brief goes in a file: `--prompt-file <path>`.
 - **Ask the agent to show you a file, image or diagram and it opens in nebula.** Say "open it",
   "show me the examples" or "show the diagram" and the session runs `nebula open <file>…`; every TUI

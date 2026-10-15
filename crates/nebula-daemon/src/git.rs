@@ -89,6 +89,13 @@ const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// a repo of many submodules answers fast; past [`STATUS_TIMEOUT`] it is
 /// an error.
 pub async fn uncommitted_paths(path: &Path) -> Result<usize> {
+    // Nebula's own hook files are rewritten at every spawn, so they are
+    // never anyone's half-done work: left out, or the first Claude session
+    // in a repo that doesn't ignore its settings file would make the
+    // checkout read as busy for good.
+    let mine = crate::hooks::installer::WORKTREE_FILES
+        .iter()
+        .map(|f| format!(":(top,exclude){f}"));
     let status = Command::new("git")
         .arg("-C")
         .arg(path)
@@ -98,7 +105,10 @@ pub async fn uncommitted_paths(path: &Path) -> Result<usize> {
             "-z",
             "-uall",
             "--ignore-submodules=dirty",
+            "--",
+            ":(top)",
         ])
+        .args(mine)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .kill_on_drop(true)
         .output();
@@ -1334,6 +1344,33 @@ mod tests {
         }
         assert_eq!(uncommitted_paths(&wt).await.unwrap(), 5);
         assert!(uncommitted_paths(&tmp.path().join("nope")).await.is_err());
+    }
+
+    /// The files nebula itself writes at a spawn are nobody's work in
+    /// flight, whether or not the machine's git ignores them: a checkout
+    /// whose only changes are those reads as clean, and a real edit beside
+    /// them still counts. (The repo turns off the user's global excludes,
+    /// which on a developer's machine often already list Claude's file.)
+    #[tokio::test]
+    async fn nebulas_own_hook_files_are_not_uncommitted_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        git(&repo, &["config", "core.excludesFile", "/dev/null"])
+            .await
+            .unwrap();
+        for f in crate::hooks::installer::WORKTREE_FILES {
+            let file = repo.join(f);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "{}").unwrap();
+        }
+        assert_eq!(uncommitted_paths(&repo).await.unwrap(), 0);
+        // Only those files: another one beside them in `.claude` counts.
+        std::fs::write(repo.join(".claude/notes.md"), "mine").unwrap();
+        assert_eq!(uncommitted_paths(&repo).await.unwrap(), 1);
+        std::fs::write(repo.join("half-written.rs"), "fn").unwrap();
+        assert_eq!(uncommitted_paths(&repo).await.unwrap(), 2);
     }
 
     /// The check runs beside a live session, so it must never write the
