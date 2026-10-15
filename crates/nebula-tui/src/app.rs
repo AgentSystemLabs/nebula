@@ -655,9 +655,30 @@ impl ContextMenu {
 /// What a row or a title wears while its launch is a CLAUDE CLOUD one.
 pub(crate) const CLOUD_LABEL: &str = " · cloud";
 
+/// A start or move held behind the SHARED HOLD's confirm
+/// (`event_loop::shared_hold`).
+#[derive(Debug, Clone)]
+pub struct SharedHold {
+    /// The `CreateAgent`, `CreatePrAgent` or `MoveAgent`, as built.
+    pub req: nebula_core::protocol::ClientRequest,
+    /// What went out with it and waits with it: the warm-slot refill a
+    /// create pushes right behind itself.
+    pub with: Vec<nebula_core::protocol::ClientRequest>,
+    /// The flash the request set ("moved polish-nav to feat"), put back
+    /// only once it is sent.
+    pub flash: Option<String>,
+    /// Something other than the user put another overlay over the dialog
+    /// (a refused launch's prompt coming back): the hold waits it out and
+    /// asks again, rather than reading the dialog's absence as a no.
+    pub parked: bool,
+}
+
 /// Destructive action waiting behind a confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingAction {
+    /// The SHARED HOLD's yes: send the start or move it held
+    /// (`RequestState::shared_hold`).
+    SendSharedHold,
     /// A project's stored `repo_path` is gone from disk. Answering yes
     /// opens the path-completing prompt that sends `SetProjectPath`.
     LocateProjectPath {
@@ -4003,6 +4024,12 @@ impl Default for ModalState {
 }
 
 pub struct RequestState {
+    /// A start or move aimed at a worktree that already has a live
+    /// session, held while its confirm is up (`event_loop::shared_hold`).
+    pub shared_hold: Option<SharedHold>,
+    /// The `req_id` a yes on that confirm just let through, so the same
+    /// event's check does not hold it a second time.
+    pub shared_allowed: Option<u64>,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
     /// In-flight creates — keys of `pending` — the user has navigated away
@@ -4053,6 +4080,8 @@ pub struct RequestState {
 impl Default for RequestState {
     fn default() -> Self {
         Self {
+            shared_hold: None,
+            shared_allowed: None,
             next_req_id: 1,
             pending: HashMap::new(),
             left_behind: std::collections::HashSet::new(),

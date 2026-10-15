@@ -423,6 +423,7 @@ pub enum SettingKind {
     HideUninstalledHarnesses,
     AskBeforeArchive,
     ConfirmDragMove,
+    ConfirmSharedWorktree,
 }
 
 /// One harness field row in the Agents tab. The tab renders one section
@@ -517,6 +518,7 @@ impl SettingKind {
             SettingKind::HighlightCurrentCard => (2026, 9, 28),
             SettingKind::AskBeforeArchive => (2026, 10, 3),
             SettingKind::ConfirmDragMove => (2026, 10, 2),
+            SettingKind::ConfirmSharedWorktree => (2026, 10, 15),
             SettingKind::SourceControlGraph | SettingKind::InlineGraphics => (2026, 10, 9),
         }
     }
@@ -660,6 +662,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::ConfirmDragMove,
                 label: "Confirm drag move",
                 hint: "A session card dropped on another worktree or project tab asks before it moves (off = the drop moves it at once; m's picker never asks)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::ConfirmSharedWorktree,
+                label: "Confirm shared worktree",
+                hint: "Starting or moving a session into a worktree another live session is in asks first (the root checkout never asks; off = never asks)",
                 group: "",
             },
         ]),
@@ -1382,6 +1390,13 @@ pub struct Config {
     /// config predating the key too. The MOVE PICKER (`m`) never asks: a
     /// pick and Enter are already deliberate.
     pub confirm_drag_move: bool,
+    /// CONFIRM SHARED WORKTREE: starting or moving a session into a
+    /// worktree that already has a live session asks first
+    /// (`event_loop::shared_hold`), since the two share one set of files,
+    /// one index and one branch. The project's root checkout never asks:
+    /// several sessions there is the everyday way to work. On by default,
+    /// a config predating the key too.
+    pub confirm_shared_worktree: bool,
     /// Whether each new QUICK PROMPT starts aimed at a fresh worktree
     /// rather than the checkout under the grid's cursor (the project's
     /// ROOT BRANCH when nothing is aimed at — `launcher::target_for`).
@@ -1553,6 +1568,7 @@ impl Default for Config {
             quick_prompt_focus: false,
             follow_new_session: true,
             confirm_drag_move: true,
+            confirm_shared_worktree: true,
             quick_prompt_new_worktree: false,
             keybindings: BTreeMap::new(),
             skipped: BTreeSet::new(),
@@ -2376,6 +2392,7 @@ impl Config {
             SettingKind::QuickPromptFocus => on_off(self.quick_prompt_focus).into(),
             SettingKind::FollowNewSession => on_off(self.follow_new_session).into(),
             SettingKind::ConfirmDragMove => on_off(self.confirm_drag_move).into(),
+            SettingKind::ConfirmSharedWorktree => on_off(self.confirm_shared_worktree).into(),
             SettingKind::QuickPromptNewWorktree => on_off(self.quick_prompt_new_worktree).into(),
         }
     }
@@ -2515,6 +2532,9 @@ impl Config {
             }
             SettingKind::ConfirmDragMove => {
                 self.confirm_drag_move = !self.confirm_drag_move;
+            }
+            SettingKind::ConfirmSharedWorktree => {
+                self.confirm_shared_worktree = !self.confirm_shared_worktree;
             }
             SettingKind::QuickPromptNewWorktree => {
                 self.quick_prompt_new_worktree = !self.quick_prompt_new_worktree;
@@ -4205,6 +4225,29 @@ mod tests {
     /// FOLLOW NEW SESSION starts on, sits under the QUICK PROMPT's Focus
     /// row on the Agents tab, toggles like any bool and persists under its
     /// own key; a config predating the key reads as on.
+    /// CONFIRM SHARED WORKTREE starts on, sits on the Sessions tab,
+    /// toggles like any bool and persists; a config predating the key
+    /// reads as on.
+    #[test]
+    fn confirm_shared_worktree_is_on_by_default_and_persists() {
+        let mut cfg = Config::default();
+        assert!(cfg.confirm_shared_worktree);
+        let (tab, row) = locate(SettingKind::ConfirmSharedWorktree).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        cfg.cycle(tab, row, 0);
+        assert_eq!(cfg.value_label(SettingKind::ConfirmSharedWorktree), "off");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(
+            !load_from(&path).confirm_shared_worktree,
+            "off survives a save"
+        );
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.confirm_shared_worktree, "a missing key reads as on");
+    }
+
     #[test]
     fn confirm_drag_move_is_on_by_default_and_persists() {
         let mut cfg = Config::default();

@@ -2122,7 +2122,11 @@ pub(super) fn drop_card(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.pane.last_session_click = None;
     app.chrome.dirty = true;
     if let Some(worktree) = drag.over {
-        if crate::config::Config::load().confirm_drag_move {
+        // A checkout another session is live in is asked about by the
+        // SHARED HOLD, which says more: one question, not two in a row.
+        if crate::config::Config::load().confirm_drag_move
+            && !super::shared_hold::would_hold_move(app, &drag.agent, &worktree)
+        {
             confirm_move(app, drag.agent, worktree);
         } else {
             move_agent(app, drag.agent, worktree, out);
@@ -12636,6 +12640,93 @@ mod tests {
         })
     }
 
+    /// A move into a linked worktree another session is live in waits for
+    /// a yes: the two would share one checkout, index and branch. `n`
+    /// sends nothing and leaves no request waiting on an answer; `y` sends
+    /// the move as it was built. The root checkout is never asked about,
+    /// and **Confirm shared worktree** off sends at once.
+    #[test]
+    fn a_move_into_a_worktree_with_a_live_session_asks_first() {
+        let pick_feat = |app: &mut App| {
+            key(app, KeyCode::Char('m'), KeyModifiers::NONE);
+            for c in "feat".chars() {
+                key(app, KeyCode::Char(c), KeyModifiers::NONE);
+            }
+            key(app, KeyCode::Enter, KeyModifiers::NONE)
+        };
+        let select = |app: &mut App, id: &str| {
+            draw_at(app, 130, 50);
+            key(app, KeyCode::Esc, KeyModifiers::NONE);
+            draw_at(app, 130, 50);
+            for row in 0..2 {
+                let (x, y) = row_cell(app, row);
+                click_at(app, x, y);
+                if app.selected_session().unwrap().id.0 == id {
+                    return;
+                }
+            }
+            panic!("no card for {id}");
+        };
+        with_default_config(|| {
+            let mut app = two_sessions();
+            select(&mut app, "a1");
+            let waiting = app.requests.pending.len();
+            let out = pick_feat(&mut app);
+            assert_eq!(sent_move(&out), None, "held, not sent");
+            let Some(Overlay::Confirm(dialog)) = &app.modals.overlay else {
+                panic!("the move asks first");
+            };
+            assert_eq!(dialog.title, "Shared worktree");
+            assert!(
+                dialog.message.starts_with("polish-nav is live in feat."),
+                "{}",
+                dialog.message
+            );
+            assert_eq!(app.chrome.flash, None, "no 'moved' while it is asked about");
+            let out = key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+            assert_eq!(sent_move(&out), None);
+            assert!(app.modals.overlay.is_none());
+            assert_eq!(app.requests.pending.len(), waiting, "nothing left waiting");
+            assert_eq!(
+                app.chrome.flash.as_deref(),
+                Some("not moved: feat already has a live session")
+            );
+
+            pick_feat(&mut app);
+            let out = key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert_eq!(sent_move(&out), Some(("a1".into(), "w2".into())));
+            assert!(app.modals.overlay.is_none());
+            assert!(app.requests.shared_hold.is_none());
+            assert!(
+                app.chrome
+                    .flash
+                    .as_deref()
+                    .is_some_and(|f| f.contains("to feat")),
+                "the move's own flash once it is sent: {:?}",
+                app.chrome.flash
+            );
+
+            // The root checkout, with a live session of its own, is not.
+            let mut app = two_sessions();
+            select(&mut app, "a2");
+            key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(sent_move(&out), Some(("a2".into(), "w1".into())));
+            assert!(app.modals.overlay.is_none());
+        });
+        with_config_json(r#"{"confirm_shared_worktree": false}"#, || {
+            let mut app = two_sessions();
+            select(&mut app, "a1");
+            let out = pick_feat(&mut app);
+            assert_eq!(
+                sent_move(&out),
+                Some(("a1".into(), "w2".into())),
+                "sent at once"
+            );
+            assert!(app.modals.overlay.is_none());
+        });
+    }
+
     /// `m` on a card lists the project's other checkouts, then the other
     /// projects', and a pick moves the session there; a mid-turn one is
     /// told it follows when its turn ends.
@@ -12806,46 +12897,55 @@ mod tests {
     /// its rule.
     #[test]
     fn a_drop_under_the_last_band_moves_there_without_asking_when_confirm_is_off() {
-        with_config_json(r#"{"confirm_drag_move": false}"#, || {
-            let mut app = two_sessions();
-            draw_at(&mut app, 130, 50);
-            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            draw_at(&mut app, 130, 50);
-            let (x, y) = row_cell(&app, 1);
-            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-            draw_at(&mut app, 130, 50);
-            let bands = crate::launcher::bands(&app);
-            let (last, foot) = app
-                .chrome
-                .hits
-                .iter()
-                .filter_map(|(r, hit)| match hit {
-                    HitTarget::LauncherBand(i) => Some((*i, r.y + r.height)),
-                    _ => None,
-                })
-                .max_by_key(|(_, foot)| *foot)
-                .expect("bands were drawn");
-            assert_eq!(bands[last].worktree.0, "w2", "feat's band is last");
-            assert!(matches!(
-                app.hit_at(x, foot + 1),
-                Some(HitTarget::PanelBg(Focus::Sessions))
-            ));
+        // feat already has a live session; that question is
+        // `a_move_into_a_worktree_with_a_live_session_asks_first`'s.
+        with_config_json(
+            r#"{"confirm_drag_move": false, "confirm_shared_worktree": false}"#,
+            || {
+                let mut app = two_sessions();
+                draw_at(&mut app, 130, 50);
+                key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                draw_at(&mut app, 130, 50);
+                let (x, y) = row_cell(&app, 1);
+                mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+                draw_at(&mut app, 130, 50);
+                let bands = crate::launcher::bands(&app);
+                let (last, foot) = app
+                    .chrome
+                    .hits
+                    .iter()
+                    .filter_map(|(r, hit)| match hit {
+                        HitTarget::LauncherBand(i) => Some((*i, r.y + r.height)),
+                        _ => None,
+                    })
+                    .max_by_key(|(_, foot)| *foot)
+                    .expect("bands were drawn");
+                assert_eq!(bands[last].worktree.0, "w2", "feat's band is last");
+                assert!(matches!(
+                    app.hit_at(x, foot + 1),
+                    Some(HitTarget::PanelBg(Focus::Sessions))
+                ));
 
-            let mut out = Vec::new();
-            for kind in [
-                MouseEventKind::Drag(MouseButton::Left),
-                MouseEventKind::Up(MouseButton::Left),
-            ] {
-                let event = MouseEvent {
-                    kind,
-                    column: x,
-                    row: foot + 1,
-                    modifiers: KeyModifiers::NONE,
-                };
-                handle_terminal_event(&mut app, crossterm::event::Event::Mouse(event), &mut out);
-            }
-            assert!(app.modals.overlay.is_none(), "no confirm");
-            assert_eq!(sent_move(&out), Some(("a1".into(), "w2".into())));
-        });
+                let mut out = Vec::new();
+                for kind in [
+                    MouseEventKind::Drag(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    let event = MouseEvent {
+                        kind,
+                        column: x,
+                        row: foot + 1,
+                        modifiers: KeyModifiers::NONE,
+                    };
+                    handle_terminal_event(
+                        &mut app,
+                        crossterm::event::Event::Mouse(event),
+                        &mut out,
+                    );
+                }
+                assert!(app.modals.overlay.is_none(), "no confirm");
+                assert_eq!(sent_move(&out), Some(("a1".into(), "w2".into())));
+            },
+        );
     }
 }
