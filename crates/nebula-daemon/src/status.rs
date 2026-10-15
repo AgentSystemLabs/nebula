@@ -402,7 +402,13 @@ impl AgentStatusMachine {
                     // Deferred by 6 s on Claude's side, so it is never the
                     // first word of a dialog nebula can see — and it can be
                     // the last word of one the user has already closed.
-                    Some("permission_prompt") => {
+                    // An MCP server asking for input (`elicitation_dialog`,
+                    // or `elicitation_url_dialog` for one sent to a web
+                    // page) is a dialog inside the foreground tool call no
+                    // other hook reports, so its notification is the only
+                    // word of it; that call's PostToolUse is the answer, as
+                    // for a permission prompt.
+                    Some("permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog") => {
                         if !self.late_prompt_echo(now) {
                             self.wait_on(Origin::Foreground, false, &mut effects);
                         }
@@ -983,6 +989,53 @@ mod tests {
             let fx = m.handle(tool(name, None, true), Some("s1"), now);
             assert_eq!(status_of(&fx), Some(AgentStatus::Running), "{name}");
         }
+    }
+
+    #[test]
+    fn an_mcp_server_asking_for_input_waits_on_you() {
+        // The reported bug: an MCP tool's "requests your input" dialog
+        // (a destructive SQL confirmation) left the row running.
+        for kind in ["elicitation_dialog", "elicitation_url_dialog"] {
+            let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+            let now = t0();
+            m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+            m.handle(
+                tool("mcp__supabase__execute_sql", None, false),
+                Some("s1"),
+                now,
+            );
+            let fx = m.handle(
+                HookEvent::Notification {
+                    notification_type: Some(kind.into()),
+                },
+                Some("s1"),
+                now + Duration::from_secs(1),
+            );
+            assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback), "{kind}");
+            // Accepting lets the call finish: its PostToolUse is the answer.
+            let fx = m.handle(
+                tool("mcp__supabase__execute_sql", None, true),
+                Some("s1"),
+                now + Duration::from_secs(20),
+            );
+            assert_eq!(status_of(&fx), Some(AgentStatus::Running), "{kind}");
+        }
+    }
+
+    #[test]
+    fn other_notifications_leave_the_status_alone() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        let fx = m.handle(
+            HookEvent::Notification {
+                notification_type: Some("auth_success".into()),
+            },
+            Some("s1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), None);
+        assert_eq!(m.status(), AgentStatus::Running);
     }
 
     #[test]
