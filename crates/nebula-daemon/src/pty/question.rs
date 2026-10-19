@@ -30,6 +30,7 @@
 //! screen once the dialog is answered (verified on agy 1.4.2 against
 //! captured PTY output; the headlines are agy's own strings).
 
+use nebula_core::AgentKind;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,15 @@ pub enum DialogKind {
 }
 
 impl DialogKind {
+    /// The screen-scraped dialog this harness draws without a hook.
+    pub fn for_agent(kind: AgentKind) -> Option<Self> {
+        match kind {
+            AgentKind::Cursor => Some(Self::CursorQuestion),
+            AgentKind::Antigravity => Some(Self::AntigravityPermission),
+            _ => None,
+        }
+    }
+
     /// Marker groups: the dialog is open while every string of any one
     /// group is on screen, in order and each within [`MAX_DIALOG_ROWS`] of
     /// the one before — a dialog draws its legend just under its headline,

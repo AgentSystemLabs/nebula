@@ -2990,6 +2990,81 @@ mod tests {
             .unwrap();
     }
 
+    /// A handoff from before dialog scanning recovers the scanner from
+    /// the agent row; a carried choice still wins over that row.
+    #[tokio::test]
+    async fn adopted_sessions_recover_missing_question_scanners() {
+        use crate::pty::question::DialogKind;
+
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", "/tmp", true);
+        for (index, (kind, carried_kind, expected)) in AgentKind::ALL
+            .iter()
+            .map(|&kind| {
+                let expected = match kind {
+                    AgentKind::Cursor => Some(DialogKind::CursorQuestion),
+                    AgentKind::Antigravity => Some(DialogKind::AntigravityPermission),
+                    _ => None,
+                };
+                (kind, None, expected)
+            })
+            .chain([(
+                AgentKind::Antigravity,
+                Some(DialogKind::CursorQuestion),
+                Some(DialogKind::CursorQuestion),
+            )])
+            .enumerate()
+        {
+            let id = format!("restored-{index}");
+            seed_agent(&daemon, &id, "w", None);
+            let mut agent = daemon
+                .store
+                .get_agent(&AgentId(id.clone()))
+                .unwrap()
+                .unwrap();
+            daemon.store.delete_agent(&agent.id).unwrap();
+            agent.kind = kind;
+            daemon.store.insert_agent(&agent).unwrap();
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .unwrap();
+            // Give adopt its own fd, as exec would; the slave stays open
+            // so the reader waits while we inspect the restored session.
+            let fd = unsafe { nix::libc::dup(pair.master.as_raw_fd().unwrap()) };
+            assert!(fd >= 0);
+            let sref = SessionRef::Agent(agent.id);
+            assert_eq!(
+                daemon.adopt_sessions(vec![crate::handoff::CarriedSession {
+                    pty: crate::pty::Carried {
+                        sref: sref.clone(),
+                        master_fd: fd,
+                        pid: std::process::id(),
+                        size: (120, 40),
+                        ring_start_seq: 0,
+                        ring: Vec::new(),
+                        kitty_stack: Vec::new(),
+                        bracketed_paste: false,
+                        progress_busy: None,
+                        title: None,
+                        cloud_scan: false,
+                        question_scan: carried_kind,
+                    },
+                    spare: false,
+                    launching: false,
+                }]),
+                1
+            );
+            let session = daemon.session(&sref).unwrap();
+            assert_eq!(
+                session.carry().unwrap().unwrap().question_scan,
+                expected,
+                "{kind:?} with carried {carried_kind:?}"
+            );
+            session.uncarry();
+        }
+    }
+
     fn agent_worktree(daemon: &Daemon, id: &str) -> String {
         daemon
             .store

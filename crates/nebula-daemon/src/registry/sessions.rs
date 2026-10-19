@@ -137,12 +137,22 @@ impl Daemon {
     pub fn adopt_sessions(self: &Arc<Self>, carried: Vec<crate::handoff::CarriedSession>) -> usize {
         let mut adopted = 0;
         for crate::handoff::CarriedSession {
-            pty,
+            mut pty,
             spare,
             launching,
         } in carried
         {
             let sref = pty.sref.clone();
+            // An older image may not have armed the harness's scanner:
+            // recover it from the row before adopt seeds it from the ring.
+            if pty.question_scan.is_none() {
+                if let SessionRef::Agent(id) = &sref {
+                    pty.question_scan =
+                        self.store.get_agent(id).ok().flatten().and_then(|agent| {
+                            crate::pty::question::DialogKind::for_agent(agent.kind)
+                        });
+                }
+            }
             match PtySession::adopt(pty) {
                 Ok(session) if spare => session.kill(),
                 Ok(session) => {
