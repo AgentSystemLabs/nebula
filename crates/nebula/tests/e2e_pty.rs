@@ -3370,7 +3370,7 @@ async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
                 "fi\n",
                 "claude() {{\n",
                 "  if [ -t 0 ]; then tty=tty; else tty=notty; fi\n",
-                "  echo \"claude $tty stdin=$(tty) pane=${NEBULA_PANE_TTY-unset} $*\" > '{d}/claude-ran'\n",
+                "  echo \"claude $tty stdin=$(tty) pane=${{NEBULA_PANE_TTY-unset}} $*\" > '{d}/claude-ran'\n",
                 "  sleep 600\n",
                 "}}\n",
             ),
