@@ -1081,14 +1081,48 @@ async fn hook_post_from_agent_pty_drives_status() {
 /// hook involved at all.
 #[tokio::test]
 async fn pty_progress_sequence_drives_status_without_any_hook() {
+    pty_progress_sequence_drives_status_without_any_hook_for(
+        AgentKind::Claude,
+        "cancelled",
+        |busy| {
+            let state = if busy { "3" } else { "0" };
+            format!("printf '\\033]9;4;{state};\\007'\n").into_bytes()
+        },
+    )
+    .await;
+}
+
+/// Codex has the same hookless failure mode when hooks are unavailable or not
+/// trusted yet, but it advertises terminal lifecycle with OSC 7501 instead of
+/// OSC 9;4. Those bytes must drive the same status path.
+#[tokio::test]
+async fn pty_codex_lifecycle_drives_status_without_any_hook() {
+    pty_progress_sequence_drives_status_without_any_hook_for(AgentKind::Codex, "codexed", |busy| {
+        let state = if busy { "working" } else { "idle" };
+        format!("printf '\\033]7501;state={state}:app=codex\\007'\n").into_bytes()
+    })
+    .await;
+}
+
+async fn pty_progress_sequence_drives_status_without_any_hook_for(
+    kind: AgentKind,
+    name: &str,
+    emit: impl Fn(bool) -> Vec<u8>,
+) {
     let env = TestEnv::new();
     let repo = env.make_repo();
-    let mut daemon = env.spawn_daemon();
+    let codex_home = env.tmp.path().join("codex-home");
+    let mut daemon = if kind == AgentKind::Codex {
+        std::fs::create_dir_all(&codex_home).unwrap();
+        env.spawn_daemon_with("/bin/sh", &[("CODEX_HOME", codex_home.to_str().unwrap())])
+    } else {
+        env.spawn_daemon()
+    };
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     let worktree = add_project_get_main_worktree(&mut c, &repo).await;
-    let agent_id = create_agent_get_id(&mut c, &worktree.id, "cancelled", 2).await;
+    let agent_id = create_agent_get_id_of_kind(&mut c, &worktree.id, name, kind, 2).await;
 
     let sref = SessionRef::Agent(agent_id.clone());
     write_frame(
@@ -1107,14 +1141,12 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
     // The command text is echoed back by the tty, which is the point: only
     // the real escape bytes may move the status, never a mention of them.
     // `\ddd` octal, not `\e` — POSIX printf, so this works under dash too.
-    let emit = |state: &str| format!("printf '\\033]9;4;{state};\\007'\n").into_bytes();
-
-    // Turn starts: progress goes indeterminate → running.
+    // Turn starts: progress/lifecycle goes busy → running.
     write_frame(
         &mut c,
         &ClientRequest::Input {
             session: sref.clone(),
-            data: emit("3"),
+            data: emit(true),
         },
     )
     .await
@@ -1127,12 +1159,13 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
     })
     .await;
 
-    // User hits escape: the progress bar clears, and nothing else happens.
+    // User hits escape or the response finishes: the terminal reports idle,
+    // and nothing else happens.
     write_frame(
         &mut c,
         &ClientRequest::Input {
             session: sref.clone(),
-            data: emit("0"),
+            data: emit(false),
         },
     )
     .await
@@ -3036,13 +3069,23 @@ async fn create_agent_get_id(
     name: &str,
     req_id: u64,
 ) -> nebula_core::AgentId {
+    create_agent_get_id_of_kind(c, worktree, name, AgentKind::Claude, req_id).await
+}
+
+async fn create_agent_get_id_of_kind(
+    c: &mut UnixStream,
+    worktree: &nebula_core::WorktreeId,
+    name: &str,
+    kind: AgentKind,
+    req_id: u64,
+) -> nebula_core::AgentId {
     write_frame(
         c,
         &ClientRequest::CreateAgent {
             req_id,
             worktree: worktree.clone(),
             name: name.into(),
-            kind: AgentKind::Claude,
+            kind,
             custom_harness: None,
             model: None,
             effort: None,

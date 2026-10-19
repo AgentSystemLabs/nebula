@@ -155,10 +155,12 @@
   "Hooks need review" prompt and every later worktree is silent). Groups are tagged `_nebulaManaged`,
   user hooks preserved, rebuilt each spawn. Each hook is a fail-soft curl to the daemon's loopback HTTP
   endpoint, authenticated with a per-boot bearer token injected into the agent's environment only.
-- **…plus the progress bar, for the cancel no hook reports.** Escaping out of a turn fires no `Stop` and
-  suppresses the idle notification that normally un-sticks one, so nebula also reads the CLI's terminal
-  progress-bar escapes (OSC 9;4) straight off the PTY. That signal survives a cancel, and it stays busy
-  while a permission prompt is open — so it can't mark an agent done while it is actually waiting on you.
+- **…plus terminal lifecycle signals, for the turn ends no hook reports.** Escaping out of a turn fires no
+  `Stop` and suppresses the idle notification that normally un-sticks one, so nebula also reads the CLI's
+  own terminal status escapes straight off the PTY: Claude's OSC 9;4 progress bar and Codex's OSC 7501
+  `state=working|blocked|idle:app=codex` lifecycle messages. Those signals survive a cancel or a missing
+  hook approval, and they stay busy while a permission prompt is open — so they can't mark an agent done
+  while it is actually waiting on you.
 - **…and the IDLE PROMPT, which is a hold rather than a finish.** Claude posts a
   `Notification{idle_prompt}` after roughly 60 s parked at the input box with nobody touching the
   keyboard, and that is the notification which un-sticks a turn that ended without a `Stop` — a

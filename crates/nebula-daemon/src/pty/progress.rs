@@ -1,4 +1,4 @@
-//! OSC 9;4 progress scanner — the busy/idle signal nebula reads straight
+//! Terminal progress scanner — the busy/idle signal nebula reads straight
 //! off the agent's output stream.
 //!
 //! Why this exists: Claude Code fires no hook when the user cancels a turn
@@ -25,16 +25,21 @@
 //! the idle glyph while the prompt waits, but the progress state does not, so
 //! this signal cannot green out an agent that genuinely needs feedback.
 //!
-//! States follow the ConEmu/Windows-Terminal convention: 0 removes the
-//! progress bar, 1/2/3/4 are normal/error/indeterminate/paused. Anything
-//! that isn't 0 counts as busy.
+//! Claude Code uses OSC 9;4, following the ConEmu/Windows-Terminal convention:
+//! 0 removes the progress bar, 1/2/3/4 are normal/error/indeterminate/paused.
+//! Anything that isn't 0 counts as busy.
+//!
+//! Codex uses OSC 7501 lifecycle messages:
+//! `state=working:app=codex` and `state=blocked:app=codex` are busy;
+//! `state=idle:app=codex` is idle. Cleanup/unknown states are ignored.
 
 use super::osc::OscFramer;
 
-/// Longest OSC payload we will buffer. `9;4;<state>;<pct>` is far shorter;
-/// anything longer (a title, a hyperlink, a base64 image) is poisoned and
-/// skipped without allocating.
-const MAX_OSC: usize = 24;
+/// Longest OSC payload we will buffer. Progress payloads are short
+/// (`9;4;<state>;<pct>` or `7501;state=working:app=codex`); anything longer
+/// (a title, a hyperlink, a base64 image) is poisoned and skipped without
+/// allocating.
+const MAX_OSC: usize = 64;
 
 /// Tracks the child's advertised progress state across chunk boundaries.
 #[derive(Debug)]
@@ -94,9 +99,14 @@ impl ProgressScanner {
     }
 
     fn dispatch(&mut self, payload: Vec<u8>) {
-        let Some(rest) = payload.strip_prefix(b"9;4;") else {
-            return;
-        };
+        if let Some(rest) = payload.strip_prefix(b"9;4;") {
+            self.dispatch_osc_9_4(rest);
+        } else if let Some(rest) = payload.strip_prefix(b"7501;") {
+            self.dispatch_codex_lifecycle(rest);
+        }
+    }
+
+    fn dispatch_osc_9_4(&mut self, rest: &[u8]) {
         // `9;4;<state>` or `9;4;<state>;<percent>`; an empty state is a no-op
         // rather than a guess.
         let state = rest.split(|&b| b == b';').next().unwrap_or(b"");
@@ -106,13 +116,35 @@ impl ProgressScanner {
         let busy = state.iter().any(|&b| b != b'0');
         self.busy = Some(busy);
     }
+
+    fn dispatch_codex_lifecycle(&mut self, rest: &[u8]) {
+        let mut state = None;
+        let mut app_is_codex = false;
+        for part in rest.split(|&b| b == b':') {
+            if let Some(value) = part.strip_prefix(b"state=") {
+                state = Some(value);
+            } else if let Some(value) = part.strip_prefix(b"app=") {
+                app_is_codex = value == b"codex";
+            }
+        }
+        if !app_is_codex {
+            return;
+        }
+        match state {
+            Some(b"working" | b"blocked") => self.busy = Some(true),
+            Some(b"idle") => self.busy = Some(false),
+            _ => {}
+        }
+    }
 }
 
-/// Could `buf` still grow into a `9;4;…` payload?
+/// Could `buf` still grow into one of the progress payloads?
 fn prefix_possible(buf: &[u8]) -> bool {
-    const PREFIX: &[u8] = b"9;4;";
-    let n = buf.len().min(PREFIX.len());
-    buf[..n] == PREFIX[..n]
+    const PREFIXES: [&[u8]; 2] = [b"9;4;", b"7501;"];
+    PREFIXES.iter().any(|prefix| {
+        let n = buf.len().min(prefix.len());
+        buf[..n] == prefix[..n]
+    })
 }
 
 #[cfg(test)]
@@ -173,6 +205,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_lifecycle_reports_busy_and_idle_without_hooks() {
+        assert_eq!(
+            scan(&[
+                b"\x1b]7501;state=working:app=codex\x07",
+                b"\x1b]7501;state=blocked:app=codex\x07",
+                b"\x1b]7501;state=idle:app=codex\x07",
+            ]),
+            vec![Some(true), None, Some(false)]
+        );
+    }
+
+    #[test]
+    fn codex_lifecycle_survives_chunk_boundaries_and_st() {
+        let full = b"\x1b]7501;state=idle:app=codex\x1b\\";
+        for split in 0..full.len() {
+            let mut s = ProgressScanner::new();
+            let a = s.feed(&full[..split]);
+            let b = s.feed(&full[split..]);
+            assert_eq!(
+                (a, b),
+                (None, Some(false)),
+                "split at {split} lost the sequence"
+            );
+        }
+    }
+
+    #[test]
     fn ignores_other_oscs_and_malformed_payloads() {
         let mut s = ProgressScanner::new();
         // Claude interleaves title updates with progress on every frame.
@@ -181,6 +240,21 @@ mod tests {
         assert_eq!(s.feed(b"\x1b]9;5;\x07"), None, "9;5 is not progress");
         assert_eq!(s.feed(b"\x1b]9;4;\x07"), None, "empty state is not a guess");
         assert_eq!(s.feed(b"\x1b]9;4;x;\x07"), None, "non-numeric state");
+        assert_eq!(
+            s.feed(b"\x1b]7501;state=working:app=other\x07"),
+            None,
+            "only codex lifecycle messages count"
+        );
+        assert_eq!(
+            s.feed(b"\x1b]7501;state=clear:app=codex\x07"),
+            None,
+            "cleanup is not turn completion"
+        );
+        assert_eq!(
+            s.feed(b"\x1b]7501;state=surprised:app=codex\x07"),
+            None,
+            "unknown codex states are ignored"
+        );
         assert!(s.busy().is_none(), "nothing above should have set a state");
         assert_eq!(s.feed(b"\x1b]9;4;3;\x07"), Some(true));
     }
@@ -213,6 +287,7 @@ mod tests {
             s.feed(b"9;4;0; is just text\r\n\x1b[1;32mgreen\x1b[0m"),
             None
         );
+        assert_eq!(s.feed(b"7501;state=idle:app=codex is just text\r\n"), None);
         assert!(s.busy().is_none());
     }
 }
