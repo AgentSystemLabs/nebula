@@ -137,6 +137,12 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        Some(nebula_core::harness::HarnessCatalog::Antigravity) => {
+            crate::antigravity_catalogue::models()
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        }
         None => headed(
             descriptor
                 .model
@@ -2009,6 +2015,9 @@ impl Config {
                 Some(nebula_core::harness::HarnessCatalog::Cursor) => format!(
                     "Default model family for new {label} sessions; rows follow cursor-agent --list-models"
                 ),
+                Some(nebula_core::harness::HarnessCatalog::Antigravity) => {
+                    format!("Default model for new {label} sessions; rows follow agy models")
+                }
                 None => format!("Default model for new {label} sessions (default = CLI's pick)"),
             },
             HarnessField::Effort => {
@@ -4748,7 +4757,8 @@ mod tests {
                 AgentKind::Pi,
                 AgentKind::Muse,
                 AgentKind::Grok,
-                AgentKind::OpenCode
+                AgentKind::OpenCode,
+                AgentKind::Antigravity
             ],
             "the disabled kind drops out, order kept"
         );
@@ -4776,10 +4786,56 @@ mod tests {
 
         // Every kind off is representable (a hand edit), and reads as empty.
         let cfg: Config = serde_json::from_str(
-            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false,"muse_enabled":false,"opencode_enabled":false,"harnesses":{"grok":{"enabled":false}}}"#,
+            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false,"muse_enabled":false,"opencode_enabled":false,"harnesses":{"grok":{"enabled":false},"antigravity":{"enabled":false}}}"#,
         )
         .unwrap();
         assert!(cfg.enabled_kinds().is_empty());
+    }
+
+    #[test]
+    fn antigravity_is_builtin_and_settings_persist_without_legacy_keys() {
+        let descriptor = nebula_core::harness::builtin("antigravity").unwrap();
+        assert_eq!(
+            model_choices_in(&descriptor),
+            crate::antigravity_catalogue::models()
+        );
+        assert_eq!(
+            effort_choices_in(&descriptor, Some("gemini-4-argon-high")),
+            ["default", "low", "medium", "high", "xhigh", "max"]
+        );
+        let mut cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg
+            .offered_harnesses()
+            .contains(&(AgentKind::Antigravity, None)));
+        assert_eq!(
+            AgentKind::parse("antigravity"),
+            Some(AgentKind::Antigravity)
+        );
+        assert_eq!(AgentKind::Antigravity.cli_program(), "agy");
+        cfg.set_harness_enabled("antigravity", false);
+        cfg.set_harness_model("antigravity", "model-id".into());
+        cfg.set_harness_effort("antigravity", "high".into());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert!(!loaded.kind_enabled(AgentKind::Antigravity));
+        assert_eq!(
+            loaded.default_model(AgentKind::Antigravity).as_deref(),
+            Some("model-id")
+        );
+        assert_eq!(
+            loaded.default_effort(AgentKind::Antigravity).as_deref(),
+            Some("high")
+        );
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved["harnesses"]["antigravity"]["enabled"], false);
+        assert_eq!(
+            saved["harnesses"]["antigravity"]["model_default"],
+            "model-id"
+        );
+        assert_eq!(saved["harnesses"]["antigravity"]["effort_default"], "high");
     }
 
     #[test]
@@ -4824,6 +4880,7 @@ mod tests {
                 (AgentKind::Muse, None),
                 (AgentKind::Grok, None),
                 (AgentKind::OpenCode, None),
+                (AgentKind::Antigravity, None),
             ]
         );
 
@@ -4838,8 +4895,8 @@ mod tests {
         )
         .unwrap();
         let offered = cfg.offered_harnesses();
-        assert_eq!(offered.len(), 8);
-        assert_eq!(offered[7], (AgentKind::Custom, Some("agy".into())));
+        assert_eq!(offered.len(), AgentKind::ALL.len());
+        assert_eq!(offered[8], (AgentKind::Custom, Some("agy".into())));
         let rows = cfg.agent_rows();
         assert!(rows.contains(&("off".to_string(), HarnessField::Enabled)));
         assert!(rows.contains(&("broken".to_string(), HarnessField::Enabled)));
@@ -4871,8 +4928,9 @@ mod tests {
         } else {
             std::env::remove_var("PATH");
         }
-        assert_eq!(offered.len(), 1);
-        assert_eq!(offered[0], (AgentKind::Custom, Some("agy".into())));
+        assert_eq!(offered.len(), 2);
+        assert_eq!(offered[0], (AgentKind::Antigravity, None));
+        assert_eq!(offered[1], (AgentKind::Custom, Some("agy".into())));
     }
 
     /// Safety: one broken `harnesses` entry never takes the rest down.
@@ -5349,6 +5407,14 @@ mod tests {
                         "OpenCode".to_string(),
                         vec!["Enabled".to_string(), "Model".to_string()]
                     ),
+                    (
+                        "Antigravity".to_string(),
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
+                    ),
                 ]
             );
 
@@ -5404,6 +5470,7 @@ mod tests {
                         "Muse",
                         "Grok Build",
                         "OpenCode",
+                        "Antigravity",
                         "agy"
                     ]
                 );

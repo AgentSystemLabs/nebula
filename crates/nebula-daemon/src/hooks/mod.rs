@@ -1,6 +1,7 @@
 //! Agent-CLI hook receiver: a loopback-only HTTP endpoint the shell hook
 //! one-liners POST to (`/api/hooks/claude`, `/api/hooks/codex`,
-//! `/api/hooks/cursor`, `/api/hooks/pi` and `/api/hooks/opencode`). Codex
+//! `/api/hooks/cursor`, `/api/hooks/pi`, `/api/hooks/opencode` and
+//! `/api/hooks/antigravity`). Codex
 //! mirrors Claude's hook
 //! events and payload shape; cursor speaks its own dialect, but its
 //! installer translates event names into the `hookEvent` query param and
@@ -8,7 +9,10 @@
 //! `workspace_roots`); pi has no shell hooks at all — its managed extension
 //! (`pi_extension.rs`) maps pi's events onto the same names and POSTs
 //! Claude-shaped payloads, and so does OpenCode's managed plugin
-//! (`opencode_plugin.rs`) — so one handler serves all five. Fail-soft on
+//! (`opencode_plugin.rs`). Antigravity's managed plugin
+//! (`antigravity_plugin.rs`) posts agy's own camelCase payloads under agy's
+//! event names, translated here, and reads an agy-shaped JSON reply on
+//! every event — so one handler serves all six. Fail-soft on
 //! both sides — a malformed payload still gets a 200 so a broken hook never
 //! faults the user's agent turn.
 //!
@@ -17,6 +21,7 @@
 //! while a session is untitled, and a `sessionTitle` whenever the row's
 //! name is not the one Claude holds (CLAUDE TITLE SYNC, `session_title.rs`).
 
+pub mod antigravity_plugin;
 pub mod installer;
 pub mod opencode_plugin;
 pub mod pi_extension;
@@ -90,6 +95,10 @@ enum HookDialect {
     /// Cursor: every hook answers with its own gating JSON and drops the
     /// body, so the `{"ok": …}` diagnostics can stay.
     Plain,
+    /// Antigravity: every hook prints the body as its JSON reply, so every
+    /// event (auth failure included) answers with an agy-shaped object —
+    /// `{}`, or `injectSteps` where nebula has something to say.
+    AgyJson,
 }
 
 /// Which CLI a route serves. Beyond the dialect, only Claude persists a
@@ -101,6 +110,7 @@ enum HookCli {
     Cursor,
     Pi,
     OpenCode,
+    Antigravity,
 }
 
 impl HookCli {
@@ -110,9 +120,13 @@ impl HookCli {
                 HookDialect::Injectable
             }
             HookCli::Cursor => HookDialect::Plain,
+            HookCli::Antigravity => HookDialect::AgyJson,
         }
     }
 }
+
+/// The empty agy hook reply: no steps to inject, no decision to change.
+pub const AGY_EMPTY: &str = "{}";
 
 #[derive(Clone)]
 pub struct HookEnv {
@@ -163,7 +177,9 @@ pub struct HookPayload {
     /// lives (`<dir>/<session_id>/custom-title.json`).
     pub transcript_path: Option<String>,
     /// Cursor names the resumable chat id `conversation_id` (== its
-    /// `session_id`, but only the alias is guaranteed on every event).
+    /// `session_id`, but only the alias is guaranteed on every event);
+    /// agy sends the `--conversation` id camelCased.
+    #[serde(alias = "conversationId")]
     pub conversation_id: Option<String>,
     pub notification_type: Option<String>,
     pub tool_name: Option<String>,
@@ -173,8 +189,14 @@ pub struct HookPayload {
     pub source: Option<String>,
     pub exit_code: Option<i32>,
     pub cwd: Option<String>,
-    /// Cursor sends no `cwd`; its first workspace root plays the role.
+    /// Cursor sends no `cwd`; its first workspace root plays the role
+    /// (agy's `workspacePaths` likewise).
+    #[serde(alias = "workspacePaths")]
     pub workspace_roots: Option<Vec<String>>,
+    /// agy's model-call counter within a turn: 0 on a turn's first
+    /// PreInvocation, which is the closest agy comes to a prompt submit.
+    #[serde(rename = "invocationNum")]
+    pub invocation_num: Option<u64>,
 }
 
 impl HookPayload {
@@ -234,6 +256,35 @@ pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent>
     })
 }
 
+/// agy's event name, as the daemon's: a turn's first model call stands in
+/// for the prompt submit agy has no hook for (`invocationNum` restarts at
+/// 0 every turn); its later calls carry nothing the status machine reads.
+fn antigravity_event_name<'a>(hook_event: &'a str, payload: &HookPayload) -> Option<&'a str> {
+    match hook_event {
+        "PreInvocation" => (payload.invocation_num.unwrap_or(0) == 0).then_some("UserPromptSubmit"),
+        "SessionStart" | "Stop" => Some(hook_event),
+        _ => None,
+    }
+}
+
+/// The agy reply for `event`: nebula's guidance as a persistent system
+/// message when a conversation starts (agy has no system-prompt flag, and
+/// a resume fires no SessionStart — the message is already in the
+/// conversation it resumes), the AUTO-TITLE INSTRUCTION as a one-turn
+/// message while the row is untitled, else nothing.
+fn antigravity_reply(event: &HookEvent, auto_title_pending: bool) -> String {
+    let step = match event {
+        HookEvent::SessionStart { .. } => serde_json::json!({
+            "systemMessage": { "systemMessage": crate::registry::NEBULA_GUIDANCE.join("\n\n") }
+        }),
+        HookEvent::UserPromptSubmit if auto_title_pending => {
+            serde_json::json!({ "ephemeralMessage": AUTO_TITLE_INSTRUCTION })
+        }
+        _ => return AGY_EMPTY.to_string(),
+    };
+    serde_json::json!({ "injectSteps": [step] }).to_string()
+}
+
 /// A hook receiver an earlier image of the daemon was serving: its
 /// listening socket, open across the exec, and the token every live agent
 /// already carries in its environment.
@@ -283,6 +334,10 @@ pub async fn start_hook_server(
         .route("/api/hooks/cursor", post(receive_cursor_hook))
         .route("/api/hooks/pi", post(receive_pi_hook))
         .route("/api/hooks/opencode", post(receive_opencode_hook))
+        .route(
+            &format!("/api/hooks/{}", antigravity_plugin::ENDPOINT),
+            post(receive_antigravity_hook),
+        )
         .with_state(state);
 
     tokio::spawn(async move {
@@ -358,6 +413,17 @@ async fn receive_opencode_hook(
     receive_hook(HookCli::OpenCode, state, query, headers, body).await
 }
 
+/// `/api/hooks/antigravity`: agy's managed plugin posts agy payloads under
+/// agy's event names and prints this body as the hook's JSON reply.
+async fn receive_antigravity_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Antigravity, state, query, headers, body).await
+}
+
 async fn receive_hook(
     cli: HookCli,
     state: Arc<HookServerState>,
@@ -369,8 +435,11 @@ async fn receive_hook(
     // outcome (auth failure included) must answer with empty-or-instruction.
     let injectable =
         cli.dialect() == HookDialect::Injectable && query.hook_event == "UserPromptSubmit";
+    let agy = cli.dialect() == HookDialect::AgyJson;
     let quiet_or = |status: StatusCode, diag: &str| {
-        let body = if injectable {
+        let body = if agy {
+            AGY_EMPTY.to_string()
+        } else if injectable {
             String::new()
         } else {
             diag.to_string()
@@ -390,7 +459,11 @@ async fn receive_hook(
 
     // Parse failures still 200 — never fault a hook.
     let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
-    let Some(event) = parse_event(&query.hook_event, &payload) else {
+    let hook_event = match cli {
+        HookCli::Antigravity => antigravity_event_name(&query.hook_event, &payload),
+        _ => Some(query.hook_event.as_str()),
+    };
+    let Some(event) = hook_event.and_then(|name| parse_event(name, &payload)) else {
         return quiet_or(StatusCode::OK, HOOK_NOT_OK);
     };
     let agent_id = AgentId(query.agent_id.clone());
@@ -406,7 +479,11 @@ async fn receive_hook(
             payload.transcript_path.as_deref(),
             payload.session_id.as_deref(),
         ),
-        HookCli::Codex | HookCli::Cursor | HookCli::Pi | HookCli::OpenCode => None,
+        HookCli::Codex
+        | HookCli::Cursor
+        | HookCli::Pi
+        | HookCli::OpenCode
+        | HookCli::Antigravity => None,
     };
     // The prompt rides only its own event, condensed here so the channel
     // never carries a pasted file whole.
@@ -417,6 +494,15 @@ async fn receive_hook(
             .and_then(crate::prompt_history::condense),
         _ => None,
     };
+    // Built before the event moves into the delivery; read only by agy.
+    let agy_reply = agy.then(|| {
+        let pending = matches!(event, HookEvent::UserPromptSubmit)
+            && state
+                .store
+                .agent_auto_title_pending(&agent_id)
+                .unwrap_or(false);
+        antigravity_reply(&event, pending)
+    });
     let _ = state
         .tx
         .send(HookDelivery {
@@ -428,6 +514,9 @@ async fn receive_hook(
             prompt,
         })
         .await;
+    if let Some(reply) = agy_reply {
+        return (StatusCode::OK, reply);
+    }
 
     if injectable {
         // Prompt submitted on a still-untitled session: hand the CLI the
@@ -453,7 +542,11 @@ async fn receive_hook(
                     // `TitleState::to_push`, which resolves the dialect).
                     s.to_push().map(str::to_string)
                 }),
-            HookCli::Codex | HookCli::Cursor | HookCli::Pi | HookCli::OpenCode => None,
+            HookCli::Codex
+            | HookCli::Cursor
+            | HookCli::Pi
+            | HookCli::OpenCode
+            | HookCli::Antigravity => None,
         };
         return (
             StatusCode::OK,
@@ -724,6 +817,87 @@ mod tests {
         )
         .await;
         assert_eq!((status, body.as_str()), (401, ""));
+    }
+
+    /// agy's route: its event names and camelCase payload translate into
+    /// the daemon's, and every reply — auth failure included — is a JSON
+    /// object agy can read: guidance at SessionStart, the instruction on a
+    /// turn's first PreInvocation while pending, `{}` otherwise.
+    #[tokio::test]
+    async fn antigravity_route_translates_agy_events_and_replies_in_json() {
+        let store = seeded_store();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
+        let post = |agent: &str, event: &str, payload: &str, token: &str| {
+            let path = format!("/api/hooks/antigravity?agentId={agent}&hookEvent={event}");
+            let (payload, token) = (payload.to_string(), token.to_string());
+            async move { http_post(env.port, &path, &token, &payload).await }
+        };
+        let turn_start = r#"{"conversationId":"c1","workspacePaths":["/tmp/p"],"invocationNum":0}"#;
+
+        let (status, body) = post(
+            "pending",
+            "SessionStart",
+            r#"{"conversationId":"c1"}"#,
+            &env.token,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let guidance = reply["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap();
+        assert!(guidance.contains("nebula worktree"), "{guidance}");
+        assert!(guidance.contains("nebula spawn"), "{guidance}");
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.event, HookEvent::SessionStart { source: None });
+        assert_eq!(delivery.session_id.as_deref(), Some("c1"));
+
+        // A turn's first model call is the prompt submit, with the
+        // instruction riding a one-turn message while the row is pending.
+        let (_, body) = post("pending", "PreInvocation", turn_start, &env.token).await;
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            reply["injectSteps"][0]["ephemeralMessage"],
+            AUTO_TITLE_INSTRUCTION
+        );
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
+        assert_eq!(delivery.session_id.as_deref(), Some("c1"));
+        assert_eq!(delivery.cwd.as_deref(), Some("/tmp/p"));
+        let (_, body) = post("titled", "PreInvocation", turn_start, &env.token).await;
+        assert_eq!(body, AGY_EMPTY);
+        assert_eq!(rx.recv().await.unwrap().event, HookEvent::UserPromptSubmit);
+
+        // Later model calls in the turn are not news: `{}`, no delivery.
+        let (_, body) = post(
+            "pending",
+            "PreInvocation",
+            r#"{"conversationId":"c1","invocationNum":3}"#,
+            &env.token,
+        )
+        .await;
+        assert_eq!(body, AGY_EMPTY);
+
+        let (_, body) = post(
+            "pending",
+            "Stop",
+            r#"{"conversationId":"c1","fullyIdle":true}"#,
+            &env.token,
+        )
+        .await;
+        assert_eq!(body, AGY_EMPTY);
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(
+            delivery.event,
+            HookEvent::Stop,
+            "the skipped call never delivered"
+        );
+
+        // Unknown events and bad tokens still answer agy in JSON.
+        let (_, body) = post("pending", "PreToolUse", "{}", &env.token).await;
+        assert_eq!(body, AGY_EMPTY);
+        let (status, body) = post("pending", "Stop", "{}", "wrong-token").await;
+        assert_eq!((status, body.as_str()), (401, AGY_EMPTY));
     }
 
     #[tokio::test]

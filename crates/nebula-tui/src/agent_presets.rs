@@ -299,7 +299,7 @@ mod tests {
             &path,
             r#"[
                 {"name": "reviewer", "kind": "codex", "pinned": true},
-                {"name": "future", "kind": "antigravity", "model": "x"}
+                {"name": "future", "kind": "future-harness", "model": "x"}
             ]"#,
         )
         .unwrap();
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(names, ["reviewer", "scratch", "future"]);
         assert_eq!(saved[0]["pinned"], true);
         assert_eq!(saved[0]["prefix"], "Be strict.");
-        assert_eq!(saved[2]["kind"], "antigravity");
+        assert_eq!(saved[2]["kind"], "future-harness");
         assert_eq!(load_from(&path).len(), 2);
     }
 

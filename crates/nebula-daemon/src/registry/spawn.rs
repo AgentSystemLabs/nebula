@@ -441,6 +441,12 @@ impl Daemon {
             Some(AgentKind::OpenCode) => {
                 hooks::opencode_plugin::install(&hooks::opencode_plugin::opencode_config_dir())
             }
+            // Antigravity reads hooks only from a customization root: one
+            // managed plugin in its global config dir (no trust prompt, and
+            // nothing written into the user's checked-in `.agents/`).
+            Some(AgentKind::Antigravity) => {
+                hooks::antigravity_plugin::install(&hooks::antigravity_plugin::gemini_config_dir())
+            }
             _ => Ok(()),
         };
         if let Err(e) = install_result {

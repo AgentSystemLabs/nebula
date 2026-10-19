@@ -23,7 +23,7 @@ another session to …\", \"open a new session for …\", \"hand this off\"), do
 process yourself. Run this shell command instead, exactly once:\n\n  nebula spawn \"<task>\"\n\nwhere \
 <task> is the work the user wants that session to do, in their own words — the new session opens on \
 it as its first prompt, so make it self-contained. Add `--kind \
-claude|codex|cursor|pi|muse|grok|opencode` only when the user names the harness; otherwise the new \
+claude|codex|cursor|pi|muse|grok|opencode|antigravity` only when the user names the harness; otherwise the new \
 session matches this one. nebula starts it beside this session, in the same worktree, and it shows \
 up in the sessions list on its own. When the user wants that separate new/parallel session on its \
 own branch or worktree (\"start a new session on branch fix-login\", \"spin up an agent in a new \

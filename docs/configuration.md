@@ -122,7 +122,7 @@ behaviors that change how the tree is worked; every switch there is off by defau
 | `muse_model` | string | `"default"` | Agents | Default `--model` for new Muse sessions. Any model id passes through verbatim; `"default"` means don't pass the flag. |
 | `muse_effort` | string | `"default"` | Agents | Reserved until the `muse` CLI documents a reasoning flag. Stored, never sent. |
 | `opencode_model` | string | `"default"` | Agents | Default `--model` for new OpenCode sessions: a `provider/model` id passed verbatim (`opencode models` lists what your machine has credentials for). The overlay lists a few well-known ids (`opencode/big-pickle`, `anthropic/claude-sonnet-5`, …); a hand-edited one passes through. `"default"` means don't pass the flag, so OpenCode opens on its own last-picked model. There is no `opencode_effort`: OpenCode has no effort flag (reasoning is a per-model variant picked inside its TUI), so its Agents section has no Effort row. |
-| `custom_harnesses` | array | `[]` | Agents | Extra CLIs the NEW SESSION PICKER offers after the built-ins, each with its own Agents tab section (Enabled and Model rows). Each entry is `{id, program}` plus options: `label` (picker text, defaults to the id), `enabled` (default `true`), `model` (default `"default"` = the CLI's pick, else passed verbatim), `model_flag` (default `"--model"`), and `hooks` (a built-in dialect the program speaks: `claude`, `codex`, `cursor`, `pi` or `opencode` — with one set the sessions report status, prompts and permission waits exactly like that harness, including title sync and auto-title for `claude`; without one they stay process-based, running while the PTY is live and never waiting-on-you). Ids use lowercase letters, digits and hyphens and must not collide with a built-in. Legacy: new harnesses belong in `harnesses`, where they also gain resume, effort, system-prompt and hook-dialect rows. Invalid entries never launch — the picker hides them and the daemon refuses them with the reason. |
+| `custom_harnesses` | array | `[]` | Agents | Extra CLIs the NEW SESSION PICKER offers after the built-ins, each with its own Agents tab section (Enabled and Model rows). Each entry is `{id, program}` plus options: `label` (picker text, defaults to the id), `enabled` (default `true`), `model` (default `"default"` = the CLI's pick, else passed verbatim), `model_flag` (default `"--model"`), and `hooks` (a built-in dialect the program speaks: `claude`, `codex`, `cursor`, `pi`, `opencode` or `antigravity` — with one set the sessions report status, prompts and permission waits exactly like that harness, including title sync and auto-title for `claude`; without one they stay process-based, running while the PTY is live and never waiting-on-you). Ids use lowercase letters, digits and hyphens and must not collide with a built-in. Legacy: new harnesses belong in `harnesses`, where they also gain resume, effort, system-prompt and hook-dialect rows. Invalid entries never launch — the picker hides them and the daemon refuses them with the reason. |
 | `harnesses` | object | `{}` | Agents | The harness registry: per-harness deltas over the compiled-in known harnesses (Claude, Codex, Cursor, Pi, Muse, Grok Build, OpenCode), and whole new third-party CLIs. The Agents tab grows one section per entry — Enabled, Model, and Effort rows while the harness offers effort — and the `n` picker, `e` presets, spawn, resume and hooks all read the merged rows. A hand edit that breaks one entry refuses its launches with the reason, never the whole file. Run `nebula config harnesses` to print the effective rows to copy from. |
 | `keybindings` | object | `{}` | Hotkeys | KEYMAP overrides, keyed by action id, valued with a comma-separated chord list: `{"git_diff": "ctrl+g, g"}`. An empty string deliberately unbinds; unknown ids are ignored. Only rows that differ from the defaults are written. |
 | `prewarm_agents` | bool | `true` | Sessions | DAEMON-owned PREWARM POOL: keep one booted agent CLI standing by in the selected WORKTREE, so creating a session there adopts it and feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes), and that spare is a real session as far as the CLI is concerned — Claude's own `/list-agents` lists it beside the sessions you made, named after the directory (`my-repo-3f`), and the memory modal (`Shift+M`) groups it under **warm spares**. Off drains the pool on the DAEMON's next sweep (within 30 s). |
@@ -149,7 +149,7 @@ is what bounds the cost of both when they are left on.
 
 ### The harness registry
 
-The seven known harnesses ship compiled in, and `harnesses` edits them per field — or adds a new
+The eight known harnesses ship compiled in, and `harnesses` edits them per field — or adds a new
 CLI outright. Only your deltas go in the file; `nebula config harnesses` prints the effective rows
 to copy from. Disabling one is one line, and adding a CLI is one block: picker, presets, spawn,
 resume, hooks and the Agents tab section all follow, with no rebuild.
@@ -458,3 +458,38 @@ PTY (and scrubbed from plain terminals) so hooks can reach the HOOK RECEIVER —
 set yourself. `NEBULA_IMPORT_BUNDLE` is likewise set *by* `nebula ssh` and `nebula tunnel` in the
 remote command: the SETTINGS BUNDLE the remote nebula merges at startup and removes from its
 environment before it starts anything. For all of these, empty and unset mean the same thing: use the default.
+
+### Antigravity
+
+The built-in `antigravity` harness launches `agy` (the terminal CLI). Its model defaults
+come from the CLI unless overridden. For example:
+
+```json
+{
+  "harnesses": {
+    "antigravity": {
+      "enabled": true,
+      "effort_default": "high"
+    }
+  }
+}
+```
+
+The model picker loads IDs from `agy models`, cached in `antigravity_models.json` in
+Nebula's data directory for one day and refreshed in the background. Until a catalogue
+is available it offers `default`; `model_default` can also be set to a model ID directly.
+The built-in effort choices for agy 1.4.2 are `default`, `low`, `medium`, `high`,
+`xhigh`, and `max`; availability depends on the selected model.
+A custom installation path can be supplied with `program`. Initial tasks use
+`--prompt-interactive`; permissions remain governed by Antigravity's own settings.
+Status comes from a managed agy plugin nebula writes to `~/.gemini/config/plugins/nebula/`
+(global, so no trust prompt and nothing in your checked-in `.agents/`): `PreInvocation`
+at a turn's start marks the session running, `Stop` marks it idle, and the conversation
+ID is captured so a restored session resumes via `--conversation`, never implicit
+`--continue`. The plugin's `SessionStart` reply injects nebula's guidance (worktrees,
+`nebula spawn`, sessions, `nebula open`) as a system message, and a turn's first
+`PreInvocation` carries the auto-title instruction while the session is untitled. The
+hooks are env-guarded, so an `agy` run outside nebula loads the plugin and does nothing.
+agy has no hook for its permission prompts, so an Antigravity session never goes red.
+On resume, `--prompt-interactive` submits the relocation notice to that conversation.
+The built-in ID is `antigravity`, leaving existing custom `agy` entries intact.

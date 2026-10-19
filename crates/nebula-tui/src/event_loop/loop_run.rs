@@ -24,6 +24,7 @@ macro_rules! main_loop_body {
     // The Cursor MODEL / EFFORT lists: cached `cursor-agent --list-models`
     // now, a background refresh when the cache is a day old.
     crate::cursor_catalogue::bootstrap(cfg.cursor_enabled);
+    crate::antigravity_catalogue::bootstrap(cfg.kind_enabled(nebula_core::AgentKind::Antigravity));
     // The Claude MODEL list: Claude Code's own `availableModels` allowlist
     // when its settings carry one, so an org-restricted machine offers the
     // ids the CLI will accept instead of aliases it refuses.

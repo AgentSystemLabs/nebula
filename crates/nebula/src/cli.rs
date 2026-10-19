@@ -177,7 +177,7 @@ pub(crate) enum Command {
         #[arg(required = true, num_args = 1..)]
         task: Vec<String>,
         /// Harness for the new session: claude, codex, cursor, pi, muse,
-        /// grok or opencode.
+        /// grok, opencode or antigravity.
         ///
         /// Defaults to the harness this session is running.
         #[arg(long, value_name = "KIND", value_parser = parse_agent_kind)]

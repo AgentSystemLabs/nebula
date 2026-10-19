@@ -108,14 +108,14 @@ const CURSOR_EVENTS: &[(&str, &str)] = &[
 /// The shell test every hook opens with. Outside nebula (a bare `claude`
 /// in the same checkout) the session env is absent and the hook must be
 /// inert — exit before curl ever runs.
-fn env_guard() -> String {
+pub(super) fn env_guard() -> String {
     format!("[ -z \"${AGENT_ID}\" ] || [ -z \"${API_URL}\" ]")
 }
 
 /// The POST itself, identical for every dialect: bearer auth, the hook's
 /// stdin payload passed straight through, and the agent id plus event
 /// name on the query string so the daemon needs nothing else to route it.
-fn hook_curl(endpoint: &str, event: &str) -> String {
+pub(super) fn hook_curl(endpoint: &str, event: &str) -> String {
     format!(
         "curl -sS -m {HOOK_CURL_TIMEOUT_SECS} -X POST -H \"Authorization: Bearer ${API_TOKEN}\" \
          -H \"Content-Type: application/json\" --data-binary @- \

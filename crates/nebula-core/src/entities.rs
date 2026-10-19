@@ -69,6 +69,8 @@ pub enum AgentKind {
     /// its positional is the project path, and a session resumes by
     /// `--session <id>`.
     OpenCode,
+    /// Google Antigravity terminal CLI (`agy`); process-based status.
+    Antigravity,
     /// A user-defined harness from the `custom_harnesses` registry: the
     /// entry id travels beside the session (see `Agent::custom_harness`),
     /// never in this variant. Launches with the entry's program and model
@@ -81,7 +83,7 @@ impl AgentKind {
     /// boot-time CLI probe warm) and should fail to compile if one is added.
     /// `Custom` rides along: it never launches without its registry entry,
     /// so loops over ALL skip it explicitly where a bare kind is meaningless.
-    pub const ALL: [AgentKind; 8] = [
+    pub const ALL: [AgentKind; 9] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Cursor,
@@ -89,6 +91,7 @@ impl AgentKind {
         AgentKind::Muse,
         AgentKind::Grok,
         AgentKind::OpenCode,
+        AgentKind::Antigravity,
         AgentKind::Custom,
     ];
 
@@ -101,6 +104,7 @@ impl AgentKind {
             AgentKind::Muse => "muse",
             AgentKind::Grok => "grok",
             AgentKind::OpenCode => "opencode",
+            AgentKind::Antigravity => "antigravity",
             AgentKind::Custom => "custom",
         }
     }
@@ -117,6 +121,7 @@ impl AgentKind {
             "muse" => AgentKind::Muse,
             "grok" => AgentKind::Grok,
             "opencode" => AgentKind::OpenCode,
+            "antigravity" => AgentKind::Antigravity,
             _ => return None,
         })
     }
@@ -136,6 +141,7 @@ impl AgentKind {
             AgentKind::Muse => "muse",
             AgentKind::Grok => "grok",
             AgentKind::OpenCode => "opencode",
+            AgentKind::Antigravity => "agy",
             AgentKind::Custom => "custom",
         }
     }

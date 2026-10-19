@@ -11,7 +11,7 @@
 
 **Mission control for your coding agents.**
 
-Run **Claude Code**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build** and **OpenCode** across every project and git WORKTREE you own — from one
+Run **Claude Code**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build**, **OpenCode** and **Antigravity** across every project and git WORKTREE you own — from one
 terminal, one keyboard, one grid. They keep working when you close it.
 
 [![Release](https://img.shields.io/github/v/release/AgentSystemLabs/nebula?style=flat-square&color=e8c547&label=release)](https://github.com/AgentSystemLabs/nebula/releases)
@@ -76,7 +76,7 @@ on a tab tells you exactly where to look without opening anything.
 
 ## Supported harnesses
 
-Seven CLIs work out of the box, each with its own Agents tab section and model/effort rows. Install the CLI,
+Eight CLIs work out of the box, each with its own Agents tab section and model/effort rows. Install the CLI,
 pick it in the box's `Tab` picker, done. A CLI missing from PATH still shows in the picker; the DAEMON
 re-checks through the login shell at launch.
 
@@ -89,6 +89,21 @@ re-checks through the login shell at launch.
 | <img src="https://www.google.com/s2/favicons?domain=meta.com&sz=128" width="24" height="24" alt="Muse"> | [Muse](https://developer.meta.com/ai/lp/muse-code) | `muse` | `curl -fsSL https://dev.meta.ai/install.sh \| bash` |
 | <img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=128" width="24" height="24" alt="OpenCode"> | [OpenCode](https://opencode.ai/docs/) | `opencode` | `curl -fsSL https://opencode.ai/install \| bash` |
 | <img src="https://www.google.com/s2/favicons?domain=x.ai&sz=128" width="24" height="24" alt="Grok"> | [Grok](https://github.com/xai-org/grok-build) | `grok` | `curl -fsSL https://x.ai/cli/install.sh \| bash` |
+| Antigravity | [Antigravity CLI](https://antigravity.google/docs/cli/install/) | `agy` | See official CLI installation instructions |
+
+Antigravity uses Google's **`agy` terminal CLI**, installed and authenticated separately.
+Install it using the [official CLI instructions](https://antigravity.google/docs/cli/install/).
+Select **Antigravity** in the harness picker. From an existing Nebula agent session,
+`nebula spawn "your task" --kind antigravity` starts an Antigravity session beside it.
+Initial tasks use `--prompt-interactive` so the session stays interactive; `--prompt` would run headlessly.
+Model and effort defaults can be configured under `harnesses.antigravity` in config.json.
+The model picker follows `agy models`, cached for one day and refreshed in the background.
+Effort choices are `default`, `low`, `medium`, `high`, `xhigh`, and `max` (agy 1.4.2).
+Resuming with a known conversation ID also submits the relocation notice via `--prompt-interactive`.
+Status is process-based: the card stays running while `agy` is alive. Managed turn/permission hooks
+and automatic conversation-ID capture are not implemented yet. Use `/resume` inside `agy` to recover
+history after a process restart; Nebula only passes `--conversation <id>` when a session ID is known.
+This build uses IPC protocol 51; rebuild/reload the daemon alongside the TUI.
 
 ## Install
 
@@ -113,7 +128,7 @@ WSL2 is supported as Linux. WSL1 is not: it lacks the Linux kernel behavior nebu
 for its Unix socket, pidfile lock, and PTYs, so nebula reports that directly and tells you to convert
 the distro with `wsl.exe --set-version <distro> 2`.
 
-> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, or `opencode`.
+> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, `opencode`, or `agy`.
 > nebula spawns them; it doesn't ship them.
 >
 > Three commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
@@ -144,7 +159,7 @@ project on the machine, and `x` closes a tab without touching its sessions.
 `Enter` launches it — with the harness, model and effort the Agents tab defaults name, in the checkout
 under the cursor — and the cursor and the pane land on the new card as it shows up in the grid
 (turn off **Follow new** in Settings → Agents to stay on the card you were on). For one launch
-only, `Tab` picks another harness (**Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build** or **OpenCode**, `→`
+only, `Tab` picks another harness (**Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build**, **OpenCode** or **Antigravity**, `→`
 for MODEL and EFFORT), `Ctrl+O` a model, `Ctrl+T` any checkout of the project, `Ctrl+P` any project on the
 machine (a launch aimed elsewhere runs in the background and the footer says where it went). Send the
 box empty and the CLI starts bare, its pane yours to type the first prompt into. Save a framing you
@@ -229,7 +244,8 @@ into the WORKTREE's `.claude/settings.local.json`, `.cursor/hooks.json` or `~/.c
 `_nebulaManaged`, your own hooks preserved, rebuilt every spawn — and each one is a fail-soft `curl` to
 the DAEMON's loopback HOOK RECEIVER, authenticated with a per-boot BEARER TOKEN. Pi has no shell hooks,
 so it gets one managed extension at `~/.pi/agent/extensions/nebula.ts` that posts the same events, and
-OpenCode gets one managed plugin at `~/.config/opencode/plugins/nebula.ts` that does the same. For the one event no CLI
+OpenCode gets one managed plugin at `~/.config/opencode/plugins/nebula.ts` that does the same, and Antigravity
+one managed agy plugin at `~/.gemini/config/plugins/nebula/`. For the one event no CLI
 reports — a turn you cancelled with `Esc` — the PROGRESS SCANNER reads the CLI's own OSC 9;4 progress
 escapes straight off the PTY, a signal that survives the cancel and stays busy while a permission prompt
 is open.
@@ -259,9 +275,9 @@ hides the Effort row until you map effort. `nebula config harnesses` prints the 
 from, and a block that stops making sense refuses its launches with the reason while everything else
 keeps working. Ids use lowercase letters, digits and hyphens, and must not collide with a built-in.
 
-`hooks` names a built-in dialect, not your own scripts: `claude`, `codex`, `cursor`, `pi` or `opencode`. At spawn
+`hooks` names a built-in dialect, not your own scripts: `claude`, `codex`, `cursor`, `pi`, `opencode` or `antigravity`. At spawn
 nebula installs that dialect's MANAGED HOOKS for the session (the same `.claude/settings.local.json`,
-`.cursor/hooks.json`, `~/.codex/hooks.json`, pi extension or OpenCode plugin the built-in gets), so a CLI that speaks
+`.cursor/hooks.json`, `~/.codex/hooks.json`, pi extension, OpenCode plugin or agy plugin the built-in gets), so a CLI that speaks
 that protocol reports status, prompts and permission waits exactly like the real thing. A
 Claude-compatible CLI with `"hooks": "claude"` even gets title sync and auto-title. Leave `hooks` out
 and the sessions stay process-based: running while the PTY is live, never red. Either way your own

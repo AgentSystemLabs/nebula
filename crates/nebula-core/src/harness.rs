@@ -1,6 +1,6 @@
 //! The harness registry: one behavior descriptor per agent CLI.
 //!
-//! The seven known harnesses ship as a compiled-in table ([`builtin`]);
+//! The eight known harnesses ship as a compiled-in table ([`builtin`]);
 //! the user's config adds a `harnesses` map of [`HarnessOverride`]s over
 //! it — disable one, repoint a program, rename a flag, or define a whole
 //! new CLI — and [`registry`] merges the two (plus the legacy
@@ -38,12 +38,13 @@ pub struct ModelEntry {
 /// Which TUI-side catalogue supplies a harness's model (and, for Cursor,
 /// effort) rows at runtime, in place of the descriptor's static lists:
 /// Claude's `claude_models` / `availableModels` allowlist, or Cursor's
-/// `--list-models` union over its seed.
+/// `--list-models` union over its seed, or Antigravity's `agy models`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessCatalog {
     Claude,
     Cursor,
+    Antigravity,
 }
 
 impl HarnessCatalog {
@@ -51,6 +52,7 @@ impl HarnessCatalog {
         match self {
             HarnessCatalog::Claude => "claude",
             HarnessCatalog::Cursor => "cursor",
+            HarnessCatalog::Antigravity => "antigravity",
         }
     }
 
@@ -58,6 +60,7 @@ impl HarnessCatalog {
         Some(match s.trim() {
             "claude" => HarnessCatalog::Claude,
             "cursor" => HarnessCatalog::Cursor,
+            "antigravity" => HarnessCatalog::Antigravity,
             _ => return None,
         })
     }
@@ -280,6 +283,7 @@ impl HarnessDescriptor {
             Some("cursor") => Some(crate::AgentKind::Cursor),
             Some("pi") => Some(crate::AgentKind::Pi),
             Some("opencode") => Some(crate::AgentKind::OpenCode),
+            Some("antigravity") => Some(crate::AgentKind::Antigravity),
             _ => None,
         }
     }
@@ -339,10 +343,10 @@ impl HarnessDescriptor {
         }
         if let Some(dialect) = self.hooks.as_deref().map(str::trim) {
             match dialect {
-                "claude" | "codex" | "cursor" | "pi" | "opencode" => {}
+                "claude" | "codex" | "cursor" | "pi" | "opencode" | "antigravity" => {}
                 _ => {
                     return Some(format!(
-                        "harness `{}` hooks `{dialect}`: name a built-in dialect (claude, codex, cursor, pi, opencode)",
+                        "harness `{}` hooks `{dialect}`: name a built-in dialect (claude, codex, cursor, pi, opencode, antigravity)",
                         self.id.trim()
                     ));
                 }
@@ -533,6 +537,39 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
                 append_flag: Some("--rules".into()),
                 ..SystemSpec::default()
             },
+            ..base
+        },
+        // Verified with agy 1.4.2 --help: low|medium|high|xhigh|max.
+        // --prompt is headless; only
+        // --prompt-interactive submits a task (also with --conversation) and keeps
+        // the PTY interactive.
+        // Keep the CLI's own model default and permission policy. Status,
+        // the conversation id and nebula's guidance ride a managed agy
+        // plugin (hooks/antigravity_plugin.rs), not a system-prompt flag.
+        "antigravity" => HarnessDescriptor {
+            label: "Antigravity".into(),
+            program: "agy".into(),
+            model: ModelSpec {
+                flag: Some("--model".into()),
+                catalog: Some(HarnessCatalog::Antigravity),
+                ..ModelSpec::default()
+            },
+            effort: EffortSpec {
+                flag: Some("--effort".into()),
+                efforts: ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                offered: true,
+                ..EffortSpec::default()
+            },
+            prompt_flag: Some("--prompt-interactive".into()),
+            resume: ResumeSpec {
+                flag: Some("--conversation".into()),
+                ..ResumeSpec::default()
+            },
+            hooks: Some("antigravity".into()),
+            relocation_prompt: true,
             ..base
         },
         // OpenCode's model is a `provider/model` id (`opencode models`
@@ -975,7 +1012,7 @@ mod tests {
     #[test]
     fn builtins_cover_every_builtin_kind() {
         let all = builtins();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), AgentKind::ALL.len() - 1);
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
                 continue;
@@ -1011,6 +1048,18 @@ mod tests {
         assert!(!muse.resumes());
         assert_eq!(muse.hooks, None);
         assert!(muse.effort.offered, "muse keeps its reserved Effort row");
+        let antigravity = builtin("antigravity").unwrap();
+        assert_eq!(antigravity.model.catalog, Some(HarnessCatalog::Antigravity));
+        assert_eq!(
+            antigravity.effort.efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(antigravity.relocation_prompt);
+        assert_eq!(
+            HarnessCatalog::parse("antigravity"),
+            Some(HarnessCatalog::Antigravity)
+        );
+        assert_eq!(HarnessCatalog::Antigravity.as_str(), "antigravity");
         let opencode = builtin("opencode").unwrap();
         assert_eq!(opencode.program, "opencode");
         assert_eq!(opencode.prompt_flag.as_deref(), Some("--prompt"));
@@ -1079,13 +1128,24 @@ mod tests {
         let ids: Vec<&str> = all.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["claude", "codex", "cursor", "pi", "muse", "grok", "opencode", "zed", "agy"]
+            vec![
+                "claude",
+                "codex",
+                "cursor",
+                "pi",
+                "muse",
+                "grok",
+                "opencode",
+                "antigravity",
+                "zed",
+                "agy"
+            ]
         );
         assert!(!all[0].enabled, "the claude override applied");
-        assert_eq!(all[7].program, "agy", "legacy entry converts");
-        assert_eq!(all[8].program, "agy", "map-only entry resolves");
+        assert_eq!(all[8].program, "agy", "legacy entry converts");
+        assert_eq!(all[9].program, "agy", "map-only entry resolves");
         assert!(
-            !all[8].effort.offered,
+            !all[9].effort.offered,
             "a bare program stays Model-only like a legacy custom"
         );
     }
@@ -1148,7 +1208,11 @@ mod tests {
         broken.program = "  ".into();
         let all = registry(&BTreeMap::new(), &[broken]);
         assert!(resolve(&all, AgentKind::Custom, Some("broken")).is_err());
-        assert_eq!(usable(&all).len(), 7, "the broken entry is hidden");
+        assert_eq!(
+            usable(&all).len(),
+            AgentKind::ALL.len() - 1,
+            "the broken entry is hidden"
+        );
     }
 
     #[test]

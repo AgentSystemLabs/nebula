@@ -1,5 +1,6 @@
 pub mod agent_picker;
 pub mod agent_presets;
+pub mod antigravity_catalogue;
 pub mod app;
 pub mod branch_name;
 pub mod branch_switch;

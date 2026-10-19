@@ -1344,6 +1344,18 @@ mod tests {
             role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
+        let antigravity = Agent {
+            id: AgentId::generate(),
+            kind: AgentKind::Antigravity,
+            custom_harness: None,
+            session_id: Some("agy-conversation".into()),
+            ..custom.clone()
+        };
+        store.insert_agent(&antigravity).unwrap();
+        let loaded = store.get_agent(&antigravity.id).unwrap().unwrap();
+        assert_eq!(loaded.kind, AgentKind::Antigravity);
+        assert_eq!(loaded.custom_harness, None);
+        assert_eq!(loaded.session_id.as_deref(), Some("agy-conversation"));
         store.insert_agent(&custom).unwrap();
         let (_, _, reloaded, _) = store.load_tree().unwrap();
         let back = reloaded.iter().find(|a| a.id == custom.id).unwrap();

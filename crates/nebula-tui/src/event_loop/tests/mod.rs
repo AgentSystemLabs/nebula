@@ -6889,7 +6889,15 @@ fn picker_omits_a_disabled_harness() {
         let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(
             labels,
-            ["Claude", "Cursor", "Pi", "Muse", "Grok Build", "OpenCode"],
+            [
+                "Claude",
+                "Cursor",
+                "Pi",
+                "Muse",
+                "Grok Build",
+                "OpenCode",
+                "Antigravity"
+            ],
             "Codex is absent, not greyed"
         );
 
@@ -6917,7 +6925,7 @@ fn picker_omits_a_disabled_harness() {
 #[test]
 fn picker_with_every_harness_disabled_flashes_instead_of_opening() {
     with_config_json(
-        r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false, "muse_enabled": false, "opencode_enabled": false, "harnesses":{"grok":{"enabled":false}}}"#,
+        r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false, "muse_enabled": false, "opencode_enabled": false, "harnesses":{"grok":{"enabled":false},"antigravity":{"enabled":false}}}"#,
         || {
             let mut app = App::new();
             seed_tree(&mut app);
@@ -6986,6 +6994,7 @@ fn agents_tab_toggles_a_harness_and_refuses_the_last_one() {
         let (_, muse_row) = locate_agent("muse", HarnessField::Enabled).unwrap();
         let (_, grok_row) = locate_agent("grok", HarnessField::Enabled).unwrap();
         let (_, opencode_row) = locate_agent("opencode", HarnessField::Enabled).unwrap();
+        let (_, antigravity_row) = locate_agent("antigravity", HarnessField::Enabled).unwrap();
         let mut app = App::new();
         let mut out = Vec::new();
         open_settings_on(&mut app, tab, &mut out);
@@ -7032,12 +7041,17 @@ fn agents_tab_toggles_a_harness_and_refuses_the_last_one() {
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(!crate::config::Config::load().opencode_enabled);
+        for _ in opencode_row..antigravity_row {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         let cfg = crate::config::Config::load();
         assert!(
-            cfg.opencode_enabled,
+            cfg.kind_enabled(AgentKind::Antigravity),
             "the last harness cannot be switched off"
         );
-        assert_eq!(cfg.enabled_kinds(), vec![AgentKind::OpenCode]);
+        assert_eq!(cfg.enabled_kinds(), vec![AgentKind::Antigravity]);
         let (text, level) = settings_view(&app).notice.clone().expect("a warning");
         assert!(matches!(level, crate::app::NoticeLevel::Warn));
         assert!(text.contains("at least one harness"), "{text}");
