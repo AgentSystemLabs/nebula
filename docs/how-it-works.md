@@ -159,6 +159,11 @@
   suppresses the idle notification that normally un-sticks one, so nebula also reads the CLI's terminal
   progress-bar escapes (OSC 9;4) straight off the PTY. That signal survives a cancel, and it stays busy
   while a permission prompt is open — so it can't mark an agent done while it is actually waiting on you.
+- **Codex's terminal lifecycle also reports completion.** Codex 0.163.0 uses OSC 7501 with
+  `state=working:app=codex` and `state=idle:app=codex` rather than OSC 9;4. Nebula reads these through
+  the same busy/idle path, so a finished response leaves yellow even when its hooks are awaiting trust.
+  `blocked` counts as busy; `clear` releases terminal ownership and is ignored. Completion still goes
+  through the STOP GATE when subagents are tracked.
 - **…and the IDLE PROMPT, which is a hold rather than a finish.** Claude posts a
   `Notification{idle_prompt}` after roughly 60 s parked at the input box with nobody touching the
   keyboard, and that is the notification which un-sticks a turn that ended without a `Stop` — a

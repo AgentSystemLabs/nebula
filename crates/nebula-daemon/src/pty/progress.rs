@@ -1,5 +1,12 @@
-//! OSC 9;4 progress scanner — the busy/idle signal nebula reads straight
-//! off the agent's output stream.
+//! Busy/idle scanner for OSC 9;4 progress and Codex's OSC 7501 lifecycle
+//! status, read straight off the agent's output stream.
+//!
+//! Codex 0.163.0 emits `ESC ] 7501;state=working:app=codex ESC \\` and
+//! `state=idle` on turn completion, not OSC 9;4. Reading these messages
+//! keeps a finished turn from staying yellow when its Stop hook is not
+//! available (for example, hooks awaiting trust). `blocked` stays busy:
+//! a pending approval is not a finished turn. `state=clear` only releases
+//! terminal ownership on exit or handoff and says nothing about the turn.
 //!
 //! Why this exists: Claude Code fires no hook when the user cancels a turn
 //! (`Stop` is documented as "does not run if the stoppage occurred due to a
@@ -31,10 +38,10 @@
 
 use super::osc::OscFramer;
 
-/// Longest OSC payload we will buffer. `9;4;<state>;<pct>` is far shorter;
+/// Longest OSC payload we will buffer. Both progress and lifecycle status fit;
 /// anything longer (a title, a hyperlink, a base64 image) is poisoned and
 /// skipped without allocating.
-const MAX_OSC: usize = 24;
+const MAX_OSC: usize = 64;
 
 /// Tracks the child's advertised progress state across chunk boundaries.
 #[derive(Debug)]
@@ -94,6 +101,16 @@ impl ProgressScanner {
     }
 
     fn dispatch(&mut self, payload: Vec<u8>) {
+        if payload.starts_with(b"7501;") {
+            match payload.as_slice() {
+                b"7501;state=idle:app=codex" => self.busy = Some(false),
+                b"7501;state=working:app=codex" | b"7501;state=blocked:app=codex" => {
+                    self.busy = Some(true);
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some(rest) = payload.strip_prefix(b"9;4;") else {
             return;
         };
@@ -108,11 +125,14 @@ impl ProgressScanner {
     }
 }
 
-/// Could `buf` still grow into a `9;4;…` payload?
+/// Could `buf` still grow into a progress or lifecycle payload?
 fn prefix_possible(buf: &[u8]) -> bool {
-    const PREFIX: &[u8] = b"9;4;";
-    let n = buf.len().min(PREFIX.len());
-    buf[..n] == PREFIX[..n]
+    [b"9;4;".as_slice(), b"7501;state=".as_slice()]
+        .iter()
+        .any(|prefix| {
+            let n = buf.len().min(prefix.len());
+            buf[..n] == prefix[..n]
+        })
 }
 
 #[cfg(test)]
@@ -138,6 +158,84 @@ mod tests {
             ]),
             vec![Some(false), None, Some(true), None, Some(false)]
         );
+    }
+
+    #[test]
+    fn codex_lifecycle_reports_busy_and_idle_without_hooks() {
+        assert_eq!(
+            scan(&[
+                b"\x1b]7501;state=idle:app=codex\x1b\\",
+                b"\x1b]7501;state=working:app=codex\x1b\\",
+                b"\x1b]7501;state=blocked:app=codex\x1b\\",
+                b"\x1b]7501;state=working:app=codex\x1b\\",
+                b"\x1b]7501;state=idle:app=codex\x1b\\",
+                b"\x1b]7501;state=idle:app=codex\x1b\\",
+                b"\x1b]7501;state=clear\x1b\\",
+            ]),
+            vec![Some(false), Some(true), None, None, Some(false), None, None]
+        );
+    }
+
+    #[test]
+    fn codex_lifecycle_survives_every_chunk_boundary_and_terminator() {
+        for full in [
+            b"\x1b]7501;state=working:app=codex\x1b\\".as_slice(),
+            b"\x1b]7501;state=working:app=codex\x07".as_slice(),
+        ] {
+            for split in 0..full.len() {
+                let mut s = ProgressScanner::new();
+                assert_eq!(s.feed(&full[..split]), None);
+                assert_eq!(s.feed(&full[split..]), Some(true), "split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn codex_lifecycle_ignores_clear_unknown_states_and_other_apps() {
+        let mut s = ProgressScanner::restored(Some(true));
+        for payload in [
+            "7501;state=clear",
+            "7501;state=idle",
+            "7501;state=idle:app=other",
+            "7501;state=idle:app=codex-extra",
+            "7501;state=unknown:app=codex",
+            "7501;state=idle:app=codex:unexpected",
+        ] {
+            assert_eq!(s.feed(format!("\x1b]{payload}\x1b\\").as_bytes()), None);
+            assert_eq!(s.busy(), Some(true), "{payload}");
+        }
+        assert_eq!(s.feed(b"\x1b]7501;state=idle:app=codex\x1b\\"), Some(false));
+    }
+
+    #[test]
+    fn codex_lifecycle_finishes_interactive_and_optimistic_launches() {
+        use crate::status::{AgentStatusMachine, HookEvent};
+        use nebula_core::AgentStatus;
+        use std::time::Instant;
+
+        for mut machine in [
+            AgentStatusMachine::new(AgentStatus::Fresh, None),
+            AgentStatusMachine::launching(),
+        ] {
+            let mut scanner = ProgressScanner::new();
+            let now = Instant::now();
+            let initial = machine.status();
+            for (payload, expected) in [
+                ("idle", initial),
+                ("working", AgentStatus::Running),
+                ("blocked", AgentStatus::Running),
+                ("working", AgentStatus::Running),
+                ("idle", AgentStatus::Finished),
+                ("working", AgentStatus::Running),
+                ("idle", AgentStatus::Finished),
+            ] {
+                let bytes = format!("\x1b]7501;state={payload}:app=codex\x1b\\");
+                if let Some(busy) = scanner.feed(bytes.as_bytes()) {
+                    machine.handle(HookEvent::Progress { busy }, None, now);
+                }
+                assert_eq!(machine.status(), expected, "{payload}");
+            }
+        }
     }
 
     #[test]

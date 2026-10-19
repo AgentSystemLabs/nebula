@@ -1081,6 +1081,21 @@ async fn hook_post_from_agent_pty_drives_status() {
 /// hook involved at all.
 #[tokio::test]
 async fn pty_progress_sequence_drives_status_without_any_hook() {
+    pty_busy_idle_sequences_drive_status("9;4;3;", "9;4;0;").await;
+}
+
+/// Codex 0.163.0 emits OSC 7501 instead of OSC 9;4. Its hookless turn
+/// completion must take the same PTY -> STATUS MACHINE -> TUI event path.
+#[tokio::test]
+async fn pty_codex_lifecycle_drives_status_without_any_hook() {
+    pty_busy_idle_sequences_drive_status(
+        "7501;state=working:app=codex",
+        "7501;state=idle:app=codex",
+    )
+    .await;
+}
+
+async fn pty_busy_idle_sequences_drive_status(busy: &str, idle: &str) {
     let env = TestEnv::new();
     let repo = env.make_repo();
     let mut daemon = env.spawn_daemon();
@@ -1103,18 +1118,18 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
     .await
     .unwrap();
 
-    // Have the shell in the agent PTY emit exactly what Claude Code emits.
+    // Have the shell in the agent PTY emit the CLI's lifecycle sequences.
     // The command text is echoed back by the tty, which is the point: only
     // the real escape bytes may move the status, never a mention of them.
     // `\ddd` octal, not `\e` — POSIX printf, so this works under dash too.
-    let emit = |state: &str| format!("printf '\\033]9;4;{state};\\007'\n").into_bytes();
+    let emit = |payload: &str| format!("printf '\\033]{payload}\\033\\134'\n").into_bytes();
 
     // Turn starts: progress goes indeterminate → running.
     write_frame(
         &mut c,
         &ClientRequest::Input {
             session: sref.clone(),
-            data: emit("3"),
+            data: emit(busy),
         },
     )
     .await
@@ -1127,12 +1142,12 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
     })
     .await;
 
-    // User hits escape: the progress bar clears, and nothing else happens.
+    // The turn finishes or is cancelled, and nothing else happens.
     write_frame(
         &mut c,
         &ClientRequest::Input {
             session: sref.clone(),
-            data: emit("0"),
+            data: emit(idle),
         },
     )
     .await
