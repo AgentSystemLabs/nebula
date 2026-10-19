@@ -879,12 +879,31 @@ fn flush_deadline(
     }
 }
 
+/// Confirms a dialog close once [`question::CLOSE_SETTLE`] has passed, for a
+/// child that went quiet right after erasing it; a close later output
+/// already confirmed (or a dialog that came back) leaves no edge to send.
+async fn settle_question(session: std::sync::Weak<PtySession>) {
+    tokio::time::sleep(question::CLOSE_SETTLE + std::time::Duration::from_millis(10)).await;
+    let Some(session) = session.upgrade() else {
+        return;
+    };
+    let edge = session
+        .question
+        .lock()
+        .as_mut()
+        .and_then(|(_, scanner)| scanner.feed(b"", std::time::Instant::now()));
+    if let Some(open) = edge {
+        tracing::debug!(session = ?session.sref, open, "child question dialog settled");
+        let _ = session.events.send(PtyEvent::Question { open });
+    }
+}
+
 /// Drains the reader channel: append to the ring (always — detach is free),
 /// coalesce bursts, broadcast to whoever is attached.
 async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
     let mut pending: Vec<u8> = Vec::new();
 
-    let flush = |session: &PtySession, pending: &mut Vec<u8>| {
+    let flush = |session: &Arc<PtySession>, pending: &mut Vec<u8>| {
         if pending.is_empty() {
             return;
         }
@@ -903,11 +922,16 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             Some(scanner) => scanner.feed(pending),
             None => Vec::new(),
         };
-        let question_edge = session
-            .question
-            .lock()
-            .as_mut()
-            .and_then(|(_, scanner)| scanner.feed(pending, std::time::Instant::now()));
+        let (question_edge, settle) = match session.question.lock().as_mut() {
+            Some((_, scanner)) => {
+                let edge = scanner.feed(pending, std::time::Instant::now());
+                (edge, scanner.take_settle_request())
+            }
+            None => (None, false),
+        };
+        if settle {
+            tokio::spawn(settle_question(Arc::downgrade(session)));
+        }
         let seq = session.ring.lock().append(pending);
         let _ = session.events.send(PtyEvent::Output {
             seq,
@@ -1193,6 +1217,46 @@ mod tests {
         .await;
         assert!(quiet.is_err(), "a restored dialog is not re-announced");
         restored.kill();
+    }
+
+    /// A child that erases its dialog and then goes silent still closes it:
+    /// the settle re-check runs with no further output to drive it.
+    #[tokio::test]
+    async fn a_dialog_closed_before_the_child_goes_quiet_still_settles() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "sleep 0.5; printf 'Do you trust the contents of this project?\\r\\n\
+                     > Yes\\r\\n  ↑/↓ Navigate · enter Confirm'; sleep 0.5; \
+                     printf '\\033[2J\\033[H> '; sleep 5"
+                        .into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        let mut rx = session.events.subscribe();
+        session.arm_question_scan(DialogKind::AntigravityPermission, true);
+        let edges = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut edges = Vec::new();
+            while edges.len() < 2 {
+                if let Ok(PtyEvent::Question { open }) = rx.recv().await {
+                    edges.push(open);
+                }
+            }
+            edges
+        })
+        .await
+        .expect("open and settled close within 10s");
+        assert_eq!(edges, [true, false]);
+        session.kill();
     }
 
     /// The pane is nebula's grid, not the terminal the daemon was started

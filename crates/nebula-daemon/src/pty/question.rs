@@ -48,8 +48,10 @@ pub enum DialogKind {
 
 impl DialogKind {
     /// Marker groups: the dialog is open while every string of any one
-    /// group is on screen, in order (a dialog draws its legend under its
-    /// headline, so a menu above a stale headline does not count).
+    /// group is on screen, in order and each within [`MAX_DIALOG_ROWS`] of
+    /// the one before — a dialog draws its legend just under its headline,
+    /// so a picker's legend below a stale headline that has scrolled up, or
+    /// above one, does not count.
     pub fn markers(self) -> &'static [&'static [&'static str]] {
         match self {
             Self::CursorQuestion => &[&[LEGEND]],
@@ -57,6 +59,8 @@ impl DialogKind {
                 // Commands, tool calls, access and admin escalation.
                 &["Requesting permission", AGY_MENU_LEGEND],
                 &["Accept this file edit?", AGY_MENU_LEGEND],
+                &["Allow access to this file?", AGY_MENU_LEGEND],
+                &["Do you want to proceed?", AGY_MENU_LEGEND],
                 // A checkout agy has not been told to trust yet — every
                 // fresh worktree, before the session's first turn.
                 &[
@@ -73,6 +77,11 @@ impl DialogKind {
 /// as closed. Above any split repaint's gap; under the spinner's period.
 pub const CLOSE_SETTLE: Duration = Duration::from_millis(150);
 
+/// The most screen rows one marker may sit below the one before it: agy's
+/// tallest dialog (a command prompt whose options wrap in a narrow pane)
+/// with room to spare.
+const MAX_DIALOG_ROWS: usize = 24;
+
 /// Side length the screen is floored at — see `pty::cursor`.
 const MIN_SIDE: u16 = 2;
 
@@ -83,6 +92,8 @@ pub struct QuestionScanner {
     open: bool,
     /// While open: when all markers were first seen missing.
     missing_since: Option<Instant>,
+    /// A settle re-check is already scheduled for this close.
+    settle_requested: bool,
 }
 
 impl QuestionScanner {
@@ -105,6 +116,7 @@ impl QuestionScanner {
             markers,
             open,
             missing_since: None,
+            settle_requested: false,
         }
     }
 
@@ -113,16 +125,28 @@ impl QuestionScanner {
         self.parser.screen_mut().set_size(rows, cols);
     }
 
-    /// Feed a chunk of child output. `Some(open)` only on an edge.
     /// Whether the dialog is up as far as this scanner knows.
     pub fn is_open(&self) -> bool {
         self.open
     }
 
+    /// Once per close in progress: true when the dialog has gone missing
+    /// and nobody has yet been asked to come back after [`CLOSE_SETTLE`].
+    /// A CLI that erases its dialog in one flush and then sits idle (agy at
+    /// an empty prompt after its trust dialog) sends no later output to
+    /// confirm the close, so the caller re-feeds nothing once it has passed.
+    pub fn take_settle_request(&mut self) -> bool {
+        let due = self.open && self.missing_since.is_some() && !self.settle_requested;
+        self.settle_requested |= due;
+        due
+    }
+
+    /// Feed a chunk of child output. `Some(open)` only on an edge.
     pub fn feed(&mut self, data: &[u8], now: Instant) -> Option<bool> {
         self.parser.process(data);
         if markers_shown(self.parser.screen(), self.markers) {
             self.missing_since = None;
+            self.settle_requested = false;
             if self.open {
                 return None;
             }
@@ -138,14 +162,21 @@ impl QuestionScanner {
         }
         self.open = false;
         self.missing_since = None;
+        self.settle_requested = false;
         Some(false)
     }
 }
 
 fn markers_shown(screen: &vt100::Screen, markers: &[&[&str]]) -> bool {
     let mut text = String::new();
+    // The screen row each byte of `text` came from.
+    let mut rows = Vec::new();
+    let mut row = 0;
     let mut gap = false;
     for c in screen.contents().chars() {
+        if c == '\n' {
+            row += 1;
+        }
         if c.is_whitespace()
             || matches!(
                 c,
@@ -157,22 +188,34 @@ fn markers_shown(screen: &vt100::Screen, markers: &[&[&str]]) -> bool {
         }
         if gap && !text.is_empty() {
             text.push(' ');
+            rows.push(row);
         }
         gap = false;
         text.push(c);
+        rows.resize(text.len(), row);
     }
-    markers.iter().any(|group| in_order(&text, group))
+    markers.iter().any(|group| grouped(&text, &rows, group))
 }
 
-/// Whether every marker occurs in `text`, each after the one before it.
-fn in_order(text: &str, group: &[&str]) -> bool {
-    let mut rest = text;
-    group.iter().all(|marker| match rest.find(marker) {
-        Some(at) => {
-            rest = &rest[at + marker.len()..];
-            true
-        }
-        None => false,
+/// Whether `group` occurs in `text` in order, each marker the nearest one
+/// above the next and no more than [`MAX_DIALOG_ROWS`] rows above it.
+/// Anchored on every sighting of the last marker, walking back from it.
+fn grouped(text: &str, rows: &[usize], group: &[&str]) -> bool {
+    let Some((last, before)) = group.split_last() else {
+        return false;
+    };
+    text.match_indices(last).any(|(anchor, _)| {
+        let mut at = anchor;
+        before
+            .iter()
+            .rev()
+            .all(|marker| match text[..at].rfind(marker) {
+                Some(found) if rows[at] - rows[found] <= MAX_DIALOG_ROWS => {
+                    at = found;
+                    true
+                }
+                _ => false,
+            })
     })
 }
 
@@ -284,6 +327,42 @@ mod tests {
         // A picker's legend, with no permission headline above it.
         let picker = "\x1b[2J\x1b[HSelect a model\r\n> Gemini\r\n  ↑/↓ Navigate · enter Confirm";
         assert_eq!(s.feed(picker.as_bytes(), t), None);
+    }
+
+    /// A headline left by an answered prompt that has since scrolled more
+    /// than a dialog's height up does not pair with a picker's legend.
+    #[test]
+    fn a_far_stale_headline_does_not_pair_with_a_later_picker() {
+        let t = Instant::now();
+        let markers = DialogKind::AntigravityPermission.markers();
+        let mut screen = String::from("\x1b[2J\x1b[HRequesting permission for:\r\n");
+        for i in 0..30 {
+            screen.push_str(&format!("● step {i}\r\n"));
+        }
+        screen.push_str("Select a model\r\n> Gemini\r\n  ↑/↓ Navigate · enter Confirm");
+        let mut s = QuestionScanner::new(120, 40, b"", markers);
+        assert_eq!(s.feed(screen.as_bytes(), t), None);
+        // The file-access prompt agy 1.4.2 draws is its own headline.
+        let access = "\x1b[2J\x1b[HAllow access to this file?\r\n   /etc/hosts\r\n\
+                      > 1. Yes, allow access\r\n  2. No\r\n\r\n  ↑/↓ Navigate · enter Confirm";
+        assert_eq!(s.feed(access.as_bytes(), t), Some(true));
+    }
+
+    /// A close with no output after it asks once for a settle re-check,
+    /// which then confirms it; a dialog that comes back cancels the ask.
+    #[test]
+    fn a_quiet_close_requests_one_settle_recheck() {
+        let t = Instant::now();
+        let markers = DialogKind::AntigravityPermission.markers();
+        let mut s = QuestionScanner::new(120, 40, b"", markers);
+        assert!(!s.take_settle_request(), "nothing open");
+        s.feed(&agy_permission(), t);
+        assert!(!s.take_settle_request(), "still on screen");
+        assert_eq!(s.feed(&agy_running(), t + ms(10)), None);
+        assert!(s.take_settle_request());
+        assert!(!s.take_settle_request(), "asked once per close");
+        assert_eq!(s.feed(b"", t + ms(10) + CLOSE_SETTLE), Some(false));
+        assert!(!s.take_settle_request());
     }
 
     #[test]

@@ -179,13 +179,7 @@ pub fn restart(daemon: &Arc<Daemon>, handles: &Handles, request: &Request) -> Re
     if !exe.is_absolute() || !meta.is_file() {
         bail!("{} is not a nebula binary", exe.display());
     }
-    match probe_version(exe) {
-        Some(v) if v >= VERSION => {}
-        _ => bail!(
-            "{} can't take over running sessions — it predates in-place restarts",
-            exe.display()
-        ),
-    }
+    check_restart_version(exe, probe_version(exe))?;
 
     // Nothing spawns, and nothing writes the database, from here to the
     // exec: a child forked now would inherit the masters left open for it.
@@ -240,6 +234,20 @@ pub fn restart(daemon: &Arc<Daemon>, handles: &Handles, request: &Request) -> Re
     daemon.uncarry_sessions();
     let _ = std::fs::remove_file(&state_path);
     Err(err)
+}
+
+fn check_restart_version(exe: &Path, version: Option<u32>) -> Result<()> {
+    match version {
+        Some(v) if v >= VERSION => Ok(()),
+        Some(v) => bail!(
+            "{} can't take over running sessions — it reads restart state v{v} but this daemon writes v{VERSION}; kill/relaunch is needed",
+            exe.display()
+        ),
+        None => bail!(
+            "{} can't take over running sessions — it predates in-place restarts",
+            exe.display()
+        ),
+    }
 }
 
 /// The newest restart-state version `exe` reads. Run from the runtime dir:
@@ -428,6 +436,23 @@ fn nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_version_refusal_distinguishes_missing_and_older_versions() {
+        let exe = Path::new("/tmp/nebula");
+        assert_eq!(
+            check_restart_version(exe, None).unwrap_err().to_string(),
+            "/tmp/nebula can't take over running sessions — it predates in-place restarts"
+        );
+        assert_eq!(
+            check_restart_version(exe, Some(2))
+                .unwrap_err()
+                .to_string(),
+            format!("/tmp/nebula can't take over running sessions — it reads restart state v2 but this daemon writes v{VERSION}; kill/relaunch is needed")
+        );
+        assert!(check_restart_version(exe, Some(VERSION)).is_ok());
+        assert!(check_restart_version(exe, Some(VERSION + 1)).is_ok());
+    }
 
     #[test]
     fn question_scan_reads_legacy_named_messagepack_handoffs() {
