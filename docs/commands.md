@@ -23,6 +23,7 @@ nebula sessions             list every session across every project     (agents 
 nebula read <session>       read recent context from another session    (agents run this)
 nebula ask <session> <q>    ask another session and print its answer    (agents run this)
 nebula archive <session>... archive agent sessions, as `a` does in the TUI
+nebula unarchive <session>… bring archived sessions back, as `u` does in the TUI
 nebula config <cmd>         back up, restore or locate this machine's settings
 nebula browser              serve this TUI in a web browser via ttyd
 nebula ssh <host>           open nebula on a remote host over ssh
@@ -99,6 +100,10 @@ nebula archive <session>...
                           # part of one; never a project or branch): the process stops, the row
                           # is kept, and `u` in the TUI brings it back. Every name resolves before
                           # anything is archived, and the session running the command is refused.
+nebula unarchive <session>...
+                          # bring archived agent sessions back, matched the same way but among
+                          # archived sessions only (`nebula sessions` doesn't list those). Every
+                          # name resolves before anything is restored.
 ```
 
 ## Settings

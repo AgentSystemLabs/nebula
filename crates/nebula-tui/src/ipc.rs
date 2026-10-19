@@ -565,16 +565,28 @@ fn resolve_archive_target<'a>(
     sessions: &'a [SessionSummary],
     raw: &str,
 ) -> Result<&'a SessionSummary> {
+    let agents: Vec<&SessionSummary> = sessions
+        .iter()
+        .filter(|s| matches!(s.session, SessionRef::Agent(_)))
+        .collect();
+    resolve_by_id_or_name(&agents, raw, "agent session", |s| (&s.id, &s.name))
+}
+
+/// The matching rule `nebula archive` and `nebula unarchive` share over
+/// their candidate rows: an exact id or name, else the one row whose id or
+/// name contains `raw` (case-insensitive); several matches are an error
+/// naming them.
+fn resolve_by_id_or_name<'a, T>(
+    rows: &[&'a T],
+    raw: &str,
+    what: &str,
+    id_name: impl Fn(&T) -> (&str, &str),
+) -> Result<&'a T> {
     let raw = raw.trim();
     if raw.is_empty() {
         bail!("session name or id is empty");
     }
-    let agents = || {
-        sessions
-            .iter()
-            .filter(|s| matches!(s.session, SessionRef::Agent(_)))
-    };
-    let pick = |found: Vec<&'a SessionSummary>| -> Option<Result<&'a SessionSummary>> {
+    let pick = |found: Vec<&'a T>| -> Option<Result<&'a T>> {
         match found.as_slice() {
             [] => None,
             [one] => Some(Ok(*one)),
@@ -582,26 +594,78 @@ fn resolve_archive_target<'a>(
                 "{raw} matches {} sessions ({}); use an id",
                 many.len(),
                 many.iter()
-                    .map(|s| format!("{} {}", s.id, s.name))
+                    .map(|row| {
+                        let (id, name) = id_name(row);
+                        format!("{id} {name}")
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             ))),
         }
     };
-    let exact = agents()
-        .filter(|s| s.id.eq_ignore_ascii_case(raw) || s.name.eq_ignore_ascii_case(raw))
+    let exact = rows
+        .iter()
+        .copied()
+        .filter(|row| {
+            let (id, name) = id_name(row);
+            id.eq_ignore_ascii_case(raw) || name.eq_ignore_ascii_case(raw)
+        })
         .collect();
     if let Some(result) = pick(exact) {
         return result;
     }
     let needle = raw.to_ascii_lowercase();
-    let fuzzy = agents()
-        .filter(|s| {
-            s.id.to_ascii_lowercase().contains(&needle)
-                || s.name.to_ascii_lowercase().contains(&needle)
+    let fuzzy = rows
+        .iter()
+        .copied()
+        .filter(|row| {
+            let (id, name) = id_name(row);
+            id.to_ascii_lowercase().contains(&needle) || name.to_ascii_lowercase().contains(&needle)
         })
         .collect();
-    pick(fuzzy).unwrap_or_else(|| bail!("no agent session matches {raw}"))
+    pick(fuzzy).unwrap_or_else(|| bail!("no {what} matches {raw}"))
+}
+
+/// `nebula unarchive <session>...`: bring archived agent sessions back, as
+/// `u` does in the TUI's archive view. `nebula sessions` lists live rows
+/// only, so names resolve against the daemon's full snapshot, archived
+/// agents alone. Every target resolves before any is restored.
+pub async fn unarchive_sessions(targets: &[String]) -> Result<()> {
+    let mut conn = session_context_connection("unarchive").await?;
+    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
+    let agents = loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Snapshot { agents, .. }) => break agents,
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before sending a snapshot"),
+        }
+    };
+    let archived: Vec<&Agent> = agents.iter().filter(|a| a.archived).collect();
+    let mut picked: Vec<&Agent> = Vec::new();
+    for target in targets {
+        let agent = resolve_by_id_or_name(&archived, target, "archived session", |a| {
+            (&a.id.0, &a.name)
+        })?;
+        if !picked.iter().any(|p| p.id == agent.id) {
+            picked.push(agent);
+        }
+    }
+    for agent in picked {
+        let req_id = ONE_SHOT_REQ_ID;
+        write_frame(
+            &mut conn.stream,
+            &ClientRequest::UnarchiveAgent {
+                req_id,
+                id: agent.id.clone(),
+            },
+        )
+        .await?;
+        match await_reply(&mut conn, req_id).await? {
+            Reply::Ack => println!("unarchived {} ({})", agent.name, agent.id),
+            Reply::Error(message) => bail!("unarchive {}: {message}", agent.name),
+        }
+    }
+    Ok(())
 }
 
 pub async fn read_session(session: &str, lines: u32) -> Result<()> {
@@ -1341,6 +1405,25 @@ mod tests {
         assert!(id("nebula").is_err());
         assert!(id("shell").is_err());
         assert!(id("  ").is_err());
+    }
+
+    // `unarchive` resolves over archived rows only, so a live session that
+    // shares the name never makes it ambiguous, and a miss says which pool.
+    #[test]
+    fn unarchive_targets_resolve_among_the_rows_given() {
+        let rows = [
+            ("01A".to_string(), "agent-1".to_string()),
+            ("01B".to_string(), "Fix login".to_string()),
+        ];
+        let archived: Vec<&(String, String)> = rows.iter().collect();
+        let id = |raw: &str| {
+            resolve_by_id_or_name(&archived, raw, "archived session", |r| (&r.0, &r.1))
+                .map(|r| r.0.clone())
+        };
+        assert_eq!(id("login").unwrap(), "01B");
+        assert_eq!(id("01a").unwrap(), "01A");
+        let err = id("review").unwrap_err().to_string();
+        assert_eq!(err, "no archived session matches review");
     }
 
     // Unset and empty are the same miss, and the error has to name the

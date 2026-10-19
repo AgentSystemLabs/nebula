@@ -245,6 +245,17 @@ pub(crate) enum Command {
         #[arg(required = true, num_args = 1.., value_name = "SESSION")]
         sessions: Vec<String>,
     },
+    /// Bring archived agent sessions back, as `u` does in the TUI.
+    ///
+    /// Each session is an id or an unambiguous name (a unique part of one
+    /// matches too), looked up among archived sessions only. Every name must
+    /// resolve before any session is restored.
+    #[command(after_help = UNARCHIVE_EXAMPLES)]
+    Unarchive {
+        /// Session ids or names.
+        #[arg(required = true, num_args = 1.., value_name = "SESSION")]
+        sessions: Vec<String>,
+    },
     /// Ask another session a question and print its answer.
     ///
     /// Sends a labelled prompt into the target agent, waits for that turn to
@@ -532,6 +543,12 @@ Examples:
   nebula archive agent-2
   nebula archive agent-2 agent-3 \"Review Question Scanner Diff\"
   nebula archive 01HZY8QHA4AYM7M4XTA2G3KC9B";
+
+const UNARCHIVE_EXAMPLES: &str = "\
+Examples:
+  nebula unarchive agent-2
+  nebula unarchive agent-2 \"Review Question Scanner Diff\"
+  nebula unarchive 01HZY8QHA4AYM7M4XTA2G3KC9B";
 
 const ASK_EXAMPLES: &str = "\
 Examples:
