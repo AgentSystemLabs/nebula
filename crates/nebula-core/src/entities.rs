@@ -69,7 +69,11 @@ pub enum AgentKind {
     /// its positional is the project path, and a session resumes by
     /// `--session <id>`.
     OpenCode,
-    /// Google Antigravity terminal CLI (`agy`); process-based status.
+    /// Google Antigravity terminal CLI (`agy`). Status, conversation-id
+    /// capture (`--conversation <id>`) and guidance/auto-title injection
+    /// come from a managed agy plugin (`hooks::antigravity_plugin`), while
+    /// permission and trust prompts are read off the screen (`pty::question`);
+    /// the first prompt rides `--prompt-interactive`.
     Antigravity,
     /// A user-defined harness from the `custom_harnesses` registry: the
     /// entry id travels beside the session (see `Agent::custom_harness`),

@@ -7,7 +7,7 @@ Everything that can start an AGENT, and what each launch path does differently.
 ## The NEW SESSION PICKER
 
 Press `n` on the grid. A menu asks what to
-run — **Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build**, or **OpenCode** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
+run — **Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build**, **OpenCode**, or **Antigravity** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
 switched off on the settings overlay's Agents tab and drops out of the menu entirely. Turn on `Hide missing CLIs`
 on the Agents tab and the menu lists only enabled harnesses whose CLI is found on PATH (the daemon still
 checks through the login shell at launch). Your own CLIs join the menu too: add them to config.json
@@ -21,7 +21,8 @@ its effort list follows the family, `-fast` variants included — `cursor-agent 
 into the id, so nebula launches `--model claude-opus-5-thinking-high-fast`; the list is a built-in seed
 merged with `--list-models`, cached in `cursor_models.json` beside `config.json` and refreshed daily;
 Pi's model is a fuzzy `--model` pattern — `opus`, `sonnet`, or a `provider/id` you set in `config.json` —
-and its effort is the `--thinking` level, `off` through `max`).
+and its effort is the `--thinking` level, `off` through `max`; Antigravity's model list comes from `agy models`,
+cached in `antigravity_models.json` and refreshed daily, with `--effort` levels `low` through `max`).
 In those submenus you type to filter — `opus` narrows the rows to the Opus families, `↑`/`↓` move, `Backspace` widens, `Esc` clears — and the preset editor's Harness / Model / Effort rows take the same type-ahead.
 `Enter` anywhere takes your configured defaults. On the
 Claude row — and on any row of the Claude model and effort lists under it, whose title then reads
@@ -68,7 +69,7 @@ the life of the SESSION, and nothing in the picker or the settings overlay softe
 permission gate to begin with — nebula passes no flag, and it runs its tools as it sees fit. Muse is
 the same: no flag mapped yet. OpenCode keeps its own permission prompts: nebula passes no `--auto`, so it
 stops and asks like Claude does, and a `permissions_flag` of `--auto` in its `harnesses` entry is how you
-opt out of that. Pick the
+opt out of that. Antigravity (`agy`) likewise keeps its own permission and trust prompts. Pick the
 harness with that in mind, especially in the ROOT WORKTREE.
 
 The same choice reaches the STATUS DOT, because an AGENT can only report what its hook set can see.
@@ -97,7 +98,10 @@ inert outside nebula) that posts OpenCode's `chat.message` as `UserPromptSubmit`
 gated tool's `PostToolUse`, and its `question` tool's `question.asked` / `question.replied` as
 `PreToolUse` / `PostToolUse` — so an OpenCode row goes yellow, red while a permission or a question
 waits on you (one raised from a subagent session included), and green when the turn ends, an aborted
-one included.
+one included. Antigravity loads one managed plugin (`~/.gemini/config/plugins/nebula/`, inert outside
+nebula) whose hooks post `SessionStart`, a turn's first `PreInvocation` as `UserPromptSubmit`, and `Stop`,
+while permission, file-edit, and trust dialogs are read off the session's screen so an Antigravity row
+goes yellow mid-turn, red while a dialog waits on you, and green when the turn ends.
 
 ## AGENT PRESETS
 

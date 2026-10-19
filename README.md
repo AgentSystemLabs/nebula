@@ -99,10 +99,12 @@ Initial tasks use `--prompt-interactive` so the session stays interactive; `--pr
 Model and effort defaults can be configured under `harnesses.antigravity` in config.json.
 The model picker follows `agy models`, cached for one day and refreshed in the background.
 Effort choices are `default`, `low`, `medium`, `high`, `xhigh`, and `max` (agy 1.4.2).
-Resuming with a known conversation ID also submits the relocation notice via `--prompt-interactive`.
-Status is process-based: the card stays running while `agy` is alive. Managed turn/permission hooks
-and automatic conversation-ID capture are not implemented yet. Use `/resume` inside `agy` to recover
-history after a process restart; Nebula only passes `--conversation <id>` when a session ID is known.
+Resuming a session uses the conversation ID captured by the managed agy plugin (`--conversation <id>`),
+and a relocated session also receives the relocation notice via `--prompt-interactive`.
+Status, guidance injection (`SessionStart`), and auto-title injection (`PreInvocation`) come from the
+managed plugin at `~/.gemini/config/plugins/nebula/` (env-guarded, so a bare `agy` outside Nebula is
+unaffected), while permission, file-edit, and trust dialogs are read off the session's screen so the
+card goes red when waiting on you.
 This build uses IPC protocol 51; rebuild/reload the daemon alongside the TUI.
 
 ## Install
