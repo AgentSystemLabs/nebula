@@ -1,4 +1,7 @@
-//! Cursor's ask-question dialog, read off the screen. cursor-agent fires no
+//! Harness dialogs no hook reports, read off the screen: a dialog is open
+//! while every string of one of its marker groups is on screen.
+//!
+//! Cursor's ask-question dialog: cursor-agent fires no
 //! hook for its `AskQuestion` tool — no `preToolUse`, no `postToolUse`, even
 //! though both fire for its shell calls — and drives no OSC 9;4 progress
 //! bar, so the dialog it draws is the only sign the turn is waiting on you
@@ -18,13 +21,55 @@
 //! two flushes shows the box erased in between. Once answered, the CLI's
 //! spinner repaints every quarter second, which is what confirms the close;
 //! a turn that ends before that is finished by its `stop` hook instead.
+//!
+//! Antigravity's permission and trust dialogs: agy fires no hook while one
+//! waits (a PreToolUse reply would have to decide it), so they are read
+//! the same way. Each pairs a headline with the selection legend under its
+//! menu — the headline alone can sit in the transcript the agent printed,
+//! and the legend alone also heads agy's pickers — and the pair leaves the
+//! screen once the dialog is answered (verified on agy 1.4.2 against
+//! captured PTY output; the headlines are agy's own strings).
 
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 /// The dialog's key legend, as the CLI prints it.
 const LEGEND: &str = "Space select · Enter next/submit · Esc to skip";
 
-/// How long the legend has to stay off the screen before the dialog counts
+/// agy's selection-menu legend, the second half of every agy marker group.
+const AGY_MENU_LEGEND: &str = "↑/↓ Navigate ·";
+
+/// The harness dialog to watch for, also persisted across daemon restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DialogKind {
+    CursorQuestion,
+    AntigravityPermission,
+}
+
+impl DialogKind {
+    /// Marker groups: the dialog is open while every string of any one
+    /// group is on screen, in order (a dialog draws its legend under its
+    /// headline, so a menu above a stale headline does not count).
+    pub fn markers(self) -> &'static [&'static [&'static str]] {
+        match self {
+            Self::CursorQuestion => &[&[LEGEND]],
+            Self::AntigravityPermission => &[
+                // Commands, tool calls, access and admin escalation.
+                &["Requesting permission", AGY_MENU_LEGEND],
+                &["Accept this file edit?", AGY_MENU_LEGEND],
+                // A checkout agy has not been told to trust yet — every
+                // fresh worktree, before the session's first turn.
+                &[
+                    "Do you trust the contents of this project?",
+                    AGY_MENU_LEGEND,
+                ],
+                &["Trust this folder?", AGY_MENU_LEGEND],
+            ],
+        }
+    }
+}
+
+/// How long all markers have to stay off the screen before the dialog counts
 /// as closed. Above any split repaint's gap; under the spinner's period.
 pub const CLOSE_SETTLE: Duration = Duration::from_millis(150);
 
@@ -32,24 +77,32 @@ pub const CLOSE_SETTLE: Duration = Duration::from_millis(150);
 const MIN_SIDE: u16 = 2;
 
 pub struct QuestionScanner {
+    markers: &'static [&'static [&'static str]],
     /// No scrollback: only what is on screen now matters.
     parser: vt100::Parser,
     open: bool,
-    /// While open: when the legend was first seen missing.
+    /// While open: when all markers were first seen missing.
     missing_since: Option<Instant>,
 }
 
 impl QuestionScanner {
     /// A screen at the PTY's size with `history` replayed into it. A dialog
     /// already up in it counts as open without an edge: whoever wrote the
-    /// history already acted on it.
-    pub fn new(cols: u16, rows: u16, history: &[u8]) -> Self {
+    /// history already acted on it. Markers match substrings of the screen
+    /// after whitespace and box borders collapse to single spaces.
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        history: &[u8],
+        markers: &'static [&'static [&'static str]],
+    ) -> Self {
         let (cols, rows) = grid_size(cols, rows);
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(history);
-        let open = legend_shown(parser.screen());
+        let open = markers_shown(parser.screen(), markers);
         Self {
             parser,
+            markers,
             open,
             missing_since: None,
         }
@@ -61,9 +114,14 @@ impl QuestionScanner {
     }
 
     /// Feed a chunk of child output. `Some(open)` only on an edge.
+    /// Whether the dialog is up as far as this scanner knows.
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
     pub fn feed(&mut self, data: &[u8], now: Instant) -> Option<bool> {
         self.parser.process(data);
-        if legend_shown(self.parser.screen()) {
+        if markers_shown(self.parser.screen(), self.markers) {
             self.missing_since = None;
             if self.open {
                 return None;
@@ -84,11 +142,16 @@ impl QuestionScanner {
     }
 }
 
-fn legend_shown(screen: &vt100::Screen) -> bool {
+fn markers_shown(screen: &vt100::Screen, markers: &[&[&str]]) -> bool {
     let mut text = String::new();
     let mut gap = false;
     for c in screen.contents().chars() {
-        if c.is_whitespace() || c == '│' {
+        if c.is_whitespace()
+            || matches!(
+                c,
+                '┌' | '┐' | '└' | '┘' | '╭' | '╮' | '╰' | '╯' | '─' | '┃' | '│'
+            )
+        {
             gap = true;
             continue;
         }
@@ -98,7 +161,19 @@ fn legend_shown(screen: &vt100::Screen) -> bool {
         gap = false;
         text.push(c);
     }
-    text.contains(LEGEND)
+    markers.iter().any(|group| in_order(&text, group))
+}
+
+/// Whether every marker occurs in `text`, each after the one before it.
+fn in_order(text: &str, group: &[&str]) -> bool {
+    let mut rest = text;
+    group.iter().all(|marker| match rest.find(marker) {
+        Some(at) => {
+            rest = &rest[at + marker.len()..];
+            true
+        }
+        None => false,
+    })
 }
 
 fn grid_size(cols: u16, rows: u16) -> (u16, u16) {
@@ -152,10 +227,98 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    /// agy's command prompt as agy 1.4.2 draws it (captured off a PTY).
+    fn agy_permission() -> Vec<u8> {
+        concat!(
+            "\x1b[2J\x1b[H● Ran (touch probe.txt) (ctrl+o to expand)\r\n\r\n",
+            "Command\r\n", "────────────────────\r\n\r\n",
+            "Requesting permission for:\r\n", "   touch probe.txt\r\n\r\n",
+            "Run this command?\r\n", "> 1. Yes, run command\r\n",
+            "  2. Yes, and always allow in this conversation for commands that start with 'touch'\r\n",
+            "  4. No, cancel\r\n\r\n",
+            "  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\r\n",
+            "esc to cancel                    Gemini 3.8 Flash · high",
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// agy once the prompt is answered: the call's line, the working footer.
+    fn agy_running() -> Vec<u8> {
+        "\x1b[2J\x1b[H● Ran (touch probe.txt) (ctrl+o to expand)\r\n\r\n⠋ Working\r\nesc to cancel"
+            .as_bytes()
+            .to_vec()
+    }
+
+    #[test]
+    fn agy_permission_prompt_opens_and_closes_once_answered() {
+        let t = Instant::now();
+        let markers = DialogKind::AntigravityPermission.markers();
+        let mut s = QuestionScanner::new(120, 40, b"", markers);
+        assert_eq!(s.feed(&agy_running(), t), None);
+        assert_eq!(s.feed(&agy_permission(), t), Some(true));
+        assert_eq!(s.feed(&agy_running(), t + ms(1000)), None, "first sighting");
+        assert_eq!(s.feed(&agy_running(), t + ms(1200)), Some(false));
+        // A narrow pane wraps the legend; it still reads as one line.
+        let mut s = QuestionScanner::new(30, 40, b"", markers);
+        assert_eq!(s.feed(&agy_permission(), t), Some(true), "wrapped");
+    }
+
+    #[test]
+    fn agy_trust_dialog_opens_but_half_a_marker_group_does_not() {
+        let t = Instant::now();
+        let markers = DialogKind::AntigravityPermission.markers();
+        let trust = "\x1b[2J\x1b[HDo you trust the contents of this project?\r\n\r\n\
+                     > Yes, I trust this folder\r\n  No, exit\r\n\r\n  ↑/↓ Navigate · enter Confirm";
+        let mut s = QuestionScanner::new(120, 40, b"", markers);
+        assert_eq!(s.feed(trust.as_bytes(), t), Some(true));
+        // The headline in the transcript, with no menu under it.
+        let mut s = QuestionScanner::new(120, 40, b"", markers);
+        let quoted =
+            "\x1b[2J\x1b[Hagy shows Requesting permission for: before a command\r\nesc to cancel";
+        assert_eq!(s.feed(quoted.as_bytes(), t), None);
+        // A picker drawn above a headline left behind by an answered prompt.
+        let stale = "\x1b[2J\x1b[HSelect a model\r\n> Gemini\r\n  ↑/↓ Navigate · enter Confirm\r\n\
+                     Requesting permission for:";
+        assert_eq!(s.feed(stale.as_bytes(), t), None, "legend above headline");
+        // A picker's legend, with no permission headline above it.
+        let picker = "\x1b[2J\x1b[HSelect a model\r\n> Gemini\r\n  ↑/↓ Navigate · enter Confirm";
+        assert_eq!(s.feed(picker.as_bytes(), t), None);
+    }
+
+    #[test]
+    fn any_marker_opens_and_switching_markers_keeps_it_open() {
+        let t = Instant::now();
+        let mut s = QuestionScanner::new(120, 40, b"", &[&["Allow access"], &["Confirm action"]]);
+        assert_eq!(s.feed(b"unrelated output", t), None);
+        assert_eq!(
+            s.feed("\x1b[2J\x1b[H╭─╮\r\n┃ Allow\taccess │\r\n╰─╯".as_bytes(), t),
+            Some(true)
+        );
+        assert_eq!(
+            s.feed(b"\x1b[2J\x1b[HConfirm\r\n action", t + ms(500)),
+            None
+        );
+        assert_eq!(s.feed(b"\x1b[2J\x1b[Hgone", t + ms(1000)), None);
+        assert_eq!(s.feed(b"", t + ms(1150)), Some(false));
+    }
+
+    #[test]
+    fn alternate_marker_in_history_is_open_without_an_edge() {
+        let mut s = QuestionScanner::new(
+            120,
+            40,
+            b"second marker",
+            &[&["first marker"], &["second marker"]],
+        );
+        assert_eq!(s.feed(b"", Instant::now()), None);
+        assert!(s.open);
+    }
+
     #[test]
     fn the_dialog_opens_at_once() {
         let t = Instant::now();
-        let mut s = QuestionScanner::new(120, 40, b"");
+        let mut s = QuestionScanner::new(120, 40, b"", DialogKind::CursorQuestion.markers());
         assert_eq!(s.feed(b" \xe2\xa0\x8b Composing\r\n", t), None);
         assert_eq!(s.feed(&dialog(120), t), Some(true));
         assert_eq!(
@@ -169,7 +332,8 @@ mod tests {
     fn a_wrapped_legend_still_matches() {
         let t = Instant::now();
         for width in [40, 50, 64] {
-            let mut s = QuestionScanner::new(width as u16, 40, b"");
+            let mut s =
+                QuestionScanner::new(width as u16, 40, b"", DialogKind::CursorQuestion.markers());
             assert_eq!(s.feed(&dialog(width), t), Some(true), "{width} cols");
         }
     }
@@ -177,7 +341,7 @@ mod tests {
     #[test]
     fn closing_waits_for_the_legend_to_stay_gone() {
         let t = Instant::now();
-        let mut s = QuestionScanner::new(120, 40, b"");
+        let mut s = QuestionScanner::new(120, 40, b"", DialogKind::CursorQuestion.markers());
         s.feed(&dialog(120), t);
         assert_eq!(s.feed(&composing(), t + ms(1000)), None, "first sighting");
         assert_eq!(
@@ -192,12 +356,15 @@ mod tests {
     #[test]
     fn a_repaint_split_across_flushes_is_not_a_close() {
         let t = Instant::now();
-        let mut s = QuestionScanner::new(120, 40, b"");
+        let mut s = QuestionScanner::new(120, 40, b"", DialogKind::CursorQuestion.markers());
         s.feed(&dialog(120), t);
         let frame = dialog(120);
         let (head, tail) = frame.split_at(frame.len() / 2);
         assert_eq!(s.feed(head, t + ms(1000)), None);
-        assert!(!legend_shown(s.parser.screen()), "the head erased the box");
+        assert!(
+            !markers_shown(s.parser.screen(), s.markers),
+            "the head erased the box"
+        );
         assert_eq!(s.feed(tail, t + ms(1001)), None);
         // The half-drawn moment does not count toward a later close.
         assert_eq!(s.feed(&composing(), t + ms(1200)), None);
@@ -206,7 +373,7 @@ mod tests {
     #[test]
     fn a_tail_only_repaint_leaves_it_open() {
         let t = Instant::now();
-        let mut s = QuestionScanner::new(120, 40, b"");
+        let mut s = QuestionScanner::new(120, 40, b"", DialogKind::CursorQuestion.markers());
         s.feed(&dialog(120), t);
         // Ink repaints just the last line when nothing above it changed.
         let tail = b"\x1b[1A\x1b[2K\x1b[G  \xe2\x86\x92 Add a follow-up \xc2\xb7 6%\r\n";
@@ -217,7 +384,8 @@ mod tests {
     #[test]
     fn a_dialog_in_the_history_is_open_without_an_edge() {
         let t = Instant::now();
-        let mut s = QuestionScanner::new(120, 40, &dialog(120));
+        let mut s =
+            QuestionScanner::new(120, 40, &dialog(120), DialogKind::CursorQuestion.markers());
         assert_eq!(s.feed(&dialog(120), t), None);
         s.feed(&composing(), t + ms(100));
         assert_eq!(s.feed(&composing(), t + ms(400)), Some(false));
@@ -227,7 +395,12 @@ mod tests {
     fn a_squeezed_pane_does_not_panic() {
         let t = Instant::now();
         for (cols, rows) in [(0, 0), (1, 1), (2, 2)] {
-            let mut s = QuestionScanner::new(cols, rows, &dialog(120));
+            let mut s = QuestionScanner::new(
+                cols,
+                rows,
+                &dialog(120),
+                DialogKind::CursorQuestion.markers(),
+            );
             s.resize(cols, rows);
             s.feed(&dialog(120), t);
         }

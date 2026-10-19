@@ -605,8 +605,15 @@ impl Daemon {
         if cloud_task.is_some() {
             session.arm_cloud_scan();
         }
-        if agent.kind == AgentKind::Cursor {
-            session.arm_question_scan();
+        match agent.kind {
+            AgentKind::Cursor => {
+                session.arm_question_scan(crate::pty::question::DialogKind::CursorQuestion, true)
+            }
+            AgentKind::Antigravity => session.arm_question_scan(
+                crate::pty::question::DialogKind::AntigravityPermission,
+                true,
+            ),
+            _ => {}
         }
         Ok(session)
     }

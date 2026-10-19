@@ -490,6 +490,8 @@ ID is captured so a restored session resumes via `--conversation`, never implici
 `nebula spawn`, sessions, `nebula open`) as a system message, and a turn's first
 `PreInvocation` carries the auto-title instruction while the session is untitled. The
 hooks are env-guarded, so an `agy` run outside nebula loads the plugin and does nothing.
-agy has no hook for its permission prompts, so an Antigravity session never goes red.
+agy has no hook for its permission prompts, so nebula reads them off the session's screen
+instead: the session goes red while a command or tool permission prompt, a file-edit review or
+the trust dialog of a fresh checkout is up, and back to running once it is answered.
 On resume, `--prompt-interactive` submits the relocation notice to that conversation.
 The built-in ID is `antigravity`, leaving existing custom `agy` entries intact.

@@ -210,6 +210,8 @@ with no managed hooks or automatic capture of its session ID yet. Model and effo
 set through `harnesses.grok` in config.json; the CLI supplies their defaults when unset. An OpenCode
 SESSION does go red: nebula passes no `--auto`, so `opencode` keeps its own permission prompts, and its
 managed plugin reports each one (and each `question` the agent asks you) as it opens and closes.
+An Antigravity SESSION goes red too: agy reports no permission event, so nebula reads its permission,
+file-edit and trust dialogs off the session's screen.
 
 The PROJECT TABS ROLL UP their sessions: each tab carries one dot per state its sessions are in, with
 the count and no word at all — red waiting on you, blue finished unread, yellow mid-turn, in that order

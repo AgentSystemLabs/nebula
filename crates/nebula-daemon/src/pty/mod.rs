@@ -14,7 +14,7 @@ use nebula_core::SessionRef;
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use progress::ProgressScanner;
-use question::QuestionScanner;
+use question::{DialogKind, QuestionScanner};
 use ring::ScrollbackRing;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -205,9 +205,7 @@ pub enum PtyEvent {
     CloudSession {
         id: String,
     },
-    /// Cursor's ask-question dialog came up or went away. Only scanned for
-    /// on cursor-agent sessions (`arm_question_scan`), which fire no hook
-    /// for it (see `pty::question`).
+    /// A harness dialog came up or went away (see `pty::question`).
     Question {
         open: bool,
     },
@@ -245,9 +243,9 @@ pub struct PtySession {
     /// Claude Cloud session id scanner; `None` until a `--cloud` launch
     /// arms it, so ordinary sessions pay nothing.
     cloud: Mutex<Option<CloudScanner>>,
-    /// Cursor's ask-question dialog watcher; `None` until a cursor-agent
+    /// Harness dialog watcher and its kind; `None` until a
     /// session arms it, so other sessions keep no screen for it.
-    question: Mutex<Option<QuestionScanner>>,
+    question: Mutex<Option<(DialogKind, QuestionScanner)>>,
     /// Screen for answering cursor position reports; `None` until the child
     /// first asks, so sessions that never do parse nothing.
     cursor: Mutex<Option<CursorTracker>>,
@@ -372,8 +370,8 @@ impl PtySession {
         if cloud_scan {
             session.arm_cloud_scan();
         }
-        if question_scan {
-            session.arm_question_scan();
+        if let Some(kind) = question_scan {
+            session.arm_question_scan(kind, false);
         }
         Ok(session)
     }
@@ -410,7 +408,7 @@ impl PtySession {
             progress_busy: self.progress.lock().busy(),
             title: self.title.lock().title().map(str::to_string),
             cloud_scan: self.cloud.lock().is_some(),
-            question_scan: self.question.lock().is_some(),
+            question_scan: self.question.lock().as_ref().map(|(kind, _)| *kind),
         }))
     }
 
@@ -436,7 +434,7 @@ impl PtySession {
         if let Some(cursor) = self.cursor.lock().as_mut() {
             cursor.resize(cols, rows);
         }
-        if let Some(question) = self.question.lock().as_mut() {
+        if let Some((_, question)) = self.question.lock().as_mut() {
             question.resize(cols, rows);
         }
         Ok(())
@@ -624,16 +622,25 @@ impl PtySession {
         }
     }
 
-    /// Start watching this cursor-agent child's screen for its
-    /// ask-question dialog (see `pty::question`); edges then arrive as
+    /// Start watching this child's screen for the selected
+    /// harness dialog (see `pty::question`); edges then arrive as
     /// `PtyEvent::Question`. The screen is built from the ring under the
     /// scanner's lock, which the pump takes before it appends a chunk, so
-    /// no byte is missed or fed twice.
-    pub fn arm_question_scan(&self) {
+    /// no byte is missed or fed twice. A dialog already on screen counts as
+    /// acted on when `fresh` is false (a restored session: the previous
+    /// image saw it); on a `fresh` spawn nobody has, so it is announced — a
+    /// fast CLI can draw its launch dialog (agy's trust prompt) first.
+    pub fn arm_question_scan(&self, kind: DialogKind, fresh: bool) {
         let mut slot = self.question.lock();
         let (cols, rows) = *self.last_size.lock();
         let (_, history) = self.snapshot(None);
-        *slot = Some(QuestionScanner::new(cols, rows, &history));
+        let scanner = QuestionScanner::new(cols, rows, &history, kind.markers());
+        let announce = fresh && scanner.is_open();
+        *slot = Some((kind, scanner));
+        drop(slot);
+        if announce {
+            let _ = self.events.send(PtyEvent::Question { open: true });
+        }
     }
 
     /// The bytes owed to the child for one chunk's queries, in query order.
@@ -690,10 +697,29 @@ pub struct Carried {
     /// prints (`arm_cloud_scan`).
     #[serde(default)]
     pub cloud_scan: bool,
-    /// A cursor-agent session watched for its ask-question dialog
+    /// The harness dialog watched on this session
     /// (`arm_question_scan`).
-    #[serde(default)]
-    pub question_scan: bool,
+    #[serde(default, deserialize_with = "deserialize_question_scan")]
+    pub question_scan: Option<DialogKind>,
+}
+
+/// Older named MessagePack handoffs stored only whether Cursor scanning was armed.
+fn deserialize_question_scan<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<DialogKind>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Armed {
+        Legacy(bool),
+        Kind(DialogKind),
+    }
+    Ok(
+        Option::<Armed>::deserialize(deserializer)?.and_then(|armed| match armed {
+            Armed::Legacy(true) => Some(DialogKind::CursorQuestion),
+            Armed::Legacy(false) => None,
+            Armed::Kind(kind) => Some(kind),
+        }),
+    )
 }
 
 /// Blocks until the child exits; its exit code, when the OS gave one.
@@ -881,7 +907,7 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             .question
             .lock()
             .as_mut()
-            .and_then(|scanner| scanner.feed(pending, std::time::Instant::now()));
+            .and_then(|(_, scanner)| scanner.feed(pending, std::time::Instant::now()));
         let seq = session.ring.lock().append(pending);
         let _ = session.events.send(PtyEvent::Output {
             seq,
@@ -1099,6 +1125,74 @@ mod tests {
         assert_eq!(title, "✳ Fix Login");
         assert_eq!(session.window_title().as_deref(), Some("✳ Fix Login"));
         session.kill();
+    }
+
+    /// A dialog the child drew before the scan was armed is announced on a
+    /// fresh spawn (nobody has acted on it), and stays quiet on a restore.
+    #[tokio::test]
+    async fn a_dialog_drawn_before_arming_is_announced_only_when_fresh() {
+        let spawn = || {
+            PtySession::spawn(
+                SessionRef::Agent(AgentId::generate()),
+                SpawnSpec {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "printf 'Do you trust the contents of this project?\\r\\n\
+                         > Yes, I trust this folder\\r\\n  ↑/↓ Navigate · enter Confirm'; sleep 5"
+                            .into(),
+                    ],
+                    cwd: std::env::temp_dir(),
+                    env: vec![],
+                    scrub_env: &[],
+                    cols: DEFAULT_COLS,
+                    rows: DEFAULT_ROWS,
+                },
+            )
+            .unwrap()
+        };
+        let drawn = |session: &Arc<PtySession>| {
+            let session = session.clone();
+            async move {
+                while !String::from_utf8_lossy(&session.snapshot(None).1).contains("Navigate") {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+        let fresh = spawn();
+        tokio::time::timeout(std::time::Duration::from_secs(10), drawn(&fresh))
+            .await
+            .expect("dialog drawn within 10s");
+        let mut rx = fresh.events.subscribe();
+        fresh.arm_question_scan(DialogKind::AntigravityPermission, true);
+        let open = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(PtyEvent::Question { open }) = rx.recv().await {
+                    break open;
+                }
+            }
+        })
+        .await
+        .expect("an announced dialog");
+        assert!(open);
+        fresh.kill();
+
+        let restored = spawn();
+        tokio::time::timeout(std::time::Duration::from_secs(10), drawn(&restored))
+            .await
+            .expect("dialog drawn within 10s");
+        let mut rx = restored.events.subscribe();
+        restored.arm_question_scan(DialogKind::AntigravityPermission, false);
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            loop {
+                if let Ok(PtyEvent::Question { .. }) = rx.recv().await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(quiet.is_err(), "a restored dialog is not re-announced");
+        restored.kill();
     }
 
     /// The pane is nebula's grid, not the terminal the daemon was started

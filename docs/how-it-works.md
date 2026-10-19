@@ -227,8 +227,12 @@
   `.agents/`) whose env-guarded hooks POST agy's own payloads: `SessionStart` (its reply injects nebula's
   guidance as a system message, agy having no system-prompt flag), a turn's first `PreInvocation` →
   `UserPromptSubmit` (`invocationNum` restarts at 0 every turn), and `Stop`. agy fires no hook for its
-  permission prompts, and a `PreToolUse` reply would have to decide them, so an Antigravity session is
-  never red.
+  permission prompts (a `PreToolUse` reply would have to decide them), so they are read off the screen
+  the way Cursor's question dialog is: each dialog's headline (`Requesting permission`, `Accept this
+  file edit?`, the trust prompt a fresh checkout raises) together with the `↑/↓ Navigate ·` legend of
+  its menu turns the session red, and both gone for 150 ms turns it back — the pair, because agy
+  leaves a stale headline behind once the menu is answered, and shows the same legend under its
+  pickers.
 - **Sessions title themselves.** Create a session with the default name and the agent renames it after
   your first prompt — a 3-4 word title describing the ask (e.g. `Fix Login Redirect`), via a
   `nebula rename <title>` command the CLI runs in its own turn (no extra API calls, no MCP server).

@@ -31,7 +31,8 @@ use std::time::Duration;
 /// The state-file format this build writes, and the newest it reads. A
 /// daemon only restarts onto a binary whose `_restart-version` is at least
 /// its own, so a change that an older reader could misread bumps this.
-pub const VERSION: u32 = 2;
+// v3 stores the armed dialog kind instead of a boolean.
+pub const VERSION: u32 = 3;
 
 /// A request older than this is a leftover, not a client still waiting.
 const REQUEST_MAX_AGE_MS: i64 = 60_000;
@@ -429,6 +430,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn question_scan_reads_legacy_named_messagepack_handoffs() {
+        use crate::pty::question::DialogKind;
+        let base = serde_json::json!({
+            "sref": nebula_core::SessionRef::Agent(AgentId("a".into())),
+            "master_fd": 9, "pid": 1234, "size": [120, 40],
+            "ring_start_seq": 0, "ring": []
+        });
+        for (value, expected) in [
+            (
+                Some(serde_json::json!(true)),
+                Some(DialogKind::CursorQuestion),
+            ),
+            (Some(serde_json::json!(false)), None),
+            (None, None),
+            (Some(serde_json::json!(null)), None),
+        ] {
+            let mut old = base.clone();
+            if let Some(value) = value {
+                old["question_scan"] = value;
+            }
+            let bytes = rmp_serde::to_vec_named(&old).unwrap();
+            let carried: Carried = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(carried.question_scan, expected);
+        }
+        for kind in [
+            DialogKind::CursorQuestion,
+            DialogKind::AntigravityPermission,
+        ] {
+            let mut value = base.clone();
+            value["question_scan"] = serde_json::to_value(kind).unwrap();
+            let bytes = rmp_serde::to_vec_named(&value).unwrap();
+            let carried: Carried = rmp_serde::from_slice(&bytes).unwrap();
+            let bytes = rmp_serde::to_vec_named(&carried).unwrap();
+            let back: Carried = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back.question_scan, Some(kind));
+        }
+    }
+
+    #[test]
     fn state_round_trips_with_its_rings() {
         let state = State {
             version: VERSION,
@@ -450,7 +490,7 @@ mod tests {
                     progress_busy: Some(true),
                     title: Some("✳ Fix Login".into()),
                     cloud_scan: true,
-                    question_scan: true,
+                    question_scan: Some(crate::pty::question::DialogKind::AntigravityPermission),
                 },
                 spare: false,
                 launching: true,
@@ -468,7 +508,11 @@ mod tests {
         );
         assert_eq!(pty.title.as_deref(), Some("✳ Fix Login"));
         assert!(pty.bracketed_paste);
-        assert!(pty.cloud_scan && pty.question_scan && back.sessions[0].launching);
+        assert!(pty.cloud_scan && back.sessions[0].launching);
+        assert_eq!(
+            pty.question_scan,
+            Some(crate::pty::question::DialogKind::AntigravityPermission)
+        );
     }
 
     #[test]
@@ -485,7 +529,7 @@ mod tests {
             progress_busy: None,
             title: None,
             cloud_scan: false,
-            question_scan: false,
+            question_scan: None,
         };
         let carry = Carry {
             nonce: String::new(),
