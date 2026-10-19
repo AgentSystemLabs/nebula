@@ -265,8 +265,8 @@
   Built-in Claude only; a row on an exact id (a Bedrock id from `claude_models`) keeps it while
   Claude stays in that family.
 - **Cards show what they were last asked.** The `prompt` field of the `UserPromptSubmit` payload —
-  which every hooked harness sends — is condensed to one line in the hook receiver, kept on the AGENT
-  row (the newest ten, in SQLite), and the newest is drawn on the session's card with an ago label.
+  or, for Antigravity, the latest user request in its transcript — is condensed to one line in the
+  hook receiver, kept on the AGENT row (the newest ten, in SQLite), and the newest is drawn on the session's card with an ago label.
   Pure capture: nothing is injected into the
   model's context and no extra turn runs. See [Sessions](sessions.md#recent-prompts).
 - **The header counts what is waiting on the repo.** The GRID's header says

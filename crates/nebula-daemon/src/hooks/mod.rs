@@ -22,6 +22,7 @@
 //! name is not the one Claude holds (CLAUDE TITLE SYNC, `session_title.rs`).
 
 pub mod antigravity_plugin;
+mod antigravity_prompt;
 pub mod installer;
 pub mod opencode_plugin;
 pub mod pi_extension;
@@ -173,8 +174,9 @@ pub struct HookPayload {
     /// (`beforeSubmitPrompt`) all name it `prompt`, and pi's extension
     /// posts it under the same key.
     pub prompt: Option<String>,
-    /// Claude's transcript file; its directory is where the session title
-    /// lives (`<dir>/<session_id>/custom-title.json`).
+    /// Claude's or agy's transcript file. Claude's directory is where the
+    /// session title lives (`<dir>/<session_id>/custom-title.json`).
+    #[serde(alias = "transcriptPath")]
     pub transcript_path: Option<String>,
     /// Cursor names the resumable chat id `conversation_id` (== its
     /// `session_id`, but only the alias is guaranteed on every event);
@@ -488,10 +490,18 @@ async fn receive_hook(
     // The prompt rides only its own event, condensed here so the channel
     // never carries a pasted file whole.
     let prompt = match event {
-        HookEvent::UserPromptSubmit => payload
-            .prompt
-            .as_deref()
-            .and_then(crate::prompt_history::condense),
+        HookEvent::UserPromptSubmit => {
+            let captured = if agy && payload.prompt.is_none() {
+                antigravity_prompt::read(payload.transcript_path.as_deref()).await
+            } else {
+                None
+            };
+            payload
+                .prompt
+                .as_deref()
+                .or(captured.as_deref())
+                .and_then(crate::prompt_history::condense)
+        }
         _ => None,
     };
     // Built before the event moves into the delivery; read only by agy.
@@ -832,7 +842,18 @@ mod tests {
             let (payload, token) = (payload.to_string(), token.to_string());
             async move { http_post(env.port, &path, &token, &payload).await }
         };
-        let turn_start = r#"{"conversationId":"c1","workspacePaths":["/tmp/p"],"invocationNum":0}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            include_bytes!("fixtures/antigravity-transcript.jsonl"),
+        )
+        .unwrap();
+        let turn_start = serde_json::json!({
+            "conversationId": "c1", "workspacePaths": ["/tmp/p"],
+            "invocationNum": 0, "transcriptPath": path,
+        })
+        .to_string();
 
         let (status, body) = post(
             "pending",
@@ -854,7 +875,7 @@ mod tests {
 
         // A turn's first model call is the prompt submit, with the
         // instruction riding a one-turn message while the row is pending.
-        let (_, body) = post("pending", "PreInvocation", turn_start, &env.token).await;
+        let (_, body) = post("pending", "PreInvocation", &turn_start, &env.token).await;
         let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             reply["injectSteps"][0]["ephemeralMessage"],
@@ -862,9 +883,13 @@ mod tests {
         );
         let delivery = rx.recv().await.unwrap();
         assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
+        assert_eq!(
+            delivery.prompt.as_deref(),
+            Some("Reply with exactly: nebula prompt probe")
+        );
         assert_eq!(delivery.session_id.as_deref(), Some("c1"));
         assert_eq!(delivery.cwd.as_deref(), Some("/tmp/p"));
-        let (_, body) = post("titled", "PreInvocation", turn_start, &env.token).await;
+        let (_, body) = post("titled", "PreInvocation", &turn_start, &env.token).await;
         assert_eq!(body, AGY_EMPTY);
         assert_eq!(rx.recv().await.unwrap().event, HookEvent::UserPromptSubmit);
 
