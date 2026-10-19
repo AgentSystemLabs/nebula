@@ -66,9 +66,16 @@ const LOGIN_SHELL_ARGS: [&str; 3] = ["-l", "-i", "-c"];
 /// give the login shell `/dev/null` as stdin while it sources rc files.
 /// Shell startup tools that auto-`exec` only when stdin is a TTY (Iris-style
 /// autocomplete launchers) then leave the `-c` payload alone. The payload
-/// reopens `/dev/tty` before starting the agent, so the CLI itself remains
-/// fully interactive.
-const LOGIN_SHELL_STDIN_SHIM: &str = "exec </dev/null; exec \"$@\"";
+/// reopens the concrete PTY device before starting the agent, so the CLI
+/// itself remains fully interactive without inheriting macOS's kqueue-hostile
+/// `/dev/tty` alias.
+const LOGIN_SHELL_STDIN_SHIM: &str = "\
+NEBULA_PANE_TTY=$(tty 2>/dev/null); \
+[ \"$NEBULA_PANE_TTY\" != \"not a tty\" ] || NEBULA_PANE_TTY=; \
+: \"${NEBULA_PANE_TTY:=/dev/tty}\"; \
+export NEBULA_PANE_TTY; \
+exec </dev/null; \
+exec \"$@\"";
 /// Cap on one CLI probe. A heavy rc file costs ~1s; a hung one must not
 /// stall a create forever, so on timeout the CLI is assumed present and
 /// the spawn itself gets to report.
@@ -832,9 +839,9 @@ fn resolve_harness_in(
 /// its own — which is why `PtySession::kill` sweeps the whole tree rather
 /// than one group.
 ///
-/// The wrapper process feeds `/dev/null` to the shell while those files run,
-/// then the prelude reopens `/dev/tty` and restates what the pane is *after*
-/// startup:
+/// The wrapper process records the PTY device, feeds `/dev/null` to the shell
+/// while those files run, then the prelude reopens that concrete device and
+/// restates what the pane is *after* startup:
 /// `TERM` and `COLORTERM` name nebula's own grid — 24-bit colour whatever
 /// the host terminal — and `NO_COLOR` / `FORCE_COLOR` are dropped. A
 /// login-only profile that exports `NO_COLOR` reaches a session here and
@@ -856,7 +863,11 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
 /// TERMINAL's `.nebula.json` `run`, pipes and `&&` and all — behind the
 /// same prelude.
 fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
-    let mut cmdline = String::from("exec </dev/tty; unset");
+    let mut cmdline = format!(
+        "exec <\"${{{}:-/dev/tty}}\"; unset {}",
+        env::PANE_TTY,
+        env::PANE_TTY
+    );
     for name in env::PANE_COLOR_OVERRIDES {
         cmdline.push(' ');
         cmdline.push_str(name);
@@ -1982,7 +1993,8 @@ mod tests {
     /// What every agent launch runs once the login shell's files have run,
     /// ahead of the command itself.
     const PANE_ENV: &str =
-        "unset NO_COLOR FORCE_COLOR; export TERM=xterm-256color COLORTERM=truecolor;";
+        "unset NEBULA_PANE_TTY NO_COLOR FORCE_COLOR; export TERM=xterm-256color COLORTERM=truecolor;";
+    const PTY_REOPEN: &str = r#"exec <"${NEBULA_PANE_TTY:-/dev/tty}"; "#;
 
     #[test]
     fn cli_probe_line_looks_the_program_up_verbatim() {
@@ -2034,18 +2046,15 @@ mod tests {
                 "-l",
                 "-i",
                 "-c",
-                &format!("exec </dev/tty; {PANE_ENV} claude '--resume' 'sid-1'")
+                &format!("{PTY_REOPEN}{PANE_ENV} claude '--resume' 'sid-1'")
             ]
         );
         // Single quotes in an arg survive the wrapping.
         let (_, args) = login_shell_wrap("/bin/zsh", "echo", &["it's".to_string()]);
-        assert_eq!(
-            args[7],
-            format!(r"exec </dev/tty; {PANE_ENV} echo 'it'\''s'")
-        );
+        assert_eq!(args[7], format!(r"{PTY_REOPEN}{PANE_ENV} echo 'it'\''s'"));
         // A command word that isn't a plain name is quoted like an argument.
         let (_, args) = login_shell_wrap("/bin/zsh", "my tool", &[]);
-        assert_eq!(args[7], format!("exec </dev/tty; {PANE_ENV} 'my tool'"));
+        assert_eq!(args[7], format!("{PTY_REOPEN}{PANE_ENV} 'my tool'"));
     }
 
     /// The command word resolves through the shell, so an alias or function
@@ -2065,7 +2074,7 @@ mod tests {
             .arg(format!(
                 "claude() {{ printf 'routed %s' \"$*\"; }}; {}",
                 args[7]
-                    .strip_prefix("exec </dev/tty; ")
+                    .strip_prefix(PTY_REOPEN)
                     .expect("launch line restores the PTY before the command")
             ))
             .output()
@@ -2102,7 +2111,7 @@ mod tests {
         let mut zsh_args = args[4..7].to_vec();
         zsh_args.push(
             args[7]
-                .strip_prefix("exec </dev/tty; ")
+                .strip_prefix(PTY_REOPEN)
                 .expect("launch line restores the PTY before the command")
                 .to_string(),
         );
@@ -2143,7 +2152,7 @@ mod tests {
             .arg("-c")
             .arg(
                 args[7]
-                    .strip_prefix("exec </dev/tty; ")
+                    .strip_prefix(PTY_REOPEN)
                     .expect("launch line restores the PTY before the command"),
             )
             .env("NO_COLOR", "1")

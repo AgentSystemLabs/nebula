@@ -27,6 +27,9 @@ pub const IMPORT_BUNDLE: &str = "NEBULA_IMPORT_BUNDLE";
 /// Replaces every agent CLI with one command line, taken verbatim (tests
 /// stand in `/bin/sh` or a stub script for `claude`).
 pub const AGENT_CMD: &str = "NEBULA_AGENT_CMD";
+/// Concrete PTY device path captured before a login-shell launch temporarily
+/// puts `/dev/null` on stdin for rc-file startup.
+pub const PANE_TTY: &str = "NEBULA_PANE_TTY";
 /// Idle-session reaper sweep period in ms; tests shorten it.
 pub const IDLE_REAP_MS: &str = "NEBULA_IDLE_REAP_MS";
 /// External-worktree sync probe period in ms; tests shorten it.

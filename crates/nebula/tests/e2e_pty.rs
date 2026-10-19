@@ -3370,7 +3370,7 @@ async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
                 "fi\n",
                 "claude() {{\n",
                 "  if [ -t 0 ]; then tty=tty; else tty=notty; fi\n",
-                "  echo \"claude $tty $*\" > '{d}/claude-ran'\n",
+                "  echo \"claude $tty stdin=$(tty) pane=${NEBULA_PANE_TTY-unset} $*\" > '{d}/claude-ran'\n",
                 "  sleep 600\n",
                 "}}\n",
             ),
@@ -3407,10 +3407,12 @@ async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
     .await
     .expect("the rc-defined claude function should run");
     let ran = std::fs::read_to_string(&marker).unwrap();
-    assert!(
-        ran.starts_with("claude tty --append-system-prompt "),
-        "{ran:?}"
-    );
+    let fields: Vec<_> = ran.split_whitespace().collect();
+    assert_eq!(fields.first(), Some(&"claude"), "{ran:?}");
+    assert_eq!(fields.get(1), Some(&"tty"), "{ran:?}");
+    assert_ne!(fields.get(2), Some(&"stdin=/dev/tty"), "{ran:?}");
+    assert_eq!(fields.get(3), Some(&"pane=unset"), "{ran:?}");
+    assert_eq!(fields.get(4), Some(&"--append-system-prompt"), "{ran:?}");
     assert!(
         !dir.join("iris").exists(),
         "the rc autostart hook should not have taken over the PTY"
