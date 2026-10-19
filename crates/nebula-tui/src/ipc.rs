@@ -518,6 +518,92 @@ pub async fn list_sessions(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `nebula archive <session>...`: archive agent sessions by id or name,
+/// as `a` does in the TUI (the PTY is killed, the row is kept and `u`
+/// brings it back). Every target resolves before any is archived, so a
+/// typo archives nothing, and the session this runs inside is refused.
+pub async fn archive_sessions(targets: &[String]) -> Result<()> {
+    let mut conn = session_context_connection("archive").await?;
+    let sessions = fetch_sessions(&mut conn).await?;
+    let caller = env::non_empty(env::AGENT_ID);
+    let mut picked: Vec<&SessionSummary> = Vec::new();
+    for target in targets {
+        let session = resolve_archive_target(&sessions, target)?;
+        if caller.as_deref() == Some(session.id.as_str()) {
+            bail!("{target} is the session running this command; archive it from the TUI");
+        }
+        if !picked.iter().any(|p| p.id == session.id) {
+            picked.push(session);
+        }
+    }
+    for session in picked {
+        let SessionRef::Agent(id) = &session.session else {
+            unreachable!("resolve_archive_target only returns agent sessions");
+        };
+        let req_id = ONE_SHOT_REQ_ID;
+        write_frame(
+            &mut conn.stream,
+            &ClientRequest::ArchiveAgent {
+                req_id,
+                id: id.clone(),
+            },
+        )
+        .await?;
+        match await_reply(&mut conn, req_id).await? {
+            Reply::Ack => println!("archived {} ({})", session.name, session.id),
+            Reply::Error(message) => bail!("archive {}: {message}", session.name),
+        }
+    }
+    Ok(())
+}
+
+/// One agent session for `nebula archive`: an exact id or name, else the
+/// one whose id or name contains `raw` (case-insensitive). Unlike `read`,
+/// project and branch never match — a project name would hit every
+/// session in it.
+fn resolve_archive_target<'a>(
+    sessions: &'a [SessionSummary],
+    raw: &str,
+) -> Result<&'a SessionSummary> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("session name or id is empty");
+    }
+    let agents = || {
+        sessions
+            .iter()
+            .filter(|s| matches!(s.session, SessionRef::Agent(_)))
+    };
+    let pick = |found: Vec<&'a SessionSummary>| -> Option<Result<&'a SessionSummary>> {
+        match found.as_slice() {
+            [] => None,
+            [one] => Some(Ok(*one)),
+            many => Some(Err(anyhow::anyhow!(
+                "{raw} matches {} sessions ({}); use an id",
+                many.len(),
+                many.iter()
+                    .map(|s| format!("{} {}", s.id, s.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    };
+    let exact = agents()
+        .filter(|s| s.id.eq_ignore_ascii_case(raw) || s.name.eq_ignore_ascii_case(raw))
+        .collect();
+    if let Some(result) = pick(exact) {
+        return result;
+    }
+    let needle = raw.to_ascii_lowercase();
+    let fuzzy = agents()
+        .filter(|s| {
+            s.id.to_ascii_lowercase().contains(&needle)
+                || s.name.to_ascii_lowercase().contains(&needle)
+        })
+        .collect();
+    pick(fuzzy).unwrap_or_else(|| bail!("no agent session matches {raw}"))
+}
+
 pub async fn read_session(session: &str, lines: u32) -> Result<()> {
     let mut conn = session_context_connection("read").await?;
     let req_id = ONE_SHOT_REQ_ID;
@@ -1207,6 +1293,55 @@ fn send_signal(pid: i32, sig: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(session: SessionRef, id: &str, name: &str, project: &str) -> SessionSummary {
+        SessionSummary {
+            session,
+            id: id.into(),
+            name: name.into(),
+            project_id: ProjectId("p".into()),
+            project: project.into(),
+            worktree_id: WorktreeId("w".into()),
+            worktree: "/tmp/p".into(),
+            branch: "main".into(),
+            harness: "codex".into(),
+            status: "idle".into(),
+            alive: true,
+            summary: String::new(),
+        }
+    }
+
+    #[test]
+    fn archive_targets_resolve_by_id_or_name_never_project() {
+        let agent = |id: &str| SessionRef::Agent(AgentId(id.into()));
+        let rows = vec![
+            summary(agent("01A"), "01A", "agent-1", "nebula"),
+            summary(agent("01B"), "01B", "agent-12", "nebula"),
+            summary(
+                agent("01C"),
+                "01C",
+                "Review Question Scanner Diff",
+                "nebula",
+            ),
+            summary(
+                SessionRef::Terminal(TerminalId("t1".into())),
+                "t1",
+                "shell",
+                "nebula",
+            ),
+        ];
+        let id = |raw: &str| resolve_archive_target(&rows, raw).map(|s| s.id.clone());
+        // An exact name wins over the longer name it is part of.
+        assert_eq!(id("agent-1").unwrap(), "01A");
+        assert_eq!(id("01b").unwrap(), "01B");
+        assert_eq!(id("question scanner").unwrap(), "01C");
+        let err = id("agent").unwrap_err().to_string();
+        assert!(err.contains("matches 2 sessions"), "{err}");
+        // A project name is not a session name, and terminals are not agents.
+        assert!(id("nebula").is_err());
+        assert!(id("shell").is_err());
+        assert!(id("  ").is_err());
+    }
 
     // Unset and empty are the same miss, and the error has to name the
     // command the model just ran so it knows why it can't work here.

@@ -22,6 +22,7 @@ nebula open <file>…         show files/images/diagrams in file tabs     (agent
 nebula sessions             list every session across every project     (agents run this)
 nebula read <session>       read recent context from another session    (agents run this)
 nebula ask <session> <q>    ask another session and print its answer    (agents run this)
+nebula archive <session>... archive agent sessions, as `a` does in the TUI
 nebula config <cmd>         back up, restore or locate this machine's settings
 nebula browser              serve this TUI in a web browser via ttyd
 nebula ssh <host>           open nebula on a remote host over ssh
@@ -93,6 +94,11 @@ nebula ask <session> "<question>" [--timeout S] [--no-wait]
                           # send a labelled question into another local agent, wait for that turn
                           # to finish, and print the answer. A busy target is queued until idle by
                           # default; --no-wait fails fast instead.
+nebula archive <session>...
+                          # archive agent sessions by id or name (an exact match, else a unique
+                          # part of one; never a project or branch): the process stops, the row
+                          # is kept, and `u` in the TUI brings it back. Every name resolves before
+                          # anything is archived, and the session running the command is refused.
 ```
 
 ## Settings

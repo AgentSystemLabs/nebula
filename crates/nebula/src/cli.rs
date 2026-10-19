@@ -233,6 +233,18 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = 200)]
         lines: u32,
     },
+    /// Archive agent sessions, as `a` does in the TUI.
+    ///
+    /// Each session is an id or an unambiguous name (a unique part of one
+    /// matches too). Its process is stopped and its row kept: `u` in the
+    /// TUI brings it back. Every name must resolve before any session is
+    /// archived, and the session running this command is refused.
+    #[command(after_help = ARCHIVE_EXAMPLES)]
+    Archive {
+        /// Session ids or names.
+        #[arg(required = true, num_args = 1.., value_name = "SESSION")]
+        sessions: Vec<String>,
+    },
     /// Ask another session a question and print its answer.
     ///
     /// Sends a labelled prompt into the target agent, waits for that turn to
@@ -514,6 +526,12 @@ const READ_EXAMPLES: &str = "\
 Examples:
   nebula read research
   nebula read 01HZY8QHA4AYM7M4XTA2G3KC9B --lines 80";
+
+const ARCHIVE_EXAMPLES: &str = "\
+Examples:
+  nebula archive agent-2
+  nebula archive agent-2 agent-3 \"Review Question Scanner Diff\"
+  nebula archive 01HZY8QHA4AYM7M4XTA2G3KC9B";
 
 const ASK_EXAMPLES: &str = "\
 Examples:

@@ -125,6 +125,11 @@ pub fn run_read_session(session: &str, lines: u32) -> Result<()> {
     runtime()?.block_on(ipc::read_session(session, lines))
 }
 
+/// `nebula archive <session>...` (see `ipc::archive_sessions`).
+pub fn run_archive(sessions: &[String]) -> Result<()> {
+    runtime()?.block_on(ipc::archive_sessions(sessions))
+}
+
 pub fn run_ask_session(session: &str, question: String, timeout: u64, wait: bool) -> Result<()> {
     runtime()?.block_on(ipc::ask_session(session, &question, timeout, wait))
 }
