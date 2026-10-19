@@ -397,6 +397,7 @@ pub enum SettingKind {
     PrewarmSessions,
     DoneSound,
     FeedbackSound,
+    DesktopNotifications,
     PresetText,
     DeleteEmptyWorktree,
     AutoCleanupMerged,
@@ -489,6 +490,7 @@ impl SettingKind {
             | SettingKind::QuickPromptFocus => (2026, 8, 29),
             // v0.23.0 / v0.24.0
             SettingKind::FeedbackSound
+            | SettingKind::DesktopNotifications
             | SettingKind::WorktreeBaseBranch
             | SettingKind::PrewarmAgents
             | SettingKind::PrewarmSessions => (2026, 9, 9),
@@ -623,7 +625,13 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::FeedbackSound,
                 label: "Feedback sound",
-                hint: "Ring, and notify an unfocused window, when a turn stops to ask you (off silences both)",
+                hint: "Ring when a turn stops to ask you: off, the terminal bell, or a macOS system sound",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::DesktopNotifications,
+                label: "Desktop notifications",
+                hint: "Native notifications for unfocused sessions that ask, finish, or fail (daemon-owned; works with no TUI)",
                 group: "",
             },
             SettingSpec {
@@ -1045,10 +1053,12 @@ pub struct Config {
     /// What rings when a turn stops at NEEDS FEEDBACK — a permission
     /// prompt or a question the agent is parked on. Same values and
     /// resolution as `done_sound`; `Sosumi` by default so red and green
-    /// sound different from the next room. The one knob for both the
-    /// FEEDBACK SOUND and the desktop notification an unfocused terminal
-    /// window gets: "off" silences the pair.
+    /// sound different from the next room.
     pub feedback_sound: String,
+    /// Native desktop notifications for sessions that need feedback, finish,
+    /// or fail while no focused TUI is typing at them. Owned by the daemon,
+    /// so notifications still fire when no TUI is attached.
+    pub desktop_notifications: bool,
     /// PRESET TEXT: which side of the task a new AGENT PRESET's text goes
     /// — `prefix` (one box, sent before the task), `postfix` (one box,
     /// sent after it) or `prefix & postfix` (both). The PRESET EDITOR
@@ -1495,6 +1505,7 @@ impl Default for Config {
             prewarm_sessions: true,
             done_sound: "Glass".into(),
             feedback_sound: "Sosumi".into(),
+            desktop_notifications: true,
             preset_text: PresetText::DEFAULT.as_str().into(),
             delete_empty_worktree: false,
             auto_cleanup_merged: false,
@@ -2348,6 +2359,7 @@ impl Config {
             SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
             SettingKind::DoneSound => self.done_sound.clone(),
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
+            SettingKind::DesktopNotifications => on_off(self.desktop_notifications).into(),
             SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::DeleteEmptyWorktree => on_off(self.delete_empty_worktree).into(),
             SettingKind::AutoCleanupMerged => on_off(self.auto_cleanup_merged).into(),
@@ -2435,6 +2447,9 @@ impl Config {
             }
             SettingKind::FeedbackSound => {
                 self.feedback_sound = cycle_choice(&self.feedback_sound, SOUNDS, step).into();
+            }
+            SettingKind::DesktopNotifications => {
+                self.desktop_notifications = !self.desktop_notifications;
             }
             SettingKind::PresetText => {
                 // Cycled from the resolved side, so a hand edit off the
@@ -3557,7 +3572,11 @@ mod tests {
         cfg.save_to(&path).unwrap();
         let loaded = load_from(&path);
         assert_eq!(loaded.feedback_sound, "off");
-        assert_eq!(loaded.feedback_sound(), None, "off is silence for both");
+        assert_eq!(
+            loaded.feedback_sound(),
+            None,
+            "off silences the feedback sound"
+        );
         assert_eq!(loaded.done_sound, "Glass");
 
         // The same resolution as the done sound: the bell over ssh and off
@@ -3569,6 +3588,34 @@ mod tests {
             resolve_sound("Sosumi", false, true),
             Some(Sound::File(Path::new(MACOS_SOUNDS_DIR).join("Sosumi.aiff")))
         );
+    }
+
+    #[test]
+    fn desktop_notifications_default_on_and_toggle_on_sessions_tab() {
+        let mut cfg = Config::default();
+        assert!(cfg.desktop_notifications);
+        assert_eq!(cfg.value_label(SettingKind::DesktopNotifications), "on");
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(old.desktop_notifications);
+
+        let (tab, row) = locate(SettingKind::DesktopNotifications).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        assert_eq!(
+            locate(SettingKind::FeedbackSound).unwrap(),
+            (tab, row - 1),
+            "the switch sits next to the feedback sound it complements"
+        );
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.desktop_notifications);
+        assert_eq!(cfg.value_label(SettingKind::DesktopNotifications), "off");
+        cfg.cycle(tab, row, -1);
+        assert!(cfg.desktop_notifications);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.desktop_notifications = false;
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).desktop_notifications);
     }
 
     #[test]
@@ -4498,7 +4545,7 @@ mod tests {
         assert!(!cfg.remember_harness);
     }
 
-    /// PRESET TEXT: a Sessions row after the sounds, `prefix` by default,
+    /// PRESET TEXT: a Sessions row after the notification rows, `prefix` by default,
     /// cycling the three sides and persisted under `preset_text`; a hand
     /// edit off the list reads as the default, and `both` as the long
     /// label.
@@ -4519,8 +4566,12 @@ mod tests {
 
         let (tab, row) = locate(SettingKind::PresetText).unwrap();
         assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
-        let (sound_tab, sound_row) = locate(SettingKind::FeedbackSound).unwrap();
-        assert_eq!((sound_tab, sound_row + 1), (tab, row), "after the sounds");
+        let (notify_tab, notify_row) = locate(SettingKind::DesktopNotifications).unwrap();
+        assert_eq!(
+            (notify_tab, notify_row + 1),
+            (tab, row),
+            "after the notification rows"
+        );
         cfg.cycle(tab, row, 1);
         assert_eq!(cfg.preset_text(), PresetText::Postfix);
         cfg.cycle(tab, row, 1);

@@ -104,6 +104,7 @@ impl Daemon {
                         changed_at,
                         unseen,
                     });
+                    self.maybe_notify_status_change(agent_id, status);
                 }
                 Effect::SaveSessionId(sid) => {
                     if let Err(e) = self.store.set_agent_session_id(agent_id, Some(&sid)) {
@@ -112,5 +113,45 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    fn maybe_notify_status_change(&self, agent_id: &AgentId, status: AgentStatus) {
+        let Some(kind) = crate::notifications::NotificationKind::of(status) else {
+            return;
+        };
+        if !crate::config::Config::load().desktop_notifications {
+            return;
+        }
+        if self.session_is_focused(&SessionRef::Agent(agent_id.clone())) {
+            return;
+        }
+        let Ok(Some(agent)) = self.store.get_agent(agent_id) else {
+            return;
+        };
+        let (project, branch) = self
+            .store
+            .get_worktree(&agent.worktree_id)
+            .ok()
+            .flatten()
+            .map(|worktree| {
+                let project = self
+                    .store
+                    .get_project(&worktree.project_id)
+                    .ok()
+                    .flatten()
+                    .map(|p| p.name)
+                    .unwrap_or_default();
+                (project, worktree.branch)
+            })
+            .unwrap_or_default();
+        let place = match (project.is_empty(), branch.is_empty()) {
+            (false, false) => format!("{project} - {branch}"),
+            (true, false) => branch,
+            _ => String::new(),
+        };
+        self.notifications.notify(
+            agent_id,
+            crate::notifications::Notification::new(kind, agent.name, place),
+        );
     }
 }

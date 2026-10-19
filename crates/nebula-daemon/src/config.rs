@@ -29,6 +29,11 @@ pub struct Config {
     /// reaped session revives on the next attach or prewarm (agents resume
     /// their conversation). Malformed values fall back to the 5m default.
     pub session_idle_timeout: String,
+    /// Post native desktop notifications when an unfocused session needs
+    /// feedback, finishes, or fails. The daemon owns this so alerts still
+    /// fire when no TUI is attached; missing desktop notification commands
+    /// fail soft in the log.
+    pub desktop_notifications: bool,
     /// The branch every new WORKTREE nobody named a base for starts from
     /// — a project's **New worktree**, a bare `nebula worktree`, the QUICK
     /// PROMPT's auto-created one. Empty (the default) means origin's own
@@ -74,6 +79,7 @@ impl Default for Config {
             prewarm_agents: true,
             prewarm_sessions: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
+            desktop_notifications: true,
             worktree_base_branch: String::new(),
             custom_harnesses: Vec::new(),
             harnesses: BTreeMap::new(),
@@ -180,6 +186,7 @@ mod tests {
         let (cfg, skipped) = nebula_core::settings::parse_lenient::<Config>(&obj);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert!(!cfg.prewarm_agents && !cfg.prewarm_sessions);
+        assert!(cfg.desktop_notifications);
         assert_eq!(cfg.session_idle_timeout, "30m");
         assert_eq!(cfg.worktree_base_branch, "develop");
         assert_eq!(cfg.custom_harnesses.len(), 1, "the legacy list reads");
@@ -287,5 +294,14 @@ mod tests {
         assert!(cfg.prewarm_sessions);
         let cfg: Config = serde_json::from_str(r#"{"prewarm_sessions": false}"#).unwrap();
         assert!(!cfg.prewarm_sessions);
+    }
+
+    #[test]
+    fn desktop_notifications_default_on_and_allow_opt_out() {
+        assert!(Config::default().desktop_notifications);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.desktop_notifications);
+        let cfg: Config = serde_json::from_str(r#"{"desktop_notifications": false}"#).unwrap();
+        assert!(!cfg.desktop_notifications);
     }
 }

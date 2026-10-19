@@ -19,6 +19,7 @@ use nebula_core::{
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -219,6 +220,12 @@ pub struct Daemon {
     /// — so an attach replays how the run ended instead of running it
     /// again. Dropped when the run starts again, is stopped, or its row goes.
     finished_runs: Mutex<HashMap<TerminalId, FinishedRun>>,
+    /// Per-client session focus, reported by focused TUI windows. A status
+    /// change for one of these sessions is already in front of the user, so
+    /// daemon desktop notifications skip it.
+    focused_sessions: Mutex<HashMap<u64, SessionRef>>,
+    next_client_id: AtomicU64,
+    notifications: crate::notifications::NotificationCenter,
 }
 
 mod exit;
@@ -254,7 +261,37 @@ impl Daemon {
             prewarm_sweep: Mutex::new(None),
             resumes: Mutex::new(HashMap::new()),
             finished_runs: Mutex::new(HashMap::new()),
+            focused_sessions: Mutex::new(HashMap::new()),
+            next_client_id: AtomicU64::new(1),
+            notifications: crate::notifications::NotificationCenter::new(),
         })
+    }
+
+    pub(crate) fn next_client_id(&self) -> u64 {
+        self.next_client_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_focused_session(&self, client_id: u64, session: Option<SessionRef>) {
+        let mut focused = self.focused_sessions.lock();
+        match session {
+            Some(session) => {
+                focused.insert(client_id, session);
+            }
+            None => {
+                focused.remove(&client_id);
+            }
+        }
+    }
+
+    pub(crate) fn clear_focused_session(&self, client_id: u64) {
+        self.focused_sessions.lock().remove(&client_id);
+    }
+
+    pub(crate) fn session_is_focused(&self, session: &SessionRef) -> bool {
+        self.focused_sessions
+            .lock()
+            .values()
+            .any(|focused| focused == session)
     }
 
     pub(crate) async fn store_blocking<T, F>(self: &Arc<Self>, f: F) -> Result<T>
@@ -2168,6 +2205,30 @@ mod tests {
                 token: String::new(),
             },
         )
+    }
+
+    #[test]
+    fn focused_sessions_are_tracked_per_client_and_cleared() {
+        let daemon = test_daemon();
+        let first = daemon.next_client_id();
+        let second = daemon.next_client_id();
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+
+        daemon.set_focused_session(first, Some(a1.clone()));
+        assert!(daemon.session_is_focused(&a1));
+        assert!(!daemon.session_is_focused(&a2));
+
+        daemon.set_focused_session(second, Some(a2.clone()));
+        assert!(daemon.session_is_focused(&a1));
+        assert!(daemon.session_is_focused(&a2));
+
+        daemon.set_focused_session(first, None);
+        assert!(!daemon.session_is_focused(&a1));
+        assert!(daemon.session_is_focused(&a2));
+
+        daemon.clear_focused_session(second);
+        assert!(!daemon.session_is_focused(&a2));
     }
 
     #[test]

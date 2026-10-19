@@ -2,6 +2,30 @@
 
 use super::*;
 
+const FOCUSED_SESSION_PROTOCOL: u32 = 51;
+
+pub(crate) fn active_focused_session(app: &App) -> Option<SessionRef> {
+    (app.chrome.window_focused && app.nav.focus == Focus::Terminal && app.pane.term_locked)
+        .then(|| app.pane.term.as_ref().map(|term| term.sref.clone()))
+        .flatten()
+}
+
+pub(crate) fn report_focused_session(
+    app: &mut App,
+    protocol_version: u32,
+    out: &mut Vec<ClientRequest>,
+) {
+    if protocol_version < FOCUSED_SESSION_PROTOCOL {
+        return;
+    }
+    let focused = active_focused_session(app);
+    if app.chrome.reported_focused_session == focused {
+        return;
+    }
+    app.chrome.reported_focused_session = focused.clone();
+    out.push(ClientRequest::SetFocusedSession { session: focused });
+}
+
 macro_rules! main_loop_body {
     ($terminal:ident, $channels:ident) => {{
 
@@ -447,6 +471,7 @@ macro_rules! main_loop_body {
             handle_vim_event(&mut app, ev);
         }
         note_preview_change(&mut app, preview_before);
+        report_focused_session(&mut app, $channels.protocol_version, &mut out);
 
         // A worker thread panicked: the loop is fine, the default hook's
         // message is smeared over the alternate screen, and the crash log
@@ -492,15 +517,17 @@ macro_rules! main_loop_body {
         }
 
         // One or more turns stopped to ask the user: ring the FEEDBACK
-        // SOUND once for the lot and, while the $terminal window is in the
-        // background, name each of them in a desktop notification — never
-        // over ssh, where the desktop is the wrong machine's. `off` is
-        // silence for both.
+        // SOUND once for the lot. New daemons own desktop notifications so
+        // they still work with no TUI attached; the old TUI notifier stays
+        // only as a compatibility fallback for older daemons.
         let alerts = std::mem::take(&mut app.chrome.pending_feedback);
         if !alerts.is_empty() {
             if let Some(sound) = crate::config::Config::load().feedback_sound() {
                 alerts::play_sound($terminal.backend_mut(), sound);
-                if !app.chrome.window_focused && !app.chrome.is_remote {
+                if $channels.protocol_version < FOCUSED_SESSION_PROTOCOL
+                    && !app.chrome.window_focused
+                    && !app.chrome.is_remote
+                {
                     alerts::notify_desktop(&alerts);
                 }
             }

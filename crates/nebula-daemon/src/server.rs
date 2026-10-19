@@ -74,6 +74,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
 }
 
 struct ClientConnection {
+    id: u64,
     daemon: Arc<Daemon>,
     out_tx: mpsc::Sender<ServerEvent>,
     attached: HashMap<SessionRef, tokio::task::JoinHandle<()>>,
@@ -83,7 +84,9 @@ struct ClientConnection {
 
 impl ClientConnection {
     fn new(daemon: Arc<Daemon>, out_tx: mpsc::Sender<ServerEvent>) -> Self {
+        let id = daemon.next_client_id();
         Self {
+            id,
             daemon,
             out_tx,
             attached: HashMap::new(),
@@ -114,6 +117,10 @@ impl ClientConnection {
             } => self.handle_attach(session, from_seq, cols, rows).await,
             ClientRequest::Detach { session } => {
                 self.handle_detach(session);
+                Ok(true)
+            }
+            ClientRequest::SetFocusedSession { session } => {
+                self.daemon.set_focused_session(self.id, session);
                 Ok(true)
             }
             ClientRequest::Input { session, data } => {
@@ -1064,6 +1071,7 @@ impl ClientConnection {
     }
 
     async fn cleanup(&mut self) {
+        self.daemon.clear_focused_session(self.id);
         for (sref, h) in self.attached.drain() {
             h.abort();
             self.daemon.note_detached(&sref);

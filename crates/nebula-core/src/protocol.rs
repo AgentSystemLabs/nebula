@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 50;
+pub const PROTOCOL_VERSION: u32 = 51;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -64,6 +64,13 @@ pub enum ClientRequest {
     },
     Detach {
         session: SessionRef,
+    },
+    /// The session currently under the user's hands in a focused TUI window,
+    /// or `None` when this client is not actively typing at a session.
+    /// The daemon uses this only to suppress desktop notifications for the
+    /// thing the user is already looking at.
+    SetFocusedSession {
+        session: Option<SessionRef>,
     },
     Input {
         session: SessionRef,
