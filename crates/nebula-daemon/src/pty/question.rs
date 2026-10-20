@@ -57,6 +57,14 @@ impl DialogKind {
         }
     }
 
+    /// The dialog for a session on a harness speaking `hook_dialect`: a
+    /// custom harness wrapping agy (`hooks: antigravity`) draws agy's
+    /// dialogs and fires no hook for them either, so it scans like agy. A
+    /// harness with no dialect falls back to its own kind.
+    pub fn for_harness(kind: AgentKind, hook_dialect: Option<AgentKind>) -> Option<Self> {
+        Self::for_agent(hook_dialect.unwrap_or(kind))
+    }
+
     /// Marker groups: the dialog is open while every string of any one
     /// group is on screen, in order and each within [`MAX_DIALOG_ROWS`] of
     /// the one before — a dialog draws its legend just under its headline,
@@ -179,13 +187,13 @@ impl QuestionScanner {
 
 fn markers_shown(screen: &vt100::Screen, markers: &[&[&str]]) -> bool {
     let mut text = String::new();
-    // The screen row each byte of `text` came from.
-    let mut rows = Vec::new();
-    let mut row = 0;
+    // Where each screen row after the first starts in `text`: one entry per
+    // row rather than one per byte, since this runs on every output flush.
+    let mut row_starts = Vec::new();
     let mut gap = false;
     for c in screen.contents().chars() {
         if c == '\n' {
-            row += 1;
+            row_starts.push(text.len());
         }
         if c.is_whitespace()
             || matches!(
@@ -198,29 +206,32 @@ fn markers_shown(screen: &vt100::Screen, markers: &[&[&str]]) -> bool {
         }
         if gap && !text.is_empty() {
             text.push(' ');
-            rows.push(row);
         }
         gap = false;
         text.push(c);
-        rows.resize(text.len(), row);
     }
-    markers.iter().any(|group| grouped(&text, &rows, group))
+    markers
+        .iter()
+        .any(|group| grouped(&text, &row_starts, group))
 }
 
 /// Whether `group` occurs in `text` in order, each marker the nearest one
 /// above the next and no more than [`MAX_DIALOG_ROWS`] rows above it.
 /// Anchored on every sighting of the last marker, walking back from it.
-fn grouped(text: &str, rows: &[usize], group: &[&str]) -> bool {
+fn grouped(text: &str, row_starts: &[usize], group: &[&str]) -> bool {
     let Some((last, before)) = group.split_last() else {
         return false;
     };
+    // The row a byte of `text` was read from. A gap's space sits at the
+    // start of the row its next character came from.
+    let row = |at: usize| row_starts.partition_point(|&start| start <= at);
     text.match_indices(last).any(|(anchor, _)| {
         let mut at = anchor;
         before
             .iter()
             .rev()
             .all(|marker| match text[..at].rfind(marker) {
-                Some(found) if rows[at] - rows[found] <= MAX_DIALOG_ROWS => {
+                Some(found) if row(at) - row(found) <= MAX_DIALOG_ROWS => {
                     at = found;
                     true
                 }
@@ -236,6 +247,30 @@ fn grid_size(cols: u16, rows: u16) -> (u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A custom harness wrapping agy scans like agy; one with no dialect,
+    /// or a dialect without a screen-read dialog, scans nothing.
+    #[test]
+    fn the_harness_dialect_picks_the_dialog() {
+        assert_eq!(
+            DialogKind::for_harness(AgentKind::Custom, Some(AgentKind::Antigravity)),
+            Some(DialogKind::AntigravityPermission)
+        );
+        assert_eq!(
+            DialogKind::for_harness(AgentKind::Custom, Some(AgentKind::Cursor)),
+            Some(DialogKind::CursorQuestion)
+        );
+        assert_eq!(DialogKind::for_harness(AgentKind::Custom, None), None);
+        assert_eq!(
+            DialogKind::for_harness(AgentKind::Custom, Some(AgentKind::Claude)),
+            None
+        );
+        assert_eq!(
+            DialogKind::for_harness(AgentKind::Antigravity, None),
+            Some(DialogKind::AntigravityPermission),
+            "a builtin with its hooks cleared still draws its dialogs"
+        );
+    }
 
     /// The dialog as cursor-agent paints it at `width` columns: the
     /// previous frame erased, then the box. The legend wraps inside the

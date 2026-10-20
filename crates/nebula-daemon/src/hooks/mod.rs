@@ -492,7 +492,11 @@ async fn receive_hook(
     let prompt = match event {
         HookEvent::UserPromptSubmit => {
             let captured = if agy && payload.prompt.is_none() {
-                antigravity_prompt::read(payload.transcript_path.as_deref()).await
+                antigravity_prompt::read(
+                    payload.transcript_path.as_deref(),
+                    payload.conversation_id.as_deref(),
+                )
+                .await
             } else {
                 None
             };
@@ -843,7 +847,8 @@ mod tests {
             async move { http_post(env.port, &path, &token, &payload).await }
         };
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transcript.jsonl");
+        let path = dir.path().join("c1").join("transcript.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
             include_bytes!("fixtures/antigravity-transcript.jsonl"),

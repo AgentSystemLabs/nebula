@@ -605,7 +605,9 @@ impl Daemon {
         if cloud_task.is_some() {
             session.arm_cloud_scan();
         }
-        if let Some(kind) = crate::pty::question::DialogKind::for_agent(agent.kind) {
+        if let Some(kind) =
+            crate::pty::question::DialogKind::for_harness(agent.kind, harness.hook_dialect())
+        {
             session.arm_question_scan(kind, true);
         }
         Ok(session)

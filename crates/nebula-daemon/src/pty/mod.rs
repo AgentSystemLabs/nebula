@@ -219,10 +219,11 @@ enum ReaderMsg {
 pub struct PtySession {
     pub sref: SessionRef,
     // PTY lock order: writer/master are independent operation locks; scanner
-    // locks are fed one at a time before appending to `ring`. The only
-    // intentional nested scanner path is cursor/question setup before a ring
-    // snapshot so no bytes are missed; code must not take `ring` and then a
-    // scanner lock.
+    // locks are fed one at a time before appending to `ring`. The intentional
+    // nested scanner paths are cursor/question setup before a ring snapshot
+    // so no bytes are missed, and the pump holding `question` across its
+    // ring append until that flush's dialog edge is sent; code must not take
+    // `ring` and then a scanner lock.
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     /// Child pid: drives the SIGHUP → SIGKILL escalation (the child is its
@@ -637,7 +638,7 @@ impl PtySession {
         let scanner = QuestionScanner::new(cols, rows, &history, kind.markers());
         let announce = fresh && scanner.is_open();
         *slot = Some((kind, scanner));
-        drop(slot);
+        // Under the lock, like every other edge (see `settle_question`).
         if announce {
             let _ = self.events.send(PtyEvent::Question { open: true });
         }
@@ -887,9 +888,10 @@ async fn settle_question(session: std::sync::Weak<PtySession>) {
     let Some(session) = session.upgrade() else {
         return;
     };
-    let edge = session
-        .question
-        .lock()
+    // Sent under the scanner's lock, as the pump sends its own edges, so
+    // the two never publish out of the order they changed the state in.
+    let mut slot = session.question.lock();
+    let edge = slot
         .as_mut()
         .and_then(|(_, scanner)| scanner.feed(b"", std::time::Instant::now()));
     if let Some(open) = edge {
@@ -922,7 +924,12 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             Some(scanner) => scanner.feed(pending),
             None => Vec::new(),
         };
-        let (question_edge, settle) = match session.question.lock().as_mut() {
+        // Held until this flush's edge is sent: the settle timer feeds the
+        // same scanner, and an edge published after the lock dropped could
+        // land behind a newer one (a close overtaking the reopen after it).
+        // Scanner before ring is the lock order `arm_question_scan` takes.
+        let mut question = session.question.lock();
+        let (question_edge, settle) = match question.as_mut() {
             Some((_, scanner)) => {
                 let edge = scanner.feed(pending, std::time::Instant::now());
                 (edge, scanner.take_settle_request())
@@ -957,6 +964,7 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             tracing::debug!(session = ?session.sref, open, "child question dialog changed");
             let _ = session.events.send(PtyEvent::Question { open });
         }
+        drop(question);
     };
 
     let mut last_flush: Option<tokio::time::Instant> = None;
@@ -1256,6 +1264,57 @@ mod tests {
         .await
         .expect("open and settled close within 10s");
         assert_eq!(edges, [true, false]);
+        session.kill();
+    }
+
+    /// A dialog redrawn just as the settle re-check fires races the pump
+    /// against the timer on another worker: whichever wins, the edges
+    /// alternate and the last one matches the scanner, so the row never
+    /// reads running while the dialog is up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redraw_racing_the_settle_check_keeps_edges_in_order() {
+        let draw = "printf '\\033[2J\\033[HRequesting permission\\r\\n> Allow\\r\\n  ↑/↓ Navigate · enter Confirm'";
+        let script = format!(
+            "sleep 0.3; {draw}; for i in 1 2 3 4 5 6; do sleep 0.3; \
+             printf '\\033[2J\\033[H> '; sleep 0.16; {draw}; done; sleep 5"
+        );
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        let mut rx = session.events.subscribe();
+        session.arm_question_scan(DialogKind::AntigravityPermission, true);
+        let mut edges = Vec::new();
+        // The script draws for ~3s; collect until it has gone quiet.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if let Ok(PtyEvent::Question { open }) = rx.recv().await {
+                    edges.push(open);
+                }
+            }
+        })
+        .await;
+        assert_eq!(edges.first(), Some(&true), "{edges:?}");
+        assert!(
+            edges.windows(2).all(|pair| pair[0] != pair[1]),
+            "edges alternate: {edges:?}"
+        );
+        let open = session
+            .question
+            .lock()
+            .as_ref()
+            .is_some_and(|(_, scanner)| scanner.is_open());
+        assert!(open, "the dialog is up at the end");
+        assert_eq!(edges.last(), Some(&open), "{edges:?}");
         session.kill();
     }
 

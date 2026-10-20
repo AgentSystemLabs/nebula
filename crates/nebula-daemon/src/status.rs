@@ -255,6 +255,11 @@ pub struct AgentStatusMachine {
     /// While `needs_feedback`: an `AskUserQuestion` is among the open
     /// dialogs, so no tool event but its own `PostToolUse` leaves red.
     question_open: bool,
+    /// A screen-read dialog (`HookEvent::Question`) raised on a `fresh`
+    /// row: a launch dialog — agy's trust prompt on a new checkout — that
+    /// comes before any turn, so answering it returns the row to `fresh`
+    /// rather than starting a turn nobody submitted.
+    dialog_before_turn: bool,
     /// When the status last left `needs_feedback` — the user answered, or
     /// the turn ended around the dialog. A `permission_prompt` notification
     /// inside `LATE_PROMPT_NOTIFICATION_GRACE` of it is a late echo.
@@ -287,6 +292,7 @@ impl AgentStatusMachine {
             subagent_alive_at: None,
             waiting_on: None,
             question_open: false,
+            dialog_before_turn: false,
             feedback_left_at: None,
             launch_idle_pending: false,
             relocating: false,
@@ -512,12 +518,24 @@ impl AgentStatusMachine {
                         self.status,
                         AgentStatus::Terminated | AgentStatus::Disconnected
                     ) {
+                        if self.status != AgentStatus::NeedsFeedback {
+                            self.dialog_before_turn = self.status == AgentStatus::Fresh;
+                        }
                         self.wait_on(Origin::Foreground, true, &mut effects);
                     }
                 } else if self.status == AgentStatus::NeedsFeedback {
-                    // Answered or skipped: the turn carries on either way.
-                    // A turn that already ended keeps its own status.
-                    self.set_status(AgentStatus::Running, &mut effects);
+                    // Answered or skipped: the turn carries on either way —
+                    // or, for a launch dialog, has still to start. A turn
+                    // that already ended keeps its own status.
+                    let back = if self.dialog_before_turn {
+                        AgentStatus::Fresh
+                    } else {
+                        AgentStatus::Running
+                    };
+                    self.set_status(back, &mut effects);
+                }
+                if !open {
+                    self.dialog_before_turn = false;
                 }
             }
             HookEvent::SessionEnded { exit_code } => {
@@ -859,6 +877,33 @@ mod tests {
         assert_eq!(status_of(&fx), Some(AgentStatus::Running));
         let fx = m.handle(HookEvent::Stop, Some("ses_1"), now);
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    /// agy's trust prompt on a fresh launch comes before any turn: red
+    /// while it waits, then back to fresh — not running — once answered,
+    /// so the row neither reads busy nor escapes the idle reaper. A dialog
+    /// inside a turn still returns to running.
+    #[test]
+    fn a_launch_dialog_returns_the_row_to_fresh() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        let fx = m.handle(HookEvent::Question { open: true }, None, now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        let fx = m.handle(HookEvent::Question { open: false }, None, now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Fresh));
+
+        m.handle(HookEvent::UserPromptSubmit, Some("c1"), now);
+        m.handle(HookEvent::Question { open: true }, None, now);
+        let fx = m.handle(HookEvent::Question { open: false }, None, now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+
+        // A prompt submitted while the launch dialog was up started a turn.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        m.handle(HookEvent::Question { open: true }, None, now);
+        m.handle(HookEvent::UserPromptSubmit, Some("c1"), now);
+        let fx = m.handle(HookEvent::Question { open: false }, None, now);
+        assert_eq!(status_of(&fx), None);
+        assert_eq!(m.status(), AgentStatus::Running);
     }
 
     /// Cursor's ask-question dialog, seen on its screen since no hook
