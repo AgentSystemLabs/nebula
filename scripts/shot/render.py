@@ -105,12 +105,21 @@ NEEDED_GLYPHS = "2500 256d 25b8"
 def default_font():
     if os.path.exists(MENLO):
         return MENLO
-    if shutil.which("fc-match"):
-        found = subprocess.run(["fc-match", "-f", "%{file}", "monospace:charset=" + NEEDED_GLYPHS],
-                               capture_output=True, text=True).stdout.strip()
-        if found:
-            return found
-    sys.exit("render.py: no Menlo and no fc-match to find a monospace font; pass --font <path>")
+    fc_match = shutil.which("fc-match")
+    if not fc_match:
+        sys.exit("render.py: no Menlo and no fc-match to find a monospace font; pass --font <path>")
+    try:
+        done = subprocess.run([fc_match, "-f", "%{file}", "monospace:charset=" + NEEDED_GLYPHS],
+                              capture_output=True, text=True)
+    except OSError as e:
+        sys.exit("render.py: could not run fc-match (%s); pass --font <path>" % e)
+    if done.returncode != 0:
+        detail = done.stderr.strip() or "exit status %d" % done.returncode
+        sys.exit("render.py: fc-match failed (%s); pass --font <path>" % detail)
+    found = done.stdout.strip()
+    if not found:
+        sys.exit("render.py: fc-match found no monospace font with box-drawing glyphs; pass --font <path>")
+    return found
 
 
 def render(grid, out, font_path, size):
