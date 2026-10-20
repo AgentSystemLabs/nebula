@@ -524,12 +524,22 @@ pub async fn list_sessions(json: bool) -> Result<()> {
 /// typo archives nothing, and the session this runs inside is refused.
 pub async fn archive_sessions(targets: &[String]) -> Result<()> {
     let mut conn = session_context_connection("archive").await?;
-    let sessions = fetch_sessions(&mut conn).await?;
     let caller = env::non_empty(env::AGENT_ID);
+    archive_over(&mut conn, targets, caller.as_deref()).await
+}
+
+/// [`archive_sessions`] past the connect, with the calling session's id
+/// passed in rather than read from the environment, so tests can drive it.
+async fn archive_over(
+    conn: &mut Connection,
+    targets: &[String],
+    caller: Option<&str>,
+) -> Result<()> {
+    let sessions = fetch_sessions(conn).await?;
     let mut picked: Vec<&SessionSummary> = Vec::new();
     for target in targets {
         let session = resolve_archive_target(&sessions, target)?;
-        if caller.as_deref() == Some(session.id.as_str()) {
+        if caller == Some(session.id.as_str()) {
             bail!("{target} is the session running this command; archive it from the TUI");
         }
         if !picked.iter().any(|p| p.id == session.id) {
@@ -549,7 +559,7 @@ pub async fn archive_sessions(targets: &[String]) -> Result<()> {
             },
         )
         .await?;
-        match await_reply(&mut conn, req_id).await? {
+        match await_reply(conn, req_id).await? {
             Reply::Ack => println!("archived {} ({})", session.name, session.id),
             Reply::Error(message) => bail!("archive {}: {message}", session.name),
         }
@@ -632,6 +642,11 @@ fn resolve_by_id_or_name<'a, T>(
 /// agents alone. Every target resolves before any is restored.
 pub async fn unarchive_sessions(targets: &[String]) -> Result<()> {
     let mut conn = session_context_connection("unarchive").await?;
+    unarchive_over(&mut conn, targets).await
+}
+
+/// [`unarchive_sessions`] past the connect, so tests can drive it.
+async fn unarchive_over(conn: &mut Connection, targets: &[String]) -> Result<()> {
     write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
     let agents = loop {
         match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
@@ -660,7 +675,7 @@ pub async fn unarchive_sessions(targets: &[String]) -> Result<()> {
             },
         )
         .await?;
-        match await_reply(&mut conn, req_id).await? {
+        match await_reply(conn, req_id).await? {
             Reply::Ack => println!("unarchived {} ({})", agent.name, agent.id),
             Reply::Error(message) => bail!("unarchive {}: {message}", agent.name),
         }
@@ -1424,6 +1439,193 @@ mod tests {
         assert_eq!(id("01a").unwrap(), "01A");
         let err = id("review").unwrap_err().to_string();
         assert_eq!(err, "no archived session matches review");
+    }
+
+    fn archived_agent(id: &str, name: &str, archived: bool) -> Agent {
+        Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId("w".into()),
+            name: name.into(),
+            status: nebula_core::AgentStatus::Running,
+            archived,
+            archived_at: 0,
+            unseen: false,
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: !archived,
+            issue_url: None,
+            role: nebula_core::AgentRole::Worker,
+            recent_prompts: Vec::new(),
+        }
+    }
+
+    /// A daemon on the far end of a socket pair for the archive commands:
+    /// it lists `sessions`, snapshots `agents`, acks every archive and
+    /// unarchive except of the ids in `refuse`, and once the client hangs
+    /// up returns what it was asked to archive or unarchive, in order.
+    fn fake_archive_daemon(
+        sessions: Vec<SessionSummary>,
+        agents: Vec<Agent>,
+        refuse: &'static [&'static str],
+    ) -> (Connection, tokio::task::JoinHandle<Vec<String>>) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let daemon = tokio::spawn(async move {
+            let mut asked = Vec::new();
+            while let Some(req) = read_frame::<ClientRequest, _>(&mut server).await.unwrap() {
+                let (req_id, id) = match req {
+                    ClientRequest::ListSessions { req_id } => {
+                        let sessions = sessions.clone();
+                        let reply = ServerEvent::SessionList { req_id, sessions };
+                        write_frame(&mut server, &reply).await.unwrap();
+                        continue;
+                    }
+                    ClientRequest::Subscribe => {
+                        let reply = ServerEvent::Snapshot {
+                            projects: Vec::new(),
+                            worktrees: Vec::new(),
+                            agents: agents.clone(),
+                            terminals: Vec::new(),
+                            links: Vec::new(),
+                            pr_seen: Vec::new(),
+                            ui_state: None,
+                        };
+                        write_frame(&mut server, &reply).await.unwrap();
+                        continue;
+                    }
+                    ClientRequest::ArchiveAgent { req_id, id } => {
+                        asked.push(format!("archive {}", id.0));
+                        (req_id, id)
+                    }
+                    ClientRequest::UnarchiveAgent { req_id, id } => {
+                        asked.push(format!("unarchive {}", id.0));
+                        (req_id, id)
+                    }
+                    other => panic!("archive commands never send {other:?}"),
+                };
+                let reply = if refuse.contains(&id.0.as_str()) {
+                    ServerEvent::Error {
+                        req_id: Some(req_id),
+                        message: "refused".into(),
+                    }
+                } else {
+                    ServerEvent::Ack {
+                        req_id,
+                        created: None,
+                    }
+                };
+                write_frame(&mut server, &reply).await.unwrap();
+            }
+            asked
+        });
+        let conn = Connection {
+            stream: client,
+            daemon_pid: 1,
+            protocol_version: PROTOCOL_VERSION,
+        };
+        (conn, daemon)
+    }
+
+    fn archive_rows() -> Vec<SessionSummary> {
+        let agent = |id: &str| SessionRef::Agent(AgentId(id.into()));
+        vec![
+            summary(agent("01A"), "01A", "agent-1", "nebula"),
+            summary(agent("01B"), "01B", "agent-12", "nebula"),
+            summary(agent("01C"), "01C", "Fix login", "nebula"),
+        ]
+    }
+
+    /// Run `nebula archive` against [`fake_archive_daemon`]: its result,
+    /// and the requests the daemon saw.
+    async fn archive_against(
+        targets: &[&str],
+        caller: Option<&str>,
+        refuse: &'static [&'static str],
+    ) -> (Result<()>, Vec<String>) {
+        let (mut conn, daemon) = fake_archive_daemon(archive_rows(), Vec::new(), refuse);
+        let targets: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
+        let result = archive_over(&mut conn, &targets, caller).await;
+        drop(conn);
+        (result, daemon.await.unwrap())
+    }
+
+    // Every target resolves before any is archived: a typo, an ambiguous
+    // name or the caller itself anywhere in the list stops every PTY kill.
+    #[tokio::test]
+    async fn archive_sends_nothing_unless_every_target_resolves() {
+        let (result, asked) = archive_against(&["01C", "nope"], None, &[]).await;
+        let err = result.unwrap_err().to_string();
+        assert_eq!(err, "no agent session matches nope");
+        assert!(asked.is_empty(), "{asked:?}");
+
+        let (result, asked) = archive_against(&["01C", "agent"], None, &[]).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("matches 2 sessions"), "{err}");
+        assert!(asked.is_empty(), "{asked:?}");
+
+        let (result, asked) = archive_against(&["01C", "agent-1"], Some("01A"), &[]).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("is the session running this command"), "{err}");
+        assert!(asked.is_empty(), "{asked:?}");
+    }
+
+    #[tokio::test]
+    async fn archive_sends_one_request_per_session_named() {
+        let (result, asked) =
+            archive_against(&["agent-1", "01a", "login", "Fix login"], Some("01B"), &[]).await;
+        result.unwrap();
+        assert_eq!(asked, ["archive 01A", "archive 01C"]);
+    }
+
+    // A refusal is the error, and the sessions after it are left running.
+    #[tokio::test]
+    async fn archive_stops_at_the_first_daemon_error() {
+        let (result, asked) = archive_against(&["01A", "01B", "01C"], None, &["01B"]).await;
+        let err = result.unwrap_err().to_string();
+        assert_eq!(err, "archive agent-12: refused");
+        assert_eq!(asked, ["archive 01A", "archive 01B"]);
+    }
+
+    // `unarchive` resolves among the snapshot's archived agents: a live
+    // session is never restored nor makes a name ambiguous, and the same
+    // all-or-nothing, once-each, stop-on-error rules as `archive` hold.
+    #[tokio::test]
+    async fn unarchive_resolves_among_archived_agents_in_the_snapshot() {
+        let agents = || {
+            vec![
+                archived_agent("01L", "Fix login", false),
+                archived_agent("01X", "Fix login flow", true),
+                archived_agent("01Y", "Review diff", true),
+            ]
+        };
+        let run = |targets: &'static [&'static str], refuse: &'static [&'static str]| {
+            let (mut conn, daemon) = fake_archive_daemon(Vec::new(), agents(), refuse);
+            async move {
+                let targets: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
+                let result = unarchive_over(&mut conn, &targets).await;
+                drop(conn);
+                (result, daemon.await.unwrap())
+            }
+        };
+
+        let (result, asked) = run(&["fix login", "01x", "review"], &[]).await;
+        result.unwrap();
+        assert_eq!(asked, ["unarchive 01X", "unarchive 01Y"]);
+
+        let (result, asked) = run(&["review", "01L"], &[]).await;
+        let err = result.unwrap_err().to_string();
+        assert_eq!(err, "no archived session matches 01L");
+        assert!(asked.is_empty(), "{asked:?}");
+
+        let (result, asked) = run(&["01X", "01Y"], &["01X"]).await;
+        let err = result.unwrap_err().to_string();
+        assert_eq!(err, "unarchive Fix login flow: refused");
+        assert_eq!(asked, ["unarchive 01X"]);
     }
 
     // Unset and empty are the same miss, and the error has to name the
