@@ -21944,3 +21944,53 @@ fn archived_sessions_keep_the_question_with_show_all_worktrees_on() {
         );
     });
 }
+
+/// The main loop holds an attach asked for before the pane has a size —
+/// the tree landing ahead of the first frame — and sends it right after
+/// the frame, sized to the pane that frame drew: the session's PTY goes
+/// straight to that size instead of the fallback grid and back, a bounce
+/// an app reading its size off SIGWINCH never sees.
+#[test]
+fn an_attach_before_the_pane_has_a_size_waits_for_the_frame() {
+    let mut app = App::new();
+    app.pane.size_before_attach = true;
+    let sref = SessionRef::Agent(AgentId("a1".into()));
+    let mut out = Vec::new();
+    send_attach(&mut app, sref.clone(), &mut out);
+    assert!(out.is_empty(), "nothing goes out before the frame: {out:?}");
+    assert_eq!(app.pane.attach_after_draw, Some(sref.clone()));
+
+    // The frame draws the pane at 78×35.
+    app.pane.term_area = ratatui::layout::Rect::new(1, 2, 78, 35);
+    send_held_attach(&mut app, &mut out);
+    assert!(
+        matches!(
+            out.as_slice(),
+            [ClientRequest::Attach { session, cols: 78, rows: 35, .. }] if *session == sref
+        ),
+        "{out:?}"
+    );
+    assert_eq!(app.pane.attach_after_draw, None);
+}
+
+/// A frame that draws no pane (folded away) does not hold the attach
+/// forever: it goes out after that frame at the fallback grid, as it
+/// always did — a follow-up typed from the grid still reaches its CLI.
+#[test]
+fn a_held_attach_goes_out_after_a_frame_with_no_pane() {
+    let mut app = App::new();
+    app.pane.size_before_attach = true;
+    let sref = SessionRef::Agent(AgentId("a1".into()));
+    let mut out = Vec::new();
+    send_attach(&mut app, sref.clone(), &mut out);
+    send_held_attach(&mut app, &mut out);
+    let (cols, rows) = FALLBACK_PANE;
+    assert!(
+        matches!(
+            out.as_slice(),
+            [ClientRequest::Attach { session, cols: c, rows: r, .. }]
+                if *session == sref && *c == cols && *r == rows
+        ),
+        "{out:?}"
+    );
+}

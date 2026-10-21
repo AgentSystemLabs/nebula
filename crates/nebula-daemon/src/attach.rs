@@ -78,7 +78,7 @@ pub async fn bind(
     let _ = if exact {
         session.resize(size.cols, size.rows)
     } else {
-        session.resize_with_jiggle(size.cols, size.rows)
+        session.resize_forcing_repaint(size.cols, size.rows)
     };
     (rx, replay_end)
 }

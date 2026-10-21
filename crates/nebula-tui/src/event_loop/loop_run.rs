@@ -7,6 +7,8 @@ macro_rules! main_loop_body {
 
     let mut app = App::new();
     app.chrome.conn = ConnState::Connected;
+    // This loop draws, so an attach can wait a frame for the pane's size.
+    app.pane.size_before_attach = true;
     // The repo nebula was started in, for the first run's "open this
     // folder" — looked up once, off the tree the snapshot has not sent yet.
     app.launcher.launch_repo = crate::app::launch_repo();
@@ -124,6 +126,7 @@ macro_rules! main_loop_body {
             next_draw = pacer.drew(tokio::time::Instant::now(), began.elapsed());
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
+            send_held_attach(&mut app, &mut out);
         }
 
         let focus_before = app.nav.focus;
