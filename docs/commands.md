@@ -26,6 +26,7 @@ nebula config <cmd>         back up, restore or locate this machine's settings
 nebula browser              serve this TUI in a web browser via ttyd
 nebula ssh <host>           open nebula on a remote host over ssh
 nebula tunnel <host>        open a remote host's nebula in a tab here
+nebula sbx [name]           open nebula inside a local Docker sandbox
 nebula upgrade              install the latest published nebula
 ```
 
@@ -136,6 +137,15 @@ nebula tunnel <host> [dir] [--port N] [--remote-port N]
                           # `nebula browser`), --remote-port the far end when something there
                           # already holds that number. Settings ride along as they do for
                           # `nebula ssh` (--no-sync-config leaves them here)
+nebula sbx [name] [--image IMAGE]
+                          # nebula inside a local Docker container, so agents never see this
+                          # machine's files: creates `nebula-sbx` (or `nebula-sbx-<name>`) from
+                          # buildpack-deps:bookworm-scm on first use, starts it when stopped, and
+                          # gets in the way `nebula ssh` does — the same self-installing script,
+                          # over `docker exec` instead of ssh. The container is kept, daemon,
+                          # sessions and clones included; `docker rm -f nebula-sbx` discards it.
+                          # --image only applies when the container is created. Needs `docker`
+                          # on PATH; settings ride along as they do for `nebula ssh`
 nebula browser [--port N] [--bind ADDR | --public] [--credential USER:PASSWORD] [--no-open]
                           # serve this TUI in a browser tab via ttyd and open it; needs ttyd on
                           # PATH. With no --port it takes 7681 when that's free and a free port

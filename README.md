@@ -72,7 +72,7 @@ on a tab tells you exactly where to look without opening anything.
 | **Every open issue, one key from an agent** | `i` lists the project's open GitHub issues, newest first, filtered as you type, and reads the one under the cursor — description, labels, comments. `Enter` opens the QUICK PROMPT for it, `Shift+Tab` launches one of your AGENT PRESETS on it, `Ctrl+e` edits its title and description in place; the issue's URL travels with the session as context on every spawn, so the harness knows what it is fixing. `Shift+I` on the card opens the issue it came from. |
 | **Diff, find, grep, browse** | `g` opens the DIFF VIEWER with REVIEWED MARKS, `f` the FILE FINDER, `F` a `git grep`, `b` the TREE BROWSER — all scoped to the card's WORKTREE, all one key from anywhere. Markdown previews are rendered pages, Mermaid fences become diagrams when `mmdc` is installed, and image files preview inline instead of as binary blobs. |
 | **`/` finds anything, anywhere** | The PALETTE spans every PROJECT on the machine, each session listed with its project in front of it. Before you type it is that overview, sorted by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `.` / `,` cycle that same attention order with no modal at all, one session per press, every project included. Open pull requests are rows too. |
-| **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. Your settings and agent presets go along, and `nebula config export` / `import` back them up. |
+| **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. `nebula sbx` does the same into a local Docker container, so agents run sandboxed. Your settings and agent presets go along, and `nebula config export` / `import` back them up. |
 
 ## Supported harnesses
 
@@ -116,9 +116,10 @@ the distro with `wsl.exe --set-version <distro> 2`.
 > **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, or `opencode`.
 > nebula spawns them; it doesn't ship them.
 >
-> Three commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
-> exit if there is no OpenSSH client (`ssh`), and `nebula browser` needs `ttyd` on your `PATH` — for
-> `nebula tunnel` it is the *remote* host that needs it. The TUI itself needs neither.
+> Four commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
+> exit if there is no OpenSSH client (`ssh`), `nebula sbx` needs `docker`, and `nebula browser` needs
+> `ttyd` on your `PATH` — for `nebula tunnel` it is the *remote* host that needs it. The TUI itself
+> needs none of them.
 
 ## Quickstart
 

@@ -61,8 +61,8 @@ pub(crate) use export_settings_bundle;
 
 /// Runs under `sh -c` on the remote: $1 = install URL, $2 = start dir
 /// (optional, may be empty; defaults to the remote $HOME), $3 = the settings
-/// bundle (optional).
-const REMOTE_SCRIPT: &str = concat!(
+/// bundle (optional). `nebula sbx` runs it too, under `docker exec`.
+pub(crate) const REMOTE_SCRIPT: &str = concat!(
     install_prelude!(),
     "cd -- \"${2:-$HOME}\" || exit 1; ",
     export_settings_bundle!("3"),

@@ -337,6 +337,25 @@ pub(crate) enum Command {
         #[arg(long)]
         no_sync_config: bool,
     },
+    /// Open nebula inside a local Docker sandbox.
+    ///
+    /// Starts a Docker container and runs nebula in it, installing it there
+    /// first as `nebula ssh` does, so agents work inside the container and
+    /// never see this machine's files. The container is kept: the next
+    /// `nebula sbx` finds its daemon, sessions and clones where you left
+    /// them. A NAME gets a sandbox of its own, `nebula-sbx-NAME`; remove
+    /// one with `docker rm -f`. Settings ride along as for `nebula ssh`.
+    #[command(after_help = SBX_EXAMPLES)]
+    Sbx {
+        /// A separate sandbox, e.g. one per client (default: `nebula-sbx`).
+        name: Option<String>,
+        /// Image to create the container from (default:
+        /// buildpack-deps:bookworm-scm).
+        ///
+        /// Only read when the container is created; recreate it to change.
+        #[arg(long)]
+        image: Option<String>,
+    },
     /// Open a remote host's nebula in a browser tab here.
     ///
     /// One ssh tunnel does the whole thing: it installs nebula on the remote
@@ -543,6 +562,13 @@ Examples:
   nebula ssh user@server /srv/app  start in a directory there
   nebula ssh user@server --no-sync-config
                                    keep this machine's settings here";
+
+const SBX_EXAMPLES: &str = "\
+Examples:
+  nebula sbx                       open nebula in the nebula-sbx container
+  nebula sbx client-a              a separate sandbox, nebula-sbx-client-a
+  nebula sbx --image node:22       create it from another image
+  docker rm -f nebula-sbx          throw the default sandbox away";
 
 const CONFIG_EXAMPLES: &str = "\
 Examples:
