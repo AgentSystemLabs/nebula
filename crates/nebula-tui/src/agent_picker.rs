@@ -5,9 +5,10 @@
 //! `ContextMenu` with a row per harness still enabled on the AGENTS TAB (a
 //! disabled one is absent, not greyed), every row a
 //! `MenuAction::NewAgentOfKind` carrying the surface's launch context, so
-//! `→` drills into the same MODEL / EFFORT submenus everywhere.
+//! `→` drills into the same MODEL / EFFORT submenus everywhere. Every one
+//! takes type-ahead: letters narrow the harnesses to their fuzzy matches.
 
-use crate::app::{App, ContextMenu, MenuAction, MenuItem, Overlay};
+use crate::app::{App, ContextMenu, MenuAction, MenuFilter, MenuItem, Overlay};
 use crate::config::Config;
 use crate::pull_request::{OpenPr, PrLaunch};
 use crate::quick_prompt::QuickReturn;
@@ -203,6 +204,12 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
         quick.as_deref(),
         harness_label,
     );
+    // Type-ahead, as in the MODEL / EFFORT submenus: with a long list of
+    // harnesses a few letters beat scrolling.
+    let filter = Some(MenuFilter {
+        query: String::new(),
+        all: items.clone(),
+    });
     app.modals.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some(title),
         items,
@@ -210,7 +217,7 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
         hover,
         area: ratatui::layout::Rect::default(),
         parent: None,
-        filter: None,
+        filter,
     }));
 }
 

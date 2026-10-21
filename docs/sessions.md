@@ -22,7 +22,7 @@ into the id, so nebula launches `--model claude-opus-5-thinking-high-fast`; the 
 merged with `--list-models`, cached in `cursor_models.json` beside `config.json` and refreshed daily;
 Pi's model is a fuzzy `--model` pattern — `opus`, `sonnet`, or a `provider/id` you set in `config.json` —
 and its effort is the `--thinking` level, `off` through `max`).
-In those submenus you type to filter — `opus` narrows the rows to the Opus families, `↑`/`↓` move, `Backspace` widens, `Esc` clears — and the preset editor's Harness / Model / Effort rows take the same type-ahead.
+The menu and those submenus take type-ahead: letters narrow the rows to their fuzzy matches, best first — `gro` is Grok Build, `opus` narrows a model list to the Opus families — `↑`/`↓` move, `Backspace` widens, `Esc` clears the text before it closes; the preset editor's Harness / Model / Effort rows take the same type-ahead. Because letters type, `j`/`k` and `h`/`l` do too: the arrows move and drill.
 `Enter` anywhere takes your configured defaults. On the
 Claude row — and on any row of the Claude model and effort lists under it, whose title then reads
 `Claude model · cloud` — `Tab` toggles Cloud mode, the footer naming the key and the state it is in

@@ -6190,7 +6190,7 @@ fn tab_in_a_claude_submenu_toggles_cloud_for_the_whole_launch() {
         assert_eq!(menu(&app).hovered_claude_cloud(), Some(false));
         assert_eq!(
                 ui::menu_footer_hint(menu(&app)).as_deref(),
-                Some("Tab: cloud off  type to filter  ↑/↓: move  Backspace: widen  ?: settings  Enter: pick  Esc: back")
+                Some("Tab: cloud off  ?: settings  type to filter  Enter: pick  Esc: back  ↑/↓: move  Backspace: widen")
             );
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
         assert_eq!(menu(&app).items[2].label, "opus", "a model row stays one");
@@ -6507,28 +6507,30 @@ fn question_mark_jumps_from_picker_to_harness_settings() {
     })
 }
 
-/// `s` jumps like `?` on the filter-less picker, but types in the
-/// model submenu, where it narrows the list instead.
+/// `s` types in the harness pickers and their model submenus, where
+/// it narrows the list, and still jumps like `?` from a PR row's
+/// menu, which has no filter to eat it.
 #[test]
-fn s_jumps_on_the_picker_and_types_in_submenus() {
+fn s_types_in_the_pickers_and_jumps_from_a_pr_row_menu() {
     use crate::config::{agents_tab, locate_agent, HarnessField};
     with_default_config(|| {
         let mut app = App::new();
         seed_tree(&mut app);
         app.nav.focus = Focus::Sessions;
         let mut out = Vec::new();
+        let worktree = app.selected_worktree().unwrap().id.clone();
 
+        // In the picker `s` is a filter letter: Muse is the one match.
         open_picker(&mut app);
-        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
-        let Some(Overlay::Settings(view)) = &app.modals.overlay else {
-            panic!("expected settings, got {:?}", app.modals.overlay);
+        let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+            panic!("`s` narrows instead of jumping: {:?}", app.modals.overlay);
         };
-        let (tab, row) = locate_agent("codex", HarnessField::Enabled).unwrap();
-        assert_eq!(tab, agents_tab());
-        assert_eq!((view.tab, view.selected), (tab, row));
+        assert_eq!(menu.filter_query(), "s");
+        assert_eq!(menu.items[menu.hover].label, "Muse");
 
-        // In a model submenu `s` is a filter letter, not a jump.
+        // In a model submenu too.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         open_picker(&mut app);
         press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
@@ -6542,6 +6544,35 @@ fn s_jumps_on_the_picker_and_types_in_submenus() {
                 .any(|r| matches!(r, ClientRequest::CreateAgent { .. })),
             "filtering must not create anything"
         );
+
+        // A PR row's menu has no filter: `s` jumps there.
+        let pr = crate::pull_request::OpenPr {
+            number: 7,
+            title: "Attach links".into(),
+            url: pr_url(7),
+            is_draft: false,
+            health: Default::default(),
+            base: "main".into(),
+            head: "pr-7-head".into(),
+        };
+        let mut items = crate::agent_picker::pr_session_menu_rows(worktree, &pr);
+        items.truncate(2);
+        app.modals.overlay = Some(Overlay::Menu(ContextMenu {
+            title: None,
+            items,
+            at: None,
+            hover: 1,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }));
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Settings(view)) = &app.modals.overlay else {
+            panic!("expected settings, got {:?}", app.modals.overlay);
+        };
+        let (tab, row) = locate_agent("codex", HarnessField::Enabled).unwrap();
+        assert_eq!(tab, agents_tab());
+        assert_eq!((view.tab, view.selected), (tab, row));
     })
 }
 
@@ -6576,7 +6607,7 @@ fn question_mark_ignores_menus_without_session_rows() {
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("s/?: settings"), "footer names it:\n{text}");
+        assert!(text.contains("?: settings"), "footer names it:\n{text}");
     })
 }
 
@@ -6709,7 +6740,7 @@ fn picker_second_row_creates_codex_agent() {
         let mut out = Vec::new();
 
         open_picker(&mut app);
-        for code in [KeyCode::Char('j'), KeyCode::Enter] {
+        for code in [KeyCode::Down, KeyCode::Enter] {
             handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE), &mut out);
         }
         assert!(
@@ -6737,7 +6768,7 @@ fn picker_third_row_creates_cursor_agent() {
         let mut out = Vec::new();
 
         open_picker(&mut app);
-        for code in [KeyCode::Char('j'), KeyCode::Char('j'), KeyCode::Enter] {
+        for code in [KeyCode::Down, KeyCode::Down, KeyCode::Enter] {
             handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE), &mut out);
         }
         assert!(
@@ -7021,7 +7052,7 @@ fn picker_omits_a_disabled_harness() {
         );
 
         // The second row is now Cursor: the rows shift, nothing is dead.
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
             app.modals.overlay.is_none(),
@@ -18503,8 +18534,9 @@ fn the_harness_picker_is_no_wider_than_its_rows_and_keeps_its_keys_in_the_footer
         };
         let (on_claude, text) = drawn(&mut app);
         let (title_w, rows_w) = match &app.modals.overlay {
+            // The title wears the type-ahead's bare ` ⌕`.
             Some(Overlay::Menu(m)) => (
-                m.title.as_deref().unwrap().chars().count() + 4,
+                m.title.as_deref().unwrap().chars().count() + 6,
                 m.items
                     .iter()
                     .map(|i| i.label.chars().count())
@@ -18528,7 +18560,7 @@ fn the_harness_picker_is_no_wider_than_its_rows_and_keeps_its_keys_in_the_footer
         );
         let footer = lines
             .iter()
-            .position(|l| l.contains("Tab: cloud off") && l.contains("s/?: settings"))
+            .position(|l| l.contains("Tab: cloud off") && l.contains("?: settings"))
             .unwrap_or_else(|| panic!("the footer names the picker's keys:\n{text}"));
         assert!(footer > bottom, "below the modal, in the footer bar");
 
@@ -18537,7 +18569,7 @@ fn the_harness_picker_is_no_wider_than_its_rows_and_keeps_its_keys_in_the_footer
         let (on_codex, text) = drawn(&mut app);
         assert_eq!(on_codex, on_claude, "hovering another row never resizes it");
         assert!(!text.contains("Tab: cloud"), "{text}");
-        assert!(text.contains("s/?: settings"), "{text}");
+        assert!(text.contains("?: settings"), "{text}");
     })
 }
 
@@ -19487,6 +19519,92 @@ fn cursor_preset_effort_follows_the_model_family() {
             "spec label names family and effort:\n{text}"
         );
     });
+}
+
+/// The harness picker itself takes type-ahead (#117): a few letters
+/// pick a harness out of a long list instead of scrolling to it.
+#[test]
+fn picker_types_to_filter_harnesses() {
+    with_default_config(|| {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.nav.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        fn menu(app: &App) -> &ContextMenu {
+            match &app.modals.overlay {
+                Some(Overlay::Menu(menu)) => menu,
+                other => panic!("expected the picker, got {other:?}"),
+            }
+        }
+
+        open_picker(&mut app);
+        let all = menu(&app).items.len();
+        assert!(menu(&app).filter.is_some(), "the picker takes type-ahead");
+        let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("New session ⌕"),
+            "bare ⌕ in the title:\n{text}"
+        );
+        assert!(text.contains("type to filter"), "footer hint:\n{text}");
+        assert!(
+            text.contains("Esc: close"),
+            "Esc closes the picker:\n{text}"
+        );
+
+        // "gro" narrows to Grok Build, the cursor on it.
+        type_text(&mut app, "gro", &mut out);
+        assert_eq!(labels_of(menu(&app)), vec!["Grok Build"]);
+        assert_eq!(menu(&app).hover, 0);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("New session ⌕ gro"),
+            "query in the title:\n{text}"
+        );
+
+        // A letter no harness matches is refused and flashed.
+        type_text(&mut app, "z", &mut out);
+        assert_eq!(menu(&app).filter_query(), "gro");
+        assert!(app
+            .chrome
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("groz")));
+
+        // Backspace widens back to every row, the cursor kept on the
+        // harness it was on rather than thrown to the top.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(menu(&app).items.len(), all);
+        assert_eq!(menu(&app).items[menu(&app).hover].label, "Grok Build");
+
+        // Esc with nothing typed closes; Esc with text clears it first.
+        type_text(&mut app, "cod", &mut out);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(menu(&app).filter_query(), "");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.modals.overlay.is_none());
+
+        // Enter on a match launches it.
+        open_picker(&mut app);
+        type_text(&mut app, "codex", &mut out);
+        assert_eq!(menu(&app).items[menu(&app).hover].label, "Codex");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(matches!(
+            out.last(),
+            Some(ClientRequest::CreateAgent {
+                kind: AgentKind::Codex,
+                ..
+            })
+        ));
+    });
+}
+
+fn labels_of(menu: &ContextMenu) -> Vec<&str> {
+    menu.items.iter().map(|i| i.label.as_str()).collect()
 }
 
 #[test]
@@ -20625,13 +20743,9 @@ fn a_click_on_a_list_row_is_enter_on_it() {
                 // Drawn, as the clicked one is: the pane's size rides
                 // every Attach.
                 drawn_list_area(&mut by_keys);
-                // Letters type ahead in the palette and the preset
-                // lists, so ↓ moves there.
-                let down = if name == "palette" || name.ends_with("presets") {
-                    KeyCode::Down
-                } else {
-                    KeyCode::Char('j')
-                };
+                // Letters type ahead in every one of these lists, so
+                // ↓ moves.
+                let down = KeyCode::Down;
                 // The palette opens with its cursor on the top
                 // session, under the project header drawn above it:
                 // walk up to the first row before counting down.
