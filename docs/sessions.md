@@ -343,6 +343,10 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   just, cargo` ahead of the verdict (`● in use by zsh · clean · detached`), or after a warning
   (`⚠ 3 modified · in use by cargo`). Like the rest of the line it is read every 30 s or so, so a
   process that has just exited may still be named; the confirm checks again.
+  A checkout someone locked to keep it (`git worktree lock --reason …`: by hand, by an agent, by a
+  tool that reuses it) says so first, in the accent color — `🔒 locked: nightly build · clean ·
+  detached` — and after a warning, which keeps its place and color (`⚠ 3 modified · 🔒 locked:
+  nightly build`). A long reason is cut on the band; the delete confirm shows it whole.
   A git at work in the checkout — `git submodule update` still cloning, a fetch, a rebase or a
   merge — or one stopped part-way (a rebase waiting on a conflict) reads `⋯ git submodule update
   running` or `⋯ git rebase in progress` instead, dim (a stopped one that also holds what a delete

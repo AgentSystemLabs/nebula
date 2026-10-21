@@ -1094,6 +1094,7 @@ pub(super) fn empty_band_lead(
                 // In use is the warning color too: a band busy with work
                 // nebula does not show is no band to delete now.
                 crate::band_safety::Tone::Warn | crate::band_safety::Tone::InUse => th.warn,
+                crate::band_safety::Tone::Locked => th.accent,
                 crate::band_safety::Tone::Ahead if !lit => th.text,
                 _ => fg,
             };

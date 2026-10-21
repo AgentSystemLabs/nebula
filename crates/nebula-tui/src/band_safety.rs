@@ -20,7 +20,12 @@
 //!   its working directory in the checkout (a build, a shell, a tool's
 //!   scratch run): `0 sessions` alone never says that. It leads the git
 //!   verdict, `● in use by zsh · clean · detached`, and follows a warning,
-//!   `⚠ 3 modified · in use by cargo`.
+//!   `⚠ 3 modified · in use by cargo`;
+//! - `🔒 locked: <reason>` — someone locked the checkout (`git worktree
+//!   lock`) to keep it: a person, an agent, a tool that reuses it. It leads
+//!   what else the band says, `🔒 locked: nightly build · clean ·
+//!   detached`, in the accent color — after a warning, which keeps its
+//!   place and color: `⚠ 3 modified · 🔒 locked: nightly build`.
 //!
 //! "Merged" is counted by content, not ancestry: a branch landed by squash
 //! merge, rebase or cherry-pick reads merged. Before the first read a band
@@ -212,6 +217,9 @@ pub(crate) enum Tone {
     /// Something outside nebula's sessions is working in the checkout:
     /// the warning color, though a delete would not destroy it.
     InUse,
+    /// Someone locked the checkout to keep it, and nothing worse is to
+    /// say: the accent color.
+    Locked,
 }
 
 /// What a band's line says about its checkout.
@@ -224,10 +232,50 @@ pub(crate) struct Verdict {
 /// Process names a band lists before it says "+N".
 const IN_USE_NAMED: usize = 2;
 
+/// Characters of a lock's reason a band shows before it cuts it with `…`;
+/// the delete confirm shows it whole.
+const LOCK_REASON_SHOWN: usize = 40;
+
 /// The band's verdict on `check`: None when there is nothing to say — a
 /// daemon that did not say where the branch stands, or a branch that is
 /// its base's own, with nothing at work in it.
 pub(crate) fn verdict(check: &WorktreeCheck) -> Option<Verdict> {
+    let rest = work_verdict(check);
+    let Some(reason) = &check.locked else {
+        return rest;
+    };
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut lock = String::from("🔒 locked");
+    if !reason.is_empty() {
+        lock.push_str(": ");
+        if reason.chars().count() > LOCK_REASON_SHOWN {
+            let cut: String = reason.chars().take(LOCK_REASON_SHOWN - 1).collect();
+            lock.push_str(cut.trim_end());
+            lock.push('…');
+        } else {
+            lock.push_str(&reason);
+        }
+    }
+    Some(match rest {
+        // A warning still leads, in its color: the lock never hides what
+        // a delete would destroy or interrupt.
+        Some(v) if matches!(v.tone, Tone::Warn | Tone::InUse) => Verdict {
+            text: format!("{} · {lock}", v.text),
+            tone: v.tone,
+        },
+        Some(v) => Verdict {
+            text: format!("{lock} · {}", v.text.trim_start_matches("✓ ")),
+            tone: Tone::Locked,
+        },
+        None => Verdict {
+            text: lock,
+            tone: Tone::Locked,
+        },
+    })
+}
+
+/// The band's verdict on what is in the checkout and at work in it.
+fn work_verdict(check: &WorktreeCheck) -> Option<Verdict> {
     let git = git_verdict(check);
     if check.landing.is_none() || check.processes.is_empty() || git_running(check) {
         // A git at work names itself (`⋯ git submodule update running`).
@@ -441,6 +489,48 @@ mod tests {
         assert_eq!(
             text(&with(WorktreeLanding::default(), loose)),
             Some(("⚠ detached · 2 unreachable".into(), Tone::Warn))
+        );
+    }
+
+    #[test]
+    fn a_locked_checkout_says_so_whoever_locked_it() {
+        let detached = WorktreeCheck {
+            detached: true,
+            locked: Some("BranchKit merge queue:\nreused by every push".into()),
+            ..WorktreeCheck::default()
+        };
+        assert_eq!(
+            text(&with(WorktreeLanding::default(), detached)),
+            Some((
+                "🔒 locked: BranchKit merge queue: reused by every… · clean · detached".into(),
+                Tone::Locked
+            ))
+        );
+        let bare = WorktreeCheck {
+            locked: Some(String::new()),
+            ahead: 2,
+            ..WorktreeCheck::default()
+        };
+        assert_eq!(
+            text(&with(WorktreeLanding::default(), bare)),
+            Some(("🔒 locked · ↑2 unmerged".into(), Tone::Locked))
+        );
+        let nothing_else = WorktreeCheck {
+            locked: Some("x".repeat(60)),
+            ..WorktreeCheck::default()
+        };
+        let (words, tone) = text(&with(WorktreeLanding::default(), nothing_else)).unwrap();
+        assert_eq!(tone, Tone::Locked);
+        assert_eq!(words, format!("🔒 locked: {}…", "x".repeat(39)));
+        // A warning keeps its place and color ahead of the lock.
+        let dirty = WorktreeCheck {
+            changes: 3,
+            locked: Some("nightly build".into()),
+            ..WorktreeCheck::default()
+        };
+        assert_eq!(
+            text(&with(WorktreeLanding::default(), dirty)),
+            Some(("⚠ 3 modified · 🔒 locked: nightly build".into(), Tone::Warn))
         );
     }
 
