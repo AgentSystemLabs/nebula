@@ -1,5 +1,6 @@
 mod browser;
 mod cli;
+mod sbx;
 mod ssh;
 mod tunnel;
 mod upgrade;
@@ -111,6 +112,7 @@ fn main() -> Result<()> {
             path,
             no_sync_config,
         }) => ssh::run_ssh(&host, path.as_deref(), !no_sync_config),
+        Some(Command::Sbx { name, image }) => sbx::run_sbx(name.as_deref(), image.as_deref()),
         Some(Command::Tunnel {
             host,
             path,
