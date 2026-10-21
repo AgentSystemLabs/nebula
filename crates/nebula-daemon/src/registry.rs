@@ -4644,6 +4644,119 @@ mod tests {
         assert!(daemon.prewarmed.lock().is_empty());
     }
 
+    /// Missing Codex hooks used to leave a finished row without an id:
+    /// reaping its PTY meant the next attach silently opened a new chat.
+    #[tokio::test]
+    async fn idle_reaping_preserves_used_agents_until_they_can_resume() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let dir = tempfile::tempdir().unwrap();
+        seed_worktree(&daemon, "p", "w", dir.path().to_str().unwrap(), true);
+        seed_agent(&daemon, "template", "w", None);
+        let template = daemon
+            .store
+            .get_agent(&AgentId("template".into()))
+            .unwrap()
+            .unwrap();
+        daemon.store.delete_agent(&template.id).unwrap();
+
+        for (name, kind, status, sid, kept) in [
+            (
+                "missing",
+                AgentKind::Codex,
+                AgentStatus::Finished,
+                None,
+                true,
+            ),
+            (
+                "claude",
+                AgentKind::Claude,
+                AgentStatus::Finished,
+                None,
+                true,
+            ),
+            (
+                "blank",
+                AgentKind::Codex,
+                AgentStatus::Finished,
+                Some(" "),
+                true,
+            ),
+            (
+                "resumable",
+                AgentKind::Codex,
+                AgentStatus::Finished,
+                Some("sid"),
+                false,
+            ),
+            (
+                "hookless",
+                AgentKind::Muse,
+                AgentStatus::Finished,
+                Some("sid"),
+                true,
+            ),
+            ("fresh", AgentKind::Codex, AgentStatus::Fresh, None, false),
+            ("busy", AgentKind::Codex, AgentStatus::Running, None, true),
+            (
+                "feedback",
+                AgentKind::Codex,
+                AgentStatus::NeedsFeedback,
+                None,
+                true,
+            ),
+        ] {
+            let mut agent = template.clone();
+            agent.id = AgentId(name.into());
+            agent.kind = kind;
+            agent.status = status;
+            agent.session_id = sid.map(str::to_string);
+            daemon.store.insert_agent(&agent).unwrap();
+            let sref = SessionRef::Agent(agent.id.clone());
+            let session = PtySession::spawn(
+                sref.clone(),
+                SpawnSpec {
+                    program: "sleep".into(),
+                    args: vec!["30".into()],
+                    cwd: dir.path().to_path_buf(),
+                    env: vec![],
+                    scrub_env: &[],
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+            daemon.install_session(session.clone());
+            daemon
+                .session_interest
+                .lock()
+                .insert(sref.clone(), Instant::now() - Duration::from_secs(600));
+            daemon.reap_idle_sessions_after(Duration::from_secs(300));
+            assert_eq!(daemon.is_alive(&sref), kept, "{name}");
+            if kept {
+                assert!(Arc::ptr_eq(&session, &daemon.session(&sref).unwrap()));
+            }
+        }
+
+        // Hooks recovering makes the very same conversation safe to reap.
+        let id = AgentId("missing".into());
+        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("recovered".into()));
+        daemon.apply_hook_event(&id, HookEvent::Stop, Some("recovered".into()));
+        daemon.reap_idle_sessions_after(Duration::from_secs(300));
+        assert!(!daemon.is_alive(&SessionRef::Agent(id.clone())));
+        assert_eq!(
+            daemon
+                .store
+                .get_agent(&id)
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("recovered")
+        );
+        daemon.kill_all();
+    }
+
     /// Switching `prewarm_agents` off drains the pool on the next sweep. A
     /// spare is a real CLI process the user can see — Claude's own
     /// `/list-agents` lists it beside their sessions, named after the

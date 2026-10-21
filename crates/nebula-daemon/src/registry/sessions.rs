@@ -222,11 +222,17 @@ impl Daemon {
     /// detached from their terminal — see `pty::detached_job_under`),
     /// terminals with a command running, and prewarm-pool sessions
     /// (`reap_prewarmed` owns those). A reaped session revives on the next
-    /// attach or prewarm; agents resume their conversation.
+    /// attach or prewarm; agents resume their conversation. Used agents
+    /// without a resumable id stay alive: missing hooks must not turn an
+    /// idle timeout into a new conversation.
     pub fn reap_idle_sessions(self: &Arc<Self>) {
         let Some(timeout) = crate::config::Config::load().session_idle_timeout() else {
             return;
         };
+        self.reap_idle_sessions_after(timeout);
+    }
+
+    pub(super) fn reap_idle_sessions_after(self: &Arc<Self>, timeout: Duration) {
         let sessions: Vec<(SessionRef, Arc<PtySession>)> = self
             .sessions
             .lock()
@@ -265,6 +271,18 @@ impl Daemon {
                             AgentStatus::Running | AgentStatus::NeedsFeedback
                         ) =>
                     {
+                        true
+                    }
+                    Some(agent)
+                        if agent.status != AgentStatus::Fresh
+                            && !resolve_harness(agent.kind, agent.custom_harness.as_deref())
+                                .is_ok_and(|harness| {
+                                    resume_session_id(&agent, &harness, false)
+                                        .is_some_and(|sid| !sid.trim().is_empty())
+                                }) =>
+                    {
+                        // Killing this PTY would lose its conversation:
+                        // the next attach would launch a fresh session.
                         true
                     }
                     // A backgrounded tool call — Claude's `run_in_background`
