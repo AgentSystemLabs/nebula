@@ -161,10 +161,9 @@ fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             // starts a session jumps to that harness's Agents section,
             // where its defaults live. Ahead of type-ahead on purpose:
             // `?` is a jump on these rows, never a filter letter (no row
-            // contains one); `s` only jumps without a filter, since in
-            // the model/effort submenus it narrows the list. `s` keeps
-            // its global meaning — settings — so the picker agrees with
-            // the panels.
+            // contains one); `s` only jumps without a filter — the
+            // harness pickers and their model/effort submenus type it
+            // into the query — so it still jumps from a PR row's menu.
             KeyCode::Char(c)
                 if (c == '?' || (c == 's' && menu.filter.is_none()))
                     && menu.hovered_agent_kind().is_some() =>
@@ -174,7 +173,8 @@ fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     .expect("the guard checked the hovered row");
                 open_harness_settings(app, kind, custom);
             }
-            // Type-ahead in the MODEL / EFFORT submenus: letters narrow the
+            // Type-ahead in the harness pickers and their MODEL / EFFORT
+            // submenus (and the other filtered pickers): letters narrow the
             // rows (so ↑/↓ move there, not j/k), Backspace widens, and Esc
             // clears the text before it backs out. A letter no row matches
             // is refused, so the list never empties.

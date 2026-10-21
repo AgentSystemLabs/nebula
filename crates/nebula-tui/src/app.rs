@@ -463,8 +463,9 @@ pub struct ContextMenu {
     pub area: Rect,
     /// The menu ← returns to when this one is a submenu.
     pub parent: Option<Box<ContextMenu>>,
-    /// Type-ahead over the rows — set on the MODEL / EFFORT submenus, where
-    /// letters filter instead of moving (↑/↓ move there); None elsewhere.
+    /// Type-ahead over the rows — set on the harness pickers and their
+    /// MODEL / EFFORT submenus (and a few other pickers), where letters
+    /// filter instead of moving (↑/↓ move there); None elsewhere.
     pub filter: Option<MenuFilter>,
 }
 
@@ -491,10 +492,14 @@ impl ContextMenu {
             return false;
         }
         let items: Vec<MenuItem> = ranked.iter().map(|(i, _)| filter.all[*i].clone()).collect();
+        // A list with no ✓ (the harness pickers) keeps the cursor on the
+        // row it was on, so clearing a query never jumps it to the top.
+        let hovered = self.items.get(self.hover).map(|i| i.label.as_str());
         self.hover = if query.trim().is_empty() {
             items
                 .iter()
                 .position(|i| i.label.ends_with(" ✓"))
+                .or_else(|| items.iter().position(|i| Some(i.label.as_str()) == hovered))
                 .unwrap_or(0)
         } else {
             0
