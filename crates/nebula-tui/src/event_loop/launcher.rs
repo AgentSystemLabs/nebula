@@ -2762,11 +2762,7 @@ fn picker_checkouts<'a>(app: &'a App, project: &ProjectId) -> Vec<&'a nebula_cor
     let now = crate::app::now_ms();
     checkouts.sort_by_key(|w| {
         let r = crate::app::worktree_recency(&app.tree, &w.id, now);
-        (
-            Reverse(w.is_main),
-            Reverse(r.interacted),
-            Reverse(r.stamped),
-        )
+        (Reverse(w.is_main), r.sort_key())
     });
     checkouts
 }

@@ -5419,6 +5419,133 @@ fn status_change_resorts_and_selection_follows() {
     assert_eq!(app.nav.sel_session, 0, "selection followed agent-2");
 }
 
+/// A session finishing in ANOTHER project must not pull the view over
+/// there. The Projects column is a row index into a list sorted by
+/// recency, where a project with a turn under way counts as "now". When
+/// the finish is stamped at (or a hair past) the TUI's own clock — the
+/// daemon stamped it in the same millisecond the event was handled, or
+/// its clock runs a little ahead — the finished project briefly ties or
+/// beats the working one. The reconcile on the event re-seats the cursor
+/// for that order, and a moment later, with no event at all, the clock
+/// moves on and the order flips back: the same row index now names the
+/// project that just finished. Its session got the highlight while the
+/// pane went on showing the prompt just sent — the swap Cody saw when
+/// the done sound rang. The order must not move on the clock alone.
+#[test]
+fn a_finish_in_another_project_never_moves_the_view_there() {
+    use nebula_core::{AgentStatus, ProjectId};
+    let mut app = App::new();
+    seed_tree(&mut app);
+    seed_second_project(&mut app);
+    let now = crate::app::now_ms();
+    let flip = |agent: &str, status: AgentStatus, changed_at: i64| ServerEvent::StatusChanged {
+        agent: AgentId(agent.into()),
+        status,
+        changed_at,
+        unseen: false,
+    };
+    // An earlier prompt still running over in `nebula`, and the one just
+    // sent here in `demo`.
+    hse(&mut app, flip("a2", AgentStatus::Running, now - 60_000));
+    hse(&mut app, flip("a1", AgentStatus::Running, now - 1_000));
+    let demo = ProjectId("p1".into());
+    let mut out = Vec::new();
+    assert!(select_project_row_by_id(&mut app, &demo));
+    restore_context(&mut app, &mut out);
+    app.pane.term = Some(AttachedTerm::new(
+        SessionRef::Agent(AgentId("a1".into())),
+        40,
+        10,
+    ));
+    assert_eq!(
+        app.selected_session().map(|a| a.name),
+        Some("agent-1".into())
+    );
+
+    // The other project's turn ends, stamped just ahead of this clock.
+    hse(
+        &mut app,
+        flip("a2", AgentStatus::Finished, crate::app::now_ms() + 30),
+    );
+    assert_eq!(app.selected_project().map(|p| &p.id), Some(&demo));
+
+    // Nothing happens but time passing.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(
+        app.selected_project().map(|p| &p.id),
+        Some(&demo),
+        "the view stays on the project the user is in"
+    );
+    assert_eq!(
+        app.selected_session().map(|a| a.name),
+        Some("agent-1".into()),
+        "and the highlight stays on the session the pane shows"
+    );
+}
+
+/// The same for two checkouts of one project: a turn ending in the other
+/// one never takes the Worktrees cursor off the checkout being worked in.
+#[test]
+fn a_finish_in_another_checkout_never_moves_the_worktree_cursor() {
+    use nebula_core::{AgentStatus, Entity, Worktree, WorktreeId};
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let feature = WorktreeId("w2".into());
+    hse(
+        &mut app,
+        ServerEvent::EntityUpserted {
+            entity: Entity::Worktree(Worktree {
+                id: feature.clone(),
+                project_id: nebula_core::ProjectId("p1".into()),
+                path: "/tmp/demo-feature".into(),
+                branch: "feature".into(),
+                is_main: false,
+                sort_order: 0,
+            }),
+        },
+    );
+    seed_agent_in(&mut app, "a2", &feature);
+    // A third checkout, so the two the test turns on are both below the
+    // pinned main row and sort against each other.
+    let other = WorktreeId("w3".into());
+    hse(
+        &mut app,
+        ServerEvent::EntityUpserted {
+            entity: Entity::Worktree(Worktree {
+                id: other.clone(),
+                project_id: nebula_core::ProjectId("p1".into()),
+                path: "/tmp/demo-other".into(),
+                branch: "other".into(),
+                is_main: false,
+                sort_order: 1,
+            }),
+        },
+    );
+    seed_agent_in(&mut app, "a3", &other);
+    let now = crate::app::now_ms();
+    let flip = |agent: &str, status: AgentStatus, changed_at: i64| ServerEvent::StatusChanged {
+        agent: AgentId(agent.into()),
+        status,
+        changed_at,
+        unseen: false,
+    };
+    hse(&mut app, flip("a3", AgentStatus::Running, now - 60_000));
+    hse(&mut app, flip("a2", AgentStatus::Running, now - 1_000));
+    let mut out = Vec::new();
+    assert!(select_worktree_by_id(&mut app, &feature, &mut out));
+
+    hse(
+        &mut app,
+        flip("a3", AgentStatus::Finished, crate::app::now_ms() + 30),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(
+        app.selected_worktree().map(|w| &w.id),
+        Some(&feature),
+        "the cursor stays on the checkout being worked in"
+    );
+}
+
 /// Confirming a worktree delete drops the row (and its agents)
 /// immediately — the daemon deletes in the background — and an Error
 /// reply for that request restores them where they were.
