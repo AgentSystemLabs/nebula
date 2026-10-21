@@ -220,6 +220,7 @@ next ATTACH or prewarm, and an agent RESUMES its conversation there.
   default, `postfix` or `prefix & postfix`). `R` inside the overlay puts every setting —
   hotkeys included — back to its default, after a confirmation, and removes `config.local.json`.
   A row that shipped in the last seven days reads `(new)` before its label.
+  `/` searches every tab at once, for when you know the setting or hotkey but not its tab.
 - **Every grid key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
   and writes overrides into the same file (`"keybindings": {"git_diff": "ctrl+g, g"}`); an empty value
   unbinds. Because nebula is always a guest inside Terminal.app / Ghostty / tmux, the tab says at bind

@@ -13232,6 +13232,152 @@ fn settings_view(app: &App) -> &crate::app::SettingsView {
     }
 }
 
+/// Type `text` into whatever has the keys, one character at a time.
+fn type_keys(app: &mut App, text: &str, out: &mut Vec<ClientRequest>) {
+    for c in text.chars() {
+        press(app, KeyCode::Char(c), KeyModifiers::NONE, out);
+    }
+}
+
+/// `/` searches every tab at once: the cursor lands on the first match,
+/// wherever it lives, and the row keys act on it there. Esc drops the
+/// search and leaves the cursor on that row, in its own tab; a second Esc
+/// closes the overlay as usual.
+#[test]
+fn slash_searches_every_settings_tab() {
+    use crate::config::{setting_at, SettingKind, SETTINGS_TABS};
+    let mut app = App::new();
+    let mut out = Vec::new();
+    // From the tab strip, the way a fresh open lands.
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+    assert!(settings_view(&app).typing, "/ opens the field");
+    assert!(!settings_view(&app).on_tabs);
+    // Letters type now, so `s` and `q` don't close the overlay.
+    type_keys(&mut app, "color theme", &mut out);
+    let view = settings_view(&app);
+    assert!(view.searching());
+    assert_eq!(SETTINGS_TABS[view.tab].title, "Appearance");
+    assert_eq!(
+        setting_at(view.tab, view.selected).map(|s| s.kind),
+        Some(SettingKind::Theme)
+    );
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(
+        text.contains("/ color theme"),
+        "query in place of the rule:\n{text}"
+    );
+    assert!(text.contains("1 match"), "match count:\n{text}");
+    assert!(
+        text.contains(" Appearance\n") || text.contains(" Appearance "),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Search Enter attaches"),
+        "rows that don't match are gone:\n{text}"
+    );
+
+    // Enter hands the keys back to the rows, matches still listed.
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+    assert!(!settings_view(&app).typing);
+    assert!(settings_view(&app).searching());
+    // Esc drops the search, cursor still on the theme row.
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+    let view = settings_view(&app);
+    assert!(view.search.is_none());
+    assert_eq!(
+        setting_at(view.tab, view.selected).map(|s| s.kind),
+        Some(SettingKind::Theme)
+    );
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+    assert!(app.modals.overlay.is_none(), "then Esc closes as before");
+}
+
+/// The issue's case: find a hotkey and rebind it without walking the
+/// forty-row Hotkeys tab.
+#[test]
+fn settings_search_reaches_a_hotkey_and_enter_rebinds_it() {
+    let mut app = App::new();
+    let mut out = Vec::new();
+    open_settings_on(&mut app, 0, &mut out);
+    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+    type_keys(&mut app, "duplicate", &mut out);
+    let duplicate = crate::keymap::ACTIONS
+        .iter()
+        .position(|a| a.label == "Duplicate session")
+        .unwrap();
+    let view = settings_view(&app);
+    assert!(view.is_hotkeys());
+    assert_eq!(view.selected, duplicate);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+    let view = settings_view(&app);
+    assert!(view.capturing(), "Enter on the match starts the rebind");
+    assert_eq!(view.capture.as_ref().unwrap().action, duplicate);
+}
+
+/// A key that would leave nothing listed is refused, as a picker's
+/// type-ahead refuses it, and ⌫ on an empty field closes the search.
+#[test]
+fn settings_search_refuses_a_key_that_matches_nothing() {
+    let mut app = App::new();
+    let mut out = Vec::new();
+    open_settings_on(&mut app, 0, &mut out);
+    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+    type_keys(&mut app, "themeqqq", &mut out);
+    let view = settings_view(&app);
+    assert_eq!(view.search.as_deref(), Some("theme"));
+    assert!(matches!(
+        view.notice,
+        Some((_, crate::app::NoticeLevel::Warn))
+    ));
+    for _ in 0.."theme".len() {
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+    }
+    assert!(
+        settings_view(&app).search.is_some(),
+        "an empty field stays open"
+    );
+    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+    assert!(settings_view(&app).search.is_none());
+}
+
+/// Over the matches j/k walk across tabs, ↑ off the first goes back into
+/// the field, and asking for a tab drops the search.
+#[test]
+fn settings_search_results_walk_across_tabs() {
+    let mut app = App::new();
+    let mut out = Vec::new();
+    open_settings_on(&mut app, 0, &mut out);
+    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+    // "session" is on almost every tab.
+    type_keys(&mut app, "session", &mut out);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+    let first = (settings_view(&app).tab, settings_view(&app).selected);
+    let mut tabs = std::collections::BTreeSet::new();
+    for _ in 0..200 {
+        tabs.insert(settings_view(&app).tab);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    }
+    assert!(tabs.len() > 2, "j crossed tabs: {tabs:?}");
+    while (settings_view(&app).tab, settings_view(&app).selected) != first {
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+    }
+    press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+    assert!(
+        settings_view(&app).typing,
+        "↑ off the first match is the field"
+    );
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+    assert!(
+        settings_view(&app).search.is_none(),
+        "Tab is a tab's own rows"
+    );
+}
+
 #[test]
 fn tab_and_backtab_walk_the_strip_and_wrap() {
     let mut app = App::new();

@@ -565,16 +565,18 @@ fn handle_settings_mouse(
             if body.height > 0 && mouse.row >= body.y && mouse.row < body.y + body.height {
                 let row = first_row + (mouse.row - body.y) as usize;
                 // Group headers and blanks aren't clickable; the shared
-                // row map keeps this in step with the renderer.
-                if let Some(index) = crate::config::settings_rows(tab)
+                // row map keeps this in step with the renderer, search
+                // results included.
+                let hit = view
+                    .body_rows(&app.chrome.keymap)
                     .get(row)
-                    .and_then(|r| r.index())
-                {
+                    .and_then(|(t, r)| r.index().map(|i| (*t, i)));
+                if let Some((row_tab, index)) = hit {
                     // A click moves the cursor there, as j/k would; on the
                     // row it was already on, it is Enter.
-                    run_settings_cmd(app, SettingsCmd::Move(index));
+                    run_settings_cmd(app, SettingsCmd::Jump(row_tab, index));
                     run_settings_cmd(app, SettingsCmd::EnterList);
-                    if selected == index {
+                    if (tab, selected) == (row_tab, index) {
                         run_settings_cmd(app, activate::settings_row_cmd(hotkeys, index));
                     }
                 }

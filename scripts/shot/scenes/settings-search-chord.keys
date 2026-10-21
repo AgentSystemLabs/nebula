@@ -1,0 +1,7 @@
+# Settings search by chord: `/` then `^f` lists what Ctrl+F answers to, Enter hands the keys back
+# to the rows.
+s
+/
+^
+f
+Enter
