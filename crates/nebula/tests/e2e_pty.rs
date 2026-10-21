@@ -3357,6 +3357,58 @@ async fn create_agent_runs_the_shells_own_claude_and_archive_clears_its_job() {
 /// `EINVAL: invalid argument, kqueue` the moment it starts.
 #[tokio::test]
 async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
+    let launch = launch_claude_through_rc("").await;
+    assert!(
+        launch.ran.starts_with("claude tty --append-system-prompt "),
+        "{:?}",
+        launch.ran
+    );
+    assert!(
+        !launch.iris_took_over,
+        "the rc autostart hook should not have taken over the PTY"
+    );
+    assert_ne!(
+        launch.stdin.trim_end(),
+        "/dev/tty",
+        "stdin must be the PTY's own device, which kqueue can watch"
+    );
+    assert_eq!(
+        launch.pane_tty.trim_end(),
+        "unset",
+        "the launch line unsets the PTY's name before the agent runs"
+    );
+}
+
+/// An rc file that clears `NEBULA_PANE_TTY` must not leave the agent on the
+/// `/dev/null` the rc files ran with: the launch line falls back to
+/// `/dev/tty` instead of failing on `exec <""`.
+#[tokio::test]
+async fn create_agent_gets_a_tty_when_rc_clears_the_pane_tty() {
+    let launch = launch_claude_through_rc("unset NEBULA_PANE_TTY\n").await;
+    assert!(
+        launch.ran.starts_with("claude tty --append-system-prompt "),
+        "{:?}",
+        launch.ran
+    );
+    assert!(!launch.iris_took_over);
+}
+
+/// What the rc-defined `claude` saw when [`launch_claude_through_rc`] ran it.
+struct RcLaunch {
+    /// `claude <tty|notty> <args>`.
+    ran: String,
+    /// `tty`'s answer for its stdin.
+    stdin: String,
+    /// `NEBULA_PANE_TTY` as it saw it, or `unset`.
+    pane_tty: String,
+    /// The Iris-style autostart ran instead.
+    iris_took_over: bool,
+}
+
+/// Create a Claude agent through a login shell whose rc file has an
+/// Iris-style autostart (it `exec`s when interactive with a TTY stdin),
+/// then `extra_rc`, then a `claude` function that records its stdin.
+async fn launch_claude_through_rc(extra_rc: &str) -> RcLaunch {
     let env = TestEnv::new();
     let repo = env.make_repo();
     let dir = env.tmp.path().to_path_buf();
@@ -3370,14 +3422,17 @@ async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
                 "if [ \"$interactive\" = 1 ] && [ -t 0 ]; then\n",
                 "  exec sh -c 'echo iris-autostarted > \"{d}/iris\"; sleep 600'\n",
                 "fi\n",
+                "{extra}",
                 "claude() {{\n",
                 "  if [ -t 0 ]; then tty=tty; else tty=notty; fi\n",
                 "  tty > '{d}/claude-stdin'\n",
+                "  echo \"${{NEBULA_PANE_TTY-unset}}\" > '{d}/claude-pane-tty'\n",
                 "  echo \"claude $tty $*\" > '{d}/claude-ran'\n",
                 "  sleep 600\n",
                 "}}\n",
             ),
-            d = dir.display()
+            d = dir.display(),
+            extra = extra_rc,
         ),
     )
     .unwrap();
@@ -3409,21 +3464,12 @@ async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
     })
     .await
     .expect("the rc-defined claude function should run");
-    let ran = std::fs::read_to_string(&marker).unwrap();
-    assert!(
-        ran.starts_with("claude tty --append-system-prompt "),
-        "{ran:?}"
-    );
-    assert!(
-        !dir.join("iris").exists(),
-        "the rc autostart hook should not have taken over the PTY"
-    );
-    let stdin = std::fs::read_to_string(dir.join("claude-stdin")).unwrap();
-    assert_ne!(
-        stdin.trim_end(),
-        "/dev/tty",
-        "stdin must be the PTY's own device, which kqueue can watch"
-    );
+    let launch = RcLaunch {
+        ran: std::fs::read_to_string(&marker).unwrap(),
+        stdin: std::fs::read_to_string(dir.join("claude-stdin")).unwrap(),
+        pane_tty: std::fs::read_to_string(dir.join("claude-pane-tty")).unwrap(),
+        iris_took_over: dir.join("iris").exists(),
+    };
 
     write_frame(
         &mut c,
@@ -3438,6 +3484,7 @@ async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
+    launch
 }
 
 /// One PrewarmWorktreeSessions must revive every dead session under the

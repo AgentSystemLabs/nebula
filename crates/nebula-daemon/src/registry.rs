@@ -79,10 +79,12 @@ fn login_shell_stdin_shim() -> String {
 /// The payload's first step: stdin back on the pane's PTY, by its device
 /// path rather than `/dev/tty` — Claude Code (Bun) watches stdin with
 /// kqueue, which on macOS refuses `/dev/tty` with `EINVAL`, and the CLI
-/// exits on the spot.
+/// exits on the spot. An rc file that unsets or empties the variable falls
+/// back to `/dev/tty` rather than `exec <""`, which would fail and leave
+/// the agent on the `/dev/null` the rc files ran with.
 fn reopen_pane_tty() -> String {
     let var = env::PANE_TTY;
-    format!("exec <\"${var}\"; unset {var}; ")
+    format!("exec <\"${{{var}:-/dev/tty}}\"; unset {var}; ")
 }
 /// Cap on one CLI probe. A heavy rc file costs ~1s; a hung one must not
 /// stall a create forever, so on timeout the CLI is assumed present and
@@ -2089,6 +2091,40 @@ mod tests {
             out.stdout.is_empty(),
             "{:?}",
             String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// The launch line reopens stdin from the device the shim named, and
+    /// unsets the name before the command runs so no child inherits it.
+    /// Left empty (an rc file cleared it), it falls back to `/dev/tty`
+    /// instead of `exec <""`, which would fail and leave stdin on the
+    /// rc files' `/dev/null` — the e2e
+    /// `create_agent_gets_a_tty_when_rc_clears_the_pane_tty` covers that
+    /// half, since it needs a controlling terminal.
+    #[test]
+    fn reopen_pane_tty_reads_the_named_device_then_unsets_it() {
+        assert_eq!(
+            reopen_pane_tty(),
+            r#"exec <"${NEBULA_PANE_TTY:-/dev/tty}"; unset NEBULA_PANE_TTY; "#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("pane");
+        std::fs::write(&device, "from-the-pane\n").unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "{}cat; echo \"pane=${{{}-unset}}\"",
+                reopen_pane_tty(),
+                env::PANE_TTY
+            ))
+            .env(env::PANE_TTY, &device)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "from-the-pane\npane=unset\n"
         );
     }
 
