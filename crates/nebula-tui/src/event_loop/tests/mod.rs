@@ -440,6 +440,42 @@ fn a_red_turn_in_the_pane_you_are_typing_at_is_silent() {
     assert_eq!(app.chrome.pending_feedback.len(), 1);
 }
 
+#[test]
+fn focused_session_reporting_tracks_the_session_under_the_users_hands() {
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let sref = SessionRef::Agent(AgentId("a1".into()));
+    app.pane.term = Some(AttachedTerm::new(sref.clone(), 40, 10));
+    app.nav.focus = Focus::Terminal;
+    app.pane.term_locked = true;
+
+    let mut out = Vec::new();
+    report_focused_session(&mut app, 50, &mut out);
+    assert!(out.is_empty(), "older daemons must not see the new request");
+
+    report_focused_session(&mut app, 51, &mut out);
+    assert!(
+        matches!(
+            out.as_slice(),
+            [ClientRequest::SetFocusedSession { session: Some(session) }] if *session == sref
+        ),
+        "{out:?}"
+    );
+    out.clear();
+    report_focused_session(&mut app, 51, &mut out);
+    assert!(out.is_empty(), "unchanged focus is not spammed");
+
+    app.chrome.window_focused = false;
+    report_focused_session(&mut app, 51, &mut out);
+    assert!(
+        matches!(
+            out.as_slice(),
+            [ClientRequest::SetFocusedSession { session: None }]
+        ),
+        "{out:?}"
+    );
+}
+
 /// A session with no live PTY behind it — reaped, or not booted since
 /// the daemon started — wears a gray dot whatever its last status was,
 /// and takes its color back once it is warm again. An unread finish

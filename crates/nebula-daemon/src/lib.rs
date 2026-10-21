@@ -6,6 +6,7 @@ pub mod handoff;
 pub mod hooks;
 pub mod lifecycle;
 pub mod metrics;
+mod notifications;
 pub mod open_files;
 pub mod orchestrator;
 pub mod pr_scope;

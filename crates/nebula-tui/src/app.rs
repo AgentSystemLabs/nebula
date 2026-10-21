@@ -3877,6 +3877,10 @@ pub struct ChromeState {
     /// keeps every desktop notification off rather than posting them while
     /// the user is looking.
     pub window_focused: bool,
+    /// The focused-session state last reported to the daemon on this
+    /// connection. The daemon uses it only to suppress desktop notifications
+    /// for a session already under the user's hands.
+    pub reported_focused_session: Option<SessionRef>,
     /// Launch instant; the first-run splash animation and the status-sweep
     /// text animation are pure functions of time elapsed since this.
     pub splash_epoch: std::time::Instant,
@@ -3925,6 +3929,7 @@ impl Default for ChromeState {
             pending_ding: false,
             pending_feedback: Vec::new(),
             window_focused: true,
+            reported_focused_session: None,
             splash_epoch: std::time::Instant::now(),
             welcome_on_screen: false,
             animations: true,
