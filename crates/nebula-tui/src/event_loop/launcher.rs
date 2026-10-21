@@ -7371,6 +7371,55 @@ mod tests {
         });
     }
 
+    /// The layout is written soon after it changes, not only on `q`: a
+    /// tab opened and then the window closed comes back. Nothing is
+    /// written before the first snapshot, whose saved layout the TUI is
+    /// still waiting to restore, nor when nothing changed, and a burst of
+    /// changes is one write of the last layout.
+    #[test]
+    fn the_layout_is_saved_soon_after_it_changes() {
+        with_default_config(|| {
+            let now = tokio::time::Instant::now();
+            let mut saver = super::super::UiStateSaver::default();
+            let mut app = two_tabs();
+
+            app.chrome.snapshot_loaded = false;
+            saver.note(&app, now);
+            assert_eq!(saver.due, None, "nothing before the first snapshot");
+
+            // The snapshot lands and restores the saved layout.
+            app.launcher.launcher_tabs.reverse();
+            app.chrome.snapshot_loaded = true;
+            saver.note(&app, now);
+            assert_eq!(saver.due, None, "the restored layout is not written back");
+
+            app.launcher.launcher_tabs.reverse();
+            saver.note(&app, now);
+            let later = now + std::time::Duration::from_millis(300);
+            app.launcher.launcher_tabs.reverse();
+            app.launcher.launcher_tabs.reverse();
+            saver.note(&app, later);
+            assert_eq!(
+                saver.due,
+                Some(now + super::super::UI_STATE_SAVE_DELAY),
+                "due one delay after the first change, however many follow"
+            );
+
+            let Some(ClientRequest::SaveUiState { json }) = saver.flush(&app) else {
+                panic!("the changed layout is written");
+            };
+            let mut back = two_sessions();
+            super::super::restore_ui_state(&mut back, &json);
+            assert_eq!(
+                back.launcher.launcher_tabs,
+                [ProjectId("p2".into()), ProjectId("p1".into())]
+            );
+            assert!(saver.flush(&app).is_none(), "written once");
+            saver.note(&app, later);
+            assert_eq!(saver.due, None, "nothing left to write");
+        });
+    }
+
     /// A third project, `docs`, with a checkout and no sessions in it.
     fn seed_empty_project(app: &mut App) {
         hse(
