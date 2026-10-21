@@ -170,6 +170,78 @@ fn parse_worktree_list(out: &str) -> Vec<WorktreeEntry> {
     entries
 }
 
+/// The lock git keeps on `worktree`, a checkout of `repo`: the reason it
+/// was locked with (empty when none was given), or None when it is not
+/// locked. Anyone can lock a checkout — `git worktree lock --reason …` by
+/// hand, an agent marking the one it works in, a tool keeping one it
+/// reuses — and git's own `worktree remove` and `prune` then leave it be.
+pub async fn worktree_lock(repo: &Path, worktree: &Path) -> Result<Option<String>> {
+    let out = git(repo, &["worktree", "list", "--porcelain"]).await?;
+    let real = std::fs::canonicalize(worktree).ok();
+    Ok(lock_in_list(&out, |listed| {
+        listed == worktree || real.is_some() && std::fs::canonicalize(listed).ok() == real
+    }))
+}
+
+/// The pure half of [`worktree_lock`]: in `git worktree list --porcelain`
+/// output, the `locked` line of the stanza whose path `is_target` picks.
+/// Git writes `locked` alone when no reason was given, and C-quotes a
+/// reason it cannot print as is (a newline, a quote).
+fn lock_in_list(out: &str, is_target: impl Fn(&Path) -> bool) -> Option<String> {
+    let mut in_target = false;
+    for line in out.lines() {
+        if let Some(listed) = line.strip_prefix("worktree ") {
+            in_target = is_target(Path::new(listed));
+        } else if in_target && line == "locked" {
+            return Some(String::new());
+        } else if let Some(reason) = line.strip_prefix("locked ").filter(|_| in_target) {
+            return Some(unquote_c_style(reason));
+        }
+    }
+    None
+}
+
+/// Undo git's C-style quoting (`"a \"b\"\n\303\251"`); text git left
+/// unquoted comes back as it is.
+fn unquote_c_style(text: &str) -> String {
+    let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
+        return text.to_string();
+    };
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut chars = inner.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match chars.next() {
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'r') => bytes.push(b'\r'),
+            Some(b'a') => bytes.push(0x07),
+            Some(b'b') => bytes.push(0x08),
+            Some(b'f') => bytes.push(0x0c),
+            Some(b'v') => bytes.push(0x0b),
+            Some(d @ b'0'..=b'7') => {
+                let mut value = u32::from(d - b'0');
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(&o @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(o - b'0');
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(u8::try_from(value).unwrap_or(b'?'));
+            }
+            Some(other) => bytes.push(other),
+            None => bytes.push(b'\\'),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// The branch a paused rebase in `checkout` is replaying, if there is one —
 /// read from the same state file `git status` uses to say "rebasing branch
 /// X" while `git worktree list` calls the checkout detached. `None` for a
@@ -736,10 +808,13 @@ pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> 
             let _ = git(repo, &["worktree", "prune"]).await;
             Ok(())
         }
-        // Locked by a session that ran `git worktree lock` (Claude Code locks
-        // its worktree and a killed session never unlocks). The caller has
-        // already killed this worktree's sessions, so the lock is stale —
-        // unlock and retry rather than surfacing git's refusal.
+        // Locked (`git worktree lock`): often by an agent that locks the
+        // checkout it works in and never unlocks when killed, but anyone
+        // can lock one to keep it. A delete the person asked for was
+        // confirmed with the lock and its reason in front of them (the
+        // DELETE CHECK names it, to a client that reads it); auto-cleanup
+        // never takes a locked checkout. So unlock and retry rather than
+        // surfacing git's refusal.
         Err(e) if e.to_string().contains("locked working tree") => {
             git(repo, &["worktree", "unlock", &path_str]).await?;
             git(repo, &args).await?;
@@ -1448,6 +1523,58 @@ mod tests {
 
         // Path gone AND git no longer knows it — still not an error.
         remove_worktree(&repo, &wt, false).await.unwrap();
+    }
+
+    #[test]
+    fn lock_in_list_reads_the_target_stanzas_lock_and_reason() {
+        let out = "worktree /r\nHEAD 1\nbranch refs/heads/main\n\n\
+                   worktree /r/a\nHEAD 2\nbranch refs/heads/a\nlocked\n\n\
+                   worktree /r/b\nHEAD 3\ndetached\nlocked merge queue: reused by every push\n\n\
+                   worktree /r/c\nHEAD 4\nbranch refs/heads/c\nlocked \"two\\nlines \\\"q\\\" caf\\303\\251\"\n\n\
+                   worktree /r/d\nHEAD 5\nbranch refs/heads/d\n";
+        let lock = |p: &str| lock_in_list(out, |listed| listed == Path::new(p));
+        assert_eq!(lock("/r"), None, "the main checkout is not locked");
+        assert_eq!(lock("/r/a").as_deref(), Some(""), "locked, no reason");
+        assert_eq!(
+            lock("/r/b").as_deref(),
+            Some("merge queue: reused by every push")
+        );
+        assert_eq!(lock("/r/c").as_deref(), Some("two\nlines \"q\" café"));
+        assert_eq!(lock("/r/d"), None, "another stanza's lock is not its");
+        assert_eq!(lock("/r/x"), None, "not listed");
+    }
+
+    #[tokio::test]
+    async fn worktree_lock_reads_what_git_worktree_lock_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        let wt_str = wt.to_string_lossy().into_owned();
+        assert_eq!(worktree_lock(&repo, &wt).await.unwrap(), None);
+        git(&repo, &["worktree", "lock", &wt_str]).await.unwrap();
+        assert_eq!(
+            worktree_lock(&repo, &wt).await.unwrap().as_deref(),
+            Some("")
+        );
+        git(&repo, &["worktree", "unlock", &wt_str]).await.unwrap();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "kept for the nightly build",
+                &wt_str,
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            worktree_lock(&repo, &wt).await.unwrap().as_deref(),
+            Some("kept for the nightly build")
+        );
     }
 
     #[tokio::test]

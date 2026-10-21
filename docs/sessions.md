@@ -320,7 +320,9 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   worktree with its last card. "Nothing running" counts nebula's own sessions only: an agent
   whose session lives in another checkout can be working in this one through absolute paths.
   So every confirm that would take a worktree off disk first runs the **DELETE CHECK** and lists
-  what it finds under the question — processes whose working directory is inside the checkout
+  what it finds under the question — first, when the checkout is locked (`git worktree lock`,
+  by hand, by an agent or by a tool that reuses it), the lock and the reason it was locked with,
+  since deleting unlocks it; then processes whose working directory is inside the checkout
   (other than its own sessions, which the confirm already counts), uncommitted changes and how
   recently the newest was written, and commits its base lacks (or, on a detached HEAD, commits
   no branch holds). `Enter` waits for the check — up to ten seconds — so the delete is never
@@ -372,8 +374,8 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   Turn on **Auto-clean merged worktrees** in Settings → Sessions (`auto_cleanup_merged`) to have
   nebula remove linked checkouts after their PR lands. It is off by default and guarded: the ROOT
   WORKTREE, the repo's default branch, branches used as the base of open PRs, dirty checkouts,
-  checkouts with untracked files, moved heads, running terminals and sessions mid-turn are skipped
-  with a short notice instead.
+  checkouts with untracked files, locked checkouts, moved heads, running terminals and sessions
+  mid-turn are skipped with a short notice instead.
 - **Walking it.** `j` and `k` walk the bands — the rule of the band under the cursor takes the
   accent and its branch goes bold, its remembered card (the session it was last left on, else its
   first) is raised out of the row — a heavy accent frame (`┏━┓`, a weight no status frame takes) over

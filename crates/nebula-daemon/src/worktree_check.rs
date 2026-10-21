@@ -9,7 +9,8 @@
 //! each cheap and each best effort, and each saying so when it could not
 //! look: which processes have their working directory inside the checkout,
 //! what `git status` reports there and how recently it was written, and
-//! which commits HEAD has that its base lacks.
+//! which commits HEAD has that its base lacks. And one thing a person or
+//! tool may have said outright: that the checkout is locked, and why.
 
 use crate::git;
 use anyhow::{Context, Result};
@@ -80,6 +81,10 @@ async fn git_half(repo: &Path, worktree: &Path, configured_base: Option<String>)
             anyhow::anyhow!("found no base branch to compare its commits with"),
             &mut check,
         );
+    }
+    match git::worktree_lock(repo, worktree).await {
+        Ok(lock) => check.locked = lock,
+        Err(e) => note(e, &mut check),
     }
     check
 }

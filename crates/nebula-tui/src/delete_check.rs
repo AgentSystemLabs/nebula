@@ -326,6 +326,17 @@ fn bulk_lines(states: &[(String, &CheckState)], now_ms: i64) -> Vec<CheckLine> {
 /// A finished check's findings, one sentence each.
 fn findings(check: &WorktreeCheck, now_ms: i64) -> Vec<String> {
     let mut out = Vec::new();
+    // First: the one finding someone stated on purpose.
+    match check.locked.as_deref() {
+        Some("") => {
+            out.push("locked (git worktree lock, no reason given) — deleting unlocks it".into())
+        }
+        Some(reason) => out.push(format!(
+            "locked: {} — deleting unlocks it",
+            one_line(reason)
+        )),
+        None => {}
+    }
     if !check.processes.is_empty() {
         let n = check.processes.len();
         out.push(format!(
@@ -367,6 +378,11 @@ fn findings(check: &WorktreeCheck, now_ms: i64) -> Vec<String> {
 /// A finished check's findings as a bulk delete's line lists them.
 fn short_findings(check: &WorktreeCheck, now_ms: i64) -> Vec<String> {
     let mut out = Vec::new();
+    match check.locked.as_deref() {
+        Some("") => out.push("locked".into()),
+        Some(reason) => out.push(format!("locked: {}", one_line(reason))),
+        None => {}
+    }
     if !check.processes.is_empty() {
         out.push(format!("running {}", process_names(check)));
     }
@@ -388,6 +404,11 @@ fn short_findings(check: &WorktreeCheck, now_ms: i64) -> Vec<String> {
         out.push("not fully checked".into());
     }
     out
+}
+
+/// A lock reason as one line of a dialog: git keeps a reason's newlines.
+fn one_line(reason: &str) -> String {
+    reason.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn process_names(check: &WorktreeCheck) -> String {
@@ -459,6 +480,39 @@ mod tests {
                 "⚠ 2 commits origin/main lacks (the branch keeps them)",
             ]
         );
+    }
+
+    #[test]
+    fn a_locked_checkout_leads_with_its_lock_and_reason() {
+        let check = WorktreeCheck {
+            locked: Some("merge queue:\nreused by every push".into()),
+            changes: 1,
+            ..WorktreeCheck::default()
+        };
+        let text: Vec<String> = single_lines("probe", &done(check.clone()), 0)
+            .into_iter()
+            .inspect(|l| assert!(l.warn))
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "⚠ locked: merge queue: reused by every push — deleting unlocks it",
+                "⚠ 1 uncommitted change",
+            ]
+        );
+        assert_eq!(
+            short_findings(&check, 0)[0],
+            "locked: merge queue: reused by every push"
+        );
+
+        let bare = WorktreeCheck {
+            locked: Some(String::new()),
+            ..WorktreeCheck::default()
+        };
+        assert!(bare.has_findings(), "a lock alone is a finding");
+        let text = &single_lines("probe", &done(bare), 0)[0].text;
+        assert!(text.contains("no reason given"), "{text}");
     }
 
     #[test]

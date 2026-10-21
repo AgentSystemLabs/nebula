@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 53;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -24,6 +24,11 @@ pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
 /// a request it could not decode, and its delete confirm simply goes
 /// without the check.
 pub const CHECK_WORKTREE_PROTOCOL: u32 = 51;
+
+/// First protocol whose clients read `WorktreeCheck::locked`. The daemon
+/// leaves it off the check it sends an older client, whose reply is then
+/// byte for byte what it always was.
+pub const WORKTREE_LOCK_PROTOCOL: u32 = 53;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -647,6 +652,15 @@ pub struct WorktreeCheck {
     pub detached: bool,
     /// Why git could not be asked, when it could not.
     pub git_error: Option<String>,
+    /// The checkout is locked (`git worktree lock`): the reason it was
+    /// locked with, empty when none was given. Whoever locked it — a
+    /// person, an agent, a CI tool — asked git to keep it, and git's own
+    /// `worktree remove` refuses it; a delete unlocks it first, so the
+    /// confirm says so. Kept last and left off the wire when None: an
+    /// older client decodes the shorter check it always did, and the
+    /// daemon clears it for one (`WORKTREE_LOCK_PROTOCOL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<String>,
 }
 
 /// One process `WorktreeCheck` found working inside a checkout.
@@ -666,6 +680,7 @@ impl WorktreeCheck {
             || self.changes > 0
             || self.ahead > 0
             || self.git_error.is_some()
+            || self.locked.is_some()
     }
 }
 
@@ -861,5 +876,57 @@ mod tests {
         assert!(protocol_compatible_with(PROTOCOL_VERSION));
         assert!(protocol_compatible_with(PROTOCOL_VERSION + 1));
         assert!(!protocol_compatible_with(MIN_COMPATIBLE_PROTOCOL - 1));
+    }
+
+    /// A check with no lock is the bytes a client older than
+    /// `WORKTREE_LOCK_PROTOCOL` always read; one with a lock reaches a new
+    /// client whole.
+    #[test]
+    fn a_checks_lock_costs_an_older_client_nothing() {
+        /// `WorktreeCheck` as it was before `locked`.
+        #[derive(Serialize, Deserialize)]
+        struct Before {
+            processes: Vec<WorktreeProcess>,
+            process_error: Option<String>,
+            changes: u32,
+            newest_change_ms: Option<i64>,
+            ahead: u32,
+            base: Option<String>,
+            detached: bool,
+            git_error: Option<String>,
+        }
+        let unlocked = WorktreeCheck {
+            changes: 2,
+            base: Some("origin/main".into()),
+            ..WorktreeCheck::default()
+        };
+        let before = Before {
+            processes: Vec::new(),
+            process_error: None,
+            changes: 2,
+            newest_change_ms: None,
+            ahead: 0,
+            base: Some("origin/main".into()),
+            detached: false,
+            git_error: None,
+        };
+        assert_eq!(
+            rmp_serde::to_vec(&unlocked).unwrap(),
+            rmp_serde::to_vec(&before).unwrap()
+        );
+        let older: WorktreeCheck =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&before).unwrap()).unwrap();
+        assert_eq!(
+            older, unlocked,
+            "a newer client reads an older daemon's check"
+        );
+
+        let locked = WorktreeCheck {
+            locked: Some("kept".into()),
+            ..unlocked
+        };
+        let back: WorktreeCheck =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&locked).unwrap()).unwrap();
+        assert_eq!(back, locked);
     }
 }
