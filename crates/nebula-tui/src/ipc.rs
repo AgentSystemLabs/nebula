@@ -223,9 +223,13 @@ fn daemon_exe_path(pid: i32) -> Option<String> {
 pub struct IpcChannels {
     pub tx: tokio::sync::mpsc::Sender<ClientRequest>,
     pub rx: tokio::sync::mpsc::Receiver<ServerEvent>,
+    /// The protocol the DAEMON said it speaks, so a request it would not
+    /// know is never sent to it.
+    pub protocol_version: u32,
 }
 
 pub fn split_connection(conn: Connection) -> IpcChannels {
+    let protocol_version = conn.protocol_version;
     let (read_half, mut write_half) = conn.stream.into_split();
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<ServerEvent>(1024);
     let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<ClientRequest>(256);
@@ -251,6 +255,7 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
     IpcChannels {
         tx: req_tx,
         rx: event_rx,
+        protocol_version,
     }
 }
 

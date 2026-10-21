@@ -226,10 +226,19 @@ fn draw_menu_overlay(f: &mut Frame, app: &mut App, menu: crate::app::ContextMenu
 }
 
 fn draw_confirm_overlay(f: &mut Frame, app: &mut App, confirm: crate::app::ConfirmDialog) {
+    // A worktree delete waits, unshown, for a moment for its DELETE CHECK
+    // so it opens once and filled in; the footer says it is checking.
+    if crate::delete_check::held(app) {
+        return;
+    }
     let th = app.chrome.theme;
     // Bulk deletes itemize their casualties across several message
     // lines — size the dialog to fit them.
     let msg_lines: Vec<&str> = confirm.message.lines().collect();
+    // A worktree delete's DELETE CHECK, under the question: what the
+    // checkout still holds, or that it is being looked at.
+    let check_lines =
+        crate::delete_check::lines(app, &confirm.action, nebula_core::clock::now_ms());
     // A delete that empties a linked worktree asks about the
     // checkout in the same dialog, so its legend has three
     // answers: yes takes both, no takes the card alone, and
@@ -256,12 +265,14 @@ fn draw_confirm_overlay(f: &mut Frame, app: &mut App, confirm: crate::app::Confi
     };
     let longest = msg_lines
         .iter()
+        .copied()
+        .chain(check_lines.iter().map(|l| l.text.as_str()))
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(0)
         .max(legend.width());
     let width = (longest as u16 + 4).max(CONFIRM_MIN_W);
-    let height = msg_lines.len() as u16 + 4;
+    let height = (msg_lines.len() + check_lines.len()) as u16 + 4;
     let area = centered_rect(f.area(), width, height);
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -278,6 +289,14 @@ fn draw_confirm_overlay(f: &mut Frame, app: &mut App, confirm: crate::app::Confi
         .into_iter()
         .map(|l| Line::from(l.to_string()))
         .collect();
+    lines.extend(check_lines.into_iter().map(|l| {
+        let style = if l.warn {
+            Style::default().fg(th.warn)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        Line::from(Span::styled(l.text, style))
+    }));
     lines.push(Line::from(""));
     lines.push(legend);
     f.render_widget(Paragraph::new(lines), inner);

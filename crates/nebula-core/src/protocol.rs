@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 50;
+pub const PROTOCOL_VERSION: u32 = 51;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -18,6 +18,12 @@ pub const PROTOCOL_VERSION: u32 = 50;
 /// `[MIN_COMPATIBLE_PROTOCOL, PROTOCOL_VERSION]` range includes at least one
 /// version the other peer also supports.
 pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
+
+/// First protocol whose daemon answers `ClientRequest::CheckWorktree`. A
+/// client asks only a daemon at least this new; an older one is never sent
+/// a request it could not decode, and its delete confirm simply goes
+/// without the check.
+pub const CHECK_WORKTREE_PROTOCOL: u32 = 51;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -122,6 +128,15 @@ pub enum ClientRequest {
         req_id: u64,
         id: WorktreeId,
         force: bool,
+    },
+    /// What deleting this worktree would interrupt or lose — the DELETE
+    /// CHECK a confirm shows before the checkout leaves the disk. Answered
+    /// by `ServerEvent::WorktreeChecked` with the same req_id (not an Ack),
+    /// or an `Error`. Reads only: nothing is touched. Gated on
+    /// [`CHECK_WORKTREE_PROTOCOL`].
+    CheckWorktree {
+        req_id: u64,
+        id: WorktreeId,
     },
     /// Opt-in cleanup for a linked worktree whose PR was detected as merged.
     /// The daemon re-checks the safety invariants before touching disk:
@@ -598,6 +613,58 @@ pub struct MetricsSnapshot {
     pub sessions: Vec<SessionMetrics>,
 }
 
+/// What deleting a worktree would interrupt or lose, as the DAEMON found
+/// it just now (`ClientRequest::CheckWorktree`). Every part is best effort
+/// and says so when it could not look: a check that failed is not a clean
+/// bill of health.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeCheck {
+    /// Processes whose working directory is inside the checkout — a build,
+    /// an editor, a shell, the tool calls of an agent whose own session
+    /// lives elsewhere — other than the worktree's own sessions, which the
+    /// confirm already counts and which go down with it.
+    pub processes: Vec<WorktreeProcess>,
+    /// Why the process sweep could not run, when it could not.
+    pub process_error: Option<String>,
+    /// Paths `git status` reports: uncommitted edits, untracked files, and
+    /// submodules with changes or new commits.
+    pub changes: u32,
+    /// Epoch ms of the newest write among those paths — "still being
+    /// worked on" when it is a moment ago. None with no changes.
+    pub newest_change_ms: Option<i64>,
+    /// Commits HEAD has that `base` lacks. The branch keeps them after the
+    /// checkout goes, unless `detached`.
+    pub ahead: u32,
+    /// What `ahead` was counted against (`origin/main`); None when nothing
+    /// could be found to compare with.
+    pub base: Option<String>,
+    /// HEAD is detached: `ahead` then counts commits no branch or remote
+    /// holds, which the delete leaves to the reflog alone.
+    pub detached: bool,
+    /// Why git could not be asked, when it could not.
+    pub git_error: Option<String>,
+}
+
+/// One process `WorktreeCheck` found working inside a checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeProcess {
+    pub pid: u32,
+    /// The executable's short name (`cargo`, `zsh`).
+    pub name: String,
+}
+
+impl WorktreeCheck {
+    /// Did the check find anything a delete would interrupt or lose — or
+    /// fail to look at something it should have?
+    pub fn has_findings(&self) -> bool {
+        !self.processes.is_empty()
+            || self.process_error.is_some()
+            || self.changes > 0
+            || self.ahead > 0
+            || self.git_error.is_some()
+    }
+}
+
 /// What `EnterWorktree` did to the agent's live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnterOutcome {
@@ -753,6 +820,12 @@ pub enum ServerEvent {
         flags: u8,
     },
 
+    /// Reply to `ClientRequest::CheckWorktree`.
+    WorktreeChecked {
+        req_id: u64,
+        id: WorktreeId,
+        check: WorktreeCheck,
+    },
     /// Reply to `ClientRequest::GetMetrics`.
     Metrics {
         req_id: u64,

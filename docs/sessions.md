@@ -311,7 +311,17 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   worktree's own confirm; the root's band says no `d`, since the root is never deleted. With the
   setting on, deleting a worktree's last card never asks about the worktree: the band stays,
   empty, until its own `d` — unless **Delete emptied worktree** is on, which still deletes the
-  worktree with its last card. Each band is a
+  worktree with its last card. "Nothing running" counts nebula's own sessions only: an agent
+  whose session lives in another checkout can be working in this one through absolute paths.
+  So every confirm that would take a worktree off disk first runs the **DELETE CHECK** and lists
+  what it finds under the question — processes whose working directory is inside the checkout
+  (other than its own sessions, which the confirm already counts), uncommitted changes and how
+  recently the newest was written, and commits its base lacks (or, on a detached HEAD, commits
+  no branch holds). `Enter` waits for the check — up to ten seconds — so the delete is never
+  confirmed ahead of it; a check that fails or runs out of time says so rather than reading as
+  clean. The dialog itself waits for the check (the footer says `checking 'feat' for work in
+  progress…`), so it opens once, already filled in; only a check still out after five seconds
+  opens it early, with `Checking…` (`Esc` cancels throughout). Each band is a
   titled rule over one row of cards: the rule names the checkout in its scope color (`↳ feat`,
   `⌂ main` for the root — the project is the grid's own scope, named once in the header), with
   that checkout's uncommitted changes right behind the branch in the warning color (`↳ feat +3

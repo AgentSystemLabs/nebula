@@ -16,6 +16,7 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
         | event @ ServerEvent::FilesOpened { .. }
         | event @ ServerEvent::ReviewOpened { .. }
         | event @ ServerEvent::Metrics { .. }
+        | event @ ServerEvent::WorktreeChecked { .. }
         | event @ ServerEvent::OutputTail { .. }
         | event @ ServerEvent::AttachRefused { .. } => handle_tree_event(app, event, out),
         event @ ServerEvent::Error { .. } => handle_error_event(app, event, out),
@@ -499,6 +500,10 @@ fn handle_tree_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequ
             app.jobs.last_metrics = Some(snapshot);
             app.chrome.dirty = true;
         }
+        ServerEvent::WorktreeChecked { req_id, id, check } => {
+            // Answered with WorktreeChecked, not Ack; `land` clears the slot.
+            crate::delete_check::land(app, req_id, id, check);
+        }
         ServerEvent::OutputTail {
             req_id,
             session,
@@ -534,6 +539,10 @@ fn handle_error_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientReq
     let _ = &mut *out;
     match event {
         ServerEvent::Error { req_id, message } => {
+            // A DELETE CHECK that failed says so in its confirm.
+            if req_id.is_some_and(|id| crate::delete_check::land_error(app, id, &message)) {
+                return;
+            }
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back. A
             // failed Cloud launch reopens its populated task editor.

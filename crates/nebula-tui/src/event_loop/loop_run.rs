@@ -7,6 +7,7 @@ macro_rules! main_loop_body {
 
     let mut app = App::new();
     app.chrome.conn = ConnState::Connected;
+    app.requests.daemon_protocol = $channels.protocol_version;
     // This loop draws, so an attach can wait a frame for the pane's size.
     app.pane.size_before_attach = true;
     // The repo nebula was started in, for the first run's "open this
@@ -138,6 +139,11 @@ macro_rules! main_loop_body {
             .map_or_else(tokio::time::Instant::now, |combo| {
                 tokio::time::Instant::from_std(combo.deadline())
             });
+        // When a worktree delete's confirm, held for its DELETE CHECK, is
+        // to be shown though the check has not answered (its arm below).
+        let confirm_reveal = crate::delete_check::reveal_at(&app);
+        let confirm_reveal_at = confirm_reveal
+            .map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std);
         // When the EDGE AUTO-SCROLL next steps (its arm below).
         let drag_autoscroll_deadline = app
             .pane.next_drag_autoscroll
@@ -256,6 +262,9 @@ macro_rules! main_loop_body {
                 }
                 let _ = reassert_modes($terminal.backend_mut());
                 next_mode_reassert = tokio::time::Instant::now() + MODE_REASSERT;
+            }
+            _ = tokio::time::sleep_until(confirm_reveal_at), if confirm_reveal.is_some() => {
+                app.chrome.dirty = true;
             }
             // The EDGE AUTO-SCROLL beat: a drag-selection resting past the
             // pane's top or bottom edge scrolls the history under it, with
@@ -508,6 +517,10 @@ macro_rules! main_loop_body {
                 }
             }
         }
+
+        // A confirm that would delete a worktree asks what it still holds,
+        // whichever key or menu opened it.
+        crate::delete_check::sync(&mut app, &mut out);
 
         for req in out.drain(..) {
             if $channels.tx.send(req).await.is_err() {
