@@ -87,10 +87,11 @@
   falling back to `origin/HEAD` in a repo that has no branch of that name.
 - **Worktrees made outside nebula show up anyway — WORKTREE SYNC.** Every 2 s the DAEMON mtime-probes
   the git files a worktree operation touches — the repo's shared `.git/HEAD`, the `.git/worktrees`
-  directory, and each linked checkout's own `HEAD` — and only when the newest of those stamps has moved
-  does it spend a `git worktree list` and reconcile the rows. So an agent that runs `git worktree add`
-  itself, a `git checkout` you did in another terminal, or a worktree someone removed lands on the
-  grid within a couple of seconds without a restart, while an idle repo costs nothing but a few
+  directory, and each linked checkout's own `HEAD` — and only when the newest of those stamps has moved,
+  or a registered checkout's directory has disappeared, does it spend a `git worktree list` and
+  reconcile the rows. So an agent that runs `git worktree add` itself, a `git checkout` you did in
+  another terminal, or a worktree someone removed (with `git worktree remove` or a plain `rm -rf`)
+  lands on the grid within a couple of seconds without a restart, while an idle repo costs nothing but a few
   `stat` calls (`NEBULA_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
   100 ms). This structural sync is the *only* git polling the DAEMON does — the pull request lookups
   further down are the TUI's own.
@@ -159,6 +160,11 @@
   suppresses the idle notification that normally un-sticks one, so nebula also reads the CLI's terminal
   progress-bar escapes (OSC 9;4) straight off the PTY. That signal survives a cancel, and it stays busy
   while a permission prompt is open — so it can't mark an agent done while it is actually waiting on you.
+- **Codex's terminal lifecycle also reports completion.** Codex 0.163.0 uses OSC 7501 with
+  `state=working:app=codex` and `state=idle:app=codex` rather than OSC 9;4. Nebula reads these through
+  the same busy/idle path, so a finished response leaves yellow even when its hooks are awaiting trust.
+  `blocked` counts as busy; `clear` releases terminal ownership and is ignored. Completion still goes
+  through the STOP GATE when subagents are tracked.
 - **…and the IDLE PROMPT, which is a hold rather than a finish.** Claude posts a
   `Notification{idle_prompt}` after roughly 60 s parked at the input box with nobody touching the
   keyboard, and that is the notification which un-sticks a turn that ended without a `Stop` — a
@@ -280,7 +286,12 @@
   session in the directory its transcript recorded, the old checkout. Cursor and OpenCode resume silent
   and wait for your next prompt (`opencode --session <id> --prompt "<note>"` loads the session but never
   submits the note); Muse reboots fresh with no note (no resume flag mapped). The restart is the only way there: an agent CLI can't `cd` out of the
-  directory it was started in.
+  directory it was started in. When the restart can't bring the conversation back — no session id stored, a
+  Claude session id with no transcript behind it, or a resume that dies within its first seconds and is
+  restarted fresh — the
+  CLIs that take the note (Claude, Codex, Pi) open instead on one saying the conversation could not be
+  carried over, and the agent asks you to restate the request rather than guessing at it. (Pi creates a
+  missing session instead of failing, so a lost Pi session is not detected.)
 - **Ask the agent for another session and it starts one.** Tell a Claude session "start a new nebula
   session that fixes the login redirect" and it runs `nebula spawn "<task>"`: the daemon starts a second
   agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse|grok|opencode`

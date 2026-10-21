@@ -55,20 +55,37 @@ struct ResumeWatch {
     spawned_at: Instant,
     cols: u16,
     rows: u16,
+    /// What a fresh boot opens on if this resume fails fast: a
+    /// relocation's lost-conversation notice, so the respawn says so
+    /// instead of starting silent on a turn the card is waiting for.
+    fresh_prompt: Option<String>,
 }
 /// `$SHELL -l -i -c <cmd>`: a login *and* interactive shell, so zsh sources
 /// ~/.zprofile and ~/.zshrc both and the child sees the PATH the user's
 /// terminal has. CLI probes use it directly, and PTY launches wrap it through
-/// [`LOGIN_SHELL_STDIN_SHIM`] below so rc-file startup sees stdin as non-TTY
+/// [`login_shell_stdin_shim`] below so rc-file startup sees stdin as non-TTY
 /// until nebula's command is about to run.
 const LOGIN_SHELL_ARGS: [&str; 3] = ["-l", "-i", "-c"];
 /// Tiny POSIX wrapper for PTY launches: keep stdout/stderr on the PTY, but
 /// give the login shell `/dev/null` as stdin while it sources rc files.
 /// Shell startup tools that auto-`exec` only when stdin is a TTY (Iris-style
 /// autocomplete launchers) then leave the `-c` payload alone. The payload
-/// reopens `/dev/tty` before starting the agent, so the CLI itself remains
-/// fully interactive.
-const LOGIN_SHELL_STDIN_SHIM: &str = "exec </dev/null; exec \"$@\"";
+/// reopens the PTY by the device path named here ([`reopen_pane_tty`])
+/// before starting the agent, so the CLI itself remains fully interactive.
+fn login_shell_stdin_shim() -> String {
+    let var = env::PANE_TTY;
+    format!("{var}=$(tty) || {var}=/dev/tty; export {var}; exec </dev/null; exec \"$@\"")
+}
+/// The payload's first step: stdin back on the pane's PTY, by its device
+/// path rather than `/dev/tty` — Claude Code (Bun) watches stdin with
+/// kqueue, which on macOS refuses `/dev/tty` with `EINVAL`, and the CLI
+/// exits on the spot. An rc file that unsets or empties the variable falls
+/// back to `/dev/tty` rather than `exec <""`, which would fail and leave
+/// the agent on the `/dev/null` the rc files ran with.
+fn reopen_pane_tty() -> String {
+    let var = env::PANE_TTY;
+    format!("exec <\"${{{var}:-/dev/tty}}\"; unset {var}; ")
+}
 /// Cap on one CLI probe. A heavy rc file costs ~1s; a hung one must not
 /// stall a create forever, so on timeout the CLI is assumed present and
 /// the spawn itself gets to report.
@@ -427,6 +444,66 @@ fn relocation_prompt(relocate: bool, worktree: &Worktree) -> Option<String> {
             worktree.path.display()
         )
     })
+}
+
+/// The prompt a relocated session opens on when the respawn came up fresh
+/// instead of resuming: the CLI never saw the conversation, so rather
+/// than "continue" — which it would answer by guessing — it tells the user
+/// the conversation was lost and waits for them to restate it.
+fn relocation_lost_prompt(worktree: &Worktree) -> String {
+    format!(
+        "[nebula] This session was moved into the worktree `{}` at {}, but its previous \
+         conversation could not be resumed: you are a fresh session with none of its context. \
+         Tell the user, in one or two lines, that the conversation could not be carried over \
+         into the worktree and ask them to restate what they want done here. Do not guess at \
+         the earlier request and do not start any work.",
+        worktree.branch,
+        worktree.path.display()
+    )
+}
+
+/// The first turn a spawn opens on.
+#[derive(Clone, Copy, Debug)]
+enum FirstPrompt<'a> {
+    /// Submitted whether the CLI resumes or boots fresh: the prefix + task
+    /// + postfix an AGENT PRESET launch composes.
+    Task(&'a str),
+    /// A relocation's notice, picked by what the spawn actually does:
+    /// `resumed` carries the conversation on in the new checkout, `fresh`
+    /// tells a CLI that came up without it that it was lost.
+    Relocation { resumed: &'a str, fresh: &'a str },
+}
+
+/// The prompt a spawn submits, given whether it resumes.
+fn pick_first_prompt(first: Option<FirstPrompt<'_>>, resumes: bool) -> Option<&str> {
+    match first? {
+        FirstPrompt::Task(task) => Some(task),
+        FirstPrompt::Relocation { resumed, fresh } => Some(if resumes { resumed } else { fresh }),
+    }
+}
+
+/// What an agent spawn did, for the callers that care how it came up.
+struct Spawned {
+    session: Arc<PtySession>,
+    /// The CLI is handed a first turn (a task, a notice or a scope rule).
+    prompted: bool,
+    /// A stored conversation the spawn did not bring back.
+    lost_session: bool,
+}
+
+/// The session id a spawn resumes, if any: the row's stored id, when the
+/// harness maps a resume and the spawn is a plain local launch (not a
+/// Cloud dispatch, an attach or a test override). The one decision the
+/// command, the rule's placement and a relocation's notice share.
+fn resume_session_id<'a>(
+    agent: &'a Agent,
+    harness: &nebula_core::harness::HarnessDescriptor,
+    not_a_plain_launch: bool,
+) -> Option<&'a str> {
+    if not_a_plain_launch || !harness.resumes() {
+        return None;
+    }
+    agent.session_id.as_deref()
 }
 
 /// The checkout the test wrapper boots every spawn in.
@@ -815,7 +892,7 @@ fn resolve_harness_in(
 }
 
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
-/// 'exec </dev/tty; unset …; export …; prog args'`) so the child gets the
+/// 'exec <"$NEBULA_PANE_TTY"; unset …; export …; prog args'`) so the child gets the
 /// user's real environment — ~/.zprofile and ~/.zshrc on zsh — rather than
 /// the daemon's.
 ///
@@ -833,7 +910,7 @@ fn resolve_harness_in(
 /// than one group.
 ///
 /// The wrapper process feeds `/dev/null` to the shell while those files run,
-/// then the prelude reopens `/dev/tty` and restates what the pane is *after*
+/// then the prelude reopens the PTY and restates what the pane is *after*
 /// startup:
 /// `TERM` and `COLORTERM` name nebula's own grid — 24-bit colour whatever
 /// the host terminal — and `NO_COLOR` / `FORCE_COLOR` are dropped. A
@@ -856,7 +933,8 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
 /// TERMINAL's `.nebula.json` `run`, pipes and `&&` and all — behind the
 /// same prelude.
 fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
-    let mut cmdline = String::from("exec </dev/tty; unset");
+    let mut cmdline = reopen_pane_tty();
+    cmdline.push_str("unset");
     for name in env::PANE_COLOR_OVERRIDES {
         cmdline.push(' ');
         cmdline.push_str(name);
@@ -867,7 +945,7 @@ fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
     cmdline.push_str(env::PANE_COLORTERM);
     cmdline.push_str("; ");
     cmdline.push_str(line);
-    let mut args = vec!["-c".to_string(), LOGIN_SHELL_STDIN_SHIM.to_string()];
+    let mut args = vec!["-c".to_string(), login_shell_stdin_shim()];
     args.push("nebula-login-shell".to_string());
     args.push(shell.to_string());
     args.extend(LOGIN_SHELL_ARGS.iter().map(|s| s.to_string()));
@@ -2016,6 +2094,40 @@ mod tests {
         );
     }
 
+    /// The launch line reopens stdin from the device the shim named, and
+    /// unsets the name before the command runs so no child inherits it.
+    /// Left empty (an rc file cleared it), it falls back to `/dev/tty`
+    /// instead of `exec <""`, which would fail and leave stdin on the
+    /// rc files' `/dev/null` — the e2e
+    /// `create_agent_gets_a_tty_when_rc_clears_the_pane_tty` covers that
+    /// half, since it needs a controlling terminal.
+    #[test]
+    fn reopen_pane_tty_reads_the_named_device_then_unsets_it() {
+        assert_eq!(
+            reopen_pane_tty(),
+            r#"exec <"${NEBULA_PANE_TTY:-/dev/tty}"; unset NEBULA_PANE_TTY; "#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("pane");
+        std::fs::write(&device, "from-the-pane\n").unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "{}cat; echo \"pane=${{{}-unset}}\"",
+                reopen_pane_tty(),
+                env::PANE_TTY
+            ))
+            .env(env::PANE_TTY, &device)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "from-the-pane\npane=unset\n"
+        );
+    }
+
     #[test]
     fn login_shell_wrap_quotes_args_and_leaves_the_command_word_bare() {
         let (program, args) = login_shell_wrap(
@@ -2028,24 +2140,27 @@ mod tests {
             args,
             vec![
                 "-c",
-                LOGIN_SHELL_STDIN_SHIM,
+                &login_shell_stdin_shim(),
                 "nebula-login-shell",
                 "/bin/zsh",
                 "-l",
                 "-i",
                 "-c",
-                &format!("exec </dev/tty; {PANE_ENV} claude '--resume' 'sid-1'")
+                &format!("{}{PANE_ENV} claude '--resume' 'sid-1'", reopen_pane_tty())
             ]
         );
         // Single quotes in an arg survive the wrapping.
         let (_, args) = login_shell_wrap("/bin/zsh", "echo", &["it's".to_string()]);
         assert_eq!(
             args[7],
-            format!(r"exec </dev/tty; {PANE_ENV} echo 'it'\''s'")
+            format!(r"{}{PANE_ENV} echo 'it'\''s'", reopen_pane_tty())
         );
         // A command word that isn't a plain name is quoted like an argument.
         let (_, args) = login_shell_wrap("/bin/zsh", "my tool", &[]);
-        assert_eq!(args[7], format!("exec </dev/tty; {PANE_ENV} 'my tool'"));
+        assert_eq!(
+            args[7],
+            format!("{}{PANE_ENV} 'my tool'", reopen_pane_tty())
+        );
     }
 
     /// The command word resolves through the shell, so an alias or function
@@ -2065,7 +2180,7 @@ mod tests {
             .arg(format!(
                 "claude() {{ printf 'routed %s' \"$*\"; }}; {}",
                 args[7]
-                    .strip_prefix("exec </dev/tty; ")
+                    .strip_prefix(reopen_pane_tty().as_str())
                     .expect("launch line restores the PTY before the command")
             ))
             .output()
@@ -2102,7 +2217,7 @@ mod tests {
         let mut zsh_args = args[4..7].to_vec();
         zsh_args.push(
             args[7]
-                .strip_prefix("exec </dev/tty; ")
+                .strip_prefix(reopen_pane_tty().as_str())
                 .expect("launch line restores the PTY before the command")
                 .to_string(),
         );
@@ -2143,7 +2258,7 @@ mod tests {
             .arg("-c")
             .arg(
                 args[7]
-                    .strip_prefix("exec </dev/tty; ")
+                    .strip_prefix(reopen_pane_tty().as_str())
                     .expect("launch line restores the PTY before the command"),
             )
             .env("NO_COLOR", "1")
@@ -2168,6 +2283,82 @@ mod tests {
                 token: String::new(),
             },
         )
+    }
+
+    /// A relocation's notice is picked by what the spawn does: the
+    /// "continue" notice only reaches a CLI that resumed, a fresh one gets
+    /// the lost notice, and a preset's task is submitted either way.
+    #[test]
+    fn a_relocation_notice_follows_whether_the_spawn_resumes() {
+        let relocation = Some(FirstPrompt::Relocation {
+            resumed: "carry on",
+            fresh: "lost",
+        });
+        assert_eq!(pick_first_prompt(relocation, true), Some("carry on"));
+        assert_eq!(pick_first_prompt(relocation, false), Some("lost"));
+        assert_eq!(
+            pick_first_prompt(Some(FirstPrompt::Task("task")), false),
+            Some("task")
+        );
+        assert_eq!(
+            pick_first_prompt(Some(FirstPrompt::Task("task")), true),
+            Some("task")
+        );
+        assert_eq!(pick_first_prompt(None, true), None);
+    }
+
+    /// The one resume decision: the stored id, only for a plain local
+    /// launch of a harness that maps a resume.
+    #[test]
+    fn a_spawn_resumes_only_a_stored_id_on_a_plain_launch() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_agent(&daemon, "a1", "feat", Some("s1"));
+        seed_agent(&daemon, "a2", "feat", None);
+        let get = |id: &str| {
+            daemon
+                .store
+                .get_agent(&AgentId(id.into()))
+                .unwrap()
+                .unwrap()
+        };
+        let claude = resolve_harness(AgentKind::Claude, None).unwrap();
+        let (a1, a2) = (get("a1"), get("a2"));
+        assert_eq!(resume_session_id(&a1, &claude, false), Some("s1"));
+        assert_eq!(
+            resume_session_id(&a1, &claude, true),
+            None,
+            "attach, cloud or override"
+        );
+        assert_eq!(
+            resume_session_id(&a2, &claude, false),
+            None,
+            "nothing stored"
+        );
+        let mut no_resume = claude.clone();
+        no_resume.resume = Default::default();
+        assert_eq!(
+            resume_session_id(&a1, &no_resume, false),
+            None,
+            "no resume mapping"
+        );
+    }
+
+    #[test]
+    fn the_lost_relocation_notice_names_the_checkout_and_never_says_continue() {
+        let feat = Worktree {
+            id: WorktreeId("feat".into()),
+            project_id: ProjectId("p".into()),
+            path: PathBuf::from("/nebula-test/p-feat"),
+            branch: "feat".into(),
+            is_main: false,
+            sort_order: 1,
+        };
+        let notice = relocation_lost_prompt(&feat);
+        assert!(notice.contains("`feat`") && notice.contains("/nebula-test/p-feat"));
+        assert!(notice.contains("could not be resumed"));
+        assert!(!notice.contains("Continue the user's most recent request"));
     }
 
     #[test]
@@ -3838,6 +4029,53 @@ mod tests {
         );
         let rt = worktrees.iter().find(|w| w.id.as_str() == "rt").unwrap();
         assert!(rt.is_main, "the surviving root row keeps the badge");
+    }
+
+    /// A checkout deleted out from under git (`rm -rf`, Finder, a disk
+    /// sweep) stays in `git worktree list` until someone prunes it: marked
+    /// `prunable`, or — if it was locked, as Claude Code's worktrees are —
+    /// not even that. It is gone all the same, so its row goes too, and the
+    /// repo itself is left as it was.
+    #[tokio::test]
+    async fn reconcile_drops_a_row_whose_checkout_was_deleted_without_git() {
+        for locked in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let repo = init_repo(&root);
+            let feat = root.join("repo-worktrees").join("feat");
+            git_in(
+                &repo,
+                &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
+            );
+            if locked {
+                git_in(&repo, &["worktree", "lock", &feat.to_string_lossy()]);
+            }
+
+            let daemon = test_daemon();
+            let project = project_at(&daemon, &repo);
+            daemon.sync_project_worktrees(&project).await.unwrap();
+            let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+            assert!(worktrees.iter().any(|w| w.branch == "feat"), "adopted");
+
+            std::fs::remove_dir_all(&feat).unwrap();
+            daemon.sync_project_worktrees(&project).await.unwrap();
+
+            let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+            assert!(
+                worktrees.iter().all(|w| w.branch != "feat"),
+                "locked={locked}: the deleted checkout's row is gone: {worktrees:#?}"
+            );
+            // nebula does not prune or unlock for the user.
+            let listed = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "list", "--porcelain"])
+                .output()
+                .unwrap();
+            let listed = String::from_utf8_lossy(&listed.stdout);
+            let mark = if locked { "locked" } else { "prunable" };
+            assert!(listed.contains(mark), "locked={locked}: {listed}");
+        }
     }
 
     /// A fresh repo with one commit, at a canonical path (the macOS

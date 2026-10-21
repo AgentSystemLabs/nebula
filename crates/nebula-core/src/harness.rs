@@ -192,7 +192,9 @@ pub struct HarnessDescriptor {
     pub hooks: Option<String>,
     /// Whether a relocated session resumes with the trailing "continue in
     /// this checkout" prompt (only for CLIs verified to open a resumed
-    /// session on one).
+    /// session on one). The same CLIs, when the relocation comes back
+    /// without its conversation, open on a "could not be resumed" prompt
+    /// instead.
     #[serde(default, skip_serializing_if = "is_false")]
     pub relocation_prompt: bool,
     /// Whether model and effort compose into one `--model {m}-{e}` id

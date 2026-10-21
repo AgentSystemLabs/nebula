@@ -218,20 +218,37 @@ impl Daemon {
         self.last_cwd.lock().remove(id);
         // A row whose entry went missing since still relocates; the boot
         // itself refuses with the entry's reason, so the notice degrades
-        // to none rather than failing the move.
-        let prompt = resolve_harness(agent.kind, agent.custom_harness.as_deref())
-            .map(|harness| relocation_prompt(notice && harness.relocation_prompt, target))
-            .unwrap_or(None);
+        // to none rather than failing the move. Which notice the CLI opens
+        // on is the spawn's call, made from what it actually does: a
+        // resume carries on in the new checkout; a CLI that comes up fresh
+        // (no transcript behind the session id, say) never saw the
+        // conversation, so rather than "continue" — which it would answer
+        // by guessing — it is told the conversation was lost. Both only
+        // for the CLIs verified to take the trailing prompt, and only when
+        // `notice` asks: a move the user made resumes silent either way.
+        let takes_notice = notice
+            && resolve_harness(agent.kind, agent.custom_harness.as_deref())
+                .is_ok_and(|harness| harness.relocation_prompt);
+        let notices = relocation_prompt(takes_notice, target)
+            .map(|resumed| (resumed, relocation_lost_prompt(target)));
         let spawned = self.spawn_agent_session_with(
             &agent,
             target,
             DEFAULT_COLS,
             DEFAULT_ROWS,
             None,
-            prompt.as_deref(),
+            notices
+                .as_ref()
+                .map(|(resumed, fresh)| FirstPrompt::Relocation { resumed, fresh }),
         );
         let continued = match spawned {
-            Ok(_) => prompt.is_some(),
+            Ok(spawned) => {
+                if spawned.lost_session {
+                    tracing::warn!(agent = %id, to = %target.branch, "relocated session could not resume its conversation — respawned fresh");
+                }
+                // A move the user made never carries a held turn on.
+                notice && spawned.prompted
+            }
             Err(e) => {
                 tracing::warn!(agent = %id, error = %e, "respawn after worktree relocation failed");
                 false
