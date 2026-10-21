@@ -3352,7 +3352,9 @@ async fn create_agent_runs_the_shells_own_claude_and_archive_clears_its_job() {
 /// never reaches `<agent>`. Nebula keeps the login shell interactive for rc
 /// files, but makes stdin non-TTY until the launch line itself reopens the
 /// PTY, so aliases/functions from rc still work and the agent gets a real
-/// terminal.
+/// terminal — by the PTY's own device path, not `/dev/tty`: macOS kqueue
+/// refuses `/dev/tty`, and Claude Code (Bun) dies on its stdin watcher with
+/// `EINVAL: invalid argument, kqueue` the moment it starts.
 #[tokio::test]
 async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
     let env = TestEnv::new();
@@ -3370,6 +3372,7 @@ async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
                 "fi\n",
                 "claude() {{\n",
                 "  if [ -t 0 ]; then tty=tty; else tty=notty; fi\n",
+                "  tty > '{d}/claude-stdin'\n",
                 "  echo \"claude $tty $*\" > '{d}/claude-ran'\n",
                 "  sleep 600\n",
                 "}}\n",
@@ -3414,6 +3417,12 @@ async fn create_agent_survives_rc_autostart_that_execs_on_tty_stdin() {
     assert!(
         !dir.join("iris").exists(),
         "the rc autostart hook should not have taken over the PTY"
+    );
+    let stdin = std::fs::read_to_string(dir.join("claude-stdin")).unwrap();
+    assert_ne!(
+        stdin.trim_end(),
+        "/dev/tty",
+        "stdin must be the PTY's own device, which kqueue can watch"
     );
 
     write_frame(
