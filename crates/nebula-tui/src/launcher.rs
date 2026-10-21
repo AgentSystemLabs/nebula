@@ -252,6 +252,15 @@ impl Band {
         self.cards.iter().filter(|c| c.is_terminal()).count()
     }
 
+    /// Its sessions with a live process — more than one is a SHARED
+    /// WORKTREE: agents editing one checkout, index and branch at once.
+    pub fn live_sessions(&self) -> usize {
+        self.cards
+            .iter()
+            .filter(|c| matches!(c, Card::Session(row) if row.agent.alive))
+            .count()
+    }
+
     /// Where `sref`'s card sits in the band.
     pub fn position(&self, sref: &SessionRef) -> Option<usize> {
         self.cards.iter().position(|c| &c.sref() == sref)

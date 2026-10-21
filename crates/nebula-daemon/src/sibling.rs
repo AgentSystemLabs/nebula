@@ -4,11 +4,18 @@
 //! STARTING PROMPT. The caller's own process is never touched (unlike
 //! `nebula worktree`, nothing here waits on a turn end), so the model runs
 //! it, tells the user, and carries on.
+//!
+//! A SHARED WORKTREE — one holding more than one live session — is said
+//! out loud: the reply names the sessions already there, and a spawn into
+//! one that also has uncommitted changes is refused unless the caller
+//! passes `--same-worktree`, since two sessions in one checkout share its
+//! files, index and branch, and one's commit or build takes in the other's
+//! half-done work.
 
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use nebula_core::{Agent, AgentId, AgentKind, EntityId, WorktreeId};
+use nebula_core::{Agent, AgentId, AgentKind, EntityId, SessionRef, Worktree, WorktreeId};
 
 use crate::registry::{CreateAgentSpec, Daemon};
 
@@ -33,7 +40,11 @@ when the user names one). Do not use `nebula spawn --worktree` for requests that
 session to \"do this in a new worktree\" or \"move to a worktree\"; follow the worktree guidance and \
 run `nebula worktree <name>` for those. This session is unaffected by a spawn either way: carry on \
 with whatever else the user asked, and if starting the session was the whole request, tell the user \
-in one line that it is running. If the command fails, report the error.";
+in one line that it is running. If nebula refuses because that worktree already has live sessions \
+and uncommitted changes, run it again with `--worktree` and a branch that has no worktree yet, unless \
+the user asked for the same checkout, in which case add `--same-worktree`. For a long brief, write it \
+to a file and pass `--prompt-file <path>` instead of the task words. If the command fails, report \
+the error.";
 
 /// What nebula appends to Claude and pi so every session can consult other
 /// sessions when the user names them, without becoming the orchestrator.
@@ -55,6 +66,50 @@ pub struct SiblingWorktree<'a> {
     pub base: Option<&'a str>,
 }
 
+/// What a successful `nebula spawn` started: the new row, the worktree it
+/// runs in, and the names of the live sessions that were already there.
+#[derive(Debug, Clone)]
+pub struct SiblingSpawned {
+    pub agent: AgentId,
+    pub worktree: Worktree,
+    pub shared_with: Vec<String>,
+}
+
+/// Why a spawn into `worktree` is refused, or None when it may go ahead:
+/// it is refused only when the worktree already has a live session in it
+/// (`live`, their names) AND `uncommitted` paths — sharing a clean
+/// checkout is said, not refused. `named_branch`: the spawn already
+/// carried `--worktree` and landed on that branch's existing checkout, so
+/// the way out is a branch with no worktree yet, not the same flag again.
+pub(crate) fn shared_worktree_refusal(
+    worktree: &Worktree,
+    live: &[String],
+    uncommitted: usize,
+    named_branch: bool,
+) -> Option<String> {
+    if live.is_empty() || uncommitted == 0 {
+        return None;
+    }
+    let n = live.len();
+    let own_checkout = if named_branch {
+        "`--worktree` with a branch that has no worktree yet"
+    } else {
+        "`--worktree <branch>`"
+    };
+    Some(format!(
+        "refused: the worktree on branch \"{branch}\" ({path}) has {uncommitted} uncommitted \
+         path{paths} and {n} live session{sessions} already in it ({names}). A new session there \
+         would share its files, index and branch, so one session's commit, amend or build would \
+         take in another's half-done work. Run it again with {own_checkout} to give the new \
+         session its own checkout, or add `--same-worktree` to share this one anyway.",
+        branch = worktree.branch,
+        path = worktree.path.display(),
+        paths = if uncommitted == 1 { "" } else { "s" },
+        sessions = if n == 1 { "" } else { "s" },
+        names = live.join(", "),
+    ))
+}
+
 /// The first free `agent-N` among `taken` — the same default the TUI's
 /// name prompt offers, which is what makes the new row eligible for
 /// AUTO-TITLE (the daemon titles only rows created on the default name).
@@ -73,6 +128,58 @@ impl Daemon {
             bail!("agent is archived");
         }
         Ok(caller)
+    }
+
+    /// The names of the live, unarchived sessions in `worktree`, in tree
+    /// order — who a session started there would share its checkout with.
+    fn live_sessions_in(&self, worktree: &WorktreeId) -> Result<Vec<String>> {
+        let (_, _, agents, _) = self.store.load_tree()?;
+        Ok(agents
+            .into_iter()
+            .filter(|a| &a.worktree_id == worktree && !a.archived)
+            .filter(|a| self.is_alive(&SessionRef::Agent(a.id.clone())))
+            .map(|a| a.name)
+            .collect())
+    }
+
+    /// [`shared_worktree_refusal`] for `worktree` as it stands on disk.
+    /// Nobody live there asks git nothing. A status git cannot give — a
+    /// lock, a broken index, a timeout — refuses too, with the reason: the
+    /// check exists for exactly the checkout someone is working in, and
+    /// letting a spawn through unasked is the collision it guards against.
+    async fn check_shared_worktree(
+        &self,
+        worktree: &Worktree,
+        live: &[String],
+        named_branch: bool,
+    ) -> Result<()> {
+        if live.is_empty() {
+            return Ok(());
+        }
+        let uncommitted = match crate::git::uncommitted_paths(&worktree.path).await {
+            Ok(n) => n,
+            Err(error) => {
+                tracing::warn!(
+                    worktree = %worktree.path.display(),
+                    error = %error,
+                    "shared-worktree check: git status failed"
+                );
+                bail!(
+                    "refused: the worktree on branch \"{}\" ({}) has {} live session{} already in \
+                     it, and git could not say whether it has uncommitted changes ({error:#}). Add \
+                     `--same-worktree` to share it anyway, or give the new session its own \
+                     checkout with `--worktree`.",
+                    worktree.branch,
+                    worktree.path.display(),
+                    live.len(),
+                    if live.len() == 1 { "" } else { "s" },
+                );
+            }
+        };
+        match shared_worktree_refusal(worktree, live, uncommitted, named_branch) {
+            Some(reason) => bail!("{reason}"),
+            None => Ok(()),
+        }
     }
 
     /// The first free `agent-N` among the rows in `worktree`.
@@ -148,18 +255,25 @@ impl Daemon {
     /// boot a new agent beside it with `starting_prompt` as its first
     /// prompt — in the caller's worktree, or with `worktree` in the
     /// caller's PROJECT's worktree on that branch, cut first when there is
-    /// none. Returns the new row's id; a created worktree and the agent
-    /// reach every client through the ordinary create paths.
+    /// none. Refused when that worktree already has a live session and
+    /// uncommitted changes, unless `share_worktree`. Returns the new row,
+    /// its worktree and who it shares it with; a created worktree and the
+    /// agent reach every client through the ordinary create paths.
     pub async fn spawn_sibling_agent(
         self: &Arc<Self>,
         id: &AgentId,
         kind: Option<AgentKind>,
         worktree: Option<SiblingWorktree<'_>>,
+        share_worktree: bool,
         starting_prompt: &str,
-    ) -> Result<EntityId> {
+    ) -> Result<SiblingSpawned> {
         let caller = self.spawning_caller(id)?;
+        let named_branch = worktree.is_some();
         let target = match worktree {
-            None => caller.worktree_id.clone(),
+            None => self
+                .store
+                .get_worktree(&caller.worktree_id)?
+                .context("worktree not found")?,
             Some(SiblingWorktree { branch, base }) => {
                 let branch = branch.trim();
                 if branch.is_empty() {
@@ -182,11 +296,25 @@ impl Daemon {
                     .project_id;
                 self.worktree_on_branch_for_spawn(&project, branch, base)
                     .await?
-                    .id
             }
         };
-        let spec = self.sibling_spec(&caller, kind, &target, starting_prompt)?;
-        self.create_agent(spec).await
+        // Held from the look at who is live until the new session is: a
+        // second spawn into the same checkout then sees this one.
+        let _sibling_ops = self.sibling_ops.lock().await;
+        let shared_with = self.live_sessions_in(&target.id)?;
+        if !share_worktree {
+            self.check_shared_worktree(&target, &shared_with, named_branch)
+                .await?;
+        }
+        let spec = self.sibling_spec(&caller, kind, &target.id, starting_prompt)?;
+        let EntityId::Agent(agent) = self.create_agent(spec).await? else {
+            bail!("create_agent returned a non-agent id");
+        };
+        Ok(SiblingSpawned {
+            agent,
+            worktree: target,
+            shared_with,
+        })
     }
 }
 
@@ -361,7 +489,7 @@ mod tests {
             .insert_agent(&agent("agent-1", "feat", AgentKind::Claude, None))
             .unwrap();
         let err = daemon
-            .spawn_sibling_agent(&AgentId("agent-1".into()), None, None, " \n ")
+            .spawn_sibling_agent(&AgentId("agent-1".into()), None, None, false, " \n ")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("is empty"), "{err}");
@@ -433,19 +561,19 @@ mod tests {
             base: None,
         };
         let err = daemon
-            .spawn_sibling_agent(&caller, None, Some(blank_branch), "Fix it")
+            .spawn_sibling_agent(&caller, None, Some(blank_branch), false, "Fix it")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("branch name is empty"), "{err}");
 
         let err = daemon
-            .spawn_sibling_agent(&caller, None, Some(fresh), " \n ")
+            .spawn_sibling_agent(&caller, None, Some(fresh), false, " \n ")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("is empty"), "{err}");
 
         let err = daemon
-            .spawn_sibling_agent(&AgentId("nope".into()), None, Some(fresh), "Fix it")
+            .spawn_sibling_agent(&AgentId("nope".into()), None, Some(fresh), false, "Fix it")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("agent not found"), "{err}");
@@ -457,12 +585,90 @@ mod tests {
             .insert_agent(&agent("custom-1", "feat", AgentKind::Custom, None))
             .unwrap();
         let err = daemon
-            .spawn_sibling_agent(&AgentId("custom-1".into()), None, Some(fresh), "Fix it")
+            .spawn_sibling_agent(
+                &AgentId("custom-1".into()),
+                None,
+                Some(fresh),
+                false,
+                "Fix it",
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("missing its registry id"), "{err}");
 
         let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
         assert_eq!(worktrees.len(), 2, "no worktree was registered");
+    }
+
+    fn worktree(branch: &str) -> Worktree {
+        Worktree {
+            id: WorktreeId(branch.into()),
+            project_id: ProjectId("p".into()),
+            path: format!("/nebula-test/p-{branch}").into(),
+            branch: branch.into(),
+            is_main: false,
+            sort_order: 0,
+        }
+    }
+
+    /// A worktree is refused only with both a live session in it and work
+    /// in flight: a clean shared checkout is said in the reply, not refused,
+    /// and an idle checkout with changes is nobody else's.
+    #[test]
+    fn a_shared_worktree_is_refused_only_with_uncommitted_changes() {
+        let feat = worktree("feat");
+        let live = vec!["agent-1".to_string(), "Fix Login".to_string()];
+        assert_eq!(shared_worktree_refusal(&feat, &live, 0, false), None);
+        assert_eq!(shared_worktree_refusal(&feat, &[], 7, false), None);
+
+        let reason = shared_worktree_refusal(&feat, &live, 3, false).expect("refused");
+        for says in [
+            "branch \"feat\"",
+            "/nebula-test/p-feat",
+            "3 uncommitted paths",
+            "2 live sessions already in it (agent-1, Fix Login)",
+            "--worktree <branch>",
+            "--same-worktree",
+        ] {
+            assert!(reason.contains(says), "{says:?} missing from {reason}");
+        }
+        let one = shared_worktree_refusal(&feat, &live[..1], 1, false).unwrap();
+        assert!(
+            one.contains("1 uncommitted path and 1 live session already"),
+            "{one}"
+        );
+
+        // `--worktree feat` already landed here: naming it again would be
+        // refused again, so the way out is a branch with no worktree.
+        let named = shared_worktree_refusal(&feat, &live, 3, true).unwrap();
+        assert!(
+            named.contains("`--worktree` with a branch that has no worktree yet"),
+            "{named}"
+        );
+    }
+
+    /// Without live sessions (none run in a unit test) nobody shares the
+    /// worktree and git is never asked — the test project is no repo. With
+    /// one, a status git cannot give refuses, saying why.
+    #[tokio::test]
+    async fn an_idle_worktree_has_nobody_to_share_with() {
+        let daemon = daemon();
+        daemon
+            .store
+            .insert_agent(&agent("agent-1", "feat", AgentKind::Claude, None))
+            .unwrap();
+        let feat = WorktreeId("feat".into());
+        assert!(daemon.live_sessions_in(&feat).unwrap().is_empty());
+        daemon
+            .check_shared_worktree(&worktree("feat"), &[], false)
+            .await
+            .unwrap();
+        let err = daemon
+            .check_shared_worktree(&worktree("feat"), &["agent-1".into()], false)
+            .await
+            .expect_err("an unreadable status refuses")
+            .to_string();
+        assert!(err.contains("git could not say"), "{err}");
+        assert!(err.contains("--same-worktree"), "{err}");
     }
 }

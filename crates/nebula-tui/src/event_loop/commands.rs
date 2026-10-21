@@ -399,6 +399,7 @@ pub(crate) fn run_pending_action(
         }
         PendingAction::ResetSettings => reset_settings(app),
         PendingAction::Quit => app.chrome.should_quit = true,
+        PendingAction::SendSharedHold => shared_hold::send_shared_hold(app, out),
     }
 }
 

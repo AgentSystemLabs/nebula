@@ -279,7 +279,7 @@ mod tests {
     //! on the cards.
     use super::super::tests::{buffer_text, hse, seed_tree, with_config_json, with_default_config};
     use super::super::{handle_server_event, handle_terminal_event};
-    use crate::app::{App, Focus};
+    use crate::app::{App, Focus, Overlay};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use nebula_core::{
         Agent, AgentId, AgentKind, AgentStatus, ClientRequest, Entity, EntityId, Project,
@@ -423,6 +423,61 @@ mod tests {
 
     fn cursor(app: &App) -> Option<AgentId> {
         app.selected_session().map(|a| a.id)
+    }
+
+    /// A quick prompt aimed at a linked worktree another session is live
+    /// in asks first, and backing out of the question loses nothing: the
+    /// box comes back with its task, and no stand-in card is left on the
+    /// grid. A yes then sends the launch. (The seeded root checkout is
+    /// made a linked one in place: what is under test is the hold on the
+    /// request, not how the checkout got there.)
+    #[test]
+    fn a_launch_into_a_worktree_with_a_live_session_asks_first_and_keeps_the_task() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut linked = app.tree.worktrees[0].clone();
+            linked.is_main = false;
+            linked.branch = "feat".into();
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(linked),
+                },
+            );
+            draw(&mut app);
+            let agents = app.tree.agents.len();
+
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            type_text(&mut app, "tidy the nav");
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::CreateAgent { .. })),
+                "held: {out:?}"
+            );
+            assert!(
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c)) if c.title == "Shared worktree"),
+                "the launch asks first"
+            );
+
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+                panic!("the box comes back");
+            };
+            assert_eq!(prompt.input.as_str(), "tidy the nav");
+            assert_eq!(app.tree.agents.len(), agents, "no stand-in left behind");
+
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let out = key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::CreateAgent { worktree, .. } if worktree.0 == "w1"
+                )),
+                "the yes sends it: {out:?}"
+            );
+        });
     }
 
     /// FOLLOW NEW SESSION off: Enter from a card leaves that card

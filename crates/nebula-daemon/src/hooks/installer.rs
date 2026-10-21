@@ -50,6 +50,18 @@ const CLAUDE_SETTINGS_FILE: &str = "settings.local.json";
 const CLAUDE_DIR: &str = ".claude";
 const CURSOR_DIR: &str = ".cursor";
 const CODEX_DIR: &str = ".codex";
+/// Every file nebula writes inside a worktree, relative to its root:
+/// Claude's settings and Cursor's hooks and title rule. All three are
+/// rewritten at each spawn, so they say nothing about anyone's work in
+/// flight — `git::uncommitted_paths` leaves them out. A repo only ignores
+/// them if someone told git to (Claude Code adds its settings file to the
+/// user's global excludes when it writes one itself; nebula does not).
+pub const WORKTREE_FILES: &[&str] = &[
+    ".claude/settings.local.json",
+    ".cursor/hooks.json",
+    ".cursor/rules/nebula-title.mdc",
+];
+
 /// How long a hook waits on the daemon. Hooks run inline in the agent's
 /// turn, so a hung daemon has to cost seconds, not a stuck session.
 const HOOK_CURL_TIMEOUT_SECS: u32 = 3;

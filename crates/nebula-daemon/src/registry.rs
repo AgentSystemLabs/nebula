@@ -170,6 +170,10 @@ pub struct Daemon {
     /// Serializes worktree create/delete with the background auto-sync so
     /// a checkout is never adopted twice while its row is mid-insert.
     worktree_ops: tokio::sync::Mutex<()>,
+    /// Serializes `nebula spawn`'s shared-worktree check with the create
+    /// it guards, so two spawns into one checkout cannot both see it
+    /// without the other's new session (`sibling.rs`).
+    pub(crate) sibling_ops: tokio::sync::Mutex<()>,
     /// Warm agent CLIs awaiting adoption, at most one per (worktree, kind).
     prewarmed: Mutex<HashMap<(WorktreeId, AgentKind), PrewarmEntry>>,
     /// Cached `command -v` results per CLI so a missing binary doesn't get
@@ -243,6 +247,7 @@ impl Daemon {
             session_installs,
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
+            sibling_ops: tokio::sync::Mutex::new(()),
             prewarmed: Mutex::new(HashMap::new()),
             cli_probes: Mutex::new(HashMap::new()),
             attach_counts: Mutex::new(HashMap::new()),

@@ -1653,7 +1653,10 @@ struct BandRule {
 /// COLOR, its uncommitted changes behind it in the heads-up color, its
 /// pull request in the PR rows' own colors — a rule to the right end,
 /// and there how many cards are under it (`2 sessions · 1 terminal`), or
-/// off its edges (`▸ 2 more`). On the band the cursor is on the
+/// off its edges (`▸ 2 more`). A SHARED WORKTREE — more than one live
+/// session in the checkout — says so ahead of the count in the heads-up
+/// color (`2 live, shared · 3 sessions`): those agents edit one set of
+/// files, one index and one branch, and nothing else on the grid shows it. On the band the cursor is on the
 /// branch is bold — this is what says which checkout the pane reads,
 /// since no card under it wears the cursor — and for as long as the keys
 /// are on it the rule wears the accent, opens on the CURSOR MARK `❯`
@@ -1733,6 +1736,21 @@ fn draw_band_rule(
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(key, Style::default().fg(th.accent)));
                 spans.push(Span::styled(does, Style::default().fg(th.dim)));
+            }
+        }
+        // A SHARED WORKTREE says so ahead of the count, decided last so it
+        // takes only what the counts and the Tab hint leave: `3 live,
+        // shared`, then `3 live`, then nothing on a rule too narrow to keep
+        // the branch legible beside it.
+        let live = band.live_sessions();
+        if live > 1 {
+            let taken: usize = spans.iter().map(|s| s.width()).sum();
+            let marker = [format!("{live} live, shared"), format!("{live} live")]
+                .into_iter()
+                .find(|m| width >= 3 + m.chars().count() + 3 + taken + 5 + ENTER_HINT_ROOM);
+            if let Some(marker) = marker {
+                spans.insert(0, Span::styled(" · ", Style::default().fg(th.dim)));
+                spans.insert(0, Span::styled(marker, Style::default().fg(th.warn)));
             }
         }
         spans
@@ -5133,6 +5151,52 @@ mod tests {
         // The cards under it say what runs in the checkout, not where.
         let text = row_string(&worktree, 0);
         assert!(text.contains("1 session"), "{text:?}");
+    }
+
+    /// A checkout with more than one live session says it is shared, in the
+    /// heads-up color ahead of the count; one live session, or several
+    /// with only one still running, is the plain count.
+    #[test]
+    fn a_band_with_two_live_sessions_says_it_is_shared() {
+        let app = App::new();
+        let th = app.chrome.theme;
+        let mut band = a_band(false, "feat-x");
+        let alone = rule_row(&app, &band, 60);
+        assert!(!row_string(&alone, 0).contains("shared"));
+
+        let mut second = band.cards[0].clone();
+        if let crate::launcher::Card::Session(row) = &mut second {
+            row.agent.alive = false;
+        }
+        band.cards.push(second.clone());
+        let one_live = rule_row(&app, &band, 60);
+        let text = row_string(&one_live, 0);
+        assert!(
+            text.contains("2 sessions") && !text.contains("shared"),
+            "{text:?}"
+        );
+
+        if let crate::launcher::Card::Session(row) = &mut second {
+            row.agent.alive = true;
+        }
+        band.cards.push(second);
+        let shared = rule_row(&app, &band, 60);
+        let text = row_string(&shared, 0);
+        assert!(text.contains("2 live, shared · 3 sessions"), "{text:?}");
+        assert_eq!(painted(&shared, 0, th.warn).trim(), "2 live, shared");
+
+        // Narrower, the marker gives way before the branch does: the short
+        // form, then nothing.
+        let narrow = rule_row(&app, &band, 44);
+        let text = row_string(&narrow, 0);
+        assert!(text.contains("↳ feat-x"), "{text:?}");
+        assert_eq!(painted(&narrow, 0, th.warn).trim(), "2 live", "{text:?}");
+        let narrowest = rule_row(&app, &band, 34);
+        let text = row_string(&narrowest, 0);
+        assert!(
+            text.contains("↳ feat-x") && !text.contains("live"),
+            "{text:?}"
+        );
     }
 
     /// The checkout's changed-file count rides right behind the branch on

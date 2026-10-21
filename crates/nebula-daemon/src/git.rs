@@ -73,6 +73,55 @@ pub async fn repair_worktrees(repo: &Path, moved: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// How long [`uncommitted_paths`] waits on `git status` before it gives
+/// up: the answer sits on `nebula spawn`'s reply path.
+const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many paths in the checkout at `path` have uncommitted changes —
+/// staged, unstaged or untracked, every untracked file counted as the
+/// WORKTREES PANEL's badge counts it (`-uall`), ignored ones not at all.
+/// What `nebula spawn` asks before it starts a second live session in one
+/// worktree. Run beside that live session, so with git's optional locks
+/// off (`GIT_OPTIONAL_LOCKS=0`, as the TUI's `git_command` does): a
+/// status refreshing the index would hold `.git/index.lock` under the
+/// agent's own `git add` / `commit` (issue #15). A submodule's own dirt is
+/// skipped (`--ignore-submodules=dirty`, a moved pointer still counts) so
+/// a repo of many submodules answers fast; past [`STATUS_TIMEOUT`] it is
+/// an error.
+pub async fn uncommitted_paths(path: &Path) -> Result<usize> {
+    // Nebula's own hook files are rewritten at every spawn, so they are
+    // never anyone's half-done work: left out, or the first Claude session
+    // in a repo that doesn't ignore its settings file would make the
+    // checkout read as busy for good.
+    let mine = crate::hooks::installer::WORKTREE_FILES
+        .iter()
+        .map(|f| format!(":(top,exclude){f}"));
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "-uall",
+            "--ignore-submodules=dirty",
+            "--",
+            ":(top)",
+        ])
+        .args(mine)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(STATUS_TIMEOUT, status)
+        .await
+        .map_err(|_| anyhow::anyhow!("git status took over {}s", STATUS_TIMEOUT.as_secs()))?
+        .map_err(spawn_err)?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(nebula_core::git_status::parse_status_z(&output.stdout).len())
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeEntry {
     pub path: PathBuf,
@@ -1373,6 +1422,113 @@ mod tests {
         remove_worktree(&repo, &wt, false).await.unwrap();
         let entries = list_worktrees(&repo).await.unwrap();
         assert!(entries.iter().all(|e| e.path != wt));
+    }
+
+    #[tokio::test]
+    async fn uncommitted_paths_sees_edits_and_new_files_but_not_ignored_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        assert_eq!(uncommitted_paths(&wt).await.unwrap(), 0);
+
+        std::fs::write(wt.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target/out"), "built").unwrap();
+        std::fs::write(wt.join("half-written.rs"), "fn").unwrap();
+        // `.gitignore` and the new file; `target/` is ignored.
+        assert_eq!(uncommitted_paths(&wt).await.unwrap(), 2);
+        // Every file in a new directory counts, as the band's badge counts
+        // them, not the one directory git's default would collapse them to.
+        std::fs::create_dir(wt.join("fixtures")).unwrap();
+        for n in 0..3 {
+            std::fs::write(wt.join(format!("fixtures/{n}.json")), "{}").unwrap();
+        }
+        assert_eq!(uncommitted_paths(&wt).await.unwrap(), 5);
+        assert!(uncommitted_paths(&tmp.path().join("nope")).await.is_err());
+    }
+
+    /// The files nebula itself writes at a spawn are nobody's work in
+    /// flight, whether or not the machine's git ignores them: a checkout
+    /// whose only changes are those reads as clean, and a real edit beside
+    /// them still counts. (The repo turns off the user's global excludes,
+    /// which on a developer's machine often already list Claude's file.)
+    #[tokio::test]
+    async fn nebulas_own_hook_files_are_not_uncommitted_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        git(&repo, &["config", "core.excludesFile", "/dev/null"])
+            .await
+            .unwrap();
+        for f in crate::hooks::installer::WORKTREE_FILES {
+            let file = repo.join(f);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "{}").unwrap();
+        }
+        assert_eq!(uncommitted_paths(&repo).await.unwrap(), 0);
+        // Only those files: another one beside them in `.claude` counts.
+        std::fs::write(repo.join(".claude/notes.md"), "mine").unwrap();
+        assert_eq!(uncommitted_paths(&repo).await.unwrap(), 1);
+        std::fs::write(repo.join("half-written.rs"), "fn").unwrap();
+        assert_eq!(uncommitted_paths(&repo).await.unwrap(), 2);
+    }
+
+    /// The check runs beside a live session, so it must never write the
+    /// index: a stale stat cache makes a plain `git status` rewrite it
+    /// through `.git/index.lock`, under the agent's own `git commit`
+    /// (issue #15). The same stamp the TUI's `changed_files` test reads.
+    #[tokio::test]
+    async fn uncommitted_paths_never_rewrites_the_index() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::UNIX_EPOCH;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        std::fs::write(repo.join("tracked.txt"), "same").unwrap();
+        git(&repo, &["add", "tracked.txt"]).await.unwrap();
+        git(&repo, &["commit", "-m", "tracked"]).await.unwrap();
+        let index = repo.join(".git").join("index");
+        let stamp = || {
+            let meta = std::fs::metadata(&index).unwrap();
+            (meta.ino(), meta.modified().unwrap())
+        };
+        // Same content, another mtime: the stat cache no longer matches.
+        let stale = |secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(repo.join("tracked.txt"))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+
+        stale(1_000_000_000);
+        let before = stamp();
+        assert_eq!(uncommitted_paths(&repo).await.unwrap(), 0);
+        assert_eq!(stamp(), before, "the spawn check rewrote the index");
+
+        // The control: with optional locks allowed, a status does rewrite
+        // it, so the assertion above is testing something.
+        stale(1_000_000_100);
+        let before = stamp();
+        let plain = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .env("GIT_OPTIONAL_LOCKS", "1")
+            .args(["status", "--porcelain=v1", "-z"])
+            .output()
+            .await
+            .unwrap();
+        assert!(plain.status.success());
+        assert_ne!(
+            stamp(),
+            before,
+            "control: a plain status refreshes the index"
+        );
     }
 
     #[tokio::test]

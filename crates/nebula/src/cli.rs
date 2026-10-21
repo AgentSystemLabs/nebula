@@ -170,12 +170,23 @@ pub(crate) enum Command {
     /// a new nebula session. The new session starts in the same worktree (or
     /// the one `--worktree` names), on the task you name as its first
     /// prompt, and shows up on the grid on its own — this session carries
-    /// on untouched.
+    /// on untouched. A worktree that already holds a live session is named
+    /// in the reply, and refused while it has uncommitted changes unless
+    /// `--same-worktree` is passed.
     #[command(after_help = SPAWN_EXAMPLES)]
     Spawn {
         /// The task the new session starts on; multiple words need no quotes.
-        #[arg(required = true, num_args = 1..)]
+        #[arg(
+            required_unless_present = "prompt_file",
+            conflicts_with = "prompt_file",
+            num_args = 1..
+        )]
         task: Vec<String>,
+        /// Read the task from this file instead of the arguments (`-` reads
+        /// standard input) — for a brief too long or too full of quotes to
+        /// pass as words.
+        #[arg(long, value_name = "PATH")]
+        prompt_file: Option<std::path::PathBuf>,
         /// Harness for the new session: claude, codex, cursor, pi, muse,
         /// grok or opencode.
         ///
@@ -193,6 +204,12 @@ pub(crate) enum Command {
         /// Refused when the branch already exists.
         #[arg(long, value_name = "REF", requires = "worktree")]
         base: Option<String>,
+        /// Start the session even when its worktree already has a live
+        /// session and uncommitted changes. Without it that spawn is
+        /// refused: two sessions in one checkout share its files, index and
+        /// branch.
+        #[arg(long)]
+        same_worktree: bool,
     },
     /// Show files to the user inside this nebula.
     ///
@@ -497,7 +514,11 @@ Examples:
   nebula spawn --kind codex \"review the diff on this branch\"
   nebula spawn --worktree fix-login \"fix the login redirect\"
                                    start it in that branch's worktree, made if new
-  nebula spawn --worktree hotfix --base v0.21.0 \"backport the fix\"";
+  nebula spawn --worktree hotfix --base v0.21.0 \"backport the fix\"
+  nebula spawn --worktree fix-login --prompt-file brief.md
+                                   the task is the file's contents
+  nebula spawn --same-worktree \"review my uncommitted diff\"
+                                   share this checkout, changes and all";
 
 const OPEN_EXAMPLES: &str = "\
 Examples:
