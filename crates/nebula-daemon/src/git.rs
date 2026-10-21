@@ -886,9 +886,12 @@ pub async fn delete_branch_at(repo: &Path, tip: &nebula_core::BranchTip) -> Resu
 }
 
 /// How many commits in `worktree`'s submodule stores nothing else keeps:
-/// commits reachable from a store's HEAD, local branches, tags or stash
-/// that no remote-tracking ref of it holds and the ROOT WORKTREE's store
-/// for the same submodule (`root`'s) lacks too. A linked worktree's
+/// commits reachable from a store's HEAD, local branches or stash that no
+/// remote-tracking ref of it holds and the ROOT WORKTREE's store for the
+/// same submodule (`root`'s) lacks too. Tags count only when
+/// `ask_remotes` (a confirm, never a band): git records no "fetched from"
+/// for a tag, so only a remote can say whether a tag is the one copy, and
+/// a band does not go to the network every rotation. A linked worktree's
 /// submodules live in its own git dir (`.git/worktrees/<name>/modules/…`),
 /// which `git worktree remove` deletes — so a superproject commit can pin
 /// a submodule commit that exists nowhere else. The stores counted are
@@ -899,7 +902,7 @@ pub async fn delete_branch_at(repo: &Path, tip: &nebula_core::BranchTip) -> Resu
 /// git dir. Never the main repository's `.git/modules`, which a worktree
 /// delete leaves alone. The stores are asked [`SUBMODULE_JOBS`] at a time:
 /// a repo with two dozen submodules is most of what a confirm waits for.
-pub async fn submodule_unpushed(worktree: &Path, root: &Path) -> Result<u32> {
+pub async fn submodule_unpushed(worktree: &Path, root: &Path, ask_remotes: bool) -> Result<u32> {
     let own_git = PathBuf::from(
         git_read(worktree, &["rev-parse", "--absolute-git-dir"])
             .await?
@@ -962,7 +965,7 @@ pub async fn submodule_unpushed(worktree: &Path, root: &Path) -> Result<u32> {
                 .and_then(|root_git| kept_store(&store, &own_git, &checkout, root, root_git));
             let cwd = checkout.clone();
             jobs.spawn(async move {
-                lost_in_store(cwd, store, kept)
+                lost_in_store(cwd, store, kept, ask_remotes)
                     .await
                     .map_err(|e| SubmoduleError::wrap(&label, e))
             });
@@ -1085,22 +1088,29 @@ fn kept_store(
 }
 
 /// What one store holds that no remote does and `kept` (the root's store
-/// for the same submodule) lacks: its HEAD, its local branches and tags (a
-/// commit on a branch, then HEAD detached back to the pin, is still lost
-/// with the store) and its stash. `--glob` matches nothing when there is
-/// no stash; the bracket keeps git from reading it as `refs/stash/*`.
-async fn lost_in_store(cwd: PathBuf, store: PathBuf, kept: Option<PathBuf>) -> Result<u32> {
+/// for the same submodule) lacks: its HEAD, its local branches (a commit
+/// on a branch, then HEAD detached back to the pin, is still lost with the
+/// store), its stash, and with `ask_remotes` its tags no remote has (see
+/// [`unpushed_tags`]). `--glob` matches nothing when there is no stash;
+/// the bracket keeps git from reading it as `refs/stash/*`.
+async fn lost_in_store(
+    cwd: PathBuf,
+    store: PathBuf,
+    kept: Option<PathBuf>,
+    ask_remotes: bool,
+) -> Result<u32> {
     let git_dir = format!("--git-dir={}", store.display());
-    let refs = [
-        "--branches",
-        "--tags",
-        "--glob=refs/stas[h]",
-        "--not",
-        "--remotes",
-    ];
+    let tags = match ask_remotes {
+        true => unpushed_tags(&cwd, &git_dir).await?,
+        false => Vec::new(),
+    };
+    let mut refs = vec!["--branches", "--glob=refs/stas[h]"];
+    refs.extend(tags.iter().map(String::as_str));
+    refs.extend(["--not", "--remotes"]);
+    let refs = refs.as_slice();
     let with_head: Vec<&str> = [git_dir.as_str(), "rev-list", "HEAD"]
         .into_iter()
-        .chain(refs)
+        .chain(refs.iter().copied())
         .collect();
     let lost = match git_read(&cwd, &with_head).await {
         Ok(lost) => lost,
@@ -1112,7 +1122,7 @@ async fn lost_in_store(cwd: PathBuf, store: PathBuf, kept: Option<PathBuf>) -> R
         Err(e) if !head_resolves(&cwd, &git_dir).await => {
             let refs_only: Vec<&str> = [git_dir.as_str(), "rev-list"]
                 .into_iter()
-                .chain(refs)
+                .chain(refs.iter().copied())
                 .collect();
             git_read(&cwd, &refs_only).await.map_err(|_| e)?
         }
@@ -1126,6 +1136,62 @@ async fn lost_in_store(cwd: PathBuf, store: PathBuf, kept: Option<PathBuf>) -> R
         lost.lines().count()
     };
     Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// The store's tags (full ref names) that no remote of it has under the
+/// same name at the same object. A tag a fetch brought in names commits
+/// the remote keeps, but git records no "fetched from" for a tag, so only
+/// the remote can tell it from one made here and never pushed. The remote
+/// is asked only when some tag holds a commit no branch, stash or
+/// remote-tracking ref does — usually none, and then nothing goes to the
+/// network — and timeboxed like a fetch. A remote that does not answer
+/// keeps none of the tags: a confirm warns rather than guess.
+async fn unpushed_tags(cwd: &Path, git_dir: &str) -> Result<Vec<String>> {
+    let held = git_read(
+        cwd,
+        &[
+            git_dir,
+            "rev-list",
+            "--max-count=1",
+            "--tags",
+            "--not",
+            "--branches",
+            "--glob=refs/stas[h]",
+            "--remotes",
+        ],
+    )
+    .await?;
+    if held.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut on_remotes = HashSet::new();
+    let remotes = git_read(cwd, &[git_dir, "remote"]).await?;
+    for remote in remotes.lines().map(str::trim).filter(|r| !r.is_empty()) {
+        let Ok(listed) = git_remote(cwd, &[git_dir, "ls-remote", "--tags", remote]).await else {
+            continue;
+        };
+        for line in listed.lines() {
+            if let Some((oid, name)) = line.split_once('\t') {
+                on_remotes.insert((name.to_string(), oid.to_string()));
+            }
+        }
+    }
+    let local = git_read(
+        cwd,
+        &[
+            git_dir,
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/tags",
+        ],
+    )
+    .await?;
+    Ok(local
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(oid, name)| !on_remotes.contains(&(name.to_string(), oid.to_string())))
+        .map(|(_, name)| name.to_string())
+        .collect())
 }
 
 /// Does the store at `git_dir` (a `--git-dir=` argument) have a HEAD
@@ -2383,7 +2449,7 @@ mod tests {
         let mut args = allow.to_vec();
         args.extend(["submodule", "update", "--init", "-q"]);
         git(&wt, &args).await.unwrap();
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 0);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
         let sub = wt.join("lib");
         git(&sub, &["config", "user.email", "t@t"]).await.unwrap();
         git(&sub, &["config", "user.name", "t"]).await.unwrap();
@@ -2392,7 +2458,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!sub.join(".git").exists(), "deinitialised");
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 1);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
     }
 
     #[test]
@@ -2414,7 +2480,7 @@ mod tests {
         git(&wt, &["init", "-q", "--bare", &store.to_string_lossy()])
             .await
             .unwrap();
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 0);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
     }
 
     /// A store git cannot read names its submodule in the error, for the
@@ -2428,7 +2494,7 @@ mod tests {
         let broken = Path::new(own.trim()).join("modules").join("half");
         std::fs::create_dir_all(broken.join("objects")).unwrap();
         std::fs::write(broken.join("HEAD"), "not a ref\n").unwrap();
-        let err = submodule_unpushed(&wt, &repo).await.unwrap_err();
+        let err = submodule_unpushed(&wt, &repo, true).await.unwrap_err();
         let failed = err
             .downcast_ref::<SubmoduleError>()
             .unwrap_or_else(|| panic!("{err:#}"));
@@ -2486,7 +2552,7 @@ mod tests {
         let mut args = allow.to_vec();
         args.extend(["submodule", "update", "--init", "--recursive", "-q"]);
         git(&wt, &args).await.unwrap();
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 0);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
 
         let nested = wt.join("lib").join("inner");
         git(&nested, &["config", "user.email", "t@t"])
@@ -2494,7 +2560,7 @@ mod tests {
             .unwrap();
         git(&nested, &["config", "user.name", "t"]).await.unwrap();
         commit_file(&nested, "n.txt", "n").await;
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 1);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
     }
 
     /// A symbolic-ref branch is deleted itself, never what it points at.
@@ -2554,11 +2620,11 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "add lib"])
             .await
             .unwrap();
-        assert_eq!(submodule_unpushed(&repo, &repo).await.unwrap(), 0);
+        assert_eq!(submodule_unpushed(&repo, &repo, true).await.unwrap(), 0);
 
         let wt = add_worktree(&repo, "feat", None).await.unwrap();
         assert_eq!(
-            submodule_unpushed(&wt, &repo).await.unwrap(),
+            submodule_unpushed(&wt, &repo, true).await.unwrap(),
             0,
             "not checked out in the worktree: nothing in it"
         );
@@ -2575,7 +2641,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 0);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
         let sub = wt.join("lib");
         git(&sub, &["config", "user.email", "t@t"]).await.unwrap();
         git(&sub, &["config", "user.name", "t"]).await.unwrap();
@@ -2585,7 +2651,7 @@ mod tests {
             .await
             .unwrap();
         assert!(changed_paths(&wt).await.unwrap().is_empty());
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 2);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 2);
 
         // Fetched into the root's copy but on none of its refs, they are
         // dangling there — gone at its next gc — so still lost.
@@ -2593,12 +2659,12 @@ mod tests {
         git(&repo.join("lib"), &["fetch", "-q", &wt_sub, "HEAD"])
             .await
             .unwrap();
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 2);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 2);
         // A branch there keeps them: they survive the delete.
         git(&repo.join("lib"), &["branch", "kept", "FETCH_HEAD"])
             .await
             .unwrap();
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 0);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
 
         // A commit on a local branch of the worktree's submodule, HEAD
         // then detached back to the pin: on no remote, in no other store.
@@ -2609,13 +2675,75 @@ mod tests {
             .await
             .unwrap();
         assert!(changed_paths(&wt).await.unwrap().is_empty());
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 1);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
 
         // A stash there is lost with the store too.
         git(&sub, &["branch", "-q", "-D", "side"]).await.unwrap();
-        assert_eq!(submodule_unpushed(&wt, &repo).await.unwrap(), 0);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
         std::fs::write(sub.join("x.txt"), "edited").unwrap();
         git(&sub, &["stash", "-q"]).await.unwrap();
-        assert!(submodule_unpushed(&wt, &repo).await.unwrap() > 0);
+        assert!(submodule_unpushed(&wt, &repo, true).await.unwrap() > 0);
+    }
+
+    /// A tag is no keeper until a remote says it has it: a band never asks,
+    /// so a commit only a tag holds is not counted there; a confirm asks,
+    /// and counts it unless a remote has that tag at that commit.
+    #[tokio::test]
+    async fn submodule_tags_count_only_when_no_remote_has_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("lib");
+        std::fs::create_dir(&upstream).unwrap();
+        init_repo(&upstream).await;
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let url = upstream.to_string_lossy().into_owned();
+        let allow = ["-c", "protocol.file.allow=always"];
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "add", "-q", &url, "lib"]);
+        git(&repo, &args).await.unwrap();
+        git(&repo, &["commit", "-q", "-m", "add lib"])
+            .await
+            .unwrap();
+        let wt = add_worktree(&repo, "feat", None).await.unwrap();
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "update", "--init", "-q"]);
+        git(&wt, &args).await.unwrap();
+        let sub = wt.join("lib");
+        git(&sub, &["config", "user.email", "t@t"]).await.unwrap();
+        git(&sub, &["config", "user.name", "t"]).await.unwrap();
+
+        // A commit only a tag holds, HEAD back at the pin.
+        let pin = git(&sub, &["rev-parse", "HEAD"]).await.unwrap();
+        commit_file(&sub, "t.txt", "t").await;
+        git(&sub, &["tag", "v1"]).await.unwrap();
+        git(&sub, &["checkout", "-q", "--detach", pin.trim()])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, false).await.unwrap(), 0);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+
+        // Pushed: the remote has it at that commit, though no
+        // remote-tracking ref or root store does.
+        git(&sub, &["push", "-q", "origin", "v1"]).await.unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+
+        // A remote that does not answer keeps nothing.
+        git(&sub, &["remote", "set-url", "origin", "/nonexistent/lib"])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+        git(&sub, &["remote", "set-url", "origin", &url])
+            .await
+            .unwrap();
+
+        // Moved here since: the remote's v1 is another commit, and the
+        // new one is held by nothing else.
+        commit_file(&sub, "u.txt", "u").await;
+        git(&sub, &["tag", "-f", "v1"]).await.unwrap();
+        git(&sub, &["checkout", "-q", "--detach", pin.trim()])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
     }
 }

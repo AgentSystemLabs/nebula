@@ -26,8 +26,9 @@ const IGNORED_NAMED: usize = 3;
 /// every pid the worktree's own sessions lead or run — the confirm counts
 /// those already and they go down with it — and `configured_base` the
 /// WORKTREE BASE BRANCH setting. `band` is an idle band's check, asked
-/// every rotation: it skips the gitignored files, a confirm's question
-/// only, and keeps the rest — the processes at work in the checkout
+/// every rotation: it skips the gitignored files and the submodules'
+/// remote tags, a confirm's questions only, and keeps the rest — the
+/// processes at work in the checkout
 /// included, which is how a band says it is in use.
 pub async fn check(
     repo: &Path,
@@ -177,13 +178,14 @@ fn git_op_of(args: &str) -> Option<String> {
 /// recently they were written, its commits the base lacks by content — or,
 /// on a detached HEAD, the commits nothing else holds — and its
 /// submodules' commits that live in this checkout's store alone.
-/// `ignored` also lists the gitignored files a delete takes: a confirm's
-/// question, not a band's, which would pay for it every rotation.
+/// `confirm` also lists the gitignored files a delete takes and asks the
+/// submodules' remotes which of their tags they have: a confirm's
+/// questions, not a band's, which would pay for them every rotation.
 async fn git_half(
     repo: &Path,
     worktree: &Path,
     configured_base: Option<String>,
-    ignored: bool,
+    confirm: bool,
 ) -> WorktreeCheck {
     let mut check = WorktreeCheck::default();
     let mut landing = WorktreeLanding::default();
@@ -192,9 +194,9 @@ async fn git_half(
     let (status, commits, submodules, keepsakes) = tokio::join!(
         git::changed_paths(worktree),
         commits_half(repo, worktree, configured_base),
-        git::submodule_unpushed(worktree, repo),
+        git::submodule_unpushed(worktree, repo, confirm),
         async {
-            match ignored {
+            match confirm {
                 true => Some(git::ignored_keepsakes(worktree).await),
                 false => None,
             }
