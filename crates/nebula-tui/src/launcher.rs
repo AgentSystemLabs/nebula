@@ -95,10 +95,9 @@ pub fn rows(app: &App) -> Vec<LauncherRow> {
         .iter()
         .filter_map(|agent| row_of(app, agent, scope.as_ref(), Some(want_archived)))
         .collect();
-    let now = crate::app::now_ms();
     rows.sort_by(|a, b| {
-        crate::app::recency_key(&a.agent, now)
-            .cmp(&crate::app::recency_key(&b.agent, now))
+        crate::app::recency_key(&a.agent)
+            .cmp(&crate::app::recency_key(&b.agent))
             .then_with(|| b.agent.id.cmp(&a.agent.id))
     });
     // A stable pass over the top of it, so the launch just fired is the
@@ -1628,14 +1627,8 @@ pub fn project_cards(app: &App) -> Vec<ProjectCard> {
         .collect();
     // Two stable passes: recency first, then the standing over it, so two
     // cards with the same standing keep the panel's order between them.
-    // The raw stamp breaks the tie every project with a session mid-turn
-    // shares, as it does in the panels (`crate::app::recency_key`).
-    cards.sort_by_key(|c| {
-        (
-            std::cmp::Reverse(c.recency.interacted),
-            std::cmp::Reverse(c.recency.stamped),
-        )
-    });
+    // The panels' own RECENCY ORDER (`crate::app::Recency::sort_key`).
+    cards.sort_by_key(|c| c.recency.sort_key());
     cards.sort_by_key(|c| std::cmp::Reverse(attention(c.status)));
     cards
 }
@@ -1662,10 +1655,9 @@ fn project_sessions(app: &App, project: &ProjectId) -> Vec<Agent> {
         .filter(|a| !a.archived && checkouts.contains(&a.worktree_id))
         .cloned()
         .collect();
-    let now = crate::app::now_ms();
     out.sort_by(|a, b| {
-        crate::app::recency_key(a, now)
-            .cmp(&crate::app::recency_key(b, now))
+        crate::app::recency_key(a)
+            .cmp(&crate::app::recency_key(b))
             .then_with(|| b.id.cmp(&a.id))
     });
     out.sort_by_key(|a| std::cmp::Reverse(attention(Some(a.status))));
