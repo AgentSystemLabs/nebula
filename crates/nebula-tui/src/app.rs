@@ -2050,6 +2050,10 @@ pub struct SettingsView {
     pub search: Option<crate::text_input::TextInput>,
     /// Keys go to the search field, not the rows: from `/` until Enter.
     pub typing: bool,
+    /// The rows the query matched when it was last typed, held until it
+    /// changes: acting on a match (rebinding the chord it was found by)
+    /// never drops it from under the cursor.
+    pub results: Vec<(usize, crate::config::SettingsRow)>,
 }
 
 impl SettingsView {
@@ -2087,19 +2091,14 @@ impl SettingsView {
     /// The body's rows, each with the tab it is on: the search's matches
     /// while it has words, the tab's own rows otherwise. Shared by the
     /// renderer, the keys and the mouse so they can't drift.
-    pub fn body_rows(
-        &self,
-        keymap: &crate::keymap::Keymap,
-    ) -> Vec<(usize, crate::config::SettingsRow)> {
-        match &self.search {
-            Some(query) if self.searching() => {
-                crate::config::search_rows(&crate::config::Config::load(), keymap, query)
-            }
-            _ => crate::config::settings_rows(self.tab)
-                .into_iter()
-                .map(|row| (self.tab, row))
-                .collect(),
+    pub fn body_rows(&self) -> Vec<(usize, crate::config::SettingsRow)> {
+        if self.searching() {
+            return self.results.clone();
         }
+        crate::config::settings_rows(self.tab)
+            .into_iter()
+            .map(|row| (self.tab, row))
+            .collect()
     }
 
     pub fn warn(&mut self, text: impl Into<String>) {

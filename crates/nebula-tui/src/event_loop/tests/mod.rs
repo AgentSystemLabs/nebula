@@ -13318,6 +13318,38 @@ fn settings_search_reaches_a_hotkey_and_enter_rebinds_it() {
     assert_eq!(view.capture.as_ref().unwrap().action, duplicate);
 }
 
+/// A row found by its chord stays listed after that chord changes: the
+/// matches hold until the query does, so unbinding the very key you
+/// searched for doesn't pull the row out from under the cursor.
+#[test]
+fn settings_search_keeps_a_row_whose_chord_just_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::config::with_config_path(dir.path().join("config.json"), || {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        let fullscreen = crate::keymap::ACTIONS
+            .iter()
+            .position(|a| a.label == "Full-screen session")
+            .unwrap();
+        let chord = app.chrome.keymap.display_at(fullscreen);
+        open_settings_on(&mut app, 0, &mut out);
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        type_keys(&mut app, &chord, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(settings_view(&app).selected, fullscreen);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+        assert_ne!(app.chrome.keymap.display_at(fullscreen), chord, "unbound");
+        let view = settings_view(&app);
+        assert!(view.searching());
+        assert!(
+            view.body_rows()
+                .iter()
+                .any(|(t, r)| *t == view.tab && r.index() == Some(fullscreen)),
+            "the row is still listed under the cursor"
+        );
+    });
+}
+
 /// A key that would leave nothing listed is refused, as a picker's
 /// type-ahead refuses it, and ⌫ on an empty field closes the search.
 #[test]

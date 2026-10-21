@@ -654,7 +654,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &mut App, view: crate::app::Setting
     // terminal now that the Hotkeys tab alone is forty rows.
     let cfg = crate::config::Config::load();
     let tab = view.tab;
-    let rows = view.body_rows(&app.chrome.keymap);
+    let rows = view.body_rows();
     // The Project tab's rows are the selected project's: its
     // name and path head the tab, and its entry is what the
     // values read. No project (an empty tree) leaves them n/a.

@@ -568,7 +568,7 @@ fn handle_settings_mouse(
                 // row map keeps this in step with the renderer, search
                 // results included.
                 let hit = view
-                    .body_rows(&app.chrome.keymap)
+                    .body_rows()
                     .get(row)
                     .and_then(|(t, r)| r.index().map(|i| (*t, i)));
                 if let Some((row_tab, index)) = hit {

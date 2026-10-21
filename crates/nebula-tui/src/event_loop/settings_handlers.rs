@@ -130,15 +130,13 @@ fn edit_search(app: &mut App, key: &KeyEvent) {
     if !query.handle_key(key).changed() {
         return;
     }
-    let probe = SettingsView {
-        search: Some(query.clone()),
-        ..view.clone()
-    };
-    let first = probe
-        .body_rows(&app.chrome.keymap)
-        .into_iter()
-        .find_map(|(tab, row)| row.index().map(|i| (tab, i)));
-    if probe.searching() && first.is_none() {
+    let results =
+        crate::config::search_rows(&crate::config::Config::load(), &app.chrome.keymap, &query);
+    let first = results
+        .iter()
+        .find_map(|(tab, row)| row.index().map(|i| (*tab, i)));
+    let words = query.split_whitespace().next().is_some();
+    if words && first.is_none() {
         if let Some(view) = settings_mut(app) {
             view.warn(format!(
                 "no setting matches \u{201c}{}\u{201d}",
@@ -149,9 +147,10 @@ fn edit_search(app: &mut App, key: &KeyEvent) {
     }
     if let Some(view) = settings_mut(app) {
         view.search = Some(query);
+        view.results = results;
         view.notice = None;
     }
-    if let (true, Some((tab, row))) = (probe.searching(), first) {
+    if let Some((tab, row)) = first {
         run_settings_cmd(app, SettingsCmd::Jump(tab, row));
     }
 }
@@ -162,7 +161,7 @@ fn edit_search(app: &mut App, key: &KeyEvent) {
 fn search_step(app: &App, delta: isize) -> Option<(usize, usize)> {
     let view = settings(app)?;
     let targets: Vec<(usize, usize)> = view
-        .body_rows(&app.chrome.keymap)
+        .body_rows()
         .into_iter()
         .filter_map(|(tab, row)| row.index().map(|i| (tab, i)))
         .collect();
