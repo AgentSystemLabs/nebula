@@ -258,7 +258,20 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let found = processes_in(&dir, &HashSet::new());
+        // `spawn` can return before the kernel renames the child, so the
+        // first sweep may read the test thread's name off /proc. Sweep again
+        // until the exec has landed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let found = loop {
+            let found = processes_in(&dir, &HashSet::new());
+            let named = found
+                .as_ref()
+                .is_ok_and(|f| f.iter().any(|p| p.pid == pid && p.name.contains("sleep")));
+            if named || std::time::Instant::now() > deadline {
+                break found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         let spared = processes_in(&dir, &[pid].into());
         let _ = child.kill();
         let _ = child.wait();
