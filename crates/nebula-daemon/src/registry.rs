@@ -55,6 +55,10 @@ struct ResumeWatch {
     spawned_at: Instant,
     cols: u16,
     rows: u16,
+    /// What a fresh boot opens on if this resume fails fast: a
+    /// relocation's lost-conversation notice, so the respawn says so
+    /// instead of starting silent on a turn the card is waiting for.
+    fresh_prompt: Option<String>,
 }
 /// `$SHELL -l -i -c <cmd>`: a login *and* interactive shell, so zsh sources
 /// ~/.zprofile and ~/.zshrc both and the child sees the PATH the user's
@@ -427,6 +431,66 @@ fn relocation_prompt(relocate: bool, worktree: &Worktree) -> Option<String> {
             worktree.path.display()
         )
     })
+}
+
+/// The prompt a relocated session opens on when the respawn came up fresh
+/// instead of resuming: the CLI never saw the conversation, so rather
+/// than "continue" — which it would answer by guessing — it tells the user
+/// the conversation was lost and waits for them to restate it.
+fn relocation_lost_prompt(worktree: &Worktree) -> String {
+    format!(
+        "[nebula] This session was moved into the worktree `{}` at {}, but its previous \
+         conversation could not be resumed: you are a fresh session with none of its context. \
+         Tell the user, in one or two lines, that the conversation could not be carried over \
+         into the worktree and ask them to restate what they want done here. Do not guess at \
+         the earlier request and do not start any work.",
+        worktree.branch,
+        worktree.path.display()
+    )
+}
+
+/// The first turn a spawn opens on.
+#[derive(Clone, Copy, Debug)]
+enum FirstPrompt<'a> {
+    /// Submitted whether the CLI resumes or boots fresh: the prefix + task
+    /// + postfix an AGENT PRESET launch composes.
+    Task(&'a str),
+    /// A relocation's notice, picked by what the spawn actually does:
+    /// `resumed` carries the conversation on in the new checkout, `fresh`
+    /// tells a CLI that came up without it that it was lost.
+    Relocation { resumed: &'a str, fresh: &'a str },
+}
+
+/// The prompt a spawn submits, given whether it resumes.
+fn pick_first_prompt(first: Option<FirstPrompt<'_>>, resumes: bool) -> Option<&str> {
+    match first? {
+        FirstPrompt::Task(task) => Some(task),
+        FirstPrompt::Relocation { resumed, fresh } => Some(if resumes { resumed } else { fresh }),
+    }
+}
+
+/// What an agent spawn did, for the callers that care how it came up.
+struct Spawned {
+    session: Arc<PtySession>,
+    /// The CLI is handed a first turn (a task, a notice or a scope rule).
+    prompted: bool,
+    /// A stored conversation the spawn did not bring back.
+    lost_session: bool,
+}
+
+/// The session id a spawn resumes, if any: the row's stored id, when the
+/// harness maps a resume and the spawn is a plain local launch (not a
+/// Cloud dispatch, an attach or a test override). The one decision the
+/// command, the rule's placement and a relocation's notice share.
+fn resume_session_id<'a>(
+    agent: &'a Agent,
+    harness: &nebula_core::harness::HarnessDescriptor,
+    not_a_plain_launch: bool,
+) -> Option<&'a str> {
+    if not_a_plain_launch || !harness.resumes() {
+        return None;
+    }
+    agent.session_id.as_deref()
 }
 
 /// The checkout the test wrapper boots every spawn in.
@@ -2168,6 +2232,82 @@ mod tests {
                 token: String::new(),
             },
         )
+    }
+
+    /// A relocation's notice is picked by what the spawn does: the
+    /// "continue" notice only reaches a CLI that resumed, a fresh one gets
+    /// the lost notice, and a preset's task is submitted either way.
+    #[test]
+    fn a_relocation_notice_follows_whether_the_spawn_resumes() {
+        let relocation = Some(FirstPrompt::Relocation {
+            resumed: "carry on",
+            fresh: "lost",
+        });
+        assert_eq!(pick_first_prompt(relocation, true), Some("carry on"));
+        assert_eq!(pick_first_prompt(relocation, false), Some("lost"));
+        assert_eq!(
+            pick_first_prompt(Some(FirstPrompt::Task("task")), false),
+            Some("task")
+        );
+        assert_eq!(
+            pick_first_prompt(Some(FirstPrompt::Task("task")), true),
+            Some("task")
+        );
+        assert_eq!(pick_first_prompt(None, true), None);
+    }
+
+    /// The one resume decision: the stored id, only for a plain local
+    /// launch of a harness that maps a resume.
+    #[test]
+    fn a_spawn_resumes_only_a_stored_id_on_a_plain_launch() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_agent(&daemon, "a1", "feat", Some("s1"));
+        seed_agent(&daemon, "a2", "feat", None);
+        let get = |id: &str| {
+            daemon
+                .store
+                .get_agent(&AgentId(id.into()))
+                .unwrap()
+                .unwrap()
+        };
+        let claude = resolve_harness(AgentKind::Claude, None).unwrap();
+        let (a1, a2) = (get("a1"), get("a2"));
+        assert_eq!(resume_session_id(&a1, &claude, false), Some("s1"));
+        assert_eq!(
+            resume_session_id(&a1, &claude, true),
+            None,
+            "attach, cloud or override"
+        );
+        assert_eq!(
+            resume_session_id(&a2, &claude, false),
+            None,
+            "nothing stored"
+        );
+        let mut no_resume = claude.clone();
+        no_resume.resume = Default::default();
+        assert_eq!(
+            resume_session_id(&a1, &no_resume, false),
+            None,
+            "no resume mapping"
+        );
+    }
+
+    #[test]
+    fn the_lost_relocation_notice_names_the_checkout_and_never_says_continue() {
+        let feat = Worktree {
+            id: WorktreeId("feat".into()),
+            project_id: ProjectId("p".into()),
+            path: PathBuf::from("/nebula-test/p-feat"),
+            branch: "feat".into(),
+            is_main: false,
+            sort_order: 1,
+        };
+        let notice = relocation_lost_prompt(&feat);
+        assert!(notice.contains("`feat`") && notice.contains("/nebula-test/p-feat"));
+        assert!(notice.contains("could not be resumed"));
+        assert!(!notice.contains("Continue the user's most recent request"));
     }
 
     #[test]

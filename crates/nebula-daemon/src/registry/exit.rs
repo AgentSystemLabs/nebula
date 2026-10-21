@@ -78,7 +78,12 @@ impl Daemon {
                             if exit_code.unwrap_or(1) != 0
                                 && watch.spawned_at.elapsed() < RESUME_FAIL_WINDOW
                             {
-                                daemon.respawn_failed_resume(id, watch.cols, watch.rows);
+                                daemon.respawn_failed_resume(
+                                    id,
+                                    watch.cols,
+                                    watch.rows,
+                                    watch.fresh_prompt,
+                                );
                             }
                         }
                         break;
