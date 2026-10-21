@@ -970,6 +970,82 @@ fn grouped(
     rows
 }
 
+/// SETTINGS SEARCH (`/` in the overlay): the rows of every tab that hold
+/// each word of `query`, any case, in strip order, each paired with the
+/// tab it lives on. A section opens under a header naming where its rows
+/// live (`Hotkeys · Panes`, or the bare tab title for ungrouped rows), so
+/// a match never has to be read out of context. A row's text is its tab,
+/// section, label and hint, plus the chords a Hotkeys row answers to, so
+/// `^f` finds what Ctrl+F does. Empty for a query with no words.
+pub fn search_rows(
+    cfg: &Config,
+    keymap: &crate::keymap::Keymap,
+    query: &str,
+) -> Vec<(usize, SettingsRow)> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut out = Vec::new();
+    if words.is_empty() {
+        return out;
+    }
+    for (tab, spec) in SETTINGS_TABS.iter().enumerate() {
+        let mut group = String::new();
+        let mut header: Option<String> = None;
+        for row in settings_rows(tab) {
+            let index = match &row {
+                SettingsRow::Header(title) => {
+                    group = title.clone();
+                    continue;
+                }
+                SettingsRow::Setting(i) | SettingsRow::Hotkey(i) => *i,
+                SettingsRow::Blank | SettingsRow::Project => continue,
+            };
+            let text = format!(
+                "{} {group} {}",
+                spec.title,
+                search_text(cfg, keymap, tab, index)
+            )
+            .to_lowercase();
+            if !words.iter().all(|w| text.contains(w.as_str())) {
+                continue;
+            }
+            let title = if group.is_empty() {
+                spec.title.to_string()
+            } else {
+                format!("{} · {group}", spec.title)
+            };
+            if header.as_deref() != Some(title.as_str()) {
+                if !out.is_empty() {
+                    out.push((tab, SettingsRow::Blank));
+                }
+                out.push((tab, SettingsRow::Header(title.clone())));
+                header = Some(title);
+            }
+            out.push((tab, row));
+        }
+    }
+    out
+}
+
+/// What [`search_rows`] matches a row against, past its tab and section:
+/// its label and hint, and a Hotkeys row's chords.
+fn search_text(cfg: &Config, keymap: &crate::keymap::Keymap, tab: usize, index: usize) -> String {
+    match SETTINGS_TABS.get(tab).map(|t| t.body) {
+        Some(TabBody::Hotkeys) => crate::keymap::spec_at(index)
+            .map(|s| format!("{} {} {}", s.label, keymap.display_at(index), s.hint))
+            .unwrap_or_default(),
+        Some(TabBody::Agents) => {
+            let label = match AGENTS_HEAD.get(index) {
+                Some(spec) => spec.label,
+                None => cfg.agent_row(index).map_or("", |(_, field)| field.label()),
+            };
+            format!("{label} {}", cfg.agent_hint_by_index(index))
+        }
+        _ => setting_at(tab, index)
+            .map(|s| format!("{} {}", s.label, s.hint))
+            .unwrap_or_default(),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {

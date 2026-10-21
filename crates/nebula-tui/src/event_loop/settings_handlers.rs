@@ -20,14 +20,23 @@ pub(crate) fn handle_settings_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    if view.typing {
+        search_key(app, key);
+        return;
+    }
 
     let (tab, selected, on_tabs) = (view.tab, view.selected, view.on_tabs);
+    let (open_search, searching) = (view.search.is_some(), view.searching());
     let last = crate::config::tab_len(tab).saturating_sub(1);
     let tabs = crate::config::tab_count();
     let hotkeys = view.is_hotkeys();
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     let cmd = match key.code {
+        KeyCode::Char('/') => SettingsCmd::Search,
+        // Esc backs out of a search before it closes the overlay, leaving
+        // the cursor on the match it was on, now in its own tab.
+        KeyCode::Esc if open_search => SettingsCmd::EndSearch,
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => SettingsCmd::Close,
         KeyCode::BackTab => SettingsCmd::Tab((tab + tabs - 1) % tabs),
         KeyCode::Tab if shift => SettingsCmd::Tab((tab + tabs - 1) % tabs),
@@ -53,6 +62,16 @@ pub(crate) fn handle_settings_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter if on_tabs => SettingsCmd::EnterList,
         KeyCode::Up | KeyCode::Char('k') if on_tabs => return,
         // ---- the list has focus ----
+        // Over search results j/k walk the matches, whatever tab each is
+        // on, and ↑ off the first one goes back to the query.
+        KeyCode::Char('j') | KeyCode::Down if searching => match search_step(app, 1) {
+            Some((tab, row)) => SettingsCmd::Jump(tab, row),
+            None => return,
+        },
+        KeyCode::Char('k') | KeyCode::Up if searching => match search_step(app, -1) {
+            Some((tab, row)) => SettingsCmd::Jump(tab, row),
+            None => SettingsCmd::Search,
+        },
         KeyCode::Char('j') | KeyCode::Down => SettingsCmd::Move((selected + 1).min(last)),
         // ↑ off the top row steps onto the tab strip.
         KeyCode::Char('k') | KeyCode::Up if selected == 0 => SettingsCmd::FocusTabs,
@@ -70,6 +89,86 @@ pub(crate) fn handle_settings_key(app: &mut App, key: KeyEvent) {
         _ => return,
     };
     run_settings_cmd(app, cmd);
+}
+
+/// A key while the SETTINGS SEARCH field has it: everything types except
+/// the few that steer. ↑/↓ walk the matches without leaving the field,
+/// Enter leaves it with the matches still listed for the row keys to act
+/// on, and Esc (or ⌫ on an empty field) drops the search.
+fn search_key(app: &mut App, key: KeyEvent) {
+    let Some(view) = settings(app) else {
+        return;
+    };
+    let empty = view.search.as_ref().is_none_or(|q| q.is_empty());
+    let cmd = match key.code {
+        KeyCode::Esc => SettingsCmd::EndSearch,
+        KeyCode::Backspace if empty => SettingsCmd::EndSearch,
+        KeyCode::Enter => SettingsCmd::EnterList,
+        KeyCode::Up | KeyCode::Down => {
+            let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+            match search_step(app, delta) {
+                Some((tab, row)) => SettingsCmd::Jump(tab, row),
+                None => return,
+            }
+        }
+        _ => {
+            edit_search(app, &key);
+            return;
+        }
+    };
+    run_settings_cmd(app, cmd);
+}
+
+/// Type into the search field. Each change lands the cursor on the first
+/// match; a key that would leave nothing listed is refused with a warning,
+/// as a picker's type-ahead refuses it, so the body never empties.
+fn edit_search(app: &mut App, key: &KeyEvent) {
+    let Some(view) = settings(app) else {
+        return;
+    };
+    let mut query = view.search.clone().unwrap_or_default();
+    if !query.handle_key(key).changed() {
+        return;
+    }
+    let results =
+        crate::config::search_rows(&crate::config::Config::load(), &app.chrome.keymap, &query);
+    let first = results
+        .iter()
+        .find_map(|(tab, row)| row.index().map(|i| (*tab, i)));
+    let words = query.split_whitespace().next().is_some();
+    if words && first.is_none() {
+        if let Some(view) = settings_mut(app) {
+            view.warn(format!(
+                "no setting matches \u{201c}{}\u{201d}",
+                query.trim()
+            ));
+        }
+        return;
+    }
+    if let Some(view) = settings_mut(app) {
+        view.search = Some(query);
+        view.results = results;
+        view.notice = None;
+    }
+    if let Some((tab, row)) = first {
+        run_settings_cmd(app, SettingsCmd::Jump(tab, row));
+    }
+}
+
+/// The selectable row `delta` steps from the cursor through the body as
+/// drawn ([`SettingsView::body_rows`]), as `(tab, row)`; None past either
+/// end.
+fn search_step(app: &App, delta: isize) -> Option<(usize, usize)> {
+    let view = settings(app)?;
+    let targets: Vec<(usize, usize)> = view
+        .body_rows()
+        .into_iter()
+        .filter_map(|(tab, row)| row.index().map(|i| (tab, i)))
+        .collect();
+    let at = targets
+        .iter()
+        .position(|&target| target == (view.tab, view.selected))?;
+    targets.get(at.checked_add_signed(delta)?).copied()
 }
 
 /// Run one SETTINGS OVERLAY command: the one place the overlay's state
@@ -92,6 +191,34 @@ pub(crate) fn run_settings_cmd(app: &mut App, cmd: SettingsCmd) {
                 view.selected = row;
                 view.notice = None;
                 view.capture = None;
+                // Asking for a tab is asking for its own rows.
+                view.search = None;
+                view.typing = false;
+            }
+        }
+        SettingsCmd::Jump(next, row) => {
+            app.modals.settings_tab = next;
+            app.remember_settings_row(next, row);
+            if let Some(view) = settings_mut(app) {
+                view.tab = next;
+                view.selected = row;
+                view.notice = None;
+            }
+        }
+        SettingsCmd::Search => {
+            app.remember_settings_focus(false);
+            if let Some(view) = settings_mut(app) {
+                view.search.get_or_insert_with(Default::default);
+                view.typing = true;
+                view.on_tabs = false;
+                view.notice = None;
+            }
+        }
+        SettingsCmd::EndSearch => {
+            if let Some(view) = settings_mut(app) {
+                view.search = None;
+                view.typing = false;
+                view.notice = None;
             }
         }
         SettingsCmd::FocusTabs => {
@@ -105,6 +232,12 @@ pub(crate) fn run_settings_cmd(app: &mut App, cmd: SettingsCmd) {
             app.remember_settings_focus(false);
             if let Some(view) = settings_mut(app) {
                 view.on_tabs = false;
+                // Out of the search field; a query with no words has
+                // nothing to keep listed.
+                view.typing = false;
+                if !view.searching() {
+                    view.search = None;
+                }
             }
         }
         SettingsCmd::Move(i) => {
@@ -182,11 +315,19 @@ pub(crate) fn settings_mut(app: &mut App) -> Option<&mut SettingsView> {
 pub(crate) enum SettingsCmd {
     Close,
     Tab(usize),
+    /// Put the cursor on `(tab, row)`: a search match, wherever it lives.
+    Jump(usize, usize),
+    /// Open the search field (or go back into it), keeping any query.
+    Search,
+    /// Drop the search; the cursor stays on its row, in that row's tab.
+    EndSearch,
     FocusTabs,
     EnterList,
     Move(usize),
     Apply(usize, i32),
-    Capture { add: bool },
+    Capture {
+        add: bool,
+    },
     ResetHotkey,
     ClearHotkey,
     Nudge,

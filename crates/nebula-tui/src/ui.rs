@@ -773,16 +773,28 @@ fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
     if view.capture.is_some() {
         return "Enter: reassign it here   Esc: leave it where it is";
     }
+    if view.typing {
+        return "type: search every tab  ↑/↓: move  Enter: done typing  Esc: clear search";
+    }
     if view.on_tabs {
-        return "←/→: tab   ↓: into the list   1-9: jump   R: reset all   Esc: close";
+        return "←/→: tab   ↓: into the list   1-9: jump   /: search   R: reset all   Esc: close";
+    }
+    if view.searching() {
+        if view.is_hotkeys() {
+            return "Enter: rebind  a: add  ⌫: default  x: unbind  /: edit search  Esc: clear search";
+        }
+        if crate::config::setting_at(view.tab, view.selected).is_some_and(|s| s.kind.is_text()) {
+            return "↑/↓: move  Enter: type a value  /: edit search  Esc: clear search";
+        }
+        return "↑/↓: move  Enter: toggle  ←/→: cycle  /: edit search  Esc: clear search";
     }
     if view.is_hotkeys() {
-        return "Enter: rebind  a: add  ⌫: default  x: unbind  R: reset all  Tab: next  ↑: tabs";
+        return "Enter: rebind  a: add  ⌫: default  x: unbind  /: search  R: reset all  ↑: tabs";
     }
     if crate::config::setting_at(view.tab, view.selected).is_some_and(|s| s.kind.is_text()) {
-        return "↑/↓: move  Enter: type a value (empty = default)  R: reset all  Tab: next tab";
+        return "↑/↓: move  Enter: type a value (empty = default)  /: search  R: reset all";
     }
-    "↑/↓: move  Enter: toggle  ←/→: cycle  R: reset all  Tab: next tab  ↑ at top: tabs"
+    "↑/↓: move  Enter: toggle  ←/→: cycle  /: search  R: reset all  Tab: next tab"
 }
 
 pub(crate) fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {

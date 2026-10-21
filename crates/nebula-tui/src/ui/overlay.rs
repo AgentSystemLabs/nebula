@@ -654,7 +654,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &mut App, view: crate::app::Setting
     // terminal now that the Hotkeys tab alone is forty rows.
     let cfg = crate::config::Config::load();
     let tab = view.tab;
-    let rows = crate::config::settings_rows(tab);
+    let rows = view.body_rows();
     // The Project tab's rows are the selected project's: its
     // name and path head the tab, and its entry is what the
     // values read. No project (an empty tree) leaves them n/a.
@@ -665,7 +665,16 @@ fn draw_settings_overlay(f: &mut Frame, app: &mut App, view: crate::app::Setting
     // strip and its rule above the body, and a blank + hint +
     // keys + config path below it.
     const CHROME: u16 = 2 + 4;
-    let want = rows.len() as u16 + CHROME + 2;
+    // An open search holds the modal at the tallest tab's height, so it
+    // doesn't jump about while the matches come and go.
+    let tallest = match view.search {
+        Some(_) => (0..crate::config::tab_count())
+            .map(|t| crate::config::settings_rows(t).len())
+            .max()
+            .unwrap_or(0),
+        None => 0,
+    };
+    let want = rows.len().max(tallest) as u16 + CHROME + 2;
     let height = want.min(f.area().height.saturating_sub(2)).max(CHROME + 3);
     let area = centered_rect(f.area(), SETTINGS_W, height);
     let inner = render_modal_frame(f, area, " Settings ", th);
@@ -679,7 +688,21 @@ fn draw_settings_overlay(f: &mut Frame, app: &mut App, view: crate::app::Setting
         view.on_tabs,
         th,
     );
-    let mut lines: Vec<Line> = vec![Line::from(strip), strip_rule(inner.width, th)];
+    // An open search takes the rule's line, so it costs the body nothing.
+    let second = match &view.search {
+        Some(query) => {
+            let found = rows.iter().filter(|(_, r)| r.index().is_some()).count();
+            settings_search_line(
+                query,
+                view.typing,
+                view.searching().then_some(found),
+                inner,
+                th,
+            )
+        }
+        None => strip_rule(inner.width, th),
+    };
+    let mut lines: Vec<Line> = vec![Line::from(strip), second];
 
     // ---- body ----
     let body_h = inner.height.saturating_sub(CHROME).max(1) as usize;
@@ -689,7 +712,6 @@ fn draw_settings_overlay(f: &mut Frame, app: &mut App, view: crate::app::Setting
         &cfg,
         &rows,
         &view,
-        tab,
         body_h,
         inner,
         project.as_ref(),
@@ -762,14 +784,44 @@ fn draw_settings_overlay(f: &mut Frame, app: &mut App, view: crate::app::Setting
     }
 }
 
+/// The SETTINGS SEARCH field, in place of the rule under the tab strip:
+/// the live input while it has the keys, the query as plain text once
+/// Enter has handed them back to the rows, and how many rows match.
+fn settings_search_line(
+    query: &crate::text_input::TextInput,
+    typing: bool,
+    found: Option<usize>,
+    inner: Rect,
+    th: Theme,
+) -> Line<'static> {
+    let count = found.map_or(String::new(), |n| {
+        format!("  {n} {}", if n == 1 { "match" } else { "matches" })
+    });
+    let room = (inner.width as usize).saturating_sub(3 + count.chars().count());
+    let mut spans = vec![Span::styled(" / ", Style::default().fg(th.accent))];
+    if typing {
+        let field = Rect {
+            width: room as u16,
+            ..inner
+        };
+        spans.extend(search_line(query, "type to search every tab…", field, th).spans);
+    } else {
+        spans.push(Span::styled(
+            truncate(query, room),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(count, Style::default().fg(th.dim)));
+    Line::from(spans)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn append_settings_body_lines(
     lines: &mut Vec<Line<'static>>,
     app: &App,
     cfg: &crate::config::Config,
-    rows: &[crate::config::SettingsRow],
+    rows: &[(usize, crate::config::SettingsRow)],
     view: &crate::app::SettingsView,
-    tab: usize,
     body_h: usize,
     inner: Rect,
     project: Option<&(String, std::path::PathBuf)>,
@@ -780,7 +832,7 @@ fn append_settings_body_lines(
     // row stays on screen without any scroll state.
     let sel_row = rows
         .iter()
-        .position(|r| r.index() == Some(view.selected))
+        .position(|(t, r)| *t == view.tab && r.index() == Some(view.selected))
         .unwrap_or(0);
     let first_row = (sel_row + 1).saturating_sub(body_h);
     let today = crate::config::today_days();
@@ -791,19 +843,22 @@ fn append_settings_body_lines(
             ""
         }
     };
-    let label_w = crate::config::tab_settings(tab)
+    // Search results mix tabs: their labels line up across all of them.
+    let tabs: std::collections::BTreeSet<usize> = rows.iter().map(|(t, _)| *t).collect();
+    let label_w = tabs
         .iter()
+        .flat_map(|t| crate::config::tab_settings(*t))
         .map(|spec| new_prefix(spec.kind).len() + spec.label.chars().count() + 1)
         .fold(28, usize::max);
     let project_settings = project.map(|(_, path)| cfg.project(path));
-    for row in rows.iter().skip(first_row).take(body_h) {
+    for (row_tab, row) in rows.iter().skip(first_row).take(body_h) {
         append_settings_row(
             lines,
             app,
             cfg,
             row,
             view,
-            tab,
+            *row_tab,
             inner,
             project,
             project_settings.as_ref(),
@@ -913,7 +968,7 @@ fn append_setting_value_row(
         };
         (spec.label.to_string(), value, new_prefix(spec.kind))
     };
-    let selected = i == view.selected && !view.on_tabs;
+    let selected = tab == view.tab && i == view.selected && !view.on_tabs;
     let mut label_style = Style::default();
     let mut value_style = Style::default().fg(th.accent);
     if selected {
@@ -942,7 +997,7 @@ fn append_hotkey_row(
     th: Theme,
 ) {
     let spec = crate::keymap::spec_at(i).expect("settings_rows indexes the action table");
-    let selected = i == view.selected && !view.on_tabs;
+    let selected = view.is_hotkeys() && i == view.selected && !view.on_tabs;
     let value = if selected && view.capturing() {
         "press a key…".to_string()
     } else {

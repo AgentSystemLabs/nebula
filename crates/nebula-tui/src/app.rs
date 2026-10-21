@@ -2042,6 +2042,18 @@ pub struct SettingsView {
     /// Transient line under the body: duplicate warnings, host-terminal
     /// warnings, "reset to default".
     pub notice: Option<(String, NoticeLevel)>,
+    /// SETTINGS SEARCH (`/`), while it is open: the query in place of the
+    /// rule under the tab strip. Once it has words the body is every tab's
+    /// matching rows ([`crate::config::search_rows`]), and `tab` /
+    /// `selected` follow the match under the cursor, so each key does to
+    /// a match what it does on the match's own tab.
+    pub search: Option<crate::text_input::TextInput>,
+    /// Keys go to the search field, not the rows: from `/` until Enter.
+    pub typing: bool,
+    /// The rows the query matched when it was last typed, held until it
+    /// changes: acting on a match (rebinding the chord it was found by)
+    /// never drops it from under the cursor.
+    pub results: Vec<(usize, crate::config::SettingsRow)>,
 }
 
 impl SettingsView {
@@ -2067,6 +2079,26 @@ impl SettingsView {
 
     pub fn is_hotkeys(&self) -> bool {
         self.tab == crate::config::hotkeys_tab()
+    }
+
+    /// The search has words, so the body shows its matches.
+    pub fn searching(&self) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|q| q.split_whitespace().next().is_some())
+    }
+
+    /// The body's rows, each with the tab it is on: the search's matches
+    /// while it has words, the tab's own rows otherwise. Shared by the
+    /// renderer, the keys and the mouse so they can't drift.
+    pub fn body_rows(&self) -> Vec<(usize, crate::config::SettingsRow)> {
+        if self.searching() {
+            return self.results.clone();
+        }
+        crate::config::settings_rows(self.tab)
+            .into_iter()
+            .map(|row| (self.tab, row))
+            .collect()
     }
 
     pub fn warn(&mut self, text: impl Into<String>) {

@@ -1,0 +1,8 @@
+# Settings opened fresh, `/` typed, then `pane`: the matches from every tab, under headers naming
+# where each lives, cursor on the first.
+s
+/
+p
+a
+n
+e
