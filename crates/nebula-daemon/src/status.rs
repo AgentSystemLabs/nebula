@@ -154,6 +154,10 @@ impl HookEvent {
 pub enum Effect {
     SetStatus(AgentStatus),
     SaveSessionId(String),
+    /// The CLI started a new conversation in the same process — `/clear`,
+    /// `/new`, a `/resume` of another one — so the row's RECENT PROMPTS
+    /// describe a conversation it no longer has.
+    ConversationChanged,
 }
 
 /// Who raised the dialog the agent is waiting on: the foreground turn, or
@@ -339,6 +343,14 @@ impl AgentStatusMachine {
                 if self.session_id.as_deref() != Some(sid) {
                     // New claude process (restart / manual relaunch): adopt it
                     // and forget the old session's subagents.
+                    // Replacing a known id is a new conversation: Claude,
+                    // Codex and Pi mint one on `/clear` or `/new`, and
+                    // Cursor's `/clear` and OpenCode's `/new` show only as
+                    // the next prompt under a new id. A resume or a compact
+                    // keeps the id.
+                    if self.session_id.is_some() {
+                        effects.push(Effect::ConversationChanged);
+                    }
                     self.session_id = Some(sid.to_string());
                     self.subagents.clear();
                     self.stop_held = false;
@@ -392,6 +404,13 @@ impl AgentStatusMachine {
                     self.stop_held = false;
                     self.drain_idle_since = None;
                     self.subagent_alive_at = None;
+                }
+                // A start over said in words (Claude/Codex `clear`, Pi's
+                // `new`), for a CLI that keeps the id across it.
+                if matches!(source.as_deref(), Some("clear" | "new"))
+                    && !effects.contains(&Effect::ConversationChanged)
+                {
+                    effects.push(Effect::ConversationChanged);
                 }
             }
             HookEvent::PermissionRequest { subagent_id } => {
@@ -2039,5 +2058,71 @@ mod tests {
         );
         let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(1));
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    fn conversation_changes(effects: &[Effect]) -> usize {
+        effects
+            .iter()
+            .filter(|e| **e == Effect::ConversationChanged)
+            .count()
+    }
+
+    /// A new id replacing a known one is a new conversation, whatever the
+    /// event carrying it; the first id a session reports is not.
+    #[test]
+    fn a_replaced_session_id_is_a_new_conversation() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        let start = |s: &str| HookEvent::SessionStart {
+            source: Some(s.into()),
+        };
+        assert_eq!(
+            conversation_changes(&m.handle(start("startup"), Some("s1"), now)),
+            0
+        );
+        assert_eq!(
+            conversation_changes(&m.handle(HookEvent::UserPromptSubmit, Some("s1"), now)),
+            0
+        );
+        for kept in ["resume", "compact"] {
+            assert_eq!(
+                conversation_changes(&m.handle(start(kept), Some("s1"), now)),
+                0,
+                "{kept}"
+            );
+        }
+        // Codex `/new` reports `startup` under a new id; Cursor's `/clear`
+        // shows only as the next prompt under one.
+        assert_eq!(
+            conversation_changes(&m.handle(start("startup"), Some("s2"), now)),
+            1
+        );
+        assert_eq!(
+            conversation_changes(&m.handle(HookEvent::UserPromptSubmit, Some("s3"), now)),
+            1
+        );
+    }
+
+    /// `clear` (Claude, Codex) and Pi's `new` are a new conversation even
+    /// when the id stays, and are reported once when it changes too.
+    #[test]
+    fn a_clear_or_new_session_start_is_a_new_conversation_once() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, Some("s1".into()));
+        let now = t0();
+        let start = |s: &str| HookEvent::SessionStart {
+            source: Some(s.into()),
+        };
+        assert_eq!(
+            conversation_changes(&m.handle(start("clear"), Some("s1"), now)),
+            1
+        );
+        assert_eq!(
+            conversation_changes(&m.handle(start("new"), Some("s1"), now)),
+            1
+        );
+        assert_eq!(
+            conversation_changes(&m.handle(start("clear"), Some("s2"), now)),
+            1
+        );
     }
 }
