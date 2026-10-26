@@ -964,8 +964,9 @@ pub async fn submodule_unpushed(worktree: &Path, root: &Path, ask_remotes: bool)
                 .as_deref()
                 .and_then(|root_git| kept_store(&store, &own_git, &checkout, root, root_git));
             let cwd = checkout.clone();
+            let folder = label.clone();
             jobs.spawn(async move {
-                lost_in_store(cwd, store, kept, ask_remotes)
+                lost_in_store(cwd, store, kept, &folder, ask_remotes)
                     .await
                     .map_err(|e| SubmoduleError::wrap(&label, e))
             });
@@ -1097,6 +1098,7 @@ async fn lost_in_store(
     cwd: PathBuf,
     store: PathBuf,
     kept: Option<PathBuf>,
+    folder: &str,
     ask_remotes: bool,
 ) -> Result<u32> {
     let git_dir = format!("--git-dir={}", store.display());
@@ -1128,13 +1130,14 @@ async fn lost_in_store(
         }
         Err(e) => return Err(e),
     };
-    let n = if lost.trim().is_empty() {
-        0
+    let lost = if lost.trim().is_empty() {
+        Vec::new()
     } else if let Some(kept) = kept {
         unkept_in(&cwd, &kept, &lost).await?
     } else {
-        lost.lines().count()
+        lost.lines().map(str::to_string).collect()
     };
+    let n = unfolded(&cwd, &git_dir, folder, lost).await?.len();
     Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
 
@@ -1206,18 +1209,19 @@ async fn head_resolves(cwd: &Path, git_dir: &str) -> bool {
     .is_ok()
 }
 
-/// How many of `commits` (one id per line) the root's store `kept` does
+/// Which of `commits` (one id per line) the root's store `kept` does
 /// not keep: commits it lacks, and commits it has but no ref of it
 /// reaches — a commit fetched by id and left dangling goes at its next
 /// gc, so it is no keeper.
-async fn unkept_in(cwd: &Path, kept: &Path, commits: &str) -> Result<usize> {
+async fn unkept_in(cwd: &Path, kept: &Path, commits: &str) -> Result<Vec<String>> {
     let kept_dir = format!("--git-dir={}", kept.display());
     let answers = git_read_input(cwd, &[&kept_dir, "cat-file", "--batch-check"], commits).await?;
-    let mut missing = 0;
+    let mut missing = Vec::new();
     let mut present = String::new();
     for line in answers.lines() {
         match line.split_once(' ') {
-            Some((_, "missing")) | None => missing += 1,
+            Some((id, "missing")) => missing.push(id.to_string()),
+            None => missing.push(line.to_string()),
             Some((id, _)) => {
                 present.push_str(id);
                 present.push('\n');
@@ -1236,8 +1240,75 @@ async fn unkept_in(cwd: &Path, kept: &Path, commits: &str) -> Result<usize> {
     )
     .await?;
     let asked: HashSet<&str> = present.lines().collect();
-    let dangling = unreached.lines().filter(|id| asked.contains(id)).count();
-    Ok(missing + dangling)
+    missing.extend(
+        unreached
+            .lines()
+            .filter(|id| asked.contains(id))
+            .map(str::to_string),
+    );
+    Ok(missing)
+}
+
+/// Of `commits` in the store at `git_dir` (a `--git-dir=` argument), the
+/// ones the superproject's remotes do not hold as the folder `folder`.
+/// A submodule folded into the superproject as a plain folder (`git
+/// filter-repo --to-subdirectory-filter`, `git subtree add`) keeps each
+/// commit's tree but not its id, so its old store, left in a worktree's
+/// git dir, reads as commits on no remote though every one is published
+/// as that folder. A commit counts as held when some commit a
+/// remote-tracking ref of the superproject reaches has its exact tree at
+/// `folder`; a local branch is no keeper, the same as for the store's
+/// own commits. The walk runs only when the superproject has one of the
+/// trees at all, so a store with no folded past costs one `cat-file`.
+async fn unfolded(
+    cwd: &Path,
+    git_dir: &str,
+    folder: &str,
+    commits: Vec<String>,
+) -> Result<Vec<String>> {
+    if commits.is_empty() {
+        return Ok(commits);
+    }
+    let asked: String = commits.iter().map(|c| format!("{c}^{{tree}}\n")).collect();
+    let trees = git_read_input(
+        cwd,
+        &[git_dir, "cat-file", "--batch-check=%(objectname)"],
+        &asked,
+    )
+    .await?;
+    let trees: Vec<&str> = trees.lines().collect();
+    if trees.len() != commits.len() {
+        return Ok(commits);
+    }
+    let known: String = trees.iter().map(|t| format!("{t}\n")).collect();
+    let here = git_read_input(
+        cwd,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        &known,
+    )
+    .await?;
+    if !here.lines().any(|l| l.ends_with(" tree")) {
+        return Ok(commits);
+    }
+    let pathspec = format!(":(literal){folder}");
+    let touched = git_read(cwd, &["rev-list", "--remotes", "--", &pathspec]).await?;
+    let at_folder: String = touched.lines().map(|c| format!("{c}:{folder}\n")).collect();
+    let held = git_read_input(
+        cwd,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        &at_folder,
+    )
+    .await?;
+    let held: HashSet<&str> = held
+        .lines()
+        .filter_map(|l| l.strip_suffix(" tree"))
+        .collect();
+    Ok(commits
+        .into_iter()
+        .zip(trees)
+        .filter(|(_, tree)| !held.contains(tree))
+        .map(|(commit, _)| commit)
+        .collect())
 }
 
 /// The submodules checked out in `dir`, relative to it: the gitlinks its
@@ -2458,6 +2529,70 @@ mod tests {
             .await
             .unwrap();
         assert!(!sub.join(".git").exists(), "deinitialised");
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+    }
+
+    /// A submodule later folded into the superproject as a plain folder
+    /// keeps each commit's tree, not its id: its old store's commits stop
+    /// counting once a remote holds that tree at the folder, and not
+    /// before (a local branch is no keeper).
+    #[tokio::test]
+    async fn a_store_whose_commits_were_folded_and_pushed_counts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allow = ["-c", "protocol.file.allow=always"];
+        let upstream = tmp.path().join("lib");
+        let repo = tmp.path().join("repo");
+        for dir in [&upstream, &repo] {
+            std::fs::create_dir(dir).unwrap();
+            init_repo(dir).await;
+        }
+        let url = upstream.to_string_lossy().into_owned();
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "add", "-q", url.as_str(), "lib"]);
+        git(&repo, &args).await.unwrap();
+        git(&repo, &["commit", "-q", "-m", "add lib"])
+            .await
+            .unwrap();
+        let wt = add_worktree(&repo, "feat", None).await.unwrap();
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "update", "--init", "-q"]);
+        git(&wt, &args).await.unwrap();
+        let sub = wt.join("lib");
+        git(&sub, &["config", "user.email", "t@t"]).await.unwrap();
+        git(&sub, &["config", "user.name", "t"]).await.unwrap();
+        commit_file(&sub, "z.txt", "z").await;
+        let store = git(&sub, &["rev-parse", "--absolute-git-dir"])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+
+        // Fold: the store's commit becomes the folder `lib` in the main
+        // repository, under a new commit id.
+        let mut args = allow.to_vec();
+        args.extend(["fetch", "-q", store.trim(), "HEAD"]);
+        git(&repo, &args).await.unwrap();
+        git(&repo, &["rm", "-q", "--cached", "lib"]).await.unwrap();
+        git(&repo, &["rm", "-q", "--cached", ".gitmodules"])
+            .await
+            .unwrap();
+        git(&repo, &["read-tree", "--prefix=lib/", "FETCH_HEAD^{tree}"])
+            .await
+            .unwrap();
+        git(&repo, &["commit", "-q", "-m", "fold lib"])
+            .await
+            .unwrap();
+        assert_eq!(
+            submodule_unpushed(&wt, &repo, true).await.unwrap(),
+            1,
+            "folded on a local branch only"
+        );
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+
+        // A commit made after the fold is on no remote in any shape.
+        commit_file(&sub, "y.txt", "y").await;
         assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
     }
 
