@@ -1,0 +1,3 @@
+# Ctrl+o on a changed file: the configured editor opens on it at the hunk the pane shows.
+g
+C-o

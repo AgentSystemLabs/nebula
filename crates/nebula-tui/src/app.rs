@@ -1164,8 +1164,9 @@ pub struct DiffView {
     /// The reader has moved the cursor: what lands from now on leaves it
     /// where they put it (`settle`).
     pub touched: bool,
-    /// Diffs side by side (`Ctrl+s` flips it), remembered across opens.
-    /// A narrow pane falls back to the unified diff.
+    /// Diffs side by side — the `diff_inline` SETTING off; `Ctrl+s` flips
+    /// it and writes the setting back. A narrow pane falls back to the
+    /// unified diff.
     pub split: bool,
     /// `diff` laid out side by side, while `split` is on and it has hunks.
     pub split_rows: Option<std::sync::Arc<[crate::git_diff::SplitRow]>>,
@@ -1380,6 +1381,20 @@ impl DiffView {
     pub fn toggle_split(&mut self) {
         self.split = !self.split;
         self.refresh_split();
+    }
+
+    /// The line of the new file at the top of the diff pane — or below it,
+    /// the nearest one the pane has — in the layout the last draw used:
+    /// where Enter opens the editor. 1 for a diff with no hunk.
+    pub fn editor_line(&self) -> u64 {
+        let row = self.scroll as usize;
+        let line = match &self.split_rows {
+            Some(rows) if self.split_shown => crate::git_diff::split_new_line_at(rows, row)
+                .or_else(|| crate::git_diff::split_new_line_at(rows, 0)),
+            _ => crate::git_diff::new_line_at(&self.diff, row)
+                .or_else(|| crate::git_diff::new_line_at(&self.diff, 0)),
+        };
+        line.map_or(1, u64::from)
     }
 
     /// The rows the diff pane scrolls over, in the layout the last draw
@@ -3143,9 +3158,11 @@ pub struct UiState {
     /// in older blobs, which keep the flat list.
     #[serde(default)]
     pub diff_tree: bool,
-    /// False means the diff modal opens side by side; absent in older blobs,
-    /// so they keep the new default.
-    #[serde(default)]
+    /// RETIRED to the `diff_inline` SETTING: blobs through this build said
+    /// here that `Ctrl+s` had left the diff modal unified. Read once, to
+    /// carry that choice into the setting (`restore_ui_state`), and never
+    /// written again.
+    #[serde(default, skip_serializing)]
     pub diff_unified: bool,
     /// Height the LAUNCHER VIEW's pane was dragged to; absent in older
     /// blobs, and None in ones written before the edge was ever dragged,
@@ -3998,9 +4015,6 @@ pub struct ModalState {
     /// The diff modal lists its files as a directory tree (`Ctrl+t` inside
     /// it), remembered across opens and launches like the width.
     pub diff_tree: bool,
-    /// The diff modal shows diffs side by side (`Ctrl+s` inside it),
-    /// remembered the same way.
-    pub diff_split: bool,
     /// Selected tab of the settings modal, remembered across opens.
     pub settings_tab: usize,
     /// Cursor row of the settings modal, one per tab, remembered across
@@ -4042,7 +4056,6 @@ impl Default for ModalState {
             follow_up: None,
             diff_files_width: DEFAULT_DIFF_FILES_W,
             diff_tree: false,
-            diff_split: true,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
             settings_on_tabs: true,

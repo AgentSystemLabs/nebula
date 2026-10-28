@@ -3286,6 +3286,77 @@ diff --git a/src/b.rs b/src/b.rs
     assert!(!view.diff.contains("+new"), "chunks don't bleed");
 }
 
+/// Ctrl+o on a changed file in the DIFF VIEWER is the editor: a pull
+/// request's diff has no checkout to edit and a deleted file nothing left
+/// to open, so both say so; the viewer stays up either way.
+#[test]
+fn ctrl_o_on_a_diff_file_opens_the_editor_or_says_why_not() {
+    let mut app = pr_diff_app(false);
+    let mut out = Vec::new();
+    press(
+        &mut app,
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+        &mut out,
+    );
+    assert!(
+        app.chrome
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("pull request")),
+        "flash: {:?}",
+        app.chrome.flash
+    );
+    assert!(app.pane.vim.is_none());
+    diff_view(&app);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kept.rs"), "a\nb\n").unwrap();
+    let files = vec![
+        crate::git_diff::DiffFile {
+            path: "gone.rs".into(),
+            orig_path: None,
+            xy: [' ', 'D'],
+        },
+        crate::git_diff::DiffFile {
+            path: "kept.rs".into(),
+            orig_path: None,
+            xy: [' ', 'M'],
+        },
+    ];
+    let mut app = App::new();
+    let view = DiffView::new(dir.path().to_path_buf(), "main".into(), files, true);
+    app.modals.overlay = Some(Overlay::Diff(view));
+    press(
+        &mut app,
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+        &mut out,
+    );
+    assert!(
+        app.chrome
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("gone.rs")),
+        "flash: {:?}",
+        app.chrome.flash
+    );
+
+    // A file on disk goes to the editor; with no editor channel (a unit
+    // test) nothing spawns, and nothing is flashed or folded either.
+    app.chrome.flash = None;
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    assert_eq!(diff_view(&app).selected_path(), Some("kept.rs"));
+    press(
+        &mut app,
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+        &mut out,
+    );
+    assert_eq!(app.chrome.flash, None);
+    assert_eq!(diff_view(&app).selected_path(), Some("kept.rs"));
+}
+
 /// A pull request's diff spread over two directories, one of them a
 /// chain the tree folds into a single row.
 const TREE_PR_DIFF: &str = "\

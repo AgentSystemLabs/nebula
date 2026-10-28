@@ -1358,7 +1358,11 @@ fn draw_diff_overlay(f: &mut Frame, app: &mut App, view: crate::app::DiffView) {
         (diff_a.width as usize).saturating_sub(4),
     );
     let mut block = panel_block(&title, true, th).title_bottom(Line::from(Span::styled(
-        " ^r: toggle reviewed ",
+        if view.selected_file().is_some() && view.prefetched.is_none() {
+            " ^o: edit · ^r: toggle reviewed · ^s: split/inline "
+        } else {
+            " ^r: toggle reviewed · ^s: split/inline "
+        },
         Style::default().fg(th.dim),
     )));
     let diff_inner = block.inner(diff_a);

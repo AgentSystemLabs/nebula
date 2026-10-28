@@ -1,0 +1,3 @@
+# The DIFF VIEWER flipped inline with Ctrl+s, which also writes the diff_inline setting back.
+g
+C-s
