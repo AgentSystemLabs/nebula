@@ -497,8 +497,10 @@ macro_rules! main_loop_body {
         // through the same $terminal as the OSC writes above, so over ssh it
         // rings the $terminal the user is sitting at. CONFIG.JSON is read
         // fresh, like every other setting.
+        // MUTE SOUNDS silences it whatever `done_sound` names.
         if std::mem::take(&mut app.chrome.pending_ding) {
-            if let Some(sound) = crate::config::Config::load().done_sound() {
+            let cfg = crate::config::Config::load();
+            if let Some(sound) = cfg.done_sound().filter(|_| !cfg.mute_sounds) {
                 alerts::play_sound($terminal.backend_mut(), sound);
             }
         }
@@ -507,11 +509,14 @@ macro_rules! main_loop_body {
         // SOUND once for the lot and, while the $terminal window is in the
         // background, name each of them in a desktop notification — never
         // over ssh, where the desktop is the wrong machine's. `off` is
-        // silence for both.
+        // silence for both; MUTE SOUNDS silences only the sound.
         let alerts = std::mem::take(&mut app.chrome.pending_feedback);
         if !alerts.is_empty() {
-            if let Some(sound) = crate::config::Config::load().feedback_sound() {
-                alerts::play_sound($terminal.backend_mut(), sound);
+            let cfg = crate::config::Config::load();
+            if let Some(sound) = cfg.feedback_sound() {
+                if !cfg.mute_sounds {
+                    alerts::play_sound($terminal.backend_mut(), sound);
+                }
                 if !app.chrome.window_focused && !app.chrome.is_remote {
                     alerts::notify_desktop(&alerts);
                 }

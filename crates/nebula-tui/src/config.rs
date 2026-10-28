@@ -395,6 +395,7 @@ pub enum SettingKind {
     SessionIdleTimeout,
     PrewarmAgents,
     PrewarmSessions,
+    MuteSounds,
     DoneSound,
     FeedbackSound,
     PresetText,
@@ -518,6 +519,7 @@ impl SettingKind {
             SettingKind::AskBeforeArchive => (2026, 10, 3),
             SettingKind::ConfirmDragMove => (2026, 10, 2),
             SettingKind::SourceControlGraph | SettingKind::InlineGraphics => (2026, 10, 9),
+            SettingKind::MuteSounds => (2026, 10, 28),
         }
     }
 
@@ -612,6 +614,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::PrewarmSessions,
                 label: "Prewarm dead sessions",
                 hint: "Boot a worktree's dead sessions while the cursor rests on it, so attaching is instant",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::MuteSounds,
+                label: "Mute sounds",
+                hint: "Silence the done and feedback sounds (desktop notifications still show)",
                 group: "",
             },
             SettingSpec {
@@ -1125,6 +1133,12 @@ pub struct Config {
     /// FEEDBACK SOUND and the desktop notification an unfocused terminal
     /// window gets: "off" silences the pair.
     pub feedback_sound: String,
+    /// MUTE SOUNDS: the one switch that silences every sound the TUI
+    /// plays — the DONE SOUND and the FEEDBACK SOUND — whatever
+    /// `done_sound` / `feedback_sound` name, so turning it back off
+    /// restores the choices. Unlike `feedback_sound: "off"` it leaves the
+    /// desktop notification alone. Off by default.
+    pub mute_sounds: bool,
     /// PRESET TEXT: which side of the task a new AGENT PRESET's text goes
     /// — `prefix` (one box, sent before the task), `postfix` (one box,
     /// sent after it) or `prefix & postfix` (both). The PRESET EDITOR
@@ -1571,6 +1585,7 @@ impl Default for Config {
             prewarm_sessions: true,
             done_sound: "Glass".into(),
             feedback_sound: "Sosumi".into(),
+            mute_sounds: false,
             preset_text: PresetText::DEFAULT.as_str().into(),
             delete_empty_worktree: false,
             auto_cleanup_merged: false,
@@ -2422,6 +2437,7 @@ impl Config {
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::PrewarmAgents => on_off(self.prewarm_agents).into(),
             SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
+            SettingKind::MuteSounds => on_off(self.mute_sounds).into(),
             SettingKind::DoneSound => self.done_sound.clone(),
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::PresetText => self.preset_text().as_str().into(),
@@ -2505,6 +2521,9 @@ impl Config {
             }
             SettingKind::PrewarmSessions => {
                 self.prewarm_sessions = !self.prewarm_sessions;
+            }
+            SettingKind::MuteSounds => {
+                self.mute_sounds = !self.mute_sounds;
             }
             SettingKind::DoneSound => {
                 self.done_sound = cycle_choice(&self.done_sound, SOUNDS, step).into();
@@ -3818,6 +3837,30 @@ mod tests {
         // A config predating the key keeps animations on.
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(cfg.animations);
+    }
+
+    #[test]
+    fn mute_sounds_default_off_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(!cfg.mute_sounds);
+        // Its row sits just above the two sounds it silences.
+        let (tab, row) = locate(SettingKind::MuteSounds).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        assert_eq!(locate(SettingKind::DoneSound).unwrap(), (tab, row + 1));
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.mute_sounds);
+        assert_eq!(cfg.value_label(SettingKind::MuteSounds), "on");
+        // Muting leaves the chosen sounds in place for when it is lifted.
+        assert_eq!(cfg.done_sound, "Glass");
+        assert_eq!(cfg.feedback_sound, "Sosumi");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).mute_sounds);
+        // A config predating the key keeps sounds on.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.mute_sounds);
     }
 
     /// DRAFT PULL REQUESTS: an Appearance row that reads `shown` / `hidden`
