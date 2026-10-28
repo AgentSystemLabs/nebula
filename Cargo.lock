@@ -1299,6 +1299,7 @@ dependencies = [
  "crossterm",
  "futures",
  "image",
+ "libc",
  "nebula-core",
  "nebula-fuzzy",
  "portable-pty",

@@ -11628,7 +11628,11 @@ mod tests {
             assert_eq!(buf[(root.right() - 1, root.y)].bg, fill, "edge to edge");
             assert_eq!(buf[(root.x - 1, root.y)].bg, th.accent, "the accent bar");
             let title = &buf[(root.x + 4, root.y)];
-            assert_eq!(title.fg, gray::DIM, "a fresh session's status color");
+            assert_eq!(
+                title.fg,
+                gray::dim(&app.chrome.theme),
+                "a fresh session's status color"
+            );
             assert!(title.modifier.contains(Modifier::BOLD));
             // The child is `term-1`, its title past the `└ ❯ `.
             let child_title = &buf[(child.x + 8, child.y)];
@@ -12464,7 +12468,7 @@ mod tests {
                 .expect("the #141 is a button");
             let cell = &term.backend().buffer()[(link.x, link.y)];
             assert_eq!(cell.symbol(), "#");
-            assert_eq!(cell.fg, gray::LINK);
+            assert_eq!(cell.fg, gray::link(&app.chrome.theme));
             assert!(cell.modifier.contains(Modifier::UNDERLINED));
             assert_eq!(link.width, 4);
 

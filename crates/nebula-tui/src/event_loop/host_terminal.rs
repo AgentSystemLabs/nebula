@@ -81,6 +81,9 @@ pub(super) fn setup_terminal() -> Result<HostTerminal> {
         // moment a pull request was most likely just closed there.
         crossterm::event::EnableFocusChange,
     )?;
+    // The terminal's background, for the `auto` APPEARANCE — asked
+    // before the EventStream exists, as the kitty probe below is.
+    probe_background();
     // Kitty keyboard protocol on the outer terminal. Probe first —
     // Terminal.app and friends don't speak it (must happen before the
     // EventStream exists; the probe reads stdin).
@@ -96,6 +99,79 @@ pub(super) fn setup_terminal() -> Result<HostTerminal> {
     // writes instead of one syscall per line (Stdout is line-buffered).
     let writer = BufWriter::with_capacity(64 * 1024, std::io::stdout());
     Ok(Terminal::new(CrosstermBackend::new(writer))?)
+}
+
+/// How long the background probe waits for the host to answer. A local
+/// terminal answers in well under a millisecond; this is for ssh.
+const BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Ask the host for its background color (OSC 11) and record whether it
+/// is light (`theme::set_detected_light`). A DA1 query (`CSI c`) rides
+/// behind it: every terminal answers that one, and answers in order, so a
+/// DA1 reply with no color ahead of it means the host doesn't speak OSC 11
+/// and the wait ends at once rather than at the timeout. Nothing is
+/// recorded on no answer — `auto` then falls back to `COLORFGBG`, then dark.
+/// Needs raw mode (the reply would echo otherwise); stdin not a tty skips.
+fn probe_background() {
+    use std::os::fd::AsRawFd;
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    // SAFETY: isatty only inspects the descriptor.
+    if unsafe { libc::isatty(fd) } != 1 {
+        return;
+    }
+    let mut out = std::io::stdout();
+    if out
+        .write_all(b"\x1b]11;?\x1b\\\x1b[c")
+        .and_then(|()| out.flush())
+        .is_err()
+    {
+        return;
+    }
+    let deadline = std::time::Instant::now() + BACKGROUND_PROBE_TIMEOUT;
+    let mut reply = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as libc::c_int) };
+        if ready <= 0 {
+            break;
+        }
+        let mut chunk = [0u8; 256];
+        // SAFETY: reading into a buffer we own, at most its length.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        reply.extend_from_slice(&chunk[..n as usize]);
+        if da1_answered(&reply) {
+            break;
+        }
+    }
+    if let Some(rgb) = crate::theme::parse_osc11(&reply) {
+        let light = crate::theme::rgb_is_light(rgb);
+        tracing::debug!(?rgb, light, "terminal background");
+        crate::theme::set_detected_light(light);
+    }
+}
+
+/// Whether `reply` holds a complete DA1 answer (`CSI ? … c`).
+fn da1_answered(reply: &[u8]) -> bool {
+    reply.windows(3).enumerate().any(|(i, w)| {
+        w == b"\x1b[?"
+            && reply[i + 3..]
+                .iter()
+                .find(|b| !(b.is_ascii_digit() || **b == b';'))
+                == Some(&b'c')
+    })
 }
 
 pub fn restore_terminal() {
@@ -403,6 +479,14 @@ mod tests {
         let _ = std::panic::catch_unwind(|| panic!("host-terminal-owner-panic"));
         assert_eq!(OWNER_PANICS.load(Ordering::Relaxed), 1);
         assert!(!take_worker_panic(), "and it is not a worker panic");
+    }
+
+    #[test]
+    fn the_background_probe_stops_at_a_whole_da1_reply() {
+        assert!(!da1_answered(b"\x1b]11;rgb:0/0/0\x07"));
+        assert!(!da1_answered(b"\x1b]11;rgb:0/0/0\x07\x1b[?62;2"));
+        assert!(da1_answered(b"\x1b]11;rgb:0/0/0\x07\x1b[?62;22c"));
+        assert!(da1_answered(b"\x1b[?1;2c"));
     }
 
     fn text(bytes: &[u8]) -> String {

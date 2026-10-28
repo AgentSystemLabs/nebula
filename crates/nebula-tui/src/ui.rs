@@ -218,7 +218,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.chrome.rows_memo.disarm();
     if app.chrome.black_background {
         let area = f.area();
-        draw_black_background(f.buffer_mut(), area);
+        draw_black_background(f.buffer_mut(), area, app.chrome.theme);
     }
 }
 
@@ -919,16 +919,17 @@ fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
 }
 
 /// The BLACK BACKGROUND setting: paint every cell still on the terminal's
-/// default background pure black. Runs last in a frame, after the overlays
+/// default background the theme's canvas — pure black, or pure white in
+/// the light APPEARANCE. Runs last in a frame, after the overlays
 /// and the focus tint, and — like the tint — only touches `Reset` cells, so
 /// selection fills, the tint and the colors a session draws itself stay on
 /// top of it.
-fn draw_black_background(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+fn draw_black_background(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 if cell.bg == Color::Reset {
-                    cell.bg = crate::theme::BLACK_BACKGROUND;
+                    cell.bg = th.canvas();
                 }
             }
         }
@@ -2474,13 +2475,20 @@ mod tests {
         let area = Rect::new(0, 0, 2, 1);
         let mut buf = ratatui::buffer::Buffer::empty(area);
         buf[(1, 0)].bg = app.chrome.theme.sel_bg;
-        draw_black_background(&mut buf, area);
+        draw_black_background(&mut buf, area, app.chrome.theme);
         assert_eq!(buf[(0, 0)].bg, crate::theme::BLACK_BACKGROUND);
         assert_eq!(
             buf[(1, 0)].bg,
             app.chrome.theme.sel_bg,
             "a fill stays on top"
         );
+
+        // The light APPEARANCE paints the same cells white instead: a
+        // black slab under dark-on-light text is what it exists to avoid.
+        let light = crate::theme::Theme::light_by_name("default");
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        draw_black_background(&mut buf, area, light);
+        assert_eq!(buf[(0, 0)].bg, crate::theme::WHITE_BACKGROUND);
     }
 
     #[test]
