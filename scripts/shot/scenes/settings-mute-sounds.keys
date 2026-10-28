@@ -1,0 +1,10 @@
+# Settings › Sessions with the cursor on the new Mute sounds row (the tab's fourth), just switched on,
+# so its hint shows in the footer and the Done / Feedback sound rows below keep their choices.
+# The first j leaves the tab strip for the rows.
+s
+Tab
+j
+j
+j
+j
+Enter
