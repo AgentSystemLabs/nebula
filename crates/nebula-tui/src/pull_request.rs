@@ -269,6 +269,10 @@ pub struct PullRequest {
     /// [`STATE_CLOSED`].
     pub state: String,
     pub is_draft: bool,
+    /// Reported by a session, not proved to belong to this checkout. Display
+    /// its status, but never use it to authorize merged-worktree cleanup.
+    #[serde(default)]
+    pub reported: bool,
     /// The local checkout branch this pull request's head names
     /// ([`checkout_branch`]): bare for same-repo PRs, owner-qualified for
     /// forks.
@@ -380,6 +384,35 @@ pub async fn lookup(dir: &Path) -> Lookup {
     }
 }
 
+/// Prefer the actual branch PR. Only a definite branch miss permits a
+/// session-reported URL to supply the row, without requiring its head/commit
+/// to match a checkout in an entirely different repository.
+pub async fn lookup_with_reported(dir: &Path, reported: Option<&str>) -> Lookup {
+    let branch = lookup(dir).await;
+    if branch != Lookup::Absent {
+        return branch;
+    }
+    let Some(url) = reported.and_then(nebula_core::github_url::github_pr_url) else {
+        return branch;
+    };
+    match run_gh(None, &["pr", "view", &url, "--json",
+        "number,url,title,state,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,headRepositoryOwner,mergeable,statusCheckRollup,comments,reviews"], TIMEOUT).await {
+        Ok(out) => parse_reported(&out, viewer_login().await, &url),
+        Err(error) => classify_miss(&error),
+    }
+}
+
+fn parse_reported(json: &str, viewer: Option<&str>, url: &str) -> Lookup {
+    match parse(json, viewer) {
+        Some(mut pr) if pr.url.eq_ignore_ascii_case(url) => {
+            pr.url = url.into();
+            pr.reported = true;
+            Lookup::Found(pr)
+        }
+        _ => Lookup::Absent,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CheckoutContext {
     branch: String,
@@ -482,6 +515,7 @@ fn parse(json: &str, viewer: Option<&str>) -> Option<PullRequest> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let url = web_url(&v)?;
     Some(PullRequest {
+        reported: false,
         number: v.get("number")?.as_u64()?,
         url,
         title: str_at(&v, "title"),
@@ -1748,5 +1782,24 @@ rename to new.rs
             Lookup::Unavailable,
             "no gh at all, or a timeout"
         );
+    }
+    #[test]
+    fn reported_pr_tracks_open_and_merged_without_checkout_identity() {
+        let url = "https://github.com/other/game/pull/384";
+        for state in [STATE_OPEN, STATE_MERGED] {
+            let json = format!(
+                r#"{{"number":384,"url":"{url}","state":"{state}","headRefName":"external-branch","headRefOid":"external-sha"}}"#
+            );
+            let Lookup::Found(pr) = parse_reported(&json, None, url) else {
+                panic!("not found")
+            };
+            assert!(pr.reported);
+            assert_eq!(pr.state, state);
+            assert_eq!(pr.head, "external-branch");
+            assert_eq!(
+                parse_reported(&json, None, "https://github.com/other/game/pull/385"),
+                Lookup::Absent
+            );
+        }
     }
 }

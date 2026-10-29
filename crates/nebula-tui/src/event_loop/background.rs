@@ -177,6 +177,19 @@ pub(crate) fn refresh_git_changes(app: &mut App) {
     land_git_changes(app, id, count);
 }
 
+/// Most recently reported PR; older saved ticket/design links do not qualify.
+pub(super) fn reported_pr_for(app: &App, id: &WorktreeId) -> Option<String> {
+    app.tree
+        .links
+        .iter()
+        .filter(|link| &link.worktree_id == id)
+        .filter_map(|link| {
+            nebula_core::github_url::github_pr_url(&link.url).map(|url| (link.sort_order, url))
+        })
+        .max_by_key(|(order, _)| *order)
+        .map(|(_, url)| url)
+}
+
 /// Ask `gh` for the selected worktree's pull request, off the loop. Skipped
 /// while one is in flight — a repaint must never stack `gh` processes — and
 /// until the timer the last answer armed expires. The reply arrives on
@@ -203,9 +216,10 @@ pub(crate) fn lookup_pull_request(
         return;
     }
     app.github.pr_inflight.insert(id.clone());
+    let reported = reported_pr_for(app, &id);
     let pr_tx = pr_tx.clone();
     tokio::spawn(async move {
-        let pr = crate::pull_request::lookup(&path).await;
+        let pr = crate::pull_request::lookup_with_reported(&path, reported.as_deref()).await;
         let _ = pr_tx.send((id, pr));
     });
 }
@@ -225,9 +239,10 @@ pub(crate) fn sweep_pull_request(
         return;
     };
     app.github.pr_inflight.insert(id.clone());
+    let reported = reported_pr_for(app, &id);
     let pr_tx = pr_tx.clone();
     tokio::spawn(async move {
-        let pr = crate::pull_request::lookup(&path).await;
+        let pr = crate::pull_request::lookup_with_reported(&path, reported.as_deref()).await;
         let _ = pr_tx.send((id, pr));
     });
 }
@@ -373,7 +388,7 @@ pub(crate) fn maybe_auto_cleanup_merged(
     else {
         return;
     };
-    if pr.head != worktree.branch || pr.head_sha.is_empty() {
+    if pr.reported || pr.head != worktree.branch || pr.head_sha.is_empty() {
         return;
     }
     if app

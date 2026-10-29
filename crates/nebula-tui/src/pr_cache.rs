@@ -60,7 +60,9 @@ const DIFFS_DIR: &str = "diffs";
 /// checkout's branch (`pull_request::checkout_branch`), not `gh`'s bare
 /// `headRefName` — a fork row cached under 1 would launch its PR SESSION
 /// into whichever checkout of ours shares the fork branch's name.
-const VERSION: u32 = 3;
+// Version 4 preserves the session-reported provenance bit. Older readers
+// must not treat an external PR's cached head as proof for checkout cleanup.
+const VERSION: u32 = 4;
 
 /// The document on disk. Keyed the way the app keys the same things:
 /// checkout rows by worktree id, open lists by project id, bodies by URL.
@@ -342,6 +344,7 @@ mod tests {
 
     fn pr(number: u64, state: &str) -> PullRequest {
         PullRequest {
+            reported: false,
             number,
             url: format!("https://github.com/o/r/pull/{number}"),
             title: format!("PR {number}"),

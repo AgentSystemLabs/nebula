@@ -6338,6 +6338,7 @@ mod tests {
 
     fn pr(url: &str) -> PullRequest {
         PullRequest {
+            reported: false,
             number: 7,
             url: url.into(),
             title: "Attach links".into(),

@@ -145,6 +145,8 @@ pub struct HookDelivery {
     /// (`prompt_history::condense`). Only a `UserPromptSubmit` carries
     /// one, and only when the payload had a non-blank, user-written one.
     pub prompt: Option<String>,
+    /// One unambiguous PR in a foreground completed assistant answer.
+    pub reported_pr: Option<String>,
 }
 
 /// Permissive payload: every field optional, unknown fields ignored. Hook
@@ -154,6 +156,7 @@ pub struct HookDelivery {
 #[serde(default)]
 pub struct HookPayload {
     pub hook_event_name: Option<String>,
+    pub last_assistant_message: Option<String>,
     pub session_id: Option<String>,
     /// The prompt text on `UserPromptSubmit` — Claude, Codex and Cursor
     /// (`beforeSubmitPrompt`) all name it `prompt`, and pi's extension
@@ -417,6 +420,14 @@ async fn receive_hook(
             .and_then(crate::prompt_history::condense),
         _ => None,
     };
+    let reported_pr = if matches!(event, HookEvent::Stop) && payload.subagent_id().is_none() {
+        payload
+            .last_assistant_message
+            .as_deref()
+            .and_then(nebula_core::github_url::reported_pr_url)
+    } else {
+        None
+    };
     let _ = state
         .tx
         .send(HookDelivery {
@@ -426,6 +437,7 @@ async fn receive_hook(
             cwd,
             transcript,
             prompt,
+            reported_pr,
         })
         .await;
 
@@ -764,6 +776,33 @@ mod tests {
         assert_eq!(status, 200);
         let delivery = rx.recv().await.unwrap();
         assert!(delivery.cwd.is_none(), "subagent cwd: {:?}", delivery.cwd);
+    }
+
+    #[tokio::test]
+    async fn codex_foreground_stop_captures_the_reported_pr_only() {
+        let (env, mut rx, _) = start_hook_server(seeded_store(), None).await.unwrap();
+        for (event, extra, expected) in [
+            ("Stop", "", true),
+            ("UserPromptSubmit", "", false),
+            ("Stop", ",\"agent_id\":\"child\"", false),
+        ] {
+            let body = format!(
+                r#"{{"session_id":"s1","last_assistant_message":"Opened [PR](https://github.com/other/game/pull/384)."{extra}}}"#
+            );
+            let (status, _) = http_post(
+                env.port,
+                &format!("/api/hooks/codex?agentId=titled&hookEvent={event}"),
+                &env.token,
+                &body,
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                rx.recv().await.unwrap().reported_pr.is_some(),
+                expected,
+                "{body}"
+            );
+        }
     }
 
     /// The prompt reaches the drain loop condensed, on its own event

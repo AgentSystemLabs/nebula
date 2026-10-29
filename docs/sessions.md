@@ -653,3 +653,23 @@ whole diff, `Ctrl+o` — or a click on the `↗ open in browser` button pinned r
 frame — opens it in the browser and marks it read on the way out, and `Esc` closes the
 modal (twice, with a filter typed). The hotkey is
 rebindable (`pull_requests`).
+
+## Pull requests reported by a session
+
+A completed foreground answer that names exactly one GitHub pull request
+adds its link to the session's worktree. This includes a Codex session that
+created the PR from a separate clone or another repository. Repeated links
+are saved once; answers naming multiple PRs do not guess which one to track.
+User prompts and subagent answers do not create links.
+
+The checkout's own branch PR takes precedence. When GitHub confirms that
+branch has no PR, Nebula checks the most recently reported PR by URL, keeps
+its link and state across restarts, and colors an idle checkout purple when
+it has merged. Running or waiting-for-feedback sessions keep their usual
+status colors. Network failures retain the last known state.
+
+Reported PRs never authorize automatic checkout cleanup, even when the branch
+names happen to match. They do not change a session's launch scope or move
+its checkout. Capture requires the harness's foreground Stop hook to supply
+`last_assistant_message` (supported by Codex 0.165); older completions are not
+scanned retroactively.

@@ -2867,6 +2867,7 @@ fn seed_branch_pr(app: &mut App, number: u64, title: &str) {
     app.github.pull_requests.insert(
         nebula_core::WorktreeId("w1".into()),
         Some(crate::pull_request::PullRequest {
+            reported: false,
             number,
             url: format!("https://github.com/o/r/pull/{number}"),
             title: title.into(),
@@ -3576,6 +3577,7 @@ fn a_failed_pr_diff_flashes_instead_of_opening() {
 /// A pull request as the cache would hand it back, for the rows.
 fn cached_pr(number: u64) -> crate::pull_request::PullRequest {
     crate::pull_request::PullRequest {
+        reported: false,
         number,
         url: pr_url(number),
         title: format!("PR {number}"),
@@ -4199,6 +4201,7 @@ fn shift_r_on_the_pr_row_refreshes_pull_requests() {
     app.github.pull_requests.insert(
         wid.clone(),
         Some(crate::pull_request::PullRequest {
+            reported: false,
             number: 7,
             url: url.clone(),
             title: "Attach links".into(),
@@ -4479,6 +4482,7 @@ fn a_found_pr_keeps_being_refreshed() {
     app.github.pull_requests.insert(
         wt.clone(),
         Some(crate::pull_request::PullRequest {
+            reported: false,
             number: 7,
             url: "https://github.com/o/r/pull/7".into(),
             title: "done".into(),
@@ -4512,6 +4516,7 @@ fn opening_a_pull_request_marks_it_read() {
     app.github.pull_requests.insert(
         wt.clone(),
         Some(crate::pull_request::PullRequest {
+            reported: false,
             number: 7,
             url: url.into(),
             title: "done".into(),
@@ -22616,4 +22621,65 @@ fn a_held_attach_goes_out_after_a_frame_with_no_pane() {
         ),
         "{out:?}"
     );
+}
+
+/// A PR made in another repo must still link and turn the finished row
+/// purple. Even coincidentally matching branch/SHA cannot authorize cleanup.
+#[test]
+fn reported_pr_links_refreshes_turns_purple_and_never_cleans_the_checkout() {
+    use nebula_core::{Entity, Link, WorktreeId};
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let id = WorktreeId("w1".into());
+    app.github.pr_recheck.insert(
+        id.clone(),
+        (
+            std::time::Instant::now() + std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(300),
+        ),
+    );
+    let url = "https://github.com/other/game/pull/384";
+    hse(
+        &mut app,
+        ServerEvent::EntityUpserted {
+            entity: Entity::Link(Link {
+                id: LinkId("reported".into()),
+                worktree_id: id.clone(),
+                url: url.into(),
+                sort_order: 0,
+            }),
+        },
+    );
+    assert!(
+        !app.github.pr_recheck.contains_key(&id),
+        "new links bypass old no-PR backoff"
+    );
+    assert_eq!(reported_pr_for(&app, &id).as_deref(), Some(url));
+    let mut pr = cached_pr(384);
+    pr.reported = true;
+    pr.url = url.into();
+    pr.head = app.tree.worktrees[0].branch.clone();
+    pr.head_sha = "0123456789abcdef".into();
+    land_pull_request(&mut app, id.clone(), Lookup::Found(pr.clone()));
+    assert_eq!(
+        app.visible_links().len(),
+        1,
+        "saved and resolved link are one row"
+    );
+    assert!(!app.worktree_wears_merge(&id));
+    pr.state = crate::pull_request::STATE_MERGED.into();
+    land_pull_request(&mut app, id.clone(), Lookup::Found(pr));
+    assert!(app.worktree_wears_merge(&id));
+    assert!(app.merge_is_fresh(&id));
+    app.launcher.auto_cleanup_merged = true;
+    app.tree.worktrees[0].is_main = false;
+    let mut out = Vec::new();
+    maybe_auto_cleanup_merged(&mut app, &id, &mut out);
+    assert!(
+        out.is_empty(),
+        "reported PRs never request destructive cleanup"
+    );
+    let json = serde_json::to_string(app.github.pull_requests[&id].as_ref().unwrap()).unwrap();
+    let restored: crate::pull_request::PullRequest = serde_json::from_str(&json).unwrap();
+    assert!(restored.reported, "cache must preserve cleanup protection");
 }
