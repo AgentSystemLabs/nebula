@@ -394,6 +394,15 @@ async fn receive_hook(
         return quiet_or(StatusCode::OK, HOOK_NOT_OK);
     };
     let agent_id = AgentId(query.agent_id.clone());
+    // A Claude tool can launch codex exec with the parent's NEBULA_*
+    // environment. Its start/stop hooks must not adopt or finish that row.
+    if cli == HookCli::Codex {
+        if let Ok(Some(agent)) = state.store.get_agent(&agent_id) {
+            if agent.kind != nebula_core::AgentKind::Codex {
+                return quiet_or(StatusCode::OK, HOOK_NOT_OK);
+            }
+        }
+    }
     tracing::debug!(agent = %agent_id, event = ?event, "hook received");
     // A subagent's tool traffic reports the payload's cwd too, but that is
     // the Task's position, not the session's — an isolated subagent working
@@ -538,6 +547,15 @@ mod tests {
             .insert_agent_with_auto_title(&agent("pending"), true)
             .unwrap();
         store.insert_agent(&agent("titled")).unwrap();
+        store
+            .insert_agent_with_auto_title(
+                &Agent {
+                    kind: AgentKind::Codex,
+                    ..agent("codex")
+                },
+                true,
+            )
+            .unwrap();
         // A row the user (or AUTO-TITLE) named, that Claude doesn't hold yet.
         store
             .insert_agent(&Agent {
@@ -546,6 +564,22 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    #[tokio::test]
+    async fn nested_codex_hooks_do_not_drive_a_claude_session() {
+        let (env, mut rx, _) = start_hook_server(seeded_store(), None).await.unwrap();
+        for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+            let (status, _) = http_post(
+                env.port,
+                &format!("/api/hooks/codex?agentId=titled&hookEvent={event}"),
+                &env.token,
+                r#"{"session_id":"nested-codex"}"#,
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     /// The reply's `sessionTitle` is how a nebula-side name reaches
@@ -589,12 +623,12 @@ mod tests {
         // Codex: same dialect, but no title exchange and no transcript.
         let (_, body) = http_post(
             env.port,
-            "/api/hooks/codex?agentId=named&hookEvent=UserPromptSubmit",
+            "/api/hooks/codex?agentId=codex&hookEvent=UserPromptSubmit",
             &env.token,
             payload,
         )
         .await;
-        assert_eq!(body, "");
+        assert_eq!(body, auto_title_injection());
         assert!(rx.recv().await.unwrap().transcript.is_none());
 
         // Other Claude events deliver the transcript too (the sync reads on
@@ -665,7 +699,10 @@ mod tests {
         for route in ["codex", "pi", "opencode"] {
             let (_, body) = http_post(
                 env.port,
-                &format!("/api/hooks/{route}?agentId=pending&hookEvent=UserPromptSubmit"),
+                &format!(
+                    "/api/hooks/{route}?agentId={}&hookEvent=UserPromptSubmit",
+                    if route == "codex" { "codex" } else { "pending" }
+                ),
                 &env.token,
                 payload,
             )
