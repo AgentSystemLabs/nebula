@@ -1,8 +1,9 @@
 //! TUI user settings, read from the same two layers the daemon reads —
 //! `paths::config_path()` with `paths::config_local_path()` over it, see
 //! `nebula_core::settings` (each side deserializes only its own fields;
-//! serde ignores the rest). Loaded fresh at each use so edits apply without
-//! restarting the TUI. A missing file or unknown fields fall back to
+//! serde ignores the rest). File stamps are checked at each use so edits apply
+//! without restarting the TUI; unchanged settings reuse their parsed value.
+//! A missing file or unknown fields fall back to
 //! defaults; a value this build can't read costs only its own key, which is
 //! logged and left as stored.
 //!
@@ -1642,9 +1643,63 @@ impl Default for Config {
 /// serde — a file this build can only read key by key.
 const RENAMED_KEYS: &[(&str, &str)] = &[("hide_terminal_glyphs", "hide_card_marks")];
 
+// The UI reads settings from key handlers and draw paths. Keep one parsed
+// value per thread, keyed by both layers and their file identity/stamps:
+// hand edits, atomic replacements, deletions and local overrides all
+// invalidate immediately, without repeatedly reading and parsing JSON.
+#[derive(PartialEq, Eq)]
+struct SettingsStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    device: u64,
+    inode: u64,
+    changed: (i64, i64),
+}
+
+fn settings_stamp(path: &Path) -> Option<SettingsStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(SettingsStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        device: meta.dev(),
+        inode: meta.ino(),
+        changed: (meta.ctime(), meta.ctime_nsec()),
+    })
+}
+
+struct CachedConfig {
+    path: PathBuf,
+    local: PathBuf,
+    stamps: (Option<SettingsStamp>, Option<SettingsStamp>),
+    value: Config,
+}
+
+thread_local! {
+    static CONFIG_CACHE: std::cell::RefCell<Option<CachedConfig>> = const { std::cell::RefCell::new(None) };
+}
+
 impl Config {
     pub fn load() -> Self {
-        let cfg = load_layers(&settings_path(), &local_settings_path());
+        let path = settings_path();
+        let local = local_settings_path();
+        let stamps = (settings_stamp(&path), settings_stamp(&local));
+        let cfg = CONFIG_CACHE.with(|slot| {
+            let mut cached = slot.borrow_mut();
+            if let Some(held) = cached.as_ref() {
+                if held.path == path && held.local == local && held.stamps == stamps {
+                    return held.value.clone();
+                }
+            }
+            let value = load_layers(&path, &local);
+            *cached = Some(CachedConfig {
+                path,
+                local,
+                stamps,
+                value: value.clone(),
+            });
+            value
+        });
         // The Claude model rows follow `claude_models` live, as every
         // other hand edit does. Not under test: the list is process-global
         // and a test that never pinned the path would install the dev's.
@@ -1741,6 +1796,9 @@ impl Config {
                 }
             }
         }
+        // Invalidate before writing either layer, including on partial
+        // failure. A subsequent read must observe what reached disk.
+        CONFIG_CACHE.with(|slot| slot.borrow_mut().take());
         settings::write_json(path, &serde_json::Value::Object(root))?;
         if let (true, Some(held)) = (local_changed, local_root) {
             settings::write_json(local, &serde_json::Value::Object(held))?;
@@ -5570,5 +5628,79 @@ mod tests {
         assert_eq!(saved["palette_enter_attaches"], true);
         assert_eq!(saved["git_init_on_create"], true);
         assert_eq!(saved["session_idle_timeout"], "5m");
+    }
+}
+
+#[cfg(test)]
+mod performance_probes {
+    #[test]
+    #[ignore = "manual settings benchmark; run with --ignored --nocapture"]
+    fn repeated_settings_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = serde_json::to_value(super::Config::default()).unwrap();
+        // Project overrides and fields owned by the daemon can make the
+        // shared settings much larger than the TUI's own settings.
+        config["benchmark_extra"] = serde_json::json!(vec!["project override"; 2000]);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        super::with_config_path(path, || {
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                std::hint::black_box(super::Config::load());
+            }
+            eprintln!(
+                "settings read: {:.3} us/load",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn settings_cache_observes_same_size_edits_even_when_mtime_is_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"editor":"vim"}"#).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        with_config_path(path.clone(), || {
+            assert_eq!(Config::load().editor, "vim");
+            std::fs::write(&path, r#"{"editor":"nvi"}"#).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            assert_eq!(Config::load().editor, "nvi");
+        });
+    }
+
+    #[test]
+    fn settings_cache_observes_layer_creation_replacement_and_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let local = dir.path().join("config.local.json");
+        std::fs::write(&path, r#"{"editor":"vim"}"#).unwrap();
+        with_config_path(path.clone(), || {
+            assert_eq!(Config::load().editor, "vim");
+            std::fs::write(&local, r#"{"editor":"nvi"}"#).unwrap();
+            assert_eq!(Config::load().editor, "nvi");
+            let replacement = dir.path().join("replacement.json");
+            std::fs::write(&replacement, r#"{"editor":"zed"}"#).unwrap();
+            std::fs::rename(replacement, &local).unwrap();
+            assert_eq!(Config::load().editor, "zed");
+            std::fs::remove_file(&local).unwrap();
+            assert_eq!(Config::load().editor, "vim");
+            let mut cfg = Config::load();
+            cfg.editor = "hx".into();
+            cfg.save().unwrap();
+            assert_eq!(Config::load().editor, "hx");
+            Config::reset_to_defaults().unwrap();
+            assert_eq!(Config::load().editor, Config::default().editor);
+        });
     }
 }

@@ -2762,3 +2762,82 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod performance_probes {
+    #[test]
+    #[ignore = "manual rendering benchmark; run with --ignored --nocapture"]
+    fn large_pull_request_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::with_config_path(dir.path().join("config.json"), || {
+            let mut files = Vec::new();
+            let mut chunks = std::collections::HashMap::new();
+            for i in 0..250 {
+                let path = format!("src/file_{i}.rs");
+                files.push(crate::git_diff::DiffFile {
+                    path: path.clone(),
+                    orig_path: None,
+                    xy: ['M', ' '],
+                });
+                chunks.insert(
+                    path,
+                    "@@ -1 +1 @@\n-old content\n+new content\n".repeat(1000),
+                );
+            }
+            let mut view =
+                crate::app::DiffView::new(dir.path().into(), "Large PR".into(), files, true);
+            view.split = false;
+            view.prefetched = Some(std::sync::Arc::new(chunks));
+            crate::git_diff::load_selected_diff(&mut view);
+            let mut app = crate::app::App::new();
+            app.modals.overlay = Some(crate::app::Overlay::Diff(view));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(190, 50)).unwrap();
+            terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+            let started = std::time::Instant::now();
+            for i in 0..100 {
+                if let Some(crate::app::Overlay::Diff(view)) = &mut app.modals.overlay {
+                    view.scroll = i;
+                }
+                terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+            }
+            eprintln!(
+                "large PR scroll: {:.3} ms/frame",
+                started.elapsed().as_secs_f64() * 10.0
+            );
+        });
+    }
+    #[test]
+    #[ignore = "manual rendering benchmark; run with --ignored --nocapture"]
+    fn large_document_scroll_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.md");
+        let content = "## Reading a large document\n\nA paragraph with **bold**, `code`, and [a link](https://example.com).\n\n".repeat(2000);
+        std::fs::write(&path, content).unwrap();
+        crate::config::with_config_path(dir.path().join("config.json"), || {
+            let mut app = crate::app::App::new();
+            app.modals.overlay = Some(crate::app::Overlay::FileTabs(
+                crate::file_tabs::FileTabsView::with_jobs(
+                    dir.path().into(),
+                    "vim".into(),
+                    vec![path],
+                    None,
+                ),
+            ));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(190, 50)).unwrap();
+            terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+            let started = std::time::Instant::now();
+            for i in 0..100 {
+                if let Some(crate::app::Overlay::FileTabs(view)) = &mut app.modals.overlay {
+                    view.scroll = i;
+                }
+                terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+            }
+            eprintln!(
+                "large markdown scroll: {:.3} ms/frame",
+                started.elapsed().as_secs_f64() * 10.0
+            );
+        });
+    }
+}

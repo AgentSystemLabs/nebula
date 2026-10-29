@@ -1110,7 +1110,7 @@ pub struct DiffView {
     /// out per file. Its presence also turns OFF reviewed-mark persistence:
     /// marks are stored under the worktree path and pruned when that path
     /// isn't a directory, and a pull request has no path of its own.
-    pub prefetched: Option<HashMap<String, String>>,
+    pub prefetched: Option<std::sync::Arc<HashMap<String, String>>>,
     /// The pull request a prefetched view is showing, by URL — what a
     /// fresh `gh pr diff` landing later checks before replacing the
     /// contents of a modal opened on the cached copy. `None` for the
