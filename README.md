@@ -151,6 +151,13 @@ machine (a launch aimed elsewhere runs in the background and the footer says whe
 box empty and the CLI starts bare, its pane yours to type the first prompt into. Save a framing you
 keep retyping as an AGENT PRESET (`e`) and it becomes one keystroke; a plain shell is `t`.
 
+Codex model and effort choices follow your installed Codex CLI automatically, including newly
+released models. Nebula reads `$CODEX_HOME/models_cache.json` (default `~/.codex`) at startup,
+then refreshes from `codex app-server` in the background every 15 minutes. Each model offers
+its own supported effort levels. If discovery fails, the last catalog stays available and
+`default` always lets Codex choose. To maintain a custom static list, set
+`harnesses.codex.catalog` to `null` and `harnesses.codex.models` in your Nebula config.
+
 <div align="center"><img src="assets/quick-prompt.png" alt="The quick prompt over the grid: a task typed in, the details row naming the project, worktree, harness and model, and the frame turned green because Ctrl+N pointed the launch at a fresh worktree" width="100%"></div>
 
 **4. Pick where it runs.** Press `Ctrl+N` inside the box and the launch goes into a real `git worktree`

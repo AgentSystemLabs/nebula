@@ -1783,7 +1783,7 @@ fn draw_diff_file_list(
             .as_ref()
             .map(|tree| tree.reviewed_nodes(&view.files, &view.reviewed));
         let start = crate::app::window_start(view.side_cursor(), list_inner.height as usize);
-        let now = crate::app::now_ms() as i64;
+        let now = crate::app::now_ms();
         for row in 0..list_inner.height as usize {
             let index = start + row;
             let Some((place, inner)) = view.side_row(index) else {

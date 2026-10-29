@@ -31,6 +31,8 @@ macro_rules! main_loop_body {
     // when its settings carry one, so an org-restricted machine offers the
     // ids the CLI will accept instead of aliases it refuses.
     crate::claude_catalogue::bootstrap(cfg.claude_enabled);
+    // Codex supplies both models and their supported reasoning efforts.
+    crate::codex_catalogue::bootstrap(&cfg.effective_harness_by_id("codex"));
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
     // Pointer shape last sent to the $terminal (OSC 22), so hover over a

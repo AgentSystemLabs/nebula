@@ -5,6 +5,7 @@ pub mod branch_name;
 pub mod branch_switch;
 pub mod bundle;
 pub mod claude_catalogue;
+pub mod codex_catalogue;
 pub mod completion;
 pub mod config;
 pub mod cursor_catalogue;
