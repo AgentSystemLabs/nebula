@@ -63,6 +63,9 @@ pub(crate) fn start(term: &mut AttachedTerm, base_seq: u64, data: Vec<u8>, jobs:
         bytes: 0,
     });
     term.booting = false;
+    // Like apply_scrollback's reset: this replay can belong to a new
+    // process installed under the same session after the old one exited.
+    term.exited = false;
     jobs.run(move || {
         if cancel.is_cancelled() {
             return None;
@@ -377,6 +380,39 @@ mod tests {
                 assert_eq!(term.parser.screen().contents(), "new process");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_new_process_replay_clears_an_earlier_exit() {
+        let (mut app, mut rx) = setup();
+        event(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: sref(),
+                base_seq: 0,
+                data: history(),
+            },
+        );
+        let stale = answer(&mut rx).await;
+        event(
+            &mut app,
+            ServerEvent::SessionExited {
+                session: sref(),
+                exit_code: Some(0),
+            },
+        );
+        event(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: sref(),
+                base_seq: 0,
+                data: history(),
+            },
+        );
+        land(&mut app, stale);
+        land(&mut app, answer(&mut rx).await);
+        let term = app.pane.term.as_ref().unwrap();
+        assert!(term.painted && !term.exited && !term.booting);
     }
 
     #[tokio::test]
