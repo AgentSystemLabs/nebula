@@ -25,9 +25,9 @@ pub const SWEEP_FRAME: std::time::Duration = std::time::Duration::from_millis(10
 pub const ONE_SHOT_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many recently shown sessions keep their screen ([`App::term_cache`]):
-/// enough for a rotation through the sessions of a couple of worktrees.
+/// enough for a rotation through a busy project’s sessions.
 /// What bounds the memory is [`TERM_CACHE_CELLS`], not this.
-pub const TERM_CACHE_MAX: usize = 6;
+pub const TERM_CACHE_MAX: usize = 32;
 /// The most the kept screens may hold between them, in grid cells (32 bytes
 /// each, so about 12 MB — half of what two entries of that size each used to
 /// be allowed). An alt-screen CLI is a screen's worth, 200 KB; a shell whose

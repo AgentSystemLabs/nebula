@@ -1663,10 +1663,7 @@ fn draw_terminal_body(
             stamp_hyperlinks(screen, inner, f.buffer_mut());
             app.pane.host_cursor = pty_cursor_cell(screen, inner);
             draw_terminal_selection(f, app, screen, inner);
-            (
-                crate::links::visible_links(term.parser.screen()),
-                crate::links::visible_file_links(term.parser.screen()),
-            )
+            crate::links::visible_terminal_links(screen)
         }
         // The LAUNCHER VIEW's pane with nothing in it is an empty panel: the
         // strip over it already says which key opens a terminal here.

@@ -527,6 +527,11 @@ VIEW unarchives one card, and the next needs
 the key let go and pressed again (on a terminal with the kitty keyboard protocol, which is what
 tells a held key's repeats from a fresh press; without it a long hold still walks the row).
 
+Worktree deletion opens its confirmation immediately. The dialog shows “Checking…” while the
+daemon looks for running processes, uncommitted changes, and commits missing from the base.
+`Enter` and `y` wait for that check; `Esc` cancels immediately. Findings appear in the open dialog.
+Confirmed deletions remove cards immediately and restore them if the daemon reports a failure.
+
 **`⇧A` is the ARCHIVED VIEW**: the same grid, of the project's archived sessions instead of its live
 ones, with the header counting them under their own word (`3 archived sessions`). `u` unarchives the
 card under the cursor where it stands and `d` deletes it; `⇧A` again comes back to the live

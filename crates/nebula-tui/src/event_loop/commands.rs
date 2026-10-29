@@ -338,9 +338,7 @@ pub(crate) fn run_pending_action(
         PendingAction::DeleteAgent(id) => delete_agent(app, id, out),
         PendingAction::MoveAgent { id, worktree } => launcher::move_agent(app, id, worktree, out),
         PendingAction::CloseTerminal(id) => close_terminal(app, id, out),
-        PendingAction::DeleteLink(id) => {
-            send(app, out, |req_id| ClientRequest::DeleteLink { req_id, id });
-        }
+        PendingAction::DeleteLink(id) => optimistic::delete_link(app, id, out),
         PendingAction::DeleteWorktree(id) => delete_worktree_and_settle(app, id, out),
         PendingAction::ThenDeleteWorktree {
             first, worktree, ..

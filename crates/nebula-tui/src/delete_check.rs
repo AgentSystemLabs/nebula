@@ -25,15 +25,6 @@ use std::time::{Duration, Instant};
 /// submodules; short enough that a wedged daemon never traps the user.
 pub(crate) const CHECK_PATIENCE: Duration = Duration::from_secs(10);
 
-/// How long a confirm waiting on its check stays unshown, the footer
-/// saying it is checking. A check that answers within it — any normal
-/// one: a fraction of a second, a second or so on a big repo with many
-/// submodules — opens the dialog once, already filled in, never a
-/// "Checking…" body that then grows into the findings, which reads as a
-/// second dialog replacing the first. Past it, something is wrong, and
-/// the dialog shows with "Checking…" so the user can see why Enter waits.
-pub(crate) const SHOW_AFTER: Duration = Duration::from_secs(5);
-
 /// Process names a check line spells out before it says "+N more".
 const NAMED_PROCESSES: usize = 3;
 
@@ -45,7 +36,7 @@ pub struct DeleteChecks {
     /// Checks still out when their confirm closed: their answer, or their
     /// error, is dropped without a word.
     dropped: std::collections::HashSet<u64>,
-    /// The footer line said while a confirm is held for its check, so its
+    /// The footer line said while a confirm waits for its check, so its
     /// answer can take it down again — and nothing else's.
     status: Option<String>,
 }
@@ -159,23 +150,11 @@ fn oldest_pending(app: &App) -> Option<Instant> {
         .min()
 }
 
-/// Is the open confirm held back, unshown, for its check? True while a
-/// check is out and younger than [`SHOW_AFTER`]. (A confirm opened this
-/// turn is asked about by [`sync`] at the end of the turn, before the next
-/// frame is drawn.) Only cancelling and `Enter` / `y` (held by
-/// [`still_checking`]) reach a held confirm. A DAEMON too old to be asked
-/// never holds one: it has no check out.
-pub(crate) fn held(app: &App) -> bool {
-    oldest_pending(app).is_some_and(|since| since.elapsed() < SHOW_AFTER)
-}
-
-/// When a held confirm is to be shown, its check not having answered: the
-/// event loop wakes then to draw it.
-pub(crate) fn reveal_at(app: &App) -> Option<Instant> {
-    if !held(app) {
-        return None;
-    }
-    oldest_pending(app).map(|since| since + SHOW_AFTER)
+/// Wake once when an outstanding check times out, so an idle dialog
+/// updates its warning without waiting for another key or daemon event.
+pub(crate) fn timeout_at(app: &App) -> Option<Instant> {
+    let deadline = oldest_pending(app)? + CHECK_PATIENCE;
+    (deadline > Instant::now()).then_some(deadline)
 }
 
 /// Make every check the open confirm waits on as old as `by` — for tests

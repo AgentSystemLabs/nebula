@@ -19,7 +19,9 @@
 
 use super::{handle_server_event, send_with};
 use crate::app::{App, PendingIntent, Undo};
-use nebula_core::{AgentId, ClientRequest, Entity, EntityId, ProjectId, ServerEvent, TerminalId};
+use nebula_core::{
+    AgentId, ClientRequest, Entity, EntityId, LinkId, ProjectId, ServerEvent, TerminalId,
+};
 
 /// Show `entity` as the DAEMON will have it, and send `make`'s request with
 /// `before` — the row as it is now — to put back if it is refused.
@@ -204,6 +206,21 @@ pub(super) fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<Client
     }
 }
 
+/// Saved-link cards use the same immediate removal and rollback as sessions.
+pub(super) fn delete_link(app: &mut App, id: LinkId, out: &mut Vec<ClientRequest>) {
+    let make = |req_id| ClientRequest::DeleteLink {
+        req_id,
+        id: id.clone(),
+    };
+    match app.tree.links.iter().position(|l| l.id == id) {
+        Some(index) => {
+            let row = Entity::Link(app.tree.links[index].clone());
+            remove(app, EntityId::Link(id.clone()), index, row, out, make);
+        }
+        None => send_with(app, out, PendingIntent::None, make),
+    }
+}
+
 fn id_of(entity: &Entity) -> EntityId {
     match entity {
         Entity::Project(p) => EntityId::Project(p.id.clone()),
@@ -244,6 +261,10 @@ pub(super) fn undo(app: &mut App, undo: Undo, out: &mut Vec<ClientRequest>) {
                 Entity::Terminal(t) => {
                     let at = index.min(app.tree.terminals.len());
                     app.tree.terminals.insert(at, t.clone());
+                }
+                Entity::Link(l) => {
+                    let at = index.min(app.tree.links.len());
+                    app.tree.links.insert(at, l.clone());
                 }
                 _ => {}
             }
@@ -415,5 +436,55 @@ mod tests {
             ["archive", "unarchive"],
             "both still asked of the DAEMON"
         );
+    }
+    #[test]
+    fn link_delete_is_immediate_ignores_stale_upserts_and_rolls_back_in_order() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        for n in 1..=2 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Link(nebula_core::Link {
+                        id: LinkId(format!("l{n}")),
+                        worktree_id: nebula_core::WorktreeId("w1".into()),
+                        url: format!("https://example.com/{n}"),
+                        sort_order: n,
+                    }),
+                },
+            );
+        }
+        let before = app.tree.links[0].clone();
+        let mut out = Vec::new();
+        delete_link(&mut app, before.id.clone(), &mut out);
+        assert_eq!(app.tree.links.len(), 1);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Link(before.clone()),
+            },
+        );
+        assert_eq!(
+            app.tree.links.len(),
+            1,
+            "stale upsert cannot resurrect the card"
+        );
+        let req_id = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::DeleteLink { req_id, .. } => Some(*req_id),
+                _ => None,
+            })
+            .unwrap();
+        hse(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: "write failed".into(),
+            },
+        );
+        assert_eq!(app.tree.links.len(), 2);
+        assert_eq!(app.tree.links[0].id, before.id);
+        assert!(app.requests.deleting.is_empty());
     }
 }
