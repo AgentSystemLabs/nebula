@@ -408,6 +408,9 @@ pub(crate) fn delete_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientReque
 
 /// Close a terminal tab, detaching the pane first if it's showing it.
 pub(crate) fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<ClientRequest>) {
+    if terminal_create::cancel(app, &id, out) {
+        return;
+    }
     // The grid's cursor may be on this terminal's chip: `keep_cursor`
     // hands it to the neighbour once the row is gone, and the pane
     // follows it there.

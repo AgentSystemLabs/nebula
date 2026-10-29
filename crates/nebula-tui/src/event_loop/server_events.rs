@@ -275,6 +275,12 @@ fn handle_ack_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientReque
             // FOCUS back to them.
             let follow = !app.requests.left_behind.remove(&req_id);
             match (app.requests.pending.remove(&req_id), created) {
+                (Some(PendingIntent::TerminalCreated(create)), Some(EntityId::Terminal(real))) => {
+                    terminal_create::finish(app, create, real, follow, out)
+                }
+                (Some(PendingIntent::TerminalCreated(create)), _) => {
+                    terminal_create::discard(app, &create.placeholder, out)
+                }
                 (Some(PendingIntent::AttachCreated { focus, placeholder }), Some(id)) => {
                     attach_created(app, id, focus, placeholder, follow, out);
                 }
@@ -676,6 +682,9 @@ fn handle_error_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientReq
                 // A launch that waited on the NEW WORKTREE modal's checkout
                 // and was refused once it went out: its stand-in row goes,
                 // the checkout is real and stays.
+                Some(PendingIntent::TerminalCreated(create)) => {
+                    terminal_create::discard(app, &create.placeholder, out)
+                }
                 Some(PendingIntent::AttachCreated {
                     placeholder: Some(stand_in),
                     ..

@@ -19,7 +19,8 @@
 #   python3 scripts/perf/report.py BEFORE AFTER        two runs' OUT dirs, side by side
 #
 # A scenario line is `label<TAB>key`: a tmux key name (`j`, `Enter`, `C-d`, `BTab`), or `text:…` typed
-# literally in one go. Lines starting with `#` are comments. One line is one step; steps are STEP_SECS
+# literally in one go. `burst:t|e|c|h|o|Space|x|Enter` sends keys without driver delays.
+# Lines starting with `#` are comments. One line is one step; steps are STEP_SECS
 # apart (default 0.7), which is what lets the report tell them apart.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -127,6 +128,8 @@ while IFS=$'\t' read -r label key; do
   printf '%s\t%s\t%s\n' "$(now_us)" "$label" "$key" >> "$OUT/steps.tsv"
   case "$key" in
     text:*) $TMUX send-keys -l "${key#text:}";;
+    burst:*) IFS='|' read -r -a burst_keys <<< "${key#burst:}"
+      $TMUX send-keys "${burst_keys[@]}";;
     wait:*) sleep "${key#wait:}";;
     click:*) c="${key#click:}"                              # click:<col>,<row> — 1-based cells, SGR press + release
       $TMUX send-keys -l "$(printf '\033[<0;%d;%dM\033[<0;%d;%dm' "${c%,*}" "${c#*,}" "${c%,*}" "${c#*,}")";;

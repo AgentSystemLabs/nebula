@@ -51,6 +51,7 @@ mod server_events;
 mod server_state;
 mod settings_handlers;
 mod state_io;
+mod terminal_create;
 mod terminal_events;
 mod terminal_mouse;
 mod text_entry;

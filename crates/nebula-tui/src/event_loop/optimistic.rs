@@ -87,6 +87,10 @@ pub(super) fn rename_terminal(
     name: String,
     out: &mut Vec<ClientRequest>,
 ) {
+    if app.is_placeholder_session(&nebula_core::SessionRef::Terminal(id.clone())) {
+        app.chrome.flash = Some("terminal is still starting — rename it once ready".into());
+        return;
+    }
     let make = |req_id| ClientRequest::RenameTerminal {
         req_id,
         id: id.clone(),

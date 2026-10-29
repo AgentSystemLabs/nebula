@@ -2285,9 +2285,29 @@ impl AgentLaunchDraft {
     }
 }
 
+#[derive(Clone)]
+pub struct TerminalCreation {
+    pub(crate) placeholder: TerminalId,
+    pub(crate) input: Vec<u8>,
+    pub(crate) cancelled: bool,
+}
+
+impl std::fmt::Debug for TerminalCreation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalCreation")
+            .field("placeholder", &self.placeholder)
+            .field("queued_bytes", &self.input.len())
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
+}
+
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
+    /// A temporary terminal card shown while its shell is being created.
+    /// The reply replaces its id or removes it; input waits for the real id.
+    TerminalCreated(TerminalCreation),
     /// Attach the created session; `focus` also enters and locks the
     /// terminal pane. Off (the QUICK PROMPT's default) stops at selecting
     /// the row, so the pane previews the new session without taking the
@@ -2415,6 +2435,7 @@ impl PendingIntent {
     /// on it.
     pub fn follows(&self) -> bool {
         match self {
+            PendingIntent::TerminalCreated(create) => !create.cancelled,
             PendingIntent::AttachCreated { .. }
             | PendingIntent::AttachCreatedWithCloudRetry { .. }
             | PendingIntent::AttachCreatedPrSession { .. }
@@ -5037,7 +5058,7 @@ impl App {
     pub fn is_placeholder_session(&self, sref: &SessionRef) -> bool {
         match sref {
             SessionRef::Agent(id) => self.is_placeholder_agent(id),
-            SessionRef::Terminal(_) => false,
+            SessionRef::Terminal(id) => self.requests.pending.values().any(|intent| matches!(intent, PendingIntent::TerminalCreated(create) if &create.placeholder == id)),
         }
     }
 
