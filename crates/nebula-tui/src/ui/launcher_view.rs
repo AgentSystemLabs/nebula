@@ -1067,9 +1067,10 @@ fn draw_bands(
         .push((g.area, HitTarget::PanelBg(Focus::Sessions)));
 }
 
-/// What an EMPTY BAND says under its rule, the root's without the delete
-/// it refuses.
-const EMPTY_BAND_HINT: &str = "nothing running · p: new session · t: terminal";
+/// What an EMPTY BAND says under its rule — that nothing runs there, then
+/// its keys — the root's without the delete it refuses.
+const EMPTY_BAND_IDLE: &str = "nothing running";
+const EMPTY_BAND_KEYS: &str = "p: new session · t: terminal";
 const EMPTY_BAND_DELETE: &str = " · d: delete worktree";
 
 /// The line under an EMPTY BAND's rule — a checkout with nothing running
@@ -1095,7 +1096,7 @@ fn draw_empty_band(
     let Some(placed) = crate::launcher::place(window, scroll, row) else {
         return;
     };
-    let mut text = String::from(EMPTY_BAND_HINT);
+    let mut text = format!("{EMPTY_BAND_IDLE} · {EMPTY_BAND_KEYS}");
     if !band.is_main {
         text.push_str(EMPTY_BAND_DELETE);
     }

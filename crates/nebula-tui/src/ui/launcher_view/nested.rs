@@ -10,7 +10,7 @@
 //! and its pull request are on the DETAIL STRIP pinned under the list
 //! ([`draw_strip`]).
 
-use super::{draw_panel_edge_marks, session_look, truncate, EMPTY_BAND_DELETE, EMPTY_BAND_HINT};
+use super::{draw_panel_edge_marks, session_look, EMPTY_BAND_DELETE, EMPTY_BAND_KEYS};
 use crate::app::{App, Focus, HitTarget};
 use crate::keymap::Action;
 use crate::launcher::{Band, BandsLayout, Card, CardRef, PanelLayout, RowPr, NESTED_ROW_H};
@@ -44,6 +44,9 @@ const PR_W: usize = 5;
 const AGE_W: usize = 4;
 /// Fewest letters a title keeps before the columns right of it give way.
 const MIN_TITLE: usize = 4;
+/// Fewest cells an empty worktree's key hint is shown in, cut short; any
+/// less and the row is the branch alone.
+const MIN_HINT: usize = 12;
 
 /// Rows the DETAIL STRIP takes, its border included: four lines of
 /// detail in a box. Fixed, so the list over it never resizes as the
@@ -145,7 +148,12 @@ pub(super) fn draw_bands(
                 ..g.area
             };
             if let Some(placed) = crate::launcher::place(window, scroll, row) {
-                draw_empty(f.buffer_mut(), app, placed.rect, band, on && keys);
+                let pr_hit = draw_empty(f.buffer_mut(), app, placed.rect, band, (on, on && keys));
+                if let Some(rect) = pr_hit {
+                    app.chrome
+                        .hits
+                        .push((rect, HitTarget::LauncherThreadPr(band.worktree.clone())));
+                }
                 app.chrome
                     .hits
                     .push((placed.rect, HitTarget::LauncherBand(index)));
@@ -212,26 +220,82 @@ pub(super) fn draw_bands(
         .push((g.area, HitTarget::PanelBg(Focus::Sessions)));
 }
 
-/// An empty worktree (**Show all worktrees**): one line, in the title
-/// column the roots use, saying what can be done there.
-fn draw_empty(buf: &mut Buffer, app: &App, r: Rect, band: &Band, lit: bool) {
+/// An empty worktree (**Show all worktrees**): one line shaped like a
+/// thread's root — no caret, the scope mark, the checkout's branch where a
+/// root's title goes, its open pull request in the PR column — all dim, so
+/// checkouts with nothing in them sit back behind the threads. The cursor's
+/// row is filled like any other; with the keys on the grid it also says
+/// what can be done there, after the branch. A list of empty worktrees is
+/// a list of names, not the same sentence on every line.
+/// `(selected, lit)`: the cursor is on it, and the keys are on the grid too.
+/// Returns where the `#42` landed, for its hit.
+fn draw_empty(
+    buf: &mut Buffer,
+    app: &App,
+    r: Rect,
+    band: &Band,
+    (selected, lit): (bool, bool),
+) -> Option<Rect> {
     let th = app.chrome.theme;
-    let mut text = String::from(EMPTY_BAND_HINT);
-    if !band.is_main {
-        text.push_str(EMPTY_BAND_DELETE);
+    let width = usize::from(r.width);
+    if width == 0 || r.height == 0 {
+        return None;
     }
-    let fg = if lit { th.accent } else { gray::DIM };
-    // Four cells: the caret column and the scope mark's, each with its
-    // space, so the words start where a root's title does.
-    let shown = format!(
-        "    {}",
-        truncate(&text, usize::from(r.width).saturating_sub(4))
-    );
-    Paragraph::new(Span::styled(
-        truncate(&shown, usize::from(r.width)),
-        Style::default().fg(fg),
-    ))
-    .render(r, buf);
+    let dim = Style::default().fg(gray::DIM);
+    // The caret column (blank: nothing folds under it) and the scope
+    // mark's, each with its space, so the branch starts where a root's
+    // title does.
+    let lead = 4;
+    let columns = Columns::fit(width, lead);
+    let room = width.saturating_sub(lead + columns.width());
+    let branch = clip(&band.branch, room);
+    let (mark, mark_fg) = if band.is_main {
+        (ROOT_MARK, th.root)
+    } else {
+        (WORKTREE_MARK, th.worktree)
+    };
+    let name_style = if selected {
+        Style::default().fg(th.text).add_modifier(Modifier::BOLD)
+    } else {
+        dim
+    };
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            mark,
+            if selected {
+                Style::default().fg(mark_fg)
+            } else {
+                dim
+            },
+        ),
+        Span::raw(" "),
+        Span::styled(branch.clone(), name_style),
+    ];
+    let mut used = lead + branch.chars().count();
+    if lit {
+        // Its keys alone: the DETAIL STRIP under the list already says
+        // nothing runs there.
+        let mut hint = String::from(EMPTY_BAND_KEYS);
+        if !band.is_main {
+            hint.push_str(EMPTY_BAND_DELETE);
+        }
+        // Cut short rather than pushing into the columns; too little room
+        // for a few words of it and the branch stands alone.
+        let avail = room.saturating_sub(branch.chars().count() + 2);
+        let hint = clip(&hint, avail);
+        if avail >= MIN_HINT {
+            spans.push(Span::raw("  "));
+            used += 2 + hint.chars().count();
+            spans.push(Span::styled(hint, dim));
+        }
+    }
+    let pr_hit = push_columns(&mut spans, r, columns, used, open_pr(band), "");
+    Paragraph::new(Line::from(spans)).render(Rect { height: 1, ..r }, buf);
+    if selected {
+        fill_selected(buf, r, th);
+    }
+    pr_hit
 }
 
 /// Which row [`draw_row`] is drawing.
@@ -411,6 +475,27 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         spans.push(Span::styled(count.clone(), dim));
         used += 1 + count.chars().count();
     }
+    let pr_hit = push_columns(&mut spans, r, columns, used, row.pr, &age);
+    Paragraph::new(Line::from(spans)).render(Rect { height: 1, ..r }, buf);
+    if row.selected {
+        fill_selected(buf, r, th);
+    }
+    pr_hit
+}
+
+/// The fixed columns at a row's right end, after the `used` cells of it
+/// already in `spans`: the air up to them, the PR column — `pr` as a link,
+/// or blank — and the dim `age`, as [`Columns`] fits them. Returns where
+/// the `#42` landed, for its hit.
+fn push_columns(
+    spans: &mut Vec<Span<'static>>,
+    r: Rect,
+    columns: Columns,
+    used: usize,
+    pr: Option<&RowPr>,
+    age: &str,
+) -> Option<Rect> {
+    let width = usize::from(r.width);
     let mut pr_hit = None;
     match columns {
         Columns::None => {}
@@ -420,7 +505,7 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
             )));
             if let Columns::Both = columns {
                 spans.push(Span::raw(" "));
-                match row.pr {
+                match pr {
                     Some(pr) => {
                         let link = pr_link(pr);
                         let w = link.width();
@@ -438,12 +523,11 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
                 }
             }
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(right_aligned(&age, AGE_W), dim));
+            spans.push(Span::styled(
+                right_aligned(age, AGE_W),
+                Style::default().fg(gray::DIM),
+            ));
         }
-    }
-    Paragraph::new(Line::from(spans)).render(Rect { height: 1, ..r }, buf);
-    if row.selected {
-        fill_selected(buf, r, th);
     }
     pr_hit
 }
@@ -625,10 +709,15 @@ pub(super) fn draw_strip(
     };
     let card = crate::launcher::card_cursor(app, band).and_then(|i| band.cards.get(i));
     let mut cfg = None;
+    let text = Style::default().fg(th.text);
     let (title, runs) = match card {
-        Some(Card::Session(row)) => (row.agent.name.clone(), runs_on(&row.agent, &mut cfg)),
-        Some(Card::Terminal(t)) => (t.name.clone(), "terminal".to_string()),
-        None => (band.branch.clone(), String::new()),
+        Some(Card::Session(row)) => (
+            row.agent.name.clone(),
+            Span::styled(runs_on(&row.agent, &mut cfg), text),
+        ),
+        Some(Card::Terminal(t)) => (t.name.clone(), Span::styled("terminal", text)),
+        // An empty worktree: nothing to name but the checkout.
+        None => (band.branch.clone(), Span::styled("nothing running", dim)),
     };
     let diff = app
         .worktree_lines(&band.worktree)
@@ -694,14 +783,7 @@ pub(super) fn draw_strip(
             diff,
             width,
         ),
-        strip_line(
-            vec![
-                label("agent"),
-                Span::styled(runs, Style::default().fg(th.text)),
-            ],
-            Vec::new(),
-            width,
-        ),
+        strip_line(vec![label("agent"), runs], Vec::new(), width),
         strip_line(worktree, Vec::new(), width),
         strip_line(pr_left, pr_right, width),
     ];
