@@ -3612,6 +3612,48 @@ mod tests {
         assert_eq!(agent_worktree(&daemon, "a1"), "feat");
     }
 
+    /// A Task subagent's isolated checkout (`.claude/worktrees/agent-<id>`)
+    /// never takes the session, whatever payload reports it: the subagent
+    /// is working there, not the conversation.
+    #[test]
+    fn reparent_never_moves_a_session_into_a_subagent_checkout() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(
+            &daemon,
+            "p",
+            "sub",
+            "/nebula-test/p/.claude/worktrees/agent-a52d9b9052ac7e5db",
+            false,
+        );
+        seed_worktree(
+            &daemon,
+            "p",
+            "named",
+            "/nebula-test/p/.claude/worktrees/my-feature",
+            false,
+        );
+        seed_agent(&daemon, "a1", "root", None);
+
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            "/nebula-test/p/.claude/worktrees/agent-a52d9b9052ac7e5db/src",
+            None,
+            false,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "root");
+
+        // A worktree the session entered by name still re-homes it.
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            "/nebula-test/p/.claude/worktrees/my-feature",
+            None,
+            false,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "named");
+    }
+
     /// Regression: a session that creates a worktree and steps into it
     /// reports the new cwd *before* the sync has adopted a row for it (the
     /// `Stop` hook fires long before the next 2s sync tick). The cwd must be

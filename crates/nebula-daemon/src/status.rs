@@ -148,6 +148,16 @@ impl HookEvent {
             HookEvent::UserPromptSubmit | HookEvent::SessionStart { .. }
         )
     }
+
+    /// Whether the payload's `cwd` says where the conversation itself is
+    /// working, so it may re-home the row. Not a Notification: Claude builds
+    /// that payload with no subagent context, so a Task subagent's
+    /// notification comes without `agent_id` and with the subagent's own
+    /// checkout as its `cwd` — and an isolated subagent's notification would
+    /// drag the session into the subagent's worktree.
+    pub fn reports_session_cwd(&self) -> bool {
+        !matches!(self, HookEvent::Notification { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

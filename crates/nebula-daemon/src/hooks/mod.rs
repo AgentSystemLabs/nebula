@@ -398,8 +398,12 @@ async fn receive_hook(
     // A subagent's tool traffic reports the payload's cwd too, but that is
     // the Task's position, not the session's — an isolated subagent working
     // in a scratch checkout must never drag the row out from under the
-    // conversation. Only foreground payloads carry a cwd onward.
-    let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
+    // conversation. Only foreground payloads carry a cwd onward, and only
+    // from events whose cwd is the conversation's (not a Notification,
+    // which a subagent sends unstamped — `HookEvent::reports_session_cwd`).
+    let cwd = payload
+        .cwd()
+        .filter(|_| payload.subagent_id().is_none() && event.reports_session_cwd());
     // Only Claude persists a session title of its own beside a transcript.
     let transcript = match cli {
         HookCli::Claude => TranscriptRef::from_payload(
@@ -764,6 +768,31 @@ mod tests {
         assert_eq!(status, 200);
         let delivery = rx.recv().await.unwrap();
         assert!(delivery.cwd.is_none(), "subagent cwd: {:?}", delivery.cwd);
+    }
+
+    /// Claude builds a Notification's payload with no subagent context, so a
+    /// Task subagent's notification arrives unstamped, its `cwd` the
+    /// subagent's checkout. It still drives status, but carries no cwd on,
+    /// so it can't re-home the session into that checkout.
+    #[tokio::test]
+    async fn a_notification_carries_no_cwd() {
+        let store = seeded_store();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
+        let (status, _) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=Notification",
+            &env.token,
+            r#"{"session_id":"s1","notification_type":"permission_prompt","cwd":"/w/.claude/worktrees/agent-a1b2"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let delivery = rx.recv().await.unwrap();
+        assert!(matches!(delivery.event, HookEvent::Notification { .. }));
+        assert!(
+            delivery.cwd.is_none(),
+            "notification cwd: {:?}",
+            delivery.cwd
+        );
     }
 
     /// The prompt reaches the drain loop condensed, on its own event
