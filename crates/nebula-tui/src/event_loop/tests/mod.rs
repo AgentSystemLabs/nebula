@@ -5933,7 +5933,20 @@ fn quit_asks_before_it_closes_the_tui() {
 /// pin the config to an empty temp file to stay off the dev's real one.
 pub(super) fn with_default_config<T>(f: impl FnOnce() -> T) -> T {
     let dir = tempfile::tempdir().unwrap();
-    crate::config::with_config_path(dir.path().join("config.json"), f)
+    // Models and effort strings deliberately come from a fake runtime
+    // catalog, so these flows also cover future names without a CLI.
+    let entries: Vec<_> = ["gpt-future-sol", "gpt-future-terra", "gpt-future-luna"]
+        .iter()
+        .map(|model| {
+            serde_json::json!({
+                "model": model,
+                "supportedReasoningEfforts": [{"reasoningEffort": "future-effort"}]
+            })
+        })
+        .collect();
+    crate::codex_catalogue::with_test_catalogue(&entries, || {
+        crate::config::with_config_path(dir.path().join("config.json"), f)
+    })
 }
 
 /// Pin the config to a temp file holding `json` for the duration of `f`.
@@ -6588,7 +6601,7 @@ fn picker_enter_on_effort_row_carries_model_and_effort() {
         app.nav.focus = Focus::Sessions;
         let mut out = Vec::new();
 
-        // n → Codex row → models → Luna → efforts → minimal → Enter.
+        // n → Codex row → models → Luna → efforts → future-effort → Enter.
         open_picker(&mut app);
         press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
@@ -6596,11 +6609,14 @@ fn picker_enter_on_effort_row_carries_model_and_effort() {
             panic!("expected codex model submenu");
         };
         assert_eq!(menu.title.as_deref(), Some("Codex model"));
-        assert!(menu.items.iter().any(|item| item.label == "gpt-5.6-terra"));
+        assert!(menu
+            .items
+            .iter()
+            .any(|item| item.label == "gpt-future-terra"));
         let luna = menu
             .items
             .iter()
-            .position(|item| item.label.starts_with("gpt-5.6-luna"))
+            .position(|item| item.label.starts_with("gpt-future-luna"))
             .expect("Luna row");
         for _ in 0..luna {
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
@@ -6622,7 +6638,7 @@ fn picker_enter_on_effort_row_carries_model_and_effort() {
                     model: Some(m),
                     effort: Some(e),
                     ..
-                }] if m == "gpt-5.6-luna" && e == "minimal"
+                }] if m == "gpt-future-luna" && e == "future-effort"
             ),
             "one create, and no Claude refill behind a Codex launch: {out:?}"
         );
@@ -16148,7 +16164,7 @@ fn seed_background_run(app: &mut App) {
 
 /// Route the preset store at a temp file (and the config at a default
 /// one) and pre-seed two presets: "reviewer" (claude · opus · high,
-/// wrapped) then "scratch" (codex · gpt-5.5, bare).
+/// wrapped) then "scratch" (codex · gpt-future-luna, bare).
 pub(super) fn with_seeded_presets(f: impl FnOnce()) {
     use crate::agent_presets::AgentPreset;
     let dir = tempfile::tempdir().unwrap();
@@ -16170,7 +16186,7 @@ pub(super) fn with_seeded_presets(f: impl FnOnce()) {
                     name: "scratch".into(),
                     kind: AgentKind::Codex,
                     custom_harness: None,
-                    model: Some("gpt-5.5".into()),
+                    model: Some("gpt-future-luna".into()),
                     effort: None,
                     prefix: String::new(),
                     postfix: String::new(),
@@ -17309,8 +17325,8 @@ fn presets_a_fills_the_editor_and_enter_persists() {
         };
         assert_eq!(editor.name.as_str(), "tested");
         assert_eq!(editor.kind, AgentKind::Codex);
-        assert_eq!(editor.model, "gpt-5.6-sol", "→ steps off the default");
-        assert_eq!(editor.effort, "minimal");
+        assert_eq!(editor.model, "gpt-future-sol", "→ steps off the default");
+        assert_eq!(editor.effort, "future-effort");
         assert_eq!(editor.prefix.as_str(), "Line one\nLine two\n\nLine four");
         assert_eq!(editor.field, PresetField::Postfix);
 
@@ -17337,8 +17353,8 @@ fn presets_a_fills_the_editor_and_enter_persists() {
         let saved = &crate::agent_presets::load()[2];
         assert_eq!(saved.name, "tested");
         assert_eq!(saved.kind, AgentKind::Codex);
-        assert_eq!(saved.model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(saved.effort.as_deref(), Some("minimal"));
+        assert_eq!(saved.model.as_deref(), Some("gpt-future-sol"));
+        assert_eq!(saved.effort.as_deref(), Some("future-effort"));
         assert_eq!(saved.prefix, "Line one\nLine two\n\nLine four");
         assert_eq!(saved.postfix, "END");
         assert!(
@@ -17623,7 +17639,7 @@ fn presets_e_edits_in_place() {
         assert_eq!(editor.editing, Some(1));
         assert_eq!(editor.name.as_str(), "scratch");
         assert_eq!(editor.kind, AgentKind::Codex);
-        assert_eq!(editor.model, "gpt-5.5");
+        assert_eq!(editor.model, "gpt-future-luna");
         assert_eq!(editor.effort, crate::config::DEFAULT_CHOICE);
 
         // Tab to Model; the last choice wraps to the default.

@@ -104,6 +104,7 @@ pub const PROJECT_FILE_CHOICE: &str = nebula_core::project_file::FILE_NAME;
 // `claude_catalogue.rs` at runtime — CONFIG.JSON's `claude_models`, else
 // Claude Code's own `availableModels`, else the aliases — and Cursor's
 // from its catalogue (a seed plus a cached `cursor-agent --list-models`).
+// Codex's model and effort lists come from its app-server catalogue.
 
 /// The `quick_prompt_kind` choices: every built-in harness id, by the name
 /// the config file stores. Derived from the registry table rather than
@@ -117,7 +118,7 @@ pub fn agent_kind_names() -> Vec<String> {
 
 /// The model rows for a harness: [`DEFAULT_CHOICE`] first ("don't pass the
 /// flag — let the CLI pick", what the daemon sees as None), then the
-/// runtime catalogue (Claude/Cursor, already headed) or the descriptor's
+/// runtime catalogue (already headed) or the descriptor's
 /// static list. Pi's `--model` takes a fuzzy pattern across providers, so
 /// its list is families, not ids; a hand-edited `provider/id` passes
 /// through verbatim.
@@ -137,6 +138,7 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        Some(nebula_core::harness::HarnessCatalog::Codex) => crate::codex_catalogue::models(),
         None => headed(
             descriptor
                 .model
@@ -151,8 +153,8 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
 /// Effort rows for a harness given its chosen model (None or "default" =
 /// the CLI's pick). Empty — no Effort row, no effort submenu — while the
 /// harness offers no effort. Cursor's list follows the family (`-fast`
-/// variants ride in the effort, `high-fast`); any other harness takes its
-/// static list with any model.
+/// variants ride in the effort, `high-fast`); Codex's follows the selected
+/// model's capabilities. Other harnesses take their static list.
 pub fn effort_choices(kind: AgentKind, model: Option<&str>, custom: Option<&str>) -> Vec<String> {
     effort_choices_in(&describe(kind, custom), model)
 }
@@ -171,6 +173,15 @@ pub fn effort_choices_in(
             .iter()
             .map(|s| s.to_string())
             .collect();
+    }
+    if descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Codex) {
+        if let Some(efforts) = crate::codex_catalogue::efforts(model) {
+            return if efforts.is_empty() {
+                Vec::new()
+            } else {
+                headed(efforts)
+            };
+        }
     }
     headed(descriptor.effort.efforts.clone())
 }
@@ -237,6 +248,11 @@ pub fn fit_effort_in(
     model: Option<&str>,
     effort: Option<String>,
 ) -> Option<String> {
+    if descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Codex) {
+        if let Some(choices) = crate::codex_catalogue::efforts(model) {
+            return effort.filter(|value| fits(value, &choices));
+        }
+    }
     if !descriptor.compose_model_effort {
         return effort;
     }
@@ -2085,6 +2101,9 @@ impl Config {
                 Some(nebula_core::harness::HarnessCatalog::Cursor) => format!(
                     "Default model family for new {label} sessions; rows follow cursor-agent --list-models"
                 ),
+                Some(nebula_core::harness::HarnessCatalog::Codex) => format!(
+                    "Default model for new {label} sessions; rows follow Codex's model catalog automatically"
+                ),
                 None => format!("Default model for new {label} sessions (default = CLI's pick)"),
             },
             HarnessField::Effort => {
@@ -2123,7 +2142,7 @@ impl Config {
     }
 
     /// Cycle an Agents harness row: toggle Enabled, step Model / Effort
-    /// through the rows the pickers offer. A composing harness refits its
+    /// through the rows the pickers offer. A model-dependent harness refits its
     /// effort against the new model, so the row never holds an id the CLI
     /// would refuse.
     pub fn cycle_agent_row(&mut self, id: &str, field: HarnessField, delta: i32) {
@@ -2142,7 +2161,9 @@ impl Config {
                 let next = cycle_owned(&descriptor.model.default, &choices, step);
                 self.set_harness_model(id, next.clone());
                 let descriptor = self.effective_harness_by_id(id);
-                if descriptor.compose_model_effort {
+                if descriptor.compose_model_effort
+                    || descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Codex)
+                {
                     let choices = effort_choices_in(&descriptor, Some(&next));
                     if !fits(&descriptor.effort.default, &choices) {
                         let fitted = fit_effort_in(&descriptor, Some(&next), None)
@@ -2335,13 +2356,15 @@ impl Config {
                 changed = true;
             }
         }
-        // A composing harness (Cursor's family-suffix shape) keeps the
-        // stored effort only if the family it now names ships it, as the
+        // A model-dependent harness keeps the stored effort only if the
+        // model it now names supports it, as the
         // AGENTS TAB's own Model cycle does — never an id the CLI would
         // refuse.
         if changed {
             let descriptor = self.effective_harness_by_id(&id);
-            if descriptor.compose_model_effort {
+            if descriptor.compose_model_effort
+                || descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Codex)
+            {
                 let family = descriptor.default_model().map(str::to_string);
                 let choices = effort_choices_in(&descriptor, family.as_deref());
                 if !fits(&descriptor.effort.default, &choices) {
