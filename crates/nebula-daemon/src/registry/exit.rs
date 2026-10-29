@@ -22,6 +22,14 @@ impl Daemon {
     pub(super) fn watch_for_exit(self: &Arc<Self>, session: Arc<PtySession>) {
         let daemon = self.clone();
         let mut rx = session.events.subscribe();
+        // The child can advertise its state before this watcher attaches.
+        // Subscribe first, then reconcile the retained state so an early
+        // Codex working signal cannot leave the row fresh or finished.
+        if let (SessionRef::Agent(id), Some(busy)) = (&session.sref, session.progress_busy()) {
+            if daemon.owns_session(&session.sref, &session) {
+                daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
+            }
+        }
         let sref = session.sref.clone();
         tokio::spawn(async move {
             loop {
