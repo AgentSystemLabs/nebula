@@ -22664,5 +22664,18 @@ fn performance_probe_many_sessions_draw() {
             samples[25].as_secs_f64() * 1000.0,
             samples[49].as_secs_f64() * 1000.0
         );
+        let began = std::time::Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(crate::palette::Palette::new(
+                &app.tree,
+                false,
+                &app.github.open_prs,
+                false,
+            ));
+        }
+        eprintln!(
+            "2001-session palette: {:.3} ms/open",
+            began.elapsed().as_secs_f64() * 50.0
+        );
     });
 }
