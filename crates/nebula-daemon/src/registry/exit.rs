@@ -8,7 +8,13 @@ impl Daemon {
             .insert(session.sref.clone(), session.clone());
         // After the insert: a forward task woken by this looks the ref up.
         let _ = self.session_installs.send(session.sref.clone());
-        self.watch_for_exit(session);
+        self.watch_for_exit(session.clone());
+        if let SessionRef::Agent(id) = &session.sref {
+            if matches!(self.store.get_agent(id), Ok(Some(a)) if a.kind == AgentKind::Codex && a.custom_harness.is_none())
+            {
+                session.arm_codex_model_scan();
+            }
+        }
     }
 
     /// Once the child dies: drop it from the registry, feed the status
@@ -87,6 +93,13 @@ impl Daemon {
                             }
                         }
                         break;
+                    }
+                    Ok(PtyEvent::CodexModel { selection }) => {
+                        if let SessionRef::Agent(id) = &sref {
+                            if daemon.owns_session(&sref, &session) {
+                                daemon.adopt_codex_selection(id, &selection);
+                            }
+                        }
                     }
                     // The CLI's own busy/idle bit, read off its output. It is
                     // the only end-of-turn news after a user cancel: Claude
@@ -197,6 +210,13 @@ impl Daemon {
                             if daemon.owns_session(&sref, &session) {
                                 daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
                                 daemon.complete_pending_move(id, &HookEvent::Progress { busy });
+                            }
+                        }
+                        if let (SessionRef::Agent(id), Some(selection)) =
+                            (&sref, session.codex_selection())
+                        {
+                            if daemon.owns_session(&sref, &session) {
+                                daemon.adopt_codex_selection(id, &selection);
                             }
                         }
                         continue;
