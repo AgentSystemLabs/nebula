@@ -2926,6 +2926,7 @@ impl vt100::Callbacks for TermCallbacks {
 
 pub struct AttachedTerm {
     pub sref: SessionRef,
+    pub(crate) replay: Option<crate::terminal_replay::Pending>,
     pub parser: vt100::Parser<TermCallbacks>,
     pub exited: bool,
     /// Size the parser (and daemon PTY) currently uses.
@@ -2975,6 +2976,7 @@ impl AttachedTerm {
     pub fn new(sref: SessionRef, cols: u16, rows: u16) -> Self {
         Self {
             sref,
+            replay: None,
             parser: vt100::Parser::new_with_callbacks(
                 rows,
                 cols,
@@ -2996,6 +2998,7 @@ impl AttachedTerm {
 
     /// Reset the parser (fresh replay is about to arrive).
     pub fn reset(&mut self) {
+        self.replay = None;
         self.parser = vt100::Parser::new_with_callbacks(
             self.rows,
             self.cols,
@@ -3066,6 +3069,9 @@ impl AttachedTerm {
     /// Regrid to `cols`×`rows` when that differs from the current size.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if (self.cols, self.rows) != (cols, rows) {
+            if let Some(replay) = &mut self.replay {
+                replay.resize(cols, rows);
+            }
             self.cols = cols;
             self.rows = rows;
             self.parser.screen_mut().set_size(rows, cols);
@@ -3110,6 +3116,10 @@ impl AttachedTerm {
     /// parser's offset climbed past the top forever, and the way back down
     /// took as many notches as were spent up there.
     pub fn set_scroll(&mut self, scroll: usize) {
+        if self.replay.is_some() {
+            self.pending_scroll = Some(scroll);
+            return;
+        }
         self.parser.screen_mut().set_scrollback(scroll);
     }
 

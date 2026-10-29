@@ -16,9 +16,7 @@ pub(crate) fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
             if !app.pane.term_selection.is_some_and(|s| s.dragging) {
                 app.pane.term_selection = None;
             }
-            term.cols = area.width;
-            term.rows = area.height;
-            term.parser.screen_mut().set_size(area.height, area.width);
+            term.resize(area.width, area.height);
             out.push(ClientRequest::Resize {
                 session: term.sref.clone(),
                 cols: area.width,

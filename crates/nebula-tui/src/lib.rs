@@ -44,6 +44,7 @@ pub mod review;
 pub mod review_modal;
 pub mod splash;
 pub mod syntax;
+pub mod terminal_replay;
 pub mod terminal_tail;
 pub mod text_input;
 pub mod theme;

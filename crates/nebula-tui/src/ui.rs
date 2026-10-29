@@ -1652,8 +1652,8 @@ fn draw_terminal_body(
             draw_refused_terminal(f, inner, th, term.refused.clone().unwrap_or_default());
             (Vec::new(), Vec::new())
         }
-        Some(term) if term.booting && !term.exited => {
-            draw_booting_terminal(f, inner, th);
+        Some(term) if term.replay.is_some() || (term.booting && !term.exited) => {
+            draw_booting_terminal(f, inner, th, term.replay.is_some());
             (Vec::new(), Vec::new())
         }
         Some(term) => {
@@ -1695,16 +1695,24 @@ fn draw_refused_terminal(f: &mut Frame, inner: Rect, th: Theme, why: String) {
     f.render_widget(msg, padded);
 }
 
-fn draw_booting_terminal(f: &mut Frame, inner: Rect, th: Theme) {
+fn draw_booting_terminal(f: &mut Frame, inner: Rect, th: Theme, replaying: bool) {
     let msg = Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled(
-            "starting session…",
+            if replaying {
+                "loading session…"
+            } else {
+                "starting session…"
+            },
             Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "booting — the screen appears as soon as it paints",
+            if replaying {
+                "restoring the terminal screen"
+            } else {
+                "booting — the screen appears as soon as it paints"
+            },
             Style::default().fg(th.dim),
         )),
     ])

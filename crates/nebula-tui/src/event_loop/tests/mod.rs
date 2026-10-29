@@ -22626,3 +22626,43 @@ fn opening_the_oldest_cached_session_preserves_its_screen() {
         }
     )));
 }
+
+/// Headless CPU-cost probe for a busy project; excludes daemon and terminal I/O.
+#[test]
+#[ignore = "manual scaling benchmark; run with --ignored --nocapture"]
+fn performance_probe_many_sessions_draw() {
+    with_default_config(|| {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let template_worktree = app.tree.worktrees[0].clone();
+        let template_agent = app.tree.agents[0].clone();
+        for w in 0..50 {
+            let mut worktree = template_worktree.clone();
+            worktree.id = WorktreeId(format!("scale-w{w}"));
+            worktree.is_main = false;
+            worktree.branch = format!("feature-{w}");
+            for a in 0..40 {
+                let mut agent = template_agent.clone();
+                agent.id = AgentId(format!("scale-a{w}-{a}"));
+                agent.name = format!("Agent {w}/{a}");
+                agent.worktree_id = worktree.id.clone();
+                app.tree.agents.push(agent);
+            }
+            app.tree.worktrees.push(worktree);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(190, 50)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..50 {
+            let began = std::time::Instant::now();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            samples.push(began.elapsed());
+        }
+        samples.sort();
+        eprintln!(
+            "2001 sessions / 51 worktrees: median {:.3} ms/frame, max {:.3} ms/frame",
+            samples[25].as_secs_f64() * 1000.0,
+            samples[49].as_secs_f64() * 1000.0
+        );
+    });
+}
