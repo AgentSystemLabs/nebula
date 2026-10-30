@@ -25,7 +25,16 @@ impl Daemon {
             run_command: None,
         };
         self.store.insert_terminal(&terminal)?;
-        self.spawn_terminal_session(&terminal, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
+        if let Err(error) =
+            self.spawn_terminal_session(&terminal, &worktree, DEFAULT_COLS, DEFAULT_ROWS)
+        {
+            // The client removes its optimistic card on refusal. Keep a
+            // failed shell spawn from leaving a ghost row on reconnect.
+            if let Err(cleanup) = self.store.delete_terminal(&terminal.id) {
+                tracing::warn!(terminal = %terminal.id, error = %cleanup, "failed to remove a terminal after spawn refusal");
+            }
+            return Err(error);
+        }
         let mut broadcast_term = terminal.clone();
         broadcast_term.alive = true;
         self.broadcast(ServerEvent::EntityUpserted {

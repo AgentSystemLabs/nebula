@@ -131,6 +131,13 @@ fn handle_locked_pane_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequ
         // PTY behind it: the keystroke has nowhere to go until the real
         // session attaches, and must not land in the previous one.
         let unavailable = !app.pane_accepts_input();
+        if unavailable {
+            if let Some(data) = keys::encode_key(&key, 0) {
+                if terminal_create::buffer(app, &data) {
+                    return true;
+                }
+            }
+        }
         if !exited {
             if let Some(term) = &mut app.pane.term {
                 // Typing changes the content under a persisted selection

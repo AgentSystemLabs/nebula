@@ -793,6 +793,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_agent_model_effort(
+        &self,
+        id: &AgentId,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE agents SET model = ?2, effort = ?3 WHERE id = ?1",
+            params![id.as_str(), model, effort],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_agent(&self, id: &AgentId) -> Result<()> {
         self.delete_by_id("agents", id.as_str())
     }

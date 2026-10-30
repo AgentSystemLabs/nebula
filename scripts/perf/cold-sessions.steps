@@ -1,0 +1,68 @@
+# Run with PERF_COLD_SESSIONS=8 to prepare full rings before launching the measured TUI.
+# Exact palette queries reach every session even when grid bands are folded.
+cold: palette 1	/
+cold: find session 1	text:agent-1
+cold: visit session 1	Enter
+cold: leave session 1	C-q
+cold: palette 2	/
+cold: find session 2	text:agent-2
+cold: visit session 2	Enter
+cold: leave session 2	C-q
+cold: palette 3	/
+cold: find session 3	text:agent-3
+cold: visit session 3	Enter
+cold: leave session 3	C-q
+cold: palette 4	/
+cold: find session 4	text:agent-4
+cold: visit session 4	Enter
+cold: leave session 4	C-q
+cold: palette 5	/
+cold: find session 5	text:agent-5
+cold: visit session 5	Enter
+cold: leave session 5	C-q
+cold: palette 6	/
+cold: find session 6	text:agent-6
+cold: visit session 6	Enter
+cold: leave session 6	C-q
+cold: palette 7	/
+cold: find session 7	text:agent-7
+cold: visit session 7	Enter
+cold: leave session 7	C-q
+cold: palette 8	/
+cold: find session 8	text:agent-8
+cold: visit session 8	Enter
+cold: leave session 8	C-q
+cached: palette 1	/
+cached: find session 1	text:agent-1
+cached: visit session 1	Enter
+cached: leave session 1	C-q
+cached: palette 2	/
+cached: find session 2	text:agent-2
+cached: visit session 2	Enter
+cached: leave session 2	C-q
+cached: palette 3	/
+cached: find session 3	text:agent-3
+cached: visit session 3	Enter
+cached: leave session 3	C-q
+cached: palette 4	/
+cached: find session 4	text:agent-4
+cached: visit session 4	Enter
+cached: leave session 4	C-q
+cached: palette 5	/
+cached: find session 5	text:agent-5
+cached: visit session 5	Enter
+cached: leave session 5	C-q
+cached: palette 6	/
+cached: find session 6	text:agent-6
+cached: visit session 6	Enter
+cached: leave session 6	C-q
+cached: palette 7	/
+cached: find session 7	text:agent-7
+cached: visit session 7	Enter
+cached: leave session 7	C-q
+cached: palette 8	/
+cached: find session 8	text:agent-8
+cached: visit session 8	Enter
+cached: leave session 8	C-q
+open help	?
+close help	Escape

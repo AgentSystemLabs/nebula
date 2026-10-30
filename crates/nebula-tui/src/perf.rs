@@ -67,7 +67,12 @@ impl Perf {
             overlay_name(app),
             app.nav.focus,
         );
-        self.waiting.push((label, arrived));
+        // A no-op (e.g. releasing a key or Escape with no overlay) needs
+        // no paint. Carrying it forward would count the user's idle time
+        // until an unrelated key as rendering latency.
+        if app.chrome.dirty {
+            self.waiting.push((label, arrived));
+        }
     }
 
     /// A frame whose draw ran from `began` until now.
@@ -135,6 +140,7 @@ fn overlay_busy(app: &App) -> bool {
         Some(Overlay::Files(v)) => v.listing.is_some(),
         Some(Overlay::Tree(v)) => v.listing.is_some() || v.waiting.is_some(),
         Some(Overlay::Grep(v)) => v.waiting.is_some(),
+        Some(Overlay::Confirm(c)) => crate::delete_check::still_checking(app, &c.action).is_some(),
         _ => false,
     }
 }
@@ -224,6 +230,7 @@ pub fn server_name(ev: &nebula_core::protocol::ServerEvent) -> &'static str {
         E::EntityRemoved { .. } => "EntityRemoved",
         E::StatusChanged { .. } => "StatusChanged",
         E::Snapshot { .. } => "Snapshot",
+        E::WorktreeChecked { .. } => "WorktreeChecked",
         _ => "other",
     }
 }

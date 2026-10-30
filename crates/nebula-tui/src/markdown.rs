@@ -124,7 +124,7 @@ fn render_inner(
 #[derive(Debug, Clone)]
 pub struct Rendered {
     pub width: u16,
-    pub lines: Vec<Line<'static>>,
+    pub lines: std::sync::Arc<Vec<Line<'static>>>,
 }
 
 impl Rendered {
@@ -140,7 +140,7 @@ impl Rendered {
             Some(r) if r.width == width => r,
             _ => Rendered {
                 width,
-                lines: render(text, width as usize, breaks, Style::default(), th),
+                lines: render(text, width as usize, breaks, Style::default(), th).into(),
             },
         }
     }
@@ -166,7 +166,8 @@ impl Rendered {
                     th,
                     diagrams,
                     mode,
-                ),
+                )
+                .into(),
             },
         }
     }

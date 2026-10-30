@@ -9,6 +9,7 @@
 #
 #   BIN=target/release/nebula scripts/perf/run.sh      measure another build (default target/debug/nebula,
 #                                                      the build `make dev` runs)
+#   PERF_COLD_SESSIONS=8 scripts/perf/run.sh scripts/perf/cold-sessions.steps  first-visit replays
 #   PERF_DUMP=1 scripts/perf/run.sh                    also save the screen after every step (debugging a
 #                                                      scenario that went astray)
 #   OUT=/some/dir scripts/perf/run.sh                  where the log, the report and the dumps go
@@ -18,7 +19,8 @@
 #   python3 scripts/perf/report.py BEFORE AFTER        two runs' OUT dirs, side by side
 #
 # A scenario line is `label<TAB>key`: a tmux key name (`j`, `Enter`, `C-d`, `BTab`), or `text:…` typed
-# literally in one go. Lines starting with `#` are comments. One line is one step; steps are STEP_SECS
+# literally in one go. `burst:t|e|c|h|o|Space|x|Enter` sends keys without driver delays.
+# Lines starting with `#` are comments. One line is one step; steps are STEP_SECS
 # apart (default 0.7), which is what lets the report tell them apart.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,6 +87,26 @@ git init -q -b main "$WORK/tiny"
 git -C "$WORK/tiny" -c user.name=perf -c user.email=perf@example.invalid commit -q --allow-empty -m tiny
 "$BIN" add "$WORK/tiny" >/dev/null
 
+# Optional existing sessions with full rings: create them through a seed
+# TUI, then discard only that client. The daemon keeps their PTYs alive;
+# a fresh client must visit them without any cached terminal parsers.
+if [ "${PERF_COLD_SESSIONS:-0}" -gt 0 ]; then
+  $TMUX new-session -d -x "$COLS" -y "$ROWS" "$BIN"
+  sleep 2
+  for ((cold=0; cold<PERF_COLD_SESSIONS; cold++)); do
+    $TMUX send-keys n; sleep 0.2
+    $TMUX send-keys Enter; sleep 0.2
+    $TMUX send-keys Enter; sleep 0.8
+    $TMUX send-keys C-q; sleep 0.2
+  done
+  seed_pid="$($TMUX display-message -p '#{pane_pid}')"
+  $TMUX kill-server
+  for ((attempt=0; attempt<100; attempt++)); do
+    if ! kill -0 "$seed_pid" 2>/dev/null; then break; fi
+    sleep 0.02
+  done
+fi
+
 now_us() { python3 -c 'import time; print(int(time.time() * 1e6))'; }
 printf '%s\tlaunch\t\n' "$(now_us)" > "$OUT/steps.tsv"
 $TMUX new-session -d -x "$COLS" -y "$ROWS" "$BIN"
@@ -106,6 +128,8 @@ while IFS=$'\t' read -r label key; do
   printf '%s\t%s\t%s\n' "$(now_us)" "$label" "$key" >> "$OUT/steps.tsv"
   case "$key" in
     text:*) $TMUX send-keys -l "${key#text:}";;
+    burst:*) IFS='|' read -r -a burst_keys <<< "${key#burst:}"
+      $TMUX send-keys "${burst_keys[@]}";;
     wait:*) sleep "${key#wait:}";;
     click:*) c="${key#click:}"                              # click:<col>,<row> — 1-based cells, SGR press + release
       $TMUX send-keys -l "$(printf '\033[<0;%d;%dM\033[<0;%d;%dm' "${c%,*}" "${c#*,}" "${c%,*}" "${c#*,}")";;

@@ -35,14 +35,13 @@ pub struct ModelEntry {
     pub hint: Option<String>,
 }
 
-/// Which TUI-side catalogue supplies a harness's model (and, for Cursor,
-/// effort) rows at runtime, in place of the descriptor's static lists:
-/// Claude's `claude_models` / `availableModels` allowlist, or Cursor's
-/// `--list-models` union over its seed.
+/// Which TUI-side catalogue supplies a harness's model / effort rows at
+/// runtime, in place of the descriptor's static lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessCatalog {
     Claude,
+    Codex,
     Cursor,
 }
 
@@ -50,6 +49,7 @@ impl HarnessCatalog {
     pub fn as_str(self) -> &'static str {
         match self {
             HarnessCatalog::Claude => "claude",
+            HarnessCatalog::Codex => "codex",
             HarnessCatalog::Cursor => "cursor",
         }
     }
@@ -57,6 +57,7 @@ impl HarnessCatalog {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.trim() {
             "claude" => HarnessCatalog::Claude,
+            "codex" => HarnessCatalog::Codex,
             "cursor" => HarnessCatalog::Cursor,
             _ => return None,
         })
@@ -421,14 +422,14 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
             model: ModelSpec {
                 flag: Some("--model".into()),
                 default: default_model_choice(),
-                models: models(&["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]),
-                catalog: None,
+                models: Vec::new(),
+                catalog: Some(HarnessCatalog::Codex),
             },
             effort: EffortSpec {
                 config_flag: Some("-c".into()),
                 config_key: Some("model_reasoning_effort".into()),
                 default: default_model_choice(),
-                efforts: ["minimal", "low", "medium", "high", "xhigh"]
+                efforts: ["low", "medium", "high", "xhigh", "max"]
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
@@ -995,6 +996,9 @@ mod tests {
         assert_eq!(claude.resume.flag.as_deref(), Some("--resume"));
         assert!(claude.relocation_prompt);
         let codex = builtin("codex").unwrap();
+        assert_eq!(codex.model.catalog, Some(HarnessCatalog::Codex));
+        assert_eq!(HarnessCatalog::parse("codex"), Some(HarnessCatalog::Codex));
+        assert_eq!(HarnessCatalog::Codex.as_str(), "codex");
         assert_eq!(codex.permissions_flag.as_deref(), Some("--yolo"));
         assert_eq!(codex.resume.subcommand.as_deref(), Some("resume"));
         assert!(codex.resume.cd);

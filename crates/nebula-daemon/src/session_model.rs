@@ -166,6 +166,34 @@ fn adopt(current: Option<&str>, seen: &str) -> Option<String> {
 }
 
 impl Daemon {
+    /// Codex confirms a selection before the first turn, without firing a
+    /// hook. Persist both fields together and notify every attached client.
+    pub(crate) fn adopt_codex_selection(
+        &self,
+        id: &AgentId,
+        seen: &crate::pty::codex_model::Selection,
+    ) -> bool {
+        let Ok(Some(agent)) = self.store.get_agent(id) else {
+            return false;
+        };
+        if agent.kind != AgentKind::Codex
+            || agent.custom_harness.is_some()
+            || agent.cloud_session_id.is_some()
+            || (agent.model.as_deref() == Some(seen.model.as_str()) && agent.effort == seen.effort)
+        {
+            return false;
+        }
+        if let Err(e) = self
+            .store
+            .set_agent_model_effort(id, &seen.model, seen.effort.as_deref())
+        {
+            tracing::warn!(agent = %id, error = %e, "Codex model selection not adopted");
+            return false;
+        }
+        self.try_broadcast_agent(id);
+        true
+    }
+
     /// One pass of the model sweep over every live session's transcript.
     pub fn sweep_claude_models(&self, offsets: &mut TranscriptOffsets) {
         let known: Vec<(AgentId, PathBuf)> = self
@@ -415,6 +443,47 @@ mod tests {
             },
         );
         (daemon, id)
+    }
+
+    #[test]
+    fn codex_selection_updates_and_broadcasts_model_and_effort_together() {
+        use crate::pty::codex_model::{Scanner, Selection};
+        use nebula_core::{Entity, ServerEvent};
+        let (daemon, id) = seeded_daemon(AgentKind::Codex);
+        let mut events = daemon.events.subscribe();
+        let mut scanner = Scanner::new(120, 24);
+        let seen = scanner
+            .feed("• Model changed to gpt-5.5 xhigh for this session only\r\n".as_bytes())
+            .unwrap();
+        assert!(daemon.adopt_codex_selection(&id, &seen));
+        let agent = daemon.store.get_agent(&id).unwrap().unwrap();
+        assert_eq!(agent.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(agent.effort.as_deref(), Some("xhigh"));
+        match events.try_recv().unwrap() {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } => {
+                assert_eq!(a.model, agent.model);
+                assert_eq!(a.effort, agent.effort);
+            }
+            other => panic!("expected agent upsert, got {other:?}"),
+        }
+        assert!(!daemon.adopt_codex_selection(&id, &seen));
+        assert!(events.try_recv().is_err());
+        let default = Selection {
+            model: seen.model,
+            effort: None,
+        };
+        assert!(daemon.adopt_codex_selection(&id, &default));
+        assert!(daemon
+            .store
+            .get_agent(&id)
+            .unwrap()
+            .unwrap()
+            .effort
+            .is_none());
+        let (claude, id) = seeded_daemon(AgentKind::Claude);
+        assert!(!claude.adopt_codex_selection(&id, &default));
     }
 
     /// `/model` in a live session, end to end against a real store: the

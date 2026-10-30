@@ -3063,6 +3063,28 @@ mod tests {
         assert!(daemon.store.get_agent(&id).unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn failed_terminal_spawn_removes_the_new_row() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["terminal-failure"]);
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        seed_worktree(
+            &daemon,
+            "terminal-failure",
+            "terminal-failure-w",
+            missing.to_str().unwrap(),
+            true,
+        );
+        let id = WorktreeId("terminal-failure-w".into());
+        assert!(daemon.create_terminal(&id, None).is_err());
+        let (_, _, _, terminals) = daemon.store.load_tree().unwrap();
+        assert!(
+            terminals.is_empty(),
+            "a refused create must not reappear on reconnect"
+        );
+    }
+
     fn seed_projects(daemon: &Daemon, names: &[&str]) {
         for (i, name) in names.iter().enumerate() {
             daemon
@@ -3610,6 +3632,48 @@ mod tests {
         // cwd outside every worktree is ignored.
         daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/elsewhere", None, false);
         assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+    }
+
+    /// A Task subagent's isolated checkout (`.claude/worktrees/agent-<id>`)
+    /// never takes the session, whatever payload reports it: the subagent
+    /// is working there, not the conversation.
+    #[test]
+    fn reparent_never_moves_a_session_into_a_subagent_checkout() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(
+            &daemon,
+            "p",
+            "sub",
+            "/nebula-test/p/.claude/worktrees/agent-a52d9b9052ac7e5db",
+            false,
+        );
+        seed_worktree(
+            &daemon,
+            "p",
+            "named",
+            "/nebula-test/p/.claude/worktrees/my-feature",
+            false,
+        );
+        seed_agent(&daemon, "a1", "root", None);
+
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            "/nebula-test/p/.claude/worktrees/agent-a52d9b9052ac7e5db/src",
+            None,
+            false,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "root");
+
+        // A worktree the session entered by name still re-homes it.
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            "/nebula-test/p/.claude/worktrees/my-feature",
+            None,
+            false,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "named");
     }
 
     /// Regression: a session that creates a worktree and steps into it
