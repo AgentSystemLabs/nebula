@@ -2985,6 +2985,8 @@ pub struct AttachedTerm {
     /// The grid is blank because the session has no screen yet — the
     /// daemon replayed an empty ring, or the session was reaped and this
     /// attach is what boots it — as opposed to a replay that hasn't landed.
+    /// It lasts until something visible lands, not the first byte: a CLI
+    /// sets its terminal modes long before a resume paints a frame.
     /// The pane's "starting session…" notice shows only in the first case:
     /// flashing it for the frame a live session's replay takes reads as a
     /// hiccup on every switch.
@@ -3070,10 +3072,18 @@ impl AttachedTerm {
             self.reset();
         }
         self.next_seq = base_seq + data.len() as u64;
+        // `reset` forgets that the pane was waiting on a boot; the replay
+        // of a session this attach is reviving doesn't end that wait.
+        let was_booting = self.booting;
         self.feed(data);
-        if !self.painted {
-            self.booting = true;
-        }
+        // Still booting while the replay leaves the grid blank: the daemon
+        // had nothing (an empty ring), or only the mode switches a CLI
+        // prints before its first frame. An agent CLI always draws
+        // something, so its blank grid is a boot whatever came before; a
+        // shell's blank grid may be a `clear`, so it counts only when the
+        // pane was already waiting.
+        self.booting = !self.shows_anything()
+            && (was_booting || !self.painted || matches!(self.sref, SessionRef::Agent(_)));
         // A replay asked for to get the history back lands the reader
         // where the scroll that asked for it was headed.
         if let Some(scroll) = self.pending_scroll.take() {
@@ -3100,11 +3110,34 @@ impl AttachedTerm {
     }
 
     fn feed(&mut self, data: &[u8]) {
+        self.parser.process(data);
         if !data.is_empty() {
             self.painted = true;
-            self.booting = false;
+            // A CLI's first bytes are mode switches (bracketed paste, focus
+            // events, a hidden cursor) and a title, seconds before a resume
+            // paints anything: booting ends with the first thing to see,
+            // not the first byte, or the pane goes black in between.
+            if self.booting && self.shows_anything() {
+                self.booting = false;
+            }
         }
-        self.parser.process(data);
+    }
+
+    /// Whether the visible grid holds anything a reader would see: a glyph,
+    /// or a cell painted with a background or in reverse video. Spaces a
+    /// program writes to clear lines don't count.
+    pub fn shows_anything(&self) -> bool {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        (0..rows).any(|row| {
+            (0..cols).any(|col| {
+                screen.cell(row, col).is_some_and(|cell| {
+                    cell.contents().chars().any(|c| !c.is_whitespace())
+                        || cell.bgcolor() != vt100::Color::Default
+                        || cell.inverse()
+                })
+            })
+        })
     }
 
     /// Regrid to `cols`×`rows` when that differs from the current size.
@@ -5245,6 +5278,35 @@ impl App {
         self.jobs.git_changes.as_ref().map(|(id, _)| id) != self.selected_worktree().map(|w| &w.id)
     }
 
+    /// The pane is waiting on a session's first frame: the "starting
+    /// session…" notice is up, and its spinner wants frames.
+    pub fn pane_booting(&self) -> bool {
+        self.pane
+            .term
+            .as_ref()
+            .is_some_and(|t| t.booting && !t.exited && t.refused.is_none() && t.replay.is_none())
+    }
+
+    /// The booting notice's spinner is turning, so the loop owes it frames:
+    /// nothing else repaints a pane waiting on a CLI that has yet to draw.
+    pub fn boot_spinner_active(&self) -> bool {
+        self.chrome.animations && self.pane_booting()
+    }
+
+    /// The pane's booting session is an agent picking a conversation back
+    /// up (it has a stored session id to resume) rather than starting one.
+    pub fn pane_resuming(&self) -> bool {
+        let Some(SessionRef::Agent(id)) = self.pane.term.as_ref().map(|t| &t.sref) else {
+            return false;
+        };
+        self.tree.agents.iter().any(|a| {
+            &a.id == id
+                && a.session_id
+                    .as_deref()
+                    .is_some_and(|sid| !sid.trim().is_empty())
+        })
+    }
+
     /// Whether the daemon currently holds a live PTY for `sref`. Attaching
     /// to one only replays its ring; attaching to a session the IDLE REAPER
     /// took cold-spawns an agent CLI.
@@ -6303,6 +6365,64 @@ mod tests {
         term.apply_output(0, b"hi");
         assert!(term.painted && !term.booting, "the first bytes end it");
         assert_eq!(term.next_seq, 2);
+    }
+
+    /// What Claude prints before its first frame: a cursor save/restore,
+    /// a hidden cursor, bracketed paste, focus events. A resume can sit
+    /// there for seconds loading the transcript, and the pane must go on
+    /// saying it is booting rather than turn into a blank black grid.
+    const CLI_PREAMBLE: &[u8] = b"\x1b7\x1b[r\x1b8\x1b[?25h\x1b[?25l\x1b[?2004h\x1b[?2031h\x1b[?1004h\x1b]0;Claude Code\x07";
+
+    #[test]
+    fn mode_switches_before_the_first_frame_keep_the_pane_booting() {
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a".into())), 20, 4);
+        term.booting = true;
+        term.apply_scrollback(0, b"");
+        let n = CLI_PREAMBLE.len() as u64;
+        term.apply_output(0, CLI_PREAMBLE);
+        assert!(
+            term.painted && term.booting,
+            "nothing to see yet: still booting"
+        );
+        // Clearing lines with spaces isn't a frame either.
+        term.apply_output(n, b"    \r\n");
+        assert!(term.booting);
+        term.apply_output(n + 6, b"\x1b[31m> \x1b[0m");
+        assert!(!term.booting, "the first visible cell ends it");
+    }
+
+    /// The attach that revives a reaped session can race the boot: the
+    /// replay already holds the preamble. That is still a boot, not a
+    /// screen.
+    #[test]
+    fn a_replay_of_only_the_preamble_is_still_booting() {
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a".into())), 20, 4);
+        term.booting = true;
+        term.apply_scrollback(0, CLI_PREAMBLE);
+        assert!(term.painted && term.booting);
+
+        // A shell that cleared its screen is a screen, unless the pane was
+        // already waiting on it.
+        let mut shell = AttachedTerm::new(
+            SessionRef::Terminal(nebula_core::TerminalId("t".into())),
+            20,
+            4,
+        );
+        shell.apply_scrollback(0, b"\x1b[H\x1b[2J");
+        assert!(
+            !shell.booting,
+            "a live shell's blank screen is what it shows"
+        );
+        let mut reviving = AttachedTerm::new(
+            SessionRef::Terminal(nebula_core::TerminalId("t".into())),
+            20,
+            4,
+        );
+        reviving.booting = true;
+        reviving.apply_scrollback(0, b"\x1b[?2004h");
+        assert!(reviving.booting);
+        reviving.apply_output(8, b"$ ");
+        assert!(!reviving.booting);
     }
 
     // ---- shared list arithmetic ----
