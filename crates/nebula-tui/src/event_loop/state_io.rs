@@ -41,6 +41,53 @@ pub(crate) fn send_with_follow(
     out.push(make(req_id));
 }
 
+/// How long the layout must sit unsaved before [`UiStateSaver`] writes
+/// it: a burst of cursor moves is one write, not one per frame.
+pub(crate) const UI_STATE_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Saves the layout ([`ui_state_json`]) shortly after it changes, so a TUI
+/// that ends without `q` — its window closed, the machine shut down, a
+/// crash — comes back with its PROJECT TABS and selection as they were.
+/// The save on `q` stays: it writes the very last state.
+#[derive(Default)]
+pub(crate) struct UiStateSaver {
+    /// The layout as the DAEMON last stored it; None until the first
+    /// snapshot, so a layout restored from it is never written back over
+    /// with the empty one the TUI starts on.
+    saved: Option<String>,
+    /// When the changed layout is due to be written.
+    pub(crate) due: Option<tokio::time::Instant>,
+}
+
+impl UiStateSaver {
+    /// After a frame: a layout that differs from the saved one is due
+    /// [`UI_STATE_SAVE_DELAY`] after the first change, however many follow.
+    pub(crate) fn note(&mut self, app: &App, now: tokio::time::Instant) {
+        if !app.chrome.snapshot_loaded {
+            return;
+        }
+        let json = ui_state_json(app);
+        match &self.saved {
+            None => self.saved = Some(json),
+            Some(saved) if *saved != json => {
+                self.due.get_or_insert(now + UI_STATE_SAVE_DELAY);
+            }
+            Some(_) => self.due = None,
+        }
+    }
+
+    /// When due: the layout as it stands now, if it still differs.
+    pub(crate) fn flush(&mut self, app: &App) -> Option<ClientRequest> {
+        self.due = None;
+        let json = ui_state_json(app);
+        if self.saved.as_ref() == Some(&json) {
+            return None;
+        }
+        self.saved = Some(json.clone());
+        Some(ClientRequest::SaveUiState { json })
+    }
+}
+
 pub(crate) fn log_server_event(ev: &ServerEvent) {
     match ev {
         ServerEvent::Output { .. } | ServerEvent::Scrollback { .. } => {}
@@ -60,7 +107,7 @@ pub(crate) fn ui_state_json(app: &App) -> String {
         issues_collapsed: app.launcher.issues_collapsed,
         diff_files_width: Some(app.modals.diff_files_width),
         diff_tree: app.modals.diff_tree,
-        diff_unified: !app.modals.diff_split,
+        diff_unified: false,
         launcher_pane_h: app.launcher.launcher_pane_h,
         launcher_pane_w: app.launcher.launcher_pane_w,
         launcher_pane_hidden: app.launcher.launcher_pane_hidden,
@@ -150,7 +197,18 @@ pub(crate) fn restore_ui_state(app: &mut App, json: &str) -> bool {
         app.modals.diff_files_width = w.clamp(crate::app::MIN_DIFF_FILES_W, MAX_RESTORED_WIDTH);
     }
     app.modals.diff_tree = state.diff_tree;
-    app.modals.diff_split = !state.diff_unified;
+    if state.diff_unified {
+        // A blob from before the DIFF LAYOUT setting, with `Ctrl+s` left on
+        // unified: that choice becomes the setting. The next blob written
+        // drops the key, so this runs once.
+        let mut cfg = crate::config::Config::load();
+        if !cfg.diff_inline {
+            cfg.diff_inline = true;
+            if let Err(e) = cfg.save() {
+                tracing::warn!(error = %e, "could not carry diff layout into settings");
+            }
+        }
+    }
     // The next draw re-fits it to the body actually on screen
     // (`launcher::pane_height`); the cap here only keeps a nonsense blob
     // from carrying a wild number around.

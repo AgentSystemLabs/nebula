@@ -81,6 +81,9 @@ pub(crate) fn close_vim(app: &mut App) {
     match &mut app.modals.overlay {
         Some(Overlay::Tree(view)) if embedded => view.load_preview(),
         Some(Overlay::FileTabs(view)) => view.editor_closed(),
+        // Back on the review the editor was opened from: the file's diff
+        // as it stands now.
+        Some(Overlay::Diff(view)) => crate::git_diff::load_selected_diff(view),
         _ => {}
     }
 }

@@ -208,7 +208,10 @@ nothing added to its context — which is why it is the prompt and not a summary
 Prompts nebula composes itself, such as a PR SESSION's scope or the note a `nebula worktree`
 relocation reopens on, are left out, and so are blank ones. A click on the line lands on the card,
 archived cards show none, and a session created before the feature simply has nothing to show until
-its next prompt.
+its next prompt. Starting a new conversation in the same session — `/clear` or `/new` in Claude,
+Codex, Cursor, Pi or OpenCode, or a `/resume` of another one — empties the history: those prompts
+belong to a conversation the session no longer has. Resuming or compacting keeps it, and the
+session's name stays either way.
 
 ## The GRID
 

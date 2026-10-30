@@ -536,11 +536,16 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     activate::diff_tree_toggled(view);
                     app.modals.diff_tree = view.tree.is_some();
                 }
-                // Ctrl+s flips the diff side by side, or unified;
-                // remembered for the next open, like the tree and width.
+                // Ctrl+s flips the diff side by side, or inline, and writes
+                // the DIFF LAYOUT setting back, so the next open (and
+                // Settings → Appearance) reads the same.
                 KeyCode::Char('s') if ctrl => {
                     view.toggle_split();
-                    app.modals.diff_split = view.split;
+                    let mut cfg = crate::config::Config::load();
+                    cfg.diff_inline = !view.split;
+                    if let Err(e) = cfg.save() {
+                        app.chrome.flash = Some(format!("could not save diff layout: {e}"));
+                    }
                 }
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
@@ -552,6 +557,11 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // list's files all three stay the filter's.
                 KeyCode::Right if view.folds_on_arrows() => activate::diff_fold(view, true),
                 KeyCode::Left if view.folds_on_arrows() => activate::diff_fold(view, false),
+                // Ctrl+o on a changed file opens it in the configured
+                // editor at the line the diff is scrolled to.
+                KeyCode::Char('o') if ctrl && view.selected_file().is_some() => {
+                    open_selected_diff_file_in_editor(app)
+                }
                 KeyCode::Enter if view.folds_on_arrows() => activate::diff_row(view, at),
                 KeyCode::PageDown => view.scroll_by(page),
                 KeyCode::PageUp => view.scroll_by(-page),

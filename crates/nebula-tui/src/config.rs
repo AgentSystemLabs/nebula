@@ -425,6 +425,7 @@ pub enum SettingKind {
     HideCardMarks,
     HighlightCurrentCard,
     SourceControlGraph,
+    DiffInline,
     SessionPane,
     WorktreeLayout,
     InlineGraphics,
@@ -536,7 +537,7 @@ impl SettingKind {
             SettingKind::AskBeforeArchive => (2026, 10, 3),
             SettingKind::ConfirmDragMove => (2026, 10, 2),
             SettingKind::SourceControlGraph | SettingKind::InlineGraphics => (2026, 10, 9),
-            SettingKind::Appearance => (2026, 10, 28),
+            SettingKind::Appearance | SettingKind::DiffInline => (2026, 10, 28),
         }
     }
 
@@ -756,6 +757,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::HideDraftPrs,
                 label: "Draft pull requests",
                 hint: "Show or hide draft pull requests in / search; checkouts always stay",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::DiffInline,
+                label: "Diff layout",
+                hint: "How the g diff view lays out a file's changes: split (old left, new right) or inline (one unified column); Ctrl+s there flips it",
                 group: "",
             },
             SettingSpec {
@@ -1274,6 +1281,11 @@ pub struct Config {
     /// read-only commit graph under the changed files. Off by default, and
     /// with it off the DIFF VIEWER does not run `git log` or `rev-list`.
     pub source_control_graph: bool,
+    /// DIFF LAYOUT: the `g` DIFF VIEWER reads each file inline — one
+    /// unified column — instead of side by side. Off by default (split);
+    /// `Ctrl+s` inside the viewer flips it and writes it back here. A
+    /// pane too narrow for two columns reads inline either way.
+    pub diff_inline: bool,
     /// RETIRED with the line counts always drawn. Through 0.37 the **Card
     /// line counts** SETTING (Settings → Appearance, off by default)
     /// switched each card's `+3 files` to `+3 files +120 -45`. Every card
@@ -1620,6 +1632,7 @@ impl Default for Config {
             card_issue_number: true,
             hide_draft_prs: false,
             source_control_graph: false,
+            diff_inline: false,
             card_line_changes: false,
             skip_session_naming: false,
             confirm_on_archive: false,
@@ -2549,6 +2562,7 @@ impl Config {
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             SettingKind::SourceControlGraph => on_off(self.source_control_graph).into(),
+            SettingKind::DiffInline => diff_layout_word(self.diff_inline).into(),
             // A project row with no project to speak of: what one without
             // an entry would show.
             SettingKind::RunCommand | SettingKind::OpenCommand => {
@@ -2682,6 +2696,9 @@ impl Config {
             }
             SettingKind::SourceControlGraph => {
                 self.source_control_graph = !self.source_control_graph;
+            }
+            SettingKind::DiffInline => {
+                self.diff_inline = !self.diff_inline;
             }
             // One project's, not the file's, and typed: see `set_project_text`.
             SettingKind::RunCommand | SettingKind::OpenCommand => {}
@@ -2838,6 +2855,14 @@ fn on_off(v: bool) -> &'static str {
         "on"
     } else {
         "off"
+    }
+}
+
+fn diff_layout_word(inline: bool) -> &'static str {
+    if inline {
+        "inline"
+    } else {
+        "split"
     }
 }
 
@@ -3975,6 +4000,29 @@ mod tests {
         assert_eq!(cfg.value_label(SettingKind::SourceControlGraph), "on");
         cfg.cycle(tab, row, 1);
         assert!(!cfg.source_control_graph);
+    }
+
+    /// DIFF LAYOUT: split out of the box, flipped to inline from its
+    /// Appearance row, persisted under `diff_inline`; a config predating
+    /// the key reads split.
+    #[test]
+    fn diff_layout_defaults_split_and_toggles_inline_on_the_appearance_tab() {
+        let mut cfg = Config::default();
+        assert!(!cfg.diff_inline);
+        assert_eq!(cfg.value_label(SettingKind::DiffInline), "split");
+
+        let (tab, row) = locate(SettingKind::DiffInline).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 1);
+        assert!(cfg.diff_inline);
+        assert_eq!(cfg.value_label(SettingKind::DiffInline), "inline");
+        cfg.cycle(tab, row, -1);
+        assert!(!cfg.diff_inline);
+
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(!old.diff_inline, "a config without the key reads split");
+        let saved: Config = serde_json::from_str(r#"{"diff_inline": true}"#).unwrap();
+        assert!(saved.diff_inline);
     }
 
     /// CARD PROMPT: retired with every card carrying its last prompt. The

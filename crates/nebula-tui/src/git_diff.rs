@@ -585,6 +585,53 @@ pub fn diff_slow(view: &mut DiffView, ticket: u64) {
     }
 }
 
+/// The new file's line under unified-diff row `row`, or the nearest one
+/// below it: what the editor opens at for a diff scrolled there. Removed
+/// lines and headers have no line of their own in the new file, so the
+/// next context or added line answers for them. `None` for text with no
+/// hunk, or a row past the last new-side line.
+pub fn new_line_at(diff: &str, row: usize) -> Option<u32> {
+    let mut new = None::<u32>;
+    for (i, line) in diff.lines().enumerate() {
+        if line.starts_with("@@") {
+            new = line
+                .split_whitespace()
+                .nth(2)
+                .and_then(|part| part.strip_prefix('+'))
+                .and_then(|part| part.split(',').next())
+                .and_then(|n| n.parse().ok());
+            continue;
+        }
+        if line.starts_with("diff --git") {
+            new = None;
+            continue;
+        }
+        let Some(n) = new else { continue };
+        // Inside a hunk the first column alone says which side a line is
+        // on: an added `+++ x` is still an added line.
+        if line.starts_with(['-', '\\']) {
+            continue;
+        }
+        if i >= row {
+            return Some(n.max(1));
+        }
+        new = Some(n + 1);
+    }
+    None
+}
+
+/// The new file's line on split row `row`, or the nearest one below it —
+/// [`new_line_at`] for the side-by-side layout.
+pub fn split_new_line_at(rows: &[SplitRow], row: usize) -> Option<u32> {
+    rows.iter().skip(row).find_map(|r| match r {
+        SplitRow::Pair {
+            right: Some((n, _)),
+            ..
+        } => Some(*n),
+        _ => None,
+    })
+}
+
 /// One row of a diff laid out side by side: the old file left, the new
 /// one right.
 #[derive(Debug, Clone, PartialEq)]
@@ -846,6 +893,32 @@ mod tests {
         assert_eq!(files[4].path, "renamed.rs");
         assert_eq!(files[4].orig_path.as_deref(), Some("original.rs"));
         assert!(files[0].orig_path.is_none());
+    }
+
+    #[test]
+    fn the_editor_line_is_the_new_files_line_under_the_scroll() {
+        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3,4 +3,5 @@ fn x\n ctx3\n-old4\n+new4\n+new5\n ctx6\n@@ -20,1 +21,1 @@\n-gone\n+here\n";
+        // Above the first hunk: its first line.
+        assert_eq!(new_line_at(diff, 0), Some(3));
+        assert_eq!(new_line_at(diff, 4), Some(3));
+        // A removed line answers with the line that replaced it.
+        assert_eq!(new_line_at(diff, 5), Some(4));
+        assert_eq!(new_line_at(diff, 7), Some(5));
+        assert_eq!(new_line_at(diff, 8), Some(6));
+        // The second hunk's header and its removal: the hunk's line.
+        assert_eq!(new_line_at(diff, 9), Some(21));
+        assert_eq!(new_line_at(diff, 10), Some(21));
+        assert_eq!(new_line_at(diff, 99), None);
+        assert_eq!(new_line_at("(no changes)", 0), None);
+
+        let rows = split_rows(diff).unwrap();
+        assert_eq!(split_new_line_at(&rows, 0), Some(3));
+        let last_hunk = rows
+            .iter()
+            .rposition(|r| matches!(r, SplitRow::Note(_, DiffLineKind::Hunk)))
+            .unwrap();
+        assert_eq!(split_new_line_at(&rows, last_hunk), Some(21));
+        assert_eq!(split_new_line_at(&rows, rows.len()), None);
     }
 
     #[test]
