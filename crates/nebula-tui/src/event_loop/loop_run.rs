@@ -111,6 +111,8 @@ macro_rules! main_loop_body {
     // The INPUT LATENCY PROBE (`NEBULA_PERF_LOG`); None outside a
     // measurement run.
     let mut perf = crate::perf::Perf::from_env();
+    // Writes the layout soon after it changes, not only on `q`.
+    let mut ui_state_saver = UiStateSaver::default();
 
     loop {
         if app.chrome.dirty && tokio::time::Instant::now() >= next_draw {
@@ -139,6 +141,7 @@ macro_rules! main_loop_body {
                     app.chrome.dirty = true;
                 }
             }
+            ui_state_saver.note(&app, tokio::time::Instant::now());
         }
 
         let focus_before = app.nav.focus;
@@ -236,6 +239,11 @@ macro_rules! main_loop_body {
                 app.chrome.dirty = true;
                 sweep_was_ticking = app.status_anim_active();
                 next_sweep_frame = tokio::time::Instant::now() + SWEEP_FRAME;
+            }
+            // A changed layout is written once it has sat for
+            // `UI_STATE_SAVE_DELAY`: an idle app has no frame to do it in.
+            _ = tokio::time::sleep_until(ui_state_saver.due.unwrap_or(next_ago_refresh)), if ui_state_saver.due.is_some() => {
+                out.extend(ui_state_saver.flush(&app));
             }
             // "23m ago" labels age on their own with nothing else to
             // repaint an idle app. Only worth a frame once some row carries
