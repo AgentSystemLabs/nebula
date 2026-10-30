@@ -1,8 +1,9 @@
 //! TUI user settings, read from the same two layers the daemon reads —
 //! `paths::config_path()` with `paths::config_local_path()` over it, see
 //! `nebula_core::settings` (each side deserializes only its own fields;
-//! serde ignores the rest). Loaded fresh at each use so edits apply without
-//! restarting the TUI. A missing file or unknown fields fall back to
+//! serde ignores the rest). File stamps are checked at each use so edits apply
+//! without restarting the TUI; unchanged settings reuse their parsed value.
+//! A missing file or unknown fields fall back to
 //! defaults; a value this build can't read costs only its own key, which is
 //! logged and left as stored.
 //!
@@ -104,6 +105,7 @@ pub const PROJECT_FILE_CHOICE: &str = nebula_core::project_file::FILE_NAME;
 // `claude_catalogue.rs` at runtime — CONFIG.JSON's `claude_models`, else
 // Claude Code's own `availableModels`, else the aliases — and Cursor's
 // from its catalogue (a seed plus a cached `cursor-agent --list-models`).
+// Codex's model and effort lists come from its app-server catalogue.
 
 /// The `quick_prompt_kind` choices: every built-in harness id, by the name
 /// the config file stores. Derived from the registry table rather than
@@ -117,7 +119,7 @@ pub fn agent_kind_names() -> Vec<String> {
 
 /// The model rows for a harness: [`DEFAULT_CHOICE`] first ("don't pass the
 /// flag — let the CLI pick", what the daemon sees as None), then the
-/// runtime catalogue (Claude/Cursor, already headed) or the descriptor's
+/// runtime catalogue (already headed) or the descriptor's
 /// static list. Pi's `--model` takes a fuzzy pattern across providers, so
 /// its list is families, not ids; a hand-edited `provider/id` passes
 /// through verbatim.
@@ -137,6 +139,7 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        Some(nebula_core::harness::HarnessCatalog::Codex) => crate::codex_catalogue::models(),
         None => headed(
             descriptor
                 .model
@@ -151,8 +154,8 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
 /// Effort rows for a harness given its chosen model (None or "default" =
 /// the CLI's pick). Empty — no Effort row, no effort submenu — while the
 /// harness offers no effort. Cursor's list follows the family (`-fast`
-/// variants ride in the effort, `high-fast`); any other harness takes its
-/// static list with any model.
+/// variants ride in the effort, `high-fast`); Codex's follows the selected
+/// model's capabilities. Other harnesses take their static list.
 pub fn effort_choices(kind: AgentKind, model: Option<&str>, custom: Option<&str>) -> Vec<String> {
     effort_choices_in(&describe(kind, custom), model)
 }
@@ -171,6 +174,15 @@ pub fn effort_choices_in(
             .iter()
             .map(|s| s.to_string())
             .collect();
+    }
+    if descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Codex) {
+        if let Some(efforts) = crate::codex_catalogue::efforts(model) {
+            return if efforts.is_empty() {
+                Vec::new()
+            } else {
+                headed(efforts)
+            };
+        }
     }
     headed(descriptor.effort.efforts.clone())
 }
@@ -237,6 +249,11 @@ pub fn fit_effort_in(
     model: Option<&str>,
     effort: Option<String>,
 ) -> Option<String> {
+    if descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Codex) {
+        if let Some(choices) = crate::codex_catalogue::efforts(model) {
+            return effort.filter(|value| fits(value, &choices));
+        }
+    }
     if !descriptor.compose_model_effort {
         return effort;
     }
@@ -1642,9 +1659,63 @@ impl Default for Config {
 /// serde — a file this build can only read key by key.
 const RENAMED_KEYS: &[(&str, &str)] = &[("hide_terminal_glyphs", "hide_card_marks")];
 
+// The UI reads settings from key handlers and draw paths. Keep one parsed
+// value per thread, keyed by both layers and their file identity/stamps:
+// hand edits, atomic replacements, deletions and local overrides all
+// invalidate immediately, without repeatedly reading and parsing JSON.
+#[derive(PartialEq, Eq)]
+struct SettingsStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    device: u64,
+    inode: u64,
+    changed: (i64, i64),
+}
+
+fn settings_stamp(path: &Path) -> Option<SettingsStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(SettingsStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        device: meta.dev(),
+        inode: meta.ino(),
+        changed: (meta.ctime(), meta.ctime_nsec()),
+    })
+}
+
+struct CachedConfig {
+    path: PathBuf,
+    local: PathBuf,
+    stamps: (Option<SettingsStamp>, Option<SettingsStamp>),
+    value: Config,
+}
+
+thread_local! {
+    static CONFIG_CACHE: std::cell::RefCell<Option<CachedConfig>> = const { std::cell::RefCell::new(None) };
+}
+
 impl Config {
     pub fn load() -> Self {
-        let cfg = load_layers(&settings_path(), &local_settings_path());
+        let path = settings_path();
+        let local = local_settings_path();
+        let stamps = (settings_stamp(&path), settings_stamp(&local));
+        let cfg = CONFIG_CACHE.with(|slot| {
+            let mut cached = slot.borrow_mut();
+            if let Some(held) = cached.as_ref() {
+                if held.path == path && held.local == local && held.stamps == stamps {
+                    return held.value.clone();
+                }
+            }
+            let value = load_layers(&path, &local);
+            *cached = Some(CachedConfig {
+                path,
+                local,
+                stamps,
+                value: value.clone(),
+            });
+            value
+        });
         // The Claude model rows follow `claude_models` live, as every
         // other hand edit does. Not under test: the list is process-global
         // and a test that never pinned the path would install the dev's.
@@ -1741,6 +1812,9 @@ impl Config {
                 }
             }
         }
+        // Invalidate before writing either layer, including on partial
+        // failure. A subsequent read must observe what reached disk.
+        CONFIG_CACHE.with(|slot| slot.borrow_mut().take());
         settings::write_json(path, &serde_json::Value::Object(root))?;
         if let (true, Some(held)) = (local_changed, local_root) {
             settings::write_json(local, &serde_json::Value::Object(held))?;
@@ -2085,6 +2159,9 @@ impl Config {
                 Some(nebula_core::harness::HarnessCatalog::Cursor) => format!(
                     "Default model family for new {label} sessions; rows follow cursor-agent --list-models"
                 ),
+                Some(nebula_core::harness::HarnessCatalog::Codex) => format!(
+                    "Default model for new {label} sessions; rows follow Codex's model catalog automatically"
+                ),
                 None => format!("Default model for new {label} sessions (default = CLI's pick)"),
             },
             HarnessField::Effort => {
@@ -2123,7 +2200,7 @@ impl Config {
     }
 
     /// Cycle an Agents harness row: toggle Enabled, step Model / Effort
-    /// through the rows the pickers offer. A composing harness refits its
+    /// through the rows the pickers offer. A model-dependent harness refits its
     /// effort against the new model, so the row never holds an id the CLI
     /// would refuse.
     pub fn cycle_agent_row(&mut self, id: &str, field: HarnessField, delta: i32) {
@@ -2142,7 +2219,9 @@ impl Config {
                 let next = cycle_owned(&descriptor.model.default, &choices, step);
                 self.set_harness_model(id, next.clone());
                 let descriptor = self.effective_harness_by_id(id);
-                if descriptor.compose_model_effort {
+                if descriptor.compose_model_effort
+                    || descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Codex)
+                {
                     let choices = effort_choices_in(&descriptor, Some(&next));
                     if !fits(&descriptor.effort.default, &choices) {
                         let fitted = fit_effort_in(&descriptor, Some(&next), None)
@@ -2335,13 +2414,15 @@ impl Config {
                 changed = true;
             }
         }
-        // A composing harness (Cursor's family-suffix shape) keeps the
-        // stored effort only if the family it now names ships it, as the
+        // A model-dependent harness keeps the stored effort only if the
+        // model it now names supports it, as the
         // AGENTS TAB's own Model cycle does — never an id the CLI would
         // refuse.
         if changed {
             let descriptor = self.effective_harness_by_id(&id);
-            if descriptor.compose_model_effort {
+            if descriptor.compose_model_effort
+                || descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Codex)
+            {
                 let family = descriptor.default_model().map(str::to_string);
                 let choices = effort_choices_in(&descriptor, family.as_deref());
                 if !fits(&descriptor.effort.default, &choices) {
@@ -5570,5 +5651,79 @@ mod tests {
         assert_eq!(saved["palette_enter_attaches"], true);
         assert_eq!(saved["git_init_on_create"], true);
         assert_eq!(saved["session_idle_timeout"], "5m");
+    }
+}
+
+#[cfg(test)]
+mod performance_probes {
+    #[test]
+    #[ignore = "manual settings benchmark; run with --ignored --nocapture"]
+    fn repeated_settings_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = serde_json::to_value(super::Config::default()).unwrap();
+        // Project overrides and fields owned by the daemon can make the
+        // shared settings much larger than the TUI's own settings.
+        config["benchmark_extra"] = serde_json::json!(vec!["project override"; 2000]);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        super::with_config_path(path, || {
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                std::hint::black_box(super::Config::load());
+            }
+            eprintln!(
+                "settings read: {:.3} us/load",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn settings_cache_observes_same_size_edits_even_when_mtime_is_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"editor":"vim"}"#).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        with_config_path(path.clone(), || {
+            assert_eq!(Config::load().editor, "vim");
+            std::fs::write(&path, r#"{"editor":"nvi"}"#).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            assert_eq!(Config::load().editor, "nvi");
+        });
+    }
+
+    #[test]
+    fn settings_cache_observes_layer_creation_replacement_and_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let local = dir.path().join("config.local.json");
+        std::fs::write(&path, r#"{"editor":"vim"}"#).unwrap();
+        with_config_path(path.clone(), || {
+            assert_eq!(Config::load().editor, "vim");
+            std::fs::write(&local, r#"{"editor":"nvi"}"#).unwrap();
+            assert_eq!(Config::load().editor, "nvi");
+            let replacement = dir.path().join("replacement.json");
+            std::fs::write(&replacement, r#"{"editor":"zed"}"#).unwrap();
+            std::fs::rename(replacement, &local).unwrap();
+            assert_eq!(Config::load().editor, "zed");
+            std::fs::remove_file(&local).unwrap();
+            assert_eq!(Config::load().editor, "vim");
+            let mut cfg = Config::load();
+            cfg.editor = "hx".into();
+            cfg.save().unwrap();
+            assert_eq!(Config::load().editor, "hx");
+            Config::reset_to_defaults().unwrap();
+            assert_eq!(Config::load().editor, Config::default().editor);
+        });
     }
 }

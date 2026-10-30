@@ -872,10 +872,13 @@ pub(crate) fn attach_inner(
         // arriving comes back from there when it was shown recently: its
         // last screen is up on this frame, and the Attach below asks only
         // for what it missed. Anything else starts blank and replays.
+        // Claim the destination before stashing the old pane: inserting
+        // into a full cache could otherwise evict the screen being opened.
+        let cached = app.take_cached_term(&sref);
         if let Some(leaving) = app.pane.term.take() {
             app.stash_term(leaving);
         }
-        let term = match app.take_cached_term(&sref) {
+        let term = match cached {
             Some(mut kept) => {
                 kept.resize(cols, rows);
                 kept.set_scroll(0);

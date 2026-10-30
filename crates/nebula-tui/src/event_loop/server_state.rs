@@ -287,6 +287,14 @@ pub(crate) struct SelectionSnapshot {
     session_group: Option<SessionGroup>,
 }
 
+impl SelectionSnapshot {
+    pub(crate) fn remap_session(&mut self, from: &SessionRef, to: &SessionRef) {
+        if self.session.as_ref() == Some(from) {
+            self.session = Some(to.clone());
+        }
+    }
+}
+
 /// The Sessions panel's groups, in the order it lists them: the live
 /// agents, TERMINALS, PULL REQUESTS, ARCHIVED. Each is one unbroken run
 /// of rows, so a row's group changes only where the next one starts.

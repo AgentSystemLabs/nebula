@@ -25,9 +25,9 @@ pub const SWEEP_FRAME: std::time::Duration = std::time::Duration::from_millis(10
 pub const ONE_SHOT_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many recently shown sessions keep their screen ([`App::term_cache`]):
-/// enough for a rotation through the sessions of a couple of worktrees.
+/// enough for a rotation through a busy project’s sessions.
 /// What bounds the memory is [`TERM_CACHE_CELLS`], not this.
-pub const TERM_CACHE_MAX: usize = 6;
+pub const TERM_CACHE_MAX: usize = 32;
 /// The most the kept screens may hold between them, in grid cells (32 bytes
 /// each, so about 12 MB — half of what two entries of that size each used to
 /// be allowed). An alt-screen CLI is a screen's worth, 200 KB; a shell whose
@@ -1110,7 +1110,7 @@ pub struct DiffView {
     /// out per file. Its presence also turns OFF reviewed-mark persistence:
     /// marks are stored under the worktree path and pruned when that path
     /// isn't a directory, and a pull request has no path of its own.
-    pub prefetched: Option<HashMap<String, String>>,
+    pub prefetched: Option<std::sync::Arc<HashMap<String, String>>>,
     /// The pull request a prefetched view is showing, by URL — what a
     /// fresh `gh pr diff` landing later checks before replacing the
     /// contents of a modal opened on the cached copy. `None` for the
@@ -2285,9 +2285,29 @@ impl AgentLaunchDraft {
     }
 }
 
+#[derive(Clone)]
+pub struct TerminalCreation {
+    pub(crate) placeholder: TerminalId,
+    pub(crate) input: Vec<u8>,
+    pub(crate) cancelled: bool,
+}
+
+impl std::fmt::Debug for TerminalCreation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalCreation")
+            .field("placeholder", &self.placeholder)
+            .field("queued_bytes", &self.input.len())
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
+}
+
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
+    /// A temporary terminal card shown while its shell is being created.
+    /// The reply replaces its id or removes it; input waits for the real id.
+    TerminalCreated(TerminalCreation),
     /// Attach the created session; `focus` also enters and locks the
     /// terminal pane. Off (the QUICK PROMPT's default) stops at selecting
     /// the row, so the pane previews the new session without taking the
@@ -2415,6 +2435,7 @@ impl PendingIntent {
     /// on it.
     pub fn follows(&self) -> bool {
         match self {
+            PendingIntent::TerminalCreated(create) => !create.cancelled,
             PendingIntent::AttachCreated { .. }
             | PendingIntent::AttachCreatedWithCloudRetry { .. }
             | PendingIntent::AttachCreatedPrSession { .. }
@@ -2926,6 +2947,7 @@ impl vt100::Callbacks for TermCallbacks {
 
 pub struct AttachedTerm {
     pub sref: SessionRef,
+    pub(crate) replay: Option<crate::terminal_replay::Pending>,
     pub parser: vt100::Parser<TermCallbacks>,
     pub exited: bool,
     /// Size the parser (and daemon PTY) currently uses.
@@ -2975,6 +2997,7 @@ impl AttachedTerm {
     pub fn new(sref: SessionRef, cols: u16, rows: u16) -> Self {
         Self {
             sref,
+            replay: None,
             parser: vt100::Parser::new_with_callbacks(
                 rows,
                 cols,
@@ -2996,6 +3019,7 @@ impl AttachedTerm {
 
     /// Reset the parser (fresh replay is about to arrive).
     pub fn reset(&mut self) {
+        self.replay = None;
         self.parser = vt100::Parser::new_with_callbacks(
             self.rows,
             self.cols,
@@ -3066,6 +3090,9 @@ impl AttachedTerm {
     /// Regrid to `cols`×`rows` when that differs from the current size.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if (self.cols, self.rows) != (cols, rows) {
+            if let Some(replay) = &mut self.replay {
+                replay.resize(cols, rows);
+            }
             self.cols = cols;
             self.rows = rows;
             self.parser.screen_mut().set_size(rows, cols);
@@ -3110,6 +3137,10 @@ impl AttachedTerm {
     /// parser's offset climbed past the top forever, and the way back down
     /// took as many notches as were spent up there.
     pub fn set_scroll(&mut self, scroll: usize) {
+        if self.replay.is_some() {
+            self.pending_scroll = Some(scroll);
+            return;
+        }
         self.parser.screen_mut().set_scrollback(scroll);
     }
 
@@ -5027,7 +5058,7 @@ impl App {
     pub fn is_placeholder_session(&self, sref: &SessionRef) -> bool {
         match sref {
             SessionRef::Agent(id) => self.is_placeholder_agent(id),
-            SessionRef::Terminal(_) => false,
+            SessionRef::Terminal(id) => self.requests.pending.values().any(|intent| matches!(intent, PendingIntent::TerminalCreated(create) if &create.placeholder == id)),
         }
     }
 

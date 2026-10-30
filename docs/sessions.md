@@ -269,8 +269,11 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   `` ^` `` brings the pane up empty — one press, since there was nothing on screen to fold — with
   nothing on its header to click — `t` opens a terminal on the project's root; the terminal comes
   up as a card inside its checkout's band with the keys in it, and `t` (or an EMPTY BAND's
-  right-click **New terminal**) is the only way to open one: the grid has no `+` for it. From the keyboard the header can also be
-  walked: `k`,`k` (`↑`,`↑`) on the top row of cards hands the keys up to the tabs, with a cursor of
+  right-click **New terminal**) is the only way to open one: the grid has no `+` for it. The card
+  and its starting pane appear immediately. Typing and paste during startup wait for the new
+  shell; closing the starting terminal discards that input and closes the shell when creation
+  finishes. A failed create removes the card and reports why. From the keyboard the header can
+  also be walked: `k`,`k` (`↑`,`↑`) on the top row of cards hands the keys up to the tabs, with a cursor of
   their own on the lit tab; `h`/`l` (`←`/`→`) move it and the grid switches with it, each project
   shown on its last-focused card as the cursor passes, and `Enter` — or `j`,`j` (`↓`,`↓`) back
   down, or `Esc` — hands the keys back to the cards of the project on screen. The `×` on a tab, or `x` for the one the
@@ -526,6 +529,11 @@ archives nothing by itself (with the confirm off, it archives one card); a held 
 VIEW unarchives one card, and the next needs
 the key let go and pressed again (on a terminal with the kitty keyboard protocol, which is what
 tells a held key's repeats from a fresh press; without it a long hold still walks the row).
+
+Worktree deletion opens its confirmation immediately. The dialog shows “Checking…” while the
+daemon looks for running processes, uncommitted changes, and commits missing from the base.
+`Enter` and `y` wait for that check; `Esc` cancels immediately. Findings appear in the open dialog.
+Confirmed deletions remove cards immediately and restore them if the daemon reports a failure.
 
 **`⇧A` is the ARCHIVED VIEW**: the same grid, of the project's archived sessions instead of its live
 ones, with the header counting them under their own word (`3 archived sessions`). `u` unarchives the

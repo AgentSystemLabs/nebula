@@ -56,6 +56,7 @@ pub struct DiffListing {
 
 #[derive(Debug)]
 pub enum Answer {
+    TerminalReplay(crate::terminal_replay::Replayed),
     Grep {
         ticket: u64,
         result: Result<(Vec<GrepHit>, bool), String>,
@@ -96,10 +97,15 @@ pub enum Answer {
         result: Result<Vec<DiffFile>, String>,
     },
     /// [`STALE_GRACE`] is up on `ticket`.
-    Slow { ticket: u64 },
+    Slow {
+        ticket: u64,
+    },
     /// The system clipboard could not be written off the loop: hand the
     /// copy to the terminal instead (OSC 52), and say so.
-    ClipboardViaTerminal { payload: String, flash: String },
+    ClipboardViaTerminal {
+        payload: String,
+        flash: String,
+    },
     /// This process's resident set, for the footer's memory readout and the
     /// memory modal: a `ps`, on a five-second beat.
     ClientRss(u64),

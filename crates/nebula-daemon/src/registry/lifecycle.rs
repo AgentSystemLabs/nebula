@@ -379,7 +379,13 @@ impl Daemon {
             })
             .filter(|(_, canonical)| cwd.starts_with(canonical))
             .max_by_key(|(_, canonical)| canonical.components().count());
-        if let Some((worktree, _)) = target {
+        if let Some((worktree, canonical)) = target {
+            // A Task subagent's isolated checkout is the subagent's, never
+            // the conversation's: whatever payload reported it, the session
+            // stays where it is.
+            if is_claude_subagent_checkout(&canonical) {
+                return Ok(());
+            }
             if worktree.id != agent.worktree_id {
                 tracing::info!(
                     agent = %agent.id,
@@ -556,5 +562,52 @@ impl Daemon {
             self.record_prompt(id, text);
         }
         Ok(())
+    }
+}
+
+/// A checkout Claude Code made for an isolated Task subagent:
+/// `<repo>/.claude/worktrees/agent-<hex id>`. A Claude session the user
+/// moves into a worktree of its own (`EnterWorktree`) gets a chosen name
+/// there instead, so only the `agent-` + hex shape is the subagent's.
+pub(super) fn is_claude_subagent_checkout(path: &Path) -> bool {
+    let mut parts = path.components().rev();
+    let (Some(leaf), Some(worktrees), Some(dot_claude)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let is = |c: std::path::Component, s: &str| c.as_os_str() == s;
+    let Some(id) = leaf
+        .as_os_str()
+        .to_str()
+        .and_then(|l| l.strip_prefix("agent-"))
+    else {
+        return false;
+    };
+    is(worktrees, "worktrees")
+        && is(dot_claude, ".claude")
+        && !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod subagent_checkout_tests {
+    use super::is_claude_subagent_checkout;
+    use std::path::Path;
+
+    #[test]
+    fn only_a_claude_subagent_checkout_matches() {
+        let yes = "/r/game/.claude/worktrees/agent-a52d9b9052ac7e5db";
+        assert!(is_claude_subagent_checkout(Path::new(yes)));
+        for no in [
+            "/r/game/.claude/worktrees/my-feature",
+            "/r/game/.claude/worktrees/agent-",
+            "/r/game/.claude/worktrees/agent-notahexid",
+            "/r/game-worktrees/agent-a52d9b9052ac7e5db",
+            "/r/game/worktrees/agent-a52d9b9052ac7e5db",
+            "/r/game",
+        ] {
+            assert!(!is_claude_subagent_checkout(Path::new(no)), "{no}");
+        }
     }
 }

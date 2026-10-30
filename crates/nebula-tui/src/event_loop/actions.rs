@@ -243,19 +243,7 @@ pub(crate) fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec
         return;
     }
     worked_in(app, &worktree);
-    send_with(
-        app,
-        out,
-        PendingIntent::AttachCreated {
-            focus: true,
-            placeholder: None,
-        },
-        |req_id| ClientRequest::CreateTerminal {
-            req_id,
-            worktree,
-            name: None,
-        },
-    );
+    terminal_create::start(app, worktree, out);
 }
 
 /// The worktree the selection stands for: the selected one, or the selected
