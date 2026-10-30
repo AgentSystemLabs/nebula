@@ -821,6 +821,9 @@ mod tests {
 
     #[tokio::test]
     async fn codex_foreground_stop_captures_the_reported_pr_only() {
+        // A Codex row: Codex hooks on any other kind of session are dropped
+        // (`nested_codex_hooks_do_not_drive_a_claude_session`), and the
+        // `recv` below would wait forever.
         let (env, mut rx, _) = start_hook_server(seeded_store(), None).await.unwrap();
         for (event, extra, expected) in [
             ("Stop", "", true),
@@ -832,7 +835,7 @@ mod tests {
             );
             let (status, _) = http_post(
                 env.port,
-                &format!("/api/hooks/codex?agentId=titled&hookEvent={event}"),
+                &format!("/api/hooks/codex?agentId=codex&hookEvent={event}"),
                 &env.token,
                 &body,
             )
