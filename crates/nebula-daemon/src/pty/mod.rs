@@ -1,4 +1,5 @@
 pub mod cloud;
+pub mod codex_model;
 pub mod cursor;
 pub mod kitty;
 mod osc;
@@ -241,6 +242,9 @@ pub enum PtyEvent {
     Question {
         open: bool,
     },
+    CodexModel {
+        selection: codex_model::Selection,
+    },
 }
 
 enum ReaderMsg {
@@ -278,6 +282,7 @@ pub struct PtySession {
     /// Cursor's ask-question dialog watcher; `None` until a cursor-agent
     /// session arms it, so other sessions keep no screen for it.
     question: Mutex<Option<QuestionScanner>>,
+    codex_model: Mutex<Option<codex_model::Scanner>>,
     /// Screen for answering cursor position reports; `None` until the child
     /// first asks, so sessions that never do parse nothing.
     cursor: Mutex<Option<CursorTracker>>,
@@ -353,6 +358,7 @@ impl PtySession {
                 title: Mutex::new(title::TitleScanner::new()),
                 cloud: Mutex::new(None),
                 question: Mutex::new(None),
+                codex_model: Mutex::new(None),
                 cursor: Mutex::new(None),
             },
             reader,
@@ -397,6 +403,7 @@ impl PtySession {
                 title: Mutex::new(title::TitleScanner::restored(carried.title)),
                 cloud: Mutex::new(None),
                 question: Mutex::new(None),
+                codex_model: Mutex::new(None),
                 cursor: Mutex::new(None),
             },
             reader,
@@ -473,6 +480,9 @@ impl PtySession {
         }
         if let Some(question) = self.question.lock().as_mut() {
             question.resize(cols, rows);
+        }
+        if let Some(scanner) = self.codex_model.lock().as_mut() {
+            scanner.resize(cols, rows);
         }
         Ok(())
     }
@@ -685,6 +695,25 @@ impl PtySession {
         let (cols, rows) = *self.last_size.lock();
         let (_, history) = self.snapshot(None);
         *slot = Some(QuestionScanner::new(cols, rows, &history));
+    }
+
+    /// Arm after the event subscriber is installed. Replay under the same
+    /// lock the pump takes before appending to the ring, so fast startup
+    /// output is neither missed nor fed twice.
+    pub fn arm_codex_model_scan(&self) {
+        let mut slot = self.codex_model.lock();
+        let (cols, rows) = *self.last_size.lock();
+        let (_, history) = self.snapshot(None);
+        let mut scanner = codex_model::Scanner::new(cols, rows);
+        let selection = scanner.feed(&history);
+        *slot = Some(scanner);
+        if let Some(selection) = selection {
+            let _ = self.events.send(PtyEvent::CodexModel { selection });
+        }
+    }
+
+    pub fn codex_selection(&self) -> Option<codex_model::Selection> {
+        self.codex_model.lock().as_ref()?.selection().cloned()
     }
 
     /// The bytes owed to the child for one chunk's queries, in query order.
@@ -933,11 +962,19 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             .lock()
             .as_mut()
             .and_then(|scanner| scanner.feed(pending, std::time::Instant::now()));
+        let mut codex_scanner = session.codex_model.lock();
+        let codex_selection = codex_scanner
+            .as_mut()
+            .and_then(|scanner| scanner.feed(pending));
         let seq = session.ring.lock().append(pending);
+        drop(codex_scanner);
         let _ = session.events.send(PtyEvent::Output {
             seq,
             data: std::mem::take(pending),
         });
+        if let Some(selection) = codex_selection {
+            let _ = session.events.send(PtyEvent::CodexModel { selection });
+        }
         if let Some(flags) = actions.flags_changed {
             tracing::debug!(session = ?session.sref, flags, "child kitty flags changed");
             let _ = session.events.send(PtyEvent::KittyFlags { flags });
@@ -1112,6 +1149,48 @@ mod tests {
         assert!(screen.screen().bracketed_paste());
         // A client that kept its screen gets the ring as it is.
         assert_eq!(session.snapshot(Some(head)), (head, raw));
+    }
+
+    #[tokio::test]
+    async fn codex_model_confirmation_reaches_subscribers_before_any_prompt() {
+        for replay in [false, true] {
+            let session = PtySession::spawn(
+                SessionRef::Agent(AgentId::generate()),
+                SpawnSpec {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "printf '• Model changed to gpt-5.5 xhigh for this session only\\r\\n'; sleep 2".into()],
+                    cwd: std::env::temp_dir(),
+                    env: vec![],
+                    scrub_env: &[],
+                    cols: 120,
+                    rows: 24,
+                },
+            ).unwrap();
+            let mut rx = session.events.subscribe();
+            if replay {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !matches!(rx.recv().await, Ok(PtyEvent::Output { .. })) {}
+                })
+                .await
+                .unwrap();
+            }
+            session.arm_codex_model_scan();
+            let selection = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match rx.recv().await.unwrap() {
+                        PtyEvent::CodexModel { selection } => break selection,
+                        PtyEvent::Exited { .. } => panic!("child exited without a selection"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(selection.model, "gpt-5.5");
+            assert_eq!(selection.effort.as_deref(), Some("xhigh"));
+            assert_eq!(session.codex_selection(), Some(selection));
+            session.kill();
+        }
     }
 
     /// A window title set by the child reaches subscribers as its own

@@ -651,6 +651,17 @@ impl Store {
         Ok(true)
     }
 
+    /// Empty the row's RECENT PROMPTS (NULL is the empty history).
+    /// Returns whether a row was there.
+    pub fn clear_prompts(&self, id: &AgentId) -> Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE agents SET recent_prompts = NULL WHERE id = ?1",
+            params![id.as_str()],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn agent_claude_title(&self, id: &AgentId) -> Result<Option<String>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT claude_title FROM agents WHERE id = ?1")?;
@@ -789,6 +800,19 @@ impl Store {
         self.conn.lock().execute(
             "UPDATE agents SET model = ?2 WHERE id = ?1",
             params![id.as_str(), model],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_agent_model_effort(
+        &self,
+        id: &AgentId,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE agents SET model = ?2, effort = ?3 WHERE id = ?1",
+            params![id.as_str(), model, effort],
         )?;
         Ok(())
     }

@@ -1168,12 +1168,12 @@ pub(crate) fn land_pr_diff(app: &mut App, answer: PrDiffAnswer) {
 pub(crate) fn refresh_pr_diff_view(view: &mut DiffView, diff: &str) -> bool {
     let chunks = crate::pull_request::split_unified_diff(diff);
     let fresh: std::collections::HashMap<String, String> = chunks.iter().cloned().collect();
-    if view.prefetched.as_ref() == Some(&fresh) {
+    if view.prefetched.as_deref() == Some(&fresh) {
         return false;
     }
     let was_on = view.selected_path().map(str::to_string);
     let scroll = view.scroll;
-    view.prefetched = Some(fresh);
+    view.prefetched = Some(std::sync::Arc::new(fresh));
     view.replace_files(pr_diff_files(&chunks));
     let same = was_on.is_some_and(|path| view.select_path(&path));
     crate::git_diff::load_selected_diff(view);
@@ -1231,10 +1231,10 @@ pub(crate) fn open_pr_diff_view(
         .map(|p| p.repo_path.clone())
         .unwrap_or_default();
     let mut view = DiffView::new(root, title, files, true);
-    view.prefetched = Some(chunks.into_iter().collect());
+    view.prefetched = Some(std::sync::Arc::new(chunks.into_iter().collect()));
     view.pr_url = Some(url.to_string());
     view.files_width = app.modals.diff_files_width;
-    view.split = app.modals.diff_split;
+    view.split = !crate::config::Config::load().diff_inline;
     if app.modals.diff_tree {
         view.toggle_tree();
     }

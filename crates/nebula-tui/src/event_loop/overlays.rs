@@ -161,10 +161,9 @@ fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             // starts a session jumps to that harness's Agents section,
             // where its defaults live. Ahead of type-ahead on purpose:
             // `?` is a jump on these rows, never a filter letter (no row
-            // contains one); `s` only jumps without a filter, since in
-            // the model/effort submenus it narrows the list. `s` keeps
-            // its global meaning — settings — so the picker agrees with
-            // the panels.
+            // contains one); `s` only jumps without a filter — the
+            // harness pickers and their model/effort submenus type it
+            // into the query — so it still jumps from a PR row's menu.
             KeyCode::Char(c)
                 if (c == '?' || (c == 's' && menu.filter.is_none()))
                     && menu.hovered_agent_kind().is_some() =>
@@ -174,7 +173,8 @@ fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     .expect("the guard checked the hovered row");
                 open_harness_settings(app, kind, custom);
             }
-            // Type-ahead in the MODEL / EFFORT submenus: letters narrow the
+            // Type-ahead in the harness pickers and their MODEL / EFFORT
+            // submenus (and the other filtered pickers): letters narrow the
             // rows (so ↑/↓ move there, not j/k), Backspace widens, and Esc
             // clears the text before it backs out. A letter no row matches
             // is refused, so the list never empties.
@@ -409,25 +409,6 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
 
 fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    // A confirm held unshown for its DELETE CHECK takes only a cancel
-    // (`Esc`, or `n` where `n` cancels) and `Enter` / `y`, which wait for
-    // the check below: nothing is chosen in a dialog nobody has seen —
-    // not even the card-only `n` of a delete that offers the worktree.
-    if crate::delete_check::held(app) {
-        let three_way = matches!(
-            &app.modals.overlay,
-            Some(Overlay::Confirm(c))
-                if matches!(c.action, PendingAction::ThenDeleteWorktree { offered: true, .. })
-        );
-        let passes = match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('y') => true,
-            KeyCode::Char('n') => !three_way,
-            _ => false,
-        };
-        if !passes {
-            return;
-        }
-    }
     let Some(overlay) = &mut app.modals.overlay else {
         return;
     };
@@ -555,11 +536,16 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     activate::diff_tree_toggled(view);
                     app.modals.diff_tree = view.tree.is_some();
                 }
-                // Ctrl+s flips the diff side by side, or unified;
-                // remembered for the next open, like the tree and width.
+                // Ctrl+s flips the diff side by side, or inline, and writes
+                // the DIFF LAYOUT setting back, so the next open (and
+                // Settings → Appearance) reads the same.
                 KeyCode::Char('s') if ctrl => {
                     view.toggle_split();
-                    app.modals.diff_split = view.split;
+                    let mut cfg = crate::config::Config::load();
+                    cfg.diff_inline = !view.split;
+                    if let Err(e) = cfg.save() {
+                        app.chrome.flash = Some(format!("could not save diff layout: {e}"));
+                    }
                 }
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
@@ -571,6 +557,11 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // list's files all three stay the filter's.
                 KeyCode::Right if view.folds_on_arrows() => activate::diff_fold(view, true),
                 KeyCode::Left if view.folds_on_arrows() => activate::diff_fold(view, false),
+                // Ctrl+o on a changed file opens it in the configured
+                // editor at the line the diff is scrolled to.
+                KeyCode::Char('o') if ctrl && view.selected_file().is_some() => {
+                    open_selected_diff_file_in_editor(app)
+                }
                 KeyCode::Enter if view.folds_on_arrows() => activate::diff_row(view, at),
                 KeyCode::PageDown => view.scroll_by(page),
                 KeyCode::PageUp => view.scroll_by(-page),

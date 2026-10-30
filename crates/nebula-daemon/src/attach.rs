@@ -212,7 +212,8 @@ async fn step(
             | PtyEvent::Title { .. }
             | PtyEvent::CloudTitle { .. }
             | PtyEvent::CloudSession { .. }
-            | PtyEvent::Question { .. },
+            | PtyEvent::Question { .. }
+            | PtyEvent::CodexModel { .. },
         ) => Step::Continue,
         Err(RecvError::Lagged(_)) => {
             // Catch up from the ring. If the missed bytes are still

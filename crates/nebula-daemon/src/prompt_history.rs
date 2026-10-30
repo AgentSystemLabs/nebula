@@ -97,6 +97,18 @@ impl Daemon {
             Err(e) => tracing::warn!(agent = %id, error = %e, "prompt not recorded"),
         }
     }
+
+    /// Empty the session's history and push the row to every subscriber —
+    /// the CLI started a new conversation (`Effect::ConversationChanged`),
+    /// so the prompts it held describe one that is gone. A missing row is
+    /// silently nothing.
+    pub fn clear_prompts(&self, id: &AgentId) {
+        match self.store.clear_prompts(id) {
+            Ok(true) => self.try_broadcast_agent(id),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(agent = %id, error = %e, "prompts not cleared"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -174,16 +186,12 @@ mod tests {
         assert_eq!(condense(&exact).as_deref(), Some(exact.as_str()));
     }
 
-    /// The whole path past the hook: a recorded prompt lands on the row
-    /// and reaches subscribers as the row's upsert; an unknown id is
-    /// silent.
-    #[tokio::test]
-    async fn record_prompt_upserts_the_row_with_its_history() {
+    /// A daemon over an in-memory store holding one row, `a1`.
+    fn daemon_with_one_agent() -> (Arc<Daemon>, AgentId) {
         use crate::hooks::HookEnv;
         use crate::store::Store;
         use nebula_core::{
-            Agent, AgentKind, AgentStatus, Entity, Project, ProjectId, ServerEvent, Worktree,
-            WorktreeId,
+            Agent, AgentKind, AgentStatus, Project, ProjectId, Worktree, WorktreeId,
         };
         let store = Arc::new(Store::open_in_memory().unwrap());
         store
@@ -235,6 +243,16 @@ mod tests {
                 token: String::new(),
             },
         );
+        (daemon, id)
+    }
+
+    /// The whole path past the hook: a recorded prompt lands on the row
+    /// and reaches subscribers as the row's upsert; an unknown id is
+    /// silent.
+    #[tokio::test]
+    async fn record_prompt_upserts_the_row_with_its_history() {
+        use nebula_core::{Entity, ServerEvent};
+        let (daemon, id) = daemon_with_one_agent();
         let mut events = daemon.events.subscribe();
 
         daemon.record_prompt(&id, "fix the login redirect".into());
@@ -252,5 +270,69 @@ mod tests {
 
         daemon.record_prompt(&AgentId("ghost".into()), "nothing".into());
         assert!(events.try_recv().is_err(), "an unknown id is silent");
+    }
+
+    /// `/clear` keeps the session id but not the conversation: the
+    /// prompts typed before it leave the store and every TUI's row.
+    #[tokio::test]
+    async fn clear_prompts_empties_the_history_and_upserts_the_row() {
+        use nebula_core::{Entity, ServerEvent};
+        let (daemon, id) = daemon_with_one_agent();
+        daemon.record_prompt(&id, "fix the login redirect".into());
+        daemon.record_prompt(&id, "now the logout".into());
+        let mut events = daemon.events.subscribe();
+
+        daemon.clear_prompts(&id);
+        match events.try_recv() {
+            Ok(ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            }) => {
+                assert_eq!(a.id, id);
+                assert!(a.recent_prompts.is_empty());
+            }
+            other => panic!("expected the row's upsert, got {other:?}"),
+        }
+        let stored = daemon.store.get_agent(&id).unwrap().unwrap();
+        assert!(stored.recent_prompts.is_empty());
+
+        daemon.clear_prompts(&AgentId("ghost".into()));
+        assert!(events.try_recv().is_err(), "an unknown id is silent");
+    }
+
+    /// The hook path end to end: a prompt under one conversation, then
+    /// the next one under a new id — Cursor after `/clear`, OpenCode after
+    /// `/new` — leaves only the new prompt; a `SessionStart` that keeps the
+    /// id (`resume`, `compact`) leaves the history alone.
+    #[test]
+    fn a_new_conversation_id_drops_the_old_prompts() {
+        use crate::status::HookEvent;
+        let (daemon, id) = daemon_with_one_agent();
+        let prompts = || {
+            daemon
+                .store
+                .get_agent(&id)
+                .unwrap()
+                .unwrap()
+                .recent_prompts
+                .into_iter()
+                .map(|p| p.text)
+                .collect::<Vec<_>>()
+        };
+        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("c1".into()));
+        daemon.record_prompt(&id, "fix the login redirect".into());
+        for source in ["resume", "compact"] {
+            daemon.apply_hook_event(
+                &id,
+                HookEvent::SessionStart {
+                    source: Some(source.into()),
+                },
+                Some("c1".into()),
+            );
+        }
+        assert_eq!(prompts(), ["fix the login redirect"]);
+
+        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("c2".into()));
+        daemon.record_prompt(&id, "now the logout".into());
+        assert_eq!(prompts(), ["now the logout"]);
     }
 }

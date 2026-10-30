@@ -25,9 +25,9 @@ pub const SWEEP_FRAME: std::time::Duration = std::time::Duration::from_millis(10
 pub const ONE_SHOT_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many recently shown sessions keep their screen ([`App::term_cache`]):
-/// enough for a rotation through the sessions of a couple of worktrees.
+/// enough for a rotation through a busy project’s sessions.
 /// What bounds the memory is [`TERM_CACHE_CELLS`], not this.
-pub const TERM_CACHE_MAX: usize = 6;
+pub const TERM_CACHE_MAX: usize = 32;
 /// The most the kept screens may hold between them, in grid cells (32 bytes
 /// each, so about 12 MB — half of what two entries of that size each used to
 /// be allowed). An alt-screen CLI is a screen's worth, 200 KB; a shell whose
@@ -463,8 +463,9 @@ pub struct ContextMenu {
     pub area: Rect,
     /// The menu ← returns to when this one is a submenu.
     pub parent: Option<Box<ContextMenu>>,
-    /// Type-ahead over the rows — set on the MODEL / EFFORT submenus, where
-    /// letters filter instead of moving (↑/↓ move there); None elsewhere.
+    /// Type-ahead over the rows — set on the harness pickers and their
+    /// MODEL / EFFORT submenus (and a few other pickers), where letters
+    /// filter instead of moving (↑/↓ move there); None elsewhere.
     pub filter: Option<MenuFilter>,
 }
 
@@ -491,10 +492,14 @@ impl ContextMenu {
             return false;
         }
         let items: Vec<MenuItem> = ranked.iter().map(|(i, _)| filter.all[*i].clone()).collect();
+        // A list with no ✓ (the harness pickers) keeps the cursor on the
+        // row it was on, so clearing a query never jumps it to the top.
+        let hovered = self.items.get(self.hover).map(|i| i.label.as_str());
         self.hover = if query.trim().is_empty() {
             items
                 .iter()
                 .position(|i| i.label.ends_with(" ✓"))
+                .or_else(|| items.iter().position(|i| Some(i.label.as_str()) == hovered))
                 .unwrap_or(0)
         } else {
             0
@@ -1110,7 +1115,7 @@ pub struct DiffView {
     /// out per file. Its presence also turns OFF reviewed-mark persistence:
     /// marks are stored under the worktree path and pruned when that path
     /// isn't a directory, and a pull request has no path of its own.
-    pub prefetched: Option<HashMap<String, String>>,
+    pub prefetched: Option<std::sync::Arc<HashMap<String, String>>>,
     /// The pull request a prefetched view is showing, by URL — what a
     /// fresh `gh pr diff` landing later checks before replacing the
     /// contents of a modal opened on the cached copy. `None` for the
@@ -1164,8 +1169,9 @@ pub struct DiffView {
     /// The reader has moved the cursor: what lands from now on leaves it
     /// where they put it (`settle`).
     pub touched: bool,
-    /// Diffs side by side (`Ctrl+s` flips it), remembered across opens.
-    /// A narrow pane falls back to the unified diff.
+    /// Diffs side by side — the `diff_inline` SETTING off; `Ctrl+s` flips
+    /// it and writes the setting back. A narrow pane falls back to the
+    /// unified diff.
     pub split: bool,
     /// `diff` laid out side by side, while `split` is on and it has hunks.
     pub split_rows: Option<std::sync::Arc<[crate::git_diff::SplitRow]>>,
@@ -1380,6 +1386,20 @@ impl DiffView {
     pub fn toggle_split(&mut self) {
         self.split = !self.split;
         self.refresh_split();
+    }
+
+    /// The line of the new file at the top of the diff pane — or below it,
+    /// the nearest one the pane has — in the layout the last draw used:
+    /// where Enter opens the editor. 1 for a diff with no hunk.
+    pub fn editor_line(&self) -> u64 {
+        let row = self.scroll as usize;
+        let line = match &self.split_rows {
+            Some(rows) if self.split_shown => crate::git_diff::split_new_line_at(rows, row)
+                .or_else(|| crate::git_diff::split_new_line_at(rows, 0)),
+            _ => crate::git_diff::new_line_at(&self.diff, row)
+                .or_else(|| crate::git_diff::new_line_at(&self.diff, 0)),
+        };
+        line.map_or(1, u64::from)
     }
 
     /// The rows the diff pane scrolls over, in the layout the last draw
@@ -2285,9 +2305,29 @@ impl AgentLaunchDraft {
     }
 }
 
+#[derive(Clone)]
+pub struct TerminalCreation {
+    pub(crate) placeholder: TerminalId,
+    pub(crate) input: Vec<u8>,
+    pub(crate) cancelled: bool,
+}
+
+impl std::fmt::Debug for TerminalCreation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalCreation")
+            .field("placeholder", &self.placeholder)
+            .field("queued_bytes", &self.input.len())
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
+}
+
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
+    /// A temporary terminal card shown while its shell is being created.
+    /// The reply replaces its id or removes it; input waits for the real id.
+    TerminalCreated(TerminalCreation),
     /// Attach the created session; `focus` also enters and locks the
     /// terminal pane. Off (the QUICK PROMPT's default) stops at selecting
     /// the row, so the pane previews the new session without taking the
@@ -2415,6 +2455,7 @@ impl PendingIntent {
     /// on it.
     pub fn follows(&self) -> bool {
         match self {
+            PendingIntent::TerminalCreated(create) => !create.cancelled,
             PendingIntent::AttachCreated { .. }
             | PendingIntent::AttachCreatedWithCloudRetry { .. }
             | PendingIntent::AttachCreatedPrSession { .. }
@@ -2926,6 +2967,7 @@ impl vt100::Callbacks for TermCallbacks {
 
 pub struct AttachedTerm {
     pub sref: SessionRef,
+    pub(crate) replay: Option<crate::terminal_replay::Pending>,
     pub parser: vt100::Parser<TermCallbacks>,
     pub exited: bool,
     /// Size the parser (and daemon PTY) currently uses.
@@ -2975,6 +3017,7 @@ impl AttachedTerm {
     pub fn new(sref: SessionRef, cols: u16, rows: u16) -> Self {
         Self {
             sref,
+            replay: None,
             parser: vt100::Parser::new_with_callbacks(
                 rows,
                 cols,
@@ -2996,6 +3039,7 @@ impl AttachedTerm {
 
     /// Reset the parser (fresh replay is about to arrive).
     pub fn reset(&mut self) {
+        self.replay = None;
         self.parser = vt100::Parser::new_with_callbacks(
             self.rows,
             self.cols,
@@ -3066,6 +3110,9 @@ impl AttachedTerm {
     /// Regrid to `cols`×`rows` when that differs from the current size.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if (self.cols, self.rows) != (cols, rows) {
+            if let Some(replay) = &mut self.replay {
+                replay.resize(cols, rows);
+            }
             self.cols = cols;
             self.rows = rows;
             self.parser.screen_mut().set_size(rows, cols);
@@ -3110,6 +3157,10 @@ impl AttachedTerm {
     /// parser's offset climbed past the top forever, and the way back down
     /// took as many notches as were spent up there.
     pub fn set_scroll(&mut self, scroll: usize) {
+        if self.replay.is_some() {
+            self.pending_scroll = Some(scroll);
+            return;
+        }
         self.parser.screen_mut().set_scrollback(scroll);
     }
 
@@ -3143,9 +3194,11 @@ pub struct UiState {
     /// in older blobs, which keep the flat list.
     #[serde(default)]
     pub diff_tree: bool,
-    /// False means the diff modal opens side by side; absent in older blobs,
-    /// so they keep the new default.
-    #[serde(default)]
+    /// RETIRED to the `diff_inline` SETTING: blobs through this build said
+    /// here that `Ctrl+s` had left the diff modal unified. Read once, to
+    /// carry that choice into the setting (`restore_ui_state`), and never
+    /// written again.
+    #[serde(default, skip_serializing)]
     pub diff_unified: bool,
     /// Height the LAUNCHER VIEW's pane was dragged to; absent in older
     /// blobs, and None in ones written before the edge was ever dragged,
@@ -3998,9 +4051,6 @@ pub struct ModalState {
     /// The diff modal lists its files as a directory tree (`Ctrl+t` inside
     /// it), remembered across opens and launches like the width.
     pub diff_tree: bool,
-    /// The diff modal shows diffs side by side (`Ctrl+s` inside it),
-    /// remembered the same way.
-    pub diff_split: bool,
     /// Selected tab of the settings modal, remembered across opens.
     pub settings_tab: usize,
     /// Cursor row of the settings modal, one per tab, remembered across
@@ -4042,7 +4092,6 @@ impl Default for ModalState {
             follow_up: None,
             diff_files_width: DEFAULT_DIFF_FILES_W,
             diff_tree: false,
-            diff_split: true,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
             settings_on_tabs: true,
@@ -5027,7 +5076,7 @@ impl App {
     pub fn is_placeholder_session(&self, sref: &SessionRef) -> bool {
         match sref {
             SessionRef::Agent(id) => self.is_placeholder_agent(id),
-            SessionRef::Terminal(_) => false,
+            SessionRef::Terminal(id) => self.requests.pending.values().any(|intent| matches!(intent, PendingIntent::TerminalCreated(create) if &create.placeholder == id)),
         }
     }
 

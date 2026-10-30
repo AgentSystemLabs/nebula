@@ -365,7 +365,8 @@ pub(crate) fn open_diff_view(app: &mut App) {
     let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
-    let show_graph = crate::config::Config::load().source_control_graph;
+    let cfg = crate::config::Config::load();
+    let (show_graph, split) = (cfg.source_control_graph, !cfg.diff_inline);
     let Some(jobs) = app.jobs.view_jobs.clone() else {
         // No loop to land an answer on (unit tests): read inline.
         match crate::git_diff::read_listing(&path) {
@@ -390,7 +391,7 @@ pub(crate) fn open_diff_view(app: &mut App) {
     } else {
         let mut view = DiffView::opening(path.clone(), branch, jobs.clone(), ticket);
         view.files_width = app.modals.diff_files_width;
-        view.split = app.modals.diff_split;
+        view.split = split;
         if show_graph {
             view.place = crate::app::Place::ChangesHeader;
             crate::git_log::request_log(&mut view);
@@ -431,7 +432,7 @@ pub(crate) fn show_graph_diff_listing(
     let mut view = DiffView::new(path, branch, Vec::new(), true);
     view.jobs = app.jobs.view_jobs.clone();
     view.files_width = app.modals.diff_files_width;
-    view.split = app.modals.diff_split;
+    view.split = !crate::config::Config::load().diff_inline;
     view.place = crate::app::Place::ChangesHeader;
     if app.modals.diff_tree {
         view.toggle_tree();
@@ -456,7 +457,7 @@ pub(crate) fn show_diff_listing(
     let mut view = DiffView::new(path, branch, Vec::new(), true);
     view.jobs = app.jobs.view_jobs.clone();
     view.files_width = app.modals.diff_files_width;
-    view.split = app.modals.diff_split;
+    view.split = !crate::config::Config::load().diff_inline;
     crate::git_diff::fill_view(&mut view, listing);
     // After the marks: the tree opens on the first unreviewed file too.
     if app.modals.diff_tree && view.toggle_tree() {
@@ -552,6 +553,7 @@ pub(crate) fn open_grep_view(app: &mut App) {
 pub(crate) fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) {
     use crate::view_jobs::Answer;
     match answer {
+        Answer::TerminalReplay(answer) => crate::terminal_replay::land(app, answer),
         Answer::Grep { ticket, result } => {
             if let Some(Overlay::Grep(view)) = &mut app.modals.overlay {
                 view.land(ticket, result);
@@ -786,6 +788,36 @@ pub(crate) fn open_selected_file_in_editor(app: &mut App) {
     if spawn_editor_modal(app, &editor, &root, &path, 1, size) {
         close_finder_behind_editor(app);
     }
+}
+
+/// `Ctrl+o` on a changed file in the DIFF VIEWER: the configured editor
+/// (`Settings → General → File editor`) opens the file in the editor
+/// modal, at the new file's line the diff pane is scrolled to. The viewer
+/// stays open underneath, so quitting the editor lands back on the review
+/// with that file's diff re-read (`close_vim`). A pull request's diff has
+/// no checkout of its own on disk to edit, and a deleted file has nothing
+/// left to open: both flash instead.
+pub(crate) fn open_selected_diff_file_in_editor(app: &mut App) {
+    let Some(Overlay::Diff(view)) = &app.modals.overlay else {
+        return;
+    };
+    let Some(file) = view.selected_file() else {
+        return;
+    };
+    let path = file.path.clone();
+    if view.prefetched.is_some() {
+        app.chrome.flash = Some("a pull request's diff has no local file to edit".into());
+        return;
+    }
+    let root = view.root.clone();
+    if !root.join(&path).is_file() {
+        app.chrome.flash = Some(format!("{path} is not on disk (deleted?)"));
+        return;
+    }
+    let line = view.editor_line();
+    let editor = crate::config::Config::load().editor_command();
+    let size = vim_size_guess(app);
+    spawn_editor_modal(app, &editor, &root, &path, line, size);
 }
 
 /// Enter on a tree-browser file row: spawn the editor embedded in the

@@ -13,8 +13,7 @@
 //! their own in that same order.
 
 use crate::app::{
-    last_interaction_ms, now_ms, project_recency, project_rollup, project_unseen, worktree_recency,
-    worktree_rollup, worktree_unseen, OpenPrs, Tree,
+    last_interaction_ms, now_ms, project_recencies, rollup, worktree_recencies, OpenPrs, Tree,
 };
 use crate::filter_list::{FilterList, FilterMatch};
 use crate::pull_request::{Standing, Trouble};
@@ -298,47 +297,97 @@ fn build_palette_items(
     // crumb every row under it draws dim before its own name.
     let crumb = |p: &Project| Some((0, p.name.chars().count()));
     let projects: Vec<&Project> = tree.projects.iter().collect();
+    // Group once, preserving tree order inside each group. Palette opens
+    // and status refreshes must not rescan every session for each checkout.
+    let mut by_project: HashMap<_, Vec<_>> = HashMap::new();
+    for worktree in &tree.worktrees {
+        by_project
+            .entry(&worktree.project_id)
+            .or_default()
+            .push(worktree);
+    }
+    let mut by_worktree: HashMap<_, Vec<_>> = HashMap::new();
+    for agent in &tree.agents {
+        by_worktree
+            .entry(&agent.worktree_id)
+            .or_default()
+            .push(agent);
+    }
+    let worktree_recency = worktree_recencies(tree, now);
+    let project_recency = project_recencies(tree, now);
+    let mut worktree_state = HashMap::new();
+    let mut project_state: HashMap<_, (Option<AgentStatus>, bool)> = HashMap::new();
+    for worktree in &tree.worktrees {
+        let agents = by_worktree
+            .get(&worktree.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let status = rollup(agents.iter().filter(|a| !a.archived).map(|a| a.status));
+        let unseen = agents.iter().any(|a| !a.archived && a.unseen);
+        worktree_state.insert(&worktree.id, (status, unseen));
+    }
+    // Preserve global agent order for equal-priority statuses (terminated
+    // and disconnected share a rank); grouping by checkout would change
+    // which one the project inherits.
+    let owners: HashMap<_, _> = tree
+        .worktrees
+        .iter()
+        .map(|w| (&w.id, &w.project_id))
+        .collect();
+    for agent in tree.agents.iter().filter(|a| !a.archived) {
+        let Some(project_id) = owners.get(&agent.worktree_id) else {
+            continue;
+        };
+        let project = project_state.entry(*project_id).or_default();
+        project.0 = rollup(project.0.into_iter().chain(Some(agent.status)));
+        project.1 |= agent.unseen;
+    }
+
     // The kinds stay grouped project → worktree → session, so a bare
     // query still ranks the shallowest match first.
     for p in &projects {
+        let recency = project_recency.get(&p.id).copied().unwrap_or_default();
+        let (status, unseen) = project_state.get(&p.id).copied().unwrap_or_default();
         items.push(PaletteItem {
             target: PaletteTarget::Project(p.id.clone()),
             text: p.name.clone(),
             label_at: 0,
             crumb: None,
-            stamped: project_recency(tree, &p.id, now).stamped,
-            status: project_rollup(tree, &p.id),
-            unseen: project_unseen(tree, &p.id) > 0,
+            stamped: recency.stamped,
+            status,
+            unseen,
             tier: PaletteTier::Rest,
-            interacted: project_recency(tree, &p.id, now).interacted,
+            interacted: recency.interacted,
             standing: None,
             trouble: None,
         });
     }
     for p in &projects {
         let under = format!("{}/", p.name);
-        for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+        for w in by_project.get(&p.id).into_iter().flatten() {
+            let recency = worktree_recency.get(&w.id).copied().unwrap_or_default();
+            let (status, unseen) = worktree_state.get(&w.id).copied().unwrap_or_default();
             items.push(PaletteItem {
                 target: PaletteTarget::Worktree(w.id.clone()),
                 text: format!("{under}{}", w.branch),
                 label_at: under.chars().count(),
                 crumb: crumb(p),
-                stamped: worktree_recency(tree, &w.id, now).stamped,
-                status: worktree_rollup(tree, &w.id),
-                unseen: worktree_unseen(tree, &w.id) > 0,
+                stamped: recency.stamped,
+                status,
+                unseen,
                 tier: PaletteTier::Rest,
-                interacted: worktree_recency(tree, &w.id, now).interacted,
+                interacted: recency.interacted,
                 standing: None,
                 trouble: None,
             });
         }
     }
     for p in &projects {
-        for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+        for w in by_project.get(&p.id).into_iter().flatten() {
             // The branch stays in the searched path but not the drawn
             // label: the row reads project → session title.
             let under = format!("{}/{}/", p.name, w.branch);
-            for a in tree.agents.iter().filter(|a| a.worktree_id == w.id) {
+            for a in by_worktree.get(&w.id).into_iter().flatten() {
                 // An ARCHIVED session is not a jump target: its PTY is
                 // released, so there is nothing to attach to or answer.
                 if a.archived {
@@ -800,5 +849,49 @@ mod tests {
             !hunted.iter().any(|t| t.contains("gone")),
             "archived row found by name: {hunted:?}"
         );
+    }
+    #[test]
+    fn grouped_palette_metadata_keeps_rollup_ties_and_archived_recency() {
+        let mut tree = tree();
+        tree.agents = vec![
+            agent(
+                "disconnected-first",
+                "w2",
+                AgentStatus::Disconnected,
+                true,
+                100,
+            ),
+            agent(
+                "terminated-second",
+                "w1",
+                AgentStatus::Terminated,
+                false,
+                200,
+            ),
+            agent("archived-running", "w1", AgentStatus::Running, true, 300),
+        ];
+        tree.agents[2].archived = true;
+        let items = build_palette_items(&tree, &HashMap::new(), false);
+        for item in items {
+            match &item.target {
+                PaletteTarget::Project(id) => {
+                    assert_eq!(item.status, crate::app::project_rollup(&tree, id));
+                    assert_eq!(item.unseen, crate::app::project_unseen(&tree, id) > 0);
+                    assert_eq!(
+                        item.stamped,
+                        crate::app::project_recency(&tree, id, now_ms()).stamped
+                    );
+                }
+                PaletteTarget::Worktree(id) => {
+                    assert_eq!(item.status, crate::app::worktree_rollup(&tree, id));
+                    assert_eq!(item.unseen, crate::app::worktree_unseen(&tree, id) > 0);
+                    assert_eq!(
+                        item.stamped,
+                        crate::app::worktree_recency(&tree, id, now_ms()).stamped
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 }

@@ -397,12 +397,25 @@ async fn receive_hook(
         return quiet_or(StatusCode::OK, HOOK_NOT_OK);
     };
     let agent_id = AgentId(query.agent_id.clone());
+    // A Claude tool can launch codex exec with the parent's NEBULA_*
+    // environment. Its start/stop hooks must not adopt or finish that row.
+    if cli == HookCli::Codex {
+        if let Ok(Some(agent)) = state.store.get_agent(&agent_id) {
+            if agent.kind != nebula_core::AgentKind::Codex {
+                return quiet_or(StatusCode::OK, HOOK_NOT_OK);
+            }
+        }
+    }
     tracing::debug!(agent = %agent_id, event = ?event, "hook received");
     // A subagent's tool traffic reports the payload's cwd too, but that is
     // the Task's position, not the session's — an isolated subagent working
     // in a scratch checkout must never drag the row out from under the
-    // conversation. Only foreground payloads carry a cwd onward.
-    let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
+    // conversation. Only foreground payloads carry a cwd onward, and only
+    // from events whose cwd is the conversation's (not a Notification,
+    // which a subagent sends unstamped — `HookEvent::reports_session_cwd`).
+    let cwd = payload
+        .cwd()
+        .filter(|_| payload.subagent_id().is_none() && event.reports_session_cwd());
     // Only Claude persists a session title of its own beside a transcript.
     let transcript = match cli {
         HookCli::Claude => TranscriptRef::from_payload(
@@ -550,6 +563,15 @@ mod tests {
             .insert_agent_with_auto_title(&agent("pending"), true)
             .unwrap();
         store.insert_agent(&agent("titled")).unwrap();
+        store
+            .insert_agent_with_auto_title(
+                &Agent {
+                    kind: AgentKind::Codex,
+                    ..agent("codex")
+                },
+                true,
+            )
+            .unwrap();
         // A row the user (or AUTO-TITLE) named, that Claude doesn't hold yet.
         store
             .insert_agent(&Agent {
@@ -558,6 +580,22 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    #[tokio::test]
+    async fn nested_codex_hooks_do_not_drive_a_claude_session() {
+        let (env, mut rx, _) = start_hook_server(seeded_store(), None).await.unwrap();
+        for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+            let (status, _) = http_post(
+                env.port,
+                &format!("/api/hooks/codex?agentId=titled&hookEvent={event}"),
+                &env.token,
+                r#"{"session_id":"nested-codex"}"#,
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     /// The reply's `sessionTitle` is how a nebula-side name reaches
@@ -601,12 +639,12 @@ mod tests {
         // Codex: same dialect, but no title exchange and no transcript.
         let (_, body) = http_post(
             env.port,
-            "/api/hooks/codex?agentId=named&hookEvent=UserPromptSubmit",
+            "/api/hooks/codex?agentId=codex&hookEvent=UserPromptSubmit",
             &env.token,
             payload,
         )
         .await;
-        assert_eq!(body, "");
+        assert_eq!(body, auto_title_injection());
         assert!(rx.recv().await.unwrap().transcript.is_none());
 
         // Other Claude events deliver the transcript too (the sync reads on
@@ -677,7 +715,10 @@ mod tests {
         for route in ["codex", "pi", "opencode"] {
             let (_, body) = http_post(
                 env.port,
-                &format!("/api/hooks/{route}?agentId=pending&hookEvent=UserPromptSubmit"),
+                &format!(
+                    "/api/hooks/{route}?agentId={}&hookEvent=UserPromptSubmit",
+                    if route == "codex" { "codex" } else { "pending" }
+                ),
                 &env.token,
                 payload,
             )
@@ -803,6 +844,31 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// Claude builds a Notification's payload with no subagent context, so a
+    /// Task subagent's notification arrives unstamped, its `cwd` the
+    /// subagent's checkout. It still drives status, but carries no cwd on,
+    /// so it can't re-home the session into that checkout.
+    #[tokio::test]
+    async fn a_notification_carries_no_cwd() {
+        let store = seeded_store();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
+        let (status, _) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=Notification",
+            &env.token,
+            r#"{"session_id":"s1","notification_type":"permission_prompt","cwd":"/w/.claude/worktrees/agent-a1b2"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let delivery = rx.recv().await.unwrap();
+        assert!(matches!(delivery.event, HookEvent::Notification { .. }));
+        assert!(
+            delivery.cwd.is_none(),
+            "notification cwd: {:?}",
+            delivery.cwd
+        );
     }
 
     /// The prompt reaches the drain loop condensed, on its own event

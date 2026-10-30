@@ -31,6 +31,8 @@ macro_rules! main_loop_body {
     // when its settings carry one, so an org-restricted machine offers the
     // ids the CLI will accept instead of aliases it refuses.
     crate::claude_catalogue::bootstrap(cfg.claude_enabled);
+    // Codex supplies both models and their supported reasoning efforts.
+    crate::codex_catalogue::bootstrap(&cfg.effective_harness_by_id("codex"));
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
     // Pointer shape last sent to the $terminal (OSC 22), so hover over a
@@ -109,6 +111,8 @@ macro_rules! main_loop_body {
     // The INPUT LATENCY PROBE (`NEBULA_PERF_LOG`); None outside a
     // measurement run.
     let mut perf = crate::perf::Perf::from_env();
+    // Writes the layout soon after it changes, not only on `q`.
+    let mut ui_state_saver = UiStateSaver::default();
 
     loop {
         if app.chrome.dirty && tokio::time::Instant::now() >= next_draw {
@@ -128,6 +132,16 @@ macro_rules! main_loop_body {
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
             send_held_attach(&mut app, &mut out);
+            // Size changes and held attaches are produced by drawing. Send
+            // them before select sleeps; otherwise an idle pane waits for
+            // an unrelated timer or keystroke to start its replay.
+            for req in out.drain(..) {
+                if $channels.tx.send(req).await.is_err() {
+                    app.chrome.conn = ConnState::Disconnected;
+                    app.chrome.dirty = true;
+                }
+            }
+            ui_state_saver.note(&app, tokio::time::Instant::now());
         }
 
         let focus_before = app.nav.focus;
@@ -139,10 +153,8 @@ macro_rules! main_loop_body {
             .map_or_else(tokio::time::Instant::now, |combo| {
                 tokio::time::Instant::from_std(combo.deadline())
             });
-        // When a worktree delete's confirm, held for its DELETE CHECK, is
-        // to be shown though the check has not answered (its arm below).
-        let confirm_reveal = crate::delete_check::reveal_at(&app);
-        let confirm_reveal_at = confirm_reveal
+        let check_timeout = crate::delete_check::timeout_at(&app);
+        let check_timeout_at = check_timeout
             .map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std);
         // When the EDGE AUTO-SCROLL next steps (its arm below).
         let drag_autoscroll_deadline = app
@@ -228,6 +240,11 @@ macro_rules! main_loop_body {
                 sweep_was_ticking = app.status_anim_active();
                 next_sweep_frame = tokio::time::Instant::now() + SWEEP_FRAME;
             }
+            // A changed layout is written once it has sat for
+            // `UI_STATE_SAVE_DELAY`: an idle app has no frame to do it in.
+            _ = tokio::time::sleep_until(ui_state_saver.due.unwrap_or(next_ago_refresh)), if ui_state_saver.due.is_some() => {
+                out.extend(ui_state_saver.flush(&app));
+            }
             // "23m ago" labels age on their own with nothing else to
             // repaint an idle app. Only worth a frame once some row carries
             // one — a project or worktree row reads any session under it,
@@ -263,7 +280,7 @@ macro_rules! main_loop_body {
                 let _ = reassert_modes($terminal.backend_mut());
                 next_mode_reassert = tokio::time::Instant::now() + MODE_REASSERT;
             }
-            _ = tokio::time::sleep_until(confirm_reveal_at), if confirm_reveal.is_some() => {
+            _ = tokio::time::sleep_until(check_timeout_at), if check_timeout.is_some() => {
                 app.chrome.dirty = true;
             }
             // The EDGE AUTO-SCROLL beat: a drag-selection resting past the
@@ -446,16 +463,26 @@ macro_rules! main_loop_body {
             note_focus_change(&mut app);
         }
 
-        // Drain whatever else is immediately ready before redrawing once
-        // (burst coalescing for PTY output).
-        while let Ok(ev) = $channels.rx.try_recv() {
+        // Coalesce ready output, yielding after 64 events or about 2 ms
+        // so a continuously producing PTY cannot starve input and paint.
+        // Individual event handlers still run to completion.
+        let drain_started = std::time::Instant::now();
+        for _ in 0..64 {
+            if drain_started.elapsed() >= Duration::from_millis(2) {
+                break;
+            }
+            let Ok(ev) = $channels.rx.try_recv() else { break };
             log_server_event(&ev);
             if let Some(perf) = &mut perf {
                 perf.server(crate::perf::server_name(&ev));
             }
             handle_server_event(&mut app, ev, &mut out);
         }
-        while let Ok(ev) = vim_rx.try_recv() {
+        for _ in 0..64 {
+            if drain_started.elapsed() >= Duration::from_millis(2) {
+                break;
+            }
+            let Ok(ev) = vim_rx.try_recv() else { break };
             handle_vim_event(&mut app, ev);
         }
         note_preview_change(&mut app, preview_before);

@@ -3063,6 +3063,28 @@ mod tests {
         assert!(daemon.store.get_agent(&id).unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn failed_terminal_spawn_removes_the_new_row() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["terminal-failure"]);
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        seed_worktree(
+            &daemon,
+            "terminal-failure",
+            "terminal-failure-w",
+            missing.to_str().unwrap(),
+            true,
+        );
+        let id = WorktreeId("terminal-failure-w".into());
+        assert!(daemon.create_terminal(&id, None).is_err());
+        let (_, _, _, terminals) = daemon.store.load_tree().unwrap();
+        assert!(
+            terminals.is_empty(),
+            "a refused create must not reappear on reconnect"
+        );
+    }
+
     fn seed_projects(daemon: &Daemon, names: &[&str]) {
         for (i, name) in names.iter().enumerate() {
             daemon
@@ -3610,6 +3632,48 @@ mod tests {
         // cwd outside every worktree is ignored.
         daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/elsewhere", None, false);
         assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+    }
+
+    /// A Task subagent's isolated checkout (`.claude/worktrees/agent-<id>`)
+    /// never takes the session, whatever payload reports it: the subagent
+    /// is working there, not the conversation.
+    #[test]
+    fn reparent_never_moves_a_session_into_a_subagent_checkout() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(
+            &daemon,
+            "p",
+            "sub",
+            "/nebula-test/p/.claude/worktrees/agent-a52d9b9052ac7e5db",
+            false,
+        );
+        seed_worktree(
+            &daemon,
+            "p",
+            "named",
+            "/nebula-test/p/.claude/worktrees/my-feature",
+            false,
+        );
+        seed_agent(&daemon, "a1", "root", None);
+
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            "/nebula-test/p/.claude/worktrees/agent-a52d9b9052ac7e5db/src",
+            None,
+            false,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "root");
+
+        // A worktree the session entered by name still re-homes it.
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            "/nebula-test/p/.claude/worktrees/my-feature",
+            None,
+            false,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "named");
     }
 
     /// Regression: a session that creates a worktree and steps into it
@@ -4642,6 +4706,192 @@ mod tests {
         );
         daemon.reap_prewarmed();
         assert!(daemon.prewarmed.lock().is_empty());
+    }
+
+    /// Missing Codex hooks used to leave a finished row without an id:
+    /// reaping its PTY meant the next attach silently opened a new chat.
+    #[tokio::test]
+    async fn idle_reaping_preserves_used_agents_until_they_can_resume() {
+        use nebula_core::harness::{Clearable, HarnessOverride};
+
+        // Pin the effective registry: local overrides must never change
+        // which PTYs this regression expects the reaper to preserve.
+        let custom = HarnessOverride {
+            program: Clearable::Set("custom-agent".into()),
+            resume_flag: Clearable::Set("--resume".into()),
+            ..HarnessOverride::default()
+        };
+        let broken = HarnessOverride {
+            program: Clearable::Clear,
+            ..custom.clone()
+        };
+        let harnesses = harness_registry_in(
+            &std::collections::BTreeMap::from([
+                ("custom".into(), custom),
+                ("broken".into(), broken),
+            ]),
+            &[],
+        );
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let dir = tempfile::tempdir().unwrap();
+        seed_worktree(&daemon, "p", "w", dir.path().to_str().unwrap(), true);
+        seed_agent(&daemon, "template", "w", None);
+        let template = daemon
+            .store
+            .get_agent(&AgentId("template".into()))
+            .unwrap()
+            .unwrap();
+        daemon.store.delete_agent(&template.id).unwrap();
+
+        for (name, kind, custom_harness, status, sid, kept) in [
+            (
+                "missing",
+                AgentKind::Codex,
+                None,
+                AgentStatus::Finished,
+                None,
+                true,
+            ),
+            (
+                "claude",
+                AgentKind::Claude,
+                None,
+                AgentStatus::Finished,
+                None,
+                true,
+            ),
+            (
+                "blank",
+                AgentKind::Codex,
+                None,
+                AgentStatus::Finished,
+                Some(" "),
+                true,
+            ),
+            (
+                "resumable",
+                AgentKind::Codex,
+                None,
+                AgentStatus::Finished,
+                Some("sid"),
+                false,
+            ),
+            (
+                "hookless",
+                AgentKind::Muse,
+                None,
+                AgentStatus::Finished,
+                Some("sid"),
+                true,
+            ),
+            (
+                "fresh",
+                AgentKind::Codex,
+                None,
+                AgentStatus::Fresh,
+                None,
+                false,
+            ),
+            (
+                "busy",
+                AgentKind::Codex,
+                None,
+                AgentStatus::Running,
+                None,
+                true,
+            ),
+            (
+                "feedback",
+                AgentKind::Codex,
+                None,
+                AgentStatus::NeedsFeedback,
+                None,
+                true,
+            ),
+            (
+                "missing-harness-id",
+                AgentKind::Custom,
+                None,
+                AgentStatus::Finished,
+                Some("sid"),
+                true,
+            ),
+            (
+                "deleted-harness",
+                AgentKind::Custom,
+                Some("deleted"),
+                AgentStatus::Finished,
+                Some("sid"),
+                true,
+            ),
+            (
+                "broken-harness",
+                AgentKind::Custom,
+                Some("broken"),
+                AgentStatus::Finished,
+                Some("sid"),
+                true,
+            ),
+            (
+                "resumable-custom",
+                AgentKind::Custom,
+                Some("custom"),
+                AgentStatus::Finished,
+                Some("sid"),
+                false,
+            ),
+        ] {
+            let mut agent = template.clone();
+            agent.id = AgentId(name.into());
+            agent.kind = kind;
+            agent.custom_harness = custom_harness.map(str::to_string);
+            agent.status = status;
+            agent.session_id = sid.map(str::to_string);
+            daemon.store.insert_agent(&agent).unwrap();
+            let sref = SessionRef::Agent(agent.id.clone());
+            let session = PtySession::spawn(
+                sref.clone(),
+                SpawnSpec {
+                    program: "sleep".into(),
+                    args: vec!["30".into()],
+                    cwd: dir.path().to_path_buf(),
+                    env: vec![],
+                    scrub_env: &[],
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+            daemon.install_session(session.clone());
+            daemon
+                .session_interest
+                .lock()
+                .insert(sref.clone(), Instant::now() - Duration::from_secs(600));
+            daemon.reap_idle_sessions_after(Duration::from_secs(300), &harnesses);
+            assert_eq!(daemon.is_alive(&sref), kept, "{name}");
+            if kept {
+                assert!(Arc::ptr_eq(&session, &daemon.session(&sref).unwrap()));
+            }
+        }
+
+        // Hooks recovering makes the very same conversation safe to reap.
+        let id = AgentId("missing".into());
+        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("recovered".into()));
+        daemon.apply_hook_event(&id, HookEvent::Stop, Some("recovered".into()));
+        daemon.reap_idle_sessions_after(Duration::from_secs(300), &harnesses);
+        assert!(!daemon.is_alive(&SessionRef::Agent(id.clone())));
+        assert_eq!(
+            daemon
+                .store
+                .get_agent(&id)
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("recovered")
+        );
+        daemon.kill_all();
     }
 
     /// Switching `prewarm_agents` off drains the pool on the next sweep. A
