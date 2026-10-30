@@ -16,7 +16,11 @@
 //! with the TREE BROWSER's highlighting, tables in aligned columns, links
 //! underlined with the address dim beside them. Images are their alt text
 //! in brackets — a terminal has no picture to show — and raw HTML stays
-//! raw, dimmed, rather than being guessed at.
+//! raw, dimmed, rather than being guessed at, except for the closed list of
+//! tags GitHub renders and its bots write ([`HTML_TAGS`]: links, images,
+//! `<details>` / `<summary>`, bold and italic, and the wrappers whose text
+//! is all that matters): a fragment made only of those is drawn as the
+//! markdown it stands for, and anything else in it keeps it raw.
 
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
@@ -276,6 +280,10 @@ struct Renderer<'a> {
     links: Vec<(String, usize)>,
     /// Open images: where in `inline` the alt text began.
     images: Vec<usize>,
+    /// What HTML tags opened and have not closed yet, innermost last:
+    /// undone when the block they opened in ends, so a stray `<b>` stops
+    /// at its paragraph instead of bolding the rest of the comment.
+    html_open: Vec<HtmlStyle>,
 }
 
 impl<'a> Renderer<'a> {
@@ -312,6 +320,7 @@ impl<'a> Renderer<'a> {
             table: None,
             links: Vec::new(),
             images: Vec::new(),
+            html_open: Vec::new(),
         }
     }
 
@@ -575,6 +584,163 @@ impl<'a> Renderer<'a> {
         )
     }
 
+    /// A link closes: its address, dim, beside the text — unless the text
+    /// already is the address, or the link is a badge (nothing but an
+    /// image). An HTML `<a>` with nothing left to show (an avatar whose
+    /// `alt=""` drew nothing) shows nothing at all, address included.
+    fn link_end(&mut self, empty_says_nothing: bool) {
+        self.link = self.link.saturating_sub(1);
+        if let Some((dest, start)) = self.links.pop() {
+            if empty_says_nothing && start == self.inline.len() {
+                return;
+            }
+            let text = self.inline_text(start);
+            // A badge — a link that is nothing but an image — is
+            // read, not followed: its address stays out of the way.
+            let badge = start < self.inline.len() && self.inline[start..].iter().all(|a| a.image);
+            if !badge && shows_address(&dest, &text) {
+                let style = self.dim();
+                self.space = true;
+                self.push_text(&format!("({dest})"), style);
+            }
+        }
+    }
+
+    /// A raw-HTML fragment — one inline tag, or one line of an HTML block
+    /// (`block_line`) — drawn as the markdown it stands for when every tag
+    /// in it is on the closed list ([`HTML_TAGS`]). False, with nothing
+    /// drawn, otherwise: the caller shows it raw and dim, as all HTML once
+    /// was.
+    fn html(&mut self, src: &str, block_line: bool) -> bool {
+        let Some(pieces) = html_pieces(src) else {
+            return false;
+        };
+        for piece in pieces {
+            match piece {
+                HtmlPiece::Comment => {}
+                HtmlPiece::Text(text) => {
+                    if text.starts_with(char::is_whitespace) {
+                        self.space = true;
+                    }
+                    let style = self.style();
+                    self.push_text(text.trim(), style);
+                    if text.ends_with(char::is_whitespace) {
+                        self.space = true;
+                    }
+                }
+                HtmlPiece::Open { name, attrs } => self.html_open(&name, &attrs),
+                HtmlPiece::Close(name) => self.html_close(&name),
+            }
+        }
+        // A line of an HTML block ends in white space as far as HTML is
+        // concerned: the next line's text is a new word. An inline tag is
+        // no white space: `H<sub>2</sub>O` stays one word.
+        if block_line {
+            self.space = true;
+        }
+        true
+    }
+
+    fn html_open(&mut self, name: &str, attrs: &[(String, String)]) {
+        let attr = |key: &str| {
+            attrs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        match name {
+            "a" => {
+                self.link += 1;
+                let href = attr("href").unwrap_or_default().to_string();
+                self.links.push((href, self.inline.len()));
+                self.html_open.push(HtmlStyle::Link);
+            }
+            // `alt=""` says the picture is decoration: nothing to read. No
+            // `alt` at all is an image like a markdown one with none.
+            "img" => match attr("alt") {
+                Some(alt) if alt.trim().is_empty() => {}
+                alt => {
+                    let label = match alt {
+                        Some(alt) => format!("[{}]", alt.trim()),
+                        None => "[image]".to_string(),
+                    };
+                    let style = self.dim();
+                    let start = self.inline.len();
+                    self.push_text(&label, style);
+                    for atom in &mut self.inline[start..] {
+                        atom.image = true;
+                    }
+                }
+            },
+            // A break opening a paragraph would only be an empty row.
+            "br" if !self.inline.is_empty() => self.push_break(),
+            "p" | "details" => {
+                self.flush_inline();
+            }
+            // A terminal has nothing to fold: the summary is a line of its
+            // own behind a marker, and the content follows it.
+            "summary" => {
+                self.flush_inline();
+                let style = self.style().fg(self.th.accent);
+                self.push_text("▸", style);
+                self.space = true;
+                self.bold += 1;
+                self.html_open.push(HtmlStyle::Summary);
+            }
+            "b" | "strong" => {
+                self.bold += 1;
+                self.html_open.push(HtmlStyle::Bold);
+            }
+            "i" | "em" => {
+                self.italic += 1;
+                self.html_open.push(HtmlStyle::Italic);
+            }
+            // sup, sub, kbd, code, span, relative-time: their text is all
+            // that matters.
+            _ => {}
+        }
+    }
+
+    fn html_close(&mut self, name: &str) {
+        let style = match name {
+            "p" | "details" => {
+                self.flush_inline();
+                self.need_blank = true;
+                return;
+            }
+            "a" => HtmlStyle::Link,
+            "summary" => HtmlStyle::Summary,
+            "b" | "strong" => HtmlStyle::Bold,
+            "i" | "em" => HtmlStyle::Italic,
+            _ => return,
+        };
+        // A close with no open of its own is stray: it must not end the
+        // markdown link or bold it sits in.
+        let Some(at) = self.html_open.iter().rposition(|s| *s == style) else {
+            return;
+        };
+        self.html_open.remove(at);
+        self.html_undo(style);
+        if style == HtmlStyle::Summary {
+            self.flush_inline();
+        }
+    }
+
+    fn html_undo(&mut self, style: HtmlStyle) {
+        match style {
+            HtmlStyle::Link => self.link_end(true),
+            HtmlStyle::Bold | HtmlStyle::Summary => self.bold = self.bold.saturating_sub(1),
+            HtmlStyle::Italic => self.italic = self.italic.saturating_sub(1),
+        }
+    }
+
+    /// A block ends: whatever its HTML left open closes with it.
+    fn close_html(&mut self) {
+        while let Some(style) = self.html_open.pop() {
+            self.html_undo(style);
+        }
+    }
+
     /// Raw HTML or front matter: as written, dim, each source line its
     /// own row, wrapped on words when it is too wide.
     fn raw_lines(&mut self, text: &str) {
@@ -670,11 +836,17 @@ impl<'a> Renderer<'a> {
                 let style = self.style().fg(self.th.special);
                 self.push_text(&t, style);
             }
-            Event::Html(t) => self.raw_lines(&t),
+            Event::Html(t) => {
+                for line in t.lines() {
+                    if !self.html(line, true) {
+                        let dim = self.dim();
+                        self.push_text(line, dim);
+                        self.push_break();
+                    }
+                }
+            }
             Event::InlineHtml(t) => {
-                if t.trim_start().to_ascii_lowercase().starts_with("<br") {
-                    self.push_break();
-                } else {
+                if !self.html(&t, false) {
                     let style = self.dim();
                     self.push_text(&t, style);
                 }
@@ -826,10 +998,12 @@ impl<'a> Renderer<'a> {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph => {
+                self.close_html();
                 self.flush_inline();
                 self.need_blank = true;
             }
             TagEnd::Heading(level) => {
+                self.close_html();
                 let w = self.flush_inline();
                 self.heading = None;
                 let rule = match level {
@@ -855,6 +1029,8 @@ impl<'a> Renderer<'a> {
             }
             TagEnd::HtmlBlock | TagEnd::MetadataBlock(_) => {
                 self.raw_block = false;
+                self.close_html();
+                self.flush_inline();
                 self.need_blank = true;
             }
             TagEnd::List(_) => {
@@ -864,6 +1040,7 @@ impl<'a> Renderer<'a> {
                 }
             }
             TagEnd::Item => {
+                self.close_html();
                 self.flush_inline();
                 // An empty item still shows its marker.
                 if self.marker.is_some() {
@@ -896,6 +1073,7 @@ impl<'a> Renderer<'a> {
                 }
             }
             TagEnd::TableCell => {
+                self.close_html();
                 let cell = std::mem::take(&mut self.inline);
                 self.space = false;
                 if let Some(t) = &mut self.table {
@@ -905,21 +1083,7 @@ impl<'a> Renderer<'a> {
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
             TagEnd::Strong => self.bold = self.bold.saturating_sub(1),
             TagEnd::Strikethrough => self.strike = self.strike.saturating_sub(1),
-            TagEnd::Link => {
-                self.link = self.link.saturating_sub(1);
-                if let Some((dest, start)) = self.links.pop() {
-                    let text = self.inline_text(start);
-                    // A badge — a link that is nothing but an image — is
-                    // read, not followed: its address stays out of the way.
-                    let badge =
-                        start < self.inline.len() && self.inline[start..].iter().all(|a| a.image);
-                    if !badge && shows_address(&dest, &text) {
-                        let style = self.dim();
-                        self.space = true;
-                        self.push_text(&format!("({dest})"), style);
-                    }
-                }
-            }
+            TagEnd::Link => self.link_end(false),
             TagEnd::Image => {
                 if let Some(start) = self.images.pop() {
                     let alt = self.inline_text(start);
@@ -948,6 +1112,158 @@ impl<'a> Renderer<'a> {
             | TagEnd::Subscript => {}
         }
     }
+}
+
+/// The HTML tags drawn as what they mean instead of shown raw: the ones
+/// GitHub's markdown renders and its bots (Vercel, Netlify, Codecov,
+/// Renovate, Dependabot) write. A fragment with any other tag in it stays
+/// raw and dim — nothing outside this list is guessed at.
+const HTML_TAGS: &[&str] = &[
+    "a",
+    "img",
+    "br",
+    "p",
+    "details",
+    "summary",
+    "b",
+    "strong",
+    "i",
+    "em",
+    "sup",
+    "sub",
+    "kbd",
+    "code",
+    "span",
+    "relative-time",
+];
+
+/// A style an HTML tag turned on, until its close or its block's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HtmlStyle {
+    Bold,
+    Italic,
+    Link,
+    /// `<summary>`: bold, and its own line.
+    Summary,
+}
+
+/// One piece of a raw-HTML fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HtmlPiece {
+    Open {
+        name: String,
+        attrs: Vec<(String, String)>,
+    },
+    Close(String),
+    /// `<!-- … -->`: GitHub never shows one, and bots hide markers in them.
+    Comment,
+    Text(String),
+}
+
+/// `src` as tags, comments and text, or None when anything in it is not a
+/// well-formed tag on [`HTML_TAGS`] — an unknown tag, one left open, a
+/// doctype — so the fragment is shown raw.
+fn html_pieces(src: &str) -> Option<Vec<HtmlPiece>> {
+    let mut out = Vec::new();
+    let mut rest = src;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("<!--") {
+            let end = after.find("-->")?;
+            out.push(HtmlPiece::Comment);
+            rest = &after[end + 3..];
+        } else if rest.starts_with('<') {
+            let end = tag_end(rest)?;
+            let inner = &rest[1..end];
+            rest = &rest[end + 1..];
+            if let Some(name) = inner.strip_prefix('/') {
+                let name = name.trim().to_ascii_lowercase();
+                if !HTML_TAGS.contains(&name.as_str()) {
+                    return None;
+                }
+                out.push(HtmlPiece::Close(name));
+            } else {
+                let (name, attrs) = open_tag(inner.trim_end().trim_end_matches('/'))?;
+                if !HTML_TAGS.contains(&name.as_str()) {
+                    return None;
+                }
+                out.push(HtmlPiece::Open { name, attrs });
+            }
+        } else {
+            let next = rest.find('<').unwrap_or(rest.len());
+            out.push(HtmlPiece::Text(html_unescape(&rest[..next])));
+            rest = &rest[next..];
+        }
+    }
+    Some(out)
+}
+
+/// Where the tag `src` starts with ends: its `>`, outside any quoted
+/// attribute value.
+fn tag_end(src: &str) -> Option<usize> {
+    let mut quote = None;
+    for (i, c) in src.char_indices().skip(1) {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '>') => return Some(i),
+            (None, '<') => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// An opening tag's name, lowercased, and its attributes (names lowercased,
+/// values unquoted and unescaped; a bare attribute has an empty value).
+fn open_tag(inner: &str) -> Option<(String, Vec<(String, String)>)> {
+    let name_end = inner
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(inner.len());
+    let name = inner[..name_end].to_ascii_lowercase();
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut attrs = Vec::new();
+    let mut rest = inner[name_end..].trim_start();
+    while !rest.is_empty() {
+        let key_end = rest
+            .find(|c: char| c.is_whitespace() || c == '=')
+            .unwrap_or(rest.len());
+        let key = rest[..key_end].to_ascii_lowercase();
+        if key.is_empty() {
+            return None;
+        }
+        rest = rest[key_end..].trim_start();
+        let value = if let Some(after) = rest.strip_prefix('=') {
+            let after = after.trim_start();
+            let (value, tail) = match after.chars().next() {
+                Some(q @ ('"' | '\'')) => {
+                    let close = after[1..].find(q)? + 1;
+                    (&after[1..close], &after[close + 1..])
+                }
+                _ => {
+                    let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                    (&after[..end], &after[end..])
+                }
+            };
+            rest = tail.trim_start();
+            html_unescape(value)
+        } else {
+            String::new()
+        };
+        attrs.push((key, value));
+    }
+    Some((name, attrs))
+}
+
+/// The handful of character references a bot's text or attribute carries.
+fn html_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 /// Is a link's address worth showing beside its text? Not when the text
@@ -1596,30 +1912,138 @@ mod tests {
     }
 
     #[test]
-    fn html_stays_raw_and_dim_and_br_breaks_the_line() {
+    fn html_on_the_closed_list_is_drawn_and_the_rest_stays_raw() {
+        // A README's centered logo and an inline bold: tags on the list,
+        // drawn as the markdown they stand for.
         let out = lines(
             "<p align=\"center\">\n  <img src=\"x.png\">\n</p>\n\ntext<br>more <b>bold</b>\n",
             40,
         );
+        assert_eq!(plain(&out), ["[image]", "", "text", "more bold"]);
+        assert_eq!(span_with(&out, "[image]").style.fg, Some(th().dim));
+        let bold = span_with(&out, "bold");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        // Anything off the list keeps its fragment raw and dim, whole.
+        let out = lines(
+            "<div class=\"x\">raw</div>\n\nin <span><marquee>x</marquee></span>\n",
+            40,
+        );
+        assert!(
+            plain(&out)
+                .iter()
+                .any(|l| l == "<div class=\"x\">raw</div>"),
+            "{:?}",
+            plain(&out)
+        );
+        assert_eq!(span_with(&out, "<div").style.fg, Some(th().dim));
+        assert_eq!(span_with(&out, "<marquee>").style.fg, Some(th().dim));
+        // A long raw tag still wraps on its words rather than mid-attribute.
+        let out = lines("<video src=\"long.mp4\" title=\"some words here\">\n", 24);
+        assert_eq!(
+            plain(&out),
+            ["<video src=\"long.mp4\"", "title=\"some words here\">"]
+        );
+    }
+
+    /// A Vercel deployment comment — the HTML GitHub's bots write — reads
+    /// as its text: the summary behind a marker, the table's cells, the
+    /// date out of its `<relative-time>`, a decorative avatar (`alt=""`)
+    /// and the link around it gone, and the hidden marker comment too.
+    /// An inline tag is no white space: what it wraps stays glued to its
+    /// neighbours, as GitHub draws it.
+    #[test]
+    fn an_inline_tag_adds_no_space() {
+        let out = lines(
+            "H<sub>2</sub>O, <kbd>Ctrl</kbd>+<kbd>C</kbd>, <b>bold</b>text\n",
+            60,
+        );
+        assert_eq!(plain(&out), ["H2O, Ctrl+C, boldtext"]);
+        let out = lines("see <a href=\"https://x.dev\">site</a>, then\n", 60);
+        assert_eq!(plain(&out), ["see site (https://x.dev), then"]);
+        // A break opening a paragraph is no empty row; two in a row are.
+        let out = lines("<br>a<br><br>b\n", 60);
+        assert_eq!(plain(&out), ["a", "", "b"]);
+    }
+
+    /// A tag left open stops at the end of its paragraph, item or cell,
+    /// and a close with no open of its own changes nothing: a stray tag
+    /// never bolds or underlines the rest of the comment.
+    #[test]
+    fn a_stray_tag_stays_in_its_block() {
+        let out = lines(
+            "<b>open <a href=\"https://x.dev\">link\n\nnext\n\n- item <i>open\n- item\n",
+            60,
+        );
         assert_eq!(
             plain(&out),
             [
-                "<p align=\"center\">",
-                "<img src=\"x.png\">",
-                "</p>",
+                "open link (https://x.dev)",
                 "",
-                "text",
-                "more <b>bold</b>",
+                "next",
+                "",
+                "• item open",
+                "• item"
             ]
         );
-        assert_eq!(span_with(&out, "<p").style.fg, Some(th().dim));
-        assert_eq!(span_with(&out, "<b>").style.fg, Some(th().dim));
-        // A long tag wraps on its words rather than mid-attribute.
-        let out = lines("<img src=\"long.png\" alt=\"some words here\">\n", 24);
-        assert_eq!(
-            plain(&out),
-            ["<img src=\"long.png\"", "alt=\"some words here\">"]
+        let next = span_with(&out, "next").style;
+        assert!(!next.add_modifier.contains(Modifier::BOLD));
+        assert!(!next.add_modifier.contains(Modifier::UNDERLINED));
+        let item = &out[5].spans;
+        assert!(item
+            .iter()
+            .all(|s| !s.style.add_modifier.contains(Modifier::ITALIC)));
+        // A stray close inside markdown's own link and bold ends neither.
+        let out = lines("[aa </a> bb](https://y.dev) and **cc </b> dd**\n", 60);
+        assert_eq!(plain(&out), ["aa bb (https://y.dev) and cc dd"]);
+        assert!(span_with(&out, "bb")
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
+        assert!(span_with(&out, "dd")
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn a_bot_comment_reads_as_its_text() {
+        let body = "<!-- deploy marker -->\n\
+            The latest updates on your projects.\n\n\
+            <details><summary>1 Skipped Deployment</summary>\n\n\
+            | Project | Deployment | Updated |\n\
+            | :--- | :--- | :--- |\n\
+            | <a href=\"https://vercel.com/acme/demo\"><sup><img src=\"https://vercel.com/a.png\" width=\"16\" alt=\"\"></sup></a> [demo](https://vercel.com/acme/demo) | [Ignored](https://vercel.com/i) | <relative-time datetime=\"2026-10-07T19:47:06Z\">Oct 7, 2026</relative-time> |\n\n\
+            </details>\n";
+        let out = lines(body, 80);
+        let text = plain(&out);
+        assert!(
+            text.iter().all(|l| !l.contains('<')),
+            "no tag left: {text:?}"
         );
+        assert!(
+            text.iter().any(|l| l == "▸ 1 Skipped Deployment"),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.contains("demo") && l.contains("Ignored") && l.contains("Oct 7,")),
+            "the row's cells, side by side: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("deploy marker")),
+            "{text:?}"
+        );
+        assert!(span_with(&out, "Skipped")
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        // An HTML link with text keeps the markdown link's look.
+        let out = lines("see <a href=\"https://x.dev\">the site</a>\n", 60);
+        assert_eq!(plain(&out), ["see the site (https://x.dev)"]);
+        assert!(span_with(&out, "site")
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
     }
 
     #[test]
