@@ -552,6 +552,7 @@ pub(crate) fn open_grep_view(app: &mut App) {
 pub(crate) fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) {
     use crate::view_jobs::Answer;
     match answer {
+        Answer::TerminalReplay(answer) => crate::terminal_replay::land(app, answer),
         Answer::Grep { ticket, result } => {
             if let Some(Overlay::Grep(view)) = &mut app.modals.overlay {
                 view.land(ticket, result);

@@ -409,25 +409,6 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
 
 fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    // A confirm held unshown for its DELETE CHECK takes only a cancel
-    // (`Esc`, or `n` where `n` cancels) and `Enter` / `y`, which wait for
-    // the check below: nothing is chosen in a dialog nobody has seen —
-    // not even the card-only `n` of a delete that offers the worktree.
-    if crate::delete_check::held(app) {
-        let three_way = matches!(
-            &app.modals.overlay,
-            Some(Overlay::Confirm(c))
-                if matches!(c.action, PendingAction::ThenDeleteWorktree { offered: true, .. })
-        );
-        let passes = match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('y') => true,
-            KeyCode::Char('n') => !three_way,
-            _ => false,
-        };
-        if !passes {
-            return;
-        }
-    }
     let Some(overlay) = &mut app.modals.overlay else {
         return;
     };

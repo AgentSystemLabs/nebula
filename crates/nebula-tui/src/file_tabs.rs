@@ -52,7 +52,7 @@ pub struct FileTabsView {
     pub on_tabs: bool,
     /// The focused tab's file as highlighted (kind, text) runs per line;
     /// styling lives in ui.rs.
-    pub preview_lines: Vec<Vec<(TokenKind, String)>>,
+    pub preview_lines: std::sync::Arc<Vec<Vec<(TokenKind, String)>>>,
     pub preview_line_count: usize,
     /// Real file contents — the case that earns a line-number gutter —
     /// rather than a read error or placeholder.
@@ -116,7 +116,7 @@ impl FileTabsView {
             tabs,
             tab: 0,
             on_tabs: true,
-            preview_lines: Vec::new(),
+            preview_lines: Default::default(),
             preview_line_count: 0,
             preview_is_file: false,
             preview_text: String::new(),
@@ -190,7 +190,7 @@ impl FileTabsView {
         self.visual = preview.visual;
         self.mermaid_diagrams = preview.mermaid_diagrams;
         self.preview_line_count = preview.lines.len();
-        self.preview_lines = preview.lines;
+        self.preview_lines = std::sync::Arc::new(preview.lines);
         self.preview_text = preview.text;
     }
 

@@ -3063,6 +3063,28 @@ mod tests {
         assert!(daemon.store.get_agent(&id).unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn failed_terminal_spawn_removes_the_new_row() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["terminal-failure"]);
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        seed_worktree(
+            &daemon,
+            "terminal-failure",
+            "terminal-failure-w",
+            missing.to_str().unwrap(),
+            true,
+        );
+        let id = WorktreeId("terminal-failure-w".into());
+        assert!(daemon.create_terminal(&id, None).is_err());
+        let (_, _, _, terminals) = daemon.store.load_tree().unwrap();
+        assert!(
+            terminals.is_empty(),
+            "a refused create must not reappear on reconnect"
+        );
+    }
+
     fn seed_projects(daemon: &Daemon, names: &[&str]) {
         for (i, name) in names.iter().enumerate() {
             daemon

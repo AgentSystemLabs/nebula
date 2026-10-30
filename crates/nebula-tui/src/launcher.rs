@@ -18,6 +18,8 @@
 //! the PROJECT PICKER behind `^P` ([`ProjectPicker`]). The keys are
 //! `event_loop::launcher`'s and the drawing `ui::launcher_view`'s.
 
+use std::collections::HashMap;
+
 use crate::app::App;
 use crate::pull_request::{Standing, Trouble};
 use crate::quick_prompt::{QuickReturn, QuickTarget};
@@ -89,11 +91,42 @@ pub fn rows(app: &App) -> Vec<LauncherRow> {
     // header to fold, and an archived card answers to none of the keys a
     // live one does.
     let want_archived = app.launcher.show_archived;
+    // Join the tree once. Searching every worktree and project for every
+    // agent made a large project's frame grow with sessions × checkouts.
+    let projects: HashMap<_, _> = app.tree.projects.iter().map(|p| (&p.id, p)).collect();
+    let worktrees: HashMap<_, _> = app
+        .tree
+        .worktrees
+        .iter()
+        .filter_map(|w| {
+            let project = *projects.get(&w.project_id)?;
+            if scope.as_ref().is_some_and(|id| id != &project.id) {
+                return None;
+            }
+            Some((&w.id, (w, project)))
+        })
+        .collect();
+    let mut prs = HashMap::new();
     let mut rows: Vec<LauncherRow> = app
         .tree
         .agents
         .iter()
-        .filter_map(|agent| row_of(app, agent, scope.as_ref(), Some(want_archived)))
+        .filter_map(|agent| {
+            if agent.archived != want_archived {
+                return None;
+            }
+            let (worktree, project) = worktrees.get(&agent.worktree_id)?;
+            let pr = prs
+                .entry(&worktree.id)
+                .or_insert_with(|| row_pr(app, &worktree.id, &project.id, &worktree.branch))
+                .clone();
+            Some(LauncherRow {
+                agent: agent.clone(),
+                project: project.name.clone(),
+                branch: worktree.branch.clone(),
+                pr,
+            })
+        })
         .collect();
     rows.sort_by(|a, b| {
         crate::app::recency_key(&a.agent)
@@ -274,25 +307,33 @@ pub fn bands(app: &App) -> Vec<Band> {
     let Some(project) = app.selected_project() else {
         return Vec::new();
     };
-    let rows = rows(app);
-    let mut out = Vec::new();
-    for w in app.visible_worktrees() {
-        let mut cards: Vec<Card> = rows
+    let worktrees = app.visible_worktrees();
+    let visible: std::collections::HashSet<_> = worktrees.iter().map(|w| &w.id).collect();
+    let mut by_worktree: HashMap<WorktreeId, Vec<Card>> = HashMap::new();
+    // Move each row into its band once, retaining recency order. The old
+    // walk scanned and cloned the entire row list for every checkout.
+    for row in rows(app) {
+        by_worktree
+            .entry(row.agent.worktree_id.clone())
+            .or_default()
+            .push(Card::Session(row));
+    }
+    if !app.launcher.show_archived {
+        for terminal in app
+            .tree
+            .terminals
             .iter()
-            .filter(|r| r.agent.worktree_id == w.id)
-            .cloned()
-            .map(Card::Session)
-            .collect();
-        if !app.launcher.show_archived {
-            cards.extend(
-                app.tree
-                    .terminals
-                    .iter()
-                    .filter(|t| t.worktree_id == w.id)
-                    .cloned()
-                    .map(Card::Terminal),
-            );
+            .filter(|t| visible.contains(&t.worktree_id))
+        {
+            by_worktree
+                .entry(terminal.worktree_id.clone())
+                .or_default()
+                .push(Card::Terminal(terminal.clone()));
         }
+    }
+    let mut out = Vec::new();
+    for w in worktrees {
+        let cards = by_worktree.remove(&w.id).unwrap_or_default();
         if cards.is_empty() && (app.launcher.show_archived || !app.launcher.show_all_worktrees) {
             continue;
         }

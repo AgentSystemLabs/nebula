@@ -1,0 +1,53 @@
+# Focused responsiveness checks. Run with scripts/perf/run.sh scripts/perf/responsiveness.steps.
+# Start on an empty project grid; inspect a linked checkout before creating sessions.
+linked worktree	j
+open delete worktree	d
+cancel delete worktree	Escape
+open delete worktree again	d
+cancel delete again	Escape
+new session 1	n
+pick harness 1	Enter
+launch session 1	Enter
+leave session 1	C-q
+new session 2	n
+pick harness 2	Enter
+launch session 2	Enter
+leave session 2	C-q
+new session 3	n
+pick harness 3	Enter
+launch session 3	Enter
+leave session 3	C-q
+new session 4	n
+pick harness 4	Enter
+launch session 4	Enter
+leave session 4	C-q
+new session 5	n
+pick harness 5	Enter
+launch session 5	Enter
+leave session 5	C-q
+new session 6	n
+pick harness 6	Enter
+launch session 6	Enter
+leave session 6	C-q
+new session 7	n
+pick harness 7	Enter
+launch session 7	Enter
+leave session 7	C-q
+new session 8	n
+pick harness 8	Enter
+launch session 8	Enter
+leave session 8	C-q
+session up 1	k
+session up 2	k
+session up 3	k
+session up 4	k
+session up 5	k
+session up 6	k
+session up 7	k
+next session	j
+next session 2	j
+previous session	k
+attach selected	Enter
+leave selected	C-q
+open help	?
+close help	Escape

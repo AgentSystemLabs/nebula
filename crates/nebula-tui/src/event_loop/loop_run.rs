@@ -130,6 +130,15 @@ macro_rules! main_loop_body {
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
             send_held_attach(&mut app, &mut out);
+            // Size changes and held attaches are produced by drawing. Send
+            // them before select sleeps; otherwise an idle pane waits for
+            // an unrelated timer or keystroke to start its replay.
+            for req in out.drain(..) {
+                if $channels.tx.send(req).await.is_err() {
+                    app.chrome.conn = ConnState::Disconnected;
+                    app.chrome.dirty = true;
+                }
+            }
         }
 
         let focus_before = app.nav.focus;
@@ -141,10 +150,8 @@ macro_rules! main_loop_body {
             .map_or_else(tokio::time::Instant::now, |combo| {
                 tokio::time::Instant::from_std(combo.deadline())
             });
-        // When a worktree delete's confirm, held for its DELETE CHECK, is
-        // to be shown though the check has not answered (its arm below).
-        let confirm_reveal = crate::delete_check::reveal_at(&app);
-        let confirm_reveal_at = confirm_reveal
+        let check_timeout = crate::delete_check::timeout_at(&app);
+        let check_timeout_at = check_timeout
             .map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std);
         // When the EDGE AUTO-SCROLL next steps (its arm below).
         let drag_autoscroll_deadline = app
@@ -265,7 +272,7 @@ macro_rules! main_loop_body {
                 let _ = reassert_modes($terminal.backend_mut());
                 next_mode_reassert = tokio::time::Instant::now() + MODE_REASSERT;
             }
-            _ = tokio::time::sleep_until(confirm_reveal_at), if confirm_reveal.is_some() => {
+            _ = tokio::time::sleep_until(check_timeout_at), if check_timeout.is_some() => {
                 app.chrome.dirty = true;
             }
             // The EDGE AUTO-SCROLL beat: a drag-selection resting past the
@@ -448,16 +455,26 @@ macro_rules! main_loop_body {
             note_focus_change(&mut app);
         }
 
-        // Drain whatever else is immediately ready before redrawing once
-        // (burst coalescing for PTY output).
-        while let Ok(ev) = $channels.rx.try_recv() {
+        // Coalesce ready output, yielding after 64 events or about 2 ms
+        // so a continuously producing PTY cannot starve input and paint.
+        // Individual event handlers still run to completion.
+        let drain_started = std::time::Instant::now();
+        for _ in 0..64 {
+            if drain_started.elapsed() >= Duration::from_millis(2) {
+                break;
+            }
+            let Ok(ev) = $channels.rx.try_recv() else { break };
             log_server_event(&ev);
             if let Some(perf) = &mut perf {
                 perf.server(crate::perf::server_name(&ev));
             }
             handle_server_event(&mut app, ev, &mut out);
         }
-        while let Ok(ev) = vim_rx.try_recv() {
+        for _ in 0..64 {
+            if drain_started.elapsed() >= Duration::from_millis(2) {
+                break;
+            }
+            let Ok(ev) = vim_rx.try_recv() else { break };
             handle_vim_event(&mut app, ev);
         }
         note_preview_change(&mut app, preview_before);

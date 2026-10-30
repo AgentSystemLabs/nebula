@@ -1,0 +1,10 @@
+# Create a terminal and type a command in one input burst, before a spawn reply can be assumed.
+# PERF_DUMP=1 captures the echoed command and its result for verification.
+create and type immediately 1	burst:t|e|c|h|o|Space|N|E|B|U|L|A|_|S|T|A|R|T|U|P|_|R|E|A|D|Y|_|1|Enter
+leave terminal 1	C-q
+create and type immediately 2	burst:t|e|c|h|o|Space|N|E|B|U|L|A|_|S|T|A|R|T|U|P|_|R|E|A|D|Y|_|2|Enter
+leave terminal 2	C-q
+create and type immediately 3	burst:t|e|c|h|o|Space|N|E|B|U|L|A|_|S|T|A|R|T|U|P|_|R|E|A|D|Y|_|3|Enter
+leave terminal 3	C-q
+open help	?
+close help	Escape

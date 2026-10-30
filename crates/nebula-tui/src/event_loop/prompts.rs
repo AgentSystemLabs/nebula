@@ -39,6 +39,12 @@ pub(crate) fn quick_return_of(prompt: &PromptDialog) -> Option<crate::quick_prom
 }
 
 pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
+    if let PromptKind::RenameTerminal { id } = &kind {
+        if app.is_placeholder_session(&SessionRef::Terminal(id.clone())) {
+            app.chrome.flash = Some("terminal is still starting — rename it once ready".into());
+            return;
+        }
+    }
     use std::borrow::Cow;
     let (title, label, input): (Cow<'static, str>, Cow<'static, str>, String) = match &kind {
         // Starts on the folder nebula was started in — its parent listed,

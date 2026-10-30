@@ -7,6 +7,7 @@ pub(crate) fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
     if !pane_usable(area) {
         return;
     }
+    let placeholder = app.pane_shows_placeholder();
     if let Some(term) = &mut app.pane.term {
         if (term.cols, term.rows) != (area.width, area.height) {
             // The grid regrids and the program repaints into it: a
@@ -16,9 +17,10 @@ pub(crate) fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
             if !app.pane.term_selection.is_some_and(|s| s.dragging) {
                 app.pane.term_selection = None;
             }
-            term.cols = area.width;
-            term.rows = area.height;
-            term.parser.screen_mut().set_size(area.height, area.width);
+            term.resize(area.width, area.height);
+            if placeholder {
+                return;
+            }
             out.push(ClientRequest::Resize {
                 session: term.sref.clone(),
                 cols: area.width,
@@ -235,6 +237,17 @@ pub(crate) fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRe
         // the keyboard the way an overlay's field does while it is open.
         Event::Paste(text) if paste_into_follow_up(app, &text) => {}
         Event::Paste(text) => {
+            if app.nav.focus == Focus::Terminal
+                && app.pane.term_locked
+                && app.pane_shows_placeholder()
+            {
+                if let Some(term) = &app.pane.term {
+                    let data = pasted(term.parser.screen(), &text);
+                    if terminal_create::buffer(app, &data) {
+                        return;
+                    }
+                }
+            }
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
             if app.nav.focus == Focus::Terminal && app.pane.term_locked && app.pane_accepts_input()

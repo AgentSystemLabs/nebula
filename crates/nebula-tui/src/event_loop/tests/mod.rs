@@ -22310,9 +22310,7 @@ fn a_worktree_delete_waits_for_its_check_and_lists_what_it_found() {
         let mut out = Vec::new();
         crate::delete_check::sync(&mut app, &mut out);
         assert!(out.is_empty(), "asked once per confirm: {out:?}");
-        // A check that has not answered within SHOW_AFTER: the dialog
-        // shows with "Checking…".
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
+        // The dialog shows its pending check immediately.
         assert!(confirm_screen(&mut app).contains("Checking 'feat' for work in progress"));
 
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
@@ -22363,21 +22361,15 @@ fn a_worktree_delete_waits_for_its_check_and_lists_what_it_found() {
     });
 }
 
-/// A check that answers within SHOW_AFTER opens the dialog once, already
-/// filled in: until the answer nothing is drawn but a footer line, and
-/// once shown its text does not change — the first frame is the last
-/// word, not a "Checking…" body that grows into another dialog.
+/// Opening the dialog never waits for a daemon round trip. Findings land
+/// in the already visible confirmation, while Enter remains gated.
 #[test]
-fn a_fast_check_opens_the_dialog_once_and_filled_in() {
+fn a_worktree_delete_dialog_opens_immediately_while_checking() {
     with_default_config(|| {
         let (mut app, req_id) = delete_feat_with_check();
-        let held = confirm_screen(&mut app);
-        assert!(!held.contains("from disk?"), "no dialog yet:\n{held}");
-        assert!(
-            held.contains("checking 'feat' for work in progress"),
-            "{held}"
-        );
-
+        let screen = confirm_screen(&mut app);
+        assert!(screen.contains("from disk?"), "{screen}");
+        assert!(screen.contains("Checking 'feat'"), "{screen}");
         hse(
             &mut app,
             ServerEvent::WorktreeChecked {
@@ -22389,47 +22381,17 @@ fn a_fast_check_opens_the_dialog_once_and_filled_in() {
                 },
             },
         );
-        let shown = confirm_screen(&mut app);
-        assert!(
-            shown.contains("from disk?") && shown.contains("2 uncommitted changes"),
-            "{shown}"
-        );
-        assert!(
-            !shown.contains("checking 'feat'"),
-            "the footer line is down"
-        );
-        assert!(!shown.contains("Checking 'feat'"), "{shown}");
-        assert_eq!(app.chrome.flash, None);
-        assert_eq!(confirm_screen(&mut app), shown, "the same dialog");
-    });
-}
-
-/// A check that has not answered by SHOW_AFTER: the event loop wakes then,
-/// and the dialog shows with "Checking…" so the user sees why Enter waits.
-#[test]
-fn a_slow_check_reveals_the_dialog_at_show_after() {
-    with_default_config(|| {
-        let (mut app, _) = delete_feat_with_check();
-        let reveal = crate::delete_check::reveal_at(&app).expect("held");
-        let wait = reveal.saturating_duration_since(std::time::Instant::now());
-        assert!(
-            wait > crate::delete_check::SHOW_AFTER - std::time::Duration::from_secs(1),
-            "{wait:?}"
-        );
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
-        assert!(crate::delete_check::reveal_at(&app).is_none());
         let screen = confirm_screen(&mut app);
         assert!(
-            screen.contains("from disk?") && screen.contains("Checking 'feat'"),
+            screen.contains("from disk?") && screen.contains("2 uncommitted changes"),
             "{screen}"
         );
+        assert!(!screen.contains("Checking 'feat'"), "{screen}");
+        assert_eq!(app.chrome.flash, None);
     });
 }
 
-/// While the check is out the dialog chooses nothing: held unshown, only a
-/// cancel gets through (Enter waits, saying so); shown with "Checking…",
-/// Enter and `y` still wait for the answer. Esc cancels throughout, and
-/// takes the footer line down with it.
+/// Enter and `y` wait for the check; Esc cancels immediately.
 #[test]
 fn a_confirm_waiting_on_its_check_chooses_nothing_but_cancel() {
     with_default_config(|| {
@@ -22442,7 +22404,6 @@ fn a_confirm_waiting_on_its_check_chooses_nothing_but_cancel() {
         assert!(out.is_empty(), "{out:?}");
         assert!(matches!(app.modals.overlay, Some(Overlay::Confirm(_))));
 
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
         press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(out.is_empty(), "{out:?}");
@@ -22514,7 +22475,6 @@ fn reopening_a_worktree_delete_checks_again() {
             [ClientRequest::CheckWorktree { req_id, .. }] => assert_ne!(*req_id, first),
             other => panic!("asked again: {other:?}"),
         }
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
         assert!(confirm_screen(&mut app).contains("Checking 'feat'"));
     });
 }
@@ -22542,9 +22502,8 @@ fn an_older_daemon_gets_no_check_and_the_old_confirm() {
 }
 
 /// The card's own delete that offers to take the emptied worktree too is
-/// checked the same way; once shown, its "no, the card only" never waits,
-/// since it deletes no checkout — but nothing is chosen in a dialog still
-/// held unshown for its check.
+/// checked the same way; its "no, the card only" never waits, since it
+/// deletes no checkout.
 #[test]
 fn a_card_delete_that_offers_the_worktree_checks_it_but_n_never_waits() {
     with_default_config(|| {
@@ -22566,10 +22525,6 @@ fn a_card_delete_that_offers_the_worktree_checks_it_but_n_never_waits() {
             "{out:?}"
         );
         out.clear();
-        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-        assert!(out.is_empty(), "not chosen unseen: {out:?}");
-        assert!(matches!(app.modals.overlay, Some(Overlay::Confirm(_))));
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(out.is_empty(), "yes-to-both waits for the check: {out:?}");
         press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
@@ -22632,4 +22587,111 @@ fn a_held_attach_goes_out_after_a_frame_with_no_pane() {
         ),
         "{out:?}"
     );
+}
+
+#[test]
+fn a_delete_check_timeout_repaints_an_idle_dialog_once() {
+    with_default_config(|| {
+        let (mut app, _) = delete_feat_with_check();
+        assert!(crate::delete_check::timeout_at(&app).is_some());
+        crate::delete_check::age_checks(&mut app, crate::delete_check::CHECK_PATIENCE);
+        assert!(crate::delete_check::timeout_at(&app).is_none());
+        assert!(confirm_screen(&mut app).contains("taking too long"));
+    });
+}
+
+/// Switching to the least recently used screen must claim it before
+/// inserting the pane we leave into an already full cache.
+#[test]
+fn opening_the_oldest_cached_session_preserves_its_screen() {
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let mut out = Vec::new();
+    for n in 1..=crate::app::TERM_CACHE_MAX + 1 {
+        let id = format!("a{n}");
+        if n > 1 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: agent_entity(&id, "w1", &id, false),
+                },
+            );
+        }
+        let session = SessionRef::Agent(AgentId(id));
+        attach_now(&mut app, session.clone(), &mut out);
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session,
+                base_seq: 0,
+                data: b"cached screen".to_vec(),
+            },
+        );
+    }
+    assert_eq!(app.pane.term_cache.len(), crate::app::TERM_CACHE_MAX);
+    out.clear();
+    attach_now(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+    let term = app.pane.term.as_ref().unwrap();
+    assert!(term.painted, "screen appears before the daemon replies");
+    assert!(term.parser.screen().contents().contains("cached screen"));
+    assert!(out.iter().any(|r| matches!(
+        r,
+        ClientRequest::Attach {
+            from_seq: Some(13),
+            ..
+        }
+    )));
+}
+
+/// Headless CPU-cost probe for a busy project; excludes daemon and terminal I/O.
+#[test]
+#[ignore = "manual scaling benchmark; run with --ignored --nocapture"]
+fn performance_probe_many_sessions_draw() {
+    with_default_config(|| {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let template_worktree = app.tree.worktrees[0].clone();
+        let template_agent = app.tree.agents[0].clone();
+        for w in 0..50 {
+            let mut worktree = template_worktree.clone();
+            worktree.id = WorktreeId(format!("scale-w{w}"));
+            worktree.is_main = false;
+            worktree.branch = format!("feature-{w}");
+            for a in 0..40 {
+                let mut agent = template_agent.clone();
+                agent.id = AgentId(format!("scale-a{w}-{a}"));
+                agent.name = format!("Agent {w}/{a}");
+                agent.worktree_id = worktree.id.clone();
+                app.tree.agents.push(agent);
+            }
+            app.tree.worktrees.push(worktree);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(190, 50)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..50 {
+            let began = std::time::Instant::now();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            samples.push(began.elapsed());
+        }
+        samples.sort();
+        eprintln!(
+            "2001 sessions / 51 worktrees: median {:.3} ms/frame, max {:.3} ms/frame",
+            samples[25].as_secs_f64() * 1000.0,
+            samples[49].as_secs_f64() * 1000.0
+        );
+        let began = std::time::Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(crate::palette::Palette::new(
+                &app.tree,
+                false,
+                &app.github.open_prs,
+                false,
+            ));
+        }
+        eprintln!(
+            "2001-session palette: {:.3} ms/open",
+            began.elapsed().as_secs_f64() * 50.0
+        );
+    });
 }

@@ -89,6 +89,7 @@ fn handle_terminal_event(app: &mut App, event: ServerEvent, out: &mut Vec<Client
             base_seq,
             data,
         } => {
+            let jobs = app.jobs.view_jobs.clone();
             if let Some(term) = &mut app.pane.term {
                 if term.sref == session {
                     // The session started after all (its checkout came
@@ -107,6 +108,15 @@ fn handle_terminal_event(app: &mut App, event: ServerEvent, out: &mut Vec<Client
                             }
                         }
                     }
+                    if let Some(jobs) = jobs.filter(|_| {
+                        !term.painted && data.len() >= crate::terminal_replay::BACKGROUND_BYTES
+                    }) {
+                        crate::terminal_replay::start(term, base_seq, data, jobs);
+                        app.chrome.dirty = true;
+                        return;
+                    }
+                    // A newer replay supersedes any parser still in flight.
+                    term.replay = None;
                     // A replay continuing a kept screen lands on it; any
                     // other rebuilds the screen from scratch, and a
                     // selection anchored to the old cells goes with it.
@@ -145,6 +155,10 @@ fn handle_terminal_event(app: &mut App, event: ServerEvent, out: &mut Vec<Client
         ServerEvent::Output { session, seq, data } => {
             if let Some(term) = &mut app.pane.term {
                 if term.sref == session {
+                    if let Some(replay) = &mut term.replay {
+                        replay.output(seq, data);
+                        return;
+                    }
                     term.apply_output(seq, &data);
                     // The program wrote "the clipboard" with OSC 52 —
                     // claude's fullscreen renderer over ssh, vim, tmux —
@@ -261,6 +275,12 @@ fn handle_ack_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientReque
             // FOCUS back to them.
             let follow = !app.requests.left_behind.remove(&req_id);
             match (app.requests.pending.remove(&req_id), created) {
+                (Some(PendingIntent::TerminalCreated(create)), Some(EntityId::Terminal(real))) => {
+                    terminal_create::finish(app, create, real, follow, out)
+                }
+                (Some(PendingIntent::TerminalCreated(create)), _) => {
+                    terminal_create::discard(app, &create.placeholder, out)
+                }
                 (Some(PendingIntent::AttachCreated { focus, placeholder }), Some(id)) => {
                     attach_created(app, id, focus, placeholder, follow, out);
                 }
@@ -522,6 +542,7 @@ fn handle_tree_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequ
             app.chrome.flash = Some(line.clone());
             app.chrome.refusal_flash = Some((session.clone(), line));
             if let Some(term) = app.pane.term.as_mut().filter(|t| t.sref == session) {
+                term.replay = None;
                 term.refused = Some(message);
             }
             if app.modals.overlay.is_none() {
@@ -661,6 +682,9 @@ fn handle_error_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientReq
                 // A launch that waited on the NEW WORKTREE modal's checkout
                 // and was refused once it went out: its stand-in row goes,
                 // the checkout is real and stays.
+                Some(PendingIntent::TerminalCreated(create)) => {
+                    terminal_create::discard(app, &create.placeholder, out)
+                }
                 Some(PendingIntent::AttachCreated {
                     placeholder: Some(stand_in),
                     ..

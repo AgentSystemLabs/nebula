@@ -63,6 +63,18 @@ pub fn visible_file_links(screen: &vt100::Screen) -> Vec<FileLink> {
     links
 }
 
+/// Detect both kinds of terminal link in one traversal. Rendering needs
+/// both on every frame; sharing the walk avoids decoding every cell twice.
+pub fn visible_terminal_links(screen: &vt100::Screen) -> (Vec<TermLink>, Vec<FileLink>) {
+    let mut urls = Vec::new();
+    let mut files = Vec::new();
+    for_each_logical_line(screen, |line| {
+        scan_line(line, &mut urls);
+        scan_file_line(line, &mut files);
+    });
+    (urls, files)
+}
+
 /// Walk the screen one logical line at a time: each entry is a char plus
 /// the cell it came from, so match offsets map straight back to screen
 /// coordinates. `wrapped` rows flow into the next with no line break.
@@ -472,5 +484,19 @@ mod tests {
         assert_eq!(files[0].path, "crates/nebula-tui/src/app.rs");
         assert_eq!(files[0].line, Some(5));
         assert_eq!(files[0].segments.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod combined_tests {
+    #[test]
+    fn combined_detection_matches_individual_scans_across_wrapped_unicode_lines() {
+        let mut parser = vt100::Parser::new(20, 25, 0);
+        parser.process("λ see https://example.com/some/long/path\r\nRead(src/components/app.tsx:42) 日本語 Cargo.toml\r\n/absolute/file.rs:7".as_bytes());
+        let screen = parser.screen();
+        let (urls, files) = super::visible_terminal_links(screen);
+        assert!(!urls.is_empty() && !files.is_empty());
+        assert_eq!(urls, super::visible_links(screen));
+        assert_eq!(files, super::visible_file_links(screen));
     }
 }

@@ -226,11 +226,6 @@ fn draw_menu_overlay(f: &mut Frame, app: &mut App, menu: crate::app::ContextMenu
 }
 
 fn draw_confirm_overlay(f: &mut Frame, app: &mut App, confirm: crate::app::ConfirmDialog) {
-    // A worktree delete waits, unshown, for a moment for its DELETE CHECK
-    // so it opens once and filled in; the footer says it is checking.
-    if crate::delete_check::held(app) {
-        return;
-    }
     let th = app.chrome.theme;
     // Bulk deletes itemize their casualties across several message
     // lines — size the dialog to fit them.

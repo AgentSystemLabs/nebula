@@ -156,7 +156,7 @@ pub struct TreeBrowser {
     pub preview: String,
     /// `preview` split into syntax-highlighted (kind, text) runs per line;
     /// styling itself lives in ui.rs (the `classify_diff_line` rule).
-    pub preview_lines: Vec<Vec<(TokenKind, String)>>,
+    pub preview_lines: std::sync::Arc<Vec<Vec<(TokenKind, String)>>>,
     /// Cached line count of `preview`, for scroll clamping.
     pub preview_line_count: usize,
     /// Whether `preview` is real file contents — the case that earns a
@@ -252,7 +252,7 @@ impl TreeBrowser {
             match_count: file_count,
             best_row: None,
             preview: String::new(),
-            preview_lines: Vec::new(),
+            preview_lines: Default::default(),
             preview_line_count: 0,
             preview_is_file: false,
             markdown: false,
@@ -487,7 +487,7 @@ impl TreeBrowser {
         self.visual = preview.visual;
         self.mermaid_diagrams = preview.mermaid_diagrams;
         self.preview_line_count = preview.lines.len();
-        self.preview_lines = preview.lines;
+        self.preview_lines = std::sync::Arc::new(preview.lines);
         self.preview = preview.text;
     }
 
@@ -903,7 +903,7 @@ mod tests {
             vec!["main.rs".into()],
         );
         assert_eq!(
-            b.preview_lines,
+            *b.preview_lines,
             vec![vec![
                 (TokenKind::Keyword, "let".to_string()),
                 (TokenKind::Text, " x = ".to_string()),
