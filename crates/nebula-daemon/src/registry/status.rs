@@ -110,6 +110,7 @@ impl Daemon {
                         tracing::warn!(error = %e, "persist session id failed");
                     }
                 }
+                Effect::ConversationChanged => self.clear_prompts(agent_id),
             }
         }
     }
