@@ -56,8 +56,10 @@ sleep "${SHOT_BOOT_SECS:-4}"                                 # first paint + the
 # A keys line is a tmux key name or literal text; `click <col> <row>` / `rclick <col> <row>` (1-based
 # cells) are an SGR mouse press and release typed straight into the pane, for the targets no key reaches,
 # and `drag <col> <row> <col2> <row2>` a left press, two motion reports and the release at the far end.
+# `wait <secs>` presses nothing and lets the clock run (an idle timeout, a slow boot).
 send() {
   case "$1" in
+    wait\ *) sleep "${1#wait }"; return;;
     click\ *|rclick\ *)
       set -- $1; b=0; [ "$1" = rclick ] && b=2
       $TMUX send-keys -l "$(printf '\033[<%d;%d;%dM\033[<%d;%d;%dm' "$b" "$2" "$3" "$b" "$2" "$3")";;

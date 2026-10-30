@@ -231,10 +231,11 @@ macro_rules! main_loop_body {
             // model as the splash — a missed tick skips ahead cleanly). A
             // ONE-SHOT SWEEP ends on the clock, with no event to repaint
             // the row it leaves mid-band, so the tick after the last sweep
-            // stops still fires: that frame is the row settling.
-            _ = tokio::time::sleep_until(next_sweep_frame), if app.status_anim_active() || sweep_was_ticking => {
+            // stops still fires: that frame is the row settling. The pane's
+            // "starting session…" spinner turns on the same beat.
+            _ = tokio::time::sleep_until(next_sweep_frame), if app.status_anim_active() || app.boot_spinner_active() || sweep_was_ticking => {
                 app.chrome.dirty = true;
-                sweep_was_ticking = app.status_anim_active();
+                sweep_was_ticking = app.status_anim_active() || app.boot_spinner_active();
                 next_sweep_frame = tokio::time::Instant::now() + SWEEP_FRAME;
             }
             // "23m ago" labels age on their own with nothing else to

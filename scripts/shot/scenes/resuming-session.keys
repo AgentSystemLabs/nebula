@@ -1,0 +1,12 @@
+# Launch a session in the root checkout, walk to another checkout and wait out the idle timeout so the
+# reaper takes it, then walk back: the attach resumes it, and the frame is taken while it loads.
+Tab
+Tab
+p
+Fix the login redirect loop
+Enter
+wait 2
+j
+wait 5
+k
+wait 3

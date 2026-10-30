@@ -1599,7 +1599,12 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         // (A live session's replay lands within a frame; that blank is
         // not worth a word that would only flash.)
         Some(t) if t.booting => Some(Span::styled(
-            "starting…".to_string(),
+            if app.pane_resuming() {
+                "resuming…"
+            } else {
+                "starting…"
+            }
+            .to_string(),
             Style::default().fg(th.dim),
         )),
         // The LAUNCHER VIEW's pane says nothing of the lock: its header's
@@ -1653,7 +1658,15 @@ fn draw_terminal_body(
             (Vec::new(), Vec::new())
         }
         Some(term) if term.replay.is_some() || (term.booting && !term.exited) => {
-            draw_booting_terminal(f, inner, th, term.replay.is_some());
+            let notice = if term.replay.is_some() {
+                BootNotice::Replaying
+            } else if app.pane_resuming() {
+                BootNotice::Resuming
+            } else {
+                BootNotice::Starting
+            };
+            let spinner = app.chrome.animations.then(crate::app::now_ms);
+            draw_booting_terminal(f, inner, th, notice, spinner);
             (Vec::new(), Vec::new())
         }
         Some(term) => {
@@ -1695,29 +1708,74 @@ fn draw_refused_terminal(f: &mut Frame, inner: Rect, th: Theme, why: String) {
     f.render_widget(msg, padded);
 }
 
-fn draw_booting_terminal(f: &mut Frame, inner: Rect, th: Theme, replaying: bool) {
+/// What the pane is waiting on while its grid is blank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootNotice {
+    /// A big replay is being parsed off the UI thread.
+    Replaying,
+    /// An agent CLI is reopening a stored conversation (`--resume`): the
+    /// IDLE REAPER took it while the user was elsewhere, and the CLI can
+    /// take seconds to load the transcript before it draws.
+    Resuming,
+    /// A new session, or one with nothing to resume, is booting.
+    Starting,
+}
+
+/// Braille spinner frames for the booting notice, one per [`SWEEP_FRAME`].
+///
+/// [`SWEEP_FRAME`]: crate::app::SWEEP_FRAME
+const BOOT_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The blank pane's notice. `spinner` is the clock (ms) the spinner turns
+/// on, or None with animations off — then a still dot stands in.
+fn draw_booting_terminal(
+    f: &mut Frame,
+    inner: Rect,
+    th: Theme,
+    notice: BootNotice,
+    spinner: Option<i64>,
+) {
+    let (title, detail) = match notice {
+        BootNotice::Replaying => ("loading session…", "restoring the terminal screen"),
+        BootNotice::Resuming => (
+            "resuming session…",
+            "picking the conversation back up — it appears as soon as it paints",
+        ),
+        BootNotice::Starting => (
+            "starting session…",
+            "booting — the screen appears as soon as it paints",
+        ),
+    };
+    let glyph = match spinner {
+        Some(ms) => {
+            let tick = ms.max(0) as u128 / crate::app::SWEEP_FRAME.as_millis();
+            BOOT_SPINNER[(tick % BOOT_SPINNER.len() as u128) as usize]
+        }
+        None => '·',
+    };
+    // Vertically centred: a notice pinned to the top of a tall pane reads
+    // as a header over an empty, possibly broken, screen.
+    let lines = 3;
+    let top = inner.height.saturating_sub(lines) / 2;
+    let area = Rect {
+        y: inner.y + top,
+        height: inner.height.saturating_sub(top),
+        ..inner
+    };
     let msg = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(th.accent)),
+            Span::styled(
+                title,
+                Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+            ),
+        ]),
         Line::from(""),
-        Line::from(Span::styled(
-            if replaying {
-                "loading session…"
-            } else {
-                "starting session…"
-            },
-            Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            if replaying {
-                "restoring the terminal screen"
-            } else {
-                "booting — the screen appears as soon as it paints"
-            },
-            Style::default().fg(th.dim),
-        )),
+        Line::from(Span::styled(detail, Style::default().fg(th.dim))),
     ])
+    .wrap(Wrap { trim: false })
     .centered();
-    f.render_widget(msg, inner);
+    f.render_widget(msg, area);
 }
 
 fn draw_terminal_selection(f: &mut Frame, app: &App, screen: &vt100::Screen, inner: Rect) {
@@ -2457,6 +2515,74 @@ mod tests {
             "the recovery is on screen: {text}"
         );
         assert!(!text.contains("starting session"), "{text}");
+    }
+
+    /// Opening an idle session the reaper took: the CLI's first bytes are
+    /// mode switches, and the pane goes on saying it is resuming — with a
+    /// spinner the loop keeps turning — until the CLI draws.
+    #[test]
+    fn a_reaped_session_says_it_is_resuming_until_it_draws() {
+        let mut app = App::new();
+        let id = nebula_core::ids::AgentId("a1".into());
+        app.tree.agents.push(nebula_core::Agent {
+            id: id.clone(),
+            worktree_id: nebula_core::ids::WorktreeId("w1".into()),
+            name: "fix login".into(),
+            status: nebula_core::AgentStatus::Finished,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            status_changed_at: 0,
+            kind: nebula_core::AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: Some("4b7c".into()),
+            cloud_session_id: None,
+            sort_order: 0,
+            alive: false,
+            issue_url: None,
+            role: nebula_core::AgentRole::Worker,
+            recent_prompts: Vec::new(),
+        });
+        let mut term = crate::app::AttachedTerm::new(SessionRef::Agent(id), 60, 12);
+        term.booting = true;
+        term.apply_scrollback(0, b"");
+        term.apply_output(0, b"\x1b[?25l\x1b[?2004h\x1b[?1004h");
+        app.pane.term = Some(term);
+        app.chrome.animations = true;
+        assert!(app.boot_spinner_active(), "the spinner asks for frames");
+        let render = |app: &mut App| {
+            let area = Rect::new(0, 0, 64, 16);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(64, 16)).unwrap();
+            terminal.draw(|f| draw_terminal(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..16)
+                .map(|y| {
+                    (0..64)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect::<String>()
+        };
+        let text = render(&mut app);
+        assert!(text.contains("resuming session…"), "{text}");
+        assert!(text.contains("resuming…"), "the header says it too: {text}");
+        assert!(!text.contains("starting session"), "{text}");
+
+        app.pane
+            .term
+            .as_mut()
+            .unwrap()
+            .apply_output(22, b"\x1b[H> resumed");
+        assert!(!app.boot_spinner_active());
+        let text = render(&mut app);
+        assert!(
+            text.contains("> resumed") && !text.contains("resuming"),
+            "{text}"
+        );
     }
 
     /// The BLACK BACKGROUND setting leaves nothing on the terminal's own
