@@ -1219,7 +1219,7 @@ pub(crate) fn open_pr_diff_view(
     view.prefetched = Some(std::sync::Arc::new(chunks.into_iter().collect()));
     view.pr_url = Some(url.to_string());
     view.files_width = app.modals.diff_files_width;
-    view.split = app.modals.diff_split;
+    view.split = !crate::config::Config::load().diff_inline;
     if app.modals.diff_tree {
         view.toggle_tree();
     }
