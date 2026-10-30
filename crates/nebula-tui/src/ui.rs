@@ -415,9 +415,20 @@ pub(crate) fn menu_footer_hint(menu: &crate::app::ContextMenu) -> Option<String>
             "Tab: cloud off  "
         }
     });
+    // A submenu backs out; a picker opened from the QUICK PROMPT is owed
+    // its box back.
+    let esc = if menu.parent.is_some() {
+        "Esc: back"
+    } else if crate::event_loop::menu_quick_return(menu).is_some_and(|back| back.from_box) {
+        "Esc: back to the box"
+    } else {
+        "Esc: close"
+    };
+    // The picker's own keys lead, the self-evident ones trail, so a
+    // narrow footer cuts ↑/↓ before it cuts `?`.
     if menu.filter.is_some() {
         return Some(format!(
-            "{}type to filter  ↑/↓: move  Backspace: widen  {}Enter: pick  Esc: back",
+            "{}{}type to filter  Enter: pick  {esc}  ↑/↓: move  Backspace: widen",
             cloud.unwrap_or(""),
             if agent_jump { "?: settings  " } else { "" }
         ));
@@ -425,12 +436,6 @@ pub(crate) fn menu_footer_hint(menu: &crate::app::ContextMenu) -> Option<String>
     if cloud.is_none() && !agent_jump {
         return None;
     }
-    // A picker opened from the QUICK PROMPT is owed its box back.
-    let esc = if crate::event_loop::menu_quick_return(menu).is_some_and(|back| back.from_box) {
-        "Esc: back to the box"
-    } else {
-        "Esc: close"
-    };
     Some(format!(
         "{}s/?: settings  Enter: pick  {esc}",
         cloud.unwrap_or("")
