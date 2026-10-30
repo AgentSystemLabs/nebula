@@ -101,11 +101,11 @@ fn open_pr(band: &Band) -> Option<&RowPr> {
 }
 
 /// A pull request's number, as a link.
-fn pr_link(pr: &RowPr) -> Span<'static> {
+fn pr_link(pr: &RowPr, th: Theme) -> Span<'static> {
     Span::styled(
         format!("#{}", pr.number),
         Style::default()
-            .fg(gray::LINK)
+            .fg(gray::link(&th))
             .add_modifier(Modifier::UNDERLINED),
     )
 }
@@ -241,7 +241,7 @@ fn draw_empty(
     if width == 0 || r.height == 0 {
         return None;
     }
-    let dim = Style::default().fg(gray::DIM);
+    let dim = Style::default().fg(gray::dim(&th));
     // The caret column (blank: nothing folds under it) and the scope
     // mark's, each with its space, so the branch starts where a root's
     // title does.
@@ -290,7 +290,7 @@ fn draw_empty(
             spans.push(Span::styled(hint, dim));
         }
     }
-    let pr_hit = push_columns(&mut spans, r, columns, used, open_pr(band), "");
+    let pr_hit = push_columns(&mut spans, r, columns, used, open_pr(band), "", th);
     Paragraph::new(Line::from(spans)).render(Rect { height: 1, ..r }, buf);
     if selected {
         fill_selected(buf, r, th);
@@ -364,7 +364,7 @@ fn right_aligned(text: &str, w: usize) -> String {
 /// Fill a selected row: the accent taken nearly to black across it, and
 /// the one-cell accent bar in the padding left of it, so no column moves.
 fn fill_selected(buf: &mut Buffer, r: Rect, th: Theme) {
-    let fill = super::dim_toward_black(th.accent, gray::SELECTED_FILL);
+    let fill = th.wash(th.accent, gray::SELECTED_FILL);
     buf.set_style(r, Style::default().bg(fill));
     if r.x > 0 {
         if let Some(bar) = buf.cell_mut((r.x - 1, r.y)) {
@@ -428,7 +428,7 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
     }
     let title = clip(&title, room.saturating_sub(extra(&count)));
     let title_style = title_style(th, row, color);
-    let dim = Style::default().fg(gray::DIM);
+    let dim = Style::default().fg(gray::dim(&th));
 
     let mut spans = Vec::new();
     if row.child {
@@ -448,9 +448,9 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         let caret_fg = if row.selected && row.keys {
             th.accent
         } else if app.launcher.hover_crumb.as_ref() == Some(&fold) {
-            gray::BRIGHT
+            gray::bright(&th)
         } else {
-            gray::DIM
+            gray::dim(&th)
         };
         spans.push(Span::styled(caret, Style::default().fg(caret_fg)));
         spans.push(Span::raw(" "));
@@ -475,7 +475,7 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         spans.push(Span::styled(count.clone(), dim));
         used += 1 + count.chars().count();
     }
-    let pr_hit = push_columns(&mut spans, r, columns, used, row.pr, &age);
+    let pr_hit = push_columns(&mut spans, r, columns, used, row.pr, &age, th);
     Paragraph::new(Line::from(spans)).render(Rect { height: 1, ..r }, buf);
     if row.selected {
         fill_selected(buf, r, th);
@@ -494,6 +494,7 @@ fn push_columns(
     used: usize,
     pr: Option<&RowPr>,
     age: &str,
+    th: Theme,
 ) -> Option<Rect> {
     let width = usize::from(r.width);
     let mut pr_hit = None;
@@ -507,7 +508,7 @@ fn push_columns(
                 spans.push(Span::raw(" "));
                 match pr {
                     Some(pr) => {
-                        let link = pr_link(pr);
+                        let link = pr_link(pr, th);
                         let w = link.width();
                         spans.push(Span::raw(" ".repeat(PR_W.saturating_sub(w))));
                         let x = r.x + (width - columns.width() + 1 + PR_W.saturating_sub(w)) as u16;
@@ -525,7 +526,7 @@ fn push_columns(
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 right_aligned(age, AGE_W),
-                Style::default().fg(gray::DIM),
+                Style::default().fg(gray::dim(&th)),
             ));
         }
     }
@@ -551,7 +552,7 @@ fn row_parts(app: &App, card: &Card, th: Theme) -> RowParts {
             let look = session_look(app, &row.agent, false, th);
             let color = match look.dot.style.fg {
                 Some(c) if c != th.dim => c,
-                _ => gray::DIM,
+                _ => gray::dim(&th),
             };
             let age = if row.agent.archived {
                 thread_age(row.agent.archived_at)
@@ -567,7 +568,7 @@ fn row_parts(app: &App, card: &Card, th: Theme) -> RowParts {
             }
         }
         Card::Terminal(t) => {
-            let color = if t.alive { th.ok } else { gray::DIM };
+            let color = if t.alive { th.ok } else { gray::dim(&th) };
             // As the cards and the list draw it: `▶` running a command,
             // `❯` a shell.
             let mark = if t.run_command.is_some() {
@@ -604,7 +605,7 @@ fn title_style(th: Theme, row: &Row, color: Color) -> Style {
 fn pr_state(pr: &RowPr, th: Theme) -> (&'static str, Color) {
     match pr.standing {
         Standing::Open => ("open", th.ok),
-        Standing::Draft => ("draft", gray::DIM),
+        Standing::Draft => ("draft", gray::dim(&th)),
         Standing::Merged => ("merged", th.merged),
         Standing::Closed => ("closed", th.err),
     }
@@ -667,8 +668,11 @@ fn strip_line(
 }
 
 /// A strip line's dim label, padded to the values' column.
-fn label(word: &str) -> Span<'static> {
-    Span::styled(format!("{word:<LABEL_W$}"), Style::default().fg(gray::DIM))
+fn label(word: &str, th: Theme) -> Span<'static> {
+    Span::styled(
+        format!("{word:<LABEL_W$}"),
+        Style::default().fg(gray::dim(&th)),
+    )
 }
 
 /// The DETAIL STRIP, pinned under the list and over the key bar: the row
@@ -696,7 +700,7 @@ pub(super) fn draw_strip(
         ..inner
     };
     let width = usize::from(inner.width);
-    let dim = Style::default().fg(gray::DIM);
+    let dim = Style::default().fg(gray::dim(&th));
     let Some(band) = cursor.and_then(|i| bands.get(i)) else {
         f.render_widget(
             Paragraph::new(Span::styled("nothing selected — j/k picks a row", dim)),
@@ -734,18 +738,18 @@ pub(super) fn draw_strip(
     let branch = Span::styled(band.branch.clone(), Style::default().fg(scope));
     let worktree = if band.is_main {
         vec![
-            label("worktree"),
+            label("worktree", th),
             Span::styled(ROOT_TAG, Style::default().fg(th.root)),
             Span::raw(" "),
             branch,
         ]
     } else {
-        vec![label("worktree"), branch]
+        vec![label("worktree", th), branch]
     };
     let mut pr_hit = None;
     let (pr_left, pr_right) = match &band.pr {
         Some(pr) => {
-            let link = pr_link(pr);
+            let link = pr_link(pr, th);
             pr_hit = Some(Rect {
                 x: inner.x + LABEL_W as u16,
                 y: inner.y + 3,
@@ -754,7 +758,7 @@ pub(super) fn draw_strip(
             });
             let (state, color) = pr_state(pr, th);
             let mut left = vec![
-                label("pr"),
+                label("pr", th),
                 link,
                 Span::raw(" "),
                 Span::styled(state, Style::default().fg(color)),
@@ -772,7 +776,7 @@ pub(super) fn draw_strip(
             ];
             (left, right)
         }
-        None => (vec![label("pr"), Span::styled("none", dim)], Vec::new()),
+        None => (vec![label("pr", th), Span::styled("none", dim)], Vec::new()),
     };
     let lines = vec![
         strip_line(
@@ -783,7 +787,7 @@ pub(super) fn draw_strip(
             diff,
             width,
         ),
-        strip_line(vec![label("agent"), runs], Vec::new(), width),
+        strip_line(vec![label("agent", th), runs], Vec::new(), width),
         strip_line(worktree, Vec::new(), width),
         strip_line(pr_left, pr_right, width),
     ];

@@ -2089,7 +2089,7 @@ fn card_tint(app: &App, status: Option<Color>, th: Theme) -> Color {
     } else {
         0.6
     };
-    dim_toward_black(color, level * away)
+    th.wash(color, level * away)
 }
 
 /// How much of its status color a breathing card's fill keeps at its
@@ -2109,72 +2109,11 @@ fn tint_level(phase: usize) -> f32 {
     TINT_FLOOR + (TINT_PEAK - TINT_FLOOR) * wave
 }
 
-/// `c` at `level` of its brightness, the rest black — truecolor, as
-/// `focus_tint` already is, since the 256 palette has no dim shade of
-/// most hues. A color with no fixed value (`Reset`) is returned as is.
+/// `c` at `level` of its brightness, the rest black: the dark
+/// APPEARANCE's [`Theme::wash`], kept for the tests that pin its values.
+#[cfg(test)]
 fn dim_toward_black(c: Color, level: f32) -> Color {
-    let Some((r, g, b)) = color_rgb(c) else {
-        return c;
-    };
-    let f = |v: u8| (f32::from(v) * level).round().clamp(0.0, 255.0) as u8;
-    Color::Rgb(f(r), f(g), f(b))
-}
-
-/// The RGB a terminal most likely shows for `c`: xterm's defaults for the
-/// sixteen named colors, the 6×6×6 cube and the gray ramp for the rest of
-/// the 256.
-fn color_rgb(c: Color) -> Option<(u8, u8, u8)> {
-    const ANSI: [(u8, u8, u8); 16] = [
-        (0, 0, 0),
-        (205, 0, 0),
-        (0, 205, 0),
-        (205, 205, 0),
-        (0, 0, 238),
-        (205, 0, 205),
-        (0, 205, 205),
-        (229, 229, 229),
-        (127, 127, 127),
-        (255, 0, 0),
-        (0, 255, 0),
-        (255, 255, 0),
-        (92, 92, 255),
-        (255, 0, 255),
-        (0, 255, 255),
-        (255, 255, 255),
-    ];
-    let index = match c {
-        Color::Rgb(r, g, b) => return Some((r, g, b)),
-        Color::Indexed(i) => i,
-        Color::Black => 0,
-        Color::Red => 1,
-        Color::Green => 2,
-        Color::Yellow => 3,
-        Color::Blue => 4,
-        Color::Magenta => 5,
-        Color::Cyan => 6,
-        Color::Gray => 7,
-        Color::DarkGray => 8,
-        Color::LightRed => 9,
-        Color::LightGreen => 10,
-        Color::LightYellow => 11,
-        Color::LightBlue => 12,
-        Color::LightMagenta => 13,
-        Color::LightCyan => 14,
-        Color::White => 15,
-        Color::Reset => return None,
-    };
-    Some(match index {
-        0..=15 => ANSI[usize::from(index)],
-        16..=231 => {
-            let i = index - 16;
-            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-            (level(i / 36), level(i / 6 % 6), level(i % 6))
-        }
-        _ => {
-            let v = 8 + (index - 232) * 10;
-            (v, v, v)
-        }
-    })
+    crate::theme::mix(crate::theme::BLACK_BACKGROUND, c, level)
 }
 
 /// What an ARCHIVED card wears where a live one wears its STATUS DOT: the
@@ -2649,7 +2588,11 @@ fn draw_empty(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.chrome.theme;
     let t = crate::splash::scene_time(app, app.chrome.splash_epoch);
     let mut welcome = vec![Span::styled("Welcome to ", Style::default().fg(th.text))];
-    welcome.extend(crate::splash::wordmark_word("nebula", t));
+    welcome.extend(crate::splash::wordmark_word(
+        "nebula",
+        t,
+        app.chrome.theme.light,
+    ));
     // The key line is a button, and marked as one under the pointer the
     // way the header's are.
     let mut words = Style::default().fg(th.muted);
@@ -2695,7 +2638,7 @@ fn draw_empty(f: &mut Frame, app: &mut App, area: Rect) {
             ..text
         }
         .intersection(area);
-        crate::splash::draw_sky(f.buffer_mut(), area, clear, t, th.accent);
+        crate::splash::draw_sky(f.buffer_mut(), area, clear, t, th.accent, th.light);
     }
     // Even with no sky, the name's shine moves.
     app.chrome.welcome_on_screen = true;

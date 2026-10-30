@@ -33,6 +33,13 @@ const RAMP: &[char] = &['.', ':', '·', '+', '*', '*', 'o', '@'];
 const DUST: &[u8] = &[17, 54, 55, 92, 93, 129, 135, 177];
 /// Wordmark gradient, swept left to right.
 const MARK: &[u8] = &[99, 105, 141, 177, 213, 219];
+/// The light APPEARANCE's `DUST`: the ramp runs the other way — thin dust
+/// pale, the core deep — so the disc still brightens into its center as
+/// the eye reads it on white.
+const DUST_LIGHT: &[u8] = &[189, 183, 177, 141, 135, 99, 92, 54];
+/// The light APPEARANCE's `MARK`: the same violet-to-pink sweep, a weight
+/// white doesn't wash out.
+const MARK_LIGHT: &[u8] = &[55, 56, 92, 127, 162, 161];
 
 /// 5-row block bitmaps for N E B U L A.
 const LETTERS: &[&[&str; 5]] = &[
@@ -106,19 +113,21 @@ fn fade_at(t: f32) -> f32 {
 
 /// The wordmark's color at `u` (0 -> 1) across it: the gradient, with the
 /// slow shine sweeping through once the scene has faded in.
-fn mark_color(u: f32, t: f32, fade: f32) -> Color {
+fn mark_color(u: f32, t: f32, fade: f32, light: bool) -> Color {
     let shine = (u * 5.0 - t * 1.4).sin() > 0.93;
     if shine && fade >= 1.0 {
-        return Color::Indexed(231); // near-white glint
+        // A glint: near-white on a dark sky, near-black on a light one.
+        return Color::Indexed(if light { 233 } else { 231 });
     }
-    let gi = (u * (MARK.len() as f32 - 1.0)).round() as usize;
-    Color::Indexed(MARK[gi])
+    let mark = if light { MARK_LIGHT } else { MARK };
+    let gi = (u * (mark.len() as f32 - 1.0)).round() as usize;
+    Color::Indexed(mark[gi])
 }
 
 /// `word` in the wordmark's gradient and shine, one cell per letter: the
 /// name where there is no room for the block letters, or no call for
 /// them.
-pub fn wordmark_word(word: &str, t: f32) -> Vec<Span<'static>> {
+pub fn wordmark_word(word: &str, t: f32, light: bool) -> Vec<Span<'static>> {
     let fade = fade_at(t);
     let n = word.chars().count().max(1) as f32;
     word.chars()
@@ -127,7 +136,7 @@ pub fn wordmark_word(word: &str, t: f32) -> Vec<Span<'static>> {
             Span::styled(
                 ch.to_string(),
                 Style::default()
-                    .fg(mark_color(i as f32 / n, t, fade))
+                    .fg(mark_color(i as f32 / n, t, fade, light))
                     .add_modifier(Modifier::BOLD),
             )
         })
@@ -137,7 +146,7 @@ pub fn wordmark_word(word: &str, t: f32) -> Vec<Span<'static>> {
 /// One wordmark row as per-cell spans: gradient across the word, a slow
 /// shine sweeping through, and the blocks materializing from static
 /// (`░` -> `▒` -> `█`) while the scene fades in.
-fn wordmark_line(row: usize, t: f32, fade: f32) -> Line<'static> {
+fn wordmark_line(row: usize, t: f32, fade: f32, light: bool) -> Line<'static> {
     let width: usize = LETTERS.iter().map(|l| l[0].len()).sum::<usize>() + 2 * (LETTERS.len() - 1);
     let block = if fade < 0.5 {
         "░"
@@ -159,7 +168,7 @@ fn wordmark_line(row: usize, t: f32, fade: f32) -> Line<'static> {
                 spans.push(Span::styled(
                     block,
                     Style::default()
-                        .fg(mark_color(u, t, fade))
+                        .fg(mark_color(u, t, fade, light))
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
@@ -184,7 +193,7 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     if big {
         for row in 0..5 {
-            lines.push(wordmark_line(row, t, fade));
+            lines.push(wordmark_line(row, t, fade, th.light));
         }
     } else {
         lines.push(Line::from(vec![
@@ -256,7 +265,7 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         height: block_h,
     };
 
-    draw_sky(f.buffer_mut(), area, text, t, th.accent);
+    draw_sky(f.buffer_mut(), area, text, t, th.accent, th.light);
     f.render_widget(Paragraph::new(lines).centered(), text);
     // A click anywhere lands focus back on the (invisible) projects panel,
     // where `n` creates the first project.
@@ -270,7 +279,8 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
 /// it, dust and stars both kept off a band around `text` so the words sit
 /// on clear black. The first-run splash and the empty GRID's welcome
 /// (`ui::launcher_view`) are both drawn over it.
-pub fn draw_sky(buf: &mut Buffer, area: Rect, text: Rect, t: f32, accent: Color) {
+pub fn draw_sky(buf: &mut Buffer, area: Rect, text: Rect, t: f32, accent: Color, light: bool) {
+    let dust = if light { DUST_LIGHT } else { DUST };
     let fade = fade_at(t);
     // ---- galaxy centered in the sky above the text ----
     let above = text.y.saturating_sub(area.y).max(4);
@@ -303,7 +313,7 @@ pub fn draw_sky(buf: &mut Buffer, area: Rect, text: Rect, t: f32, accent: Color)
                 let i = (v * (RAMP.len() as f32 - 1.0)).round() as usize;
                 buf[(x, y)]
                     .set_char(RAMP[i])
-                    .set_fg(Color::Indexed(DUST[i]));
+                    .set_fg(Color::Indexed(dust[i]));
                 continue;
             }
             // Empty sky: sparse stars on their own twinkle phases, plus
@@ -320,9 +330,13 @@ pub fn draw_sky(buf: &mut Buffer, area: Rect, text: Rect, t: f32, accent: Color)
             if (h >> 4).is_multiple_of(111) {
                 buf[(x, y)].set_char('+').set_fg(accent);
             } else if tw > 0.8 {
-                buf[(x, y)].set_char('·').set_fg(Color::Indexed(189));
+                buf[(x, y)]
+                    .set_char('·')
+                    .set_fg(Color::Indexed(if light { 103 } else { 189 }));
             } else {
-                buf[(x, y)].set_char('.').set_fg(Color::Indexed(60));
+                buf[(x, y)]
+                    .set_char('.')
+                    .set_fg(Color::Indexed(if light { 250 } else { 60 }));
             }
         }
     }

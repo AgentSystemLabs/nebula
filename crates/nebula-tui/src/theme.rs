@@ -10,12 +10,172 @@
 //! terminals including Terminal.app since macOS Tahoe.
 
 use ratatui::style::Color;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// What the BLACK BACKGROUND setting paints under every cell nothing else
 /// colored. Truecolor rather than ANSI `Black`, which a terminal palette is
 /// free to map to a dark gray (a stock Ghostty's is #1d1f21) — the very
 /// gray the setting exists to get away from.
 pub const BLACK_BACKGROUND: Color = Color::Rgb(0, 0, 0);
+
+/// The light APPEARANCE's counterpart of [`BLACK_BACKGROUND`].
+pub const WHITE_BACKGROUND: Color = Color::Rgb(255, 255, 255);
+
+/// The APPEARANCE values the settings overlay cycles through: `auto`
+/// follows the terminal's own background (asked with OSC 11 at startup,
+/// `COLORFGBG` when it doesn't answer), the other two force one.
+pub const APPEARANCES: &[&str] = &["auto", "dark", "light"];
+
+/// What the startup probe learned about the host terminal's background:
+/// 0 = nothing (no answer yet, or no probe), 1 = dark, 2 = light.
+static DETECTED_BACKGROUND: AtomicU8 = AtomicU8::new(0);
+
+/// Record the startup probe's answer: whether the terminal's background
+/// is light.
+pub fn set_detected_light(light: bool) {
+    DETECTED_BACKGROUND.store(if light { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+/// Whether the terminal's background is light, as far as anything told
+/// us: the startup probe first, then `COLORFGBG` (`"15;0"` — fg;bg, an
+/// ANSI index — exported by rxvt, Konsole and iTerm2), else dark.
+fn detected_light() -> bool {
+    match DETECTED_BACKGROUND.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => std::env::var("COLORFGBG")
+            .ok()
+            .and_then(|v| colorfgbg_is_light(&v))
+            .unwrap_or(false),
+    }
+}
+
+/// `COLORFGBG`'s background is its last field: 7 (light gray) and 9–15
+/// (the bright colors but 8, the dark gray) are light backgrounds.
+fn colorfgbg_is_light(v: &str) -> Option<bool> {
+    let bg: u8 = v.rsplit(';').next()?.trim().parse().ok()?;
+    Some(bg == 7 || (9..=15).contains(&bg))
+}
+
+/// Whether `appearance` (a config value off [`APPEARANCES`]) resolves to
+/// the light palette. Anything off the list is `auto`.
+pub fn appearance_is_light(appearance: &str) -> bool {
+    match appearance.trim().to_ascii_lowercase().as_str() {
+        "light" => true,
+        "dark" => false,
+        _ => detected_light(),
+    }
+}
+
+/// Parse an OSC 11 reply (`ESC ] 11 ; rgb:RRRR/GGGG/BBBB` then BEL or ST,
+/// one to four hex digits a channel) into 8-bit RGB.
+pub fn parse_osc11(reply: &[u8]) -> Option<(u8, u8, u8)> {
+    let s = std::str::from_utf8(reply).ok()?;
+    let start = s.find("]11;")? + 4;
+    let body = &s[start..];
+    let body = body
+        .strip_prefix("rgba:")
+        .or_else(|| body.strip_prefix("rgb:"))?;
+    let end = body
+        .find(|c: char| !(c.is_ascii_hexdigit() || c == '/'))
+        .unwrap_or(body.len());
+    let mut parts = body[..end].split('/');
+    let mut channel = || -> Option<u8> {
+        let hex = parts.next()?;
+        if hex.is_empty() || hex.len() > 4 {
+            return None;
+        }
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        let max = (1u32 << (4 * hex.len())) - 1;
+        Some(((v * 255 + max / 2) / max) as u8)
+    };
+    Some((channel()?, channel()?, channel()?))
+}
+
+/// Whether a background color reads as light: WCAG relative luminance
+/// over the midpoint between black and white text contrast (~0.18).
+pub fn rgb_is_light((r, g, b): (u8, u8, u8)) -> bool {
+    let lin = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b) > 0.18
+}
+
+/// The RGB a terminal most likely shows for `c`: xterm's defaults for the
+/// sixteen named colors, the 6×6×6 cube and the gray ramp for the rest of
+/// the 256. None for a color with no fixed value (`Reset`).
+pub fn color_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    let index = match c {
+        Color::Rgb(r, g, b) => return Some((r, g, b)),
+        Color::Indexed(i) => i,
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        Color::Reset => return None,
+    };
+    Some(match index {
+        0..=15 => ANSI[usize::from(index)],
+        16..=231 => {
+            let i = index - 16;
+            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            (level(i / 36), level(i / 6 % 6), level(i % 6))
+        }
+        _ => {
+            let v = 8 + (index - 232) * 10;
+            (v, v, v)
+        }
+    })
+}
+
+/// `c` mixed over `base` at `level` (0 = all base, 1 = all `c`), as
+/// truecolor. A color with no fixed value is returned as is.
+pub fn mix(base: Color, c: Color, level: f32) -> Color {
+    let (Some((br, bg, bb)), Some((r, g, b))) = (color_rgb(base), color_rgb(c)) else {
+        return c;
+    };
+    let f = |base: u8, v: u8| {
+        (f32::from(base) + (f32::from(v) - f32::from(base)) * level)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(f(br, r), f(bg, g), f(bb, b))
+}
 
 /// Names the settings overlay cycles through; `by_name` accepts them
 /// case-insensitively and falls back to the first entry.
@@ -111,8 +271,14 @@ pub struct Theme {
     /// the one gray). On a black window it reads as the accent glowing
     /// faintly rather than as a gray slab, and it is darker than the gray
     /// it replaced, so dim text on it keeps more of its contrast.
-    /// Truecolor by necessity (see module docs).
+    /// Truecolor by necessity (see module docs). In the light APPEARANCE
+    /// the same idea runs the other way: the accent taken up to a
+    /// near-white.
     pub focus_tint: Color,
+    /// Drawn for a light terminal background (the APPEARANCE setting):
+    /// every role above is then a dark-on-light shade, the solid
+    /// background is white, and washes mix toward white, not black.
+    pub light: bool,
 }
 
 /// `done` and its sweep for a preset that already owns blue.
@@ -153,11 +319,117 @@ impl Default for Theme {
             ],
             done_sweep: [Color::Indexed(75), Color::Indexed(111), Color::Indexed(153)],
             focus_tint: Color::Rgb(0, 27, 28),
+            light: false,
         }
     }
 }
 
+/// The light APPEARANCE's `done` families, a shade darker than the dark
+/// ones so they keep their contrast on white; each sweep darkens toward
+/// its head, the way the dark ones brighten toward theirs.
+const DONE_BLUE_LIGHT: [Color; 3] = [Color::Indexed(33), Color::Indexed(26), Color::Indexed(19)];
+const DONE_PINK_LIGHT: [Color; 3] = [Color::Indexed(162), Color::Indexed(125), Color::Indexed(89)];
+const DONE_TURQUOISE_LIGHT: [Color; 3] =
+    [Color::Indexed(30), Color::Indexed(23), Color::Indexed(17)];
+
 impl Theme {
+    /// The palette the UI draws with: preset `name` in the APPEARANCE
+    /// `appearance` resolves to (see [`appearance_is_light`]).
+    pub fn resolve(name: &str, appearance: &str) -> Self {
+        if appearance_is_light(appearance) {
+            Self::light_by_name(name)
+        } else {
+            Self::by_name(name)
+        }
+    }
+
+    /// What the solid-background setting paints under every cell nothing
+    /// else colored: black, or white in the light APPEARANCE.
+    pub fn canvas(&self) -> Color {
+        if self.light {
+            WHITE_BACKGROUND
+        } else {
+            BLACK_BACKGROUND
+        }
+    }
+
+    /// `c` at `level` of its strength over the canvas: a faint wash of it
+    /// — taken toward black on a dark background, toward white on a
+    /// light one — as truecolor, since the 256 palette has no faint shade
+    /// of most hues.
+    pub fn wash(&self, c: Color, level: f32) -> Color {
+        mix(self.canvas(), c, level)
+    }
+
+    /// Preset `name` for a light terminal background. The status hues
+    /// keep their meaning — and every distinctness the dark presets hold
+    /// to — but take shades dark enough to read on white; the gray
+    /// tiers invert (text near-black, raised surfaces a step under
+    /// white); and each accent is that preset's hue at a weight white
+    /// doesn't wash out.
+    pub fn light_by_name(name: &str) -> Self {
+        let dark = Self::by_name(name);
+        // The done family follows the dark preset's choice of hue.
+        let done_sweep = if dark.done_sweep == DONE_PINK {
+            DONE_PINK_LIGHT
+        } else if dark.done_sweep == DONE_TURQUOISE {
+            DONE_TURQUOISE_LIGHT
+        } else {
+            DONE_BLUE_LIGHT
+        };
+        let base = Self {
+            accent: Color::Indexed(30), // teal — cyan, legible on white
+            on_accent: Color::Indexed(231),
+            text: Color::Indexed(235),
+            muted: Color::Indexed(240),
+            dim: Color::Indexed(245),
+            ok: Color::Indexed(64), // olive green, a hue off the worktree's
+            done: done_sweep[0],
+            warn: Color::Indexed(136), // dark goldenrod: yellow on white
+            err: Color::Indexed(160),
+            special: Color::Indexed(127),
+            merged: Color::Indexed(135),
+            root: Color::Indexed(166),    // burnt orange
+            worktree: Color::Indexed(29), // sea green
+            sel_bg: Color::Indexed(253),
+            sel_bg_dim: Color::Indexed(255),
+            edge: Color::Indexed(250),
+            warn_sweep: [Color::Indexed(136), Color::Indexed(94), Color::Indexed(58)],
+            err_sweep: [Color::Indexed(160), Color::Indexed(124), Color::Indexed(88)],
+            merged_sweep: [Color::Indexed(135), Color::Indexed(92), Color::Indexed(54)],
+            done_sweep,
+            focus_tint: Color::Reset, // derived from the accent below
+            light: true,
+        };
+        let (accent, special) = match name.trim().to_ascii_lowercase().as_str() {
+            "ocean" => (Color::Indexed(25), Color::Indexed(67)),
+            "forest" => (Color::Indexed(22), Color::Indexed(65)),
+            "rose" => (Color::Indexed(161), Color::Indexed(97)),
+            "amber" => (Color::Indexed(130), Color::Indexed(95)),
+            "lavender" => (Color::Indexed(61), Color::Indexed(133)),
+            "coral" => (Color::Indexed(167), Color::Indexed(31)),
+            "slate" => (Color::Indexed(60), Color::Indexed(24)),
+            "sand" => (Color::Indexed(137), Color::Indexed(94)),
+            "mono" => (Color::Indexed(232), Color::Indexed(243)),
+            _ => (base.accent, base.special),
+        };
+        let mut th = Self {
+            accent,
+            special,
+            ..base
+        };
+        if name.trim().eq_ignore_ascii_case("mono") {
+            // Grayscale chrome, as in the dark mono: the accent is the
+            // darkest step, text one over it, muted one over that.
+            th.text = Color::Indexed(236);
+            th.muted = Color::Indexed(241);
+            th.focus_tint = Color::Rgb(238, 238, 238);
+        } else {
+            th.focus_tint = mix(WHITE_BACKGROUND, accent, 0.10);
+        }
+        th
+    }
+
     pub fn by_name(name: &str) -> Self {
         let base = Self::default();
         match name.trim().to_ascii_lowercase().as_str() {
@@ -257,22 +529,55 @@ impl Theme {
 /// title steps could land on one shade there. Every hue the layout draws
 /// — the status dots, the cursor's accent — is still the preset's own.
 pub mod nested {
+    use super::Theme;
     use ratatui::style::Color;
 
     /// A live root's title: working, or waiting on you.
-    pub const BRIGHT: Color = Color::Rgb(0xf2, 0xf2, 0xf2);
+    pub fn bright(th: &Theme) -> Color {
+        if th.light {
+            Color::Rgb(0x1c, 0x1c, 0x1c)
+        } else {
+            Color::Rgb(0xf2, 0xf2, 0xf2)
+        }
+    }
     /// An idle root's title, and every row's age, count and connector.
-    pub const DIM: Color = Color::Rgb(0x8c, 0x8c, 0x8c);
+    pub fn dim(th: &Theme) -> Color {
+        if th.light {
+            Color::Rgb(0x70, 0x70, 0x70)
+        } else {
+            Color::Rgb(0x8c, 0x8c, 0x8c)
+        }
+    }
     /// A pull request's `#42`, underlined: a link, in the blue links wear.
-    pub const LINK: Color = Color::Rgb(0x58, 0xa6, 0xff);
+    pub fn link(th: &Theme) -> Color {
+        if th.light {
+            Color::Rgb(0x09, 0x69, 0xda)
+        } else {
+            Color::Rgb(0x58, 0xa6, 0xff)
+        }
+    }
     /// How much of the accent the cursor's row keeps as its fill: the
-    /// accent taken nearly to black, so the row is washed in it.
+    /// accent taken nearly to the canvas, so the row is washed in it.
     pub const SELECTED_FILL: f32 = 0.18;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every preset in both APPEARANCES, named for the assertion
+    /// messages: the rules below hold for a light terminal too.
+    fn palettes() -> Vec<(String, Theme)> {
+        THEMES
+            .iter()
+            .flat_map(|n| {
+                [
+                    (n.to_string(), Theme::by_name(n)),
+                    (format!("{n} (light)"), Theme::light_by_name(n)),
+                ]
+            })
+            .collect()
+    }
 
     /// Red, green, blue coordinates (0..=5) of a 6x6x6 cube color.
     fn cube(c: Color) -> Option<[u8; 3]> {
@@ -308,8 +613,7 @@ mod tests {
         // A done dot has to stay readable AS done: never green (that's
         // `ok`, which the eye files as "nothing to do here"), and never
         // the same color as another status in the same preset.
-        for name in THEMES {
-            let th = Theme::by_name(name);
+        for (name, th) in palettes() {
             assert_ne!(th.done, th.ok, "{name}: done reads as plain success");
             assert_ne!(th.done, th.warn, "{name}: done reads as running");
             assert_ne!(th.done, th.err, "{name}: done reads as needs-feedback");
@@ -325,8 +629,7 @@ mod tests {
     /// for a card with nothing going on.
     #[test]
     fn a_running_frame_never_reads_as_the_focus() {
-        for name in THEMES {
-            let th = Theme::by_name(name);
+        for (name, th) in palettes() {
             assert_ne!(th.warn, th.accent, "{name}: running reads as the cursor");
             assert_ne!(th.warn, th.edge, "{name}: running reads as a quiet card");
         }
@@ -340,8 +643,7 @@ mod tests {
     /// from the merge there. The violet this replaced was one.
     #[test]
     fn done_is_never_a_shade_of_merged() {
-        for name in THEMES {
-            let th = Theme::by_name(name);
+        for (name, th) in palettes() {
             assert!(
                 !th.merged_sweep.contains(&th.done),
                 "{name}: the merged sweep flashes the done color"
@@ -361,8 +663,7 @@ mod tests {
     /// toward its head, and is nobody else's sweep.
     #[test]
     fn done_sweep_rests_on_done_in_every_preset() {
-        for name in THEMES {
-            let th = Theme::by_name(name);
+        for (name, th) in palettes() {
             assert_eq!(th.done_sweep[0], th.done, "{name}: the sweep rests on done");
             let [tail, mid, head] = th.done_sweep;
             assert!(
@@ -389,8 +690,7 @@ mod tests {
     /// the dim its harness takes.
     #[test]
     fn the_two_scope_colors_are_a_hue_apart_in_every_preset() {
-        for name in THEMES {
-            let th = Theme::by_name(name);
+        for (name, th) in palettes() {
             assert_ne!(th.root, th.worktree, "{name}: one scope, painted twice");
             let steps = cube_steps(th.root, th.worktree);
             assert!(
@@ -417,8 +717,7 @@ mod tests {
     /// grayscale one, which is the preset that moves those roles.
     #[test]
     fn accent_text_and_muted_stay_three_tiers_in_every_preset() {
-        for name in THEMES {
-            let th = Theme::by_name(name);
+        for (name, th) in palettes() {
             assert_ne!(th.accent, th.text, "{name}: a match highlight vanishes");
             assert_ne!(th.text, th.muted, "{name}: secondary text reads as primary");
             assert_ne!(th.muted, th.dim, "{name}: secondary text reads as a hint");
@@ -435,8 +734,7 @@ mod tests {
     /// landed pull request look like it needs someone.
     #[test]
     fn merged_is_purple_and_its_own_color_in_every_preset() {
-        for name in THEMES {
-            let th = Theme::by_name(name);
+        for (name, th) in palettes() {
             assert_eq!(th.merged, Color::Indexed(135), "{name}: merged is purple");
             assert_ne!(th.merged, th.special, "{name}: merged reads as terminated");
             assert_ne!(th.merged, th.done, "{name}: merged reads as unread done");
@@ -508,5 +806,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// WCAG contrast of `c` against white.
+    fn contrast_on_white(c: Color) -> f64 {
+        let (r, g, b) = color_rgb(c).expect("a fixed color");
+        let lin = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let l = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+        1.05 / (l + 0.05)
+    }
+
+    /// A light palette has to read on white: the text tiers keep their
+    /// order of contrast, and every hue a glyph wears — accent, statuses,
+    /// scopes — holds the 3:1 WCAG asks of large text and UI glyphs.
+    #[test]
+    fn light_palettes_read_on_white() {
+        for name in THEMES {
+            let th = Theme::light_by_name(name);
+            assert!(th.light, "{name}: marked light");
+            assert_eq!(th.canvas(), WHITE_BACKGROUND);
+            assert!(contrast_on_white(th.text) >= 7.0, "{name}: text");
+            assert!(contrast_on_white(th.muted) >= 4.5, "{name}: muted");
+            assert!(contrast_on_white(th.dim) >= 3.0, "{name}: dim");
+            for (role, c) in [
+                ("accent", th.accent),
+                ("ok", th.ok),
+                ("done", th.done),
+                ("warn", th.warn),
+                ("err", th.err),
+                ("special", th.special),
+                ("merged", th.merged),
+                ("root", th.root),
+                ("worktree", th.worktree),
+            ] {
+                let ratio = contrast_on_white(c);
+                assert!(ratio >= 3.0, "{name}: {role} is {ratio:.2}:1 on white");
+            }
+            // Raised surfaces sit a step under white, the focused one
+            // further than the unfocused one, and the frame under both.
+            let lum = |c: Color| 1.05 / contrast_on_white(c) - 0.05;
+            assert!(lum(th.sel_bg) < lum(th.sel_bg_dim), "{name}: sel fills");
+            assert!(lum(th.edge) < lum(th.sel_bg), "{name}: the edge recedes");
+            // The focus tint is a pale wash of the accent: near-white, but
+            // not white, so the surface keys land in still shows.
+            let Color::Rgb(r, g, b) = th.focus_tint else {
+                panic!("{name}: focus_tint must be truecolor RGB");
+            };
+            assert_ne!((r, g, b), (255, 255, 255), "{name}: tint invisible");
+            assert!(lum(th.focus_tint) > 0.75, "{name}: tint too dark for text");
+        }
+    }
+
+    /// Washes mix toward the canvas: black in the dark APPEARANCE (the
+    /// `dim_toward_black` the cards always wore), white in the light one.
+    #[test]
+    fn washes_mix_toward_the_canvas() {
+        let dark = Theme::default();
+        let light = Theme::light_by_name("default");
+        let c = Color::Indexed(209);
+        assert_eq!(dark.wash(c, 0.5), Color::Rgb(128, 68, 48));
+        assert_eq!(dark.wash(c, 0.0), Color::Rgb(0, 0, 0));
+        assert_eq!(light.wash(c, 0.0), Color::Rgb(255, 255, 255));
+        assert_eq!(light.wash(c, 1.0), Color::Rgb(255, 135, 95));
+        assert_eq!(light.wash(Color::Reset, 0.3), Color::Reset);
+    }
+
+    #[test]
+    fn osc11_replies_parse_at_every_channel_width() {
+        assert_eq!(
+            parse_osc11(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"),
+            Some((255, 255, 255))
+        );
+        assert_eq!(
+            parse_osc11(b"\x1b]11;rgb:1d1d/1f1f/2121\x07"),
+            Some((29, 31, 33))
+        );
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:f/8/0\x07"), Some((255, 136, 0)));
+        assert_eq!(
+            parse_osc11(b"\x1b]11;rgba:fa/fa/fa/ff\x07"),
+            Some((250, 250, 250))
+        );
+        // A DA1 reply riding behind it is not part of the color.
+        assert_eq!(
+            parse_osc11(b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c"),
+            Some((0, 0, 0))
+        );
+        assert_eq!(parse_osc11(b"\x1b[?62;22c"), None);
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:zz/00/00\x07"), None);
+        assert!(rgb_is_light((255, 255, 255)));
+        assert!(rgb_is_light((0xfd, 0xf6, 0xe3)), "solarized light");
+        assert!(!rgb_is_light((0x1d, 0x1f, 0x21)));
+        assert!(!rgb_is_light((0x00, 0x2b, 0x36)), "solarized dark");
+    }
+
+    #[test]
+    fn colorfgbg_names_the_background_last() {
+        assert_eq!(colorfgbg_is_light("0;15"), Some(true));
+        assert_eq!(colorfgbg_is_light("0;default;15"), Some(true));
+        assert_eq!(colorfgbg_is_light("15;0"), Some(false));
+        assert_eq!(colorfgbg_is_light("12;8"), Some(false));
+        assert_eq!(colorfgbg_is_light("0;7"), Some(true));
+        assert_eq!(colorfgbg_is_light("default;default"), None);
+    }
+
+    /// A forced APPEARANCE ignores whatever the terminal said.
+    #[test]
+    fn a_forced_appearance_wins() {
+        assert!(appearance_is_light("light"));
+        assert!(appearance_is_light(" Light "));
+        assert!(!appearance_is_light("dark"));
+        assert!(Theme::resolve("ocean", "light").light);
+        assert_eq!(Theme::resolve("ocean", "dark"), Theme::by_name("ocean"));
     }
 }

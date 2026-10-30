@@ -418,6 +418,7 @@ pub enum SettingKind {
     DeleteEmptyWorktree,
     AutoCleanupMerged,
     ShowAllWorktrees,
+    Appearance,
     Theme,
     Animations,
     BlackBackground,
@@ -536,7 +537,7 @@ impl SettingKind {
             SettingKind::AskBeforeArchive => (2026, 10, 3),
             SettingKind::ConfirmDragMove => (2026, 10, 2),
             SettingKind::SourceControlGraph | SettingKind::InlineGraphics => (2026, 10, 9),
-            SettingKind::DiffInline => (2026, 10, 28),
+            SettingKind::Appearance | SettingKind::DiffInline => (2026, 10, 28),
         }
     }
 
@@ -687,6 +688,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
         title: "Appearance",
         body: TabBody::Values(&[
             SettingSpec {
+                kind: SettingKind::Appearance,
+                label: "Appearance",
+                hint: "Dark or light palette: auto follows the terminal's background, dark and light force one",
+                group: "",
+            },
+            SettingSpec {
                 kind: SettingKind::Theme,
                 label: "Color theme",
                 hint: "Accent colors used across the grid and overlays",
@@ -700,8 +707,8 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             },
             SettingSpec {
                 kind: SettingKind::BlackBackground,
-                label: "Black background",
-                hint: "Paint the window pure black instead of the terminal's own background (off keeps the terminal's, transparency included)",
+                label: "Solid background",
+                hint: "Paint the window pure black (white in the light appearance) instead of the terminal's own background (off keeps the terminal's, transparency included)",
                 group: "",
             },
             SettingSpec {
@@ -1189,6 +1196,12 @@ pub struct Config {
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
+    /// APPEARANCE: `auto` (the default) draws the light palette when the
+    /// terminal's background is light — asked with OSC 11 at startup,
+    /// `COLORFGBG` when it doesn't answer — and the dark one otherwise;
+    /// `dark` and `light` force one. See `theme::APPEARANCES`; anything
+    /// off the list reads as `auto`.
+    pub appearance: String,
     /// Master switch for the TUI's animations (the running/needs-feedback
     /// status-text sweep and the splash's motion). Off trades them for
     /// fewer repaints on constrained machines.
@@ -1606,6 +1619,7 @@ impl Default for Config {
             auto_cleanup_merged: false,
             show_all_worktrees: true,
             theme: "default".into(),
+            appearance: "auto".into(),
             animations: true,
             black_background: true,
             hide_card_marks: false,
@@ -1838,7 +1852,18 @@ impl Config {
 
     /// `theme` resolved to the palette the UI draws with.
     pub fn theme(&self) -> crate::theme::Theme {
-        crate::theme::Theme::by_name(&self.theme)
+        crate::theme::Theme::resolve(&self.theme, &self.appearance)
+    }
+
+    /// `appearance` as the word on the list it reads as: a hand edit off
+    /// [`crate::theme::APPEARANCES`] is `auto`.
+    pub fn appearance_word(&self) -> &'static str {
+        let word = self.appearance.trim().to_ascii_lowercase();
+        crate::theme::APPEARANCES
+            .iter()
+            .copied()
+            .find(|a| *a == word)
+            .unwrap_or("auto")
     }
 
     /// `session_pane` resolved to the side the LAUNCHER VIEW lays its pane
@@ -2524,6 +2549,7 @@ impl Config {
             SettingKind::AutoCleanupMerged => on_off(self.auto_cleanup_merged).into(),
             SettingKind::ShowAllWorktrees => on_off(self.show_all_worktrees).into(),
             SettingKind::AskBeforeArchive => on_off(self.ask_before_archive).into(),
+            SettingKind::Appearance => self.appearance_word().into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::BlackBackground => on_off(self.black_background).into(),
@@ -2625,6 +2651,10 @@ impl Config {
             }
             SettingKind::AskBeforeArchive => {
                 self.ask_before_archive = !self.ask_before_archive;
+            }
+            SettingKind::Appearance => {
+                self.appearance =
+                    cycle_choice(self.appearance_word(), crate::theme::APPEARANCES, step).into();
             }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
