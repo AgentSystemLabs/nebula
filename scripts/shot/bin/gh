@@ -73,10 +73,15 @@ def main(argv):
         return open_list()
     if argv[:2] == ["pr", "view"]:
         rest = [a for a in argv[2:] if not a.startswith("--")]
-        number = next((a for a in rest if a.isdigit()), None)
+        url = next((a for a in rest if a.startswith("https://github.com/") and "/pull/" in a), None)
+        number = url.rsplit("/", 1)[-1] if url else next((a for a in rest if a.isdigit()), None)
         if number:
             return emit("pr-%s.json" % number)
-        return emit("pr-view-%s.json" % os.path.basename(os.getcwd()))
+        name = "pr-view-%s.json" % os.path.basename(os.getcwd())
+        if os.path.isfile(os.path.join(FIX, "pr-view-absent")) and not os.path.isfile(os.path.join(FIX, name)):
+            sys.stderr.write("no pull requests found for branch\n")
+            return 1
+        return emit(name)
     if argv[:2] == ["pr", "diff"]:
         number = next((a for a in argv[2:] if a.isdigit()), None)
         return emit("pr-%s.diff" % number) if number else 1

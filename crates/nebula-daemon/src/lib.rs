@@ -12,6 +12,7 @@ pub mod pr_scope;
 pub mod prompt_history;
 pub mod pty;
 pub mod registry;
+pub mod reported_pr;
 pub mod server;
 pub mod session_context;
 pub mod session_model;
@@ -194,6 +195,7 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                 cwd,
                 transcript,
                 prompt,
+                reported_pr,
             }) = hook_rx.recv().await
             {
                 let captures_session = event.captures_session();
@@ -218,6 +220,11 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                         session_id.as_deref(),
                         captures_session,
                     );
+                }
+                if let Some(url) = reported_pr {
+                    if let Err(error) = daemon.remember_reported_pr(&agent_id, &url) {
+                        tracing::warn!(%error, "could not remember session PR");
+                    }
                 }
                 // A `nebula worktree` relocation waits for the turn to end.
                 // After the reparent on purpose: this turn's final payload

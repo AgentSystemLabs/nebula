@@ -893,9 +893,8 @@ impl Store {
 
     // ---- links ----
 
-    /// Test seeding only: nothing creates a link any more (the request
-    /// that did is gone), but rows older databases hold are still read,
-    /// edited and deleted.
+    /// Legacy test seeding. Live session capture uses `remember_pr_link`
+    /// to keep repeated Stop deliveries idempotent.
     #[cfg(test)]
     pub fn insert_link(&self, l: &Link) -> Result<()> {
         self.conn.lock().execute(
@@ -919,6 +918,32 @@ impl Store {
             params![worktree_id.as_str()],
             |r| r.get(0),
         )?)
+    }
+
+    /// Idempotent hook capture. The database lock covers both duplicate checking
+    /// and ordering, so repeated Stops cannot create duplicate links.
+    pub fn remember_pr_link(&self, worktree: &WorktreeId, url: &str) -> Result<Link> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {LINK_COLUMNS} FROM links WHERE worktree_id = ?1 AND url = ?2 LIMIT 1"
+        ))?;
+        let mut rows = stmt.query(params![worktree.as_str(), url])?;
+        if let Some(row) = rows.next()? {
+            return Ok(row_to_link(row)?);
+        }
+        let link = Link {
+            id: LinkId::generate(),
+            worktree_id: worktree.clone(),
+            url: url.into(),
+            sort_order: conn.query_row(
+                "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM links WHERE worktree_id = ?1",
+                params![worktree.as_str()],
+                |r| r.get(0),
+            )?,
+        };
+        conn.execute("INSERT INTO links (id, worktree_id, url, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![link.id.as_str(), worktree.as_str(), url, link.sort_order, now_ms()])?;
+        Ok(link)
     }
 
     pub fn set_link_url(&self, id: &LinkId, url: &str) -> Result<()> {
@@ -1414,6 +1439,41 @@ mod tests {
         // An empty marker is a real answer: opened, nobody had posted yet.
         store.mark_pr_seen(url, "").unwrap();
         assert_eq!(store.load_pr_seen().unwrap()[0].marker, "");
+    }
+
+    #[test]
+    fn reported_pr_links_are_idempotent_ordered_and_persisted() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            id: ProjectId::generate(),
+            name: "p".into(),
+            repo_path: "/tmp/p".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        let wt = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id,
+            path: "/tmp/p".into(),
+            branch: "fix".into(),
+            is_main: false,
+            sort_order: 0,
+        };
+        store.insert_worktree(&wt).unwrap();
+        let first = store
+            .remember_pr_link(&wt.id, "https://github.com/other/game/pull/384")
+            .unwrap();
+        assert_eq!(
+            store.remember_pr_link(&wt.id, &first.url).unwrap().id,
+            first.id
+        );
+        let next = store
+            .remember_pr_link(&wt.id, "https://github.com/o/r/pull/9")
+            .unwrap();
+        assert!(next.sort_order > first.sort_order);
+        let links = store.load_links().unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].worktree_id, wt.id);
     }
 
     #[test]

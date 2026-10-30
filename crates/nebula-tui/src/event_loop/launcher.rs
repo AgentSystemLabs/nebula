@@ -9101,6 +9101,7 @@ mod tests {
             app.github.pull_requests.insert(
                 WorktreeId("w2".into()),
                 Some(crate::pull_request::PullRequest {
+                    reported: false,
                     number: 42,
                     url: "https://github.com/o/web/pull/42".into(),
                     title: "Polish the nav".into(),
@@ -9146,6 +9147,7 @@ mod tests {
     /// An open pull request, `#<number> Polish the nav`, on `o/demo`.
     fn pull_request(number: u64) -> crate::pull_request::PullRequest {
         crate::pull_request::PullRequest {
+            reported: false,
             number,
             url: format!("https://github.com/o/demo/pull/{number}"),
             title: "Polish the nav".into(),

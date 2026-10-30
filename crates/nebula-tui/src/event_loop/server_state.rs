@@ -144,7 +144,10 @@ pub(crate) fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
                 }
             }
         }
-        Entity::Link(l) => upsert_by(&mut app.tree.links, l, |x, y| x.id == y.id),
+        Entity::Link(l) => {
+            app.github.pr_recheck.remove(&l.worktree_id);
+            upsert_by(&mut app.tree.links, l, |x, y| x.id == y.id);
+        }
     }
 }
 

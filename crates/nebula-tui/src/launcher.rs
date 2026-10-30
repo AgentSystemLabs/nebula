@@ -2384,6 +2384,7 @@ mod tests {
         app.github.pull_requests.insert(
             WorktreeId("w2".into()),
             Some(PullRequest {
+                reported: false,
                 number: 42,
                 url: "https://github.com/o/api/pull/42".into(),
                 title: "Add search".into(),
