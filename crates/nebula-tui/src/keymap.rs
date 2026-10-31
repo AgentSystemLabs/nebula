@@ -54,6 +54,9 @@ pub enum Action {
     NextAttention,
     /// `,`: the same walk backwards.
     PrevAttention,
+    /// `!`: the next session on the grid waiting for your input, opening
+    /// the NESTED thread folded over it.
+    NextWaiting,
     /// `]`: the LAUNCHER VIEW's next PROJECT TAB to the right — that
     /// project's sessions. The last tab goes no further.
     NextProjectTab,
@@ -300,6 +303,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &[","],
+    },
+    ActionSpec {
+        action: Action::NextWaiting,
+        id: "next_waiting",
+        label: "Next session waiting",
+        hint: "Jump to the next session on the grid waiting for your input, unfolding the thread it is in, wrapping",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["!"],
     },
     ActionSpec {
         action: Action::NextProjectTab,

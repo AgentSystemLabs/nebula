@@ -875,6 +875,8 @@ pub(super) fn handle_action(
         // `+` (or `⌘P`): the list the header's `+` drops, the click's own
         // [`open_project_menu`].
         Action::ProjectDropdown => open_project_menu(app),
+        // `!`: the next session waiting for input.
+        Action::NextWaiting => next_waiting(app, out),
         _ => return false,
     }
     true
@@ -906,6 +908,41 @@ pub(super) fn follow_up(app: &mut App) {
         return;
     };
     super::open_follow_up(app, agent.id, String::new());
+}
+
+/// What `!` says with nothing on the grid waiting for your input.
+pub(super) const NOTHING_WAITING: &str = "nothing is waiting for your input";
+
+/// `!`: the cursor onto the next session on the grid waiting for your
+/// input — the first after the cursor's row in the order the rows are
+/// drawn, wrapping past the last — whether or not a folded NESTED thread
+/// is hiding it: landing on it opens the thread (`unfold_cursor_band`),
+/// so the row under the cursor is on screen. On the only one waiting it
+/// stays put.
+pub(super) fn next_waiting(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let bands = view::bands(app);
+    let rows: Vec<(usize, usize)> = bands
+        .iter()
+        .enumerate()
+        .flat_map(|(b, band)| shown_order(app, band).into_iter().map(move |c| (b, c)))
+        .collect();
+    let at = view::band_cursor(app, &bands).and_then(|b| {
+        let card = view::card_cursor(app, &bands[b]);
+        rows.iter()
+            .position(|&(rb, rc)| rb == b && Some(rc) == card)
+    });
+    let waiting = |&(b, c): &(usize, usize)| {
+        matches!(&bands[b].cards[c], view::Card::Session(row)
+            if row.agent.status == nebula_core::AgentStatus::NeedsFeedback && !row.agent.archived)
+    };
+    let start = at.map_or(0, |i| i + 1);
+    let next = (0..rows.len())
+        .map(|n| rows[(start + n) % rows.len()])
+        .find(waiting);
+    match next {
+        Some((b, c)) => select_card(app, bands[b].cards[c].sref(), out),
+        None => app.chrome.flash = Some(NOTHING_WAITING.into()),
+    }
 }
 
 /// What a card's key says when the cursor sits on a child a folded
@@ -11589,38 +11626,44 @@ mod tests {
             assert_eq!(main.len(), 4, "root, two later prompts, the terminal");
             let lines: Vec<String> = main.iter().map(|(_, r)| row_text(&term, *r)).collect();
             assert!(
-                lines[0].starts_with("▾ ↳ Work On Issue 135"),
-                "{:?}",
+                lines[0].starts_with("▾ ↳ ○   Work On Issue 135  main "),
+                "the root's branch, after its title: {:?}",
                 lines[0]
             );
             assert!(lines[0].trim_end().ends_with("6m"), "{:?}", lines[0]);
             assert!(
-                lines[1].starts_with("    ├ Add repair regression test"),
+                lines[1].starts_with("  ├─●   Add repair regression test"),
                 "{:?}",
                 lines[1]
             );
             assert!(lines[1].trim_end().ends_with("4m"), "{:?}", lines[1]);
             assert!(
-                lines[2].starts_with("    ├ Run full test suite"),
+                lines[2].starts_with("  ├─●   Run full test suite"),
                 "{:?}",
                 lines[2]
             );
             assert!(lines[2].trim_end().ends_with("now"), "{:?}", lines[2]);
-            // The last child closes the thread on the `└`. A terminal
-            // wears its shell mark before its title; a session has none.
-            assert!(lines[3].starts_with("    └ ❯ term-1"), "{:?}", lines[3]);
+            // The last child closes the thread on the `└─`. A terminal
+            // wears its shell mark in the type column; a session leaves
+            // it blank.
+            assert!(lines[3].starts_with("  └─● ❯ term-1"), "{:?}", lines[3]);
             assert_eq!(
                 term.backend().buffer()[(main[3].1.x + 6, main[3].1.y)].fg,
                 app.chrome.theme.ok,
                 "green while it runs"
             );
-            assert!(!lines.iter().any(|l| l.contains('●')), "no status dot");
             let col = |line: &str, word: &str| {
                 let at = line.find(word).expect(word);
                 line[..at].chars().count()
             };
-            assert_eq!(col(&lines[0], "Work"), 4, "caret, space, scope mark, space");
-            assert_eq!(col(&lines[1], "Add"), col(&lines[0], "Work") + 2);
+            // One column map on every row: the status glyph, the type
+            // glyph and the title each start in the same column.
+            assert_eq!(col(&lines[0], "Work"), 8, "caret, scope, status, type");
+            assert_eq!(col(&lines[1], "Add"), col(&lines[0], "Work"));
+            assert_eq!(col(&lines[3], "term-1"), col(&lines[0], "Work"));
+            assert_eq!(col(&lines[0], "○"), 4);
+            assert_eq!(col(&lines[1], "●"), 4);
+            assert_eq!(col(&lines[3], "●"), 4);
             assert_eq!(main[0].1.height, 1);
             assert_eq!(main[1].1.y, main[0].1.bottom());
             assert_eq!(main[3].1.y, main[2].1.bottom(), "no air between children");
@@ -11632,10 +11675,13 @@ mod tests {
                 "no blank row between threads"
             );
             let feat_line = row_text(&term, feat[0].1);
+            // One agent under it, working: the spinner, on whatever
+            // frame the sweep's clock is on.
             assert!(
-                feat_line.starts_with("▸ ↳ polish-nav 1 sub"),
-                "{feat_line:?}"
+                feat_line.starts_with("▸ ↳ ●   polish-nav 1✱ "),
+                "a folded root sums up its children: {feat_line:?}"
             );
+            assert!(feat_line.contains("  feat "), "{feat_line:?}");
             assert!(feat_line.trim_end().ends_with("9m"), "{feat_line:?}");
             assert_eq!(
                 lines[0].trim_end().chars().count(),
@@ -11670,15 +11716,15 @@ mod tests {
             let buf = term.backend().buffer();
             let root = main[0].1;
             let child = main[1].1;
-            let fill = buf[(root.x + 4, root.y)].bg;
+            let fill = buf[(root.x + 8, root.y)].bg;
             assert_ne!(
                 fill,
-                buf[(child.x + 4, child.y)].bg,
+                buf[(child.x + 8, child.y)].bg,
                 "only the root is filled"
             );
             assert_eq!(buf[(root.right() - 1, root.y)].bg, fill, "edge to edge");
             assert_eq!(buf[(root.x - 1, root.y)].bg, th.accent, "the accent bar");
-            let title = &buf[(root.x + 4, root.y)];
+            let title = &buf[(root.x + 8, root.y)];
             assert_eq!(
                 title.fg,
                 gray::dim(&app.chrome.theme),
@@ -11699,13 +11745,13 @@ mod tests {
                 .modifier
                 .contains(Modifier::BOLD));
             assert!(
-                !buf[(main[0].1.x + 4, main[0].1.y)]
+                !buf[(main[0].1.x + 8, main[0].1.y)]
                     .modifier
                     .contains(Modifier::BOLD),
                 "the root stays unselected"
             );
             assert_ne!(
-                buf[(main[0].1.x + 4, main[0].1.y)].bg,
+                buf[(main[0].1.x + 8, main[0].1.y)].bg,
                 buf[(main[1].1.x + 8, main[1].1.y)].bg
             );
         });
@@ -11725,7 +11771,7 @@ mod tests {
             let term = draw_tall(&mut app);
             let feat = drawn_entries(&app, 1)[0].1;
             let title: Vec<_> = (0.."polish-nav".len() as u16)
-                .map(|i| term.backend().buffer()[(feat.x + 4 + i, feat.y)].fg)
+                .map(|i| term.backend().buffer()[(feat.x + 8 + i, feat.y)].fg)
                 .collect();
             assert!(
                 title.iter().all(|fg| th.warn_sweep.contains(fg)),
@@ -11734,7 +11780,7 @@ mod tests {
 
             app.chrome.animations = false;
             let term = draw_tall(&mut app);
-            let live = &term.backend().buffer()[(feat.x + 4, feat.y)];
+            let live = &term.backend().buffer()[(feat.x + 8, feat.y)];
             assert_eq!(live.fg, th.warn, "working, held still");
             assert!(
                 !live.modifier.contains(Modifier::BOLD),
@@ -11744,7 +11790,7 @@ mod tests {
             update_agent(&mut app, "a2", |a| a.status = AgentStatus::Finished);
             let term = draw_tall(&mut app);
             let feat = drawn_entries(&app, 1)[0].1;
-            let idle = &term.backend().buffer()[(feat.x + 4, feat.y)];
+            let idle = &term.backend().buffer()[(feat.x + 8, feat.y)];
             assert_eq!(idle.fg, th.ok, "finished");
             assert!(!idle.modifier.contains(Modifier::BOLD));
         });
@@ -11777,7 +11823,7 @@ mod tests {
                 let r = drawn_entries(app, band)[0].1;
                 let buf = term.backend().buffer();
                 (0.."polish-nav".len() as u16)
-                    .map(|i| buf[(r.x + 4 + i, r.y)].clone())
+                    .map(|i| buf[(r.x + 8 + i, r.y)].clone())
                     .collect::<Vec<_>>()
             };
 
@@ -11967,7 +12013,7 @@ mod tests {
             let term = draw_tall(&mut app);
             let (head, text) = band_header(&app, &term, 2);
             assert_eq!(head.height, 1);
-            assert!(text.starts_with("  ↳ idle "), "{text:?}");
+            assert!(text.starts_with("  ↳     idle "), "{text:?}");
             assert!(!text.contains("nothing running"), "{text:?}");
             assert!(!text.contains("delete worktree"), "{text:?}");
             let above = drawn_entries(&app, 1)[0].1;
@@ -11982,7 +12028,7 @@ mod tests {
             let term = draw_tall(&mut app);
             let (_, text) = band_header(&app, &term, 2);
             assert!(
-                text.contains("↳ idle  p: new session · t: terminal · d: delete worktree"),
+                text.contains("↳     idle  p: new session · t: terminal · d: delete worktree"),
                 "{text:?}"
             );
             assert!(
@@ -12006,7 +12052,7 @@ mod tests {
             app.launcher.launcher_nested = true;
             let term = draw_tall(&mut app);
             let (head, text) = band_header(&app, &term, 2);
-            assert!(text.starts_with("  ↳ idle "), "{text:?}");
+            assert!(text.starts_with("  ↳     idle "), "{text:?}");
             assert!(text.contains("#7"), "{text:?}");
             let pr = app
                 .hit_rect(&HitTarget::LauncherThreadPr(WorktreeId("w3".into())))
@@ -12269,7 +12315,7 @@ mod tests {
             let term = draw_tall(&mut app);
             assert_eq!(drawn_entries(&app, 0).len(), 2);
             let root = row_text(&term, drawn_entries(&app, 0)[0].1);
-            assert!(root.starts_with("▾ ↳ agent-1"), "{root:?}");
+            assert!(root.starts_with("▾ ↳ ○   agent-1"), "{root:?}");
             let screen = screen_text(&term);
             assert!(
                 screen.contains("jk move  Enter open  p sub-prompt"),
@@ -12474,7 +12520,7 @@ mod tests {
         app
     }
 
-    /// The four lines inside the DETAIL STRIP's box, as drawn.
+    /// The five lines inside the DETAIL STRIP's box, as drawn.
     fn strip_lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
         let screen = screen_text(terminal);
         let lines: Vec<&str> = screen.lines().collect();
@@ -12483,10 +12529,10 @@ mod tests {
             .position(|l| l.contains('┌'))
             .unwrap_or_else(|| panic!("no strip: {screen}"));
         assert!(
-            lines[top + 5].contains('└'),
-            "six rows, border to border: {screen}"
+            lines[top + 6].contains('└'),
+            "seven rows, border to border: {screen}"
         );
-        lines[top + 1..top + 5]
+        lines[top + 1..top + 6]
             .iter()
             .map(|l| l.trim().trim_matches('│').trim().to_string())
             .collect()
@@ -12688,6 +12734,417 @@ mod tests {
             assert_eq!(lines[0], "agent-1", "no changes, nothing at the right");
             assert_eq!(lines[2], "worktree main");
             assert_eq!(lines[3], "pr       none", "no PR, no hint");
+        });
+    }
+
+    /// A worktree `id` of `demo`, checked out on `branch`.
+    fn seed_worktree(app: &mut App, id: &str, branch: &str, sort_order: i64) {
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId(id.into()),
+                    project_id: ProjectId("p1".into()),
+                    path: format!("/tmp/demo-{id}").into(),
+                    branch: branch.into(),
+                    is_main: false,
+                    sort_order,
+                }),
+            },
+        );
+    }
+
+    /// A RUN TERMINAL `id` in `worktree`, running `command`.
+    fn seed_command(app: &mut App, id: &str, worktree: &str, name: &str, command: &str) {
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Terminal(TerminalTab {
+                    id: TerminalId(id.into()),
+                    worktree_id: WorktreeId(worktree.into()),
+                    name: name.into(),
+                    sort_order: 0,
+                    alive: true,
+                    run_command: Some(command.into()),
+                }),
+            },
+        );
+    }
+
+    /// `demo` as a working day leaves it, the NESTED layout's whole look
+    /// at once: five worktrees with threads in every state, and the root
+    /// checkout's own rows. In `feat/codex-runner` (open pull request
+    /// #141) `agent-1` waits on you and `agent-2` works; in
+    /// `fix/pty-resize-tmux` the root waits and its repro crashed; in
+    /// `theme-light-contrast` two turns are unread; `release-v0.47` is
+    /// all quiet; `sqlite-session-store` is busy. The cursor is on
+    /// `feat`'s root, so that thread is open, and `fix/pty-resize-tmux`
+    /// is opened by hand; the rest start folded. Animations are off, so
+    /// the spinner holds still.
+    fn fleet() -> App {
+        let mut app = two_sessions();
+        app.launcher.launcher_nested = true;
+        app.chrome.animations = false;
+        let now = crate::app::now_ms();
+        let set = move |app: &mut App, id: &str, name: &str, status, unseen, mins: i64| {
+            update_agent(app, id, |a| {
+                a.name = name.into();
+                a.status = status;
+                a.unseen = unseen;
+                a.status_changed_at = now - mins * 60 * 1000;
+            });
+        };
+        let agent = move |app: &mut App, id: &str, wt: &str, name: &str, status, unseen, mins| {
+            seed_running(app, id, wt, id);
+            set(app, id, name, status, unseen, mins);
+        };
+        use AgentStatus::{Finished, NeedsFeedback, Running, Terminated};
+
+        // The root checkout: two prompts and a shell, each a row alone.
+        set(&mut app, "a1", "Pull And Run Locally", Finished, false, 1);
+        agent(
+            &mut app,
+            "m2",
+            "w1",
+            "Free Up Disk Space",
+            Finished,
+            false,
+            14,
+        );
+        seed_terminal(&mut app, "mt1", "w1", "term-1");
+
+        seed_worktree(&mut app, "w2", "feat/codex-runner", 1);
+        set(
+            &mut app,
+            "a2",
+            "Add Codex Runner Support",
+            Finished,
+            false,
+            660,
+        );
+        agent(&mut app, "a20", "w2", "agent-1", NeedsFeedback, false, 0);
+        agent(&mut app, "a21", "w2", "agent-2", Running, false, 2);
+        seed_terminal(&mut app, "t20", "w2", "term-1");
+        seed_command(&mut app, "t21", "w2", "cargo watch", "cargo watch -x test");
+
+        seed_worktree(&mut app, "w4", "fix/pty-resize-tmux", 4);
+        agent(
+            &mut app,
+            "b1",
+            "w4",
+            "Fix flaky PTY resize under tmux",
+            NeedsFeedback,
+            false,
+            5,
+        );
+        agent(
+            &mut app,
+            "b2",
+            "w4",
+            "repro-in-tmux-3.4",
+            Terminated,
+            false,
+            12,
+        );
+        seed_command(&mut app, "t40", "w4", "tmux", "tmux -L nebula-test");
+
+        seed_worktree(&mut app, "w5", "theme-light-contrast", 5);
+        agent(
+            &mut app,
+            "c1",
+            "w5",
+            "Theme: light appearance contrast pass",
+            Finished,
+            true,
+            17,
+        );
+        agent(&mut app, "c2", "w5", "agent-1", Finished, true, 17);
+        agent(
+            &mut app,
+            "c3",
+            "w5",
+            "audit-256-colors",
+            Finished,
+            false,
+            52,
+        );
+        seed_terminal(&mut app, "t50", "w5", "term-1");
+
+        seed_worktree(&mut app, "w6", "release-v0.47", 6);
+        agent(
+            &mut app,
+            "d1",
+            "w6",
+            "Cut release v0.47.0",
+            Finished,
+            false,
+            360,
+        );
+        agent(&mut app, "d2", "w6", "changelog", Finished, false, 361);
+        agent(&mut app, "d3", "w6", "bump-versions", Finished, false, 362);
+
+        seed_worktree(&mut app, "w7", "sqlite-session-store", 7);
+        let long = "Migrate the session store to SQLite with WAL and background compaction";
+        agent(&mut app, "e1", "w7", long, Running, false, 3);
+        agent(
+            &mut app,
+            "e2",
+            "w7",
+            "write-migration-tests",
+            Running,
+            false,
+            4,
+        );
+        agent(&mut app, "e3", "w7", "agent-1", Finished, true, 8);
+        seed_command(
+            &mut app,
+            "t70",
+            "w7",
+            "cargo test",
+            "cargo test -p nebula-core",
+        );
+        seed_terminal(&mut app, "t71", "w7", "term-1");
+
+        let open = crate::pull_request::OpenPr {
+            number: 141,
+            title: "Add Codex runner support".into(),
+            url: "https://github.com/o/demo/pull/141".into(),
+            is_draft: false,
+            health: Default::default(),
+            head: "feat/codex-runner".into(),
+            base: "main".into(),
+        };
+        let at = std::time::Instant::now();
+        app.github.open_prs.insert(
+            ProjectId("p1".into()),
+            crate::app::OpenPrs {
+                list: vec![open],
+                at,
+                due: at + std::time::Duration::from_secs(60),
+                step: std::time::Duration::from_secs(60),
+            },
+        );
+        app.jobs.worktree_lines.insert(
+            WorktreeId("w2".into()),
+            crate::git_diff::LineChanges {
+                added: 412,
+                removed: 96,
+            },
+        );
+        app.launcher
+            .launcher_thread_open
+            .insert(WorktreeId("w4".into()));
+        super::select_card(
+            &mut app,
+            SessionRef::Agent(AgentId("a2".into())),
+            &mut Vec::new(),
+        );
+        app
+    }
+
+    /// The list and its DETAIL STRIP at a sidebar's width, as text: what
+    /// the PR shows of the layout.
+    fn fleet_capture(app: &mut App, w: u16, h: u16) -> String {
+        app.launcher.launcher_pane_hidden = true;
+        let term = draw_at(app, w, h);
+        screen_text(&term)
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The list's rows of a [`fleet_capture`], header and strip left out.
+    fn fleet_rows(capture: &str) -> Vec<String> {
+        capture
+            .lines()
+            .skip_while(|l| !l.contains('▾') && !l.contains('▸'))
+            .take_while(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The whole list at a sidebar's width, as one tree: each worktree's
+    /// root with its branch dimmed after the title, its children hanging
+    /// off it on `├─`/`└─`, the status glyph, the type glyph and the
+    /// title each in one column on every row and the ages right-aligned;
+    /// a folded root sums up what it hides; the root checkout's rows
+    /// stand flat behind `⌂`.
+    #[test]
+    fn the_nested_list_reads_as_one_aligned_tree() {
+        with_default_config(|| {
+            let mut app = fleet();
+            let rows = fleet_rows(&fleet_capture(&mut app, 76, 40));
+            let want = [
+                "  ▾ ↳ ✓   Add Codex Runner Support  feat/codex-runner            #141  11h",
+                "    ├─◐   agent-1                                                      now",
+                "    ├─●   agent-2                                                       2m",
+                "    ├─● ❯ term-1",
+                "    └─● ▶ cargo watch",
+                "    ⌂ ✓   Pull And Run Locally                                          1m",
+                "  ▸ ↳ ●   Migrate the session store to SQLite with WAL… 2✱ 2❯ ●         3m",
+                "  ▾ ↳ ◐   Fix flaky PTY resize under tmux  fix/pty-resize-tmux          5m",
+                "    ├─✗   repro-in-tmux-3.4                                            12m",
+                "    └─● ▶ tmux",
+                "    ⌂ ✓   Free Up Disk Space                                           14m",
+                "  ▸ ↳ ✓   Theme: light appearance contrast pass 2✱ 1❯ ●                17m",
+                "  ▸ ↳ ✓   Cut release v0.47.0 2✱  release-v0.47                         6h",
+                "    ⌂ ● ❯ term-1",
+            ];
+            assert_eq!(rows, want, "\n{}", rows.join("\n"));
+        });
+    }
+
+    /// A folded root's summary: how many agents and terminals it hides,
+    /// and the most urgent state among them — waiting over crashed over
+    /// unread over working — with how many share it, in that state's
+    /// color. Unfolded, the children speak for themselves and the summary
+    /// goes; with nothing going on it is the counts alone.
+    #[test]
+    fn a_folded_root_sums_up_the_children_it_hides() {
+        with_default_config(|| {
+            let mut app = fleet();
+            let th = app.chrome.theme;
+            let row_of = |app: &mut App,
+                          title: &str|
+             -> (String, ratatui::layout::Rect, Terminal<TestBackend>) {
+                app.launcher.launcher_pane_hidden = true;
+                let term = draw_at(app, 76, 40);
+                let bands = crate::launcher::bands(app);
+                for index in 0..bands.len() {
+                    if let Some(&(_, r)) = drawn_entries(app, index).first() {
+                        let line = row_text(&term, r);
+                        if line.contains(title) {
+                            return (line, r, term);
+                        }
+                    }
+                }
+                panic!("no row titled {title}");
+            };
+            let (line, r, term) = row_of(&mut app, "Migrate the session");
+            // The summary's `●`, not the status column's.
+            let at = line[..line.rfind('●').unwrap()].chars().count() as u16;
+            let unread = &term.backend().buffer()[(r.x + at, r.y)];
+            assert_eq!(unread.fg, th.done, "unread is the done blue");
+
+            // Folding `feat`: its waiting agent outranks the working one.
+            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            let (line, r, term) = row_of(&mut app, "Add Codex Runner");
+            assert!(
+                line.contains("Add Codex Runner Support 2✱ 2❯ ◐"),
+                "{line:?}"
+            );
+            let at = line.chars().position(|c| c == '◐').unwrap() as u16;
+            let waiting = &term.backend().buffer()[(r.x + at, r.y)];
+            assert_eq!(waiting.fg, th.err);
+            assert!(waiting.modifier.contains(Modifier::BOLD));
+
+            update_agent(&mut app, "a21", |a| a.status = AgentStatus::NeedsFeedback);
+            let (line, ..) = row_of(&mut app, "Add Codex Runner");
+            assert!(line.contains(" 2✱ 2❯ 2◐"), "two share it: {line:?}");
+
+            let (line, ..) = row_of(&mut app, "Fix flaky PTY");
+            assert!(!line.contains('✱'), "open, no summary: {line:?}");
+            let (line, ..) = row_of(&mut app, "Cut release");
+            assert!(line.contains("v0.47.0 2✱  release"), "all quiet: {line:?}");
+        });
+    }
+
+    /// The `↑`/`↓ more` markers count what is past their edge that wants
+    /// you — waiting, crashed, unread — children folded under a root
+    /// past it included.
+    #[test]
+    fn the_edge_markers_tally_what_wants_you_past_them() {
+        with_default_config(|| {
+            let mut app = fleet();
+            let capture = fleet_capture(&mut app, 76, 18);
+            assert!(capture.contains("↓ 11 more below  1◐  1✗  3●"), "{capture}");
+            for _ in 0..13 {
+                key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            }
+            let capture = fleet_capture(&mut app, 76, 18);
+            let above = capture
+                .lines()
+                .find(|l| l.contains("more above"))
+                .unwrap_or_else(|| panic!("{capture}"));
+            assert!(above.contains("2◐"), "{above:?}");
+        });
+    }
+
+    /// The DETAIL STRIP's fifth line: on a root, what is going on inside
+    /// its thread, most urgent first, or that it is all quiet; on any
+    /// other row its own state, and on a child the thread it is in.
+    #[test]
+    fn the_detail_strip_says_what_is_going_on_inside() {
+        with_default_config(|| {
+            let mut app = fleet();
+            let strip = |app: &mut App| {
+                app.launcher.launcher_pane_hidden = true;
+                strip_lines(&draw_at(app, 76, 40))
+            };
+            assert_eq!(strip(&mut app)[4], "inside   ◐ agent-1 · ⠹ agent-2");
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(
+                strip(&mut app)[4],
+                "state    ◐ waiting for input  in Add Codex Runner Support"
+            );
+            let to = |app: &mut App, id: &str| {
+                super::select_card(app, SessionRef::Agent(AgentId(id.into())), &mut Vec::new())
+            };
+            to(&mut app, "d1");
+            assert_eq!(strip(&mut app)[4], "inside   all quiet · 2 agents");
+            to(&mut app, "a1");
+            assert_eq!(strip(&mut app)[4], "state    ✓ done");
+        });
+    }
+
+    /// `!` walks the sessions waiting for input in the order the rows are
+    /// drawn, from the cursor on and round again, opening a folded thread
+    /// that hides one. The key bar offers it only while one waits; with
+    /// none it says so and stays put.
+    #[test]
+    fn bang_jumps_to_the_next_session_waiting_for_input() {
+        with_default_config(|| {
+            let mut app = fleet();
+            update_agent(&mut app, "c2", |a| a.status = AgentStatus::NeedsFeedback);
+            let bang = |app: &mut App| {
+                key(app, KeyCode::Char('!'), KeyModifiers::NONE);
+                selected(app)
+            };
+            let screen = screen_text(&draw_at(&mut app, 170, 70));
+            assert!(
+                screen.contains("jk move  Enter open  p sub-prompt  ! next ◐"),
+                "{screen}"
+            );
+            assert_eq!(bang(&mut app).as_deref(), Some("a20"), "feat's agent-1");
+            assert_eq!(
+                bang(&mut app).as_deref(),
+                Some("b1"),
+                "the next thread's root"
+            );
+            let w5 = WorktreeId("w5".into());
+            assert!(app.launcher.launcher_folded.contains(&w5));
+            assert_eq!(
+                bang(&mut app).as_deref(),
+                Some("c2"),
+                "inside a folded thread"
+            );
+            assert!(!app.launcher.launcher_folded.contains(&w5), "which opens");
+            let rows = fleet_rows(&fleet_capture(&mut app, 76, 40));
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains("◐   agent-1") && r.contains("├─")),
+                "{rows:#?}"
+            );
+            assert_eq!(bang(&mut app).as_deref(), Some("a20"), "and round again");
+
+            for id in ["a20", "b1", "c2"] {
+                update_agent(&mut app, id, |a| a.status = AgentStatus::Finished);
+            }
+            let screen = screen_text(&draw_at(&mut app, 170, 70));
+            assert!(!screen.contains("next ◐"), "{screen}");
+            assert_eq!(bang(&mut app).as_deref(), Some("a20"), "stays put");
+            assert_eq!(app.chrome.flash.as_deref(), Some(super::NOTHING_WAITING));
         });
     }
 

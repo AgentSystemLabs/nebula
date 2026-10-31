@@ -548,6 +548,15 @@ pub mod nested {
             Color::Rgb(0x8c, 0x8c, 0x8c)
         }
     }
+    /// A worktree root's branch after its title: a step under `dim`,
+    /// so it reads as an aside to the title rather than a second one.
+    pub fn faint(th: &Theme) -> Color {
+        if th.light {
+            Color::Rgb(0xa0, 0xa0, 0xa0)
+        } else {
+            Color::Rgb(0x5f, 0x5f, 0x5f)
+        }
+    }
     /// A pull request's `#42`, underlined: a link, in the blue links wear.
     pub fn link(th: &Theme) -> Color {
         if th.light {
