@@ -3,7 +3,10 @@
 //! geometry): one thread per worktree, the one that moved last on top,
 //! packed with no blank row between them. The earliest session in the
 //! worktree is the root row — its title is the thread's title — and every
-//! later prompt and terminal is a child row under it, one line each. The
+//! later prompt and terminal is a child row under it, one line each,
+//! hanging off the root on a `├─`/`└─` connector. Every row shares one
+//! column map — status glyph, type glyph, title, right-aligned age — and
+//! a folded root sums up what it is hiding ([`Summary`]). The
 //! root checkout is not one thread: each of its sessions and terminals is
 //! a root row of its own, with no children. No
 //! worktree header, no card border, no rail: what a row runs on, where,
@@ -16,6 +19,7 @@ use crate::keymap::Action;
 use crate::launcher::{Band, BandsLayout, Card, CardRef, PanelLayout, RowPr, NESTED_ROW_H};
 use crate::pull_request::Standing;
 use crate::theme::{nested as gray, Theme};
+use nebula_core::AgentStatus;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -26,16 +30,32 @@ use ratatui::Frame;
 /// The fold caret at the left of a thread's root: open, and folded.
 const CARET_OPEN: &str = "▾";
 const CARET_FOLDED: &str = "▸";
-/// The tree under a root: every child but the last, and the last.
-const BRANCH: &str = "├";
-const LAST_BRANCH: &str = "└";
+/// The tree under a root, hanging off its scope mark and running into
+/// the child's status glyph: every child but the last, and the last.
+const BRANCH: &str = "├─";
+const LAST_BRANCH: &str = "└─";
 /// How the DETAIL STRIP names the project's ROOT checkout, its branch
 /// after it.
 const ROOT_TAG: &str = "⌂ root";
-/// The scope mark between a root's caret and its title: the project's ROOT
-/// checkout, and a worktree.
+/// The scope mark between a root's caret and its status glyph: the
+/// project's ROOT checkout, and a worktree.
 const ROOT_MARK: &str = "⌂";
 const WORKTREE_MARK: &str = "↳";
+/// What a terminal is, in the type column: `▶` running a command, `❯` a
+/// shell. A session leaves the column blank.
+const COMMAND_MARK: &str = "▶";
+const SHELL_MARK: &str = "❯";
+/// A folded root's counts of what is under it: agents, and terminals.
+const AGENT_COUNT: &str = "✱";
+const TERMINAL_COUNT: &str = "❯";
+/// The working mark in a summary: a spinner, held on one frame with
+/// animations off.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The cells before every row's title, root or child, so the status
+/// glyph, the type glyph and the title each start in one column down the
+/// whole list: `▾ ↳ ● ❯ ` on a root, `  ├─● ❯ ` on a child.
+const LEAD: usize = 8;
 
 /// The PR column, right-aligned: `#141`, on a root whose checkout has an
 /// open pull request, blank on every other row.
@@ -44,14 +64,19 @@ const PR_W: usize = 5;
 const AGE_W: usize = 4;
 /// Fewest letters a title keeps before the columns right of it give way.
 const MIN_TITLE: usize = 4;
+/// Fewest letters a title keeps beside a folded root's summary before
+/// the summary gives way.
+const TITLE_BESIDE_SUMMARY: usize = 10;
+/// Fewest letters of a root's branch worth showing after its title.
+const MIN_BRANCH: usize = 8;
 /// Fewest cells an empty worktree's key hint is shown in, cut short; any
 /// less and the row is the branch alone.
 const MIN_HINT: usize = 12;
 
-/// Rows the DETAIL STRIP takes, its border included: four lines of
+/// Rows the DETAIL STRIP takes, its border included: five lines of
 /// detail in a box. Fixed, so the list over it never resizes as the
 /// cursor moves.
-pub(super) const STRIP_H: u16 = 6;
+pub(super) const STRIP_H: u16 = 7;
 /// The column the strip's values start in, past their labels.
 const LABEL_W: usize = 9;
 
@@ -83,13 +108,239 @@ fn thread_age(at: i64) -> String {
     }
 }
 
-/// `n` children, the way a collapsed root says it: `1 sub`, `3 subs`.
-fn sub_label(n: usize) -> String {
-    if n == 1 {
-        "1 sub".into()
-    } else {
-        format!("{n} subs")
+/// How badly a session wants you, as a folded root's summary, the edge
+/// markers and the DETAIL STRIP roll it up: most urgent last, so the
+/// highest wins a `max`. A terminal never rolls up, nor does an archived
+/// session or one with nothing going on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Urgency {
+    /// Working through a turn.
+    Working,
+    /// Finished a turn nobody has read yet.
+    Unread,
+    /// Exited with an error.
+    Crashed,
+    /// Waiting for your input.
+    Waiting,
+}
+
+impl Urgency {
+    /// The three that want a human, most urgent first: what the edge
+    /// markers count.
+    const WANTED: [Urgency; 3] = [Urgency::Waiting, Urgency::Crashed, Urgency::Unread];
+
+    fn of(card: &Card) -> Option<Self> {
+        let Card::Session(row) = card else {
+            return None;
+        };
+        let a = &row.agent;
+        if a.archived {
+            return None;
+        }
+        match a.status {
+            AgentStatus::NeedsFeedback => Some(Urgency::Waiting),
+            AgentStatus::Terminated => Some(Urgency::Crashed),
+            AgentStatus::Finished if a.unseen => Some(Urgency::Unread),
+            AgentStatus::Running => Some(Urgency::Working),
+            _ => None,
+        }
     }
+
+    /// `◐`, `✗`, `●`, or the spinner's frame at `phase`.
+    fn glyph(self, phase: usize) -> &'static str {
+        match self {
+            Urgency::Waiting => "◐",
+            Urgency::Crashed => "✗",
+            Urgency::Unread => "●",
+            Urgency::Working => SPINNER[phase % SPINNER.len()],
+        }
+    }
+
+    /// The STATUS DOT's color for the state, bold for the two that
+    /// went wrong or are stuck on you.
+    fn style(self, th: Theme) -> Style {
+        let status = match self {
+            Urgency::Waiting => AgentStatus::NeedsFeedback,
+            Urgency::Crashed => AgentStatus::Terminated,
+            Urgency::Unread => AgentStatus::Finished,
+            Urgency::Working => AgentStatus::Running,
+        };
+        let style = Style::default().fg(crate::ui::rows::status_color(Some(status), true, th));
+        if self >= Urgency::Crashed {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    }
+}
+
+/// The frame the summaries' spinner is on: the status sweep's clock,
+/// held still with animations off.
+fn spinner_phase(app: &App) -> usize {
+    if app.chrome.animations {
+        app.sweep_phase()
+    } else {
+        2
+    }
+}
+
+/// What a folded root says about the children under it: how many agents
+/// and terminals, and the most urgent state among them with how many
+/// share it — `3✱ 2❯ 2◐`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Summary {
+    agents: usize,
+    terminals: usize,
+    top: Option<(Urgency, usize)>,
+}
+
+impl Summary {
+    /// `children`, the cards of `band` folded under its root.
+    fn of(band: &Band, children: &[usize]) -> Self {
+        let mut summary = Summary::default();
+        for &i in children {
+            let card = &band.cards[i];
+            if card.is_terminal() {
+                summary.terminals += 1;
+            } else {
+                summary.agents += 1;
+            }
+            let Some(u) = Urgency::of(card) else {
+                continue;
+            };
+            summary.top = match summary.top {
+                Some((top, n)) if top == u => Some((top, n + 1)),
+                Some((top, _)) if top > u => summary.top,
+                _ => Some((u, 1)),
+            };
+        }
+        summary
+    }
+
+    /// The summary as it can stand after a root's title, widest first:
+    /// the counts and the most urgent state, the state alone, and
+    /// nothing. Each part has its space in front.
+    fn variants(self, th: Theme, phase: usize) -> Vec<Vec<Span<'static>>> {
+        let dim = Style::default().fg(gray::dim(&th));
+        let roll: Vec<Span<'static>> = self
+            .top
+            .map(|(u, n)| {
+                let count = if n > 1 { n.to_string() } else { String::new() };
+                vec![
+                    Span::raw(" "),
+                    Span::styled(format!("{count}{}", u.glyph(phase)), u.style(th)),
+                ]
+            })
+            .unwrap_or_default();
+        let mut full = Vec::new();
+        for (n, glyph) in [(self.agents, AGENT_COUNT), (self.terminals, TERMINAL_COUNT)] {
+            if n > 0 {
+                full.push(Span::raw(" "));
+                full.push(Span::styled(format!("{n}{glyph}"), dim));
+            }
+        }
+        full.extend(roll.iter().cloned());
+        let mut out = vec![full];
+        if !roll.is_empty() {
+            out.push(roll);
+        }
+        out.push(Vec::new());
+        out
+    }
+}
+
+/// The states wanting you that an edge marker points past: how many
+/// rows waiting, crashed and unread are off that edge, counting what a
+/// folded root off it is hiding too.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally([usize; 3]);
+
+impl Tally {
+    fn add(&mut self, u: Option<Urgency>) {
+        if let Some(i) = u.and_then(|u| Urgency::WANTED.iter().position(|&w| w == u)) {
+            self.0[i] += 1;
+        }
+    }
+
+    /// `  2◐  1✗`, after the marker's words; nothing when it is all
+    /// quiet past the edge.
+    fn spans(self, th: Theme) -> Vec<Span<'static>> {
+        let mut out = Vec::new();
+        for (u, n) in Urgency::WANTED.into_iter().zip(self.0) {
+            if n > 0 {
+                out.push(Span::raw("  "));
+                out.push(Span::styled(format!("{n}{}", u.glyph(0)), u.style(th)));
+            }
+        }
+        out
+    }
+}
+
+/// What the rows above the window, and below it, are hiding that wants
+/// you ([`Tally`]), for the edge markers. Nothing when the list fits.
+fn edge_tallies(app: &App, panel: &PanelLayout, bands: &[Band], scroll: u16) -> [Tally; 2] {
+    let mut tallies = [Tally::default(); 2];
+    if !panel.overflows() {
+        return tallies;
+    }
+    let bottom = scroll + panel.window().height;
+    for (band, pb) in bands.iter().zip(&panel.bands) {
+        let order = crate::launcher::thread_order(band);
+        let folded = app.band_folded(band);
+        for (n, &card) in order.iter().enumerate() {
+            let Some(cell) = pb.cell(card) else {
+                continue;
+            };
+            let side = if cell.y < scroll {
+                0
+            } else if cell.bottom() > bottom {
+                1
+            } else {
+                continue;
+            };
+            tallies[side].add(Urgency::of(&band.cards[card]));
+            if n == 0 && folded {
+                for &child in &order[1..] {
+                    tallies[side].add(Urgency::of(&band.cards[child]));
+                }
+            }
+        }
+    }
+    tallies
+}
+
+/// The status column's glyph for a session in `status`: `●` working,
+/// `◐` waiting on you, `✗` crashed, `✓` done — its color says whether it
+/// has been read — and `○` not started or gone.
+fn status_glyph(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Running => "●",
+        AgentStatus::NeedsFeedback => "◐",
+        AgentStatus::Terminated => "✗",
+        AgentStatus::Finished => "✓",
+        AgentStatus::Fresh | AgentStatus::Disconnected => "○",
+    }
+}
+
+/// The DETAIL STRIP's words for a session's state.
+fn state_words(a: &nebula_core::Agent) -> &'static str {
+    if a.archived {
+        return "archived";
+    }
+    match a.status {
+        AgentStatus::Fresh => "not started",
+        AgentStatus::Running => "working",
+        AgentStatus::Finished if a.unseen => "done · unread",
+        AgentStatus::Finished => "done",
+        AgentStatus::NeedsFeedback => "waiting for input",
+        AgentStatus::Terminated => "exited with an error",
+        AgentStatus::Disconnected => "disconnected",
+    }
+}
+
+/// The cells `spans` take.
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
 }
 
 /// The pull request a thread's PR column shows: one still open, draft or
@@ -189,6 +440,8 @@ pub(super) fn draw_bands(
                 selected: at == Some(card_index),
                 keys,
                 root: band.is_main,
+                summary: (!child && folded && children > 0).then(|| Summary::of(band, &order[1..])),
+                branch: (!child && !band.is_main).then_some(band.branch.as_str()),
                 pr: if child { None } else { open_pr(band) },
                 merged: !child && merged,
                 merge_sweeps: !child && merge_sweeps,
@@ -214,7 +467,8 @@ pub(super) fn draw_bands(
             ));
         }
     }
-    draw_panel_edge_marks(f, panel, scroll, th);
+    let [above, below] = edge_tallies(app, panel, bands, scroll);
+    draw_panel_edge_marks(f, panel, scroll, th, [above.spans(th), below.spans(th)]);
     app.chrome
         .hits
         .push((g.area, HitTarget::PanelBg(Focus::Sessions)));
@@ -242,10 +496,10 @@ fn draw_empty(
         return None;
     }
     let dim = Style::default().fg(gray::dim(&th));
-    // The caret column (blank: nothing folds under it) and the scope
-    // mark's, each with its space, so the branch starts where a root's
-    // title does.
-    let lead = 4;
+    // The caret column (blank: nothing folds under it), the scope mark's,
+    // and the status and type columns blank — nothing runs there — so the
+    // branch starts where every row's title does.
+    let lead = LEAD;
     let columns = Columns::fit(width, lead);
     let room = width.saturating_sub(lead + columns.width());
     let branch = clip(&band.branch, room);
@@ -269,7 +523,7 @@ fn draw_empty(
                 dim
             },
         ),
-        Span::raw(" "),
+        Span::raw(" ".repeat(LEAD - 3)),
         Span::styled(branch.clone(), name_style),
     ];
     let mut used = lead + branch.chars().count();
@@ -316,6 +570,10 @@ struct Row<'a> {
     /// The thread is in the project's ROOT checkout: its root row's scope
     /// mark is `⌂`, not a worktree's `↳`.
     root: bool,
+    /// A folded root's summary of the children under it.
+    summary: Option<Summary>,
+    /// A worktree root's branch, dimmed after its title.
+    branch: Option<&'a str>,
     /// A root's open pull request, for its PR column.
     pr: Option<&'a RowPr>,
     /// A root whose checkout wears its merged pull request
@@ -374,14 +632,17 @@ fn fill_selected(buf: &mut Buffer, r: Rect, th: Theme) {
     }
 }
 
-/// One thread row. A root is `▾ ↳ Title`, the caret a blank space when
-/// the thread has no children, the scope mark `⌂` in the root checkout
-/// and `↳` in a worktree, and `1 sub` after the title only while those
-/// children are folded. No status dot: the title is in the status color.
-/// A child is `    ├ Title`, the connector sitting under the root's title.
-/// A terminal keeps its `▶`/`❯` mark before its title.
-/// Right of the title, the PR column — a root's open `#42`, as a link —
-/// and the dim age, both fixed width and right-aligned on every row.
+/// One thread row, on the one column map every row shares: a root is
+/// `▾ ↳ ● ❯ Title`, a child `  ├─● ❯ Title` — the caret a blank space
+/// when the thread has no children, the scope mark `⌂` in the root
+/// checkout and `↳` in a worktree, the connector hanging off it, `└─` on
+/// the thread's last row. Then the status glyph in the status color, the
+/// type glyph — a terminal's `▶`/`❯`, blank for a session — and the
+/// title, also in the status color, so all three line up down the list.
+/// A folded root follows its title with the [`Summary`] of what is under
+/// it, and a worktree root with its branch, dimmed. Right of it all, the
+/// PR column — a root's open `#42`, as a link — and the dim age, both
+/// fixed width and right-aligned on every row.
 /// Returns where the `#42` landed, for its hit.
 fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Option<Rect> {
     let th = app.chrome.theme;
@@ -390,52 +651,33 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         return None;
     }
     let RowParts {
-        mut mark,
+        status,
+        mut kind,
         age,
         color,
         title,
         mut ramp,
     } = row_parts(app, card, th);
     if row.merged {
-        if let Some(mark) = mark.as_mut() {
-            mark.style = mark.style.fg(th.merged);
+        if let Some(kind) = kind.as_mut() {
+            kind.style = kind.style.fg(th.merged);
         }
         ramp = row.merge_sweeps.then_some(th.merged_sweep);
     }
-    let mark_w = mark.as_ref().map_or(0, Span::width);
-    let lead = if row.child {
-        4 + 1 + 1 + mark_w
-    } else {
-        1 + 1 + 1 + 1 + mark_w
-    };
-    let columns = Columns::fit(width, lead);
-    let room = width.saturating_sub(lead + columns.width());
-    let mut count = if !row.child && row.folded && row.children > 0 {
-        sub_label(row.children)
-    } else {
-        String::new()
-    };
-    // The title gives up letters first, down to a few; then the count.
-    let extra = |count: &str| {
-        if count.is_empty() {
-            0
-        } else {
-            1 + count.chars().count()
-        }
-    };
-    if room < MIN_TITLE + extra(&count) {
-        count.clear();
-    }
-    let title = clip(&title, room.saturating_sub(extra(&count)));
+    let columns = Columns::fit(width, LEAD);
+    let room = width.saturating_sub(LEAD + columns.width());
+    let summaries = row
+        .summary
+        .map(|s| s.variants(th, spinner_phase(app)))
+        .unwrap_or_default();
+    let fit = fit_title(&title, summaries, row.branch, room);
     let title_style = title_style(th, row, color);
-    let dim = Style::default().fg(gray::dim(&th));
 
     let mut spans = Vec::new();
     if row.child {
-        spans.push(Span::raw("    "));
+        spans.push(Span::raw("  "));
         let connector = if row.last { LAST_BRANCH } else { BRANCH };
-        spans.push(Span::styled(connector, dim));
-        spans.push(Span::raw(" "));
+        spans.push(Span::styled(connector, Style::default().fg(th.edge)));
     } else {
         let caret = if row.children == 0 {
             " "
@@ -462,18 +704,28 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         spans.push(Span::styled(mark, Style::default().fg(mark_fg)));
         spans.push(Span::raw(" "));
     }
-    spans.extend(mark);
-    let mut used = lead + title.chars().count();
+    spans.push(status);
+    spans.push(Span::raw(" "));
+    spans.push(kind.unwrap_or_else(|| Span::raw(" ")));
+    spans.push(Span::raw(" "));
+    let mut used = LEAD + fit.title.chars().count();
     spans.extend(super::status_name_spans(
-        title,
+        fit.title,
         title_style,
         ramp,
         app.sweep_phase(),
     ));
-    if !count.is_empty() {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(count.clone(), dim));
-        used += 1 + count.chars().count();
+    used += spans_width(&fit.summary);
+    spans.extend(fit.summary);
+    if !fit.branch.is_empty() {
+        used += 2 + fit.branch.chars().count();
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            fit.branch,
+            Style::default()
+                .fg(gray::faint(&th))
+                .add_modifier(Modifier::ITALIC),
+        ));
     }
     let pr_hit = push_columns(&mut spans, r, columns, used, row.pr, &age, th);
     Paragraph::new(Line::from(spans)).render(Rect { height: 1, ..r }, buf);
@@ -481,6 +733,49 @@ fn draw_row(buf: &mut Buffer, app: &App, r: Rect, row: &Row, card: &Card) -> Opt
         fill_selected(buf, r, th);
     }
     pr_hit
+}
+
+/// A row's title fitted to the `room` left of its columns, with what
+/// follows it on a root.
+struct Fit {
+    title: String,
+    summary: Vec<Span<'static>>,
+    branch: String,
+}
+
+/// Fit a row's `title`, a folded root's `summaries` (widest first, from
+/// [`Summary::variants`]) and a worktree root's `branch` into `room`
+/// cells. The summary keeps its widest form that still leaves the title
+/// a few letters; the title keeps all it can of what is left; and the
+/// branch takes the rest, cut short, or stands aside when that is too
+/// little of it to read.
+fn fit_title(
+    title: &str,
+    summaries: Vec<Vec<Span<'static>>>,
+    branch: Option<&str>,
+    room: usize,
+) -> Fit {
+    let title_w = title.chars().count();
+    let summary = summaries
+        .into_iter()
+        .find(|v| {
+            let w = spans_width(v);
+            w == 0 || (w <= room && room - w >= title_w.min(TITLE_BESIDE_SUMMARY))
+        })
+        .unwrap_or_default();
+    let avail = room - spans_width(&summary).min(room);
+    let branch = branch
+        .filter(|b| !b.is_empty() && *b != title)
+        .and_then(|b| {
+            let left = avail.checked_sub(title_w + 2)?;
+            (left >= b.chars().count().min(MIN_BRANCH)).then(|| clip(b, left))
+        })
+        .unwrap_or_default();
+    Fit {
+        title: clip(title, avail),
+        summary,
+        branch,
+    }
 }
 
 /// The fixed columns at a row's right end, after the `used` cells of it
@@ -535,8 +830,11 @@ fn push_columns(
 
 /// What a row shows, before it is fitted to the width.
 struct RowParts {
-    /// A terminal's `▶`/`❯` before its title; a session has none.
-    mark: Option<Span<'static>>,
+    /// The status column: the session's state as a glyph in its STATUS
+    /// DOT color, or a terminal's `●` alive and `○` gone.
+    status: Span<'static>,
+    /// The type column: a terminal's `▶`/`❯`; a session has none.
+    kind: Option<Span<'static>>,
     age: String,
     /// The title's color: the status color the cards' STATUS DOT wears.
     color: Color,
@@ -549,35 +847,51 @@ struct RowParts {
 fn row_parts(app: &App, card: &Card, th: Theme) -> RowParts {
     match card {
         Card::Session(row) => {
-            let look = session_look(app, &row.agent, false, th);
+            let a = &row.agent;
+            let look = session_look(app, a, false, th);
             let color = match look.dot.style.fg {
                 Some(c) if c != th.dim => c,
                 _ => gray::dim(&th),
             };
-            let age = if row.agent.archived {
-                thread_age(row.agent.archived_at)
+            // An archived or still-starting session keeps the mark the
+            // cards give it; any other its state's glyph, in the dot's
+            // color — dim on one whose process is gone.
+            let glyph = if a.archived || app.is_placeholder_agent(&a.id) {
+                look.dot.content.trim().to_string()
             } else {
-                thread_age(row.agent.status_changed_at)
+                status_glyph(a.status).to_string()
+            };
+            let mut status = Style::default().fg(color);
+            if a.status == AgentStatus::NeedsFeedback && color != gray::dim(&th) {
+                status = status.add_modifier(Modifier::BOLD);
+            }
+            let age = if a.archived {
+                thread_age(a.archived_at)
+            } else {
+                thread_age(a.status_changed_at)
             };
             RowParts {
-                mark: None,
+                status: Span::styled(glyph, status),
+                kind: None,
                 age,
                 color,
-                title: row.agent.name.clone(),
+                title: a.name.clone(),
                 ramp: look.ramp,
             }
         }
         Card::Terminal(t) => {
             let color = if t.alive { th.ok } else { gray::dim(&th) };
+            let status = if t.alive { "●" } else { "○" };
             // As the cards and the list draw it: `▶` running a command,
             // `❯` a shell.
-            let mark = if t.run_command.is_some() {
-                "▶ "
+            let kind = if t.run_command.is_some() {
+                COMMAND_MARK
             } else {
-                "❯ "
+                SHELL_MARK
             };
             RowParts {
-                mark: Some(Span::styled(mark, Style::default().fg(color))),
+                status: Span::styled(status, Style::default().fg(color)),
+                kind: Some(Span::styled(kind, Style::default().fg(color))),
                 age: String::new(),
                 color,
                 title: t.name.clone(),
@@ -675,12 +989,82 @@ fn label(word: &str, th: Theme) -> Span<'static> {
     )
 }
 
+/// The strip's fifth line. On a thread's root, `inside`: what is under
+/// it that is going on, most urgent first — `◐ agent-1 · ✗ repro` — or,
+/// all quiet, how many agents and terminals there are. On any other row,
+/// `state`: its own, in words, and on a child the thread it is in.
+/// Nothing on an empty worktree.
+fn strip_state(app: &App, band: &Band, at: Option<usize>, th: Theme) -> Vec<Span<'static>> {
+    let Some(at) = at.filter(|&i| i < band.cards.len()) else {
+        return Vec::new();
+    };
+    let dim = Style::default().fg(gray::dim(&th));
+    let muted = Style::default().fg(th.muted);
+    let order = crate::launcher::thread_order(band);
+    let root = order.first().copied();
+    if root == Some(at) && order.len() > 1 {
+        let children = &order[1..];
+        let mut hot: Vec<(Urgency, usize)> = children
+            .iter()
+            .filter_map(|&i| Urgency::of(&band.cards[i]).map(|u| (u, i)))
+            .collect();
+        hot.sort_by_key(|h| std::cmp::Reverse(h.0));
+        let mut spans = vec![label("inside", th)];
+        if hot.is_empty() {
+            let s = Summary::of(band, children);
+            let mut words = Vec::new();
+            for (n, what) in [(s.agents, "agent"), (s.terminals, "terminal")] {
+                if n > 0 {
+                    words.push(format!("{n} {what}{}", if n == 1 { "" } else { "s" }));
+                }
+            }
+            spans.push(Span::styled(
+                format!("all quiet · {}", words.join(" · ")),
+                dim,
+            ));
+            return spans;
+        }
+        let phase = spinner_phase(app);
+        for (n, (u, i)) in hot.into_iter().enumerate() {
+            if n > 0 {
+                spans.push(Span::styled(" · ", dim));
+            }
+            spans.push(Span::styled(u.glyph(phase), u.style(th)));
+            spans.push(Span::styled(format!(" {}", band.cards[i].name()), muted));
+        }
+        return spans;
+    }
+    let card = &band.cards[at];
+    let RowParts { status, color, .. } = row_parts(app, card, th);
+    let words = match card {
+        Card::Session(row) if app.is_placeholder_agent(&row.agent.id) => "starting",
+        Card::Session(row) => state_words(&row.agent),
+        Card::Terminal(t) if !t.alive => "exited",
+        Card::Terminal(t) if t.run_command.is_some() => "running",
+        Card::Terminal(_) => "shell",
+    };
+    let mut spans = vec![
+        label("state", th),
+        status,
+        Span::raw(" "),
+        Span::styled(words, Style::default().fg(color)),
+    ];
+    if let Some(root) = root.filter(|&r| r != at) {
+        spans.push(Span::styled("  in ", dim));
+        spans.push(Span::styled(band.cards[root].name().to_string(), muted));
+    }
+    spans
+}
+
 /// The DETAIL STRIP, pinned under the list and over the key bar: the row
-/// under the cursor, in four lines. Its title in the accent with the
+/// under the cursor, in five lines. Its title in the accent with the
 /// checkout's lines added and removed at the right; what it runs on; the
-/// checkout; and the checkout's pull request with the key that opens it in
-/// the PULL REQUESTS MODAL. A child reads its own title and harness and its
-/// thread's checkout. It never scrolls with the list, and keeps its height with nothing selected.
+/// checkout; the checkout's pull request with the key that opens it in
+/// the PULL REQUESTS MODAL; and what is going on — under a root, what its
+/// children are up to, anywhere else the row's own state
+/// ([`strip_state`]). A child reads its own title, harness and state and
+/// its thread's checkout. It never scrolls with the list, and keeps its
+/// height with nothing selected.
 pub(super) fn draw_strip(
     f: &mut Frame,
     app: &mut App,
@@ -711,7 +1095,8 @@ pub(super) fn draw_strip(
             .push((area, HitTarget::PanelBg(Focus::Sessions)));
         return;
     };
-    let card = crate::launcher::card_cursor(app, band).and_then(|i| band.cards.get(i));
+    let at = crate::launcher::card_cursor(app, band);
+    let card = at.and_then(|i| band.cards.get(i));
     let mut cfg = None;
     let text = Style::default().fg(th.text);
     let (title, runs) = match card {
@@ -790,6 +1175,7 @@ pub(super) fn draw_strip(
         strip_line(vec![label("agent", th), runs], Vec::new(), width),
         strip_line(worktree, Vec::new(), width),
         strip_line(pr_left, pr_right, width),
+        strip_line(strip_state(app, band, at, th), Vec::new(), width),
     ];
     f.render_widget(Paragraph::new(lines), inner);
     if let Some(rect) = pr_hit.filter(|r| r.width > 0 && inner.height > 3) {

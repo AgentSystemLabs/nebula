@@ -225,13 +225,24 @@ fn launcher_grid_footer_hint(app: &App, th: Theme) -> FooterHint {
     );
     if app.launcher.launcher_nested && !app.launcher.show_archived {
         let walk = format!("{}{}", k(Action::MoveDown), k(Action::MoveUp));
+        let mut key_bar = vec![
+            (walk, "move"),
+            (k(Action::Activate), "open"),
+            (k(Action::QuickPrompt), "sub-prompt"),
+        ];
+        // `!` only while there is something for it to jump to.
+        if crate::launcher::bands(app).iter().any(|b| {
+            b.cards.iter().any(|c| {
+                matches!(c, crate::launcher::Card::Session(row)
+                    if row.agent.status == nebula_core::AgentStatus::NeedsFeedback
+                        && !row.agent.archived)
+            })
+        }) {
+            key_bar.push((k(Action::NextWaiting), "next ◐"));
+        }
         return FooterHint {
             hints: Span::raw(""),
-            key_bar: Some(vec![
-                (walk, "move"),
-                (k(Action::Activate), "open"),
-                (k(Action::QuickPrompt), "sub-prompt"),
-            ]),
+            key_bar: Some(key_bar),
         };
     }
     let text = if app.launcher.show_archived {

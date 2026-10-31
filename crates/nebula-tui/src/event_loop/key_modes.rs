@@ -319,6 +319,7 @@ fn handle_global_action(
         | Action::Palette
         | Action::NextAttention
         | Action::PrevAttention
+        | Action::NextWaiting
         | Action::Delete
         | Action::DeleteAll
         | Action::FollowUp => handle_session_state_action(app, action, chord, out),
@@ -617,6 +618,11 @@ fn handle_session_state_action(
             let attaches = crate::config::Config::load().palette_enter_attaches;
             jump_attention(app, -1, attaches, out);
         }
+        // `!`: the grid takes this itself (`launcher::handle_action`); it
+        // reaches here over a full-screen session, where the walk still
+        // lands the selection on the next session waiting for input.
+        Action::NextWaiting if app.launcher_active() => launcher::next_waiting(app, out),
+        Action::NextWaiting => {}
         Action::Delete => open_delete_confirm(app),
         // Delete EVERY row of the focused panel (behind a confirm that
         // lists the casualties).
