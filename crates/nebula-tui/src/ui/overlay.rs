@@ -455,6 +455,7 @@ const HELP_LEFT: &[HelpSection] = &[
                 Act(&[NextAttention, PrevAttention]),
                 "next/prev session needing you",
             ),
+            (Act(&[NextWaiting]), "next session waiting for input"),
             (Act(&[FindFile]), "find file (^y copies path)"),
             (Act(&[Grep]), "find in files (git grep)"),
             (Act(&[TreeBrowser]), "file tree browser"),

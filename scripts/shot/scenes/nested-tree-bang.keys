@@ -1,0 +1,64 @@
+# Five launches through the box's ^T worktree picker — two in fix/rate-limits, two in
+# feat/auth-tokens, one in main — then a terminal in main and ^q back to the list. The F12s
+# (unbound, 0.6 s each) let launches settle and the delayed finish land.
+p
+C-t
+rate
+Enter
+F12
+Review the rate limit pull request and merge it once the checks pass
+Enter
+F12
+p
+C-t
+rate
+Enter
+F12
+Reproduce the burst of 429s the load test shows
+Enter
+F12
+p
+C-t
+auth
+Enter
+F12
+Do one last review to check for major security issues
+Enter
+F12
+p
+C-t
+auth
+Enter
+F12
+Write tests for the tokens migration
+Enter
+F12
+p
+C-t
+main
+Enter
+F12
+Add a label of screenshots requested to any pr that seems to be missing its screenshots
+Enter
+F12
+t
+C-q
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+# Fold both threads, park on main, then ! jumps to the session waiting for input.
+k
+k
+h
+k
+k
+h
+k
+F12
+!
+F12

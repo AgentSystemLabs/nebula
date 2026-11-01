@@ -1058,7 +1058,7 @@ fn draw_bands(
             }
         }
     }
-    draw_panel_edge_marks(f, panel, scroll, th);
+    draw_panel_edge_marks(f, panel, scroll, th, Default::default());
     app.chrome.hits.extend(band_areas);
     // Last, so the bands themselves win `hit_at`'s first-match scan and
     // only the air between them falls through to the grid.
@@ -1121,12 +1121,14 @@ fn draw_empty_band(
 /// cards are in the count too, and the marker just counts. The header's
 /// `↑↓ 5 hidden` says the same once more. A grid that fits has neither
 /// row marked, and a panel scrolled to an end leaves that end's row as
-/// plain air.
+/// plain air. `tails` follow the words above and below: the NESTED
+/// layout's tally of what is off that edge wanting you (`2◐  1✗`).
 fn draw_panel_edge_marks(
     f: &mut Frame,
     panel: &crate::launcher::PanelLayout,
     scroll: u16,
     th: Theme,
+    tails: [Vec<Span<'static>>; 2],
 ) {
     if !panel.overflows() {
         return;
@@ -1139,10 +1141,12 @@ fn draw_panel_edge_marks(
             format!(" worktree{}", plural(n))
         }
     };
-    let mark = |f: &mut Frame, r: Rect, words: String| {
+    let [above, below] = tails;
+    let mark = |f: &mut Frame, r: Rect, words: String, tail: Vec<Span<'static>>| {
+        let mut spans = vec![Span::styled(words, Style::default().fg(th.muted))];
+        spans.extend(tail);
         f.render_widget(
-            Paragraph::new(Span::styled(words, Style::default().fg(th.muted)))
-                .alignment(ratatui::layout::Alignment::Center),
+            Paragraph::new(Line::from(spans)).alignment(ratatui::layout::Alignment::Center),
             r,
         );
     };
@@ -1153,7 +1157,7 @@ fn draw_panel_edge_marks(
             ..panel.area
         };
         let n = hidden.above;
-        mark(f, r, format!("↑ {n} more{} above", what(n)));
+        mark(f, r, format!("↑ {n} more{} above", what(n)), above);
     }
     if hidden.below > 0 {
         let window = panel.window();
@@ -1163,7 +1167,7 @@ fn draw_panel_edge_marks(
             ..panel.area
         };
         let n = hidden.below;
-        mark(f, r, format!("↓ {n} more{} below", what(n)));
+        mark(f, r, format!("↓ {n} more{} below", what(n)), below);
     }
 }
 
