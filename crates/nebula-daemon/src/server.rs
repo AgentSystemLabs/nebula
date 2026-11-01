@@ -340,11 +340,13 @@ impl ClientConnection {
                 req_id,
                 id,
                 kind,
+                model,
+                effort,
                 starting_prompt,
                 worktree,
                 base,
             } => {
-                self.handle_spawn_sibling(req_id, id, kind, starting_prompt, worktree, base)
+                self.handle_spawn_sibling(req_id, id, kind, starting_prompt, worktree, base, model, effort)
                     .await;
                 Ok(true)
             }
@@ -1006,6 +1008,8 @@ impl ClientConnection {
         starting_prompt: String,
         worktree: Option<String>,
         base: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
     ) {
         // Logged by mode only — never the prompt text.
         let worktree = worktree
@@ -1016,7 +1020,7 @@ impl ClientConnection {
             });
         let result = self
             .daemon
-            .spawn_sibling_agent(&id, kind, worktree, &starting_prompt)
+            .spawn_sibling_agent_with_overrides(&id, kind, worktree, &starting_prompt, model, effort)
             .await;
         match &result {
             Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(

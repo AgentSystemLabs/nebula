@@ -376,6 +376,8 @@ pub async fn spawn_sibling_for_current_agent(
     kind: Option<AgentKind>,
     worktree: Option<String>,
     base: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<()> {
     let agent_id = current_agent_id("spawn")?;
     let task = task.trim();
@@ -407,6 +409,8 @@ pub async fn spawn_sibling_for_current_agent(
             req_id,
             id: AgentId(agent_id),
             kind,
+            model,
+            effort,
             starting_prompt: task.to_string(),
             worktree: worktree.clone(),
             base,
@@ -766,6 +770,8 @@ pub async fn orchestrator_spawn(
     base: Option<String>,
     kind: AgentKind,
     task: &str,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<()> {
     let (caller, mut conn) = orchestrator_connection().await?;
     let tree = fetch_orchestrator_tree(&caller, &mut conn).await?;
@@ -787,8 +793,8 @@ pub async fn orchestrator_spawn(
             name: String::new(),
             kind,
             custom_harness: None,
-            model: None,
-            effort: None,
+            model,
+            effort,
             starting_prompt: task.to_string(),
         },
     )

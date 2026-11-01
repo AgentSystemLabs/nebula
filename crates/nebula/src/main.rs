@@ -52,9 +52,11 @@ fn main() -> Result<()> {
         Some(Command::Spawn {
             task,
             kind,
+            model,
+            effort,
             worktree,
             base,
-        }) => nebula_tui::run_spawn(task.join(" "), kind, worktree, base),
+        }) => nebula_tui::run_spawn(task.join(" "), kind, worktree, base, model, effort),
         Some(Command::Open { files }) => nebula_tui::run_open(files),
         Some(Command::Sessions { json }) => nebula_tui::run_sessions(json),
         Some(Command::Read { session, lines }) => nebula_tui::run_read_session(&session, lines),
@@ -77,6 +79,8 @@ fn main() -> Result<()> {
                 worktree,
                 base,
                 kind,
+                model,
+                effort,
                 task,
             } => nebula_tui::run_orchestrator_spawn(
                 &project,
@@ -84,6 +88,8 @@ fn main() -> Result<()> {
                 base,
                 kind,
                 task.join(" "),
+                model,
+                effort,
             ),
             OrchestratorCommand::Review { session, tabs } => {
                 nebula_tui::run_orchestrator_review(&session, tabs)

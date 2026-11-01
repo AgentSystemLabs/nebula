@@ -301,6 +301,10 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
         kind: Option<AgentKind>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
         starting_prompt: String,
         /// `--worktree <branch>`: start the session in the caller's
         /// PROJECT's worktree on this branch instead, created (as

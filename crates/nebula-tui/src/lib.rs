@@ -114,9 +114,11 @@ pub fn run_spawn(
     kind: Option<nebula_core::AgentKind>,
     worktree: Option<String>,
     base: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<()> {
     runtime()?.block_on(ipc::spawn_sibling_for_current_agent(
-        &task, kind, worktree, base,
+        &task, kind, worktree, base, model, effort,
     ))
 }
 
@@ -150,9 +152,11 @@ pub fn run_orchestrator_spawn(
     base: Option<String>,
     kind: nebula_core::AgentKind,
     task: String,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<()> {
     runtime()?.block_on(ipc::orchestrator_spawn(
-        project, worktree, base, kind, &task,
+        project, worktree, base, kind, &task, model, effort,
     ))
 }
 
