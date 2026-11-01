@@ -351,10 +351,8 @@ impl ClientConnection {
                     id,
                     kind,
                     starting_prompt,
-                    worktree,
-                    base,
-                    model,
-                    effort,
+                    (worktree, base),
+                    (model, effort),
                 )
                 .await;
                 Ok(true)
@@ -1015,10 +1013,8 @@ impl ClientConnection {
         id: nebula_core::AgentId,
         kind: Option<nebula_core::AgentKind>,
         starting_prompt: String,
-        worktree: Option<String>,
-        base: Option<String>,
-        model: Option<String>,
-        effort: Option<String>,
+        (worktree, base): (Option<String>, Option<String>),
+        (model, effort): (Option<String>, Option<String>),
     ) {
         // Logged by mode only — never the prompt text.
         let worktree = worktree
