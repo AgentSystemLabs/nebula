@@ -182,6 +182,12 @@ pub(crate) enum Command {
         /// Defaults to the harness this session is running.
         #[arg(long, value_name = "KIND", value_parser = parse_agent_kind)]
         kind: Option<nebula_core::AgentKind>,
+        /// Model for the new session (defaults to the inherited model).
+        #[arg(long)]
+        model: Option<String>,
+        /// Reasoning effort for the new session (defaults to the inherited effort).
+        #[arg(long)]
+        effort: Option<String>,
         /// Start the session in this project's worktree on BRANCH instead,
         /// creating the worktree when the branch has none; spaces become
         /// hyphens.
@@ -462,6 +468,12 @@ pub(crate) enum OrchestratorCommand {
         /// Harness for the new session.
         #[arg(long, value_name = "KIND", value_parser = parse_agent_kind, default_value = "claude")]
         kind: nebula_core::AgentKind,
+        /// Model for the new session.
+        #[arg(long)]
+        model: Option<String>,
+        /// Reasoning effort for the new session.
+        #[arg(long)]
+        effort: Option<String>,
         /// Prompt text; multiple words need no quotes.
         #[arg(required = true, num_args = 1..)]
         task: Vec<String>,

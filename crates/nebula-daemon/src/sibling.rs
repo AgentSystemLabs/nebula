@@ -157,6 +157,19 @@ impl Daemon {
         worktree: Option<SiblingWorktree<'_>>,
         starting_prompt: &str,
     ) -> Result<EntityId> {
+        self.spawn_sibling_agent_with_overrides(id, kind, worktree, starting_prompt, None, None)
+            .await
+    }
+
+    pub async fn spawn_sibling_agent_with_overrides(
+        self: &Arc<Self>,
+        id: &AgentId,
+        kind: Option<AgentKind>,
+        worktree: Option<SiblingWorktree<'_>>,
+        starting_prompt: &str,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<EntityId> {
         let caller = self.spawning_caller(id)?;
         let target = match worktree {
             None => caller.worktree_id.clone(),
@@ -185,7 +198,13 @@ impl Daemon {
                     .id
             }
         };
-        let spec = self.sibling_spec(&caller, kind, &target, starting_prompt)?;
+        let mut spec = self.sibling_spec(&caller, kind, &target, starting_prompt)?;
+        if model.is_some() {
+            spec.model = model;
+        }
+        if effort.is_some() {
+            spec.effort = effort;
+        }
         self.create_agent(spec).await
     }
 }
