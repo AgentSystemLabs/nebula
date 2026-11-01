@@ -157,7 +157,8 @@ impl Daemon {
         worktree: Option<SiblingWorktree<'_>>,
         starting_prompt: &str,
     ) -> Result<EntityId> {
-        self.spawn_sibling_agent_with_overrides(id, kind, worktree, starting_prompt, None, None).await
+        self.spawn_sibling_agent_with_overrides(id, kind, worktree, starting_prompt, None, None)
+            .await
     }
 
     pub async fn spawn_sibling_agent_with_overrides(
@@ -198,8 +199,12 @@ impl Daemon {
             }
         };
         let mut spec = self.sibling_spec(&caller, kind, &target, starting_prompt)?;
-        if model.is_some() { spec.model = model; }
-        if effort.is_some() { spec.effort = effort; }
+        if model.is_some() {
+            spec.model = model;
+        }
+        if effort.is_some() {
+            spec.effort = effort;
+        }
         self.create_agent(spec).await
     }
 }

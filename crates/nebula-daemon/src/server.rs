@@ -346,8 +346,17 @@ impl ClientConnection {
                 worktree,
                 base,
             } => {
-                self.handle_spawn_sibling(req_id, id, kind, starting_prompt, worktree, base, model, effort)
-                    .await;
+                self.handle_spawn_sibling(
+                    req_id,
+                    id,
+                    kind,
+                    starting_prompt,
+                    worktree,
+                    base,
+                    model,
+                    effort,
+                )
+                .await;
                 Ok(true)
             }
             ClientRequest::OpenFiles { req_id, id, paths } => {
@@ -1020,7 +1029,14 @@ impl ClientConnection {
             });
         let result = self
             .daemon
-            .spawn_sibling_agent_with_overrides(&id, kind, worktree, &starting_prompt, model, effort)
+            .spawn_sibling_agent_with_overrides(
+                &id,
+                kind,
+                worktree,
+                &starting_prompt,
+                model,
+                effort,
+            )
             .await;
         match &result {
             Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
