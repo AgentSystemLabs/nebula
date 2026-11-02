@@ -13,17 +13,62 @@
 //! marks where in the chunk it was asked and the pump answers it from
 //! `pty::cursor`. Replies stay in query order either way.
 //!
-//! And bracketed paste (`CSI ? 2004 h` / `l`): a client reads the mode off
-//! its own parser to paste the way a terminal would, but a child sets it
-//! once — claude at startup — and a ring that has wrapped since no longer
-//! holds the set, so the replay has to restore it (`PtySession::snapshot`).
+//! Also tracks bracketed paste, alternate screen and mouse reporting. A
+//! child can set these only once at startup; after those bytes fall off
+//! the ring, a replay must restore them (`PtySession::snapshot`) or the
+//! client no longer knows how to paste or route the wheel.
 
 use super::ESC;
 
 /// Max nesting the spec suggests implementations may cap the stack at.
 const MAX_STACK: usize = 32;
-/// A real kitty sequence has short params; anything longer is not for us.
-const MAX_PARAMS: usize = 16;
+/// Bound buffering while allowing combined DECSET mouse-mode requests.
+const MAX_PARAMS: usize = 64;
+
+/// Screen and pointer modes carried across an in-place daemon restart.
+/// Numeric modes match the DECSET requests the client's vt100 understands.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalModes {
+    alternate_screen: bool,
+    mouse_tracking: u16,
+    mouse_encoding: u16,
+}
+
+impl TerminalModes {
+    fn set(&mut self, mode: u32, enabled: bool) {
+        match mode {
+            47 | 1049 => self.alternate_screen = enabled,
+            9 | 1000 | 1002 | 1003 => {
+                if enabled {
+                    self.mouse_tracking = mode as u16;
+                } else if self.mouse_tracking == mode as u16 {
+                    self.mouse_tracking = 0;
+                }
+            }
+            1005 | 1006 => {
+                if enabled {
+                    self.mouse_encoding = mode as u16;
+                } else if self.mouse_encoding == mode as u16 {
+                    self.mouse_encoding = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        if self.alternate_screen {
+            // Select the alternate grid without 1049's clear/save-cursor
+            // side effects: retained output supplies the screen contents.
+            out.extend_from_slice(b"\x1b[?47h");
+        }
+        for mode in [self.mouse_tracking, self.mouse_encoding] {
+            if mode != 0 {
+                out.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
+            }
+        }
+    }
+}
 
 /// What the pump should do in response to scanned output.
 #[derive(Debug, Default, PartialEq)]
@@ -70,6 +115,7 @@ pub struct KittyScanner {
     params: Vec<u8>,
     stack: Vec<u8>,
     bracketed_paste: bool,
+    terminal_modes: TerminalModes,
 }
 
 impl Default for KittyScanner {
@@ -85,15 +131,16 @@ impl KittyScanner {
             params: Vec::new(),
             stack: Vec::new(),
             bracketed_paste: false,
+            terminal_modes: TerminalModes::default(),
         }
     }
 
-    /// A scanner picking up where another image's left off: the flags stack
-    /// and the bracketed-paste mode are all an IN-PLACE RESTART carries.
-    pub fn restored(stack: Vec<u8>, bracketed_paste: bool) -> Self {
+    /// A scanner picking up where another image left off.
+    pub fn restored(stack: Vec<u8>, bracketed_paste: bool, terminal_modes: TerminalModes) -> Self {
         Self {
             stack,
             bracketed_paste,
+            terminal_modes,
             ..Self::new()
         }
     }
@@ -111,6 +158,21 @@ impl KittyScanner {
     /// Has the child turned bracketed paste on (`CSI ? 2004 h`)?
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    pub fn terminal_modes(&self) -> TerminalModes {
+        self.terminal_modes
+    }
+
+    /// Startup modes a wrapped ring may no longer contain. A gap-free
+    /// continuation already has them and must not apply this prefix.
+    pub fn replay_modes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.terminal_modes.write(&mut out);
+        if self.bracketed_paste {
+            out.extend_from_slice(b"\x1b[?2004h");
+        }
+        out
     }
 
     /// Scan a chunk of child output. Sequences split across chunks are fine —
@@ -144,6 +206,7 @@ impl KittyScanner {
                     // RIS (`ESC c`) puts every mode back to its default.
                     if b == b'c' {
                         self.bracketed_paste = false;
+                        self.terminal_modes = TerminalModes::default();
                     }
                     // Includes ESC ESC; any other escape kind is not a CSI.
                     self.state = if b == ESC { State::Esc } else { State::Ground };
@@ -218,11 +281,16 @@ impl KittyScanner {
                 _ => {}
             },
             // DECSET / DECRST, any number of modes at once
-            // (`CSI ? 1004 ; 2004 h`): only bracketed paste is tracked.
+            // (`CSI ? 1000 ; 1006 ; 2004 h`).
             b'h' | b'l' => {
                 if let Some((b'?', modes)) = params.split_first() {
-                    if modes.split(|&b| b == b';').any(|m| m == b"2004") {
-                        self.bracketed_paste = final_byte == b'h';
+                    let enabled = final_byte == b'h';
+                    for mode in modes.split(|&b| b == b';').filter_map(parse_num) {
+                        if mode == 2004 {
+                            self.bracketed_paste = enabled;
+                        } else {
+                            self.terminal_modes.set(mode, enabled);
+                        }
                     }
                 }
             }
@@ -326,6 +394,58 @@ mod tests {
         // RIS (`reset`) drops it with every other mode.
         s.feed(b"\x1bc");
         assert!(!s.bracketed_paste());
+    }
+
+    #[test]
+    fn replay_modes_follow_screen_and_mouse_transitions_across_chunks() {
+        let startup = b"\x1b[?1049;1000;1002;1003;1006;2004h";
+        for split in 0..=startup.len() {
+            let mut scanner = KittyScanner::new();
+            scanner.feed(&startup[..split]);
+            scanner.feed(&startup[split..]);
+            let mut parser = vt100::Parser::new(24, 80, 0);
+            parser.process(&scanner.replay_modes());
+            assert!(parser.screen().alternate_screen(), "split {split}");
+            assert!(parser.screen().bracketed_paste(), "split {split}");
+            assert_eq!(
+                parser.screen().mouse_protocol_mode(),
+                vt100::MouseProtocolMode::AnyMotion,
+                "split {split}"
+            );
+            assert_eq!(
+                parser.screen().mouse_protocol_encoding(),
+                vt100::MouseProtocolEncoding::Sgr,
+                "split {split}"
+            );
+
+            // Clearing another tracking/encoding mode leaves the active
+            // one in place, matching the client's vt100 parser.
+            let modes = scanner.replay_modes();
+            scanner.feed(b"\x1b[?1000;1002;1005l");
+            assert_eq!(scanner.replay_modes(), modes);
+
+            // An overlay returns control to the inline transcript. No
+            // stale alternate grid or pointer request survives its exit.
+            scanner.feed(b"\x1b[?1003;1006;1049;2004l");
+            assert!(scanner.replay_modes().is_empty());
+        }
+    }
+
+    #[test]
+    fn replay_modes_survive_daemon_restart_and_clear_on_terminal_reset() {
+        let mut scanner = KittyScanner::new();
+        scanner.feed(b"\x1b[?47h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>5u");
+        let modes = scanner.terminal_modes();
+        let encoded = serde_json::to_vec(&modes).unwrap();
+        let mut restored = KittyScanner::restored(
+            scanner.stack().to_vec(),
+            scanner.bracketed_paste(),
+            serde_json::from_slice(&encoded).unwrap(),
+        );
+        assert_eq!(restored.flags(), scanner.flags());
+        assert_eq!(restored.replay_modes(), scanner.replay_modes());
+        restored.feed(b"\x1bc");
+        assert!(restored.replay_modes().is_empty());
     }
 
     #[test]

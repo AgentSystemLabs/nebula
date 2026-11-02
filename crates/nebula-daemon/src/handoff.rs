@@ -430,6 +430,9 @@ mod tests {
 
     #[test]
     fn state_round_trips_with_its_rings() {
+        let mut scanner = crate::pty::kitty::KittyScanner::new();
+        scanner.feed(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h");
+        let terminal_modes = scanner.terminal_modes();
         let state = State {
             version: VERSION,
             nonce: "n".into(),
@@ -447,6 +450,7 @@ mod tests {
                     ring: vec![0, 1, 2, 255],
                     kitty_stack: vec![1],
                     bracketed_paste: true,
+                    terminal_modes,
                     progress_busy: Some(true),
                     title: Some("✳ Fix Login".into()),
                     cloud_scan: true,
@@ -468,7 +472,18 @@ mod tests {
         );
         assert_eq!(pty.title.as_deref(), Some("✳ Fix Login"));
         assert!(pty.bracketed_paste);
+        assert_eq!(pty.terminal_modes, terminal_modes);
         assert!(pty.cloud_scan && pty.question_scan && back.sessions[0].launching);
+
+        // A daemon from before screen/mouse modes were carried still
+        // hands off successfully; its missing state uses terminal defaults.
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy["sessions"][0]["pty"]
+            .as_object_mut()
+            .unwrap()
+            .remove("terminal_modes");
+        let legacy: State = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.sessions[0].pty.terminal_modes, Default::default());
     }
 
     #[test]
@@ -482,6 +497,7 @@ mod tests {
             ring: vec![],
             kitty_stack: vec![],
             bracketed_paste: false,
+            terminal_modes: Default::default(),
             progress_busy: None,
             title: None,
             cloud_scan: false,
