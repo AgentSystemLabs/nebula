@@ -398,6 +398,7 @@ impl PtySession {
                 kitty: Mutex::new(kitty::KittyScanner::restored(
                     carried.kitty_stack,
                     carried.bracketed_paste,
+                    carried.terminal_modes,
                 )),
                 progress: Mutex::new(ProgressScanner::restored(carried.progress_busy)),
                 title: Mutex::new(title::TitleScanner::restored(carried.title)),
@@ -449,6 +450,7 @@ impl PtySession {
             ring,
             kitty_stack: kitty.stack().to_vec(),
             bracketed_paste: kitty.bracketed_paste(),
+            terminal_modes: kitty.terminal_modes(),
             progress_busy: self.progress.lock().busy(),
             title: self.title.lock().title().map(str::to_string),
             cloud_scan: self.cloud.lock().is_some(),
@@ -617,18 +619,14 @@ impl PtySession {
     ///
     /// A replay that rebuilds the client's screen from a ring that has
     /// wrapped opens with the modes whose set may have fallen off its head
-    /// — bracketed paste, which claude turns on once at startup and the
-    /// client reads to paste the way a terminal would (#107) — and
+    /// — bracketed paste, alternate screen and mouse reporting, which
+    /// agents can turn on once at startup — and
     /// `base_seq` backs up by their length, so the client's byte count
     /// still ends where the ring does.
     pub fn snapshot(&self, from_seq: Option<u64>) -> (u64, Vec<u8>) {
         let (base_seq, data) = self.ring.lock().snapshot_from(from_seq);
-        let modes: &[u8] = if self.kitty.lock().bracketed_paste() {
-            b"\x1b[?2004h"
-        } else {
-            b""
-        };
-        with_modes(from_seq, base_seq, data, modes)
+        let modes = self.kitty.lock().replay_modes();
+        with_modes(from_seq, base_seq, data, &modes)
     }
 
     /// The end of the ring for a grid card's preview (`TailOutput`): the
@@ -762,6 +760,8 @@ pub struct Carried {
     pub kitty_stack: Vec<u8>,
     #[serde(default)]
     pub bracketed_paste: bool,
+    #[serde(default)]
+    pub terminal_modes: kitty::TerminalModes,
     #[serde(default)]
     pub progress_busy: Option<bool>,
     #[serde(default)]
@@ -1148,6 +1148,64 @@ mod tests {
         screen.process(&replay);
         assert!(screen.screen().bracketed_paste());
         // A client that kept its screen gets the ring as it is.
+        assert_eq!(session.snapshot(Some(head)), (head, raw));
+    }
+
+    /// Codex's fullscreen transcript asks for mouse reports once on entry.
+    /// Losing those bytes from the ring must not turn wheel events into
+    /// local scrollback (or prompt-history arrows) when the pane is rebuilt.
+    #[tokio::test]
+    async fn a_wrapped_replay_keeps_codex_wheel_reporting() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!(
+                        "printf '\\033[?1049h\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1006h'; \
+                         head -c {} /dev/zero | tr '\\000' x; printf '\\033[Hcodex ready'",
+                        RING_CAPACITY + 4096
+                    ),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        let mut rx = session.events.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Exited { .. }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("child exits within 10s");
+
+        let (head, raw) = session.ring.lock().snapshot_from(None);
+        assert!(head > 0, "the startup modes fell off the ring");
+        let (start, replay) = session.snapshot(None);
+        assert_eq!(start + replay.len() as u64, head + raw.len() as u64);
+        let mut parser = vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0);
+        parser.process(&replay);
+        let screen = parser.screen();
+        assert!(screen.alternate_screen(), "Codex still owns the screen");
+        assert_eq!(
+            screen.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::AnyMotion
+        );
+        assert_eq!(
+            screen.mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        );
+        assert!(screen.contents().starts_with("codex ready"));
         assert_eq!(session.snapshot(Some(head)), (head, raw));
     }
 
