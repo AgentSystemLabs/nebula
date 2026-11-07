@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -24,6 +24,10 @@ pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
 /// a request it could not decode, and its delete confirm simply goes
 /// without the check.
 pub const CHECK_WORKTREE_PROTOCOL: u32 = 51;
+
+/// First protocol whose daemon answers `ClientRequest::SleepAgent`. An
+/// older daemon is never sent one; the client says it can't sleep there.
+pub const SLEEP_AGENT_PROTOCOL: u32 = 52;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -410,6 +414,14 @@ pub enum ClientRequest {
         id: AgentId,
     },
     DeleteAgent {
+        req_id: u64,
+        id: AgentId,
+    },
+    /// SLEEP: end the agent's process to free what it holds, keeping the
+    /// row (not archived). The next attach resumes its conversation, as
+    /// after an idle reap. A turn still running is cut short; the client
+    /// confirms that first. Gated on [`SLEEP_AGENT_PROTOCOL`].
+    SleepAgent {
         req_id: u64,
         id: AgentId,
     },

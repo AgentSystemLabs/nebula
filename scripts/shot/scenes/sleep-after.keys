@@ -1,0 +1,12 @@
+# sleep-confirm, answered: the card stays, cold, and the footer says how to wake it.
+Tab
+Tab
+p
+Enter
+wait 2
+p
+Enter
+wait 2
+z
+y
+wait 1

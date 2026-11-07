@@ -444,6 +444,32 @@ impl Daemon {
         Ok(())
     }
 
+    /// SLEEP: end the agent's process to free what it holds, and keep the
+    /// row as it is. The next attach resumes its conversation, as after an
+    /// idle reap (`reap_idle_sessions`). Refused while the agent works, on
+    /// the reaper's own test: running, waiting on the user, or a
+    /// backgrounded tool call still going.
+    pub fn sleep_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
+        let agent = self.store.get_agent(id)?.context("agent not found")?;
+        if agent.archived {
+            bail!("agent is archived, so it is already asleep");
+        }
+        let sref = SessionRef::Agent(id.clone());
+        let session = self.sessions.lock().get(&sref).cloned();
+        let busy = matches!(
+            agent.status,
+            AgentStatus::Running | AgentStatus::NeedsFeedback
+        ) || session.is_some_and(|s| agent_has_detached_job(&s));
+        if busy {
+            bail!(
+                "'{}' is still working; sleep it once it is idle",
+                agent.name
+            );
+        }
+        self.kill_session(&sref);
+        self.broadcast_agent(id)
+    }
+
     pub fn unarchive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.store.set_agent_archived(id, false)?;
         self.broadcast_agent(id)?;

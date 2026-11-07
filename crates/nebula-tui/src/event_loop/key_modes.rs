@@ -314,6 +314,7 @@ fn handle_global_action(
         }
         Action::RefreshPullRequests
         | Action::Archive
+        | Action::Sleep
         | Action::Unarchive
         | Action::ToggleArchived
         | Action::Palette
@@ -565,6 +566,17 @@ fn handle_session_state_action(
                     }
                     Some(SessionRow::Link(_)) => {
                         app.chrome.flash = Some("links can't be archived — d deletes them".into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Action::Sleep => {
+            if app.nav.focus == Focus::Sessions {
+                match app.selected_session_row() {
+                    Some(SessionRow::Agent(a)) => sleep_agent(app, a.id),
+                    Some(SessionRow::Terminal(_)) => {
+                        app.chrome.flash = Some("terminals can't sleep; d closes them".into());
                     }
                     _ => {}
                 }
