@@ -114,6 +114,9 @@ pub enum Action {
     NewTerminal,
     Rename,
     Archive,
+    /// `z`: SLEEP the session card under the cursor. Its process ends and
+    /// frees what it holds; the card stays, and attaching wakes it.
+    Sleep,
     Unarchive,
     ToggleArchived,
     Delete,
@@ -496,6 +499,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["a"],
+    },
+    ActionSpec {
+        action: Action::Sleep,
+        id: "sleep",
+        label: "Sleep session",
+        hint: "End the selected agent's process to free its memory, keeping its card; attaching wakes it with the conversation resumed. Asks first; refused while the agent is working",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["z"],
     },
     ActionSpec {
         action: Action::Unarchive,

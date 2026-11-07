@@ -336,6 +336,7 @@ pub(crate) fn run_pending_action(
             }
         }
         PendingAction::DeleteAgent(id) => delete_agent(app, id, out),
+        PendingAction::SleepAgent(id) => sleep_agent_now(app, id, out),
         PendingAction::MoveAgent { id, worktree } => launcher::move_agent(app, id, worktree, out),
         PendingAction::CloseTerminal(id) => close_terminal(app, id, out),
         PendingAction::DeleteLink(id) => optimistic::delete_link(app, id, out),
@@ -560,6 +561,7 @@ pub(crate) fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<C
                 id,
             });
         }
+        MenuAction::SleepAgent(id) => sleep_agent(app, id),
         MenuAction::SendCloudMessage(id) => open_prompt(app, PromptKind::CloudMessage { id }),
         MenuAction::DuplicateAgent(id) => launcher::duplicate_agent(app, id),
         MenuAction::MoveAgentPicker(id) => launcher::open_move_picker(app, id),

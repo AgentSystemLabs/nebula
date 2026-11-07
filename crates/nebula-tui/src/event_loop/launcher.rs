@@ -922,6 +922,7 @@ fn acts_on_card(action: Action) -> bool {
         action,
         Action::Rename
             | Action::Archive
+            | Action::Sleep
             | Action::Unarchive
             | Action::Delete
             | Action::FollowUp
@@ -7676,6 +7677,78 @@ mod tests {
                 app.pane.collapsed,
                 "full-screen: there is no pane to step into"
             );
+        });
+    }
+
+    /// `z` sleeps the card under the cursor once its confirm is answered,
+    /// with no attach sent to wake it straight back; a running card is
+    /// refused, a cold one has nothing to sleep. The card menu offers
+    /// **Sleep** on a live card only.
+    #[test]
+    fn z_asks_then_sleeps_an_idle_card_and_refuses_a_running_one() {
+        let sleeps = |out: &[ClientRequest], id: &str| {
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::SleepAgent { id: a, .. } if a.0 == id))
+        };
+        let menu_has_sleep = |app: &App, id: &str| {
+            let a = app.tree.agents.iter().find(|a| a.id.0 == id).unwrap();
+            super::super::menu_items_for_session(a)
+                .iter()
+                .any(|i| i.label == "Sleep")
+        };
+        with_default_config(|| {
+            let mut app = three_sessions();
+            app.tree
+                .agents
+                .iter_mut()
+                .find(|a| a.id.0 == "a1")
+                .unwrap()
+                .status = AgentStatus::Finished;
+            draw(&mut app);
+            assert!(menu_has_sleep(&app, "a1"), "a live card offers Sleep");
+
+            super::select(&mut app, AgentId("a1".into()), &mut Vec::new());
+            let out = key(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+            assert!(!sleeps(&out, "a1"), "nothing sent before the answer");
+            assert!(
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
+                    if c.action == PendingAction::SleepAgent(AgentId("a1".into()))),
+                "it asks: {:?}",
+                app.modals.overlay
+            );
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(sleeps(&out, "a1"), "Enter sleeps it: {out:?}");
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::Attach { .. })),
+                "nothing wakes it straight back: {out:?}"
+            );
+            assert_eq!(cards(&app), ["a9", "a2", "a1"], "the card stays");
+
+            super::select(&mut app, AgentId("a2".into()), &mut Vec::new());
+            let out = key(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+            assert!(!sleeps(&out, "a2"), "running: refused");
+            assert!(app.modals.overlay.is_none(), "running: no confirm");
+            assert!(app
+                .chrome
+                .flash
+                .as_deref()
+                .unwrap_or("")
+                .contains("still working"));
+
+            for a in app.tree.agents.iter_mut().filter(|a| a.id.0 == "a2") {
+                a.alive = false;
+            }
+            assert!(!menu_has_sleep(&app, "a2"), "a cold card has no Sleep");
+            let out = key(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+            assert!(!sleeps(&out, "a2"), "cold: nothing to sleep");
+            assert!(app.modals.overlay.is_none());
+            assert!(app
+                .chrome
+                .flash
+                .as_deref()
+                .unwrap_or("")
+                .contains("already asleep"));
         });
     }
 
