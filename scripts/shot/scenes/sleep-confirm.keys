@@ -1,0 +1,11 @@
+# Two idle sessions in the root checkout (an empty quick prompt starts one with no first
+# prompt, so nothing is running), then `z` on the second: the SLEEP confirm.
+Tab
+Tab
+p
+Enter
+wait 2
+p
+Enter
+wait 2
+z
