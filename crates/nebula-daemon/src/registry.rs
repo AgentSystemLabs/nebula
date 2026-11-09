@@ -1029,6 +1029,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_sessions_keep_the_nebula_environment_on_cold_launch_and_resume() {
+        let all = test_registry();
+        let codex = test_harness(&all, AgentKind::Codex);
+        // The shared Codex server can predate this PTY and has none of its
+        // NEBULA_* variables. Both hooks and `nebula rename` need this
+        // invocation's environment, including when no model/effort override
+        // happens to force Codex into embedded mode on its own.
+        for sid in [None, Some("sid")] {
+            for prompt in [None, Some("fix the login redirect")] {
+                let (_, args, resumed) = agent_spawn_command_with(
+                    &codex,
+                    sid,
+                    Some(Path::new(TEST_CWD)),
+                    None,
+                    None,
+                    None,
+                    prompt,
+                    None,
+                    true,
+                );
+                assert_eq!(resumed, sid.is_some());
+                assert_eq!(args.first().map(String::as_str), Some("--no-daemon"));
+                if let Some(prompt) = prompt {
+                    assert_eq!(args.last().map(String::as_str), Some(prompt));
+                }
+            }
+        }
+        // A test stand-in is a complete command, never a Codex invocation.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Codex, None, None, None, Some("/bin/cat")),
+            ("/bin/cat".into(), Vec::new(), false)
+        );
+    }
+
+    #[test]
     fn spawn_command_per_kind_resume_shapes() {
         // Fresh sessions: bare CLI (Claude plus its system-prompt guidance).
         assert_eq!(
