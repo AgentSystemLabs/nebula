@@ -552,6 +552,10 @@ fn agent_spawn_command_with(
         }
         _ => (Vec::new(), false),
     };
+    // Global launch options precede subcommands too: Codex's --no-daemon
+    // keeps hooks and tools in this session's NEBULA_* environment on
+    // fresh starts, resumes, restarts and worktree relocations alike.
+    args.splice(0..0, harness.launch_args.iter().cloned());
     if let Some(flag) = harness.permissions_flag.as_deref() {
         args.push(flag.to_string());
     }
@@ -1077,7 +1081,11 @@ mod tests {
         // Codex/cursor always run in skip-permissions mode.
         assert_eq!(
             agent_spawn_command(AgentKind::Codex, None, None, None, None),
-            ("codex".into(), vec!["--yolo".to_string()], false)
+            (
+                "codex".into(),
+                vec!["--no-daemon".to_string(), "--yolo".to_string()],
+                false
+            )
         );
         // Cursor's agent CLI is `cursor-agent`, not `cursor` (the editor).
         assert_eq!(
@@ -1143,6 +1151,7 @@ mod tests {
             (
                 "codex".into(),
                 vec![
+                    "--no-daemon".to_string(),
                     "resume".to_string(),
                     "sid-2".to_string(),
                     "--cd".to_string(),
@@ -1209,6 +1218,7 @@ mod tests {
             (
                 "codex".into(),
                 vec![
+                    "--no-daemon".to_string(),
                     "--yolo".to_string(),
                     "--model".to_string(),
                     "gpt-5.5".to_string(),
@@ -1625,7 +1635,15 @@ mod tests {
                 true,
             )
             .1,
-            vec!["resume", "sid", "--cd", TEST_CWD, "--yolo", "carry on"]
+            vec![
+                "--no-daemon",
+                "resume",
+                "sid",
+                "--cd",
+                TEST_CWD,
+                "--yolo",
+                "carry on"
+            ]
         );
         assert_eq!(
             agent_spawn_command_with(
@@ -1678,6 +1696,7 @@ mod tests {
             )
             .1,
             vec![
+                "--no-daemon",
                 "--yolo",
                 "--model",
                 "gpt-5.5",
@@ -1832,6 +1851,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "--no-daemon",
                 "resume",
                 "sid",
                 "--cd",

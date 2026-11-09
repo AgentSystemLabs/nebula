@@ -180,6 +180,15 @@ including ones a later nebula adds. Like every other object key, a `harnesses` m
 `config.local.json` replaces the whole map from `config.json` rather than merging per harness,
 so keep machine-specific overrides in one layer.
 
+`launch_args` is an array of arguments placed before resume subcommands and session options.
+Codex defaults to `["--no-daemon"]`: its hooks and tool shells need the current session's
+`NEBULA_*` environment for status updates and automatic naming. A shared Codex background server
+keeps its own startup environment, which can belong to another session or have no Nebula context.
+Other harnesses default to `[]`; Codex-compatible wrappers can opt in explicitly. Setting
+`"codex": {"launch_args": []}` removes the flag for older CLIs, with the risk of missing or
+misdirected hooks when a shared server is used. Hook trust review still applies; Nebula does not
+bypass it.
+
 Grok Build is enabled by default and launches `grok`. Its Enabled toggle is stored under
 `harnesses.grok.enabled`. Set `harnesses.grok.model_default` and `effort_default` in config.json
 to pass `--model` and `--reasoning-effort`; unset values use the CLI defaults. The picker offers
