@@ -11,7 +11,7 @@
 
 **Mission control for your coding agents.**
 
-Run **Claude Code**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build** and **OpenCode** across every project and git WORKTREE you own — from one
+Run **Claude Code**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build**, **OpenCode** and **GitHub Copilot** across every project and git WORKTREE you own — from one
 terminal, one keyboard, one grid. They keep working when you close it.
 
 [![Release](https://img.shields.io/github/v/release/AgentSystemLabs/nebula?style=flat-square&color=e8c547&label=release)](https://github.com/AgentSystemLabs/nebula/releases)
@@ -89,6 +89,7 @@ re-checks through the login shell at launch.
 | <img src="https://www.google.com/s2/favicons?domain=meta.com&sz=128" width="24" height="24" alt="Muse"> | [Muse](https://developer.meta.com/ai/lp/muse-code) | `muse` | `curl -fsSL https://dev.meta.ai/install.sh \| bash` |
 | <img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=128" width="24" height="24" alt="OpenCode"> | [OpenCode](https://opencode.ai/docs/) | `opencode` | `curl -fsSL https://opencode.ai/install \| bash` |
 | <img src="https://www.google.com/s2/favicons?domain=x.ai&sz=128" width="24" height="24" alt="Grok"> | [Grok](https://github.com/xai-org/grok-build) | `grok` | `curl -fsSL https://x.ai/cli/install.sh \| bash` |
+| <img src="https://www.google.com/s2/favicons?domain=github.com&sz=128" width="24" height="24" alt="Copilot"> | [Copilot](https://github.com/github/copilot-cli) | `copilot` | `npm i -g @github/copilot` |
 
 ## Install
 
@@ -113,7 +114,7 @@ WSL2 is supported as Linux. WSL1 is not: it lacks the Linux kernel behavior nebu
 for its Unix socket, pidfile lock, and PTYs, so nebula reports that directly and tells you to convert
 the distro with `wsl.exe --set-version <distro> 2`.
 
-> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, or `opencode`.
+> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, `opencode`, or `copilot`.
 > nebula spawns them; it doesn't ship them.
 >
 > Four commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
@@ -145,7 +146,7 @@ project on the machine, and `x` closes a tab without touching its sessions.
 `Enter` launches it — with the harness, model and effort the Agents tab defaults name, in the checkout
 under the cursor — and the cursor and the pane land on the new card as it shows up in the grid
 (turn off **Follow new** in Settings → Agents to stay on the card you were on). For one launch
-only, `Tab` picks another harness (**Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build** or **OpenCode**, `→`
+only, `Tab` picks another harness (**Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build**, **OpenCode** or **Copilot**, `→`
 for MODEL and EFFORT), `Ctrl+O` a model, `Ctrl+T` any checkout of the project, `Ctrl+P` any project on the
 machine (a launch aimed elsewhere runs in the background and the footer says where it went). Send the
 box empty and the CLI starts bare, its pane yours to type the first prompt into. Save a framing you
@@ -203,6 +204,9 @@ with no managed hooks or automatic capture of its session ID yet. Model and effo
 set through `harnesses.grok` in config.json; the CLI supplies their defaults when unset. An OpenCode
 SESSION does go red: nebula passes no `--auto`, so `opencode` keeps its own permission prompts, and its
 managed plugin reports each one (and each `question` the agent asks you) as it opens and closes.
+A Copilot SESSION goes red the same way: `copilot` runs the hooks nebula installs for Claude, so its
+permission prompts and questions are reported as they open. See
+[GitHub Copilot CLI](docs/configuration.md#github-copilot-cli).
 
 The PROJECT TABS ROLL UP their sessions: each tab carries one dot per state its sessions are in, with
 the count and no word at all — red waiting on you, blue finished unread, yellow mid-turn, in that order

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///

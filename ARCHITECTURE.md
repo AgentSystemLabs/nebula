@@ -36,7 +36,7 @@ Every project is in one list — there is no grouping above it. One repo is one 
 
 Worktrees are real git worktrees, created under `<repo>/../<repo-name>-worktrees/<branch>`. The daemon also polls git metadata so worktrees created outside Nebula still show up.
 
-An agent is a PTY running `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, or `opencode` in that worktree. Restart resumes the stored session id when there is one, the way each CLI takes it (`--resume <id>` for Claude, Cursor and Grok; `codex resume <id>`, `pi --session-id <id>`, `opencode --session <id>`; muse always boots fresh: no resume flag mapped yet).
+An agent is a PTY running `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, `opencode`, or `copilot` in that worktree. Restart resumes the stored session id when there is one, the way each CLI takes it (`--resume <id>` for Claude, Cursor, Grok and Copilot; `codex resume <id>`, `pi --session-id <id>`, `opencode --session <id>`; muse always boots fresh: no resume flag mapped yet).
 
 Persistence is SQLite at `~/.local/share/nebula/nebula.db`: projects, worktrees, agents (kind + CLI session id, plus a PR URL when the AGENT was created from one), links, last UI selection.
 
