@@ -73,6 +73,38 @@ pub fn user_prompt_reply(instruction: bool, session_title: Option<&str>) -> Stri
     serde_json::json!({ "hookSpecificOutput": output }).to_string()
 }
 
+/// The AUTO-TITLE instruction as Copilot CLI reads it. Copilot fires
+/// Claude's hooks from Claude's files, but takes injected context only from
+/// a top-level `additionalContext` — Claude's `hookSpecificOutput` envelope
+/// is parsed and dropped (verified on copilot 1.0.108) — and has no
+/// `sessionTitle` to take a name from, so there is nothing but the
+/// instruction to send.
+pub fn copilot_prompt_reply(instruction: bool) -> String {
+    if !instruction {
+        return String::new();
+    }
+    serde_json::json!({ "additionalContext": AUTO_TITLE_INSTRUCTION }).to_string()
+}
+
+/// A Claude-route event as it reads for a Copilot CLI row. Copilot fires
+/// `PermissionRequest` for every tool call it weighs, including the ones a
+/// rule or `--allow-all` approves with no dialog, so that hook says nothing
+/// about a wait and is dropped (`None`). Its `permission_prompt`
+/// notification fires only as a dialog opens, and at once — not deferred
+/// like Claude's — so it is the permission wait (verified on copilot
+/// 1.0.108).
+pub fn copilot_event(event: HookEvent) -> Option<HookEvent> {
+    match event {
+        HookEvent::PermissionRequest { .. } => None,
+        HookEvent::Notification { notification_type }
+            if notification_type.as_deref() == Some("permission_prompt") =>
+        {
+            Some(HookEvent::PermissionRequest { subagent_id: None })
+        }
+        other => Some(other),
+    }
+}
+
 /// Diagnostic bodies for the route whose responses a hook discards. Never
 /// sent where a body would reach the model's context (see `HookDialect`).
 pub const HOOK_OK: &str = r#"{"ok": true}"#;
@@ -406,6 +438,21 @@ async fn receive_hook(
             }
         }
     }
+    // Copilot CLI runs the Claude hooks and posts to the Claude route, but
+    // its permission events and its reply shape are its own.
+    let copilot = cli == HookCli::Claude
+        && matches!(
+            state.store.get_agent(&agent_id),
+            Ok(Some(agent)) if agent.kind == nebula_core::AgentKind::Copilot
+        );
+    let event = if copilot {
+        match copilot_event(event) {
+            Some(event) => event,
+            None => return quiet_or(StatusCode::OK, HOOK_OK),
+        }
+    } else {
+        event
+    };
     tracing::debug!(agent = %agent_id, event = ?event, "hook received");
     // A subagent's tool traffic reports the payload's cwd too, but that is
     // the Task's position, not the session's — an isolated subagent working
@@ -480,6 +527,9 @@ async fn receive_hook(
                 }),
             HookCli::Codex | HookCli::Cursor | HookCli::Pi | HookCli::OpenCode => None,
         };
+        if copilot {
+            return (StatusCode::OK, copilot_prompt_reply(inject));
+        }
         return (
             StatusCode::OK,
             user_prompt_reply(inject, session_title.as_deref()),
@@ -596,6 +646,120 @@ mod tests {
             assert_eq!(status, 200);
             assert!(rx.try_recv().is_err());
         }
+    }
+
+    /// Copilot CLI runs the Claude hooks and posts to the Claude route,
+    /// but only a top-level `additionalContext` reaches its model: the
+    /// AUTO-TITLE instruction goes out in that shape while it is due, and
+    /// a named row sends nothing (Copilot takes no `sessionTitle`).
+    #[tokio::test]
+    async fn copilot_rows_get_the_instruction_in_copilots_reply_shape() {
+        let store = seeded_store();
+        let template = store
+            .get_agent(&AgentId("pending".into()))
+            .unwrap()
+            .unwrap();
+        let copilot = |id: &str, name: &str| Agent {
+            id: AgentId(id.into()),
+            name: name.into(),
+            kind: AgentKind::Copilot,
+            ..template.clone()
+        };
+        store
+            .insert_agent_with_auto_title(&copilot("copilot-pending", "agent-7"), true)
+            .unwrap();
+        store
+            .insert_agent(&copilot("copilot-named", "Fix Login"))
+            .unwrap();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
+        let payload = r#"{"session_id":"c1","prompt":"fix the login redirect"}"#;
+
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=copilot-pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["additionalContext"], AUTO_TITLE_INSTRUCTION);
+        assert!(parsed.get("hookSpecificOutput").is_none());
+        let delivery = rx.try_recv().unwrap();
+        assert_eq!(delivery.session_id.as_deref(), Some("c1"));
+        assert_eq!(delivery.prompt.as_deref(), Some("fix the login redirect"));
+
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=copilot-named&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.is_empty(), "no sessionTitle for Copilot: {body}");
+    }
+
+    /// Copilot fires `PermissionRequest` for tool calls no dialog ever
+    /// opens for; only its `permission_prompt` notification is a wait.
+    #[tokio::test]
+    async fn copilot_permission_wait_is_read_off_the_notification() {
+        let store = seeded_store();
+        let template = store.get_agent(&AgentId("titled".into())).unwrap().unwrap();
+        store
+            .insert_agent(&Agent {
+                id: AgentId("copilot".into()),
+                kind: AgentKind::Copilot,
+                ..template
+            })
+            .unwrap();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
+        let post = |agent: &'static str, event: &'static str, body: &'static str| {
+            let (port, token) = (env.port, env.token.clone());
+            async move {
+                http_post(
+                    port,
+                    &format!("/api/hooks/claude?agentId={agent}&hookEvent={event}"),
+                    &token,
+                    body,
+                )
+                .await
+            }
+        };
+
+        let (status, _) = post("copilot", "PermissionRequest", r#"{"sessionId":"c1"}"#).await;
+        assert_eq!(status, 200);
+        assert!(rx.try_recv().is_err(), "an auto-approved call is no wait");
+
+        post(
+            "copilot",
+            "Notification",
+            r#"{"sessionId":"c1","notification_type":"permission_prompt"}"#,
+        )
+        .await;
+        assert_eq!(
+            rx.try_recv().unwrap().event,
+            HookEvent::PermissionRequest { subagent_id: None }
+        );
+
+        // A question keeps its own notification, and Claude rows keep both.
+        post(
+            "copilot",
+            "Notification",
+            r#"{"notification_type":"elicitation_dialog"}"#,
+        )
+        .await;
+        assert_eq!(
+            rx.try_recv().unwrap().event,
+            HookEvent::Notification {
+                notification_type: Some("elicitation_dialog".into())
+            }
+        );
+        post("titled", "PermissionRequest", r#"{"session_id":"s1"}"#).await;
+        assert_eq!(
+            rx.try_recv().unwrap().event,
+            HookEvent::PermissionRequest { subagent_id: None }
+        );
     }
 
     /// The reply's `sessionTitle` is how a nebula-side name reaches

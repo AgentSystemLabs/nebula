@@ -1595,6 +1595,65 @@ mod tests {
         assert_eq!(grok.permissions_flag, None);
     }
 
+    /// Flags verified against copilot 1.0.108: `-i` carries the first
+    /// prompt (the CLI takes no positional one), `--resume <id>` reopens a
+    /// session, and the hooks are Claude's.
+    #[test]
+    fn copilot_spawn_uses_verified_flags_and_the_claude_hook_dialect() {
+        let copilot = nebula_core::harness::builtin("copilot").unwrap();
+        assert_eq!(
+            agent_spawn_command_with(&copilot, None, None, None, None, None, None, None, false),
+            (
+                "copilot".into(),
+                vec!["--allow-tool=shell(nebula:*)".into()],
+                false
+            )
+        );
+        let (program, args, resumed) = agent_spawn_command_with(
+            &copilot,
+            None,
+            Some(Path::new(TEST_CWD)),
+            Some("model-id"),
+            Some("high"),
+            None,
+            Some("fix the bug; keep this as one argument"),
+            None,
+            true,
+        );
+        assert_eq!(program, "copilot");
+        assert!(!resumed);
+        assert_eq!(
+            args,
+            vec![
+                "--allow-tool=shell(nebula:*)",
+                "--model",
+                "model-id",
+                "--reasoning-effort",
+                "high",
+                "-i",
+                "fix the bug; keep this as one argument",
+            ]
+        );
+        let (_, args, resumed) = agent_spawn_command_with(
+            &copilot,
+            Some("session-id"),
+            Some(Path::new(TEST_CWD)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(resumed);
+        assert_eq!(
+            args,
+            vec!["--allow-tool=shell(nebula:*)", "--resume", "session-id"]
+        );
+        assert_eq!(copilot.hook_dialect(), Some(AgentKind::Claude));
+        assert_eq!(copilot.permissions_flag, None);
+    }
+
     #[test]
     fn spawn_command_initial_prompt_is_the_trailing_positional_argument() {
         let all = test_registry();

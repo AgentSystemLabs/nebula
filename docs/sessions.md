@@ -7,7 +7,7 @@ Everything that can start an AGENT, and what each launch path does differently.
 ## The NEW SESSION PICKER
 
 Press `n` on the grid. A menu asks what to
-run — **Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build**, or **OpenCode** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
+run — **Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build**, **OpenCode**, or **Copilot** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
 switched off on the settings overlay's Agents tab and drops out of the menu entirely. Turn on `Hide missing CLIs`
 on the Agents tab and the menu lists only enabled harnesses whose CLI is found on PATH (the daemon still
 checks through the login shell at launch). Your own CLIs join the menu too: add them to config.json
@@ -622,7 +622,7 @@ Either way the launch is an ISSUE SESSION. The create carries the issue's URL
 (`CreateAgent::issue_url`); the DAEMON validates it, keeps it with the AGENT row beside a PR
 SESSION's URL, refuses to hand the launch to a PREWARM POOL spare (which booted without it), and on
 every cold spawn and RESUME composes an issue-context rule naming the URL, the checkout and its
-branch — Claude and Pi receive it through `--append-system-prompt`, Grok Build through `--rules`, and Codex, Cursor, Muse and OpenCode as the opening
+branch — Claude and Pi receive it through `--append-system-prompt`, Grok Build through `--rules`, and Codex, Cursor, Muse, OpenCode and Copilot as the opening
 of their first prompt, exactly as the PR rule travels. The harness therefore knows which issue the
 session exists for before it reads your task, is told to read the issue with `gh issue view` first,
 and to reference it in commits and close it from the pull request. The row it creates is an

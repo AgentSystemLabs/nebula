@@ -1,6 +1,6 @@
 //! The harness registry: one behavior descriptor per agent CLI.
 //!
-//! The seven known harnesses ship as a compiled-in table ([`builtin`]);
+//! The eight known harnesses ship as a compiled-in table ([`builtin`]);
 //! the user's config adds a `harnesses` map of [`HarnessOverride`]s over
 //! it — disable one, repoint a program, rename a flag, or define a whole
 //! new CLI — and [`registry`] merges the two (plus the legacy
@@ -577,6 +577,51 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
             hooks: Some("opencode".into()),
             ..base
         },
+        // GitHub Copilot CLI (verified on copilot 1.0.108). It reads hooks
+        // out of `.claude/settings.local.json` and fires them with Claude's
+        // event names and payloads — `session_id`, `prompt`, `cwd`, the
+        // `permission_prompt` / `elicitation_dialog` notifications, and its
+        // `ask_user` tool reported as `AskUserQuestion` — so it speaks the
+        // Claude dialect as installed; only the `UserPromptSubmit` reply
+        // differs, and a permission prompt is read off its notification
+        // (see the daemon's `hooks::copilot_prompt_reply` and
+        // `hooks::copilot_event`). No permission flag: its prompts drive
+        // NEEDS FEEDBACK through those hooks (`--allow-all` is one
+        // `permissions_flag` override away). It reads no permission rules
+        // from Claude's settings file, so the rule that lets the AUTO-TITLE
+        // `nebula rename` run unprompted rides the launch instead. It
+        // takes no positional prompt, so the first one rides `-i`, which
+        // survives the folder-trust dialog a fresh checkout opens on. No
+        // system-prompt flag. The model list is the account's, so none is
+        // compiled in: `auto` or any id `/model` shows passes verbatim.
+        // `--resume` reopens a session in the directory it recorded, not
+        // the one it is launched from, so no relocation notice.
+        "copilot" => HarnessDescriptor {
+            label: "Copilot".into(),
+            program: "copilot".into(),
+            // `=`: the flag is variadic and would take a following word.
+            launch_args: vec!["--allow-tool=shell(nebula:*)".into()],
+            model: ModelSpec {
+                flag: Some("--model".into()),
+                ..ModelSpec::default()
+            },
+            effort: EffortSpec {
+                flag: Some("--reasoning-effort".into()),
+                efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                offered: true,
+                ..EffortSpec::default()
+            },
+            prompt_flag: Some("-i".into()),
+            resume: ResumeSpec {
+                flag: Some("--resume".into()),
+                ..ResumeSpec::default()
+            },
+            hooks: Some("claude".into()),
+            ..base
+        },
         _ => return None,
     })
 }
@@ -772,7 +817,7 @@ pub struct CustomHarness {
     /// is empty, and what persisted sessions point back at. Lowercase
     /// letters, digits and hyphens; must be unique within the list and
     /// must not collide with a built-in id (`claude`, `codex`, `cursor`,
-    /// `pi`, `muse`, `opencode`).
+    /// `pi`, `muse`, `opencode`, `copilot`).
     pub id: String,
     /// Display label for the picker and session rows. Empty falls back
     /// to the id.
@@ -992,7 +1037,7 @@ mod tests {
     #[test]
     fn builtins_cover_every_builtin_kind() {
         let all = builtins();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
                 continue;
@@ -1041,6 +1086,16 @@ mod tests {
         assert!(!opencode.effort.offered, "no effort flag, no Effort row");
         assert!(!opencode.relocation_prompt);
         assert!(!opencode.claude_like());
+        let copilot = builtin("copilot").unwrap();
+        assert_eq!(copilot.program, "copilot");
+        assert_eq!(copilot.launch_args, ["--allow-tool=shell(nebula:*)"]);
+        assert_eq!(copilot.prompt_flag.as_deref(), Some("-i"));
+        assert_eq!(copilot.resume.flag.as_deref(), Some("--resume"));
+        assert_eq!(copilot.effort.flag.as_deref(), Some("--reasoning-effort"));
+        assert_eq!(copilot.hook_dialect(), Some(AgentKind::Claude));
+        assert_eq!(copilot.permissions_flag, None, "its prompts drive red");
+        assert_eq!(copilot.system_append_flag(), None);
+        assert!(!copilot.relocation_prompt);
     }
 
     #[test]
@@ -1125,13 +1180,16 @@ mod tests {
         let ids: Vec<&str> = all.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["claude", "codex", "cursor", "pi", "muse", "grok", "opencode", "zed", "agy"]
+            vec![
+                "claude", "codex", "cursor", "pi", "muse", "grok", "opencode", "copilot", "zed",
+                "agy"
+            ]
         );
         assert!(!all[0].enabled, "the claude override applied");
-        assert_eq!(all[7].program, "agy", "legacy entry converts");
-        assert_eq!(all[8].program, "agy", "map-only entry resolves");
+        assert_eq!(all[8].program, "agy", "legacy entry converts");
+        assert_eq!(all[9].program, "agy", "map-only entry resolves");
         assert!(
-            !all[8].effort.offered,
+            !all[9].effort.offered,
             "a bare program stays Model-only like a legacy custom"
         );
     }
@@ -1194,7 +1252,7 @@ mod tests {
         broken.program = "  ".into();
         let all = registry(&BTreeMap::new(), &[broken]);
         assert!(resolve(&all, AgentKind::Custom, Some("broken")).is_err());
-        assert_eq!(usable(&all).len(), 7, "the broken entry is hidden");
+        assert_eq!(usable(&all).len(), 8, "the broken entry is hidden");
     }
 
     #[test]
@@ -1205,6 +1263,7 @@ mod tests {
         assert!(custom("muse").problem().is_some());
         assert!(custom("grok").problem().is_some());
         assert!(custom("opencode").problem().is_some());
+        assert!(custom("copilot").problem().is_some());
         let claude_hooks = CustomHarness {
             hooks: Some("claude".into()),
             ..custom("agy")

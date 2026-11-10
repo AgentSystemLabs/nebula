@@ -4992,7 +4992,8 @@ mod tests {
                 AgentKind::Pi,
                 AgentKind::Muse,
                 AgentKind::Grok,
-                AgentKind::OpenCode
+                AgentKind::OpenCode,
+                AgentKind::Copilot
             ],
             "the disabled kind drops out, order kept"
         );
@@ -5020,7 +5021,7 @@ mod tests {
 
         // Every kind off is representable (a hand edit), and reads as empty.
         let cfg: Config = serde_json::from_str(
-            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false,"muse_enabled":false,"opencode_enabled":false,"harnesses":{"grok":{"enabled":false}}}"#,
+            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false,"muse_enabled":false,"opencode_enabled":false,"harnesses":{"grok":{"enabled":false},"copilot":{"enabled":false}}}"#,
         )
         .unwrap();
         assert!(cfg.enabled_kinds().is_empty());
@@ -5068,6 +5069,7 @@ mod tests {
                 (AgentKind::Muse, None),
                 (AgentKind::Grok, None),
                 (AgentKind::OpenCode, None),
+                (AgentKind::Copilot, None),
             ]
         );
 
@@ -5082,8 +5084,8 @@ mod tests {
         )
         .unwrap();
         let offered = cfg.offered_harnesses();
-        assert_eq!(offered.len(), 8);
-        assert_eq!(offered[7], (AgentKind::Custom, Some("agy".into())));
+        assert_eq!(offered.len(), 9);
+        assert_eq!(offered[8], (AgentKind::Custom, Some("agy".into())));
         let rows = cfg.agent_rows();
         assert!(rows.contains(&("off".to_string(), HarnessField::Enabled)));
         assert!(rows.contains(&("broken".to_string(), HarnessField::Enabled)));
@@ -5593,6 +5595,14 @@ mod tests {
                         "OpenCode".to_string(),
                         vec!["Enabled".to_string(), "Model".to_string()]
                     ),
+                    (
+                        "Copilot".to_string(),
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
+                    ),
                 ]
             );
 
@@ -5648,6 +5658,7 @@ mod tests {
                         "Muse",
                         "Grok Build",
                         "OpenCode",
+                        "Copilot",
                         "agy"
                     ]
                 );
