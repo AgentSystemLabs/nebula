@@ -160,6 +160,9 @@ pub struct HarnessDescriptor {
     pub label: String,
     /// The CLI nebula launches, resolved on PATH through the login shell.
     pub program: String,
+    /// Arguments before any resume subcommand or per-session options.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_args: Vec<String>,
     /// Whether the picker and presets offer this harness.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -373,6 +376,7 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
         id: id.trim().to_string(),
         label: String::new(),
         program: String::new(),
+        launch_args: Vec::new(),
         enabled: true,
         model: ModelSpec::default(),
         effort: EffortSpec::default(),
@@ -419,6 +423,9 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
         "codex" => HarnessDescriptor {
             label: "Codex".into(),
             program: "codex".into(),
+            // Hooks and tool shells must inherit this PTY's NEBULA_*
+            // environment, not a shared server's startup environment.
+            launch_args: vec!["--no-daemon".into()],
             model: ModelSpec {
                 flag: Some("--model".into()),
                 default: default_model_choice(),
@@ -669,6 +676,8 @@ pub struct HarnessOverride {
     pub effort_offered: Option<bool>,
     #[serde(default, skip_serializing_if = "Clearable::is_keep")]
     pub permissions_flag: Clearable<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_args: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Clearable::is_keep")]
     pub prompt_flag: Clearable<String>,
     #[serde(default, skip_serializing_if = "Clearable::is_keep")]
@@ -727,6 +736,9 @@ impl HarnessDescriptor {
             self.effort.offered = offered;
         }
         over.permissions_flag.apply_to(&mut self.permissions_flag);
+        if let Some(args) = &over.launch_args {
+            self.launch_args = args.clone();
+        }
         over.prompt_flag.apply_to(&mut self.prompt_flag);
         over.resume_flag.apply_to(&mut self.resume.flag);
         over.resume_subcommand.apply_to(&mut self.resume.subcommand);
@@ -812,6 +824,7 @@ impl CustomHarness {
             id: self.id.clone(),
             label: self.label.clone(),
             program: self.program.clone(),
+            launch_args: Vec::new(),
             enabled: self.enabled,
             model: ModelSpec {
                 flag: Some(self.model_flag.clone()),
@@ -897,6 +910,7 @@ pub fn registry(
             id: id.clone(),
             label: String::new(),
             program: String::new(),
+            launch_args: Vec::new(),
             enabled: true,
             model: ModelSpec::default(),
             effort: EffortSpec::default(),
@@ -996,6 +1010,7 @@ mod tests {
         assert_eq!(claude.resume.flag.as_deref(), Some("--resume"));
         assert!(claude.relocation_prompt);
         let codex = builtin("codex").unwrap();
+        assert_eq!(codex.launch_args, ["--no-daemon"]);
         assert_eq!(codex.model.catalog, Some(HarnessCatalog::Codex));
         assert_eq!(HarnessCatalog::parse("codex"), Some(HarnessCatalog::Codex));
         assert_eq!(HarnessCatalog::Codex.as_str(), "codex");
@@ -1026,6 +1041,31 @@ mod tests {
         assert!(!opencode.effort.offered, "no effort flag, no Effort row");
         assert!(!opencode.relocation_prompt);
         assert!(!opencode.claude_like());
+    }
+
+    #[test]
+    fn launch_args_follow_registry_overrides_and_can_be_cleared() {
+        let mut codex = builtin("codex").unwrap();
+        codex.apply(&HarnessOverride::default());
+        assert_eq!(codex.launch_args, ["--no-daemon"]);
+        let over: HarnessOverride = serde_json::from_value(serde_json::json!({
+            "launch_args": ["--no-daemon", "--no-alt-screen"]
+        }))
+        .unwrap();
+        codex.apply(&over);
+        assert_eq!(codex.launch_args, ["--no-daemon", "--no-alt-screen"]);
+        let encoded = serde_json::to_value(&over).unwrap();
+        assert_eq!(encoded["launch_args"], serde_json::json!(codex.launch_args));
+        let clear: HarnessOverride = serde_json::from_value(serde_json::json!({
+            "launch_args": []
+        }))
+        .unwrap();
+        codex.apply(&clear);
+        assert!(codex.launch_args.is_empty());
+        // Speaking Codex's hooks alone does not promise its CLI flags.
+        let mut custom = custom("wrapper");
+        custom.hooks = Some("codex".into());
+        assert!(custom.as_descriptor().launch_args.is_empty());
     }
 
     #[test]
