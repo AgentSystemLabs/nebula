@@ -1498,7 +1498,7 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
                         .as_deref()
                         .unwrap_or_else(|| editor.kind.as_str())
                         .to_string(),
-                    PresetField::Model => editor.model.clone(),
+                    PresetField::Model => crate::config::model_label(editor.kind, &editor.model),
                     PresetField::Effort => editor.effort.clone(),
                     PresetField::Text => editor.text.as_str().to_string(),
                     PresetField::Task => editor.task_choice().to_string(),

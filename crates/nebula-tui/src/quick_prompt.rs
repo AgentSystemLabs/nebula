@@ -444,9 +444,13 @@ impl QuickLaunch {
     /// `Quick prompt (claude · cloud · opus)`.
     pub fn title(&self) -> String {
         let harness = self.custom.as_deref().unwrap_or_else(|| self.kind.as_str());
+        let model = self
+            .model
+            .as_deref()
+            .map(|model| crate::config::model_label(self.kind, model));
         let opts: Vec<&str> = std::iter::once(harness)
             .chain(self.cloud.then_some("cloud"))
-            .chain(self.model.as_deref())
+            .chain(model.as_deref())
             .chain(self.effort.as_deref())
             .collect();
         let mut head = vec!["Quick prompt".to_string()];

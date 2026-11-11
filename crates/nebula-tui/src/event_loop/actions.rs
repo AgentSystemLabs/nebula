@@ -749,11 +749,17 @@ pub(crate) fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
     let items: Vec<MenuItem> = choices
         .iter()
         .map(|choice| {
+            // A model row reads as the harness's own picker lists it; the
+            // action below still carries the id.
+            let label = match sub {
+                SubmenuKind::Models => crate::config::model_label(*kind, choice),
+                SubmenuKind::Efforts => (*choice).to_string(),
+            };
             MenuItem::new(
                 if *choice == configured {
-                    format!("{choice} ✓")
+                    format!("{label} ✓")
                 } else {
-                    (*choice).to_string()
+                    label
                 },
                 MenuAction::NewAgentOfKind {
                     worktree: worktree.clone(),

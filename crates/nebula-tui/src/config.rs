@@ -151,6 +151,28 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
     }
 }
 
+/// What the UI calls a model: the name the harness's own picker lists it
+/// under, where nebula knows one — Claude Code's `Fable 5.2` for the stored
+/// `fable` (MODEL NAMES in `claude_catalogue.rs`) — else the id itself.
+/// Display only: the id is still what is stored, matched and passed to the
+/// CLI. Every surface that prints a session's or a launch's model goes
+/// through here, so a card, a picker row and a settings row never disagree.
+pub fn model_label(kind: AgentKind, model: &str) -> String {
+    (kind == AgentKind::Claude)
+        .then(|| crate::claude_catalogue::label(model))
+        .flatten()
+        .unwrap_or_else(|| model.to_string())
+}
+
+/// [`model_label`] against an explicit descriptor, for callers that hold
+/// one rather than a kind (the Agents tab).
+pub fn model_label_in(descriptor: &nebula_core::harness::HarnessDescriptor, model: &str) -> String {
+    (descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Claude))
+        .then(|| crate::claude_catalogue::label(model))
+        .flatten()
+        .unwrap_or_else(|| model.to_string())
+}
+
 /// Effort rows for a harness given its chosen model (None or "default" =
 /// the CLI's pick). Empty — no Effort row, no effort submenu — while the
 /// harness offers no effort. Cursor's list follows the family (`-fast`
@@ -2167,7 +2189,7 @@ impl Config {
         let descriptor = self.effective_harness_by_id(id);
         match field {
             HarnessField::Enabled => on_off(descriptor.enabled).into(),
-            HarnessField::Model => descriptor.model.default.clone(),
+            HarnessField::Model => model_label_in(&descriptor, &descriptor.model.default),
             HarnessField::Effort => {
                 let choices = effort_choices_in(
                     &descriptor,

@@ -2546,7 +2546,7 @@ fn harness_line(a: &nebula_core::Agent, cfg: &mut Option<crate::config::Config>)
     };
     if let Some(model) = a.model.as_deref().filter(|m| !m.is_empty()) {
         out.push(' ');
-        out.push_str(model);
+        out.push_str(&crate::config::model_label(a.kind, model));
     }
     out
 }
@@ -3164,10 +3164,10 @@ impl Details {
         if launch.cloud {
             harness.push_str(" · cloud");
         }
-        let mut model = launch
-            .model
-            .clone()
-            .unwrap_or_else(|| crate::config::DEFAULT_CHOICE.into());
+        let mut model = launch.model.as_deref().map_or_else(
+            || crate::config::DEFAULT_CHOICE.into(),
+            |model| crate::config::model_label(launch.kind, model),
+        );
         if let Some(effort) = launch.effort.as_deref().filter(|e| !e.is_empty()) {
             model.push(' ');
             model.push_str(effort);
@@ -4260,6 +4260,101 @@ mod tests {
         assert_eq!(runs_on_line(&a, &mut None), "claude opus high");
         a.cloud_session_id = Some("c1".into());
         assert_eq!(runs_on_line(&a, &mut None), "cloud high");
+    }
+
+    /// MODEL NAMES: a Claude model reads as Claude Code's own picker lists
+    /// it — `Fable 5.2`, not the stored `fable` — on the card, in the
+    /// QUICK PROMPT's details row and its title, and on a preset's line.
+    /// The stored id is untouched, and another harness's ids are never
+    /// renamed.
+    ///
+    /// The names are process-global, so this is the one test that installs
+    /// any, under ids no other test uses.
+    #[test]
+    fn a_claude_model_reads_as_claude_code_lists_it() {
+        let catalog = serde_json::json!({"catalog": {"surface": "cc", "config": {
+            "models": [{"id": "claude-wiring-9-9", "name": "Wiring 9.9"}],
+            "provider_alias_targets": {"wiring": {"default": "claude-wiring-9-9"}},
+        }}});
+        crate::claude_catalogue::install_names(
+            crate::claude_catalogue::ModelNames::in_catalog(&catalog, None).unwrap(),
+        );
+        use nebula_core::AgentKind;
+        assert_eq!(
+            crate::config::model_label(AgentKind::Claude, "wiring"),
+            "Wiring 9.9"
+        );
+        assert_eq!(
+            crate::config::model_label(AgentKind::Claude, "wiring[1m]"),
+            "Wiring 9.9 (1M context)"
+        );
+        assert_eq!(
+            crate::config::model_label(AgentKind::Claude, "opus"),
+            "opus",
+            "an id the catalog does not name prints as it is"
+        );
+        assert_eq!(
+            crate::config::model_label(AgentKind::Codex, "wiring"),
+            "wiring",
+            "the names are Claude Code's, not every harness's"
+        );
+        let claude = nebula_core::harness::builtin("claude").unwrap();
+        assert_eq!(
+            crate::config::model_label_in(&claude, "wiring"),
+            "Wiring 9.9"
+        );
+        let codex = nebula_core::harness::builtin("codex").unwrap();
+        assert_eq!(crate::config::model_label_in(&codex, "wiring"), "wiring");
+
+        // The session card.
+        let mut app = a_tree();
+        select(&mut app, "api");
+        app.tree.agents[0].model = Some("wiring".into());
+        app.tree.agents[0].effort = Some("high".into());
+        let lines = drawn_lines(&mut app, Rect::new(0, 0, 100, 30));
+        let row = lines
+            .iter()
+            .position(|l| l.contains("s0"))
+            .expect("the session's card");
+        assert!(
+            lines[row + 1].contains("claude Wiring 9.9 high"),
+            "what it runs on: {:?}",
+            lines[row + 1]
+        );
+        assert_eq!(
+            app.tree.agents[0].model.as_deref(),
+            Some("wiring"),
+            "the row still stores what `--model` takes"
+        );
+
+        // The QUICK PROMPT: its details row and its title.
+        let mut launch = a_launch();
+        launch.model = Some("wiring".into());
+        launch.effort = Some("high".into());
+        let line = detail_line(&app, &launch, BOX_SIZE.0 - 4, Theme::default()).line;
+        assert!(
+            text_of(&line).contains("Wiring 9.9 high"),
+            "the details row: {:?}",
+            text_of(&line)
+        );
+        assert!(
+            launch.title().contains("Wiring 9.9"),
+            "the title: {:?}",
+            launch.title()
+        );
+
+        // A preset's line in the PRESET list.
+        let preset = crate::agent_presets::AgentPreset {
+            name: "p".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: Some("wiring".into()),
+            effort: Some("high".into()),
+            prefix: String::new(),
+            postfix: String::new(),
+            skip_task: false,
+        };
+        assert_eq!(preset.spec_label(), "claude · Wiring 9.9 · high");
     }
 
     /// Every row of `body` as drawn with the view on it.
