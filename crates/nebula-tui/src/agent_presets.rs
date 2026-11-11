@@ -55,7 +55,11 @@ impl AgentPreset {
             .as_deref()
             .unwrap_or_else(|| self.kind.as_str());
         let mut parts = vec![harness.to_string()];
-        parts.extend(self.model.iter().cloned());
+        parts.extend(
+            self.model
+                .iter()
+                .map(|model| crate::config::model_label(self.kind, model)),
+        );
         parts.extend(self.effort.iter().cloned());
         parts.join(" · ")
     }

@@ -249,14 +249,24 @@
   last wins; a name you set in nebula is never undone by re-reading Claude's older one. Claude only —
   Codex and Cursor have no session name of their own.
 - **A Claude session's card names the model it is on.** Switch with `/model` inside Claude Code and
-  the card follows within a second (`claude opus` → `claude fable`, `[1m]` kept for the 1M context
-  window). Claude fires no hook for that either; it writes `Set model to …` into the transcript at
+  the card follows within a second (`claude Opus 5.5` → `claude Fable 5.2`, `(1M context)` kept for
+  the 1M context window). Claude fires no hook for that either; it writes `Set model to …` into the transcript at
   once, and a `model` line naming the exact id with each session's first prompt. The DAEMON checks the
   size of every live session's transcript each second and reads only what was appended since. The
   new model is what the row stores, so a restart or resume comes back on it and `nebula spawn`
   inherits it. A session launched on the default model gets its model named after the first prompt.
   Built-in Claude only; a row on an exact id (a Bedrock id from `claude_models`) keeps it while
   Claude stays in that family.
+- **A Claude model reads the way Claude Code lists it.** The row stores what `--model` takes — the
+  alias `fable`, or `opus[1m]` — and every surface that prints it (cards, the QUICK PROMPT, the
+  model submenu, the AGENTS TAB, presets) prints Claude Code's own name instead: `Fable 5.2`,
+  `Opus 5.5 (1M context)`. The names come from the catalog Claude Code's `/model` picker is drawn
+  from, which it caches under `~/.claude/cache/model-catalog/`; the TUI reads the newest file at
+  start and again every ten minutes, so a new release is named without an update to nebula. An
+  alias follows the provider Claude Code is pointed at (`CLAUDE_CODE_USE_BEDROCK` and its siblings,
+  from the environment or `settings.json`'s `env`). An id the catalog does not name — a Bedrock
+  ARN, a gateway path, anything on a machine where Claude Code has cached no catalog — prints as
+  it is.
 - **Cards show what they were last asked.** The `prompt` field of the `UserPromptSubmit` payload —
   which every hooked harness sends — is condensed to one line in the hook receiver, kept on the AGENT
   row (the newest ten, in SQLite), and the newest is drawn on the session's card with an ago label.

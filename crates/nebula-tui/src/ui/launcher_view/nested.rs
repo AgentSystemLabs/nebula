@@ -625,13 +625,11 @@ fn runs_on(a: &nebula_core::Agent, cfg: &mut Option<crate::config::Config>) -> S
         a.kind.as_str().to_string()
     };
     let mut parts = vec![harness];
-    for part in [a.model.as_deref(), a.effort.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        if !part.is_empty() {
-            parts.push(part.to_string());
-        }
+    if let Some(model) = a.model.as_deref().filter(|m| !m.is_empty()) {
+        parts.push(crate::config::model_label(a.kind, model));
+    }
+    if let Some(effort) = a.effort.as_deref().filter(|e| !e.is_empty()) {
+        parts.push(effort.to_string());
     }
     parts.join(" · ")
 }

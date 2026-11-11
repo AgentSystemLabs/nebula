@@ -1070,7 +1070,7 @@ fn metrics_rows(
             let model = home
                 .model
                 .as_deref()
-                .map(|model| format!(" · {model}"))
+                .map(|model| format!(" · {}", crate::config::model_label(home.kind, model)))
                 .unwrap_or_default();
             let entry = kinds.entry("warm").or_default();
             entry.0 += 1;
