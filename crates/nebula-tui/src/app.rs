@@ -257,6 +257,8 @@ pub fn clamp_files_width(area: Rect, boundary_x: i32) -> Option<u16> {
 pub enum MenuAction {
     Attach(SessionRef),
     RestartAgent(AgentId),
+    /// A card menu's **Sleep**: what `z` runs (`actions::sleep_agent`).
+    SleepAgent(AgentId),
     /// Queue a message on the row's Claude Cloud session
     /// (`ClientRequest::SendCloudMessage`), via a prompt.
     SendCloudMessage(AgentId),
@@ -686,6 +688,9 @@ pub enum PendingAction {
         terminals: Vec<TerminalId>,
     },
     DeleteAgent(AgentId),
+    /// `z` (or the card menu's Sleep): sleep the agent once the dialog is
+    /// answered.
+    SleepAgent(AgentId),
     /// A session card dropped on another band or PROJECT TAB, with the
     /// **Confirm drag move** SETTING on: move it once the dialog is
     /// answered.

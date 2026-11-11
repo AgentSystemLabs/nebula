@@ -565,6 +565,13 @@ impl ClientConnection {
                 reply_done(&self.out_tx, req_id, result).await;
                 Ok(true)
             }
+            ClientRequest::SleepAgent { req_id, id } => {
+                let result = self
+                    .blocking_daemon(move |daemon| daemon.sleep_agent(&id))
+                    .await;
+                reply_done(&self.out_tx, req_id, result).await;
+                Ok(true)
+            }
             ClientRequest::RestartAgent { req_id, id } => {
                 let result = self.daemon.restart_agent(&id).await;
                 reply_done(&self.out_tx, req_id, result).await;

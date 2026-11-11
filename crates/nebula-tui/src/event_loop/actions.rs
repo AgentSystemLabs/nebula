@@ -128,6 +128,64 @@ pub(crate) fn confirm_delete_thread(app: &App, band: &crate::launcher::Band) -> 
     with_worktree_offer(app, dialog, &band.worktree, band.cards.len())
 }
 
+/// SLEEP (`z`, and a card menu's **Sleep**): end the session's process to
+/// free its memory and CPU, keeping its card where it is. Attaching wakes
+/// it, resumed, as after an idle reap. Always behind a confirm
+/// ([`confirm_sleep_agent`]); refused while the agent works, since sleep
+/// would cut that short (the daemon refuses a backgrounded job too).
+pub(crate) fn sleep_agent(app: &mut App, id: AgentId) {
+    let Some(a) = app.tree.agents.iter().find(|a| a.id == id) else {
+        return;
+    };
+    if a.cloud_session_id.is_some() {
+        app.chrome.flash = Some("a cloud session runs in the cloud, nothing to sleep here".into());
+        return;
+    }
+    if a.archived || !a.alive {
+        app.chrome.flash = Some(format!("'{}' is already asleep; attach wakes it", a.name));
+        return;
+    }
+    if matches!(
+        a.status,
+        nebula_core::AgentStatus::Running | nebula_core::AgentStatus::NeedsFeedback
+    ) {
+        app.chrome.flash = Some(format!(
+            "'{}' is still working; sleep it once it is idle",
+            a.name
+        ));
+        return;
+    }
+    app.modals.overlay = Some(Overlay::Confirm(confirm_sleep_agent(&a.name, id)));
+}
+
+/// The sleep itself: release the pane if it shows the agent, then ask the
+/// daemon. From the dialog's Enter (`run_pending_action`), or straight
+/// from [`sleep_agent`] for a session sitting idle.
+pub(crate) fn sleep_agent_now(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
+    if app.requests.daemon_protocol < nebula_core::SLEEP_AGENT_PROTOCOL {
+        app.chrome.flash = Some("this daemon predates sleep; restart it to sleep sessions".into());
+        return;
+    }
+    detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
+    if let Some(a) = app.tree.agents.iter().find(|a| a.id == id) {
+        app.chrome.flash = Some(format!("'{}' is asleep; attach wakes it", a.name));
+    }
+    send(app, out, |req_id| ClientRequest::SleepAgent { req_id, id });
+}
+
+/// The confirm before a session is put to sleep. The message says why
+/// saying yes is cheap: attaching brings the conversation back.
+pub(crate) fn confirm_sleep_agent(name: &str, id: AgentId) -> ConfirmDialog {
+    ConfirmDialog {
+        title: "Sleep agent".into(),
+        message: format!(
+            "Sleep '{name}'? Its process ends to free memory; attaching wakes it with the conversation."
+        ),
+        action: PendingAction::SleepAgent(id),
+        area: ratatui::layout::Rect::default(),
+    }
+}
+
 /// The confirm before an agent is archived. The message says why saying
 /// yes is cheap: `u` undoes it.
 pub(crate) fn confirm_archive_agent(name: &str, id: AgentId) -> ConfirmDialog {
@@ -527,19 +585,26 @@ pub(crate) fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
         ]
     } else {
-        vec![
+        let mut items = vec![
             MenuItem::new(
                 "Attach",
                 MenuAction::Attach(SessionRef::Agent(a.id.clone())),
             ),
             MenuItem::new("Follow-up prompt", MenuAction::FollowUp),
             MenuItem::new("Restart", MenuAction::RestartAgent(a.id.clone())),
+        ];
+        // Only a session with a process to end; a cold one is asleep already.
+        if a.alive {
+            items.push(MenuItem::new("Sleep", MenuAction::SleepAgent(a.id.clone())));
+        }
+        items.extend([
             MenuItem::new("Duplicate", MenuAction::DuplicateAgent(a.id.clone())),
             MenuItem::new("Move to…", MenuAction::MoveAgentPicker(a.id.clone())),
             MenuItem::new("Rename", MenuAction::RenameAgent(a.id.clone())),
             MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
-        ]
+        ]);
+        items
     }
 }
 

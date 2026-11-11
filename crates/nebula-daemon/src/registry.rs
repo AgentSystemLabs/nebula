@@ -2065,6 +2065,49 @@ mod tests {
         daemon.kill_session(&sref);
     }
 
+    /// SLEEP ends the process and keeps the row, not archived and not
+    /// alive; the next attach boots it again, as after an idle reap. A
+    /// working agent is refused and keeps running, as is an archived row.
+    #[tokio::test]
+    async fn sleep_kills_an_idle_process_and_keeps_the_row() {
+        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
+        let daemon = test_daemon();
+        let dir = tempfile::tempdir().unwrap();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", dir.path().to_str().unwrap(), false);
+        seed_agent(&daemon, "a", "w", Some("sid-1"));
+        let id = AgentId("a".into());
+        let sref = SessionRef::Agent(id.clone());
+        daemon.ensure_session(&sref, 80, 24).unwrap();
+
+        daemon
+            .store
+            .set_agent_status(&id, AgentStatus::Running)
+            .unwrap();
+        let err = daemon.sleep_agent(&id).unwrap_err();
+        assert!(err.to_string().contains("still working"), "{err}");
+        assert!(daemon.is_alive(&sref), "a working agent keeps running");
+
+        daemon
+            .store
+            .set_agent_status(&id, AgentStatus::Finished)
+            .unwrap();
+        daemon.sleep_agent(&id).unwrap();
+        assert!(!daemon.is_alive(&sref), "the process is gone");
+        let row = daemon.store.get_agent(&id).unwrap().unwrap();
+        assert!(!row.archived, "the row stays in the list");
+
+        daemon.ensure_session(&sref, 80, 24).unwrap();
+        assert!(daemon.is_alive(&sref), "attach wakes it");
+        daemon.kill_session(&sref);
+
+        daemon.store.set_agent_archived(&id, true).unwrap();
+        assert!(
+            daemon.sleep_agent(&id).is_err(),
+            "an archived row has nothing to sleep"
+        );
+    }
+
     /// `nebula worktree <branch>` onto a row whose checkout is gone refuses
     /// before anything moves: the agent's row stays where it was and no
     /// relocation is queued, so the turn end never kills it for a respawn
