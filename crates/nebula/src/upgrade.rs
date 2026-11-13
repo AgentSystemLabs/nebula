@@ -288,20 +288,34 @@ fn stage_script(url: &str, dir: &Path) -> Result<PathBuf> {
 }
 
 /// The running binary when it lives in a cargo build dir (`target/release`,
-/// `target/debug`, or the `deps/` dir test binaries run from). Symlinks
+/// `target/debug`, or where cargo runs test binaries from). Symlinks
 /// resolve first: the usual dev setup is a `~/.cargo/bin/nebula` symlink
 /// pointing into `target/release`, and it's that symlink an upgrade replaces.
 fn dev_build() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    let dir = exe.parent()?;
-    let dir = if dir.file_name()? == "deps" {
-        dir.parent()?
-    } else {
-        dir
+    in_cargo_target(&exe).then_some(exe)
+}
+
+/// Does `exe` sit where cargo puts what it builds? Directly in a profile
+/// dir (`<target>/release/nebula`), in its `deps/` (test binaries before
+/// Rust 1.100), or in the build-dir layout cargo uses since 1.100, which
+/// runs test binaries from `<profile>/build/<package>/<hash>/out/`.
+fn in_cargo_target(exe: &Path) -> bool {
+    let Some(mut dir) = exe.parent() else {
+        return false;
     };
-    let is_target_dir = matches!(dir.file_name()?.to_str()?, "debug" | "release");
-    is_target_dir.then_some(exe)
+    let name = |d: &Path| d.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+    if name(dir).as_deref() == Some("deps") {
+        dir = dir.parent().unwrap_or(dir);
+    } else if name(dir).as_deref() == Some("out") {
+        // out/ ← <hash>/ ← <package>/ ← build/ ← <profile>/
+        let build = dir.ancestors().nth(3);
+        if let Some(build) = build.filter(|b| name(b).as_deref() == Some("build")) {
+            dir = build.parent().unwrap_or(build);
+        }
+    }
+    matches!(name(dir).as_deref(), Some("debug" | "release"))
 }
 
 #[cfg(test)]
@@ -502,10 +516,33 @@ mod tests {
         }
     }
 
+    /// Every place cargo puts a binary reads as a dev build, whichever
+    /// cargo runs the tests; an installed binary does not.
+    #[test]
+    fn cargo_target_dirs_are_recognised() {
+        for exe in [
+            "/src/nebula/target/release/nebula",
+            "/src/nebula/target/debug/nebula",
+            "/src/nebula/target/debug/deps/nebula-81def4ed18659372",
+            "/src/nebula/target/debug/build/nebula/81def4ed18659372/out/nebula-81def4ed18659372",
+        ] {
+            assert!(in_cargo_target(Path::new(exe)), "{exe}");
+        }
+        for exe in [
+            "/Users/me/.cargo/bin/nebula",
+            "/usr/local/bin/nebula",
+            "/opt/nebula/out/nebula",
+            "/src/nebula/target/debug/build/nebula-1/out/build-script-build",
+            "nebula",
+        ] {
+            assert!(!in_cargo_target(Path::new(exe)), "{exe}");
+        }
+    }
+
     #[test]
     fn dev_builds_are_refused_without_force() {
-        // Cargo runs this binary from <target>/debug/deps, so the guard sees
-        // exactly what it would see for a symlinked target/release build.
+        // Cargo runs this binary from inside <target>/debug, so the guard
+        // sees what it would see for a symlinked target/release build.
         assert!(
             dev_build().is_some(),
             "test binary should look like a cargo build"
