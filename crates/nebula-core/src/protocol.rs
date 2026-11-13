@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -24,6 +24,11 @@ pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
 /// a request it could not decode, and its delete confirm simply goes
 /// without the check.
 pub const CHECK_WORKTREE_PROTOCOL: u32 = 51;
+/// First protocol whose clients know `ServerEvent::SiblingSpawned`. The
+/// daemon answers `SpawnSiblingAgent` from an older client with the `Ack`
+/// it expects, and a client of this version takes either reply, so the
+/// change stays additive.
+pub const SIBLING_SPAWNED_PROTOCOL: u32 = 52;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -294,9 +299,10 @@ pub enum ClientRequest {
     /// `worktree` names a branch, and the same AGENT KIND / MODEL / EFFORT
     /// unless `kind` names another harness — with `starting_prompt` as the
     /// new CLI's first prompt, so it begins the task at once. The caller's
-    /// own process is untouched. Answered with `Ack { created:
-    /// Some(EntityId::Agent(..)) }`; the row reaches every TUI as an
-    /// ordinary `EntityUpserted`.
+    /// own process is untouched. Answered with `SiblingSpawned`; the row
+    /// reaches every TUI as an ordinary `EntityUpserted`. Refused, before
+    /// anything is created, when the target worktree already holds another
+    /// live session and has uncommitted changes, unless `share_worktree`.
     SpawnSiblingAgent {
         req_id: u64,
         id: AgentId,
@@ -317,6 +323,14 @@ pub enum ClientRequest {
         /// already exists is refused). Ignored without `worktree`.
         #[serde(default)]
         base: Option<String>,
+        /// `--same-worktree`: start the session even when the target
+        /// worktree has another live session and uncommitted changes —
+        /// the caller knows they will share one checkout, index and branch.
+        /// Left off the wire when false: frames are compact arrays, and a
+        /// daemon older than [`SIBLING_SPAWNED_PROTOCOL`] cannot decode a
+        /// field it does not know.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        share_worktree: bool,
     },
     /// `nebula open <file>…`, run by the agent from inside its own session:
     /// show these files to the user in every attached TUI's FILE TABS —
@@ -721,6 +735,16 @@ pub enum ServerEvent {
         worktree: Worktree,
         outcome: EnterOutcome,
     },
+    /// Reply to `SpawnSiblingAgent`: the new row, the worktree it started
+    /// in, and the names of the other live sessions already in that
+    /// worktree — empty when it has the checkout to itself — so the CLI
+    /// can tell the model it is sharing one.
+    SiblingSpawned {
+        req_id: u64,
+        agent: AgentId,
+        worktree: Worktree,
+        shared_with: Vec<String>,
+    },
     Error {
         req_id: Option<u64>,
         message: String,
@@ -861,5 +885,49 @@ mod tests {
         assert!(protocol_compatible_with(PROTOCOL_VERSION));
         assert!(protocol_compatible_with(PROTOCOL_VERSION + 1));
         assert!(!protocol_compatible_with(MIN_COMPATIBLE_PROTOCOL - 1));
+    }
+
+    /// `SpawnSiblingAgent` as protocol 51 knew it: a daemon of that version
+    /// must still decode a spawn from a newer CLI that is not sharing.
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    enum SpawnBefore52 {
+        SpawnSiblingAgent {
+            req_id: u64,
+            id: AgentId,
+            kind: Option<AgentKind>,
+            model: Option<String>,
+            effort: Option<String>,
+            starting_prompt: String,
+            worktree: Option<String>,
+            base: Option<String>,
+        },
+    }
+
+    #[test]
+    fn a_spawn_that_shares_nothing_still_decodes_on_an_older_daemon() {
+        let spawn = |share_worktree| ClientRequest::SpawnSiblingAgent {
+            req_id: 1,
+            id: AgentId("a".into()),
+            kind: None,
+            model: None,
+            effort: None,
+            starting_prompt: "task".into(),
+            worktree: None,
+            base: None,
+            share_worktree,
+        };
+        let bytes = rmp_serde::to_vec(&spawn(false)).unwrap();
+        assert!(rmp_serde::from_slice::<SpawnBefore52>(&bytes).is_ok());
+        // The flag set is a field the old shape cannot hold, which is why
+        // the CLI never sends it to a daemon older than 52.
+        let bytes = rmp_serde::to_vec(&spawn(true)).unwrap();
+        assert!(rmp_serde::from_slice::<SpawnBefore52>(&bytes).is_err());
+        let ClientRequest::SpawnSiblingAgent { share_worktree, .. } =
+            rmp_serde::from_slice(&bytes).unwrap()
+        else {
+            panic!("decoded another request");
+        };
+        assert!(share_worktree);
     }
 }
