@@ -625,6 +625,16 @@ impl Daemon {
         if !status.trim().is_empty() {
             bail!("auto-cleanup skipped {branch}: checkout has uncommitted or untracked changes");
         }
+        // Someone asked git to keep it; only a person, at the confirm, may
+        // overrule that.
+        if let Some(reason) = git::worktree_lock(&project.repo_path, &worktree.path).await? {
+            let why = if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({reason})")
+            };
+            bail!("auto-cleanup skipped {branch}: checkout is locked{why}");
+        }
 
         let (_, _, agents, terminals) = self.store_blocking(|store| store.load_tree()).await?;
         if let Some(agent) = agents.iter().find(|agent| {

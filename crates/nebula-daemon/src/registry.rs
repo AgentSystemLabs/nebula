@@ -4586,6 +4586,52 @@ mod tests {
         assert!(!wt.exists());
     }
 
+    /// A checkout someone locked is theirs to keep: the cleanup leaves it
+    /// and says why, whoever locked it.
+    #[tokio::test]
+    async fn merged_cleanup_skips_a_locked_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        let wt_str = wt.to_string_lossy().into_owned();
+        git_in(&repo, &["worktree", "add", &wt_str, "-b", "feat"]);
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "reused by the release job",
+                &wt_str,
+            ],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt_str, false);
+        let id = WorktreeId("feat".into());
+        let head = git::head_sha(&wt).await.unwrap();
+        let url = "https://github.com/o/r/pull/1";
+
+        let err = daemon
+            .cleanup_merged_worktree(&id, "feat", 1, url, &head)
+            .await
+            .expect_err("a locked checkout is kept");
+        assert!(
+            err.to_string()
+                .contains("checkout is locked (reused by the release job)"),
+            "{err:#}"
+        );
+        assert!(wt.exists());
+
+        git_in(&repo, &["worktree", "unlock", &wt_str]);
+        daemon
+            .cleanup_merged_worktree(&id, "feat", 1, url, &head)
+            .await
+            .unwrap();
+        assert!(!wt.exists());
+    }
+
     fn git_in(repo: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
             .arg("-C")

@@ -87,6 +87,9 @@ struct ClientConnection {
     attached: HashMap<SessionRef, tokio::task::JoinHandle<()>>,
     subscription: Option<tokio::task::JoinHandle<()>>,
     handshaken: bool,
+    /// The protocol the client said it speaks in its `Hello`: a reply
+    /// carrying something newer than that is cut down to what it reads.
+    client_protocol: u32,
     /// The client process, when the socket's credentials name it.
     peer_pid: Option<u32>,
 }
@@ -99,6 +102,7 @@ impl ClientConnection {
             attached: HashMap::new(),
             subscription: None,
             handshaken: false,
+            client_protocol: 0,
             peer_pid: None,
         }
     }
@@ -649,6 +653,7 @@ impl ClientConnection {
 
     async fn handle_hello(&mut self, protocol_version: u32) -> bool {
         self.handshaken = nebula_core::protocol_compatible_with(protocol_version);
+        self.client_protocol = protocol_version;
         let reply = if self.handshaken {
             ServerEvent::HelloOk {
                 protocol_version: PROTOCOL_VERSION,
@@ -911,9 +916,15 @@ impl ClientConnection {
         let daemon = self.daemon.clone();
         let out_tx = self.out_tx.clone();
         let client = self.peer_pid;
+        let reads_lock = self.client_protocol >= nebula_core::WORKTREE_LOCK_PROTOCOL;
         tokio::spawn(async move {
             let ev = match daemon.check_worktree(&id, client).await {
-                Ok(check) => ServerEvent::WorktreeChecked { req_id, id, check },
+                Ok(mut check) => {
+                    if !reads_lock {
+                        check.locked = None;
+                    }
+                    ServerEvent::WorktreeChecked { req_id, id, check }
+                }
                 Err(e) => ServerEvent::Error {
                     req_id: Some(req_id),
                     message: format!("{e:#}"),
