@@ -162,17 +162,17 @@ pub(crate) fn hold_for_shared_worktree(app: &mut App, out: &mut Vec<ClientReques
         return;
     }
     let allowed = app.requests.shared_allowed.take();
-    let Some(at) = out
-        .iter()
-        .position(|req| req_id_of(req).is_some() && req_id_of(req) != allowed)
-    else {
+    // The first request that needs the hold, wherever it sits in the batch:
+    // one that does not (a rename, a start in an empty worktree) ahead of
+    // it must not let it through.
+    let Some(at) = out.iter().position(|req| {
+        req_id_of(req).is_some_and(|id| Some(id) != allowed) && held_target(app, req).is_some()
+    }) else {
         return;
     };
-    // The cheap test first: this runs after every key and mouse move, and
-    // the setting is read from disk.
-    if held_target(app, &out[at]).is_none()
-        || !crate::config::Config::load().confirm_shared_worktree
-    {
+    // The setting last: this runs after every key and mouse move, and it is
+    // read from disk.
+    if !crate::config::Config::load().confirm_shared_worktree {
         return;
     }
     let req = out.remove(at);
@@ -351,6 +351,33 @@ mod tests {
             hold_for_shared_worktree(&mut app, &mut out);
             assert_eq!(out.len(), 2);
             assert!(!asking(&app));
+        });
+    }
+
+    /// A batch whose first request needs no hold still holds a later one
+    /// that does: a start in the root checkout ahead of a start in a
+    /// shared linked worktree lets only the first through.
+    #[test]
+    fn a_later_request_in_the_batch_is_held_too() {
+        with_default_config(|| {
+            let mut app = shared_feat();
+            let mut out = vec![create(8, "w1"), prewarm("w1"), create(9, "w2")];
+            hold_for_shared_worktree(&mut app, &mut out);
+            assert!(asking(&app));
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [
+                        ClientRequest::CreateAgent { req_id: 8, .. },
+                        ClientRequest::PrewarmAgent { .. }
+                    ]
+                ),
+                "only the root's start goes: {out:?}"
+            );
+            assert!(matches!(
+                app.requests.shared_hold.as_ref().map(|h| &h.req),
+                Some(ClientRequest::CreateAgent { req_id: 9, .. })
+            ));
         });
     }
 
