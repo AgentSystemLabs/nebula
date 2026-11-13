@@ -172,7 +172,8 @@ pub(crate) enum Command {
     /// prompt, and shows up on the grid on its own — this session carries
     /// on untouched. A worktree that already holds a live session is named
     /// in the reply, and refused while it has uncommitted changes unless
-    /// `--same-worktree` is passed.
+    /// `--same-worktree` is passed — except the project's root checkout,
+    /// where several sessions side by side is the usual way to work.
     #[command(after_help = SPAWN_EXAMPLES)]
     Spawn {
         /// The task the new session starts on; multiple words need no quotes.

@@ -5166,10 +5166,11 @@ async fn nebula_ask_cli_round_trips_queues_and_times_out() {
 }
 
 /// A SHARED WORKTREE, end to end: `nebula spawn` into a checkout that
-/// already has a live session says so and names who is there; with
-/// uncommitted changes it is refused — nothing started — until
-/// `--same-worktree`; and `--prompt-file` carries the task. A fresh
-/// `--worktree` has the checkout to itself and says nothing of sharing.
+/// already has a live session says so and names who is there; into a
+/// linked worktree with uncommitted changes it is refused — nothing
+/// started — until `--same-worktree`, while the root checkout is never
+/// refused; and `--prompt-file` carries the task. A fresh `--worktree` has
+/// the checkout to itself and says nothing of sharing.
 #[tokio::test]
 async fn nebula_spawn_says_a_worktree_is_shared_and_refuses_one_with_changes() {
     let env = TestEnv::new();
@@ -5225,16 +5226,45 @@ async fn nebula_spawn_says_a_worktree_is_shared_and_refuses_one_with_changes() {
         .await;
     }
 
-    // Work in flight in the caller's checkout: a plain spawn is refused,
-    // names the checkout and the session in it, and starts nothing.
+    // The ROOT CHECKOUT is where sessions work side by side: with work in
+    // flight there, a plain spawn still goes, and says who it shares with.
     std::fs::write(repo.join("half-written.rs"), "fn").unwrap();
     let out = agent_cli(&env, &caller, &["spawn", "review the change"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "the root checkout: {out:?}");
+    assert!(
+        stdout.contains("with 1 other live session (Fix Login)"),
+        "stdout: {stdout}"
+    );
+    std::fs::remove_file(repo.join("half-written.rs")).unwrap();
+
+    // A linked worktree with a session live in it.
+    let out = agent_cli(&env, &caller, &["spawn", "--worktree", "feat", "start"]);
+    assert!(out.status.success(), "--worktree feat: {out:?}");
+    let feat_of = |evs: &[ServerEvent]| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "feat" => Some(w.clone()),
+            _ => None,
+        })
+    };
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        feat_of(evs).is_some_and(|w| live_in(evs, &w.id, "agent-1"))
+    })
+    .await;
+    let feat = feat_of(&events).expect("the feat worktree");
+
+    // Work in flight there: a spawn into it is refused, names the checkout
+    // and the session in it, and starts nothing.
+    std::fs::write(feat.path.join("half-written.rs"), "fn").unwrap();
+    let out = agent_cli(&env, &caller, &["spawn", "--worktree", "feat", "review"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "a busy shared worktree: {out:?}");
     for says in [
         "1 uncommitted path",
-        "1 live session already in it (Fix Login)",
-        "--worktree <branch>",
+        "1 live session already in it (agent-1)",
+        "`--worktree` with a branch that has no worktree yet",
         "--same-worktree",
     ] {
         assert!(stderr.contains(says), "{says:?} missing from {stderr}");
@@ -5249,6 +5279,8 @@ async fn nebula_spawn_says_a_worktree_is_shared_and_refuses_one_with_changes() {
         &caller,
         &[
             "spawn",
+            "--worktree",
+            "feat",
             "--same-worktree",
             "--prompt-file",
             brief.to_str().unwrap(),
@@ -5257,22 +5289,26 @@ async fn nebula_spawn_says_a_worktree_is_shared_and_refuses_one_with_changes() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "--same-worktree failed: {out:?}");
     assert!(
-        stdout.contains("with 1 other live session (Fix Login)"),
+        stdout.contains("with 1 other live session (agent-1)"),
         "stdout: {stdout}"
     );
     let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
-        live_in(evs, &main_worktree.id, "agent-1")
+        live_in(evs, &feat.id, "agent-2")
     })
     .await;
-    assert!(live_in(&events, &main_worktree.id, "agent-1"));
+    assert!(live_in(&events, &feat.id, "agent-2"));
 
     // Clean again, sharing is said, not refused — now with both sessions.
-    std::fs::remove_file(repo.join("half-written.rs")).unwrap();
-    let out = agent_cli(&env, &caller, &["spawn", "run the tests"]);
+    std::fs::remove_file(feat.path.join("half-written.rs")).unwrap();
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "feat", "run the tests"],
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "a clean shared worktree: {out:?}");
     assert!(
-        stdout.contains("with 2 other live sessions (Fix Login, agent-1)"),
+        stdout.contains("with 2 other live sessions (agent-1, agent-2)"),
         "stdout: {stdout}"
     );
 

@@ -78,7 +78,10 @@ pub struct SiblingSpawned {
 /// Why a spawn into `worktree` is refused, or None when it may go ahead:
 /// it is refused only when the worktree already has a live session in it
 /// (`live`, their names) AND `uncommitted` paths — sharing a clean
-/// checkout is said, not refused. `named_branch`: the spawn already
+/// checkout is said, not refused. The project's ROOT CHECKOUT is never
+/// refused: several sessions side by side there is the everyday way to
+/// work, so the TUI does not ask about it either; only a linked worktree,
+/// cut for one piece of work, is guarded. `named_branch`: the spawn already
 /// carried `--worktree` and landed on that branch's existing checkout, so
 /// the way out is a branch with no worktree yet, not the same flag again.
 pub(crate) fn shared_worktree_refusal(
@@ -87,7 +90,7 @@ pub(crate) fn shared_worktree_refusal(
     uncommitted: usize,
     named_branch: bool,
 ) -> Option<String> {
-    if live.is_empty() || uncommitted == 0 {
+    if worktree.is_main || live.is_empty() || uncommitted == 0 {
         return None;
     }
     let n = live.len();
@@ -143,7 +146,7 @@ impl Daemon {
     }
 
     /// [`shared_worktree_refusal`] for `worktree` as it stands on disk.
-    /// Nobody live there asks git nothing. A status git cannot give — a
+    /// Nobody live there, or the root checkout, asks git nothing. A status git cannot give — a
     /// lock, a broken index, a timeout — refuses too, with the reason: the
     /// check exists for exactly the checkout someone is working in, and
     /// letting a spawn through unasked is the collision it guards against.
@@ -153,7 +156,7 @@ impl Daemon {
         live: &[String],
         named_branch: bool,
     ) -> Result<()> {
-        if live.is_empty() {
+        if live.is_empty() || worktree.is_main {
             return Ok(());
         }
         let uncommitted = match crate::git::uncommitted_paths(&worktree.path).await {
@@ -675,6 +678,18 @@ mod tests {
         );
     }
 
+    /// The ROOT CHECKOUT is where sessions work side by side: a spawn there
+    /// is never refused, live sessions and uncommitted changes or not — as
+    /// the TUI never asks about it.
+    #[test]
+    fn the_root_checkout_is_never_refused() {
+        let mut root = worktree("main");
+        root.is_main = true;
+        let live = vec!["agent-1".to_string(), "Fix Login".to_string()];
+        assert_eq!(shared_worktree_refusal(&root, &live, 3, false), None);
+        assert_eq!(shared_worktree_refusal(&root, &live, 3, true), None);
+    }
+
     /// Without live sessions (none run in a unit test) nobody shares the
     /// worktree and git is never asked — the test project is no repo. With
     /// one, a status git cannot give refuses, saying why.
@@ -698,5 +713,14 @@ mod tests {
             .to_string();
         assert!(err.contains("git could not say"), "{err}");
         assert!(err.contains("--same-worktree"), "{err}");
+
+        // The root checkout is not guarded: git is not asked, and the
+        // unreadable status that refused above lets the spawn through.
+        let mut root = worktree("feat");
+        root.is_main = true;
+        daemon
+            .check_shared_worktree(&root, &["agent-1".into()], false)
+            .await
+            .expect("the root checkout is shared freely");
     }
 }

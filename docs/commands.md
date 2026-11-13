@@ -80,7 +80,8 @@ nebula spawn --prompt-file <path> […]
                           # none (--base picks a new branch's start point and is refused when the
                           # branch already exists), and leaves this session where it is. A worktree
                           # that already has a live session is said in the reply, with who is in it;
-                          # one that also has uncommitted changes is refused unless --same-worktree.
+                          # one that also has uncommitted changes is refused unless --same-worktree
+                          # (never the project's root checkout, where sessions share by design).
                           # --prompt-file reads the task from a file (- for stdin) instead of words
 nebula open <file>…       # show the files in this nebula's FILE TABS — a modal with one tab per
                           # file, the focused one previewed, Enter editing it (agents run this only

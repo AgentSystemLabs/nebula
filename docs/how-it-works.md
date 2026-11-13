@@ -315,7 +315,8 @@
   prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission. Two sessions in one
   checkout share its files, index and branch, so a spawn says when it lands in a SHARED WORKTREE
   and names the live sessions already there; if that checkout also has uncommitted changes (not
-  counting the hook files nebula itself writes there) the spawn is refused, starting nothing, unless the agent adds `--same-worktree` — the refusal tells
+  counting the hook files nebula itself writes there) the spawn is refused, starting nothing, unless the agent adds `--same-worktree` (the project's root
+  checkout is never refused: several sessions side by side there is the everyday way in) — the refusal tells
   it to use `--worktree <branch>` instead. A long brief goes in a file: `--prompt-file <path>`.
 - **Ask the agent to show you a file, image or diagram and it opens in nebula.** Say "open it",
   "show me the examples" or "show the diagram" and the session runs `nebula open <file>…`; every TUI
