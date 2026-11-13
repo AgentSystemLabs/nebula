@@ -87,6 +87,9 @@ struct ClientConnection {
     attached: HashMap<SessionRef, tokio::task::JoinHandle<()>>,
     subscription: Option<tokio::task::JoinHandle<()>>,
     handshaken: bool,
+    /// The protocol the client said it speaks in its `Hello`: a reply
+    /// carrying something newer than that is cut down to what it reads.
+    client_protocol: u32,
     /// The client process, when the socket's credentials name it.
     peer_pid: Option<u32>,
 }
@@ -99,6 +102,7 @@ impl ClientConnection {
             attached: HashMap::new(),
             subscription: None,
             handshaken: false,
+            client_protocol: 0,
             peer_pid: None,
         }
     }
@@ -222,12 +226,17 @@ impl ClientConnection {
                 self.spawn_create_worktree(req_id, project, branch, base);
                 Ok(true)
             }
-            ClientRequest::DeleteWorktree { req_id, id, force } => {
-                self.spawn_delete_worktree(req_id, id, force);
+            ClientRequest::DeleteWorktree {
+                req_id,
+                id,
+                force,
+                delete_branch,
+            } => {
+                self.spawn_delete_worktree(req_id, id, force, delete_branch);
                 Ok(true)
             }
-            ClientRequest::CheckWorktree { req_id, id } => {
-                self.spawn_check_worktree(req_id, id);
+            ClientRequest::CheckWorktree { req_id, id, band } => {
+                self.spawn_check_worktree(req_id, id, band);
                 Ok(true)
             }
             ClientRequest::CleanupMergedWorktree {
@@ -649,6 +658,7 @@ impl ClientConnection {
 
     async fn handle_hello(&mut self, protocol_version: u32) -> bool {
         self.handshaken = nebula_core::protocol_compatible_with(protocol_version);
+        self.client_protocol = protocol_version;
         let reply = if self.handshaken {
             ServerEvent::HelloOk {
                 protocol_version: PROTOCOL_VERSION,
@@ -894,26 +904,46 @@ impl ClientConnection {
         });
     }
 
-    fn spawn_delete_worktree(&self, req_id: u64, id: nebula_core::WorktreeId, force: bool) {
+    fn spawn_delete_worktree(
+        &self,
+        req_id: u64,
+        id: nebula_core::WorktreeId,
+        force: bool,
+        delete_branch: Option<nebula_core::BranchTip>,
+    ) {
         // `git worktree remove` can take seconds on a large checkout; run it
         // off the request loop so Input/Attach frames keep flowing while it
         // grinds. `worktree_ops` still serializes it against create/sync.
         let daemon = self.daemon.clone();
         let out_tx = self.out_tx.clone();
         tokio::spawn(async move {
-            reply_done(&out_tx, req_id, daemon.delete_worktree(&id, force).await).await;
+            let result = daemon
+                .delete_worktree_and_branch(&id, force, delete_branch)
+                .await;
+            reply_done(&out_tx, req_id, result).await;
         });
     }
 
-    fn spawn_check_worktree(&self, req_id: u64, id: nebula_core::WorktreeId) {
+    fn spawn_check_worktree(&self, req_id: u64, id: nebula_core::WorktreeId, band: bool) {
         // `git status` on a big checkout and an `lsof` of every process are
         // each a fraction of a second; off the request loop, like a delete.
         let daemon = self.daemon.clone();
         let out_tx = self.out_tx.clone();
         let client = self.peer_pid;
+        // A client from before the check grew a field cannot decode it.
+        let reads_lock = self.client_protocol >= nebula_core::WORKTREE_LOCK_PROTOCOL;
+        let landing = self.client_protocol >= nebula_core::BRANCH_LANDING_PROTOCOL;
         tokio::spawn(async move {
-            let ev = match daemon.check_worktree(&id, client).await {
-                Ok(check) => ServerEvent::WorktreeChecked { req_id, id, check },
+            let ev = match daemon.check_worktree(&id, client, band).await {
+                Ok(mut check) => {
+                    if !reads_lock {
+                        check.locked = None;
+                    }
+                    if !landing {
+                        check.landing = None;
+                    }
+                    ServerEvent::WorktreeChecked { req_id, id, check }
+                }
                 Err(e) => ServerEvent::Error {
                     req_id: Some(req_id),
                     message: format!("{e:#}"),

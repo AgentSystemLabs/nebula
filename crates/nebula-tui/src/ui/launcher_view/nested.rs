@@ -10,7 +10,7 @@
 //! and its pull request are on the DETAIL STRIP pinned under the list
 //! ([`draw_strip`]).
 
-use super::{draw_panel_edge_marks, session_look, EMPTY_BAND_DELETE, EMPTY_BAND_KEYS};
+use super::{draw_panel_edge_marks, empty_band_keys, empty_band_lead, session_look};
 use crate::app::{App, Focus, HitTarget};
 use crate::keymap::Action;
 use crate::launcher::{Band, BandsLayout, Card, CardRef, PanelLayout, RowPr, NESTED_ROW_H};
@@ -273,16 +273,27 @@ fn draw_empty(
         Span::styled(branch.clone(), name_style),
     ];
     let mut used = lead + branch.chars().count();
-    if lit {
-        // Its keys alone: the DETAIL STRIP under the list already says
-        // nothing runs there.
-        let mut hint = String::from(EMPTY_BAND_KEYS);
-        if !band.is_main {
-            hint.push_str(EMPTY_BAND_DELETE);
+    // What a delete would lose, after the branch — always, not only under
+    // the cursor: it is what tells one empty checkout from the next.
+    // "Nothing running" alone stays off: the DETAIL STRIP already says it.
+    let (status, status_fg) = empty_band_lead(app, band, gray::dim(&th), lit);
+    if status != super::EMPTY_BAND_IDLE {
+        let avail = room.saturating_sub(used - lead + 2);
+        let status = clip(&status, avail);
+        if avail >= MIN_HINT {
+            spans.push(Span::raw("  "));
+            used += 2 + status.chars().count();
+            spans.push(Span::styled(status, Style::default().fg(status_fg)));
         }
+    }
+    if lit {
+        // Its keys: the DETAIL STRIP under the list already says nothing
+        // runs there.
+        let keys = empty_band_keys(band);
+        let hint = keys.trim_start_matches(" · ").to_string();
         // Cut short rather than pushing into the columns; too little room
         // for a few words of it and the branch stands alone.
-        let avail = room.saturating_sub(branch.chars().count() + 2);
+        let avail = room.saturating_sub(used - lead + 2);
         let hint = clip(&hint, avail);
         if avail >= MIN_HINT {
             spans.push(Span::raw("  "));

@@ -2,7 +2,8 @@
 //! libgit2's worktree support lags git's, these are rare user-initiated ops,
 //! and git's stderr is the best error message we could show.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -39,6 +40,51 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
         .output()
         .await
         .map_err(spawn_err)?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// [`git`] for a background read that must not take the index lock: a
+/// `git status` that refreshes the index writes it back, racing whatever
+/// the user or an agent runs in that checkout at the same moment
+/// (`GIT_OPTIONAL_LOCKS=0`, as editors and prompts set it).
+async fn git_read(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .await
+        .map_err(spawn_err)?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// [`git_read`] with `input` on its stdin.
+async fn git_read_input(repo: &Path, args: &[&str], input: &str) -> Result<String> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(spawn_err)?;
+    let mut stdin = child.stdin.take().context("git's stdin")?;
+    let input = input.to_string();
+    let writer = tokio::spawn(async move {
+        let _ = stdin.write_all(input.as_bytes()).await;
+    });
+    let output = child.wait_with_output().await?;
+    let _ = writer.await;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -168,6 +214,78 @@ fn parse_worktree_list(out: &str) -> Vec<WorktreeEntry> {
     }
     close(&mut entries, path, &mut branch, head.as_deref(), prunable);
     entries
+}
+
+/// The lock git keeps on `worktree`, a checkout of `repo`: the reason it
+/// was locked with (empty when none was given), or None when it is not
+/// locked. Anyone can lock a checkout — `git worktree lock --reason …` by
+/// hand, an agent marking the one it works in, a tool keeping one it
+/// reuses — and git's own `worktree remove` and `prune` then leave it be.
+pub async fn worktree_lock(repo: &Path, worktree: &Path) -> Result<Option<String>> {
+    let out = git(repo, &["worktree", "list", "--porcelain"]).await?;
+    let real = std::fs::canonicalize(worktree).ok();
+    Ok(lock_in_list(&out, |listed| {
+        listed == worktree || real.is_some() && std::fs::canonicalize(listed).ok() == real
+    }))
+}
+
+/// The pure half of [`worktree_lock`]: in `git worktree list --porcelain`
+/// output, the `locked` line of the stanza whose path `is_target` picks.
+/// Git writes `locked` alone when no reason was given, and C-quotes a
+/// reason it cannot print as is (a newline, a quote).
+fn lock_in_list(out: &str, is_target: impl Fn(&Path) -> bool) -> Option<String> {
+    let mut in_target = false;
+    for line in out.lines() {
+        if let Some(listed) = line.strip_prefix("worktree ") {
+            in_target = is_target(Path::new(listed));
+        } else if in_target && line == "locked" {
+            return Some(String::new());
+        } else if let Some(reason) = line.strip_prefix("locked ").filter(|_| in_target) {
+            return Some(unquote_c_style(reason));
+        }
+    }
+    None
+}
+
+/// Undo git's C-style quoting (`"a \"b\"\n\303\251"`); text git left
+/// unquoted comes back as it is.
+fn unquote_c_style(text: &str) -> String {
+    let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
+        return text.to_string();
+    };
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut chars = inner.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match chars.next() {
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'r') => bytes.push(b'\r'),
+            Some(b'a') => bytes.push(0x07),
+            Some(b'b') => bytes.push(0x08),
+            Some(b'f') => bytes.push(0x0c),
+            Some(b'v') => bytes.push(0x0b),
+            Some(d @ b'0'..=b'7') => {
+                let mut value = u32::from(d - b'0');
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(&o @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(o - b'0');
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(u8::try_from(value).unwrap_or(b'?'));
+            }
+            Some(other) => bytes.push(other),
+            None => bytes.push(b'\\'),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// The branch a paused rebase in `checkout` is replaying, if there is one —
@@ -607,12 +725,21 @@ pub async fn status_porcelain(repo: &Path) -> Result<String> {
     .await
 }
 
+/// One path `git status` reports in a checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedPath {
+    /// Relative to the checkout.
+    pub path: PathBuf,
+    /// A file git does not track (`??`), rather than an edit to one it does.
+    pub untracked: bool,
+}
+
 /// The paths `git status` reports in a checkout — uncommitted edits,
 /// untracked files, and submodules with changes or new commits of their
 /// own — relative to it. NUL-separated porcelain, so a name with a space
 /// or a newline survives; a rename reports its new name only.
-pub async fn changed_paths(worktree: &Path) -> Result<Vec<PathBuf>> {
-    let out = git(
+pub async fn changed_paths(worktree: &Path) -> Result<Vec<ChangedPath>> {
+    let out = git_read(
         worktree,
         &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
     )
@@ -621,14 +748,17 @@ pub async fn changed_paths(worktree: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Pure core of [`changed_paths`].
-fn parse_status_z(out: &str) -> Vec<PathBuf> {
+fn parse_status_z(out: &str) -> Vec<ChangedPath> {
     let mut paths = Vec::new();
     let mut entries = out.split('\0').filter(|e| !e.is_empty());
     while let Some(entry) = entries.next() {
         let Some((xy, path)) = entry.split_at_checked(3) else {
             continue;
         };
-        paths.push(PathBuf::from(path));
+        paths.push(ChangedPath {
+            path: PathBuf::from(path),
+            untracked: xy.starts_with("??"),
+        });
         // A rename or copy is followed by the name it came from.
         if xy.starts_with(['R', 'C']) {
             entries.next();
@@ -669,10 +799,589 @@ pub async fn comparison_base(repo: &Path, configured: Option<&str>) -> Option<St
         .filter(|branch| !branch.is_empty())
 }
 
-/// How many commits the checkout's HEAD has that `base` lacks.
-pub async fn commits_ahead(worktree: &Path, base: &str) -> Result<u32> {
-    let range = format!("{base}..HEAD");
-    count(git(worktree, &["rev-list", "--count", &range]).await?)
+/// How many of `head`'s commits have not landed on `base`, counted by
+/// content, not ancestry: a branch landed by a squash merge, a
+/// rebase-and-merge or a cherry-pick has commits `base..head` still lists
+/// forever, though nothing in them is missing from `base`. `git cherry`
+/// drops each commit whose patch `base` already has (patch-id equality);
+/// when some remain, one more test catches the squash merge, whose single
+/// commit matches none of them: merging `head` into `base` would change
+/// nothing (`git merge-tree --write-tree` gives `base`'s own tree). That
+/// test runs only when `cherry` found something, and any trouble with it —
+/// a conflict, a git too old for `--write-tree` — counts the commits as
+/// unlanded, never as landed. `dir` is any checkout of the repo. The
+/// merge writes its tree's objects to the store, as any merge would; it
+/// moves no ref and touches no checkout.
+pub async fn unlanded_commits(dir: &Path, base: &str, head: &str) -> Result<u32> {
+    let out = git(dir, &["cherry", base, head]).await?;
+    let unlanded = out.lines().filter(|l| l.starts_with('+')).count();
+    if unlanded == 0 || merges_to_nothing(dir, base, head).await {
+        return Ok(0);
+    }
+    Ok(u32::try_from(unlanded).unwrap_or(u32::MAX))
+}
+
+/// Would merging `head` into `base` leave `base`'s tree exactly as it is?
+async fn merges_to_nothing(dir: &Path, base: &str, head: &str) -> bool {
+    let Ok(merged) = git(dir, &["merge-tree", "--write-tree", base, head]).await else {
+        return false;
+    };
+    let base_tree = format!("{base}^{{tree}}");
+    let Ok(tree) = git(dir, &["rev-parse", "--verify", &base_tree]).await else {
+        return false;
+    };
+    let merged = merged.lines().next().unwrap_or("").trim();
+    !merged.is_empty() && merged == tree.trim()
+}
+
+/// The branch a checkout is on; None on a detached HEAD, or when git
+/// cannot say.
+pub async fn current_branch(worktree: &Path) -> Option<String> {
+    git(worktree, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .await
+        .ok()
+        .map(|out| out.trim().to_string())
+        .filter(|branch| !branch.is_empty())
+}
+
+/// Is `branch` one a delete must never take with a worktree: the base its
+/// commits are measured against (or the local branch of the same name),
+/// origin's default branch, or the branch the ROOT WORKTREE has out?
+pub async fn protected_branch(repo: &Path, branch: &str, base: Option<&str>) -> bool {
+    base.is_some_and(|base| base == branch || base.strip_prefix("origin/") == Some(branch))
+        || default_branch_name(repo).await.as_deref() == Some(branch)
+        || current_branch(repo).await.as_deref() == Some(branch)
+}
+
+/// The branch a checkout is on and the commit at its tip; None on a
+/// detached HEAD, or when git cannot say.
+pub async fn branch_tip(worktree: &Path) -> Option<nebula_core::BranchTip> {
+    let name = current_branch(worktree).await?;
+    let full = format!("refs/heads/{name}");
+    let oid = git(worktree, &["rev-parse", "--verify", "--quiet", &full])
+        .await
+        .ok()?;
+    Some(nebula_core::BranchTip {
+        name,
+        oid: oid.trim().to_string(),
+    })
+}
+
+/// Delete local branch `tip.name` only while its tip is still `tip.oid`:
+/// `git update-ref -d` compares and deletes in one step, so a commit that
+/// lands on the branch between the check and the delete keeps it. Unlike
+/// `git branch -d`, it does not refuse a branch some checkout has out —
+/// callers check that first. The branch's config section goes with it,
+/// as `git branch -D` would take it. `--no-deref`: a branch that is a
+/// symbolic ref (`alias -> main`) goes itself, never the branch it
+/// points at.
+pub async fn delete_branch_at(repo: &Path, tip: &nebula_core::BranchTip) -> Result<()> {
+    let full = format!("refs/heads/{}", tip.name);
+    git(repo, &["update-ref", "--no-deref", "-d", &full, &tip.oid])
+        .await
+        .context("its tip moved since the confirm")?;
+    let section = format!("branch.{}", tip.name);
+    let _ = git(repo, &["config", "--remove-section", &section]).await;
+    Ok(())
+}
+
+/// How many commits in `worktree`'s submodule stores nothing else keeps:
+/// commits reachable from a store's HEAD, local branches or stash that no
+/// remote-tracking ref of it holds and the ROOT WORKTREE's store for the
+/// same submodule (`root`'s) lacks too. Tags count only when
+/// `ask_remotes` (a confirm, never a band): git records no "fetched from"
+/// for a tag, so only a remote can say whether a tag is the one copy, and
+/// a band does not go to the network every rotation. A linked worktree's
+/// submodules live in its own git dir (`.git/worktrees/<name>/modules/…`),
+/// which `git worktree remove` deletes — so a superproject commit can pin
+/// a submodule commit that exists nowhere else. The stores counted are
+/// the ones the delete takes: every store under the worktree's own git
+/// dir — a submodule deinitialised there, or absent at this commit, keeps
+/// its store, commits and all — and the store of every submodule checked
+/// out in it (nested ones too), when that lives inside the worktree or its
+/// git dir. Never the main repository's `.git/modules`, which a worktree
+/// delete leaves alone. The stores are asked [`SUBMODULE_JOBS`] at a time:
+/// a repo with two dozen submodules is most of what a confirm waits for.
+pub async fn submodule_unpushed(worktree: &Path, root: &Path, ask_remotes: bool) -> Result<u32> {
+    let own_git = PathBuf::from(
+        git_read(worktree, &["rev-parse", "--absolute-git-dir"])
+            .await?
+            .trim(),
+    );
+    let own_git = std::fs::canonicalize(&own_git).unwrap_or(own_git);
+    let checkout = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    // Each store once, by the name a band names it by when it fails: its
+    // path in the checkout when one is checked out there, else its name
+    // under `modules/`.
+    let mut stores: std::collections::BTreeMap<PathBuf, String> = Default::default();
+    let modules = own_git.join("modules");
+    let mut found = Vec::new();
+    collect_stores(&modules, &mut found)?;
+    for store in found {
+        let name = store
+            .strip_prefix(&modules)
+            .map(module_name)
+            .unwrap_or_else(|_| store.display().to_string());
+        stores.insert(store, name);
+    }
+    if worktree.join(".gitmodules").exists() {
+        let mut dirs: Vec<PathBuf> = checked_out_submodules(worktree)
+            .await?
+            .into_iter()
+            .collect();
+        while let Some(rel) = dirs.pop() {
+            let dir = worktree.join(&rel);
+            let label = rel.display().to_string();
+            if let Some(store) = store_of(&dir) {
+                stores.insert(store, label.clone());
+            }
+            if dir.join(".gitmodules").exists() {
+                let nested = checked_out_submodules(&dir)
+                    .await
+                    .map_err(|e| SubmoduleError::wrap(&label, e))?;
+                dirs.extend(nested.into_iter().map(|p| rel.join(p)));
+            }
+        }
+    }
+    // Only what the delete takes.
+    stores.retain(|s, _| s.starts_with(&own_git) || s.starts_with(&checkout));
+    let mut stores: Vec<(PathBuf, String)> = stores.into_iter().collect();
+    let root_git = if root == worktree {
+        None
+    } else {
+        let out = git_read(root, &["rev-parse", "--absolute-git-dir"]).await?;
+        let dir = PathBuf::from(out.trim());
+        Some(std::fs::canonicalize(&dir).unwrap_or(dir))
+    };
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut total: u32 = 0;
+    loop {
+        while jobs.len() < SUBMODULE_JOBS {
+            let Some((store, label)) = stores.pop() else {
+                break;
+            };
+            let kept = root_git
+                .as_deref()
+                .and_then(|root_git| kept_store(&store, &own_git, &checkout, root, root_git));
+            let cwd = checkout.clone();
+            let folder = label.clone();
+            jobs.spawn(async move {
+                lost_in_store(cwd, store, kept, &folder, ask_remotes)
+                    .await
+                    .map_err(|e| SubmoduleError::wrap(&label, e))
+            });
+        }
+        let Some(done) = jobs.join_next().await else {
+            break;
+        };
+        let lost = done.context("submodule check")??;
+        total = total.saturating_add(lost);
+    }
+    Ok(total)
+}
+
+/// A store's name under a git dir's `modules/` (`lib/modules/inner` is
+/// `lib/inner`): what a band calls a submodule that is not checked out.
+fn module_name(rel: &Path) -> String {
+    let mut parts = Vec::new();
+    let mut skip = false;
+    for part in rel.components() {
+        let part = part.as_os_str().to_string_lossy();
+        // Every other `modules` level is a store's own `modules/`.
+        if skip && part == "modules" {
+            skip = false;
+            continue;
+        }
+        skip = true;
+        parts.push(part.into_owned());
+    }
+    parts.join("/")
+}
+
+/// [`submodule_unpushed`] could not read one submodule: which one, by its
+/// path in the checkout (or its name), for a band to say — a checkout in
+/// the middle of `git submodule update` reads this way for a moment.
+#[derive(Debug)]
+pub struct SubmoduleError {
+    pub path: String,
+    message: String,
+}
+
+impl SubmoduleError {
+    fn wrap(path: &str, e: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            path: path.to_string(),
+            message: format!("{e:#}"),
+        })
+    }
+}
+
+impl std::fmt::Display for SubmoduleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "submodule {}: {}", self.path, self.message)
+    }
+}
+
+impl std::error::Error for SubmoduleError {}
+
+/// Stores asked about at once by [`submodule_unpushed`].
+const SUBMODULE_JOBS: usize = 8;
+
+/// Every submodule store under `modules` (a git dir's `modules/`), nested
+/// ones too: a directory with a `HEAD` and an `objects/` is a store, and
+/// its own `modules/` holds its submodules'; any other directory is a
+/// level of a submodule name with a `/` in it. Symbolic links are not
+/// followed: a store is a real directory, and a link could loop. A
+/// `modules/` that is not there holds nothing; one that cannot be read is
+/// an error, never "nothing to lose".
+fn collect_stores(modules: &Path, stores: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = match std::fs::read_dir(modules) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", modules.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read {}", modules.display()))?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        if dir.join("HEAD").is_file() && dir.join("objects").is_dir() {
+            collect_stores(&dir.join("modules"), stores)?;
+            stores.push(std::fs::canonicalize(&dir).unwrap_or(dir));
+        } else {
+            collect_stores(&dir, stores)?;
+        }
+    }
+    Ok(())
+}
+
+/// The store of the submodule checked out at `dir`: its `.git` directory,
+/// or where its `.git` file (`gitdir: …`) points.
+pub(crate) fn store_of(dir: &Path) -> Option<PathBuf> {
+    let dot_git = dir.join(".git");
+    let store = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        dir.join(text.trim().strip_prefix("gitdir:")?.trim())
+    };
+    std::fs::canonicalize(store).ok()
+}
+
+/// The ROOT WORKTREE's store for the submodule whose store in the worktree
+/// is `store`: the same place under the root's git dir, or — for a store
+/// inside the worktree's own folder — the store of the root's checkout at
+/// the same path. None when the root has none.
+fn kept_store(
+    store: &Path,
+    own_git: &Path,
+    checkout: &Path,
+    root: &Path,
+    root_git: &Path,
+) -> Option<PathBuf> {
+    if let Ok(rel) = store.strip_prefix(own_git) {
+        let kept = root_git.join(rel);
+        return kept.join("HEAD").is_file().then_some(kept);
+    }
+    let rel = store.strip_prefix(checkout).ok()?;
+    store_of(&root.join(rel.parent()?))
+}
+
+/// What one store holds that no remote does and `kept` (the root's store
+/// for the same submodule) lacks: its HEAD, its local branches (a commit
+/// on a branch, then HEAD detached back to the pin, is still lost with the
+/// store), its stash, and with `ask_remotes` its tags no remote has (see
+/// [`unpushed_tags`]). `--glob` matches nothing when there is no stash;
+/// the bracket keeps git from reading it as `refs/stash/*`.
+async fn lost_in_store(
+    cwd: PathBuf,
+    store: PathBuf,
+    kept: Option<PathBuf>,
+    folder: &str,
+    ask_remotes: bool,
+) -> Result<u32> {
+    let git_dir = format!("--git-dir={}", store.display());
+    let tags = match ask_remotes {
+        true => unpushed_tags(&cwd, &git_dir).await?,
+        false => Vec::new(),
+    };
+    let mut refs = vec!["--branches", "--glob=refs/stas[h]"];
+    refs.extend(tags.iter().map(String::as_str));
+    refs.extend(["--not", "--remotes"]);
+    let refs = refs.as_slice();
+    let with_head: Vec<&str> = [git_dir.as_str(), "rev-list", "HEAD"]
+        .into_iter()
+        .chain(refs.iter().copied())
+        .collect();
+    let lost = match git_read(&cwd, &with_head).await {
+        Ok(lost) => lost,
+        // A store whose HEAD names a branch with no commit yet — a clone
+        // `git submodule update` is still writing — holds nothing at HEAD
+        // to lose: ask again about its refs alone. Any other failure, and
+        // a failure of that, stands: a store git cannot read is never
+        // read as empty.
+        Err(e) if !head_resolves(&cwd, &git_dir).await => {
+            let refs_only: Vec<&str> = [git_dir.as_str(), "rev-list"]
+                .into_iter()
+                .chain(refs.iter().copied())
+                .collect();
+            git_read(&cwd, &refs_only).await.map_err(|_| e)?
+        }
+        Err(e) => return Err(e),
+    };
+    let lost = if lost.trim().is_empty() {
+        Vec::new()
+    } else if let Some(kept) = kept {
+        unkept_in(&cwd, &kept, &lost).await?
+    } else {
+        lost.lines().map(str::to_string).collect()
+    };
+    let n = unfolded(&cwd, &git_dir, folder, lost).await?.len();
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// The store's tags (full ref names) that no remote of it has under the
+/// same name at the same object. A tag a fetch brought in names commits
+/// the remote keeps, but git records no "fetched from" for a tag, so only
+/// the remote can tell it from one made here and never pushed. The remote
+/// is asked only when some tag holds a commit no branch, stash or
+/// remote-tracking ref does — usually none, and then nothing goes to the
+/// network — and timeboxed like a fetch. A remote that does not answer
+/// keeps none of the tags: a confirm warns rather than guess.
+async fn unpushed_tags(cwd: &Path, git_dir: &str) -> Result<Vec<String>> {
+    let held = git_read(
+        cwd,
+        &[
+            git_dir,
+            "rev-list",
+            "--max-count=1",
+            "--tags",
+            "--not",
+            "--branches",
+            "--glob=refs/stas[h]",
+            "--remotes",
+        ],
+    )
+    .await?;
+    if held.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut on_remotes = HashSet::new();
+    let remotes = git_read(cwd, &[git_dir, "remote"]).await?;
+    for remote in remotes.lines().map(str::trim).filter(|r| !r.is_empty()) {
+        let Ok(listed) = git_remote(cwd, &[git_dir, "ls-remote", "--tags", remote]).await else {
+            continue;
+        };
+        for line in listed.lines() {
+            if let Some((oid, name)) = line.split_once('\t') {
+                on_remotes.insert((name.to_string(), oid.to_string()));
+            }
+        }
+    }
+    let local = git_read(
+        cwd,
+        &[
+            git_dir,
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/tags",
+        ],
+    )
+    .await?;
+    Ok(local
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(oid, name)| !on_remotes.contains(&(name.to_string(), oid.to_string())))
+        .map(|(_, name)| name.to_string())
+        .collect())
+}
+
+/// Does the store at `git_dir` (a `--git-dir=` argument) have a HEAD
+/// that names a commit? No on an unborn branch, as in a clone not yet
+/// fetched.
+async fn head_resolves(cwd: &Path, git_dir: &str) -> bool {
+    git_read(
+        cwd,
+        &[git_dir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )
+    .await
+    .is_ok()
+}
+
+/// Which of `commits` (one id per line) the root's store `kept` does
+/// not keep: commits it lacks, and commits it has but no ref of it
+/// reaches — a commit fetched by id and left dangling goes at its next
+/// gc, so it is no keeper.
+async fn unkept_in(cwd: &Path, kept: &Path, commits: &str) -> Result<Vec<String>> {
+    let kept_dir = format!("--git-dir={}", kept.display());
+    let answers = git_read_input(cwd, &[&kept_dir, "cat-file", "--batch-check"], commits).await?;
+    let mut missing = Vec::new();
+    let mut present = String::new();
+    for line in answers.lines() {
+        match line.split_once(' ') {
+            Some((id, "missing")) => missing.push(id.to_string()),
+            None => missing.push(line.to_string()),
+            Some((id, _)) => {
+                present.push_str(id);
+                present.push('\n');
+            }
+        }
+    }
+    if present.is_empty() {
+        return Ok(missing);
+    }
+    // Of those it has, the ones none of its refs reach. The walk also
+    // lists their unreached ancestors; only the asked-about ones count.
+    let unreached = git_read_input(
+        cwd,
+        &[&kept_dir, "rev-list", "--stdin", "--not", "--all"],
+        &present,
+    )
+    .await?;
+    let asked: HashSet<&str> = present.lines().collect();
+    missing.extend(
+        unreached
+            .lines()
+            .filter(|id| asked.contains(id))
+            .map(str::to_string),
+    );
+    Ok(missing)
+}
+
+/// Of `commits` in the store at `git_dir` (a `--git-dir=` argument), the
+/// ones the superproject's remotes do not hold as the folder `folder`.
+/// A submodule folded into the superproject as a plain folder (`git
+/// filter-repo --to-subdirectory-filter`, `git subtree add`) keeps each
+/// commit's tree but not its id, so its old store, left in a worktree's
+/// git dir, reads as commits on no remote though every one is published
+/// as that folder. A commit counts as held when some commit a
+/// remote-tracking ref of the superproject reaches has its exact tree at
+/// `folder`; a local branch is no keeper, the same as for the store's
+/// own commits. The walk runs only when the superproject has one of the
+/// trees at all, so a store with no folded past costs one `cat-file`.
+async fn unfolded(
+    cwd: &Path,
+    git_dir: &str,
+    folder: &str,
+    commits: Vec<String>,
+) -> Result<Vec<String>> {
+    if commits.is_empty() {
+        return Ok(commits);
+    }
+    let asked: String = commits.iter().map(|c| format!("{c}^{{tree}}\n")).collect();
+    let trees = git_read_input(
+        cwd,
+        &[git_dir, "cat-file", "--batch-check=%(objectname)"],
+        &asked,
+    )
+    .await?;
+    let trees: Vec<&str> = trees.lines().collect();
+    if trees.len() != commits.len() {
+        return Ok(commits);
+    }
+    let known: String = trees.iter().map(|t| format!("{t}\n")).collect();
+    let here = git_read_input(
+        cwd,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        &known,
+    )
+    .await?;
+    if !here.lines().any(|l| l.ends_with(" tree")) {
+        return Ok(commits);
+    }
+    let pathspec = format!(":(literal){folder}");
+    let touched = git_read(cwd, &["rev-list", "--remotes", "--", &pathspec]).await?;
+    let at_folder: String = touched.lines().map(|c| format!("{c}:{folder}\n")).collect();
+    let held = git_read_input(
+        cwd,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        &at_folder,
+    )
+    .await?;
+    let held: HashSet<&str> = held
+        .lines()
+        .filter_map(|l| l.strip_suffix(" tree"))
+        .collect();
+    Ok(commits
+        .into_iter()
+        .zip(trees)
+        .filter(|(_, tree)| !held.contains(tree))
+        .map(|(commit, _)| commit)
+        .collect())
+}
+
+/// The submodules checked out in `dir`, relative to it: the gitlinks its
+/// index records whose folder has a `.git` of its own — read straight off
+/// `git ls-files --stage`, much quicker than `git submodule status`.
+async fn checked_out_submodules(dir: &Path) -> Result<Vec<PathBuf>> {
+    let out = git_read(dir, &["ls-files", "-z", "--stage"]).await?;
+    Ok(gitlinks(&out)
+        .into_iter()
+        .filter(|p| dir.join(p).join(".git").exists())
+        .collect())
+}
+
+/// Pure core of [`checked_out_submodules`]: the gitlinks (mode `160000`)
+/// among `ls-files -z --stage` entries (`<mode> <oid> <stage>\t<path>`).
+fn gitlinks(out: &str) -> Vec<PathBuf> {
+    out.split('\0')
+        .filter_map(|entry| {
+            let (meta, path) = entry.split_once('\t')?;
+            meta.starts_with("160000 ").then(|| PathBuf::from(path))
+        })
+        .collect()
+}
+
+/// Gitignored output a delete costs nothing to lose: what a build, an
+/// install or the OS regenerates. Matched against an entry's last path
+/// component, so a nested `crates/x/target/` counts too. Anything else
+/// ignored — `.env`, an editor's local settings — is someone's, and the
+/// delete takes it.
+const REGENERABLE: &[&str] = &[
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".gradle",
+    ".cache",
+    ".DS_Store",
+];
+
+/// The gitignored files and folders in a checkout that are not build
+/// output ([`REGENERABLE`]), relative to it: `git ls-files --others
+/// --ignored --directory`, so a whole ignored folder is one entry.
+pub async fn ignored_keepsakes(worktree: &Path) -> Result<Vec<String>> {
+    let out = git_read(
+        worktree,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ],
+    )
+    .await?;
+    Ok(keepsakes(&out))
+}
+
+/// Pure core of [`ignored_keepsakes`].
+fn keepsakes(out: &str) -> Vec<String> {
+    out.split('\0')
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| {
+            let name = entry.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            !REGENERABLE.contains(&name)
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Is the checkout's HEAD detached — on no branch at all?
@@ -736,10 +1445,13 @@ pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> 
             let _ = git(repo, &["worktree", "prune"]).await;
             Ok(())
         }
-        // Locked by a session that ran `git worktree lock` (Claude Code locks
-        // its worktree and a killed session never unlocks). The caller has
-        // already killed this worktree's sessions, so the lock is stale —
-        // unlock and retry rather than surfacing git's refusal.
+        // Locked (`git worktree lock`): often by an agent that locks the
+        // checkout it works in and never unlocks when killed, but anyone
+        // can lock one to keep it. A delete the person asked for was
+        // confirmed with the lock and its reason in front of them (the
+        // DELETE CHECK names it, to a client that reads it); auto-cleanup
+        // never takes a locked checkout. So unlock and retry rather than
+        // surfacing git's refusal.
         Err(e) if e.to_string().contains("locked working tree") => {
             git(repo, &["worktree", "unlock", &path_str]).await?;
             git(repo, &args).await?;
@@ -1450,6 +2162,58 @@ mod tests {
         remove_worktree(&repo, &wt, false).await.unwrap();
     }
 
+    #[test]
+    fn lock_in_list_reads_the_target_stanzas_lock_and_reason() {
+        let out = "worktree /r\nHEAD 1\nbranch refs/heads/main\n\n\
+                   worktree /r/a\nHEAD 2\nbranch refs/heads/a\nlocked\n\n\
+                   worktree /r/b\nHEAD 3\ndetached\nlocked merge queue: reused by every push\n\n\
+                   worktree /r/c\nHEAD 4\nbranch refs/heads/c\nlocked \"two\\nlines \\\"q\\\" caf\\303\\251\"\n\n\
+                   worktree /r/d\nHEAD 5\nbranch refs/heads/d\n";
+        let lock = |p: &str| lock_in_list(out, |listed| listed == Path::new(p));
+        assert_eq!(lock("/r"), None, "the main checkout is not locked");
+        assert_eq!(lock("/r/a").as_deref(), Some(""), "locked, no reason");
+        assert_eq!(
+            lock("/r/b").as_deref(),
+            Some("merge queue: reused by every push")
+        );
+        assert_eq!(lock("/r/c").as_deref(), Some("two\nlines \"q\" café"));
+        assert_eq!(lock("/r/d"), None, "another stanza's lock is not its");
+        assert_eq!(lock("/r/x"), None, "not listed");
+    }
+
+    #[tokio::test]
+    async fn worktree_lock_reads_what_git_worktree_lock_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        let wt_str = wt.to_string_lossy().into_owned();
+        assert_eq!(worktree_lock(&repo, &wt).await.unwrap(), None);
+        git(&repo, &["worktree", "lock", &wt_str]).await.unwrap();
+        assert_eq!(
+            worktree_lock(&repo, &wt).await.unwrap().as_deref(),
+            Some("")
+        );
+        git(&repo, &["worktree", "unlock", &wt_str]).await.unwrap();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "kept for the nightly build",
+                &wt_str,
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            worktree_lock(&repo, &wt).await.unwrap().as_deref(),
+            Some("kept for the nightly build")
+        );
+    }
+
     #[tokio::test]
     async fn remove_worktree_unlocks_session_locked_checkout() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1492,11 +2256,56 @@ mod tests {
     #[test]
     fn status_z_keeps_odd_names_and_drops_rename_sources() {
         let out = " M src/a b.rs\0R  new.rs\0old.rs\0?? notes/\0 M sub\0";
+        let parsed = parse_status_z(out);
+        let paths: Vec<&Path> = parsed.iter().map(|c| c.path.as_path()).collect();
         assert_eq!(
-            parse_status_z(out),
-            ["src/a b.rs", "new.rs", "notes/", "sub"].map(PathBuf::from)
+            paths,
+            ["src/a b.rs", "new.rs", "notes/", "sub"].map(Path::new)
         );
+        let untracked: Vec<bool> = parsed.iter().map(|c| c.untracked).collect();
+        assert_eq!(untracked, [false, false, true, false]);
         assert!(parse_status_z("").is_empty());
+    }
+
+    #[test]
+    fn ignored_build_output_is_not_a_keepsake() {
+        let out = ".env\0target/\0crates/x/target/\0node_modules/\0.claude/settings.local.json\0notes/\0.DS_Store\0";
+        assert_eq!(
+            keepsakes(out),
+            [".env", ".claude/settings.local.json", "notes/"]
+        );
+    }
+
+    /// On a real checkout: an ignored `.env` is listed, an ignored
+    /// `target/` is not.
+    #[tokio::test]
+    async fn ignored_keepsakes_lists_dot_env_but_not_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        std::fs::write(repo.join(".gitignore"), ".env\ntarget/\n").unwrap();
+        git(&repo, &["add", ".gitignore"]).await.unwrap();
+        git(&repo, &["commit", "-q", "-m", "ignore"]).await.unwrap();
+        std::fs::write(repo.join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir_all(repo.join("target/debug")).unwrap();
+        std::fs::write(repo.join("target/debug/app"), "bin").unwrap();
+        assert_eq!(ignored_keepsakes(&repo).await.unwrap(), [".env"]);
+    }
+
+    #[test]
+    fn gitlinks_are_the_160000_entries() {
+        let out = [
+            "100644 0123 0\tsrc/a.rs",
+            "160000 4567 0\tlib/a",
+            "160000 89ab 0\tlib/with space",
+        ]
+        .join("\0");
+        let out = out.as_str();
+        assert_eq!(
+            gitlinks(out),
+            ["lib/a", "lib/with space"].map(PathBuf::from)
+        );
     }
 
     /// The DELETE CHECK's git half on a real checkout: edits and untracked
@@ -1517,16 +2326,19 @@ mod tests {
             Some("main"),
             "no origin: the root's branch"
         );
-        assert_eq!(commits_ahead(&wt, "main").await.unwrap(), 0);
+        assert_eq!(unlanded_commits(&wt, "main", "HEAD").await.unwrap(), 0);
 
         std::fs::write(wt.join("new.txt"), "x").unwrap();
         assert_eq!(
             changed_paths(&wt).await.unwrap(),
-            [PathBuf::from("new.txt")]
+            [ChangedPath {
+                path: PathBuf::from("new.txt"),
+                untracked: true,
+            }]
         );
         git(&wt, &["add", "."]).await.unwrap();
         git(&wt, &["commit", "-m", "work"]).await.unwrap();
-        assert_eq!(commits_ahead(&wt, "main").await.unwrap(), 1);
+        assert_eq!(unlanded_commits(&wt, "main", "HEAD").await.unwrap(), 1);
         assert!(!head_detached(&wt).await);
         assert_eq!(
             unreferenced_commits(&wt).await.unwrap(),
@@ -1550,5 +2362,523 @@ mod tests {
             comparison_base(&repo, Some("nope")).await.as_deref(),
             Some("main")
         );
+    }
+
+    /// Commit `file` with `body` in `dir`.
+    async fn commit_file(dir: &Path, file: &str, body: &str) {
+        std::fs::write(dir.join(file), body).unwrap();
+        git(dir, &["add", "--", file]).await.unwrap();
+        git(dir, &["commit", "-q", "-m", file]).await.unwrap();
+    }
+
+    /// A repo on `main` and a worktree on `feat` holding two commits of
+    /// its own, for the landing tests to land one way or another.
+    async fn repo_with_feature() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feat", None).await.unwrap();
+        commit_file(&wt, "a.txt", "a").await;
+        commit_file(&wt, "b.txt", "b").await;
+        (tmp, repo, wt)
+    }
+
+    /// A branch merged into its base, by a merge commit, has landed.
+    #[tokio::test]
+    async fn a_branch_landed_by_merge_has_nothing_unlanded() {
+        let (_tmp, repo, wt) = repo_with_feature().await;
+        assert_eq!(unlanded_commits(&wt, "main", "HEAD").await.unwrap(), 2);
+        commit_file(&repo, "other.txt", "o").await;
+        git(&repo, &["merge", "--no-ff", "-q", "-m", "merge", "feat"])
+            .await
+            .unwrap();
+        assert_eq!(unlanded_commits(&wt, "main", "HEAD").await.unwrap(), 0);
+        assert_eq!(unlanded_commits(&repo, "main", "feat").await.unwrap(), 0);
+    }
+
+    /// A squash merge leaves `main..feat` at two commits forever; by
+    /// content nothing in them is missing.
+    #[tokio::test]
+    async fn a_branch_landed_by_squash_has_nothing_unlanded() {
+        let (_tmp, repo, wt) = repo_with_feature().await;
+        commit_file(&repo, "other.txt", "o").await;
+        git(&repo, &["merge", "--squash", "-q", "feat"])
+            .await
+            .unwrap();
+        git(&repo, &["commit", "-q", "-m", "squashed"])
+            .await
+            .unwrap();
+        let ancestry = git(&wt, &["rev-list", "--count", "main..HEAD"])
+            .await
+            .unwrap();
+        assert_eq!(ancestry.trim(), "2", "ancestry still counts both");
+        assert_eq!(unlanded_commits(&wt, "main", "HEAD").await.unwrap(), 0);
+
+        // One more commit on the branch is unlanded again — the whole
+        // branch is, since the squash test is all or nothing.
+        commit_file(&wt, "c.txt", "c").await;
+        assert!(unlanded_commits(&wt, "main", "HEAD").await.unwrap() > 0);
+    }
+
+    /// Commits cherry-picked onto the base (a rebase-and-merge, a merge
+    /// queue) are on it by patch, not by ancestry.
+    #[tokio::test]
+    async fn a_branch_landed_by_cherry_pick_has_nothing_unlanded() {
+        let (_tmp, repo, wt) = repo_with_feature().await;
+        commit_file(&repo, "other.txt", "o").await;
+        git(&repo, &["cherry-pick", "main..feat"]).await.unwrap();
+        assert_eq!(unlanded_commits(&wt, "main", "HEAD").await.unwrap(), 0);
+    }
+
+    /// One commit the base has no patch for is counted, alone.
+    #[tokio::test]
+    async fn one_unlanded_commit_is_counted() {
+        let (_tmp, repo, wt) = repo_with_feature().await;
+        git(&repo, &["cherry-pick", "feat~1"]).await.unwrap();
+        assert_eq!(unlanded_commits(&wt, "main", "HEAD").await.unwrap(), 1);
+    }
+
+    /// The branch a worktree delete may take never includes the base,
+    /// the default branch or the root's own.
+    #[tokio::test]
+    async fn base_and_root_branches_are_protected() {
+        let (_tmp, repo, _wt) = repo_with_feature().await;
+        assert!(protected_branch(&repo, "main", Some("main")).await);
+        assert!(protected_branch(&repo, "main", Some("origin/main")).await);
+        assert!(
+            protected_branch(&repo, "main", Some("develop")).await,
+            "root's"
+        );
+        assert!(!protected_branch(&repo, "feat", Some("main")).await);
+        assert!(
+            protected_branch(&repo, "main", None).await,
+            "no base: still the root's"
+        );
+        assert!(!protected_branch(&repo, "feat", None).await);
+    }
+
+    /// `delete_branch_at` deletes a branch only at the tip it was given:
+    /// one a commit has moved since is kept.
+    #[tokio::test]
+    async fn delete_branch_at_compares_the_tip_before_it_deletes() {
+        let (_tmp, repo, wt) = repo_with_feature().await;
+        let judged = branch_tip(&wt).await.expect("on feat");
+        assert_eq!(judged.name, "feat");
+        git(&repo, &["config", "branch.feat.remote", "origin"])
+            .await
+            .unwrap();
+        commit_file(&wt, "late.txt", "late").await;
+        remove_worktree(&repo, &wt, true).await.unwrap();
+        let moved = delete_branch_at(&repo, &judged).await;
+        assert!(moved.is_err(), "a commit since the check keeps it");
+        assert!(local_branch(&repo, "feat").await);
+
+        let now = nebula_core::BranchTip {
+            name: "feat".into(),
+            oid: git(&repo, &["rev-parse", "feat"])
+                .await
+                .unwrap()
+                .trim()
+                .into(),
+        };
+        delete_branch_at(&repo, &now).await.unwrap();
+        assert!(!local_branch(&repo, "feat").await);
+        assert_eq!(config_get(&repo, "branch.feat.remote").await, None);
+    }
+
+    /// A submodule deinitialised in the worktree leaves its store in the
+    /// worktree's git dir, which the delete takes, commits and all; the
+    /// main repository's own stores, which it leaves, never count.
+    #[tokio::test]
+    async fn a_deinitialised_submodules_store_still_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allow = ["-c", "protocol.file.allow=always"];
+        let upstream = tmp.path().join("lib");
+        let repo = tmp.path().join("repo");
+        for dir in [&upstream, &repo] {
+            std::fs::create_dir(dir).unwrap();
+            init_repo(dir).await;
+        }
+        let url = upstream.to_string_lossy().into_owned();
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "add", "-q", url.as_str(), "lib"]);
+        git(&repo, &args).await.unwrap();
+        git(&repo, &["commit", "-q", "-m", "add lib"])
+            .await
+            .unwrap();
+        // A commit only the main repository's store has: never this
+        // worktree's to lose.
+        let root_sub = repo.join("lib");
+        git(&root_sub, &["config", "user.email", "t@t"])
+            .await
+            .unwrap();
+        git(&root_sub, &["config", "user.name", "t"]).await.unwrap();
+        commit_file(&root_sub, "root.txt", "r").await;
+
+        let wt = add_worktree(&repo, "feat", None).await.unwrap();
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "update", "--init", "-q"]);
+        git(&wt, &args).await.unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+        let sub = wt.join("lib");
+        git(&sub, &["config", "user.email", "t@t"]).await.unwrap();
+        git(&sub, &["config", "user.name", "t"]).await.unwrap();
+        commit_file(&sub, "z.txt", "z").await;
+        git(&wt, &["submodule", "deinit", "-q", "-f", "lib"])
+            .await
+            .unwrap();
+        assert!(!sub.join(".git").exists(), "deinitialised");
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+    }
+
+    /// A submodule later folded into the superproject as a plain folder
+    /// keeps each commit's tree, not its id: its old store's commits stop
+    /// counting once a remote holds that tree at the folder, and not
+    /// before (a local branch is no keeper).
+    #[tokio::test]
+    async fn a_store_whose_commits_were_folded_and_pushed_counts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allow = ["-c", "protocol.file.allow=always"];
+        let upstream = tmp.path().join("lib");
+        let repo = tmp.path().join("repo");
+        for dir in [&upstream, &repo] {
+            std::fs::create_dir(dir).unwrap();
+            init_repo(dir).await;
+        }
+        let url = upstream.to_string_lossy().into_owned();
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "add", "-q", url.as_str(), "lib"]);
+        git(&repo, &args).await.unwrap();
+        git(&repo, &["commit", "-q", "-m", "add lib"])
+            .await
+            .unwrap();
+        let wt = add_worktree(&repo, "feat", None).await.unwrap();
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "update", "--init", "-q"]);
+        git(&wt, &args).await.unwrap();
+        let sub = wt.join("lib");
+        git(&sub, &["config", "user.email", "t@t"]).await.unwrap();
+        git(&sub, &["config", "user.name", "t"]).await.unwrap();
+        commit_file(&sub, "z.txt", "z").await;
+        let store = git(&sub, &["rev-parse", "--absolute-git-dir"])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+
+        // Fold: the store's commit becomes the folder `lib` in the main
+        // repository, under a new commit id.
+        let mut args = allow.to_vec();
+        args.extend(["fetch", "-q", store.trim(), "HEAD"]);
+        git(&repo, &args).await.unwrap();
+        git(&repo, &["rm", "-q", "--cached", "lib"]).await.unwrap();
+        git(&repo, &["rm", "-q", "--cached", ".gitmodules"])
+            .await
+            .unwrap();
+        git(&repo, &["read-tree", "--prefix=lib/", "FETCH_HEAD^{tree}"])
+            .await
+            .unwrap();
+        git(&repo, &["commit", "-q", "-m", "fold lib"])
+            .await
+            .unwrap();
+        assert_eq!(
+            submodule_unpushed(&wt, &repo, true).await.unwrap(),
+            1,
+            "folded on a local branch only"
+        );
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+
+        // A commit made after the fold is on no remote in any shape.
+        commit_file(&sub, "y.txt", "y").await;
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+    }
+
+    #[test]
+    fn a_module_name_drops_the_stores_own_modules_levels() {
+        assert_eq!(module_name(Path::new("lib")), "lib");
+        assert_eq!(module_name(Path::new("lib/modules/inner")), "lib/inner");
+    }
+
+    /// A store mid-clone — HEAD naming a branch with no commit yet, the
+    /// state `git submodule update` leaves for a moment — holds nothing to
+    /// lose: 0, not an error.
+    #[tokio::test]
+    async fn a_store_still_being_cloned_counts_nothing() {
+        let (_tmp, repo, wt) = repo_with_feature().await;
+        let own = git(&wt, &["rev-parse", "--absolute-git-dir"])
+            .await
+            .unwrap();
+        let store = Path::new(own.trim()).join("modules").join("cloning");
+        git(&wt, &["init", "-q", "--bare", &store.to_string_lossy()])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+    }
+
+    /// A store git cannot read names its submodule in the error, for the
+    /// band to say which.
+    #[tokio::test]
+    async fn an_unreadable_store_names_its_submodule() {
+        let (_tmp, repo, wt) = repo_with_feature().await;
+        let own = git(&wt, &["rev-parse", "--absolute-git-dir"])
+            .await
+            .unwrap();
+        let broken = Path::new(own.trim()).join("modules").join("half");
+        std::fs::create_dir_all(broken.join("objects")).unwrap();
+        std::fs::write(broken.join("HEAD"), "not a ref\n").unwrap();
+        let err = submodule_unpushed(&wt, &repo, true).await.unwrap_err();
+        let failed = err
+            .downcast_ref::<SubmoduleError>()
+            .unwrap_or_else(|| panic!("{err:#}"));
+        assert_eq!(failed.path, "half");
+    }
+
+    /// Only a directory with `HEAD` and `objects/` is a store, and a
+    /// symbolic link under `modules/` is never followed.
+    #[test]
+    fn collect_stores_takes_real_stores_and_follows_no_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let modules = tmp.path().join("modules");
+        let store = modules.join("lib");
+        std::fs::create_dir_all(store.join("objects")).unwrap();
+        std::fs::write(store.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let headless = modules.join("stray");
+        std::fs::create_dir_all(&headless).unwrap();
+        std::fs::write(headless.join("HEAD"), "x").unwrap();
+        std::os::unix::fs::symlink(&modules, modules.join("loop")).unwrap();
+        let mut found = Vec::new();
+        collect_stores(&modules, &mut found).unwrap();
+        assert_eq!(found, [std::fs::canonicalize(&store).unwrap()]);
+        let mut none = Vec::new();
+        collect_stores(&tmp.path().join("absent"), &mut none).unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// A nested submodule's commits count like a top-level one's.
+    #[tokio::test]
+    async fn nested_submodule_commits_on_no_remote_are_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allow = ["-c", "protocol.file.allow=always"];
+        let make = |name: &str| tmp.path().join(name);
+        for name in ["inner", "lib", "repo"] {
+            std::fs::create_dir(make(name)).unwrap();
+            init_repo(&make(name)).await;
+        }
+        let url = |name: &str| make(name).to_string_lossy().into_owned();
+        let inner = url("inner");
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "add", "-q", inner.as_str(), "inner"]);
+        git(&make("lib"), &args).await.unwrap();
+        git(&make("lib"), &["commit", "-q", "-m", "add inner"])
+            .await
+            .unwrap();
+        let lib = url("lib");
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "add", "-q", lib.as_str(), "lib"]);
+        git(&make("repo"), &args).await.unwrap();
+        git(&make("repo"), &["commit", "-q", "-m", "add lib"])
+            .await
+            .unwrap();
+        let repo = make("repo");
+        let wt = add_worktree(&repo, "feat", None).await.unwrap();
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "update", "--init", "--recursive", "-q"]);
+        git(&wt, &args).await.unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+
+        let nested = wt.join("lib").join("inner");
+        git(&nested, &["config", "user.email", "t@t"])
+            .await
+            .unwrap();
+        git(&nested, &["config", "user.name", "t"]).await.unwrap();
+        commit_file(&nested, "n.txt", "n").await;
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+    }
+
+    /// A symbolic-ref branch is deleted itself, never what it points at.
+    #[tokio::test]
+    async fn delete_branch_at_never_follows_a_symbolic_ref() {
+        let (_tmp, repo, _wt) = repo_with_feature().await;
+        git(
+            &repo,
+            &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
+        )
+        .await
+        .unwrap();
+        let main = git(&repo, &["rev-parse", "main"]).await.unwrap();
+        let alias = nebula_core::BranchTip {
+            name: "alias".into(),
+            oid: main.trim().into(),
+        };
+        delete_branch_at(&repo, &alias).await.unwrap();
+        assert!(local_branch(&repo, "main").await, "main survives");
+        assert_eq!(
+            git(&repo, &["rev-parse", "main"]).await.unwrap(),
+            main,
+            "untouched"
+        );
+        assert!(git(&repo, &["symbolic-ref", "-q", "refs/heads/alias"])
+            .await
+            .is_err());
+    }
+
+    /// A submodule commit made in a linked worktree lives only in that
+    /// worktree's submodule store until it is pushed; one the root's
+    /// submodule has, or a remote holds, is safe.
+    #[tokio::test]
+    async fn submodule_commits_on_no_remote_are_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("lib");
+        std::fs::create_dir(&upstream).unwrap();
+        init_repo(&upstream).await;
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let url = upstream.to_string_lossy().into_owned();
+        git(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &url,
+                "lib",
+            ],
+        )
+        .await
+        .unwrap();
+        git(&repo, &["commit", "-q", "-m", "add lib"])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&repo, &repo, true).await.unwrap(), 0);
+
+        let wt = add_worktree(&repo, "feat", None).await.unwrap();
+        assert_eq!(
+            submodule_unpushed(&wt, &repo, true).await.unwrap(),
+            0,
+            "not checked out in the worktree: nothing in it"
+        );
+        git(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "-q",
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+        let sub = wt.join("lib");
+        git(&sub, &["config", "user.email", "t@t"]).await.unwrap();
+        git(&sub, &["config", "user.name", "t"]).await.unwrap();
+        commit_file(&sub, "x.txt", "x").await;
+        commit_file(&sub, "y.txt", "y").await;
+        git(&wt, &["commit", "-q", "-am", "bump lib"])
+            .await
+            .unwrap();
+        assert!(changed_paths(&wt).await.unwrap().is_empty());
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 2);
+
+        // Fetched into the root's copy but on none of its refs, they are
+        // dangling there — gone at its next gc — so still lost.
+        let wt_sub = sub.to_string_lossy().into_owned();
+        git(&repo.join("lib"), &["fetch", "-q", &wt_sub, "HEAD"])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 2);
+        // A branch there keeps them: they survive the delete.
+        git(&repo.join("lib"), &["branch", "kept", "FETCH_HEAD"])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+
+        // A commit on a local branch of the worktree's submodule, HEAD
+        // then detached back to the pin: on no remote, in no other store.
+        let pin = git(&sub, &["rev-parse", "HEAD"]).await.unwrap();
+        git(&sub, &["switch", "-q", "-c", "side"]).await.unwrap();
+        commit_file(&sub, "z.txt", "z").await;
+        git(&sub, &["checkout", "-q", "--detach", pin.trim()])
+            .await
+            .unwrap();
+        assert!(changed_paths(&wt).await.unwrap().is_empty());
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+
+        // A stash there is lost with the store too.
+        git(&sub, &["branch", "-q", "-D", "side"]).await.unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+        std::fs::write(sub.join("x.txt"), "edited").unwrap();
+        git(&sub, &["stash", "-q"]).await.unwrap();
+        assert!(submodule_unpushed(&wt, &repo, true).await.unwrap() > 0);
+    }
+
+    /// A tag is no keeper until a remote says it has it: a band never asks,
+    /// so a commit only a tag holds is not counted there; a confirm asks,
+    /// and counts it unless a remote has that tag at that commit.
+    #[tokio::test]
+    async fn submodule_tags_count_only_when_no_remote_has_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("lib");
+        std::fs::create_dir(&upstream).unwrap();
+        init_repo(&upstream).await;
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let url = upstream.to_string_lossy().into_owned();
+        let allow = ["-c", "protocol.file.allow=always"];
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "add", "-q", &url, "lib"]);
+        git(&repo, &args).await.unwrap();
+        git(&repo, &["commit", "-q", "-m", "add lib"])
+            .await
+            .unwrap();
+        let wt = add_worktree(&repo, "feat", None).await.unwrap();
+        let mut args = allow.to_vec();
+        args.extend(["submodule", "update", "--init", "-q"]);
+        git(&wt, &args).await.unwrap();
+        let sub = wt.join("lib");
+        git(&sub, &["config", "user.email", "t@t"]).await.unwrap();
+        git(&sub, &["config", "user.name", "t"]).await.unwrap();
+
+        // A commit only a tag holds, HEAD back at the pin.
+        let pin = git(&sub, &["rev-parse", "HEAD"]).await.unwrap();
+        commit_file(&sub, "t.txt", "t").await;
+        git(&sub, &["tag", "v1"]).await.unwrap();
+        git(&sub, &["checkout", "-q", "--detach", pin.trim()])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, false).await.unwrap(), 0);
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+
+        // Pushed: the remote has it at that commit, though no
+        // remote-tracking ref or root store does.
+        git(&sub, &["push", "-q", "origin", "v1"]).await.unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 0);
+
+        // A remote that does not answer keeps nothing.
+        git(&sub, &["remote", "set-url", "origin", "/nonexistent/lib"])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
+        git(&sub, &["remote", "set-url", "origin", &url])
+            .await
+            .unwrap();
+
+        // Moved here since: the remote's v1 is another commit, and the
+        // new one is held by nothing else.
+        commit_file(&sub, "u.txt", "u").await;
+        git(&sub, &["tag", "-f", "v1"]).await.unwrap();
+        git(&sub, &["checkout", "-q", "--detach", pin.trim()])
+            .await
+            .unwrap();
+        assert_eq!(submodule_unpushed(&wt, &repo, true).await.unwrap(), 1);
     }
 }

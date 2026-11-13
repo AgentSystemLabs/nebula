@@ -522,7 +522,11 @@ fn handle_tree_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequ
         }
         ServerEvent::WorktreeChecked { req_id, id, check } => {
             // Answered with WorktreeChecked, not Ack; `land` clears the slot.
-            crate::delete_check::land(app, req_id, id, check);
+            // A band's own check, or a confirm's — whose answer the band
+            // shows too, being the newer.
+            if !crate::band_safety::land(app, req_id, &id, &check) {
+                crate::delete_check::land(app, req_id, id, check);
+            }
         }
         ServerEvent::OutputTail {
             req_id,
@@ -562,6 +566,10 @@ fn handle_error_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientReq
         ServerEvent::Error { req_id, message } => {
             // A DELETE CHECK that failed says so in its confirm.
             if req_id.is_some_and(|id| crate::delete_check::land_error(app, id, &message)) {
+                return;
+            }
+            // A band's check that failed says so on the band, not here.
+            if req_id.is_some_and(|id| crate::band_safety::land_error(app, id, &message)) {
                 return;
             }
             // A failed request's intent never gets an Ack; clear it — and if

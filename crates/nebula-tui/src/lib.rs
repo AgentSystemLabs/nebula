@@ -1,6 +1,7 @@
 pub mod agent_picker;
 pub mod agent_presets;
 pub mod app;
+pub mod band_safety;
 pub mod branch_name;
 pub mod branch_switch;
 pub mod bundle;

@@ -243,21 +243,48 @@ fn draw_confirm_overlay(f: &mut Frame, app: &mut App, confirm: crate::app::Confi
         confirm.action,
         crate::app::PendingAction::ThenDeleteWorktree { offered: true, .. }
     );
-    let legend = if three_way {
-        Line::from(vec![
+    // A worktree delete, once its check says where the branch stands,
+    // names what Enter does with the branch and the key that does the
+    // other thing: the band's own `d` in its own words, a card's delete
+    // taking the worktree with the branch key after its usual answers.
+    let branch_keys = crate::delete_check::branch_keys(app, &confirm.action);
+    let branch_key = branch_keys.map(|keys| match keys {
+        crate::delete_check::BranchKeys::DeleteByDefault => "[k] keep branch",
+        crate::delete_check::BranchKeys::KeepByDefault { .. } => "[D] delete branch too",
+    });
+    let band_delete = matches!(confirm.action, crate::app::PendingAction::DeleteWorktree(_));
+    let mut legend = match branch_keys {
+        Some(keys) if band_delete => {
+            let enter = match keys {
+                crate::delete_check::BranchKeys::DeleteByDefault => "[Enter/y] delete both",
+                crate::delete_check::BranchKeys::KeepByDefault { .. } => "[Enter/y] keep branch",
+            };
+            vec![
+                Span::styled(enter, Style::default().fg(th.err)),
+                Span::raw("   "),
+                Span::styled(branch_key.unwrap_or_default(), Style::default().fg(th.err)),
+                Span::raw("   "),
+                Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
+            ]
+        }
+        _ if three_way => vec![
             Span::styled("[Enter/y] yes, both", Style::default().fg(th.err)),
             Span::raw("   "),
             Span::styled("[n] no, the card only", Style::default().fg(th.err)),
             Span::raw("   "),
             Span::styled("[Esc] cancel", Style::default().fg(th.dim)),
-        ])
-    } else {
-        Line::from(vec![
+        ],
+        _ => vec![
             Span::styled("[Enter/y] confirm", Style::default().fg(th.err)),
             Span::raw("   "),
             Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
-        ])
+        ],
     };
+    if let (Some(key), false) = (branch_key, band_delete) {
+        legend.push(Span::raw("   "));
+        legend.push(Span::styled(key, Style::default().fg(th.err)));
+    }
+    let legend = Line::from(legend);
     let longest = msg_lines
         .iter()
         .copied()

@@ -4144,6 +4144,137 @@ mod tests {
             .unwrap_or_else(|| panic!("band {index} was not drawn"))
     }
 
+    /// An EMPTY BAND says what deleting it would lose once the DELETE
+    /// CHECK's git half is in: the git tick asks about one idle band at a
+    /// time (never the root's), the answer takes the place of `nothing
+    /// running`, and a band read a moment ago is not asked again. A
+    /// check that fails says so on the band, never in the footer; a
+    /// daemon too old to answer is never asked.
+    #[test]
+    fn an_empty_band_says_what_a_delete_would_lose() {
+        with_default_config(|| {
+            let mut app = with_empty_band();
+            let mut out = Vec::new();
+            crate::band_safety::sweep(&mut app, &mut out);
+            let req_id = match out.as_slice() {
+                [ClientRequest::CheckWorktree {
+                    req_id,
+                    id,
+                    band: true,
+                }] if id.0 == "w3" => *req_id,
+                other => panic!("one band check of the idle band: {other:?}"),
+            };
+            out.clear();
+            crate::band_safety::sweep(&mut app, &mut out);
+            assert!(out.is_empty(), "one in flight at a time: {out:?}");
+
+            hse(
+                &mut app,
+                ServerEvent::WorktreeChecked {
+                    req_id,
+                    id: WorktreeId("w3".into()),
+                    check: nebula_core::WorktreeCheck {
+                        changes: 5,
+                        ahead: 4,
+                        base: Some("origin/main".into()),
+                        landing: Some(nebula_core::WorktreeLanding {
+                            untracked: 2,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                },
+            );
+            assert!(!app.requests.pending.contains_key(&req_id));
+            let screen = screen_text(&draw_tall(&mut app));
+            assert!(
+                screen.contains(
+                    "⚠ 3 modified · 2 untracked · ↑4 unmerged · p: new session · t: terminal · d: delete worktree"
+                ),
+                "{screen}"
+            );
+            crate::band_safety::sweep(&mut app, &mut out);
+            assert!(out.is_empty(), "read a moment ago: {out:?}");
+
+            let mut failing = with_empty_band();
+            crate::band_safety::sweep(&mut failing, &mut out);
+            let [ClientRequest::CheckWorktree { req_id, .. }] = out.as_slice() else {
+                panic!("{out:?}");
+            };
+            let req_id = *req_id;
+            out.clear();
+            hse(
+                &mut failing,
+                ServerEvent::Error {
+                    req_id: Some(req_id),
+                    message: "worktree not found".into(),
+                },
+            );
+            assert_eq!(failing.chrome.flash, None);
+            let screen = screen_text(&draw_tall(&mut failing));
+            assert!(
+                screen.contains("? can't read git state · retrying · p: new session"),
+                "{screen}"
+            );
+
+            // A failed band is read again on the very next tick, up to
+            // FAST_RETRIES times in a row; then it waits its turn.
+            for _ in 0..crate::band_safety::FAST_RETRIES {
+                crate::band_safety::sweep(&mut failing, &mut out);
+                let [ClientRequest::CheckWorktree { req_id, .. }] = out.as_slice() else {
+                    panic!("retried at once: {out:?}");
+                };
+                let req_id = *req_id;
+                out.clear();
+                hse(
+                    &mut failing,
+                    ServerEvent::Error {
+                        req_id: Some(req_id),
+                        message: "still not".into(),
+                    },
+                );
+            }
+            crate::band_safety::sweep(&mut failing, &mut out);
+            assert!(out.is_empty(), "backed off: {out:?}");
+
+            // A git still running there is read again every tick.
+            let mut busy = with_empty_band();
+            for round in 0..crate::band_safety::FAST_RETRIES + 2 {
+                crate::band_safety::sweep(&mut busy, &mut out);
+                let [ClientRequest::CheckWorktree { req_id, .. }] = out.as_slice() else {
+                    panic!("round {round}: {out:?}");
+                };
+                let req_id = *req_id;
+                out.clear();
+                hse(
+                    &mut busy,
+                    ServerEvent::WorktreeChecked {
+                        req_id,
+                        id: WorktreeId("w3".into()),
+                        check: nebula_core::WorktreeCheck {
+                            landing: Some(nebula_core::WorktreeLanding {
+                                git_op: Some("submodule update".into()),
+                                git_op_live: true,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    },
+                );
+            }
+            let screen = screen_text(&draw_tall(&mut busy));
+            assert!(
+                screen.contains("⋯ git submodule update running · p: new session"),
+                "{screen}"
+            );
+
+            let mut old = with_empty_band();
+            old.requests.daemon_protocol = nebula_core::BRANCH_LANDING_PROTOCOL - 1;
+            crate::band_safety::sweep(&mut old, &mut out);
+            assert!(out.is_empty(), "{out:?}");
+        });
+    }
+
     /// With **Show all worktrees** on a checkout with nothing running is
     /// on the grid as an EMPTY BAND — its branch on the rule, and under
     /// it what can be done there — which `j` walks onto like any band.

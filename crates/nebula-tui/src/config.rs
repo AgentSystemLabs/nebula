@@ -438,6 +438,7 @@ pub enum SettingKind {
     FeedbackSound,
     PresetText,
     DeleteEmptyWorktree,
+    DeleteLandedBranch,
     AutoCleanupMerged,
     ShowAllWorktrees,
     Appearance,
@@ -560,6 +561,7 @@ impl SettingKind {
             SettingKind::ConfirmDragMove => (2026, 10, 2),
             SettingKind::SourceControlGraph | SettingKind::InlineGraphics => (2026, 10, 9),
             SettingKind::Appearance | SettingKind::DiffInline => (2026, 10, 28),
+            SettingKind::DeleteLandedBranch => (2026, 10, 10),
         }
     }
 
@@ -678,6 +680,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::DeleteEmptyWorktree,
                 label: "Delete emptied worktree",
                 hint: "Deleting a worktree's last session or terminal deletes the worktree with it, no question asked (off = that delete's confirm asks first)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::DeleteLandedBranch,
+                label: "Delete landed branch",
+                hint: "Deleting a worktree whose branch has landed on its base (by content: squash and cherry-pick count) deletes the branch too; k in the confirm keeps it (off = kept unless D)",
                 group: "",
             },
             SettingSpec {
@@ -1200,6 +1208,15 @@ pub struct Config {
     /// [`Config::show_all_worktrees`] on too: only the question is that
     /// setting's to drop.
     pub delete_empty_worktree: bool,
+    /// DELETE LANDED BRANCH: a worktree delete whose DELETE CHECK found
+    /// its branch landed on its base — every commit there by content, so
+    /// a squash merge or a cherry-pick counts — deletes the branch with
+    /// the checkout; `k` in the confirm keeps it. On by default. Off, the
+    /// branch is kept unless `D` says otherwise. A branch with unlanded
+    /// commits is kept by default either way. `git worktree remove`
+    /// alone leaves every branch behind, and nebula lists worktrees, not
+    /// branches: a kept branch is one nobody sees again.
+    pub delete_landed_branch: bool,
     /// AUTO-CLEAN MERGED WORKTREES: when the PR row for a linked worktree is
     /// a trustworthy merge, ask the daemon to archive idle sessions there
     /// and remove the checkout from disk. Off by default; root/default/base
@@ -1638,6 +1655,7 @@ impl Default for Config {
             feedback_sound: "Sosumi".into(),
             preset_text: PresetText::DEFAULT.as_str().into(),
             delete_empty_worktree: false,
+            delete_landed_branch: true,
             auto_cleanup_merged: false,
             show_all_worktrees: true,
             theme: "default".into(),
@@ -2568,6 +2586,7 @@ impl Config {
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::DeleteEmptyWorktree => on_off(self.delete_empty_worktree).into(),
+            SettingKind::DeleteLandedBranch => on_off(self.delete_landed_branch).into(),
             SettingKind::AutoCleanupMerged => on_off(self.auto_cleanup_merged).into(),
             SettingKind::ShowAllWorktrees => on_off(self.show_all_worktrees).into(),
             SettingKind::AskBeforeArchive => on_off(self.ask_before_archive).into(),
@@ -2664,6 +2683,9 @@ impl Config {
             }
             SettingKind::DeleteEmptyWorktree => {
                 self.delete_empty_worktree = !self.delete_empty_worktree;
+            }
+            SettingKind::DeleteLandedBranch => {
+                self.delete_landed_branch = !self.delete_landed_branch;
             }
             SettingKind::AutoCleanupMerged => {
                 self.auto_cleanup_merged = !self.auto_cleanup_merged;
@@ -3854,6 +3876,32 @@ mod tests {
         assert!(!cfg.delete_empty_worktree, "a missing key reads as off");
         let cfg: Config = serde_json::from_str(r#"{"delete_empty_worktree": true}"#).unwrap();
         assert!(cfg.delete_empty_worktree);
+    }
+
+    /// DELETE LANDED BRANCH starts on, sits on the Sessions tab beside
+    /// DELETE EMPTIED WORKTREE, toggles like any bool, and a config
+    /// predating the key reads as on.
+    #[test]
+    fn delete_landed_branch_is_on_by_default_and_toggles() {
+        let mut cfg = Config::default();
+        assert!(cfg.delete_landed_branch);
+        let (tab, row) = locate(SettingKind::DeleteLandedBranch).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        assert_eq!(
+            locate(SettingKind::DeleteEmptyWorktree),
+            Some((tab, row - 1))
+        );
+        assert_eq!(cfg.value_label(SettingKind::DeleteLandedBranch), "on");
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.delete_landed_branch);
+        assert_eq!(cfg.value_label(SettingKind::DeleteLandedBranch), "off");
+        cfg.cycle(tab, row, 1);
+        assert!(cfg.delete_landed_branch, "←/→ toggle it like Enter does");
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.delete_landed_branch, "a missing key reads as on");
+        let cfg: Config = serde_json::from_str(r#"{"delete_landed_branch": false}"#).unwrap();
+        assert!(!cfg.delete_landed_branch);
     }
 
     /// AUTO-CLEAN MERGED WORKTREES is opt-in, sits on the Sessions tab, and
