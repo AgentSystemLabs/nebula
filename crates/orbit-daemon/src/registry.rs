@@ -527,6 +527,39 @@ fn agent_spawn_command_with(
     additional_system_prompt: Option<&str>,
     guidance: bool,
 ) -> (String, Vec<String>, bool) {
+    agent_spawn_command_browsing(
+        harness,
+        session_id,
+        cwd,
+        model,
+        effort,
+        cmd_override,
+        initial_prompt,
+        additional_system_prompt,
+        guidance,
+        None,
+    )
+}
+
+/// [`agent_spawn_command_with`], plus BROWSER TESTING when `browser` names
+/// how agent-browser is typed (`crate::browser::for_spawn` decides; the
+/// caller passes it in so the argv stays a pure function of its inputs):
+/// the subagents and the Chrome extension's deny ride ahead of the system
+/// prompt, which gains the note to delegate. Ignored without `guidance`.
+#[allow(clippy::too_many_arguments)]
+fn agent_spawn_command_browsing(
+    harness: &orbit_core::harness::HarnessDescriptor,
+    session_id: Option<&str>,
+    cwd: Option<&Path>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    cmd_override: Option<&str>,
+    initial_prompt: Option<&str>,
+    additional_system_prompt: Option<&str>,
+    guidance: bool,
+    browser: Option<&str>,
+) -> (String, Vec<String>, bool) {
+    let browser = browser.filter(|_| guidance);
     if let Some(cmd) = cmd_override {
         let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
         if parts.is_empty() {
@@ -587,20 +620,25 @@ fn agent_spawn_command_with(
     // Guidance (worktree rules, then the PR scope) rides the
     // system-prompt flag where one is mapped, folds into the first prompt
     // where prepend is, and is dropped where neither is.
+    if let Some(shell) = browser {
+        args.extend(crate::browser::claude_args(shell));
+    }
     let mut initial_prompt = initial_prompt.map(str::to_string);
     if let Some(flag) = harness.system.append_flag.as_deref() {
-        push_system_prompt(&mut args, flag, guidance, cwd, additional_system_prompt);
+        push_system_prompt(
+            &mut args,
+            flag,
+            guidance,
+            cwd,
+            browser.is_some(),
+            additional_system_prompt,
+        );
     } else if harness.system.prepend_to_first_prompt {
-        let mut first = Vec::new();
-        if guidance {
-            first.push(CLAUDE_WORKTREE_GUIDANCE.to_string());
-            first.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE.to_string());
-            first.push(crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE.to_string());
-            first.push(crate::open_files::CLAUDE_OPEN_GUIDANCE.to_string());
-            if let Some(note) = cwd.and_then(crate::graphify::guidance_for) {
-                first.push(note);
-            }
-        }
+        let mut first = if guidance {
+            orbit_guidance(cwd, browser.is_some())
+        } else {
+            Vec::new()
+        };
         if let Some(prompt) = additional_system_prompt {
             first.push(prompt.to_string());
         }
@@ -624,32 +662,41 @@ fn agent_spawn_command_with(
     (program, args, resumed)
 }
 
-/// One system-prompt flag carrying orbit's guidance (worktree, spawn,
-/// then open) and whatever else the launch adds (the PR scope).
+/// Orbit's guidance notes, in order: worktree, spawn, session context,
+/// open, then the code graph when orbit has built one for this checkout,
+/// and the browser-testing note when the spawn carries its subagents.
+fn orbit_guidance(cwd: Option<&Path>, browser: bool) -> Vec<String> {
+    let mut notes: Vec<String> = [
+        CLAUDE_WORKTREE_GUIDANCE,
+        crate::sibling::CLAUDE_SPAWN_GUIDANCE,
+        crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE,
+        crate::open_files::CLAUDE_OPEN_GUIDANCE,
+    ]
+    .map(String::from)
+    .into();
+    notes.extend(cwd.and_then(crate::graphify::guidance_for));
+    if browser {
+        notes.push(crate::browser::CLAUDE_GUIDANCE.to_string());
+    }
+    notes
+}
+
+/// One system-prompt flag carrying orbit's guidance and whatever else the
+/// launch adds (the PR scope).
 fn push_system_prompt(
     args: &mut Vec<String>,
     flag: &str,
     guidance: bool,
     cwd: Option<&Path>,
+    browser: bool,
     additional: Option<&str>,
 ) {
-    let graph_note = cwd
-        .filter(|_| guidance)
-        .and_then(crate::graphify::guidance_for);
-    let mut system_prompt = Vec::new();
-    if guidance {
-        system_prompt.push(CLAUDE_WORKTREE_GUIDANCE);
-        system_prompt.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE);
-        system_prompt.push(crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE);
-        system_prompt.push(crate::open_files::CLAUDE_OPEN_GUIDANCE);
-        // The code graph, when orbit has built one for this checkout.
-        if let Some(note) = graph_note.as_deref() {
-            system_prompt.push(note);
-        }
-    }
-    if let Some(prompt) = additional {
-        system_prompt.push(prompt);
-    }
+    let mut system_prompt = if guidance {
+        orbit_guidance(cwd, browser)
+    } else {
+        Vec::new()
+    };
+    system_prompt.extend(additional.map(String::from));
     if !system_prompt.is_empty() {
         args.extend([flag.to_string(), system_prompt.join("\n\n")]);
     }
@@ -1941,6 +1988,96 @@ mod tests {
         let with_graph = system_prompt(tmp.path());
         assert!(with_graph.contains("graphify-out/"), "{with_graph}");
         assert!(with_graph.contains(&format!("{} query", crate::graphify::shell_command())));
+    }
+
+    /// BROWSER TESTING on: Claude gets both agent-browser subagents on
+    /// their models, the Chrome extension denied, and the note to delegate
+    /// — all ahead of a trailing prompt. Off (None), the argv is exactly
+    /// the plain one.
+    #[test]
+    fn spawn_command_gives_claude_browser_subagents_only_when_on() {
+        let all = test_registry();
+        let claude = test_harness(&all, AgentKind::Claude);
+        let spawn = |guidance: bool, browser: Option<&str>| {
+            agent_spawn_command_browsing(
+                &claude,
+                None,
+                Some(Path::new(TEST_CWD)),
+                None,
+                None,
+                None,
+                Some("check the login page"),
+                None,
+                guidance,
+                browser,
+            )
+            .1
+        };
+        let shell = "/somewhere/agent-browser";
+        let args = spawn(true, Some(shell));
+        let agents = args
+            .windows(2)
+            .find(|pair| pair[0] == "--agents")
+            .map(|pair| pair[1].clone())
+            .expect("an --agents flag");
+        let agents: serde_json::Value = serde_json::from_str(&agents).unwrap();
+        assert_eq!(agents["browser-check"]["model"], "haiku");
+        assert_eq!(agents["browser-test"]["model"], "sonnet");
+        assert!(agents["browser-test"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{shell} snapshot -i")));
+        assert!(args.contains(&"--disallowedTools=mcp__claude-in-chrome__*".to_string()));
+        let system_prompt = args
+            .windows(2)
+            .find(|pair| pair[0] == "--append-system-prompt")
+            .map(|pair| pair[1].clone())
+            .expect("a system prompt");
+        assert!(system_prompt.contains(crate::browser::CLAUDE_GUIDANCE));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("check the login page")
+        );
+
+        // Off, or a spawn without guidance (a Cloud launch): no trace.
+        for args in [spawn(true, None), spawn(false, Some(shell))] {
+            assert!(!args.iter().any(|a| a == "--agents"), "{args:?}");
+            assert!(!args.iter().any(|a| a.starts_with("--disallowedTools")));
+            assert!(!args.iter().any(|a| a.contains("browser-check")));
+        }
+        assert_eq!(
+            spawn(true, None),
+            agent_spawn_command_with(
+                &claude,
+                None,
+                Some(Path::new(TEST_CWD)),
+                None,
+                None,
+                None,
+                Some("check the login page"),
+                None,
+                true,
+            )
+            .1
+        );
+    }
+
+    /// Only the built-in Claude entry takes the browser flags — not other
+    /// CLIs, nor a custom one that merely speaks Claude's hooks.
+    #[test]
+    fn browser_testing_applies_to_built_in_claude_only() {
+        let all = test_registry();
+        assert!(crate::browser::applies_to(&test_harness(
+            &all,
+            AgentKind::Claude
+        )));
+        for kind in [AgentKind::Codex, AgentKind::Cursor, AgentKind::Pi] {
+            assert!(!crate::browser::applies_to(&test_harness(&all, kind)));
+        }
+        let mut lookalike = test_harness(&all, AgentKind::Claude);
+        lookalike.id = "my-claude".into();
+        assert!(lookalike.claude_like());
+        assert!(!crate::browser::applies_to(&lookalike));
     }
 
     #[test]

@@ -114,7 +114,7 @@ pub fn run(fix: bool) -> Result<()> {
         ),
         integration(
             &tools::AGENT_BROWSER,
-            "browser testing for Claude",
+            "browser testing for Claude (Haiku / Sonnet subagents)",
             "needs npm (above)",
         ),
         tool(

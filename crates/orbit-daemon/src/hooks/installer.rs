@@ -207,13 +207,17 @@ fn managed_group(endpoint: &str, event: &str, matcher: Option<&str>) -> Value {
 /// `<cwd>/.claude/settings.local.json`, plus the permission rule that lets
 /// the auto-title `orbit rename` run unprompted.
 pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
-    // orbit's own commands, plus graphify's read-only graph queries spelled
-    // the way this machine runs graphify (crate::graphify::allow_rules).
-    let graphify = crate::graphify::allow_rules();
+    // orbit's own commands, plus graphify's read-only graph queries and
+    // agent-browser (when BROWSER TESTING is on), spelled the way this
+    // machine runs them.
+    let extra: Vec<String> = crate::graphify::allow_rules()
+        .into_iter()
+        .chain(crate::browser::allow_rules())
+        .collect();
     let rules: Vec<&str> = CLAUDE_ALLOW_RULES
         .iter()
         .copied()
-        .chain(graphify.iter().map(String::as_str))
+        .chain(extra.iter().map(String::as_str))
         .collect();
     install_managed_hooks(
         &cwd.join(CLAUDE_DIR),

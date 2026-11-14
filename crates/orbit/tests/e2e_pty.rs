@@ -59,8 +59,14 @@ impl TestEnv {
 
     /// Daemon with no `ORBIT_AGENT_CMD` override, so agent spawns take the
     /// real login-shell path, and `$SHELL` set to `shell`. Lets a test decide
-    /// what the daemon can find on PATH.
+    /// what the daemon can find on PATH. BROWSER TESTING is off unless the
+    /// test wrote a config of its own: a real Claude launch would otherwise
+    /// add its flags to the argv these tests read, and start a machine-wide
+    /// `npm install -g agent-browser` where npm is but agent-browser isn't.
     fn spawn_daemon_with_shell(&self, shell: &Path) -> DaemonProc {
+        if !self.tmp.path().join("data/config.json").exists() {
+            self.write_config(r#"{"browser_testing": false}"#);
+        }
         self.spawn_daemon_in(shell, None, &[])
     }
 

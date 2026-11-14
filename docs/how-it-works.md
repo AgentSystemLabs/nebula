@@ -326,6 +326,14 @@
   local `mmdc` when one is on PATH and otherwise shows the source plus a one-line install hint. The
   daemon only checks the caller is a known session and passes the agent's checkout along as the
   editor's working directory. Same appended prompt, plus a `Bash(orbit open:*)` permission.
+- **Ask the agent to test it in a browser and a cheaper model does.** A Claude session starts with
+  two subagents passed through `--agents` — `browser-check` (Haiku) for single-page checks and
+  `browser-test` (Sonnet) for multi-step flows — that drive Vercel's `agent-browser` CLI, and its
+  appended prompt says to delegate browser work to them; Claude picks one by the task. The Claude in
+  Chrome extension's tools are denied for that launch with `--disallowedTools=mcp__claude-in-chrome__*`
+  (no settings file changes), plus a `Bash(agent-browser:*)` permission. A spawn that finds
+  agent-browser missing starts its one-time `npm install -g` in the background and launches without
+  waiting. `"browser_testing": false` turns it off.
 - **Everything persists in SQLite** (`~/.local/share/orbit/orbit.db` or the platform equivalent):
   projects, worktrees, agents (with kind + CLI session ids), links, and your last selection.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI in the selected worktree

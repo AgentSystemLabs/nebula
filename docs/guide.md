@@ -15,6 +15,7 @@ docs go deeper on each topic; start here.
 6. [Worktrees: parallel work without collisions](#6-worktrees-parallel-work-without-collisions)
 7. [Reviewing what an agent did](#7-reviewing-what-an-agent-did)
    - [The code graph (graphify)](#the-code-graph-graphify)
+   - [Browser testing](#browser-testing)
 8. [GitHub: pull requests and issues](#8-github-pull-requests-and-issues)
 9. [Presets: tasks you repeat](#9-presets-tasks-you-repeat)
 10. [Agents that drive Orbit](#10-agents-that-drive-orbit)
@@ -217,6 +218,24 @@ or uses a copy you already have):
 
 To turn it off: `"graphify": false` in `config.json` for every project, or in a project's
 `.orbit.json` for just that one.
+
+### Browser testing
+
+Ask a Claude session to check or test something in a browser and it hands the job to a cheaper
+model driving [agent-browser](https://github.com/vercel-labs/agent-browser) (Vercel's browser CLI),
+with nothing to set up — it only needs `npm` (Orbit installs agent-browser once per machine with
+`npm install -g agent-browser` the first time a Claude session starts, or uses a copy you have):
+
+- **`browser-check`** runs on **Haiku** for quick, single-page checks: open a URL, confirm something
+  renders or a text appears, read a value, take a screenshot.
+- **`browser-test`** runs on **Sonnet** for multi-step flows: logging in, filling and submitting
+  forms, navigating across pages, reproducing a UI bug, end-to-end checks.
+- Claude picks one by the task and gets back a short report — what was checked, what was seen,
+  pass or fail, and where the screenshots are. agent-browser commands are pre-approved, so no prompts.
+- The Claude in Chrome extension is switched off for sessions Orbit starts (for that launch only —
+  your Claude settings are not changed), so browser work never lands in your own Chrome.
+
+To turn it off: `"browser_testing": false` in `config.json`.
 
 ## 8. GitHub: pull requests and issues
 

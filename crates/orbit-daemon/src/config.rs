@@ -58,6 +58,11 @@ pub struct Config {
     /// every checkout when the `graphify` CLI is installed, and point Claude
     /// at it. On by default; a checkout's `.orbit.json` can opt out alone.
     pub graphify: bool,
+    /// BROWSER TESTING: Claude sessions test web pages through agent-browser
+    /// subagents (Haiku for quick checks, Sonnet for multi-step flows)
+    /// instead of the Claude in Chrome extension, when agent-browser is
+    /// installed or npm is there to install it. On by default.
+    pub browser_testing: bool,
 }
 
 /// One project's entry under `projects` — the rows of the TUI's Project
@@ -83,6 +88,7 @@ impl Default for Config {
             harnesses: BTreeMap::new(),
             projects: BTreeMap::new(),
             graphify: true,
+            browser_testing: true,
         }
     }
 }

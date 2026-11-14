@@ -522,6 +522,12 @@ impl Daemon {
             rule.as_deref(),
             initial_prompt,
         );
+        // BROWSER TESTING: a plain built-in Claude launch gets the
+        // agent-browser subagents (and starts the tool's one-time install
+        // when it is missing).
+        let browser = plain_launch
+            .then(|| crate::browser::for_spawn(&harness))
+            .flatten();
         let (program, args, resumed) = match (cloud_task, attach) {
             (Some(task), _) => claude_cloud_spawn_command(
                 &harness,
@@ -542,7 +548,7 @@ impl Daemon {
                     false,
                 )
             }
-            (None, None) => agent_spawn_command_with(
+            (None, None) => agent_spawn_command_browsing(
                 &harness,
                 resume_sid,
                 Some(&worktree.path),
@@ -552,6 +558,7 @@ impl Daemon {
                 prompts.initial.as_deref(),
                 prompts.system.as_deref(),
                 true,
+                browser.as_deref(),
             ),
         };
         // Whether the CLI is handed a first turn — a task, a notice or a
