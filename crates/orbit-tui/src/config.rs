@@ -3154,6 +3154,10 @@ mod tests {
             "0.46.0",
             include_str!("../../orbit-core/fixtures/config-0.46.0.json"),
         ),
+        (
+            "0.47.0",
+            include_str!("../../orbit-core/fixtures/config-0.47.0.json"),
+        ),
     ];
 
     fn read_json_file(path: &Path) -> serde_json::Value {
