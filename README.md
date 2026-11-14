@@ -72,6 +72,17 @@ It downloads the prebuilt binary for your platform from the latest release into 
 no release for your platform yet. Afterwards `orbit upgrade` updates in place without stopping your
 sessions, and `orbit --version` says which build you are on.
 
+Or with **Homebrew** (macOS or Linux):
+
+```sh
+brew tap amenadem/orbit https://github.com/AmenAdem/Orbit
+brew install amenadem/orbit/orbit
+```
+
+Use the full name `amenadem/orbit/orbit`: plain `orbit` is an unrelated Homebrew cask. `orbit upgrade`
+on a Homebrew install runs `brew upgrade` for you; after a plain `brew upgrade`, run `orbit reload` to
+move a running daemon onto the new binary.
+
 **What you need:** `git` and [Claude Code](https://code.claude.com/docs/en/setup) (`claude`), plus
 **`uv`** and **`npm`** — Orbit installs the tools it integrates through those two, once per machine,
 the first time each is needed. `gh` is the one optional extra worth installing yourself, for pull

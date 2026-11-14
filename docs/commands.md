@@ -159,7 +159,8 @@ orbit browser [--port N] [--bind ADDR | --public] [--credential USER:PASSWORD] [
                           # live, writable terminal, so put something in front of it and use
                           # --credential to add ttyd's HTTP basic auth on top. --no-open serves
                           # without launching a desktop browser, for a box that has none
-orbit upgrade            # install the latest release (--force on a dev build). Swapping the
+orbit upgrade            # install the latest release (--force on a dev build); a Homebrew
+                          # install runs `brew upgrade amenadem/orbit/orbit` instead. Swapping the
                           # binary doesn't touch a running daemon, so afterwards it shuts an idle
                           # one (no live sessions) down for you and the next launch starts on the
                           # new binary. With sessions live it restarts the daemon in place onto

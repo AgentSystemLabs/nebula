@@ -56,12 +56,57 @@ fn restarted_note(sessions: usize) -> String {
 }
 
 pub fn run_upgrade(force: bool) -> Result<()> {
+    // A Homebrew install upgrades through brew: install.sh would drop a
+    // second copy in ~/.local/bin, and whichever comes first on PATH wins.
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe));
+    if let Some(prefix) = exe.as_deref().and_then(homebrew_prefix) {
+        brew_upgrade(&prefix)?;
+        finish_daemon_handoff();
+        return Ok(());
+    }
     let url = install_url();
     // The runtime dir is already the 0700 auth boundary; staging the script
     // there keeps it out of a world-writable /tmp before we execute it.
     orbit_daemon::lifecycle::ensure_runtime_dir()?;
     upgrade_with(&url, &orbit_core::paths::runtime_dir(), force)?;
     finish_daemon_handoff();
+    Ok(())
+}
+
+/// The formula's full name. Plain `orbit` is an unrelated Homebrew cask.
+const BREW_FORMULA: &str = "amenadem/orbit/orbit";
+
+/// The Homebrew prefix when `exe` (symlinks resolved) is a Homebrew
+/// install: `<prefix>/Cellar/orbit/<version>/bin/orbit`.
+fn homebrew_prefix(exe: &Path) -> Option<PathBuf> {
+    let mut up = exe.ancestors();
+    let formula = up.nth(3)?;
+    let cellar = up.next()?;
+    (formula.file_name()? == "orbit" && cellar.file_name()? == "Cellar")
+        .then(|| cellar.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+/// `brew upgrade` the formula, with the brew that owns `prefix` — the one
+/// on PATH may belong to another prefix (Intel and Apple Silicon side by
+/// side).
+fn brew_upgrade(prefix: &Path) -> Result<()> {
+    let own = prefix.join("bin/brew");
+    let brew = if own.is_file() {
+        own
+    } else {
+        PathBuf::from("brew")
+    };
+    println!("orbit was installed with Homebrew — running: brew upgrade {BREW_FORMULA}");
+    let status = Command::new(&brew)
+        .args(["upgrade", BREW_FORMULA])
+        .status()
+        .with_context(|| format!("run {}", brew.display()))?;
+    if !status.success() {
+        bail!("brew upgrade failed ({status})");
+    }
     Ok(())
 }
 
@@ -514,6 +559,24 @@ mod tests {
         for no in ["\n", "n\n", "no\n", "sure\n", ""] {
             assert!(!is_yes(no), "{no:?}");
         }
+    }
+
+    #[test]
+    fn a_cellar_path_is_a_homebrew_install() {
+        let p = |s: &str| homebrew_prefix(Path::new(s));
+        assert_eq!(
+            p("/opt/homebrew/Cellar/orbit/1.0.2/bin/orbit"),
+            Some(PathBuf::from("/opt/homebrew"))
+        );
+        assert_eq!(
+            p("/home/linuxbrew/.linuxbrew/Cellar/orbit/1.0.2/bin/orbit"),
+            Some(PathBuf::from("/home/linuxbrew/.linuxbrew"))
+        );
+        assert_eq!(p("/Users/me/.local/bin/orbit"), None);
+        assert_eq!(p("/Users/me/.cargo/bin/orbit"), None);
+        // Some other formula's Cellar, or a Cellar folder that isn't one.
+        assert_eq!(p("/opt/homebrew/Cellar/other/1.0/bin/orbit"), None);
+        assert_eq!(p("/x/Cellar/orbit/bin/orbit"), None);
     }
 
     #[test]

@@ -61,3 +61,31 @@ jobs:
         with:
           files: orbit-*.tar.gz
           generate_release_notes: true
+
+  # Point the Homebrew formula (Formula/orbit.rb — this repo is also the tap)
+  # at the release just published, so `brew upgrade` picks it up.
+  homebrew:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Regenerate formula
+        run: scripts/homebrew-formula.sh "$GITHUB_REF_NAME" dist > Formula/orbit.rb
+
+      - name: Commit to main
+        run: |
+          git diff --quiet -- Formula/orbit.rb && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Homebrew formula for $GITHUB_REF_NAME" -- Formula/orbit.rb
+          # main may have moved while the matrix built.
+          git pull --rebase origin main
+          git push origin HEAD:main
