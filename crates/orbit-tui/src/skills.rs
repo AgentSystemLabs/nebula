@@ -143,7 +143,7 @@ impl SkillPick {
     }
 }
 
-/// Claude's own folder: `~/.claude`. Unit tests never see the real one —
+/// Claude's own folder: `$CLAUDE_CONFIG_DIR`, else `~/.claude`. Unit tests never see the real one —
 /// they get the folder [`with_claude_home`] names, or one that does not
 /// exist.
 pub fn claude_home() -> PathBuf {
@@ -157,9 +157,8 @@ pub fn claude_home() -> PathBuf {
     }
     #[cfg(not(test))]
     {
-        orbit_core::env::home_dir()
-            .unwrap_or_default()
-            .join(".claude")
+        // `CLAUDE_CONFIG_DIR` when set, as Claude Code itself reads it.
+        orbit_core::paths::claude_config_dir().unwrap_or_default()
     }
 }
 

@@ -310,14 +310,16 @@ fn launcher_grid_footer_hint(app: &App, _th: Theme) -> FooterHint {
             (k(Action::Activate), "open"),
             (k(Action::QuickPrompt), "new task"),
             (k(Action::FollowUp), "follow-up"),
+            // Early, so a narrow terminal still shows where the rest is.
+            (k(Action::Help), "all keys"),
             (k(Action::Palette), "jump"),
             (
                 format!("{}{}", k(Action::PrevProjectTab), k(Action::NextProjectTab)),
                 "projects",
             ),
             (k(Action::GitDiff), "diff"),
+            (k(Action::GitGraph), "git graph"),
             (k(Action::Settings), "settings"),
-            (k(Action::Help), "all keys"),
             (k(Action::Quit), "quit"),
         ]
     };
