@@ -4410,6 +4410,9 @@ pub struct JobState {
     /// This TUI process's own RSS, sampled alongside each metrics request
     /// (the daemon can't see us).
     pub client_rss_bytes: u64,
+    /// USAGE AND LIMITS as the daemon last pushed them: the footer's plan
+    /// limits and each Claude card's context use.
+    pub usage: crate::usage::Usage,
 }
 
 pub struct App {

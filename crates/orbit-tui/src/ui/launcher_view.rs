@@ -1458,6 +1458,8 @@ fn draw_list_row(
         text_style: Style,
         badge: String,
         badge_style: Style,
+        /// `ctx 42%`, before the badge.
+        ctx: Option<(String, Color)>,
     }
     let e = match card {
         crate::launcher::Card::Session(row) => {
@@ -1478,6 +1480,7 @@ fn draw_list_row(
                 text_style: Style::default().fg(quiet_or(th.muted)),
                 badge: look.ago,
                 badge_style: look.ago_style,
+                ctx: card_context(app, a, quiet_or(th.dim), th),
             }
         }
         crate::launcher::Card::Terminal(t) => Entry {
@@ -1508,6 +1511,7 @@ fn draw_list_row(
                 EXITED_BADGE.into()
             },
             badge_style: Style::default().fg(th.err),
+            ctx: None,
         },
     };
     let mut spans = vec![mark, e.lead];
@@ -1518,6 +1522,12 @@ fn draw_list_row(
     let keep_badge = badge_w > 0 && room >= badge_w + 1 + 8;
     if keep_badge {
         room -= badge_w + 1;
+    }
+    let ctx = e
+        .ctx
+        .filter(|(text, _)| room >= text.chars().count() + 1 + 8);
+    if let Some((text, _)) = &ctx {
+        room -= text.chars().count() + 1;
     }
     let name_w = name_col.max(1).min(room);
     let name = truncate(&e.name, name_w);
@@ -1547,8 +1557,16 @@ fn draw_list_row(
             spans.push(Span::styled(text, e.text_style));
         }
     }
-    if keep_badge {
+    if keep_badge || ctx.is_some() {
         spans.push(Span::raw(" ".repeat(room.saturating_sub(used) + 1)));
+    }
+    if let Some((text, color)) = ctx {
+        spans.push(Span::styled(text, Style::default().fg(color)));
+        if keep_badge {
+            spans.push(Span::raw(" "));
+        }
+    }
+    if keep_badge {
         spans.push(Span::styled(badge, e.badge_style));
     }
     let mut line = Paragraph::new(Line::from(spans));
@@ -2206,33 +2224,49 @@ fn draw_card(
     // project is not on the card either: the grid is one project's,
     // named in the header.
     let harness = runs_on_line(a, cfg);
-    let mut second = if harness.is_empty() {
-        Vec::new()
+    // At the row's right end: how full the session's context window is
+    // (USAGE AND LIMITS — `ctx 42%`, warning colours from 80%), then the
+    // issue it was started from — a link, and the only thing on the card
+    // under the pointer that is not the card (`HitTarget::LauncherCardIssue`,
+    // placed by `card_issue_rect`, so it stays last).
+    let label = card_issue_label(app, a)
+        .filter(|label| card_issue_rect(area, label.chars().count()).is_some());
+    let label_w = label.as_ref().map_or(0, |l| l.chars().count());
+    let ctx = card_context(app, a, quiet_or(dim), th).filter(|(text, _)| {
+        // Only while what it runs on keeps a few letters.
+        width >= label_w + text.chars().count() + 2 + 6
+    });
+    let right_w = label_w
+        + ctx.as_ref().map_or(0, |(t, _)| t.chars().count())
+        + usize::from(label.is_some() && ctx.is_some());
+    let mut second = Vec::new();
+    let room = if right_w == 0 {
+        width
     } else {
-        vec![Span::styled(
-            truncate(&harness, width),
-            Style::default().fg(quiet_or(dim)),
-        )]
+        width.saturating_sub(right_w + 1)
     };
-    // The issue it was started from, at the row's right end — a link, and
-    // the only thing on the card under the pointer that is not the card
-    // (`HitTarget::LauncherCardIssue`, placed by `card_issue_rect`).
-    if let Some(label) = card_issue_label(app, a) {
-        let label_w = label.chars().count();
-        if card_issue_rect(area, label_w).is_some() {
-            let room = width - label_w - 1;
-            let harness = truncate(&harness, room);
-            let pad = width - label_w - harness.chars().count();
-            let mut style = Style::default().fg(quiet_or(th.accent));
-            if app.launcher.hover_crumb == Some(HitTarget::LauncherCardIssue(a.id.clone())) {
-                style = style.add_modifier(Modifier::UNDERLINED);
-            }
-            second = vec![
-                Span::styled(harness, Style::default().fg(quiet_or(dim))),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(label, style),
-            ];
+    let harness = truncate(&harness, room);
+    let harness_w = harness.chars().count();
+    if !harness.is_empty() {
+        second.push(Span::styled(harness, Style::default().fg(quiet_or(dim))));
+    }
+    if right_w > 0 {
+        second.push(Span::raw(
+            " ".repeat(width.saturating_sub(harness_w + right_w)),
+        ));
+    }
+    if let Some((text, color)) = ctx {
+        second.push(Span::styled(text, Style::default().fg(color)));
+        if label.is_some() {
+            second.push(Span::raw(" "));
         }
+    }
+    if let Some(label) = label {
+        let mut style = Style::default().fg(quiet_or(th.accent));
+        if app.launcher.hover_crumb == Some(HitTarget::LauncherCardIssue(a.id.clone())) {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        second.push(Span::styled(label, style));
     }
 
     // The last thing it was asked to do, on the prompt's own `›` (which
@@ -2254,6 +2288,22 @@ fn draw_card(
         let Some(r) = row_rect(inner, i) else { break };
         Paragraph::new(Line::from(spans)).render(r, buf);
     }
+}
+
+/// A session's `ctx 42%` and its colour on a card or LIST entry whose
+/// plain text is `base`: none on an archived one — put away, its context
+/// is nobody's concern — nor before its status line has counted it.
+fn card_context(
+    app: &App,
+    a: &orbit_core::Agent,
+    base: Color,
+    th: Theme,
+) -> Option<(String, Color)> {
+    if a.archived {
+        return None;
+    }
+    let pct = app.jobs.usage.context_pct(&a.id)?;
+    Some(crate::usage::context_label(pct, base, th))
 }
 
 /// The `#15` an ISSUE SESSION's card shows for the GitHub issue it was
@@ -4243,6 +4293,78 @@ mod tests {
             .take(usize::from(chip.width))
             .collect();
         assert_eq!(drawn, "#15", "the target is the text");
+    }
+
+    /// USAGE AND LIMITS: a session's context use rides the right end of
+    /// its runs-on row — dim, then warn-coloured from 80% — ahead of an
+    /// issue number, which keeps the very end; an archived card shows none.
+    #[test]
+    fn a_card_shows_its_context_use_on_the_runs_on_row() {
+        let mut app = a_tree();
+        select(&mut app, "api");
+        let th = app.chrome.theme;
+        let body = Rect::new(0, 0, 100, 30);
+        let id = app.tree.agents[0].id.clone();
+        let runs_row = |app: &mut App| {
+            let lines = drawn_lines(app, body);
+            let row = lines
+                .iter()
+                .position(|l| l.contains("s0"))
+                .expect("the session's card drawn");
+            (row + 1, lines[row + 1].clone())
+        };
+        let (_, row) = runs_row(&mut app);
+        assert!(!row.contains("ctx"), "nothing before a report: {row:?}");
+
+        app.jobs.usage.land(id.clone(), Some(42.4), None, None);
+        let (_, row) = runs_row(&mut app);
+        assert!(row.contains("claude"), "{row:?}");
+        assert!(row.contains("ctx 42%"), "{row:?}");
+        assert!(row.find("claude") < row.find("ctx 42%"), "{row:?}");
+
+        // Warn-coloured from 80%.
+        app.jobs.usage.land(id.clone(), Some(85.0), None, None);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(body.width, body.height))
+                .unwrap();
+        terminal.draw(|f| draw(f, &mut app, body)).unwrap();
+        let (y, row) = runs_row(&mut app);
+        let x = row
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(3)
+            .position(|w| w.iter().collect::<String>() == "ctx")
+            .expect("the label drawn");
+        let cell = terminal.backend().buffer()[(x as u16, y as u16)].clone();
+        assert_eq!(cell.fg, th.warn, "warn from 80%");
+
+        // An issue number keeps the very end; the context sits before it.
+        app.tree.agents[0].issue_url = Some("https://github.com/o/r/issues/15".into());
+        app.launcher.card_issue_number = true;
+        let (_, row) = runs_row(&mut app);
+        assert!(row.contains("ctx 85% #15 "), "{row:?}");
+
+        app.tree.agents[0].archived = true;
+        app.launcher.show_archived = true;
+        let lines = drawn_lines(&mut app, body);
+        assert!(!lines.iter().any(|l| l.contains("ctx 85%")), "{lines:#?}");
+    }
+
+    /// The LIST layout carries the same `ctx 42%`, before the age badge.
+    #[test]
+    fn a_list_entry_shows_its_context_use() {
+        let mut app = a_tree();
+        select(&mut app, "api");
+        app.launcher.launcher_list = true;
+        let id = app.tree.agents[0].id.clone();
+        app.jobs.usage.land(id, Some(42.0), None, None);
+        let lines = drawn_lines(&mut app, Rect::new(0, 0, 100, 30));
+        let row = lines
+            .iter()
+            .find(|l| l.contains("s0"))
+            .expect("the session's entry");
+        assert!(row.contains("ctx 42%"), "{row:?}");
+        assert!(row.find("s0") < row.find("ctx 42%"), "{row:?}");
     }
 
     /// The runs-on line is the harness, then the model, then the effort,

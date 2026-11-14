@@ -6,7 +6,7 @@ use crate::pr_scope::CreatePrAgentSpec;
 use crate::registry::{CreateAgentSpec, Daemon};
 use anyhow::{Context, Result};
 use orbit_core::codec::{read_frame, write_frame};
-use orbit_core::{ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION};
+use orbit_core::{ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION, USAGE_PROTOCOL};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -87,6 +87,9 @@ struct ClientConnection {
     attached: HashMap<SessionRef, tokio::task::JoinHandle<()>>,
     subscription: Option<tokio::task::JoinHandle<()>>,
     handshaken: bool,
+    /// The protocol the client's `Hello` advertised: events newer than it
+    /// are never pushed to it (`USAGE_PROTOCOL`).
+    client_protocol: u32,
     /// The client process, when the socket's credentials name it.
     peer_pid: Option<u32>,
 }
@@ -99,6 +102,7 @@ impl ClientConnection {
             attached: HashMap::new(),
             subscription: None,
             handshaken: false,
+            client_protocol: 0,
             peer_pid: None,
         }
     }
@@ -649,6 +653,7 @@ impl ClientConnection {
 
     async fn handle_hello(&mut self, protocol_version: u32) -> bool {
         self.handshaken = orbit_core::protocol_compatible_with(protocol_version);
+        self.client_protocol = protocol_version;
         let reply = if self.handshaken {
             ServerEvent::HelloOk {
                 protocol_version: PROTOCOL_VERSION,
@@ -668,13 +673,28 @@ impl ClientConnection {
         // the two is not lost: it arrives after the Snapshot, where a client
         // folds it in by id.
         let rx = self.daemon.events.subscribe();
+        // USAGE AND LIMITS go only to a client that can decode them; the
+        // same subscribe-first order, so a report between the replay and
+        // the forward is not lost.
+        let usage_rx =
+            (self.client_protocol >= USAGE_PROTOCOL).then(|| self.daemon.usage.subscribe());
         let snapshot = self
             .blocking_daemon(|daemon| daemon.snapshot())
             .await
             .unwrap_or_else(|_| empty_snapshot());
         self.send(snapshot).await;
+        if usage_rx.is_some() {
+            for ev in usage_replay(&self.daemon) {
+                self.send(ev).await;
+            }
+        }
         let tx = self.out_tx.clone();
-        let forward = tokio::spawn(forward_subscription_events(self.daemon.clone(), rx, tx));
+        let forward = tokio::spawn(forward_subscription_events(
+            self.daemon.clone(),
+            rx,
+            usage_rx,
+            tx,
+        ));
         if let Some(old) = self.subscription.replace(forward) {
             old.abort();
         }
@@ -1194,25 +1214,57 @@ async fn send_snapshot(daemon: &Daemon, tx: &mpsc::Sender<ServerEvent>) -> bool 
     tx.send(snapshot_or_empty(daemon)).await.is_ok()
 }
 
+/// Every agent's current `Usage`, as a subscriber that just took its
+/// snapshot (or lagged past some reports) should see it.
+fn usage_replay(daemon: &Daemon) -> Vec<ServerEvent> {
+    daemon.usage.snapshot(orbit_core::clock::now_secs() as i64)
+}
+
 async fn forward_subscription_events(
     daemon: Arc<Daemon>,
     mut rx: broadcast::Receiver<ServerEvent>,
+    mut usage_rx: Option<broadcast::Receiver<ServerEvent>>,
     tx: mpsc::Sender<ServerEvent>,
 ) {
     loop {
-        match rx.recv().await {
-            Ok(ev) => {
-                if tx.send(ev).await.is_err() {
-                    break;
-                }
+        let usage = async {
+            match usage_rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
             }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(skipped, "client subscription lagged; sending snapshot");
-                if !send_snapshot(&daemon, &tx).await {
-                    break;
+        };
+        tokio::select! {
+            received = rx.recv() => match received {
+                Ok(ev) => {
+                    if tx.send(ev).await.is_err() {
+                        break;
+                    }
                 }
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "client subscription lagged; sending snapshot");
+                    if !send_snapshot(&daemon, &tx).await {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            received = usage => match received {
+                Ok(ev) => {
+                    if tx.send(ev).await.is_err() {
+                        break;
+                    }
+                }
+                // Only the newest report per agent matters: replay those.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    for ev in usage_replay(&daemon) {
+                        if tx.send(ev).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                // The board goes only with the daemon itself.
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
         }
     }
 }
@@ -1271,7 +1323,7 @@ mod tests {
             .unwrap();
 
         let (tx, mut out) = mpsc::channel(4);
-        let forward = tokio::spawn(forward_subscription_events(daemon, rx, tx));
+        let forward = tokio::spawn(forward_subscription_events(daemon, rx, None, tx));
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(1), out.recv())
             .await
@@ -1283,5 +1335,44 @@ mod tests {
             matches!(ev, ServerEvent::Snapshot { .. }),
             "lag should resync with a snapshot, got {ev:?}"
         );
+    }
+
+    /// `Usage` reaches a subscriber whose `Hello` was at least
+    /// `USAGE_PROTOCOL` — replayed right after its Snapshot, then live —
+    /// and never one that said an older protocol, which could not decode it.
+    #[tokio::test]
+    async fn usage_events_reach_only_clients_that_know_them() {
+        use orbit_core::{AgentId, MIN_COMPATIBLE_PROTOCOL};
+        let daemon = test_daemon();
+        let report = || crate::usage::parse_report(r#"{"context_window":{"used_percentage":42}}"#);
+        daemon.usage.record(&AgentId("a1".into()), report(), 1_000);
+
+        let subscribe = |version: u32| {
+            let daemon = daemon.clone();
+            async move {
+                let (tx, rx) = mpsc::channel(64);
+                let mut client = ClientConnection::new(daemon, tx);
+                assert!(client.handle_hello(version).await);
+                client.handle_subscribe().await.unwrap();
+                (client, rx)
+            }
+        };
+        let (_new, mut new_rx) = subscribe(USAGE_PROTOCOL).await;
+        let (_old, mut old_rx) = subscribe(MIN_COMPATIBLE_PROTOCOL.max(USAGE_PROTOCOL - 1)).await;
+        daemon.usage.record(&AgentId("a2".into()), report(), 1_000);
+
+        let drain = |rx: &mut mpsc::Receiver<ServerEvent>| {
+            let mut usage = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let ServerEvent::Usage { agent, .. } = ev {
+                    usage.push(agent.0);
+                }
+            }
+            usage
+        };
+        // Let the forward tasks run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(drain(&mut new_rx), ["a1", "a2"], "replay, then live");
+        assert!(drain(&mut old_rx).is_empty(), "an older client gets none");
     }
 }

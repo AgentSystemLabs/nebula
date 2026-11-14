@@ -5149,6 +5149,93 @@ fn footer_shows_session_counts_and_memory() {
     );
 }
 
+/// USAGE AND LIMITS: the daemon's `Usage` lands in the footer as
+/// `5h 23% ↻HH:MM · wk 41%` just left of the memory readout, each window
+/// warn-coloured from 80% and err-coloured from 95%; a narrow bar drops
+/// the reset time, then the weekly window. Nothing shows before a report.
+#[test]
+fn footer_shows_plan_limits_from_the_daemon() {
+    use orbit_core::{MetricsSnapshot, RateWindow};
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let th = app.chrome.theme;
+    let draw = |app: &mut App, width: u16| {
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        terminal
+    };
+    let footer = |terminal: &Terminal<TestBackend>| -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .map(|x| buf[(x, buf.area.height - 1)].symbol().to_string())
+            .collect()
+    };
+    assert!(
+        !footer(&draw(&mut app, 120)).contains("5h "),
+        "no data, no limits"
+    );
+
+    app.jobs.last_metrics = Some(MetricsSnapshot {
+        daemon_pid: 1,
+        daemon_rss_bytes: 1024 * 1024 * 1024,
+        system_total_bytes: 0,
+        sessions: vec![],
+    });
+    let now = orbit_core::clock::now_secs() as i64;
+    let resets = now + 3600;
+    hse(
+        &mut app,
+        ServerEvent::Usage {
+            agent: AgentId("a1".into()),
+            context_pct: Some(42.0),
+            context_window: Some(200_000),
+            five_hour: Some(RateWindow {
+                used_pct: 85.0,
+                resets_at: resets,
+            }),
+            seven_day: Some(RateWindow {
+                used_pct: 96.0,
+                resets_at: now + 86_400,
+            }),
+        },
+    );
+    assert_eq!(
+        app.jobs.usage.context_pct(&AgentId("a1".into())),
+        Some(42.0)
+    );
+    let at = orbit_core::clock::local_hh_mm(resets);
+    let terminal = draw(&mut app, 120);
+    let line = footer(&terminal);
+    let limits = format!("5h 85% ↻{at} · wk 96% · ");
+    assert!(
+        line.ends_with(&format!("{limits}0 agents · 0 terms · 1.0 GB")),
+        "{line:?}"
+    );
+    let buf = terminal.backend().buffer();
+    let fg_of = |needle: &str| {
+        let chars: Vec<char> = line.chars().collect();
+        let n: Vec<char> = needle.chars().collect();
+        let x = chars
+            .windows(n.len())
+            .position(|w| w == n.as_slice())
+            .unwrap_or_else(|| panic!("{needle} in {line:?}"));
+        buf[(x as u16, 29)].fg
+    };
+    assert_eq!(fg_of("5h 85%"), th.warn, "warn from 80%");
+    assert_eq!(fg_of("wk 96%"), th.err, "err from 95%");
+    assert_eq!(fg_of("↻"), th.dim);
+
+    // Narrow: the reset goes first, then the weekly.
+    let line = footer(&draw(&mut app, 90));
+    assert!(line.contains("5h 85% · wk 96% · 0 agents"), "{line:?}");
+    assert!(!line.contains('↻'), "{line:?}");
+    let line = footer(&draw(&mut app, 85));
+    assert!(line.contains("5h 85% · 0 agents"), "{line:?}");
+    assert!(!line.contains("wk"), "{line:?}");
+    let line = footer(&draw(&mut app, 60));
+    assert!(!line.contains("5h"), "{line:?}");
+}
+
 /// INPUT PARITY: the footer's readout is a button. Its target is the
 /// words alone, the pointer on it underlines them, and a click opens
 /// the memory modal — the one `⇧M` opens, through the same

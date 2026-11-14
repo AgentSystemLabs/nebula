@@ -12,6 +12,11 @@
 //! both sides — a malformed payload still gets a 200 so a broken hook never
 //! faults the user's agent turn.
 //!
+//! `/api/statusline` is the odd one out: not a hook but Claude Code's
+//! `statusLine` command, which POSTs the status line JSON (context window,
+//! plan limits) and prints this server's answer as the status bar text —
+//! USAGE AND LIMITS (`crate::usage`).
+//!
 //! The Claude `UserPromptSubmit` reply is also the one channel back into
 //! the CLI: its `hookSpecificOutput` carries the AUTO-TITLE instruction
 //! while a session is untitled, and a `sessionTitle` whenever the row's
@@ -24,6 +29,7 @@ pub mod pi_extension;
 use crate::session_title::TranscriptRef;
 use crate::status::HookEvent;
 use crate::store::Store;
+use crate::usage::UsageBoard;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
@@ -126,6 +132,9 @@ pub struct HookServerState {
     /// Read-only peek at agent rows: drives the auto-title injection
     /// decision without a round-trip through the daemon's drain loop.
     store: Arc<Store>,
+    /// Where status line reports land; answered from at once, since the
+    /// reply is what Claude's status bar shows.
+    usage: Arc<UsageBoard>,
 }
 
 /// One accepted hook POST, decoded for the daemon's drain loop.
@@ -198,6 +207,13 @@ impl HookPayload {
     }
 }
 
+/// `/api/statusline?agentId=…` — no event name: the status line is one.
+#[derive(Debug, Deserialize)]
+pub struct StatusLineQuery {
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct HookQuery {
     #[serde(rename = "agentId")]
@@ -253,6 +269,16 @@ pub async fn start_hook_server(
     store: Arc<Store>,
     inherited: Option<InheritedHooks>,
 ) -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>, std::os::fd::RawFd)> {
+    start_hook_server_with(store, inherited, Arc::default()).await
+}
+
+/// [`start_hook_server`], landing status line reports on `usage` — the
+/// board the daemon's subscribers read.
+pub async fn start_hook_server_with(
+    store: Arc<Store>,
+    inherited: Option<InheritedHooks>,
+    usage: Arc<UsageBoard>,
+) -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>, std::os::fd::RawFd)> {
     use std::os::fd::AsRawFd;
     let (listener, token) = match inherited {
         Some(InheritedHooks { listener, token }) => {
@@ -272,6 +298,7 @@ pub async fn start_hook_server(
         token: token.clone(),
         tx,
         store,
+        usage,
     });
     // Claude and Codex UserPromptSubmit hooks pipe this server's response
     // body to the CLI's stdout, where it lands in the model's context —
@@ -286,6 +313,7 @@ pub async fn start_hook_server(
         .route("/api/hooks/cursor", post(receive_cursor_hook))
         .route("/api/hooks/pi", post(receive_pi_hook))
         .route("/api/hooks/opencode", post(receive_opencode_hook))
+        .route("/api/statusline", post(receive_status_line))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -361,6 +389,35 @@ async fn receive_opencode_hook(
     receive_hook(HookCli::OpenCode, state, query, headers, body).await
 }
 
+/// Claude Code's `statusLine` command: keep the report, and answer with
+/// the line its status bar prints. Every failure answers with an empty
+/// body — that body is drawn on the user's screen.
+async fn receive_status_line(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<StatusLineQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, String::new());
+    }
+    let report = crate::usage::parse_report(&body);
+    let now = orbit_core::clock::now_secs() as i64;
+    let line = state.usage.record(&AgentId(query.agent_id), report, now);
+    (StatusCode::OK, line)
+}
+
+/// The request carries this server's bearer token, compared in constant
+/// time.
+fn authorized(state: &HookServerState, headers: &HeaderMap) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
+        .unwrap_or(false)
+}
+
 async fn receive_hook(
     cli: HookCli,
     state: Arc<HookServerState>,
@@ -381,13 +438,7 @@ async fn receive_hook(
         (status, body)
     };
 
-    let authorized = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
-        .unwrap_or(false);
-    if !authorized {
+    if !authorized(&state, &headers) {
         return quiet_or(StatusCode::UNAUTHORIZED, HOOK_NOT_OK);
     }
 
@@ -491,7 +542,9 @@ async fn receive_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orbit_core::{Agent, AgentKind, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
+    use orbit_core::{
+        Agent, AgentKind, AgentStatus, Project, ProjectId, ServerEvent, Worktree, WorktreeId,
+    };
 
     /// Minimal raw HTTP/1.1 POST (Connection: close), so the real response
     /// body — what the hook one-liner pipes to the CLI's stdout — is under
@@ -922,6 +975,109 @@ mod tests {
         let delivery = rx.recv().await.unwrap();
         assert_eq!(delivery.event, HookEvent::Stop);
         assert!(delivery.prompt.is_none());
+    }
+
+    /// The status line route keeps the report and answers with the text
+    /// Claude's status bar prints; a bad token gets an empty body, which is
+    /// what reaches the screen.
+    #[tokio::test]
+    async fn status_line_route_answers_with_the_status_bar_text() {
+        let usage = Arc::new(UsageBoard::default());
+        let mut events = usage.subscribe();
+        let (env, _rx, _) = start_hook_server_with(seeded_store(), None, usage.clone())
+            .await
+            .unwrap();
+        let resets = orbit_core::clock::now_secs() as i64 + 3600;
+        let body = format!(
+            r#"{{"model":{{"display_name":"Opus"}},"context_window":{{"used_percentage":42}},
+                "rate_limits":{{"five_hour":{{"used_percentage":23,"resets_at":{resets}}}}}}}"#
+        );
+        let (status, text) = http_post(
+            env.port,
+            "/api/statusline?agentId=titled",
+            &env.token,
+            &body,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let at = orbit_core::clock::local_hh_mm(resets);
+        assert_eq!(text, format!("Opus · ctx 42% · 5h 23% ↻{at}"));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ServerEvent::Usage { context_pct: Some(p), .. } if p == 42.0
+        ));
+
+        let (status, text) =
+            http_post(env.port, "/api/statusline?agentId=titled", "wrong", &body).await;
+        assert_eq!((status, text.as_str()), (401, ""));
+        assert!(
+            events.try_recv().is_err(),
+            "an unauthorized report is dropped"
+        );
+
+        // Junk still answers 200, with whatever is known.
+        let (status, text) = http_post(
+            env.port,
+            "/api/statusline?agentId=titled",
+            &env.token,
+            "junk",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(text, format!("5h 23% ↻{at}"));
+    }
+
+    /// The installed status line commands against a live receiver, under
+    /// a real shell: the bare one prints the daemon's line, the chained one
+    /// prints the user's and still reports in the background.
+    #[tokio::test]
+    async fn installed_status_line_commands_reach_the_receiver() {
+        use orbit_core::env::{AGENT_ID, API_TOKEN, API_URL};
+        use tokio::io::AsyncWriteExt;
+        let usage = Arc::new(UsageBoard::default());
+        let mut events = usage.subscribe();
+        let (env, _rx, _) = start_hook_server_with(seeded_store(), None, usage.clone())
+            .await
+            .unwrap();
+        let run = |cmd: String| {
+            let env = env.clone();
+            async move {
+                let mut child = tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .env(AGENT_ID, "titled")
+                    .env(API_URL, format!("http://127.0.0.1:{}", env.port))
+                    .env(API_TOKEN, &env.token)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut stdin = child.stdin.take().unwrap();
+                stdin
+                    .write_all(br#"{"model":{"display_name":"Opus"},"context_window":{"used_percentage":7}}"#)
+                    .await
+                    .unwrap();
+                drop(stdin);
+                let out = child.wait_with_output().await.unwrap();
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            }
+        };
+        assert_eq!(
+            run(installer::status_line_command(None)).await,
+            "Opus · ctx 7%"
+        );
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ServerEvent::Usage { .. }
+        ));
+
+        let out = run(installer::status_line_command(Some("echo mine"))).await;
+        assert_eq!(out, "mine\n");
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(3), events.recv())
+            .await
+            .expect("the background report arrived")
+            .unwrap();
+        assert!(matches!(ev, ServerEvent::Usage { context_pct: Some(p), .. } if p == 7.0));
     }
 
     #[test]

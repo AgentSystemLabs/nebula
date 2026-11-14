@@ -52,6 +52,7 @@ pub mod theme;
 pub mod tree_browser;
 pub mod ui;
 pub mod update_check;
+pub mod usage;
 pub mod view_jobs;
 pub mod vim_term;
 

@@ -22,6 +22,7 @@ pub mod session_title;
 pub mod sibling;
 pub mod status;
 pub mod store;
+pub mod usage;
 pub mod worktree_check;
 pub mod worktree_hooks;
 
@@ -134,11 +135,14 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
     // Hook receiver: loopback HTTP endpoint the claude hook one-liners hit.
     // It shares the store to answer UserPromptSubmit hooks with the
     // auto-title instruction while a session is still untitled.
+    // It also takes Claude's status line reports (USAGE AND LIMITS) onto
+    // the board the daemon's subscribers read.
+    let usage = std::sync::Arc::new(usage::UsageBoard::default());
     let (hook_env, mut hook_rx, hook_fd) =
-        hooks::start_hook_server(store.clone(), inherited_hooks).await?;
+        hooks::start_hook_server_with(store.clone(), inherited_hooks, usage.clone()).await?;
     tracing::info!(port = hook_env.port, "hook receiver listening");
 
-    let daemon = registry::Daemon::new(store, hook_env);
+    let daemon = registry::Daemon::with_usage(store, hook_env, usage);
 
     if let Some(carry) = carry {
         let sessions = daemon.adopt_sessions(carry.sessions);

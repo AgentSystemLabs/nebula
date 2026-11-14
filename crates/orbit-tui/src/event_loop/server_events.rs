@@ -20,6 +20,18 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
         | event @ ServerEvent::OutputTail { .. }
         | event @ ServerEvent::AttachRefused { .. } => handle_tree_event(app, event, out),
         event @ ServerEvent::Error { .. } => handle_error_event(app, event, out),
+        ServerEvent::Usage {
+            agent,
+            context_pct,
+            five_hour,
+            seven_day,
+            ..
+        } => {
+            app.jobs
+                .usage
+                .land(agent, context_pct, five_hour, seven_day);
+            app.chrome.dirty = true;
+        }
         _ => {}
     }
 }
