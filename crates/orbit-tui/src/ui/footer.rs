@@ -1,5 +1,55 @@
 use super::*;
 
+/// Cells the bar's left side (breadcrumb, hints) keeps before the plan
+/// limits on the right may take any: on a narrow terminal the limits lose
+/// their reset time, then the weekly window, then go.
+const FOOTER_LEFT_MIN: usize = 40;
+
+/// The bar's right end: the plan limits (`5h 23% ↻14:05 · wk 41%`, sized
+/// to the room the left side leaves), then the memory readout, which is a
+/// button. Either may be missing.
+struct FooterRight {
+    limits: Vec<Span<'static>>,
+    memory: Option<String>,
+}
+
+impl FooterRight {
+    fn new(app: &App, width: u16, th: Theme) -> Self {
+        let memory = footer_usage(app);
+        let memory_w = memory.as_ref().map_or(0, |s| s.chars().count() + 2);
+        let sep = if memory.is_some() { " · " } else { "" };
+        let room =
+            usize::from(width).saturating_sub(memory_w + FOOTER_LEFT_MIN + sep.chars().count());
+        let now = orbit_core::clock::now_secs() as i64;
+        let mut limits = crate::usage::limit_spans(&app.jobs.usage, now, room, th);
+        if !limits.is_empty() && !sep.is_empty() {
+            limits.push(Span::styled(sep, Style::default().fg(th.dim)));
+        }
+        Self { limits, memory }
+    }
+
+    fn limits_w(&self) -> u16 {
+        self.limits.iter().map(|s| s.width() as u16).sum()
+    }
+
+    fn memory_w(&self) -> u16 {
+        self.memory
+            .as_ref()
+            .map_or(0, |s| s.chars().count() as u16 + 2)
+    }
+
+    /// The whole right end's width, padding included.
+    fn width(&self) -> u16 {
+        let limits = self.limits_w();
+        let pad = if self.memory.is_none() && limits > 0 {
+            2
+        } else {
+            0
+        };
+        self.memory_w() + limits + pad
+    }
+}
+
 struct FooterHint {
     hints: Span<'static>,
     key_bar: Option<Vec<(String, &'static str)>>,
@@ -462,11 +512,8 @@ fn render_footer_left(
     mut spans: Vec<Span<'static>>,
     th: Theme,
 ) {
-    let usage = footer_usage(app);
-    let right_w = usage
-        .as_ref()
-        .map(|s| s.chars().count() as u16 + 2)
-        .unwrap_or(0)
+    let right_w = FooterRight::new(app, area.width, th)
+        .width()
         .min(area.width);
     let left = Rect {
         width: area.width.saturating_sub(right_w),
@@ -502,7 +549,23 @@ fn prepend_version_plate(app: &App, spans: &mut Vec<Span<'static>>, width: u16, 
 }
 
 fn render_footer_usage(f: &mut Frame, app: &mut App, area: Rect, th: Theme) {
-    let Some(usage) = footer_usage(app) else {
+    let FooterRight { limits, memory } = FooterRight::new(app, area.width, th);
+    // The plan limits, just left of the memory readout (or at the very
+    // end without one). Not a button.
+    let limits_w: u16 = limits.iter().map(|s| s.width() as u16).sum();
+    let memory_w = memory
+        .as_ref()
+        .map_or(0, |s| s.chars().count() as u16)
+        .min(area.width);
+    if limits_w > 0 && limits_w + memory_w <= area.width {
+        let r = Rect {
+            x: area.x + area.width - memory_w - limits_w,
+            width: limits_w,
+            ..area
+        };
+        f.render_widget(Paragraph::new(Line::from(limits)), r);
+    }
+    let Some(usage) = memory else {
         return;
     };
     let right_w = (usage.chars().count() as u16 + 2).min(area.width);

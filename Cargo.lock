@@ -1362,6 +1362,7 @@ name = "orbit-core"
 version = "0.47.0"
 dependencies = [
  "directories",
+ "libc",
  "rmp-serde",
  "serde",
  "serde_bytes",

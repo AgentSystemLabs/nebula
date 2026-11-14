@@ -130,6 +130,15 @@ Project tabs add their sessions up: `api ●1` in red means one session in that 
 you, even while you look at another project. A red dot also plays a sound, and sends a desktop
 notification when the terminal window is in the background.
 
+### Usage and limits
+
+The bottom bar's right side shows your Claude plan limits — `5h 23% ↻14:05 · wk 41%`: the 5-hour
+window with its reset time, and the weekly window. They turn yellow from 80% and red from 95%, and
+the reset time, then the weekly figure, drop on a narrow terminal. Each Claude card also shows its
+session's context-window use (`ctx 42%`, yellow from 80%). Nothing shows until Claude has reported it
+(limits appear only for Pro/Max plans, after the first reply). Orbit reads this from Claude Code's
+status line; if you already have your own, Orbit chains it, so yours keeps working.
+
 ## 5. The everyday loop
 
 | I want to… | Press |

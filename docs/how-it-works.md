@@ -156,6 +156,10 @@
   "Hooks need review" prompt and every later worktree is silent). Groups are tagged `_orbitManaged`,
   user hooks preserved, rebuilt each spawn. Each hook is a fail-soft curl to the daemon's loopback HTTP
   endpoint, authenticated with a per-boot bearer token injected into the agent's environment only.
+- **Usage and limits ride the status line.** The same managed settings file carries a `statusLine`
+  (tagged `_orbitManaged`) that posts Claude Code's status JSON to the daemon's `/api/statusline`; the
+  daemon keeps per-session context use and the account's 5-hour / weekly limits in memory and pushes
+  them to TUIs as `ServerEvent::Usage`. A status line of your own is chained, not replaced.
 - **…plus the progress bar, for the cancel no hook reports.** Escaping out of a turn fires no `Stop` and
   suppresses the idle notification that normally un-sticks one, so orbit also reads the CLI's terminal
   progress-bar escapes (OSC 9;4) straight off the PTY. That signal survives a cancel, and it stays busy

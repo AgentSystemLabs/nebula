@@ -13,6 +13,15 @@
 //! hook must print a JSON response (`{"continue": true}`) to stdout or
 //! gating events fall back to fail-open error handling.
 //!
+//! Claude's settings file also gets a managed `statusLine` — not a hook,
+//! but the command Claude Code runs after every assistant message with the
+//! session's context window and plan limits as JSON on stdin (USAGE AND
+//! LIMITS, `crate::usage`). It POSTs that JSON to the daemon and prints the
+//! daemon's one-line answer; a status line the user already had (in that
+//! file, the checkout's `.claude/settings.json` or their user settings) is
+//! CHAINED: the POST goes in the background and the user's own command gets
+//! the same stdin and draws the bar, as it always did.
+//!
 //! Rules (learned the hard way in mission-control):
 //! - MERGE, never replace: user hooks are preserved untouched.
 //! - Our groups carry `_orbitManaged: true` and are stripped + rebuilt on
@@ -53,6 +62,17 @@ const CODEX_DIR: &str = ".codex";
 /// How long a hook waits on the daemon. Hooks run inline in the agent's
 /// turn, so a hung daemon has to cost seconds, not a stuck session.
 const HOOK_CURL_TIMEOUT_SECS: u32 = 3;
+/// The status line's POST runs inline with drawing Claude's status bar: a
+/// hung daemon may blank it for a second, never longer.
+const STATUS_LINE_CURL_TIMEOUT_SECS: u32 = 1;
+/// Claude Code's checked-in project settings, beside the local file, and
+/// the name of the user-level one in its config dir.
+const CLAUDE_SHARED_SETTINGS_FILE: &str = "settings.json";
+const STATUS_LINE_KEY: &str = "statusLine";
+/// Inside orbit's managed status line: the user's own status line object
+/// it displaced from the same file, kept so every reinstall chains it
+/// again (and nothing of it is lost).
+const CHAINED_KEY: &str = "_orbitChained";
 
 /// (hook event, optional matcher)
 const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
@@ -116,11 +136,45 @@ fn env_guard() -> String {
 /// stdin payload passed straight through, and the agent id plus event
 /// name on the query string so the daemon needs nothing else to route it.
 fn hook_curl(endpoint: &str, event: &str) -> String {
-    format!(
-        "curl -sS -m {HOOK_CURL_TIMEOUT_SECS} -X POST -H \"Authorization: Bearer ${API_TOKEN}\" \
-         -H \"Content-Type: application/json\" --data-binary @- \
-         \"${API_URL}/api/hooks/{endpoint}?agentId=${AGENT_ID}&hookEvent={event}\""
+    daemon_post(
+        HOOK_CURL_TIMEOUT_SECS,
+        &format!("/api/hooks/{endpoint}?agentId=${AGENT_ID}&hookEvent={event}"),
     )
+}
+
+/// curl POSTing stdin to the daemon's `route` (path and query), bearer
+/// authed, giving up after `timeout` seconds.
+fn daemon_post(timeout: u32, route: &str) -> String {
+    format!(
+        "curl -sS -m {timeout} -X POST -H \"Authorization: Bearer ${API_TOKEN}\" \
+         -H \"Content-Type: application/json\" --data-binary @- \"${API_URL}{route}\""
+    )
+}
+
+/// The managed `statusLine` command. On its own it POSTs Claude's status
+/// JSON and prints the daemon's answer — the status bar text. Chained to
+/// the user's own `user` command, it reads stdin once, POSTs it in the
+/// background (output discarded, so it never holds the bar), and hands the
+/// same bytes to `user` through `eval`, in whatever shell Claude runs
+/// status lines with, so that command behaves exactly as it did. Outside
+/// orbit (no ORBIT_* env) only the user's command runs, or nothing.
+pub(crate) fn status_line_command(user: Option<&str>) -> String {
+    let post = daemon_post(
+        STATUS_LINE_CURL_TIMEOUT_SECS,
+        &format!("/api/statusline?agentId=${AGENT_ID}"),
+    );
+    match user {
+        None => format!(
+            "if {}; then exit 0; fi; {post} 2>/dev/null || true",
+            env_guard()
+        ),
+        Some(user) => format!(
+            "orbit_in=$(cat); if {}; then :; else printf '%s' \"$orbit_in\" | \
+             {post} >/dev/null 2>&1 & fi; printf '%s' \"$orbit_in\" | eval {}",
+            env_guard(),
+            orbit_core::shell::single_quote(user)
+        ),
+    }
 }
 
 fn hook_command(endpoint: &str, event: &str) -> String {
@@ -207,6 +261,13 @@ fn managed_group(endpoint: &str, event: &str, matcher: Option<&str>) -> Value {
 /// `<cwd>/.claude/settings.local.json`, plus the permission rule that lets
 /// the auto-title `orbit rename` run unprompted.
 pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
+    install_claude_hooks_with(cwd, orbit_core::paths::claude_config_dir().as_deref())
+}
+
+/// [`install_claude_hooks`], reading the user's own settings (for a status
+/// line to chain) from `user_config` — Claude's config dir, injectable so
+/// a test never reads the real one.
+fn install_claude_hooks_with(cwd: &Path, user_config: Option<&Path>) -> Result<()> {
     // orbit's own commands, plus graphify's read-only graph queries spelled
     // the way this machine runs graphify (crate::graphify::allow_rules).
     let graphify = crate::graphify::allow_rules();
@@ -215,13 +276,92 @@ pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
         .copied()
         .chain(graphify.iter().map(String::as_str))
         .collect();
-    install_managed_hooks(
-        &cwd.join(CLAUDE_DIR),
-        CLAUDE_SETTINGS_FILE,
-        "claude",
-        CLAUDE_EVENTS,
-        &rules,
-    )
+    let dir = cwd.join(CLAUDE_DIR);
+    let path = dir.join(CLAUDE_SETTINGS_FILE);
+    let mut root = load_hooks_root(&path)?;
+    let root_obj = root_object_mut(&mut root, &path)?;
+    merge_managed_hooks(root_obj, "claude", CLAUDE_EVENTS, &path)?;
+    for rule in &rules {
+        ensure_permission_allow(root_obj, rule, &path)?;
+    }
+    let shared = [
+        Some(dir.join(CLAUDE_SHARED_SETTINGS_FILE)),
+        user_config.map(|d| d.join(CLAUDE_SHARED_SETTINGS_FILE)),
+    ];
+    merge_status_line(root_obj, shared.iter().flatten().map(PathBuf::as_path));
+    write_hooks_root(&dir, CLAUDE_SETTINGS_FILE, &root)
+}
+
+/// Orbit's own status line: tagged, or (untagged) by its endpoint.
+fn is_orbit_status_line(v: &Value) -> bool {
+    v.get("_orbitManaged").and_then(Value::as_bool) == Some(true)
+        || v.get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|c| c.contains("/api/statusline") && c.contains(AGENT_ID))
+}
+
+/// `v` as a status line of the user's own — an object with a command,
+/// and not orbit's.
+fn user_status_line(v: &Value) -> Option<&str> {
+    if is_orbit_status_line(v) {
+        return None;
+    }
+    v.get("command")
+        .and_then(Value::as_str)
+        .filter(|c| !c.trim().is_empty())
+}
+
+/// The `statusLine` a settings file holds, read leniently: a file that is
+/// missing or does not parse holds none (it is only read, never written).
+fn settings_status_line(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let root: Value = serde_json::from_str(&text).ok()?;
+    root.get(STATUS_LINE_KEY).cloned()
+}
+
+/// Put orbit's managed `statusLine` into a loaded `settings.local.json`,
+/// chaining the status line Claude would otherwise show. That is, in
+/// Claude's own precedence: the user's line in this very file (as found,
+/// or as orbit chained it last time — kept under [`CHAINED_KEY`]), else
+/// the first of `shared` — the checkout's `settings.json`, then the user's
+/// — that has one. The user's other settings for it (`padding`, …) are
+/// kept. A `statusLine` here that is neither orbit's nor a status line at
+/// all is left exactly as found, and so is nothing installed.
+fn merge_status_line<'a>(
+    root_obj: &mut Map<String, Value>,
+    shared: impl IntoIterator<Item = &'a Path>,
+) {
+    let local = match root_obj.get(STATUS_LINE_KEY) {
+        None => None,
+        Some(v) if is_orbit_status_line(v) => v
+            .get(CHAINED_KEY)
+            .filter(|c| user_status_line(c).is_some())
+            .cloned(),
+        Some(v) if user_status_line(v).is_some() => Some(v.clone()),
+        Some(_) => return,
+    };
+    let user = local.clone().or_else(|| {
+        shared
+            .into_iter()
+            .filter_map(settings_status_line)
+            .find(|v| user_status_line(v).is_some())
+    });
+    let mut line = Map::new();
+    if let Some(Value::Object(user)) = &user {
+        for (key, value) in user {
+            if !matches!(key.as_str(), "type" | "command") && !key.starts_with("_orbit") {
+                line.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let command = status_line_command(user.as_ref().and_then(user_status_line));
+    line.insert("type".into(), json!("command"));
+    line.insert("command".into(), json!(command));
+    line.insert("_orbitManaged".into(), json!(true));
+    if let Some(local) = local {
+        line.insert(CHAINED_KEY.into(), local);
+    }
+    root_obj.insert(STATUS_LINE_KEY.into(), Value::Object(line));
 }
 
 /// Idempotently add one entry to `permissions.allow`, preserving everything
@@ -291,7 +431,7 @@ pub fn codex_home() -> PathBuf {
 
 /// Merge orbit's managed hooks for Codex into `<codex_home>/hooks.json`.
 pub fn install_codex_hooks(codex_home: &Path) -> Result<()> {
-    install_managed_hooks(codex_home, HOOKS_FILE, "codex", CODEX_EVENTS, &[])
+    install_managed_hooks(codex_home, HOOKS_FILE, "codex", CODEX_EVENTS)
 }
 
 /// Drop the per-worktree `.codex/hooks.json` groups an older orbit wrote:
@@ -416,25 +556,20 @@ pub(super) fn write_text_atomic(dir: &Path, file_name: &str, text: &str) -> Resu
 }
 
 /// Load `<dir>/<file_name>`, strip-and-rebuild orbit's groups for `events`
-/// in the Claude/Codex dialect, make sure each of `allow_rules` is in
-/// `permissions.allow`, and write it back. Claude's settings file carries
-/// hooks and permissions both, so the one pass serves it and codex's
-/// hooks-only file alike (codex passes no rules).
+/// in the Claude/Codex dialect, and write it back — codex's hooks-only
+/// file. (Claude's settings file carries permissions and a status line
+/// too: `install_claude_hooks_with`.)
 fn install_managed_hooks(
     dir: &Path,
     file_name: &str,
     endpoint: &str,
     events: &[(&str, Option<&str>)],
-    allow_rules: &[&str],
 ) -> Result<()> {
     let path = dir.join(file_name);
     let mut root = load_hooks_root(&path)?;
 
     let root_obj = root_object_mut(&mut root, &path)?;
     merge_managed_hooks(root_obj, endpoint, events, &path)?;
-    for rule in allow_rules {
-        ensure_permission_allow(root_obj, rule, &path)?;
-    }
     write_hooks_root(dir, file_name, &root)
 }
 
@@ -1022,6 +1157,197 @@ mod tests {
         assert!(install_cursor_hooks(tmp.path()).is_err());
         let after = std::fs::read_to_string(dir.join("hooks.json")).unwrap();
         assert_eq!(after, original, "corrupt file must be left untouched");
+    }
+
+    /// Install with an empty user config dir, so no test reads the real
+    /// `~/.claude`.
+    fn install_claude_isolated(cwd: &Path, user_config: &Path) {
+        install_claude_hooks_with(cwd, Some(user_config)).unwrap();
+    }
+
+    fn write_settings(dir: &Path, rel: &str, value: Value) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_string(&value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn status_line_commands_are_spelled_exactly() {
+        assert_eq!(
+            status_line_command(None),
+            "if [ -z \"$ORBIT_AGENT_ID\" ] || [ -z \"$ORBIT_API_URL\" ]; then exit 0; fi; \
+             curl -sS -m 1 -X POST -H \"Authorization: Bearer $ORBIT_API_TOKEN\" \
+             -H \"Content-Type: application/json\" --data-binary @- \
+             \"$ORBIT_API_URL/api/statusline?agentId=$ORBIT_AGENT_ID\" 2>/dev/null || true"
+        );
+        assert_eq!(
+            status_line_command(Some("~/bin/line.sh 'x'")),
+            "orbit_in=$(cat); if [ -z \"$ORBIT_AGENT_ID\" ] || [ -z \"$ORBIT_API_URL\" ]; \
+             then :; else printf '%s' \"$orbit_in\" | \
+             curl -sS -m 1 -X POST -H \"Authorization: Bearer $ORBIT_API_TOKEN\" \
+             -H \"Content-Type: application/json\" --data-binary @- \
+             \"$ORBIT_API_URL/api/statusline?agentId=$ORBIT_AGENT_ID\" >/dev/null 2>&1 & fi; \
+             printf '%s' \"$orbit_in\" | eval '~/bin/line.sh '\\''x'\\'''"
+        );
+    }
+
+    #[test]
+    fn status_line_is_installed_into_a_fresh_file_and_reinstalled_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        install_claude_isolated(tmp.path(), home.path());
+        let first = read_settings(tmp.path())["statusLine"].clone();
+        assert_eq!(first["_orbitManaged"], json!(true));
+        assert_eq!(first["type"], json!("command"));
+        assert_eq!(first["command"], json!(status_line_command(None)));
+        assert!(first.get(CHAINED_KEY).is_none());
+        install_claude_isolated(tmp.path(), home.path());
+        install_claude_isolated(tmp.path(), home.path());
+        assert_eq!(read_settings(tmp.path())["statusLine"], first, "idempotent");
+    }
+
+    /// The user's own status line in settings.local.json is displaced, not
+    /// lost: orbit's chains it (padding kept), carries the original, and
+    /// every reinstall chains the original again rather than itself.
+    #[test]
+    fn a_local_user_status_line_is_chained_across_reinstalls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let theirs = json!({ "type": "command", "command": "~/bin/line.sh 'x'", "padding": 2 });
+        write_settings(
+            tmp.path(),
+            ".claude/settings.local.json",
+            json!({ "statusLine": theirs.clone(), "model": "opus" }),
+        );
+        // A user-level one loses to the checkout's own, as in Claude.
+        write_settings(
+            home.path(),
+            "settings.json",
+            json!({ "statusLine": { "type": "command", "command": "home-line" } }),
+        );
+        for _ in 0..3 {
+            install_claude_isolated(tmp.path(), home.path());
+            let settings = read_settings(tmp.path());
+            let line = &settings["statusLine"];
+            assert_eq!(line["_orbitManaged"], json!(true));
+            assert_eq!(
+                line["command"],
+                json!(status_line_command(Some("~/bin/line.sh 'x'")))
+            );
+            assert_eq!(line["padding"], json!(2));
+            assert_eq!(line[CHAINED_KEY], theirs);
+            assert_eq!(settings["model"], json!("opus"), "other settings kept");
+        }
+    }
+
+    /// No status line in the checkout: the checkout's checked-in one is
+    /// chained, else the user's own from their Claude config dir.
+    #[test]
+    fn a_shared_or_user_status_line_is_chained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_settings(
+            home.path(),
+            "settings.json",
+            json!({ "statusLine": { "type": "command", "command": "home-line", "padding": 0 } }),
+        );
+        install_claude_isolated(tmp.path(), home.path());
+        let line = read_settings(tmp.path())["statusLine"].clone();
+        assert_eq!(
+            line["command"],
+            json!(status_line_command(Some("home-line")))
+        );
+        assert_eq!(line["padding"], json!(0));
+        assert!(line.get(CHAINED_KEY).is_none(), "it still lives at home");
+
+        write_settings(
+            tmp.path(),
+            ".claude/settings.json",
+            json!({ "statusLine": { "type": "command", "command": "repo-line" } }),
+        );
+        install_claude_isolated(tmp.path(), home.path());
+        let line = read_settings(tmp.path())["statusLine"].clone();
+        assert_eq!(
+            line["command"],
+            json!(status_line_command(Some("repo-line")))
+        );
+        assert!(line.get("padding").is_none());
+
+        // Gone from both: orbit's own, unchained.
+        std::fs::remove_file(tmp.path().join(".claude/settings.json")).unwrap();
+        std::fs::remove_file(home.path().join("settings.json")).unwrap();
+        install_claude_isolated(tmp.path(), home.path());
+        let line = read_settings(tmp.path())["statusLine"].clone();
+        assert_eq!(line["command"], json!(status_line_command(None)));
+    }
+
+    /// A `statusLine` orbit can't read as one is left exactly as found.
+    #[test]
+    fn an_unreadable_status_line_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            ".claude/settings.local.json",
+            json!({ "statusLine": "weird" }),
+        );
+        install_claude_isolated(tmp.path(), home.path());
+        let settings = read_settings(tmp.path());
+        assert_eq!(settings["statusLine"], json!("weird"));
+        assert!(
+            settings["hooks"]["Stop"].is_array(),
+            "hooks still installed"
+        );
+    }
+
+    /// The commands under a real shell: outside orbit the bare one prints
+    /// nothing and the chained one runs the user's command on the same
+    /// stdin; inside orbit with the daemon unreachable, the user's line
+    /// still draws.
+    #[test]
+    fn status_line_commands_run_under_sh() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let run = |cmd: &str, api_url: Option<&str>| -> (String, std::time::Duration) {
+            let mut c = Command::new("sh");
+            c.arg("-c")
+                .arg(cmd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env_remove(AGENT_ID)
+                .env_remove(API_URL)
+                .env_remove(API_TOKEN);
+            if let Some(url) = api_url {
+                c.env(AGENT_ID, "a1").env(API_URL, url).env(API_TOKEN, "t");
+            }
+            let started = std::time::Instant::now();
+            let mut child = c.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"model":{"display_name":"Opus"}}"#)
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{cmd}: {out:?}");
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                started.elapsed(),
+            )
+        };
+        let user = "sed 's/^/user: /'";
+        assert_eq!(run(&status_line_command(None), None).0, "");
+        assert_eq!(
+            run(&status_line_command(Some(user)), None).0,
+            "user: {\"model\":{\"display_name\":\"Opus\"}}"
+        );
+        // Port 9 (discard) on loopback: nothing listens, curl fails fast.
+        let dead = Some("http://127.0.0.1:9");
+        let (out, took) = run(&status_line_command(Some(user)), dead);
+        assert!(out.starts_with("user: {"), "{out}");
+        assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+        assert_eq!(run(&status_line_command(None), dead).0, "");
     }
 
     #[test]

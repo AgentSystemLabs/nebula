@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -24,6 +24,12 @@ pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
 /// a request it could not decode, and its delete confirm simply goes
 /// without the check.
 pub const CHECK_WORKTREE_PROTOCOL: u32 = 51;
+
+/// First protocol whose client decodes `ServerEvent::Usage`. The daemon
+/// reads the client's `Hello` version and pushes the event only to a
+/// subscriber at least this new, so an older TUI is never sent a variant
+/// it could not decode; an older daemon simply never sends one.
+pub const USAGE_PROTOCOL: u32 = 52;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -681,6 +687,25 @@ pub enum EnterOutcome {
     NextLaunch,
 }
 
+/// One Claude plan limit window (the 5-hour session limit or the weekly
+/// one), as Claude Code's status line reports it: how much of it is used,
+/// and when it starts over.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RateWindow {
+    /// 0–100.
+    pub used_pct: f32,
+    /// Unix epoch seconds the window resets at.
+    pub resets_at: i64,
+}
+
+impl RateWindow {
+    /// Still counting at `now_secs` — a window whose reset has passed says
+    /// nothing about the new one.
+    pub fn live_at(&self, now_secs: i64) -> bool {
+        self.resets_at > now_secs
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewTabKind {
@@ -842,6 +867,26 @@ pub enum ServerEvent {
         session: SessionRef,
         tail: Option<OutputTail>,
     },
+
+    /// What a Claude session's status line last reported: its context
+    /// window use, and the account's plan limits as the DAEMON holds them
+    /// now (the newest report that carried them — they are per account,
+    /// not per session). Pushed on every report, and once per known agent
+    /// right after a subscriber's `Snapshot`. Gated on [`USAGE_PROTOCOL`]:
+    /// only a subscriber whose `Hello` was at least that new receives it.
+    Usage {
+        agent: AgentId,
+        /// 0–100; None until Claude has counted it.
+        #[serde(default)]
+        context_pct: Option<f32>,
+        /// The context window's size in tokens.
+        #[serde(default)]
+        context_window: Option<u64>,
+        #[serde(default)]
+        five_hour: Option<RateWindow>,
+        #[serde(default)]
+        seven_day: Option<RateWindow>,
+    },
 }
 
 #[cfg(test)]
@@ -861,5 +906,37 @@ mod tests {
         assert!(protocol_compatible_with(PROTOCOL_VERSION));
         assert!(protocol_compatible_with(PROTOCOL_VERSION + 1));
         assert!(!protocol_compatible_with(MIN_COMPATIBLE_PROTOCOL - 1));
+    }
+
+    #[test]
+    fn usage_event_round_trips_through_the_wire_codec() {
+        let ev = ServerEvent::Usage {
+            agent: AgentId("a1".into()),
+            context_pct: Some(42.0),
+            context_window: Some(200_000),
+            five_hour: Some(RateWindow {
+                used_pct: 23.5,
+                resets_at: 1_738_425_600,
+            }),
+            seven_day: None,
+        };
+        let bytes = rmp_serde::to_vec(&ev).unwrap();
+        match rmp_serde::from_slice::<ServerEvent>(&bytes).unwrap() {
+            ServerEvent::Usage {
+                agent,
+                context_pct,
+                five_hour,
+                seven_day,
+                ..
+            } => {
+                assert_eq!(agent.0, "a1");
+                assert_eq!(context_pct, Some(42.0));
+                assert_eq!(five_hour.unwrap().used_pct, 23.5);
+                assert!(seven_day.is_none());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        const { assert!(USAGE_PROTOCOL <= PROTOCOL_VERSION) };
+        const { assert!(USAGE_PROTOCOL > MIN_COMPATIBLE_PROTOCOL) };
     }
 }

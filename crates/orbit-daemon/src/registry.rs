@@ -178,6 +178,9 @@ pub struct Daemon {
     pub store: Arc<Store>,
     /// Entity/status deltas fanned out to every subscribed client.
     pub events: broadcast::Sender<ServerEvent>,
+    /// USAGE AND LIMITS: the status line reports the hook receiver keeps,
+    /// with their own event channel (`orbit_core::USAGE_PROTOCOL`).
+    pub usage: Arc<crate::usage::UsageBoard>,
     /// Every session the registry installs — a spawn, a respawn, a prewarm
     /// adoption — by ref, the moment it is in `sessions`. A client's forward
     /// task (`attach.rs`) listens so a kill-and-respawn behind an attached
@@ -249,6 +252,15 @@ mod terminals;
 
 impl Daemon {
     pub fn new(store: Arc<Store>, hook_env: HookEnv) -> Arc<Self> {
+        Self::with_usage(store, hook_env, Arc::default())
+    }
+
+    /// [`Daemon::new`] sharing `usage` with the hook receiver that fills it.
+    pub fn with_usage(
+        store: Arc<Store>,
+        hook_env: HookEnv,
+        usage: Arc<crate::usage::UsageBoard>,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         let (session_installs, _) = broadcast::channel(64);
         Arc::new(Self {
@@ -257,6 +269,7 @@ impl Daemon {
             hook_env,
             store,
             events,
+            usage,
             session_installs,
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
