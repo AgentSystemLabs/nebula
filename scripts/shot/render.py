@@ -114,7 +114,7 @@ def render(grid, out, font_path, size):
             if c == " ":
                 continue
             color = tuple(v // 2 for v in fg) if dim else fg
-            draw.text((x * cw, y * ch + 2), c, font=bold if b else font, fill=color)
+            draw.text((x * cw, y * ch + 2), c, font=bold if b and not "\u2500" <= c <= "\u259f" else font, fill=color)
             if ul:
                 draw.line([x * cw, (y + 1) * ch - 2, (x + 1) * cw, (y + 1) * ch - 2], fill=color)
             if ord(c) > 0x2E7F and font.getlength(c) > cw * 1.5:

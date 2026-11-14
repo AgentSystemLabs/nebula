@@ -27,9 +27,6 @@ auth
 Enter
 F12
 Write integration tests for token expiry and refresh
-Tab
-Down
-Enter
 Enter
 F12
 p
@@ -46,19 +43,12 @@ Enter
 F12
 p
 Sort the changelog entries by date, newest first
-Tab
-Down
-Down
-Down
-Down
-Down
-Enter
 Enter
 F12
 t
 C-q
 Escape
-j
+Down
 F12
 F12
 F12
@@ -77,7 +67,6 @@ F12
 F12
 F12
 F12
-Enter
-l
+Right
 space
 Also cover a token refreshed twice inside one second

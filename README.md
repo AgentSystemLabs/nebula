@@ -1,99 +1,63 @@
-> [!NOTE]
-> **Orbit is a personal fork of [nebula](https://github.com/AgentSystemLabs/nebula)** by Cody Seibert <!-- rebrand:keep -->
-> (MIT), reshaped for a Claude-first workflow: simpler keys, skill workflows and knowledge-graph
-> integration. **New here? Start with the [user guide](docs/guide.md).**
-
-> [!WARNING]
-> **Work in progress.** orbit is built for one person's workflow — mine — and it changes fast as I iterate on it.
-> Expect breaking changes between releases: keys that move, screens that get redrawn, features that come and go
-> without notice. If it's close to what you want, fork or clone it and bend it into what you need it to be.
-
 <div align="center">
 
-*"Whatever you do, work heartily, as for the Lord and not for men."* — Colossians 3:23 (ESV)
+# Orbit
 
-# orbit
+**Mission control for your Claude Code sessions.**
 
-**Mission control for your coding agents.**
+Run many Claude Code sessions across every project and git worktree you own — from one terminal, one
+keyboard, one screen. They keep working when you close it.
 
-Run **Claude Code**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build** and **OpenCode** across every project and git WORKTREE you own — from one
-terminal, one keyboard, one grid. They keep working when you close it.
-
-[![Release](https://img.shields.io/github/v/release/AmenAdem/Orbit?style=flat-square&color=e8c547&label=release)](https://github.com/AmenAdem/Orbit/releases)
-[![Build](https://img.shields.io/github/actions/workflow/status/AmenAdem/Orbit/release.yml?style=flat-square&label=build)](https://github.com/AmenAdem/Orbit/actions)
+[![Release](https://img.shields.io/github/v/release/AmenAdem/Orbit?style=flat-square&color=8b5cf6&label=release)](https://github.com/AmenAdem/Orbit/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square)](#install)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?style=flat-square)](https://www.rust-lang.org)
 
-[**Guide**](docs/guide.md) · [**Keys**](docs/keys.md) · [**Commands**](docs/commands.md) · [**Sessions**](docs/sessions.md) · [**Configuration**](docs/configuration.md) · [**How it works**](docs/how-it-works.md)
+[**User guide**](docs/guide.md) · [Keys](docs/keys.md) · [Commands](docs/commands.md) · [Configuration](docs/configuration.md) · [How it works](docs/how-it-works.md)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh
 ```
 
-<img src="assets/screenshot.png" alt="orbit: project tabs with status dots across the top, a band of session cards per checkout, and the running session's terminal under them" width="100%">
+<img src="assets/screenshot.png" alt="Orbit: project tabs with status dots across the top, a band of session cards per checkout, and the running session's terminal beside them" width="100%">
 
 </div>
+
+> [!NOTE]
+> **Orbit is a fork of [nebula](https://github.com/AgentSystemLabs/nebula)** by Cody Seibert (MIT), <!-- rebrand:keep -->
+> reshaped for a Claude-first workflow. It is young and moves fast: expect keys and screens to change
+> between releases.
 
 ---
 
-## Watch the walkthrough
+## Why
 
-<div align="center">
+You start three Claude sessions in three terminal tabs. Five minutes later you don't know which one is
+waiting on a permission prompt, which one finished, and which one is still thinking — so you tab through
+all of them and read the screens.
 
-<a href="https://youtu.be/ZBPqH36BPgI"><img src="https://i.ytimg.com/vi/ZBPqH36BPgI/maxresdefault.jpg" alt="Video: A Complete Walkthrough of Orbit — click to watch on YouTube" width="80%"></a>
+Orbit replaces the reading with a grid and a colour. Every session is a **card** with a **status dot**;
+cards sit in a **band** per git checkout, under a row of **project tabs** that add up their sessions'
+dots. A red `●1` on a tab tells you exactly where to look, without opening anything.
 
-**[▶ A Complete Walkthrough of Orbit](https://youtu.be/ZBPqH36BPgI)** — what orbit is, why it exists, and a full tour of it running.
-
-</div>
-
-## Three agents, three tabs, and no idea which one needs you
-
-You start three agents in three terminal tabs. Five minutes later you don't know which one is waiting on
-a permission prompt, which one finished, and which one is still thinking — so you tab through all three,
-every time, and read the screens. Start a fourth and you aren't running more agents, you're doing a worse
-job of watching the ones you have.
-
-orbit replaces the reading with a grid and a color. Every SESSION is a CARD — its name, what it runs on,
-the last thing you asked it — with a STATUS DOT that says what it's doing; the cards sit in a BAND per
-checkout under a row of PROJECT TABS, and every tab carries its sessions' dots with a count, so a red `●1`
-on a tab tells you exactly where to look without opening anything.
-
-**No Electron, no browser, no server, no MCP.** One Rust binary (a 5 MB download) and a unix socket.
+One Rust binary and a unix socket. No Electron, no browser, no server.
 
 ## What you get
 
 | | |
 |---|---|
-| **One grid, every session** | PROJECT TABS across the top, a BAND per WORKTREE, a CARD per SESSION, and the PANE — the live terminal of the card under the cursor — along the bottom or down the right. Terminals are cards too, two columns wide, showing the last lines their shell printed. `j`/`k` walk the bands, `Tab` opens one in place, `h`/`l` walk its cards, `Enter` steps into the pane and starts typing at the agent, `` Ctrl+` `` hands the keys back. |
-| **One orchestrator chat** | `F10` toggles the ORCHESTRATOR view: a pinned agent chat fills the screen, with a compact strip of every live session in attention order. The orchestrator can list, read, message, spawn and open review tabs across projects through daemon-gated commands; on narrow/mobile terminals this view is the default. |
-| **A DAEMON that owns the PTYs** | Quit the TUI, shut the laptop, come back tomorrow. The agents never stopped, and the SCROLLBACK RING is replayed on ATTACH. |
-| **STATUS DOTS you read instead of screens** | ● yellow mid-turn, ● blue finished and UNSEEN, ● green finished and read, ● red waiting on you — on every card, and counted on every PROJECT TAB (`orbit-api ●1 ●1 ●1`), so a project you aren't looking at still tells you what it owes you. A finish you haven't read wears a blue `done` badge until you do. |
-| **A task box, not a picker** | `p` opens the QUICK PROMPT: type the task, `Enter`, and an agent is working on it. The row over the box spells out the launch — `project orbit-api ^P · worktree main ^T · harness claude Tab · model opus high ^O` — and each of those is a picker you can open without losing the text. `Space` on a card is the same box for a session already running: its next turn, sent straight down its PTY, without stepping into it. |
-| **Real git WORKTREES, one keystroke** | `Ctrl+N` in the box flips the launch onto a fresh `git worktree` — the frame turns green and names the branch it will cut — and every card in that checkout sits in its own BAND, with the branch, its uncommitted changes and its pull request on the rule above them. Two agents in two directories never collide. A WORKTREE HOOK in git config lets a project claim a port or a route when a checkout is created and release it when it is deleted. |
-| **The root checkout on any branch, no shell** | `c` on a root-branch card lists every branch and remote branch, fuzzy-filtered as you type; `Enter` switches, or creates the branch when nothing matches. Uncommitted changes? The BRANCH SWITCHER asks first — stash them, bring them along, commit them, or discard them — the way an IDE would. |
-| **Agents that drive orbit back** | Tell a Claude SESSION *"do this in a worktree"* and it runs `orbit worktree`, then restarts itself resumed inside the new checkout. Say *"show me the file"* or *"show the diagram"* and `orbit open` puts text, images and Mermaid diagrams in front of you in a tabbed modal. Say *"start a new orbit session that…"* and `orbit spawn` has a second agent working beside it before you look. Say *"check what the research session found"* and it can run `orbit sessions`, `orbit read research`, or `orbit ask research "which library?"` to pull context from that session. |
-| **Every open pull request, in place** | orbit asks `gh` what's open on the repo. A band whose branch has a pull request names it on its rule — `↗ #57 Move the token store to sqlite  ready` — in red once GitHub says it no longer merges or a check failed, purple once it's merged; the header counts `3 prs · 5 issues`. `v` lists them and reads the one under the cursor — description, checks, the whole conversation — `Ctrl+g` for its diff, `Ctrl+c` to comment without leaving the keyboard, `Enter` for a PR SESSION in the pull request's own checkout, `Shift+V` on a card sends its pull request to the browser. |
-| **Every open issue, one key from an agent** | `i` lists the project's open GitHub issues, newest first, filtered as you type, and reads the one under the cursor — description, labels, comments. `Enter` opens the QUICK PROMPT for it, `Shift+Tab` launches one of your AGENT PRESETS on it, `Ctrl+e` edits its title and description in place; the issue's URL travels with the session as context on every spawn, so the harness knows what it is fixing. `Shift+I` on the card opens the issue it came from. |
-| **Diff, find, grep, browse** | `g` opens the DIFF VIEWER with REVIEWED MARKS, `f` the FILE FINDER, `F` a `git grep`, `b` the TREE BROWSER — all scoped to the card's WORKTREE, all one key from anywhere. Markdown previews are rendered pages, Mermaid fences become diagrams when `mmdc` is installed, and image files preview inline instead of as binary blobs. |
-| **`/` finds anything, anywhere** | The PALETTE spans every PROJECT on the machine, each session listed with its project in front of it. Before you type it is that overview, sorted by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `.` / `,` cycle that same attention order with no modal at all, one session per press, every project included. Open pull requests are rows too. |
-| **It follows you to other machines** | `orbit ssh <host>` opens orbit there, installing it if missing. `orbit tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. `orbit sbx` does the same into a local Docker container, so agents run sandboxed. Your settings and agent presets go along, and `orbit config export` / `import` back them up. |
-
-## Supported harnesses
-
-Seven CLIs work out of the box, each with its own Agents tab section and model/effort rows. Install the CLI,
-pick it in the box's `Tab` picker, done. A CLI missing from PATH still shows in the picker; the DAEMON
-re-checks through the login shell at launch.
-
-| | Harness | CLI | Install |
-|---|---|---|---|
-| <img src="https://www.google.com/s2/favicons?domain=claude.com&sz=128" width="24" height="24" alt="Claude"> | [Claude](https://code.claude.com/docs/en/setup) | `claude` | `curl -fsSL https://claude.ai/install.sh \| bash` |
-| <img src="https://www.google.com/s2/favicons?domain=openai.com&sz=128" width="24" height="24" alt="Codex"> | [Codex](https://github.com/openai/codex) | `codex` | `npm i -g @openai/codex` |
-| <img src="https://www.google.com/s2/favicons?domain=cursor.com&sz=128" width="24" height="24" alt="Cursor"> | [Cursor](https://cursor.com/install) | `cursor-agent` | `curl -fsSL https://cursor.com/install \| bash` |
-| <img src="https://www.google.com/s2/favicons?domain=pi.dev&sz=128" width="24" height="24" alt="Pi"> | [Pi](https://pi.dev) | `pi` | `curl -fsSL https://pi.dev/install.sh \| sh` |
-| <img src="https://www.google.com/s2/favicons?domain=meta.com&sz=128" width="24" height="24" alt="Muse"> | [Muse](https://developer.meta.com/ai/lp/muse-code) | `muse` | `curl -fsSL https://dev.meta.ai/install.sh \| bash` |
-| <img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=128" width="24" height="24" alt="OpenCode"> | [OpenCode](https://opencode.ai/docs/) | `opencode` | `curl -fsSL https://opencode.ai/install \| bash` |
-| <img src="https://www.google.com/s2/favicons?domain=x.ai&sz=128" width="24" height="24" alt="Grok"> | [Grok](https://github.com/xai-org/grok-build) | `grok` | `curl -fsSL https://x.ai/cli/install.sh \| bash` |
+| **One screen, every session** | Project tabs across the top, a band per worktree, a card per session, and the live terminal of the card under the cursor beside them. Arrow keys move; `Enter` steps into a session; `Ctrl+Q` steps back out. |
+| **Dots you read instead of screens** | ● yellow working, ● red **waiting on you**, ● blue finished and unread, ● green finished and seen — on every card and counted on every tab. Red plays a sound and sends a desktop notification. `;` jumps to the next session that needs you. |
+| **A daemon that owns the sessions** | Quit Orbit, close the laptop, come back tomorrow: the sessions never stopped, and their output is replayed when you return. |
+| **A task box, not a picker** | `p`, type the task, `Enter` — Claude is working on it. `Ctrl+N` runs it in a fresh git worktree so parallel agents never edit the same files. `Space` on a card sends a running session its next instruction without opening it. |
+| **Skills, several at once** | In the task box press `Ctrl+S` (or type `/` first) for a list of every skill you have — personal, project and plugin. Tick as many as the task needs; save a set you reuse as a **workflow** in the project's `.orbit/config.json` — commit it and your team gets it too. |
+| **Limits and context at a glance** | The footer shows your plan's 5-hour and weekly use (`5h 23% · wk 41%`), and each Claude card shows how full its context is (`ctx 64%`) — amber from 80%, red from 95%. |
+| **Code graph, built in** | Orbit keeps a [graphify](https://github.com/Graphify-Labs/graphify) knowledge graph of every checkout up to date — no LLM, a few seconds — and tells Claude to query it before searching file by file. `k` opens it in your browser. |
+| **Review without leaving** | `g` diff with reviewed marks, `l` a full-screen git graph of every branch and commit, `f` find a file, `⇧F` search in files, `b` file tree — all scoped to the card's checkout. Markdown renders, images preview inline. |
+| **Browser testing on the right model** | Claude sessions get two [agent-browser](https://github.com/vercel-labs/agent-browser) subagents: quick page checks on Haiku, multi-step flows on Sonnet — instead of driving your own Chrome. |
+| **GitHub in place** | Every band shows its branch's pull request. `v` lists open PRs (read, diff, comment, start a session on one), `i` lists issues (`Enter` starts a session on it). Needs `gh`. |
+| **Claude drives Orbit back** | Tell a session *"do this in a worktree"*, *"start a new session that writes the tests"*, *"show me the diagram"* or *"ask the api session which library it chose"* — it runs the right `orbit` command itself. |
+| **Keys you can remember** | Arrows to move, letters that mean something (`p` new task, `g` diff, `l` git graph, `k` code graph, `j` jump, `h` help), nothing that needs ⌥ or a dead key on an AZERTY Mac. Every key is rebindable. |
+| **One-time setup check** | `orbit doctor` shows what your machine has, what's missing and what each piece unlocks; `orbit doctor --fix` installs the integrated tools once. |
 
 ## Install
 
@@ -103,230 +67,117 @@ macOS or Linux — the same command installs and updates:
 curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh
 ```
 
-It downloads the prebuilt binary for your platform from the latest GitHub release into `~/.local/bin`
-(override with `ORBIT_INSTALL_DIR`), falling back to `cargo install --git` when no release matches.
-Afterwards, `orbit upgrade` runs that same script for you; it refuses to clobber a local `cargo build`
-(pass `--force` if you mean it). Upgrading with a DAEMON running is safe: an idle one — nothing live in
-it — is shut down for you, so the next launch comes up on the new binary. A DAEMON with live SESSIONS is
-restarted in place onto the new binary: every agent keeps running, mid-turn or not, and relaunching
-`orbit` picks them back up with their scrollback (`orbit reload` does the same by hand, say after a
-`make install`). Only a DAEMON from a release before that existed is left on the old binary until you
-`orbit kill` and relaunch — and when the new build speaks a different protocol, `orbit upgrade` says
-so and offers that restart for you. `orbit --version` (`-V`) says which binary you are on.
+It downloads the prebuilt binary for your platform from the latest release into `~/.local/bin`
+(override with `ORBIT_INSTALL_DIR`), and falls back to building from source with `cargo` when there is
+no release for your platform yet. Afterwards `orbit upgrade` updates in place without stopping your
+sessions, and `orbit --version` says which build you are on.
 
-WSL2 is supported as Linux. WSL1 is not: it lacks the Linux kernel behavior orbit's DAEMON relies on
-for its Unix socket, pidfile lock, and PTYs, so orbit reports that directly and tells you to convert
-the distro with `wsl.exe --set-version <distro> 2`.
+**What you need:** `git` and [Claude Code](https://code.claude.com/docs/en/setup) (`claude`), plus
+**`uv`** and **`npm`** — Orbit installs the tools it integrates through those two, once per machine,
+the first time each is needed. `gh` is the one optional extra worth installing yourself, for pull
+requests and issues. Run `orbit doctor` to check.
 
-> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, or `opencode`.
-> orbit spawns them; it doesn't ship them.
->
-> Four commands each want one more binary, and only those commands: `orbit ssh` and `orbit tunnel`
-> exit if there is no OpenSSH client (`ssh`), `orbit sbx` needs `docker`, and `orbit browser` needs
-> `ttyd` on your `PATH` — for `orbit tunnel` it is the *remote* host that needs it. The TUI itself
-> needs none of them.
+Windows works through WSL2 (as Linux); WSL1 and native Windows are not supported.
 
 ## Quickstart
 
-**1. Add a repo.** orbit is project-first, and a PROJECT is just a git checkout:
-
 ```sh
-orbit add ~/code/my-app       # or, from inside the repo: orbit add .
-```
-
-**2. Open the TUI.** A bare `orbit` launches it and auto-starts the DAEMON:
-
-```sh
+cd ~/code/my-app
 orbit
 ```
 
-It opens on the GRID — no modal, ever, on launch. With no PROJECTS yet you get the SPLASH: launched from
-inside a repo, `Enter` opens it as your first PROJECT, so step 1 is optional — anywhere else, `o` browses
-for one without leaving the TUI. Every project you open gets a PROJECT TAB in the header, the one you
-last worked in at the far left: a click, `[` / `]`, or a digit `1`–`9` switches, `+` drops a list of every
-project on the machine, and `x` closes a tab without touching its sessions.
+1. On the splash screen press **`Enter`** to open the repository you're in as your first project
+   (anywhere else, **`o`** browses for a folder).
+2. Press **`p`**, type what you want done, press **`Enter`**. A card appears with a yellow dot.
+3. Do something else. When the dot turns **blue** (done) or **red** (needs you), press **`;`** to land on
+   it, and **`Enter`** to step in. **`Ctrl+Q`** brings you back.
+4. **`q`** quits — the sessions keep running. Run `orbit` again to pick them up.
 
-**3. Start the agent.** `p` opens the QUICK PROMPT, focused, so the first thing you type is the task.
-`Enter` launches it — with the harness, model and effort the Agents tab defaults name, in the checkout
-under the cursor — and the cursor and the pane land on the new card as it shows up in the grid
-(turn off **Follow new** in Settings → Agents to stay on the card you were on). For one launch
-only, `Tab` picks another harness (**Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build** or **OpenCode**, `→`
-for MODEL and EFFORT), `Ctrl+O` a model, `Ctrl+T` any checkout of the project, `Ctrl+P` any project on the
-machine (a launch aimed elsewhere runs in the background and the footer says where it went). Send the
-box empty and the CLI starts bare, its pane yours to type the first prompt into. Save a framing you
-keep retyping as an AGENT PRESET (`e`) and it becomes one keystroke; a plain shell is `t`.
+Sessions name themselves from your first prompt (`Fix Login Redirect`, not `agent-3`). Press **`h`**
+any time for every key.
 
-Codex model and effort choices follow your installed Codex CLI automatically, including newly
-released models. Orbit reads `$CODEX_HOME/models_cache.json` (default `~/.codex`) at startup,
-then refreshes from `codex app-server` in the background every 15 minutes. Each model offers
-its own supported effort levels. If discovery fails, the last catalog stays available and
-`default` always lets Codex choose. To maintain a custom static list, set
-`harnesses.codex.catalog` to `null` and `harnesses.codex.models` in your Orbit config.
+<div align="center"><img src="assets/quick-prompt.png" alt="The task box over the grid: a task typed in, the row naming the project, worktree, harness and model, and the frame turned green because Ctrl+N pointed the launch at a fresh worktree" width="100%"></div>
 
-<div align="center"><img src="assets/quick-prompt.png" alt="The quick prompt over the grid: a task typed in, the details row naming the project, worktree, harness and model, and the frame turned green because Ctrl+N pointed the launch at a fresh worktree" width="100%"></div>
+## A closer look
 
-**4. Pick where it runs.** Press `Ctrl+N` inside the box and the launch goes into a real `git worktree`
-cut for the job — the frame turns green and names the branch — or turn on `New worktree` under
-**Quick prompt** in Settings → Agents to make that every box's default. That's the whole point of
-the BANDS: two agents in two WORKTREES edit two directories and never collide, and each band's rule
-carries the branch, its uncommitted changes (`+3 files +60 -28`) and its pull request.
+<table>
+<tr>
+<td width="50%"><img src="assets/skills.png" alt="The skill picker over the grid: two saved workflows on top, then personal skills with their descriptions, four ticked"></td>
+<td width="50%"><img src="assets/git-graph.png" alt="The git graph: every branch's commits drawn in lanes with ref badges, author and age, and the selected commit's details beside them"></td>
+</tr>
+<tr>
+<td><b>Skills per prompt</b> — <code>Ctrl+S</code> in the task box, tick a workflow or single skills.</td>
+<td><b>Git graph</b> — <code>l</code> on any card: branches, commits and messages, read-only.</td>
+</tr>
+<tr>
+<td width="50%"><img src="assets/follow-up.png" alt="The follow-up box over a finished session's card: the next instruction typed, sent straight to its CLI"></td>
+<td width="50%"><img src="assets/palette.png" alt="The jump palette: every session across every project, fuzzy-filtered, with its status dot"></td>
+</tr>
+<tr>
+<td><b>Follow-up</b> — <code>Space</code> on a card sends its next turn without opening it.</td>
+<td><b>Jump</b> — <code>j</code> or <code>/</code> to any session, anywhere.</td>
+</tr>
+</table>
 
-**5. Read the grid, not the screens.** `j` / `k` walk the bands and the pane reads each checkout's
-session as you pass; `Tab` opens a band to walk its cards, and `Enter` on a card steps into the pane
-with the grid still up — `Ctrl+q` or `` Ctrl+` `` hands the keys back. `Space` on a card opens a
-small box for that session's next turn and sends it without opening the session, so a wall of agents
-gets its next instructions one card at a time.
+## The keys that matter
 
-<div align="center"><img src="assets/follow-up.png" alt="The follow-up box over a card: the next turn for a finished Codex session, sent straight down its PTY" width="100%"></div>
-
-**6. Walk away.** `q` asks first — a CONFIRM DIALOG reading *Leave the TUI? Sessions keep running in the
-daemon.* that `Enter` accepts and a second `Ctrl+C` walks straight through. The DAEMON still owns every
-PTY — come back with `orbit` an hour later and each SESSION is exactly where you left it, scrollback
-replayed.
-
-A new SESSION starts on a default name and AUTO-TITLE renames it from your first prompt — `Fix Login
-Redirect`, not `agent-3`; `r` renames it whenever you like. A Claude SESSION's own name
-is the same name: `/rename` inside Claude Code retitles the card, and a name set in orbit reaches
-Claude's prompt box and `/resume` picker on your next prompt.
-
-## Read the dots, not the screens
-
-| Dot | AGENT STATUS |
+| Key | Does |
 |---|---|
-| ● gray | FRESH — agent never run |
-| ● yellow | RUNNING — turn in progress (the STOP GATE holds it open while subagents are live) |
-| ● blue | UNSEEN — turn complete and nobody has looked at it yet |
-| ● green | FINISHED — the same finished turn, once the cursor has been on the SESSION |
-| ● red | NEEDS FEEDBACK — permission prompt or question waiting on you |
-| ● magenta | terminated — process died mid-run |
-| ○ | disconnected — the DAEMON restarted while the agent was live |
+| `↑` `↓` `←` `→` · `Tab` | move between bands and cards · open/fold a band |
+| `Enter` · `Ctrl+Q` | step into a session · step back out |
+| `p` · `Space` | new task · follow-up to the card |
+| `;` `,` · `j` | next/previous session that needs you · jump to any session |
+| `<` `>` · `+` | previous/next project · list every project |
+| `g` · `l` · `k` | diff · git graph · code graph |
+| `f` · `⇧F` · `b` | find file · search in files · file tree |
+| `Ctrl+S` (in the task box) | pick skills and workflows for this prompt |
+| `v` · `i` | pull requests · issues |
+| `s` · `h` · `q` | settings · help · quit |
 
-A Cursor SESSION never goes red: orbit runs `cursor-agent --force` and Cursor reports no permission
-event, so waiting-on-you is not detectable there. A Muse SESSION never goes red either yet: `muse`
-has no managed hooks, so its status is process-based until a hook dialect is mapped. Grok Build also uses process-based status,
-with no managed hooks or automatic capture of its session ID yet. Model and effort IDs can be
-set through `harnesses.grok` in config.json; the CLI supplies their defaults when unset. An OpenCode
-SESSION does go red: orbit passes no `--auto`, so `opencode` keeps its own permission prompts, and its
-managed plugin reports each one (and each `question` the agent asks you) as it opens and closes.
+The full list, the mouse and every view: [Keys](docs/keys.md). Rebind anything in Settings (`s`) →
+Hotkeys.
 
-The PROJECT TABS ROLL UP their sessions: each tab carries one dot per state its sessions are in, with
-the count and no word at all — red waiting on you, blue finished unread, yellow mid-turn, in that order
-and left out where a state is empty — so a quiet project is its bare name, and a `●2` in red on a tab
-you aren't looking at is the whole message.
+## How it works, briefly
 
-A dot going blue while you were looking elsewhere is easy to miss, so orbit marks the moment and then
-keeps count. The moment: a card's name sweeps — a bright band crossing it — in yellow while it runs and in
-red while it waits on you, for as long as either lasts; a turn that finishes unread sweeps blue for about
-five seconds and then holds still, and the project's tab name sweeps in the loudest of its sessions'
-colors. Motion means live, or just changed; a card at rest is at rest (`animations` off stills all of
-it). The count: a turn that finishes in a pane that isn't on screen puts a blue `done` badge on its
-card where the age normally sits, and the tab's blue dot counts every one still owed a look. Landing the
-cursor on a card previews it, which reads it: the badge comes down as you arrive and the tab's count
-with it — `.` walks you onto the next one owed a look without hunting for it, every project included.
-The flag lives in the DAEMON, so it survives closing the TUI and is shared by every client; a turn that
-finishes in the pane you're already looking at never counts.
+Two processes, one binary. The **daemon** owns every session's terminal, a SQLite store and your git
+worktrees; the **TUI** is a client that can come and go. At spawn, Orbit merges a few managed hooks into
+the checkout's `.claude/settings.local.json` (your own settings are preserved and the hooks are inert
+outside Orbit); each hook reports to the daemon over loopback, which is where the dots come from — no
+polling, no screen scraping. Details: [How it works](docs/how-it-works.md) and
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-<div align="center"><img src="assets/palette.png" alt="The / palette over the grid: every session on the machine, the one waiting on you first, each with its project in front of it" width="100%"></div>
-
-A dot going red is the one you can't afford to miss — a blocked agent burns the clock while you're in
-another window — so that one reaches you: the FEEDBACK SOUND rings (`Sosumi` by default, distinct from
-the `Glass` DONE SOUND a finish gets), and when the terminal window is in the background a desktop
-notification names the session and its worktree. Neither fires for the pane you're locked into typing
-at with the window focused — that prompt is already under your hands. One setting, `feedback_sound`,
-owns both; `off` silences the pair. See [Configuration](docs/configuration.md).
-
-## Where the status actually comes from
-
-orbit doesn't poll the agents and it doesn't guess from the screen. At spawn it merges MANAGED HOOKS
-into the WORKTREE's `.claude/settings.local.json`, `.cursor/hooks.json` or `~/.codex/hooks.json` — tagged
-`_orbitManaged`, your own hooks preserved, rebuilt every spawn — and each one is a fail-soft `curl` to
-the DAEMON's loopback HOOK RECEIVER, authenticated with a per-boot BEARER TOKEN. Pi has no shell hooks,
-so it gets one managed extension at `~/.pi/agent/extensions/orbit.ts` that posts the same events, and
-OpenCode gets one managed plugin at `~/.config/opencode/plugins/orbit.ts` that does the same. For the one event no CLI
-reports — a turn you cancelled with `Esc` — the PROGRESS SCANNER reads the CLI's own OSC 9;4 progress
-escapes straight off the PTY, a signal that survives the cancel and stays busy while a permission prompt
-is open.
-
-## Teach orbit a new agent CLI
-
-The seven built-ins are just rows in a table, and the table is open. One block in `config.json` adds
-a CLI everywhere at once: the box's `Tab` picker, the `e` presets, spawn, resume, and the Agents tab, which
-grows it a section to tune without hand-editing.
-
-```json
-{
-  "harnesses": {
-    "mycli": {
-      "program": "mycli",
-      "model_flag": "--model",
-      "model_default": "large",
-      "hooks": "claude"
-    }
-  }
-}
-```
-
-`program` is the only required row: the binary orbit launches, resolved on PATH through your login
-shell. A new id starts enabled, takes the id as its label, boots fresh every launch (no resume), and
-hides the Effort row until you map effort. `orbit config harnesses` prints the effective rows to copy
-from, and a block that stops making sense refuses its launches with the reason while everything else
-keeps working. Ids use lowercase letters, digits and hyphens, and must not collide with a built-in.
-
-`hooks` names a built-in dialect, not your own scripts: `claude`, `codex`, `cursor`, `pi` or `opencode`. At spawn
-orbit installs that dialect's MANAGED HOOKS for the session (the same `.claude/settings.local.json`,
-`.cursor/hooks.json`, `~/.codex/hooks.json`, pi extension or OpenCode plugin the built-in gets), so a CLI that speaks
-that protocol reports status, prompts and permission waits exactly like the real thing. A
-Claude-compatible CLI with `"hooks": "claude"` even gets title sync and auto-title. Leave `hooks` out
-and the sessions stay process-based: running while the PTY is live, never red. Either way your own
-hooks are preserved (orbit's entries are tagged `_orbitManaged`) and the merge is rebuilt every
-spawn.
-
-One boundary to know: `orbit ssh` syncs `config.json` to the remote, but exec-capable harness keys
-never travel with it: each machine runs only the programs its own files name. Full row reference
-(resume styles, effort mapping, system-prompt passing, clearing a row with `null`): [Configuration](docs/configuration.md),
-"The harness registry".
+Orbit is Claude-first, but it still launches the other CLIs it inherited — Codex, Cursor, Pi, Muse,
+Grok Build and OpenCode — and any CLI you describe in `config.json`; switch the ones you don't use off
+in Settings → Agents. See [Configuration](docs/configuration.md#the-harness-registry).
 
 ## Documentation
 
 | | |
 |---|---|
-| [**Guide**](docs/guide.md) | Start here: what Orbit is, how to run it, the everyday loop, worktrees, reviewing, GitHub, presets, settings worth changing, every key, troubleshooting. |
-| [**Keys**](docs/keys.md) | Every default binding, the grid's own keys (tabs, bands, cards, the pane), the WORKTREE views (`g` `f` `F` `b` `i` `v`), the chips and readouts, and the mouse. All of it rebindable. |
-| [**Commands**](docs/commands.md) | The `orbit` CLI: `add`, `rename`, `worktree`, `spawn`, `open`, `config`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
-| [**Sessions**](docs/sessions.md) | The QUICK PROMPT and the GRID, the NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the FOLLOW-UP COMPOSER, RECENT PROMPTS, the ISSUES MODAL, the PULL REQUESTS MODAL. |
-| [**Orchestrator**](docs/orchestrator.md) | The chat-first orchestrator session, privileged commands, status strip, review modal and mobile default. |
-| [**Configuration**](docs/configuration.md) | `config.json` and `config.local.json`, backup and restore, the SETTINGS OVERLAY, the HOTKEYS TAB, the `.orbit/config.json` PROJECT FILE (**Run** and **Open** in the project's menu, `Shift+Enter` opens it), compatibility rules, logs and environment overrides. |
-| [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |
-| [**Architecture**](ARCHITECTURE.md) | Process model, the IPC CODEC and the crate layout. |
+| [**User guide**](docs/guide.md) | Start here: the everyday loop, worktrees, reviewing, GitHub, presets, settings worth changing, every key, troubleshooting. |
+| [**Keys**](docs/keys.md) | Every default binding and the mouse. |
+| [**Commands**](docs/commands.md) | The `orbit` CLI: `add`, `doctor`, `sessions`, `read`, `ask`, `worktree`, `spawn`, `open`, `config`, `ssh`, `upgrade`, … |
+| [**Sessions**](docs/sessions.md) | The task box, presets, the follow-up box, issues and pull requests in depth. |
+| [**Orchestrator**](docs/orchestrator.md) | `F10`: one pinned Claude chat that coordinates every other session. |
+| [**Configuration**](docs/configuration.md) | `config.json`, the project file, worktree hooks, logs, environment variables. |
+| [**How it works**](docs/how-it-works.md) · [**Architecture**](ARCHITECTURE.md) | The daemon, the hooks, persistence, the crate layout. |
 
-## Building
+## Building from source
 
 ```sh
-cargo build --release     # → target/release/orbit (~11 MB)
-cargo test                # unit + end-to-end suite (spawns real daemons/PTYs)
+make dev                  # build and run an isolated copy (own daemon and data)
+make ci                   # format check, clippy, the whole test suite
+make install PREFIX=~/.local/bin
 ```
 
-`orbit-core` (shared protocol/entities), `orbit-daemon` (PTYs, SQLite, HOOK RECEIVER, STATUS MACHINE),
-`orbit-tui` (ratatui client), `orbit` (the binary). `vendor/vt100` is a patched copy of the terminal
-parser wired in through `[patch.crates-io]`: rows scrolled out of a top-anchored scroll region go to the
-SCROLLBACK RING instead of being discarded, so wheel-up over a codex SESSION has something to show.
+Crates: `orbit-core` (protocol and entities), `orbit-daemon` (sessions, SQLite, hooks, status),
+`orbit-tui` (the interface), `orbit` (the binary). Releases: push a `v*` tag and CI builds macOS
+(Apple Silicon and Intel) and Linux binaries.
 
-Screenshots: `make shot SCENE=readme-grid` renders the README's hero from a scripted demo — an isolated
-orbit, stand-in agents, a stub `gh` — into `design-screenshots/`; the scenes live in `scripts/shot/scenes/`.
-
-Releases: push a `v*` tag (`git tag v0.1.0 && git push --tags`) and CI builds mac (arm/intel) and linux (x64/arm64, static musl) binaries and
-attaches them to a GitHub release — which is what `install.sh` downloads.
-
-Pull requests: a branch pushed to this repository gets an automated Claude code review on its PR, as
-inline comments. A PR from a fork does not — GitHub withholds the credentials the reviewer needs from a
-fork's workflow runs — so a maintainer reviews it by hand, or asks for the review with `@claude` in a
-PR comment.
+**Pulling in upstream nebula changes:** `scripts/rebrand.sh` renames an upstream branch to Orbit before
+it is merged — see the script's header.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-<div align="center">
-<br>
-<sub>If orbit saves you a tab, a ⭐ helps other people find it.</sub>
-</div>
+MIT — see [LICENSE](LICENSE). Orbit is based on [nebula](https://github.com/AgentSystemLabs/nebula) by <!-- rebrand:keep -->
+Cody Seibert, whose copyright notice the license keeps.

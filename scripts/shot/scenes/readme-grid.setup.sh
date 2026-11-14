@@ -7,7 +7,7 @@
 # (ORBIT_SHOT_PANE=right puts it beside the cards) so a band shows four cards across.
 mkdir -p "$WORK/data"
 cat > "$WORK/data/config.json" <<JSON
-{"prewarm_agents": false, "prewarm_sessions": false, "session_pane": "${ORBIT_SHOT_PANE:-bottom}",
+{"prewarm_agents": false, "prewarm_sessions": false, "done_sound": "off", "feedback_sound": "off", "session_pane": "${ORBIT_SHOT_PANE:-bottom}",
  "claude_model": "opus", "claude_effort": "high", "codex_model": "gpt-5.6-sol", "codex_effort": "high"}
 JSON
 mk() {
@@ -81,11 +81,16 @@ cat > "$RUNTIME/agent" <<'AGENT'
 # Stand-in agent: launch N tells story N. The dialect posted to follows the harness the keys picked.
 n=$(cat "$ORBIT_SHOT_COUNTER" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$ORBIT_SHOT_COUNTER"
 dialect=claude
-case "$n" in 3) dialect=codex;; 6) dialect=opencode;; esac
+# Every launch is Claude: Orbit is Claude-first.
 post() {
   curl -sS -m 3 -X POST -H "Authorization: Bearer $ORBIT_API_TOKEN" -H 'Content-Type: application/json' \
     -d "$2" "$ORBIT_API_URL/api/hooks/$dialect?agentId=$ORBIT_AGENT_ID&hookEvent=$1" >/dev/null 2>&1
 }
+# Claude's status line, as the managed statusLine would post it: plan limits plus this session's context.
+reset=$(( $(date +%s) + 7200 )); weekly=$(( $(date +%s) + 300000 ))
+curl -sS -m 3 -X POST -H "Authorization: Bearer $ORBIT_API_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"context_window\":{\"used_percentage\":$((20 + n * 11))},\"rate_limits\":{\"five_hour\":{\"used_percentage\":38,\"resets_at\":$reset},\"seven_day\":{\"used_percentage\":61,\"resets_at\":$weekly}}}" \
+  "$ORBIT_API_URL/api/statusline?agentId=$ORBIT_AGENT_ID" >/dev/null 2>&1
 say() { printf '%s\r\n' "$@"; }
 case "$n" in
   1) title="Checkout design tokens"
