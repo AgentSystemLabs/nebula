@@ -190,6 +190,7 @@ All of these open for the checkout of the card under the cursor:
 | Key | Opens |
 |---|---|
 | **`g`** | the **diff** of everything changed, file by file; mark files as reviewed as you go |
+| **`l`** | the **git graph**: every branch's commits with their refs, the selected one's message and files beside them; type to filter, `Enter` lists a commit's files (each read as a diff), `Ctrl+b` all branches / current branch, `Ctrl+y` copies the sha. Reading only |
 | **`f`** | **find a file** by name (fuzzy); `Enter` opens it, `Ctrl+Y` copies its path |
 | **`⇧F`** | **search inside files** (`git grep`) |
 | **`b`** | **browse** the file tree |
@@ -339,6 +340,7 @@ Every key is rebindable in Settings → Hotkeys.
 | Key | Action |
 |---|---|
 | `g` | diff |
+| `l` | git graph (commits, branches, refs) |
 | `f` / `⇧F` | find a file / search in files |
 | `b` | file tree |
 | `c` | switch the main checkout's branch |

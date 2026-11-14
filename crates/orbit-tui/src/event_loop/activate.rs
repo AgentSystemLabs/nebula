@@ -112,6 +112,17 @@ pub(super) fn diff_row(view: &mut DiffView, index: i64) {
     }
 }
 
+/// A click on the GIT GRAPH's row `index`: the first click puts the
+/// cursor there, as ↑/↓ walking onto it would; a click on the cursor's own
+/// row is Enter on it (a commit's files unfold, or fold again).
+pub(super) fn git_graph_click(view: &mut DiffView, index: i64) {
+    if index == view.side_cursor() as i64 {
+        diff_row(view, index);
+    } else {
+        diff_file(view, index);
+    }
+}
+
 /// `→` / `←` in the DIFF modal: unfold or fold the section, commit or tree
 /// directory under the cursor, and read whatever the cursor came to rest on.
 pub(super) fn diff_fold(view: &mut DiffView, inward: bool) {

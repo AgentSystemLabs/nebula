@@ -489,6 +489,34 @@ pub(crate) fn open_diff_view(app: &mut App) {
     });
 }
 
+/// `l`: the GIT GRAPH on the checkout under the cursor — or, with none,
+/// the project's repository, as `Shift+G` resolves it. The modal is up on
+/// this keypress saying it is reading; the history lands when `git log`
+/// answers (`land_view_answer`). Each open reads afresh. Reading only:
+/// nothing here writes to the repository.
+pub(crate) fn open_git_graph(app: &mut App) {
+    let checkout = app
+        .selected_worktree()
+        .map(|w| (w.path.clone(), w.branch.clone()))
+        .filter(|(path, _)| path.is_dir())
+        .or_else(|| {
+            app.selected_project()
+                .map(|p| (p.repo_path.clone(), p.name.clone()))
+        });
+    let Some((root, branch)) = checkout else {
+        app.chrome.flash = Some(SELECT_CONTEXT_FIRST.into());
+        return;
+    };
+    if !root.is_dir() {
+        app.chrome.flash = Some(format!("repository missing on disk: {}", root.display()));
+        return;
+    }
+    let mut view = DiffView::git_graph(root, branch, app.jobs.view_jobs.clone());
+    view.split = !crate::config::Config::load().diff_inline;
+    crate::git_log::request_log(&mut view);
+    app.modals.overlay = Some(Overlay::Diff(view));
+}
+
 pub(crate) fn show_graph_diff_listing(
     app: &mut App,
     path: std::path::PathBuf,

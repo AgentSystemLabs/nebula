@@ -67,7 +67,9 @@ fn overlay_footer_hint(app: &App, overlay: &Overlay, th: Theme) -> FooterHint {
             th,
         ),
         Overlay::Diff(view) => dim_hint(
-            if view.tree.is_some() {
+            if view.graph_only {
+                "type: filter  ↑/↓ PgUp/PgDn Home/End: commits  Enter: files  ⇧↑/↓: scroll  Ctrl+b: all/current branch  Ctrl+y: copy sha  Esc: clear/close"
+            } else if view.tree.is_some() {
                 "type: filter  ↑/↓: move  ←/→: fold  ⇧↑/↓: scroll  Ctrl+d/u: half list  Ctrl+t: flat list  Ctrl+u: clear filter  Esc: clear/close"
             } else {
                 "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: half list  Ctrl+t: tree  Ctrl+u: clear filter  Esc: clear/close"

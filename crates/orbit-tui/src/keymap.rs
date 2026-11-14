@@ -70,6 +70,9 @@ pub enum Action {
     AddProject,
     New,
     GitDiff,
+    /// `l`: the GIT GRAPH — the checkout's commits and branches drawn as
+    /// `git log --graph` draws them, the cursor's commit read beside them.
+    GitGraph,
     OpenRepo,
     OpenGraph,
     /// `Shift+V`: the pull request of the session card under the cursor,
@@ -378,6 +381,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["g"],
+    },
+    ActionSpec {
+        action: Action::GitGraph,
+        id: "git_graph",
+        label: "Git graph",
+        hint: "Open the commit graph for the checkout under the cursor: every branch's commits with their refs, the selected one's message and files beside them; Enter lists a commit's files, each read as a diff",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["l"],
     },
     ActionSpec {
         action: Action::OpenRepo,

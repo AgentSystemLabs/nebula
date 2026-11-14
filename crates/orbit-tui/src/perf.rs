@@ -156,6 +156,7 @@ fn overlay_name(app: &App) -> &'static str {
         Some(Overlay::Prompt(_)) => "Prompt",
         Some(Overlay::Help(_)) => "Help",
         Some(Overlay::Settings(_)) => "Settings",
+        Some(Overlay::Diff(v)) if v.graph_only => "GitGraph",
         Some(Overlay::Diff(_)) => "Diff",
         Some(Overlay::Palette(_)) => "Palette",
         Some(Overlay::Files(_)) => "Files",
