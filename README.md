@@ -1,3 +1,8 @@
+> [!NOTE]
+> **Orbit is a personal fork of [nebula](https://github.com/AgentSystemLabs/nebula)** by Cody Seibert <!-- rebrand:keep -->
+> (MIT), reshaped for a Claude-first workflow: simpler keys, skill workflows and knowledge-graph
+> integration. **New here? Start with the [user guide](docs/guide.md).**
+
 > [!WARNING]
 > **Work in progress.** orbit is built for one person's workflow — mine — and it changes fast as I iterate on it.
 > Expect breaking changes between releases: keys that move, screens that get redrawn, features that come and go
@@ -20,7 +25,7 @@ terminal, one keyboard, one grid. They keep working when you close it.
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square)](#install)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?style=flat-square)](https://www.rust-lang.org)
 
-[**Keys**](docs/keys.md) · [**Commands**](docs/commands.md) · [**Sessions**](docs/sessions.md) · [**Configuration**](docs/configuration.md) · [**How it works**](docs/how-it-works.md)
+[**Guide**](docs/guide.md) · [**Keys**](docs/keys.md) · [**Commands**](docs/commands.md) · [**Sessions**](docs/sessions.md) · [**Configuration**](docs/configuration.md) · [**How it works**](docs/how-it-works.md)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh
@@ -285,6 +290,7 @@ never travel with it: each machine runs only the programs its own files name. Fu
 
 | | |
 |---|---|
+| [**Guide**](docs/guide.md) | Start here: what Orbit is, how to run it, the everyday loop, worktrees, reviewing, GitHub, presets, settings worth changing, every key, troubleshooting. |
 | [**Keys**](docs/keys.md) | Every default binding, the grid's own keys (tabs, bands, cards, the pane), the WORKTREE views (`g` `f` `F` `b` `i` `v`), the chips and readouts, and the mouse. All of it rebindable. |
 | [**Commands**](docs/commands.md) | The `orbit` CLI: `add`, `rename`, `worktree`, `spawn`, `open`, `config`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
 | [**Sessions**](docs/sessions.md) | The QUICK PROMPT and the GRID, the NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the FOLLOW-UP COMPOSER, RECENT PROMPTS, the ISSUES MODAL, the PULL REQUESTS MODAL. |
