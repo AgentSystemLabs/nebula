@@ -1444,6 +1444,9 @@ fn draw_metrics_overlay(f: &mut Frame, app: &mut App, view: crate::app::MetricsV
     }
 }
 
+/// Narrower than this the GIT GRAPH stacks its pane under the commit list.
+const GIT_GRAPH_STACK_BELOW: u16 = 100;
+
 fn draw_diff_overlay(f: &mut Frame, app: &mut App, view: crate::app::DiffView) {
     let th = app.chrome.theme;
     let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
@@ -1451,15 +1454,26 @@ fn draw_diff_overlay(f: &mut Frame, app: &mut App, view: crate::app::DiffView) {
     // Cap first, floor second: on a tiny screen the file list keeps
     // its minimum and SPLIT_PANE_LAYOUT_MIN squeezes the diff pane
     // instead.
-    let files_w = view
-        .files_width
+    // The GIT GRAPH gives the commit list most of the width, and stacks the
+    // pane under it when the screen is too narrow for both side by side.
+    let stacked = view.graph_only && area.width < GIT_GRAPH_STACK_BELOW;
+    let want_w = if view.graph_only && view.files_width == 0 {
+        area.width * 3 / 5
+    } else {
+        view.files_width
+    };
+    let files_w = want_w
         .min(area.width.saturating_sub(crate::app::MIN_DIFF_PANE_W))
         .max(crate::app::MIN_DIFF_FILES_W);
-    let [files_a, diff_a] = Layout::horizontal([
-        Constraint::Length(files_w),
-        Constraint::Min(SPLIT_PANE_LAYOUT_MIN),
-    ])
-    .areas(area);
+    let [files_a, diff_a] = if stacked {
+        Layout::vertical([Constraint::Percentage(50), Constraint::Min(4)]).areas(area)
+    } else {
+        Layout::horizontal([
+            Constraint::Length(files_w),
+            Constraint::Min(SPLIT_PANE_LAYOUT_MIN),
+        ])
+        .areas(area)
+    };
 
     let list_inner = draw_diff_file_list(f, &view, files_a, th);
 
@@ -1492,7 +1506,9 @@ fn draw_diff_overlay(f: &mut Frame, app: &mut App, view: crate::app::DiffView) {
         (diff_a.width as usize).saturating_sub(4),
     );
     let mut block = panel_block(&title, true, th).title_bottom(Line::from(Span::styled(
-        if view.selected_file().is_some() && view.prefetched.is_none() {
+        if view.graph_only {
+            " ^s: split/inline "
+        } else if view.selected_file().is_some() && view.prefetched.is_none() {
             " ^o: edit · ^r: toggle reviewed · ^s: split/inline "
         } else {
             " ^r: toggle reviewed · ^s: split/inline "
@@ -1544,6 +1560,8 @@ fn draw_diff_overlay(f: &mut Frame, app: &mut App, view: crate::app::DiffView) {
         v.area = area;
         v.files_width = files_w;
         v.split_shown = split.is_some();
+        v.stacked = stacked;
+        v.side_area = files_a;
     }
 }
 
@@ -1875,6 +1893,40 @@ fn log_row_spans(
     spans
 }
 
+/// The GIT GRAPH's list title: which checkout and branches it shows, how
+/// many commits, and how far this branch is from its upstream.
+fn git_graph_title(view: &crate::app::DiffView) -> String {
+    let Some(log) = &view.log else {
+        return "Git graph".into();
+    };
+    let scope = if log.current_only {
+        "current branch"
+    } else {
+        "all branches"
+    };
+    let count = if log.reading.is_some() && log.commits.is_empty() {
+        "loading…".to_string()
+    } else if view.filter.is_empty() {
+        format!("{} commits", log.commits.len())
+    } else {
+        let shown = log
+            .rows
+            .iter()
+            .filter(|r| matches!(r.entry, crate::git_log::Entry::Commit(_)))
+            .count();
+        format!("{shown}/{} commits", log.commits.len())
+    };
+    let (ahead, behind) = log.sides();
+    let mut title = format!("Git graph · {scope} · {count}");
+    if ahead > 0 {
+        title.push_str(&format!(" · ↑{ahead}"));
+    }
+    if behind > 0 {
+        title.push_str(&format!(" · ↓{behind}"));
+    }
+    title
+}
+
 fn draw_diff_file_list(
     f: &mut Frame,
     view: &crate::app::DiffView,
@@ -1884,7 +1936,9 @@ fn draw_diff_file_list(
     // Left: changed-file list — flat paths, or the directory tree
     // (`Ctrl+t`); a stateless follow-window keeps the selected row
     // visible.
-    let mut files_title = if view.log.is_some() {
+    let mut files_title = if view.graph_only {
+        git_graph_title(view)
+    } else if view.log.is_some() {
         "Source control".to_string()
     } else if view.listing.is_some() && view.files.is_empty() {
         "Files (…)".to_string()
@@ -1898,7 +1952,9 @@ fn draw_diff_file_list(
     }
     // The hint names the list `Ctrl+t` leads to, not the one up.
     let block = panel_block(&files_title, true, th).title_bottom(Line::from(Span::styled(
-        if view.tree.is_some() {
+        if view.graph_only {
+            " ^b: all/current branch · ^y: copy sha "
+        } else if view.tree.is_some() {
             " ^t: flat list "
         } else {
             " ^t: tree "
@@ -1915,7 +1971,16 @@ fn draw_diff_file_list(
     }
     let list_inner = below_first_row(files_inner);
 
-    if view.log.is_some() {
+    if view.graph_only && view.side_len() == 0 {
+        let reading = view.log.as_ref().is_some_and(|l| l.reading.is_some());
+        let text = match view.log.as_ref().and_then(|l| l.error.as_deref()) {
+            Some(err) => err,
+            None if reading => "loading…",
+            None if view.filter.is_empty() => "no commits yet",
+            None => NO_MATCHES,
+        };
+        empty_list_row(f, list_inner, text, th);
+    } else if view.log.is_some() {
         let done = view
             .tree
             .as_ref()

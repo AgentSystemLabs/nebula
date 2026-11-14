@@ -260,8 +260,15 @@ fn handle_diff_mouse(
     // a file-list row selects that file (and folds or unfolds a tree
     // directory's), a drag on the files/diff border resizes the file list;
     // everything else is swallowed.
+    // The GIT GRAPH (`graph_only`) is the same modal; its list may sit
+    // above the pane, and a click on a commit only moves the cursor there
+    // until it is clicked again (`activate::git_graph_click`).
     if let Some(Overlay::Diff(view)) = &mut app.modals.overlay {
-        let over_files = view.area.contains(mouse_pos) && mouse.column < view.splitter_x();
+        let over_files = if view.graph_only {
+            view.side_area.contains(mouse_pos)
+        } else {
+            view.area.contains(mouse_pos) && mouse.column < view.splitter_x()
+        };
         match mouse.kind {
             MouseEventKind::ScrollUp if over_files => {
                 let at = view.side_cursor();
@@ -285,12 +292,20 @@ fn handle_diff_mouse(
                 // Border grab zone: the two touching border cells at the
                 // files/diff boundary.
                 let bx = view.splitter_x();
-                if on_vsplit(bx, view.area, mouse.column, mouse.row) {
+                if !view.stacked && on_vsplit(bx, view.area, mouse.column, mouse.row) {
                     view.files_drag = Some(bx as i32 - mouse.column as i32);
                     return true;
                 }
                 let area = view.list_area;
-                if view.log.is_some() {
+                if view.graph_only {
+                    let first = crate::app::window_start(view.side_cursor(), area.height as usize);
+                    if let Some(index) =
+                        crate::list_hit::row_at(area, first, view.side_len(), mouse_pos)
+                    {
+                        activate::git_graph_click(view, index as i64);
+                        app.chrome.dirty = true;
+                    }
+                } else if view.log.is_some() {
                     let first = crate::app::window_start(view.side_cursor(), area.height as usize);
                     if let Some(index) =
                         crate::list_hit::row_at(area, first, view.side_len(), mouse_pos)
@@ -311,7 +326,11 @@ fn handle_diff_mouse(
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(offset) = view.files_drag {
                     view.set_files_width(mouse.column as i32 + offset);
-                    app.modals.diff_files_width = view.files_width;
+                    // The GIT GRAPH's list is sized for itself, not
+                    // remembered for the diff viewer's file list.
+                    if !view.graph_only {
+                        app.modals.diff_files_width = view.files_width;
+                    }
                     app.chrome.dirty = true;
                 }
             }

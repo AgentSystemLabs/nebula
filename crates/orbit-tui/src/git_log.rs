@@ -9,6 +9,10 @@
 //! `Enter`, `→` or a click unfolds a commit into its files right under it,
 //! each diffed against the commit's first parent when the cursor is on it.
 //! Reading only: nothing in this module writes to the repository.
+//!
+//! The GIT GRAPH (`l`) is the same section on its own: a DIFF VIEWER
+//! opened with `DiffView::graph_only`, the GRAPH the whole sidebar and the
+//! cursor's commit (or file) read in the pane beside it.
 
 use crate::app::{DiffView, Place};
 use crate::git_diff::{cap_lines, run_git, DiffFile, MAX_DIFF_LINES};
@@ -90,13 +94,13 @@ impl Commit {
     }
 
     /// What the filter matches and a filtered row shows: the short hash,
-    /// the refs and the subject.
+    /// the refs, the subject and the author.
     pub fn haystack(&self) -> String {
         let refs = self.refs_label();
         if refs.is_empty() {
-            format!("{} {}", self.short, self.subject)
+            format!("{} {}  {}", self.short, self.subject, self.author)
         } else {
-            format!("{} {refs} {}", self.short, self.subject)
+            format!("{} {refs} {}  {}", self.short, self.subject, self.author)
         }
     }
 }
@@ -161,6 +165,9 @@ pub struct GitLog {
     pub reading: Option<u64>,
     /// Why the last read failed.
     pub error: Option<String>,
+    /// HEAD's history alone, not every branch's (`Ctrl+b` in the GIT
+    /// GRAPH; the DIFF VIEWER's section always reads them all).
+    pub current_only: bool,
 }
 
 impl GitLog {
@@ -370,6 +377,15 @@ impl GitLog {
         }
     }
 
+    /// A log already read, the cursor home: for the views a test builds
+    /// by hand.
+    #[cfg(test)]
+    pub(crate) fn from_read(read: LogRead) -> Self {
+        let mut log = Self::default();
+        log.land(read);
+        log
+    }
+
     /// A read landed: the list is replaced and the cursor stays on what it
     /// read when the fresh list still has it.
     fn land(&mut self, read: LogRead) {
@@ -384,28 +400,28 @@ impl GitLog {
     }
 }
 
-/// `git log --graph` over HEAD, every local branch and every remote one.
-pub fn read_log(root: &Path) -> Result<LogRead, String> {
+/// `git log --graph` over HEAD, every local branch and every remote one —
+/// or, `current_only`, over HEAD alone.
+pub fn read_log(root: &Path, current_only: bool) -> Result<LogRead, String> {
     if !crate::git_diff::has_head(root) {
         return Ok(LogRead::default());
     }
-    let output = run_git(
-        root,
-        &[
-            "log",
-            "--graph",
-            "--date-order",
-            "--decorate=full",
-            "--no-color",
-            "--format=%x1f%H%x1f%h%x1f%D%x1f%an%x1f%ct%x1f%s",
-            "-n",
-            MAX_COMMITS,
-            "HEAD",
-            "--branches",
-            "--remotes",
-            "--",
-        ],
-    )?;
+    let mut args = vec![
+        "log",
+        "--graph",
+        "--date-order",
+        "--decorate=full",
+        "--no-color",
+        "--format=%x1f%H%x1f%h%x1f%D%x1f%an%x1f%ct%x1f%s",
+        "-n",
+        MAX_COMMITS,
+        "HEAD",
+    ];
+    if !current_only {
+        args.extend(["--branches", "--remotes"]);
+    }
+    args.push("--");
+    let output = run_git(root, &args)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git log failed: {}", stderr.trim()));
@@ -592,16 +608,26 @@ pub fn request_log(view: &mut DiffView) {
     let ticket = crate::view_jobs::ticket();
     let log = view.log.get_or_insert_with(GitLog::default);
     log.reading = Some(ticket);
+    let current_only = log.current_only;
     let root = view.root.clone();
     match view.jobs.clone() {
         Some(jobs) => jobs.run(move || {
             Some(crate::view_jobs::Answer::Log {
                 ticket,
-                result: read_log(&root),
+                result: read_log(&root, current_only),
             })
         }),
-        None => land_log(view, ticket, read_log(&root)),
+        None => land_log(view, ticket, read_log(&root, current_only)),
     }
+}
+
+/// `Ctrl+b` in the GIT GRAPH: HEAD's history alone, or every branch's
+/// again — read afresh, the cursor kept on its commit when the other list
+/// has it.
+pub fn toggle_scope(view: &mut DiffView) {
+    let log = view.log.get_or_insert_with(GitLog::default);
+    log.current_only = !log.current_only;
+    request_log(view);
 }
 
 /// The history read came back.
@@ -626,7 +652,7 @@ pub fn land_log(view: &mut DiffView, ticket: u64, result: Result<LogRead, String
         Err(msg) => log.error = Some(msg),
     }
     if view.settle() || view.place == Place::Graph {
-        crate::git_diff::load_selected_diff(view);
+        load_selected(view);
     }
 }
 
@@ -1046,7 +1072,7 @@ mod tests {
         commit_file(&origin, "theirs", "remote work");
         git(&clone, &["fetch", "-q"]);
 
-        let read = read_log(&clone).unwrap();
+        let read = read_log(&clone, false).unwrap();
         let by_subject = |s: &str| read.commits.iter().find(|c| c.subject == s).unwrap();
         assert_eq!(by_subject("local work").side, Side::Ahead);
         assert_eq!(by_subject("remote work").side, Side::Behind);
@@ -1065,11 +1091,57 @@ mod tests {
         assert!(summary_for(&clone, WORKING).contains("ahead 1, behind 1"));
     }
 
+    /// `current_only` reads HEAD's history alone: a branch that is not
+    /// merged into it drops out, and comes back with every branch.
+    #[test]
+    fn read_log_current_only_leaves_other_branches_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@t"]);
+        git(repo, &["config", "user.name", "t"]);
+        commit_file(repo, "a", "first");
+        git(repo, &["checkout", "-q", "-b", "side"]);
+        commit_file(repo, "s", "side work");
+        git(repo, &["checkout", "-q", "main"]);
+        commit_file(repo, "m", "main work");
+
+        let subjects = |current_only| -> Vec<String> {
+            read_log(repo, current_only)
+                .unwrap()
+                .commits
+                .into_iter()
+                .map(|c| c.subject)
+                .collect()
+        };
+        let all = subjects(false);
+        assert!(all.contains(&"side work".to_string()), "{all:?}");
+        let mine = subjects(true);
+        assert_eq!(mine, ["main work", "first"]);
+    }
+
+    /// The filter reaches the author too, not only the hash, refs and
+    /// subject.
+    #[test]
+    fn the_filter_matches_a_commits_author() {
+        let mut log = log();
+        let mut by_bob = commit("c9", Vec::new());
+        by_bob.author = "Bob Builder".into();
+        let read = LogRead {
+            commits: vec![commit("c0", head()), by_bob],
+            lines: vec![("*".into(), Some(0)), ("*".into(), Some(1))],
+        };
+        log.land(read);
+        log.apply_filter("builder");
+        assert_eq!(log.rows.len(), 1);
+        assert_eq!(log.selected_key().as_deref(), Some("c9"));
+    }
+
     #[test]
     fn read_log_on_an_unborn_head_lists_no_commits() {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "-q"]);
-        let read = read_log(dir.path()).unwrap();
+        let read = read_log(dir.path(), false).unwrap();
         assert!(read.commits.is_empty());
     }
 }

@@ -21906,10 +21906,10 @@ fn key_combo_display_spells_each_press_with_what_it_did() {
         &mut out,
     );
     assert_eq!(combo_text(&app).as_deref(), Some("^d - Half page down"));
-    press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Char('='), KeyModifiers::NONE, &mut out);
     assert_eq!(
         combo_text(&app).as_deref(),
-        Some("l"),
+        Some("="),
         "an unbound key shows bare: it did nothing, and the watcher sees that"
     );
 
@@ -23272,4 +23272,189 @@ fn skill_picker_space_and_click_tick_the_same_row() {
             assert_eq!(digest(&by_key, &out_key), digest(&by_mouse, &out_mouse));
         });
     });
+}
+
+/// A GIT GRAPH over a log parsed from fixture text: two branches that
+/// merge, HEAD, a remote, and a tag. The fake root makes every read of a
+/// commit an error string, still a reload.
+fn fake_git_graph() -> crate::app::DiffView {
+    let text = "* \x1faaaa\x1faa\x1fHEAD -> refs/heads/main, refs/remotes/origin/main, tag: refs/tags/v1\x1fAnn\x1f100\x1fmerge feat\n\
+                |\\  \n\
+                | * \x1fbbbb\x1fbb\x1frefs/heads/feat\x1fBob\x1f90\x1fadd widget\n\
+                * | \x1fcccc\x1fcc\x1f\x1fAnn\x1f80\x1ffix typo\n\
+                |/  \n\
+                * \x1fdddd\x1fdd\x1f\x1fAnn\x1f70\x1finitial\n";
+    let (commits, lines) = crate::git_log::parse_log(text);
+    let mut view = DiffView::git_graph("/nonexistent-orbit-graph-test".into(), "main".into(), None);
+    view.log = Some(crate::git_log::GitLog::from_read(crate::git_log::LogRead {
+        commits,
+        lines,
+    }));
+    view
+}
+
+fn graph_cursor(app: &App) -> usize {
+    match &app.modals.overlay {
+        Some(Overlay::Diff(v)) => v.side_cursor(),
+        _ => panic!("git graph gone"),
+    }
+}
+
+fn graph_sha(app: &App) -> String {
+    match &app.modals.overlay {
+        Some(Overlay::Diff(v)) => v.graph_commit().expect("a commit").short.clone(),
+        _ => panic!("git graph gone"),
+    }
+}
+
+#[test]
+fn l_opens_the_git_graph_on_the_checkout_under_the_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = test_repo(&dir);
+    let mut app = App::new();
+    seed_repo_tree(&mut app, &repo);
+    let mut out = Vec::new();
+    press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+    match &app.modals.overlay {
+        Some(Overlay::Diff(v)) => {
+            assert!(v.graph_only);
+            assert_eq!(v.root, repo, "the checkout under the cursor");
+            let log = v.log.as_ref().unwrap();
+            assert!(!log.commits.is_empty(), "the history was read");
+        }
+        other => panic!("expected the git graph, got {other:?}"),
+    }
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+    assert!(app.modals.overlay.is_none(), "Esc closes it");
+    assert!(out.is_empty(), "the graph never talks to the daemon");
+}
+
+#[test]
+fn git_graph_walks_commits_and_filters_with_two_stage_esc() {
+    let mut app = App::new();
+    app.modals.overlay = Some(Overlay::Diff(fake_git_graph()));
+    let mut out = Vec::new();
+    assert_eq!(graph_sha(&app), "aa");
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    assert_eq!(graph_sha(&app), "bb");
+    press(&mut app, KeyCode::End, KeyModifiers::NONE, &mut out);
+    assert_eq!(graph_sha(&app), "dd");
+    press(&mut app, KeyCode::Home, KeyModifiers::NONE, &mut out);
+    assert_eq!(graph_sha(&app), "aa");
+
+    // Typing filters by author, subject or ref.
+    for c in "widget".chars() {
+        press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+    }
+    match &app.modals.overlay {
+        Some(Overlay::Diff(v)) => assert_eq!(v.side_len(), 1),
+        _ => panic!("git graph gone"),
+    }
+    assert_eq!(graph_sha(&app), "bb");
+    // First Esc clears the filter, the second closes.
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+    match &app.modals.overlay {
+        Some(Overlay::Diff(v)) => assert!(v.filter.is_empty()),
+        _ => panic!("the first Esc only clears the filter"),
+    }
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+    assert!(app.modals.overlay.is_none());
+}
+
+#[test]
+fn git_graph_ctrl_y_copies_the_sha_and_nothing_is_typed() {
+    let mut app = App::new();
+    app.modals.overlay = Some(Overlay::Diff(fake_git_graph()));
+    let mut out = Vec::new();
+    press(
+        &mut app,
+        KeyCode::Char('y'),
+        KeyModifiers::CONTROL,
+        &mut out,
+    );
+    assert_eq!(app.chrome.flash.as_deref(), Some("copied aa"));
+    match &app.modals.overlay {
+        Some(Overlay::Diff(v)) => assert!(v.filter.is_empty()),
+        _ => panic!("git graph gone"),
+    }
+}
+
+/// INPUT PARITY: a click on a commit lands where walking onto it lands,
+/// and a click on the cursor's own row acts as Enter does.
+#[test]
+fn git_graph_click_matches_walking_with_the_keys() {
+    let mut keys = App::new();
+    keys.modals.overlay = Some(Overlay::Diff(fake_git_graph()));
+    let mut clicks = App::new();
+    clicks.modals.overlay = Some(Overlay::Diff(fake_git_graph()));
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|f| ui::draw(f, &mut clicks)).unwrap();
+    let area = match &clicks.modals.overlay {
+        Some(Overlay::Diff(v)) => v.list_area,
+        _ => panic!("git graph gone"),
+    };
+    let mut out = Vec::new();
+    press(&mut keys, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    // The rows: commit aa, the join line, bb, cc, ... find bb's row.
+    let row = graph_cursor(&keys) as u16;
+    handle_mouse(
+        &mut clicks,
+        mev(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x + 2,
+            area.y + row,
+        ),
+        &mut out,
+    );
+    assert_eq!(graph_cursor(&clicks), graph_cursor(&keys));
+    assert_eq!(graph_sha(&clicks), graph_sha(&keys));
+    let unfolded = |app: &App| match &app.modals.overlay {
+        Some(Overlay::Diff(v)) => v.log.as_ref().unwrap().unfolded.len(),
+        _ => panic!("git graph gone"),
+    };
+    let before = unfolded(&clicks);
+    handle_mouse(
+        &mut clicks,
+        mev(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x + 2,
+            area.y + row,
+        ),
+        &mut out,
+    );
+    press(&mut keys, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+    assert_eq!(unfolded(&clicks), unfolded(&keys), "click = Enter");
+    assert!(unfolded(&clicks) > before || before > 0);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn git_graph_draws_ref_badges_and_the_commit_subjects() {
+    let mut app = App::new();
+    app.modals.overlay = Some(Overlay::Diff(fake_git_graph()));
+    let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    for needle in [
+        "Git graph",
+        "HEAD → main",
+        "origin/main",
+        "feat",
+        "v1",
+        "add widget",
+        "Bob",
+    ] {
+        assert!(text.contains(needle), "{needle:?} missing:\n{text}");
+    }
+    match &app.modals.overlay {
+        Some(Overlay::Diff(v)) => assert!(!v.stacked, "wide screens put the pane beside"),
+        _ => panic!("git graph gone"),
+    }
+    // A narrow screen stacks the pane under the list.
+    let mut narrow = Terminal::new(TestBackend::new(70, 30)).unwrap();
+    narrow.draw(|f| ui::draw(f, &mut app)).unwrap();
+    match &app.modals.overlay {
+        Some(Overlay::Diff(v)) => assert!(v.stacked),
+        _ => panic!("git graph gone"),
+    }
 }

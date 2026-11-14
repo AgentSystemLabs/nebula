@@ -1180,6 +1180,17 @@ pub struct DiffView {
     pub split_rows: Option<std::sync::Arc<[crate::git_diff::SplitRow]>>,
     /// The last draw showed the diff side by side, written back by it.
     pub split_shown: bool,
+    /// The GIT GRAPH (`l`): this viewer with the GRAPH as its whole
+    /// sidebar — no CHANGES, no section headers — and the cursor's commit,
+    /// or one of its files' diffs, in the pane beside it. Reading only.
+    pub graph_only: bool,
+    /// The last draw put the pane under the list rather than beside it
+    /// (a narrow GIT GRAPH), written back by it: there is no border to
+    /// drag then.
+    pub stacked: bool,
+    /// The sidebar's whole panel, written back during draw: where the
+    /// GIT GRAPH's wheel walks the commits rather than scrolling the pane.
+    pub side_area: Rect,
 }
 
 /// The most diff text a DIFF VIEWER keeps beyond the one on screen. Two
@@ -1225,6 +1236,9 @@ impl DiffView {
     /// How many rows the sidebar has: each section's header and, unfolded,
     /// its rows.
     pub fn side_len(&self) -> usize {
+        if self.graph_only {
+            return self.log.as_ref().map_or(0, |log| log.rows.len());
+        }
         let graph = match &self.log {
             Some(log) if self.graph_open => 1 + log.rows.len(),
             Some(_) => 1,
@@ -1235,6 +1249,9 @@ impl DiffView {
 
     /// The cursor's row in the sidebar.
     pub fn side_cursor(&self) -> usize {
+        if self.graph_only {
+            return self.log.as_ref().map_or(0, |log| log.selected);
+        }
         match self.place {
             Place::ChangesHeader => 0,
             Place::Changes => 1 + self.cursor(),
@@ -1245,6 +1262,9 @@ impl DiffView {
 
     /// What sidebar row `index` is: its place, and its row in that list.
     pub fn side_row(&self, index: usize) -> Option<(Place, usize)> {
+        if self.graph_only {
+            return (index < self.side_len()).then_some((Place::Graph, index));
+        }
         let changes = self.changes_len();
         match index {
             0 => Some((Place::ChangesHeader, 0)),
@@ -1296,7 +1316,13 @@ impl DiffView {
             .log
             .as_mut()
             .filter(|l| l.rows.iter().any(|r| r.entry.selectable()));
-        if changes > 0 {
+        if self.graph_only {
+            // The GIT GRAPH has no other place to be.
+            if let Some(log) = graph {
+                log.go_home();
+            }
+            self.place = Place::Graph;
+        } else if changes > 0 {
             self.place = Place::Changes;
         } else if let Some(log) = graph {
             log.go_home();
@@ -1340,6 +1366,27 @@ impl DiffView {
         view.jobs = Some(jobs);
         view.listing = Some(listing);
         view
+    }
+
+    /// The GIT GRAPH (`l`) on the checkout at `root`: up at once, its
+    /// history read by `git_log::request_log`, which the caller asks for.
+    /// `branch` names the checkout in the titles.
+    pub fn git_graph(root: PathBuf, branch: String, jobs: Option<crate::view_jobs::Jobs>) -> Self {
+        let mut view = Self::new(root, branch, Vec::new(), true);
+        view.jobs = jobs;
+        view.graph_only = true;
+        view.place = Place::Graph;
+        view.changes_open = false;
+        // Zero is "not sized yet": the first draw gives the commit list
+        // most of the width.
+        view.files_width = 0;
+        view.log = Some(crate::git_log::GitLog::default());
+        view
+    }
+
+    /// The commit the GIT GRAPH's cursor is on (or on a file of).
+    pub fn graph_commit(&self) -> Option<&crate::git_log::Commit> {
+        self.log.as_ref()?.selected_commit()
     }
 
     /// The cached diff of `path`, if this modal has read it.
@@ -1450,6 +1497,9 @@ impl DiffView {
             split: true,
             split_rows: None,
             split_shown: false,
+            graph_only: false,
+            stacked: false,
+            side_area: Rect::default(),
         };
         view.apply_filter();
         view

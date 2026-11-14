@@ -523,6 +523,7 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         return;
     };
     match overlay {
+        Overlay::Diff(view) if view.graph_only => handle_git_graph_key(app, key),
         Overlay::Diff(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -571,10 +572,8 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // Settings → Appearance) reads the same.
                 KeyCode::Char('s') if ctrl => {
                     view.toggle_split();
-                    let mut cfg = crate::config::Config::load();
-                    cfg.diff_inline = !view.split;
-                    if let Err(e) = cfg.save() {
-                        app.chrome.flash = Some(format!("could not save diff layout: {e}"));
+                    if let Some(msg) = save_diff_layout(view.split) {
+                        app.chrome.flash = Some(msg);
                     }
                 }
                 KeyCode::Down if shift => view.scroll_by(1),
@@ -607,6 +606,80 @@ fn handle_diff_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             }
         }
         _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+    }
+}
+
+/// Write the DIFF LAYOUT setting back after `Ctrl+s`, so the next open
+/// (and Settings → Appearance) reads the same; why it could not, if not.
+fn save_diff_layout(split: bool) -> Option<String> {
+    let mut cfg = crate::config::Config::load();
+    cfg.diff_inline = !split;
+    cfg.save()
+        .err()
+        .map(|e| format!("could not save diff layout: {e}"))
+}
+
+/// The GIT GRAPH (`l`): the DIFF VIEWER's keys, narrowed to a commit list.
+/// The arrows and the page keys walk the commits, `Enter` (or `→`/`←`)
+/// unfolds and folds a commit's files, `⇧` with them scrolls the pane, and
+/// anything typed filters. The verbs are chords, since letters type:
+/// `Ctrl+b` flips every branch / HEAD's alone, `Ctrl+y` copies the commit's
+/// hash. Nothing here writes to the repository.
+fn handle_git_graph_key(app: &mut App, key: KeyEvent) {
+    let Some(Overlay::Diff(view)) = &mut app.modals.overlay else {
+        return;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let rows = view.list_area.height.max(1) as i64;
+    let page = view.view_height.max(1) as i32;
+    let at = view.side_cursor() as i64;
+    match key.code {
+        // Two-stage escape: an active filter is cleared before the second
+        // Esc closes the view.
+        KeyCode::Esc if !view.filter.is_empty() => {
+            view.filter.clear();
+            activate::diff_filter_changed(view);
+        }
+        KeyCode::Esc => app.modals.overlay = None,
+        KeyCode::Char('b') if ctrl => crate::git_log::toggle_scope(view),
+        KeyCode::Char('y') if ctrl => {
+            if let Some(commit) = view.graph_commit() {
+                let (sha, label) = (commit.sha.clone(), format!("copied {}", commit.short));
+                copy_and_flash(app, &sha, &label);
+            }
+        }
+        KeyCode::Char('s') if ctrl => {
+            view.toggle_split();
+            if let Some(msg) = save_diff_layout(view.split) {
+                app.chrome.flash = Some(msg);
+            }
+        }
+        KeyCode::Char('d') if ctrl => activate::diff_file(view, at + rows / 2),
+        // Ctrl+u is the line editor's kill-to-start while something is
+        // typed; only with an empty filter does it move.
+        KeyCode::Char('u') if ctrl && view.filter.is_empty() => {
+            activate::diff_file(view, at - rows / 2)
+        }
+        KeyCode::Down if shift => view.scroll_by(1),
+        KeyCode::Up if shift => view.scroll_by(-1),
+        KeyCode::PageDown if shift => view.scroll_by(page),
+        KeyCode::PageUp if shift => view.scroll_by(-page),
+        KeyCode::Down => activate::diff_file(view, at + 1),
+        KeyCode::Up => activate::diff_file(view, at - 1),
+        KeyCode::PageDown => activate::diff_file(view, at + rows),
+        KeyCode::PageUp => activate::diff_file(view, at - rows),
+        KeyCode::Home => activate::diff_file(view, 0),
+        KeyCode::End => activate::diff_file(view, view.side_len() as i64),
+        KeyCode::Right => activate::diff_fold(view, true),
+        KeyCode::Left => activate::diff_fold(view, false),
+        KeyCode::Enter => activate::diff_row(view, at),
+        // Everything else feeds the always-on fuzzy filter.
+        _ => {
+            if view.filter.handle_key(&key).changed() {
+                activate::diff_filter_changed(view);
+            }
+        }
     }
 }
 

@@ -641,6 +641,7 @@ fn handle_tool_action(app: &mut App, action: crate::keymap::Action, out: &mut Ve
         // source.
         Action::GitDiff if app.previewed_pr().is_some() => request_pr_diff(app),
         Action::GitDiff => open_diff_view(app),
+        Action::GitGraph => open_git_graph(app),
         Action::CommentPullRequest => open_pr_comment(app),
         Action::OpenRepo => open_repo_in_browser(app),
         Action::OpenGraph => open_graph(app),

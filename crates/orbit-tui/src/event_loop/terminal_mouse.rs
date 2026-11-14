@@ -477,7 +477,8 @@ pub(crate) fn pointer_wants_resize(app: &App, column: u16, row: u16) -> bool {
     }
     match &app.modals.overlay {
         Some(Overlay::Diff(view)) => {
-            view.files_drag.is_some() || on_vsplit(view.splitter_x(), view.area, column, row)
+            view.files_drag.is_some()
+                || (!view.stacked && on_vsplit(view.splitter_x(), view.area, column, row))
         }
         Some(Overlay::Tree(view)) => {
             view.files_drag.is_some() || on_vsplit(view.splitter_x(), view.area, column, row)
