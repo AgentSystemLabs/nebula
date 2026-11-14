@@ -99,6 +99,70 @@ pub(crate) fn open_repo_in_browser(app: &mut App) {
     }
 }
 
+/// The selected checkout's graphify code graph (`k`), in the browser. The
+/// DAEMON keeps it current; when there is none yet — graphify installed
+/// after the project was added — it is built first, off the loop, and
+/// opened once it lands.
+pub(crate) fn open_graph(app: &mut App) {
+    let root = app
+        .selected_worktree()
+        .map(|w| w.path.clone())
+        .filter(|path| path.is_dir())
+        .or_else(|| app.selected_project().map(|p| p.repo_path.clone()));
+    let Some(root) = root else {
+        app.chrome.flash = Some(SELECT_CONTEXT_FIRST.into());
+        return;
+    };
+    let html = root.join("graphify-out").join("graph.html");
+    let build = !html.is_file();
+    let open = move || {
+        if build {
+            let Some(graphify) = orbit_core::tools::find("graphify") else {
+                return "graphify isn't installed — `uv tool install graphifyy`, then press k again"
+                    .to_string();
+            };
+            let built = std::process::Command::new(graphify)
+                .arg("update")
+                .arg(&root)
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            match built {
+                Err(e) => return format!("graphify couldn't start: {e}"),
+                Ok(status) if !status.success() || !html.is_file() => {
+                    return "graphify couldn't build a graph for this checkout".to_string();
+                }
+                Ok(_) => {}
+            }
+        }
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut command = std::process::Command::new(opener);
+        command.arg(&html);
+        if cfg!(test) || crate::event_loop::terminal_mouse::spawn_and_reap(command, "open graph") {
+            "opened the code graph".to_string()
+        } else {
+            format!("couldn't open {}", html.display())
+        }
+    };
+    match app.jobs.view_jobs.clone() {
+        Some(jobs) => {
+            app.chrome.flash = Some(if build {
+                "building the code graph… it opens when ready".into()
+            } else {
+                "opening the code graph…".into()
+            });
+            jobs.run(move || Some(crate::view_jobs::Answer::Flash(open())));
+        }
+        None => app.chrome.flash = Some(open()),
+    }
+}
+
 /// A new Ghostty tab in the selected worktree's directory (`Shift+C`), or in the
 /// project's own clone when it has no worktrees yet. `open -a` hands
 /// Ghostty a folder, which it takes like one dropped on its Dock icon: a tab

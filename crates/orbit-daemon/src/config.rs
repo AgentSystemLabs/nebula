@@ -54,6 +54,10 @@ pub struct Config {
     /// TUI's Project tab owns the map; the daemon reads the one key in it
     /// that is its to act on, through [`Config::run_command`].
     pub projects: BTreeMap<PathBuf, ProjectConfig>,
+    /// GRAPHIFY: keep a code knowledge graph (`graphify-out/`) up to date in
+    /// every checkout when the `graphify` CLI is installed, and point Claude
+    /// at it. On by default; a checkout's `.orbit.json` can opt out alone.
+    pub graphify: bool,
 }
 
 /// One project's entry under `projects` — the rows of the TUI's Project
@@ -78,6 +82,7 @@ impl Default for Config {
             custom_harnesses: Vec::new(),
             harnesses: BTreeMap::new(),
             projects: BTreeMap::new(),
+            graphify: true,
         }
     }
 }

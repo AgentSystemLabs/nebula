@@ -43,7 +43,7 @@ convenience stores: missing or malformed reads as empty.
 
 ## Every setting
 
-Sixty-five keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
+Sixty-six keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
 exists only in the file, so it is hand-edit-only. Most rows toggle or cycle on `Enter` / `←` / `→`; a
 *typed* row (`worktree_base_branch`, the Project tab's **Run command**) opens a one-line prompt on
 `Enter` instead, pre-filled with the stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
@@ -127,6 +127,7 @@ behaviors that change how the tree is worked; every switch there is off by defau
 | `custom_harnesses` | array | `[]` | Agents | Extra CLIs the NEW SESSION PICKER offers after the built-ins, each with its own Agents tab section (Enabled and Model rows). Each entry is `{id, program}` plus options: `label` (picker text, defaults to the id), `enabled` (default `true`), `model` (default `"default"` = the CLI's pick, else passed verbatim), `model_flag` (default `"--model"`), and `hooks` (a built-in dialect the program speaks: `claude`, `codex`, `cursor`, `pi` or `opencode` — with one set the sessions report status, prompts and permission waits exactly like that harness, including title sync and auto-title for `claude`; without one they stay process-based, running while the PTY is live and never waiting-on-you). Ids use lowercase letters, digits and hyphens and must not collide with a built-in. Legacy: new harnesses belong in `harnesses`, where they also gain resume, effort, system-prompt and hook-dialect rows. Invalid entries never launch — the picker hides them and the daemon refuses them with the reason. |
 | `harnesses` | object | `{}` | Agents | The harness registry: per-harness deltas over the compiled-in known harnesses (Claude, Codex, Cursor, Pi, Muse, Grok Build, OpenCode), and whole new third-party CLIs. The Agents tab grows one section per entry — Enabled, Model, and Effort rows while the harness offers effort — and the `n` picker, `e` presets, spawn, resume and hooks all read the merged rows. A hand edit that breaks one entry refuses its launches with the reason, never the whole file. Run `orbit config harnesses` to print the effective rows to copy from. |
 | `keybindings` | object | `{}` | Hotkeys | KEYMAP overrides, keyed by action id, valued with a comma-separated chord list: `{"git_diff": "ctrl+g, g"}`. An empty string deliberately unbinds; unknown ids are ignored. Only rows that differ from the defaults are written. |
+| `graphify` | bool | `true` | — | GRAPHIFY: keep a code knowledge graph (`graphify-out/`, kept out of git through `.git/info/exclude`) up to date in every checkout when the `graphify` CLI is installed — built when a project is added or a worktree created, refreshed after each finished turn — and tell Claude sessions to query it before searching broadly. `k` opens it. A project's `.orbit.json` can opt out with `"graphify": false`. Does nothing without the CLI. |
 | `prewarm_agents` | bool | `true` | Sessions | DAEMON-owned PREWARM POOL: keep one booted agent CLI standing by in the selected WORKTREE, so creating a session there adopts it and feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes), and that spare is a real session as far as the CLI is concerned — Claude's own `/list-agents` lists it beside the sessions you made, named after the directory (`my-repo-3f`), and the memory modal (`Shift+M`) groups it under **warm spares**. Off drains the pool on the DAEMON's next sweep (within 30 s). |
 | `prewarm_sessions` | bool | `true` | Sessions | DAEMON-owned SESSION PREWARM: boot a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** Off — for a machine with less memory to spare — landing on a worktree boots nothing: a session forks only when your cursor lands on its row or you attach to it, one at a time; sessions already up stay until the IDLE REAPER takes them. |
 
@@ -325,7 +326,9 @@ The PROJECT FILE tells orbit how a repository is run. Commit it at the repo root
 }
 ```
 
-Both keys are optional shell command lines, and both run in the selected worktree's checkout:
+`run` and `open` are optional shell command lines, and both run in the selected worktree's checkout
+(a third key, `"graphify": false`, keeps Orbit from building a code graph for the project — see
+`graphify` in [Every setting](#every-setting)):
 
 - **`run`** — the RUN COMMAND. **Run** in a card's right-click menu (or the project tab's) starts it;
   the same row, now **Stop run**, stops it. The DAEMON runs it in a RUN TERMINAL: your login shell

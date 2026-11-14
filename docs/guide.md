@@ -14,6 +14,7 @@ docs go deeper on each topic; start here.
 5. [The everyday loop](#5-the-everyday-loop)
 6. [Worktrees: parallel work without collisions](#6-worktrees-parallel-work-without-collisions)
 7. [Reviewing what an agent did](#7-reviewing-what-an-agent-did)
+   - [The code graph (graphify)](#the-code-graph-graphify)
 8. [GitHub: pull requests and issues](#8-github-pull-requests-and-issues)
 9. [Presets: tasks you repeat](#9-presets-tasks-you-repeat)
 10. [Agents that drive Orbit](#10-agents-that-drive-orbit)
@@ -191,6 +192,22 @@ All of these open for the checkout of the card under the cursor:
 Markdown files open as rendered pages, images preview inline, and Mermaid diagrams render when `mmdc`
 is installed.
 
+### The code graph (graphify)
+
+With the [graphify](https://github.com/Graphify-Labs/graphify) CLI installed (`uv tool install graphifyy`),
+Orbit keeps a **knowledge graph of your code** for every checkout, with nothing to set up:
+
+- It is built when you add a project or create a worktree, and refreshed after every Claude turn.
+  It uses code analysis only — no LLM, no cost — and takes a few seconds (incremental after that).
+- It lives in `graphify-out/` inside the checkout and is kept out of git automatically (through
+  `.git/info/exclude`, so no tracked file changes).
+- Claude sessions are told the graph exists and query it (`graphify query`, `explain`, `path`,
+  `affected`) before searching file by file — those commands are pre-approved, so no prompts.
+- **`k`** opens the graph in your browser (and builds it first if there isn't one yet).
+
+To turn it off: `"graphify": false` in `config.json` for every project, or in a project's
+`.orbit.json` for just that one.
+
 ## 8. GitHub: pull requests and issues
 
 Orbit asks the `gh` CLI what's open on the repo, so `gh` must be installed and logged in.
@@ -318,6 +335,7 @@ Every key is rebindable in Settings → Hotkeys.
 | `b` | file tree |
 | `c` | switch the main checkout's branch |
 | `⇧O` | open the checkout (editor / browser) |
+| `k` | the code graph (graphify) in the browser |
 | `v` / `i` | pull requests / issues |
 | `⇧V` / `⇧I` / `⇧G` | open PR / issue / repo in the browser |
 | `y` | comment on the pull request |
@@ -360,6 +378,7 @@ The full list, with every flag: [Commands](commands.md), or `orbit <command> --h
 | "daemon did not come up" | run `orbit kill`, then `orbit` again. Logs: `~/Library/Application Support/dev.orbit.orbit/state/daemon.log` |
 | A change I built isn't there | the old daemon is still running: `orbit reload` (or `orbit kill` then `orbit`) |
 | `path must be shorter than SUN_LEN` | the socket folder path is too long for macOS; set `ORBIT_RUNTIME_DIR` to a short path such as `/tmp/orbit` |
+| `k` says graphify couldn't start, or no graph appears | an old copy of `graphify` may come first on your PATH (`which -a graphify`); Orbit skips copies whose Python is gone, but remove stale ones or run `uv tool upgrade graphifyy` |
 | `make ci` fails with `fatal: no tag message?` | your global git config signs tags (`tag.gpgsign`). Run tests as `GIT_CONFIG_GLOBAL=/dev/null make ci` |
 | `cargo: command not found` | rustup isn't on your PATH: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"` in `~/.zshrc` |
 
@@ -376,8 +395,6 @@ These are planned for this fork and **not built yet**:
   `Enter` runs it. No more remembering keys.
 - **Calmer view with many sessions** — a filter for "needs me / active only", and a compact layout that
   switches on by itself past a number of sessions.
-- **Graphify** — Orbit keeps a knowledge graph of each project up to date (`graphify update`, no LLM
-  needed) and tells Claude to query it before searching the code.
 - **Lessons learned** — `orbit lesson add` lets an agent record a hard-won fix in `.orbit/lessons/`
   (committed), and new sessions start with the relevant ones.
 - **MCP manager** — choose which MCP servers each project's sessions load.

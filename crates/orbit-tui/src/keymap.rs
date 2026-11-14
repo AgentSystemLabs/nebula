@@ -71,6 +71,7 @@ pub enum Action {
     New,
     GitDiff,
     OpenRepo,
+    OpenGraph,
     /// `Shift+V`: the pull request of the session card under the cursor,
     /// in the browser — the `#42 title` line on the card. `v` lists the
     /// project's pull requests in orbit; the shifted key goes to GitHub.
@@ -386,6 +387,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["shift+g"],
+    },
+    ActionSpec {
+        action: Action::OpenGraph,
+        id: "open_graph",
+        label: "Knowledge graph",
+        hint: "Open the selected checkout's graphify code graph in your browser, building it first when there is none yet (needs the graphify CLI)",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["k"],
     },
     ActionSpec {
         action: Action::OpenPullRequest,

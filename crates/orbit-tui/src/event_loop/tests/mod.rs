@@ -21818,10 +21818,10 @@ fn key_combo_display_spells_each_press_with_what_it_did() {
         &mut out,
     );
     assert_eq!(combo_text(&app).as_deref(), Some("^d - Half page down"));
-    press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
     assert_eq!(
         combo_text(&app).as_deref(),
-        Some("k"),
+        Some("l"),
         "an unbound key shows bare: it did nothing, and the watcher sees that"
     );
 

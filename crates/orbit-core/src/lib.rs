@@ -13,6 +13,7 @@ pub mod project_file;
 pub mod protocol;
 pub mod settings;
 pub mod shell;
+pub mod tools;
 
 pub use entities::*;
 pub use harness::*;

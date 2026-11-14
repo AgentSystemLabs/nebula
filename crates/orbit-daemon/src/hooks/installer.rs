@@ -154,6 +154,13 @@ const CLAUDE_ALLOW_RULES: &[&str] = &[
     "Bash(orbit sessions:*)",
     "Bash(orbit read:*)",
     "Bash(orbit ask:*)",
+    // graphify's read-only graph queries, which the graphify guidance tells
+    // Claude to prefer over broad searching (crate::graphify).
+    "Bash(graphify query:*)",
+    "Bash(graphify explain:*)",
+    "Bash(graphify path:*)",
+    "Bash(graphify affected:*)",
+    "Bash(graphify god-nodes:*)",
 ];
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor

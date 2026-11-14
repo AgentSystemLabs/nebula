@@ -97,6 +97,8 @@ impl Daemon {
                 entity: Entity::Worktree(worktree),
             });
         }
+        // A new project starts with its code graph (no-op without graphify).
+        crate::graphify::refresh(&project.repo_path);
         Ok(EntityId::Project(project.id))
     }
 
@@ -688,6 +690,10 @@ impl Daemon {
         };
         if let Err(e) = worktree_hooks::run(hook, ctx).await {
             self.warn_clients(format!("{e:#}"));
+        }
+        // A fresh checkout gets its own code graph (no-op without graphify).
+        if hook == WorktreeHook::Create {
+            crate::graphify::refresh(&worktree.path);
         }
     }
 

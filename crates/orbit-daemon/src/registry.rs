@@ -589,7 +589,7 @@ fn agent_spawn_command_with(
     // where prepend is, and is dropped where neither is.
     let mut initial_prompt = initial_prompt.map(str::to_string);
     if let Some(flag) = harness.system.append_flag.as_deref() {
-        push_system_prompt(&mut args, flag, guidance, additional_system_prompt);
+        push_system_prompt(&mut args, flag, guidance, cwd, additional_system_prompt);
     } else if harness.system.prepend_to_first_prompt {
         let mut first = Vec::new();
         if guidance {
@@ -597,6 +597,9 @@ fn agent_spawn_command_with(
             first.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE.to_string());
             first.push(crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE.to_string());
             first.push(crate::open_files::CLAUDE_OPEN_GUIDANCE.to_string());
+            if cwd.is_some_and(crate::graphify::has_graph) {
+                first.push(crate::graphify::CLAUDE_GRAPHIFY_GUIDANCE.to_string());
+            }
         }
         if let Some(prompt) = additional_system_prompt {
             first.push(prompt.to_string());
@@ -627,6 +630,7 @@ fn push_system_prompt(
     args: &mut Vec<String>,
     flag: &str,
     guidance: bool,
+    cwd: Option<&Path>,
     additional: Option<&str>,
 ) {
     let mut system_prompt = Vec::new();
@@ -635,6 +639,10 @@ fn push_system_prompt(
         system_prompt.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE);
         system_prompt.push(crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE);
         system_prompt.push(crate::open_files::CLAUDE_OPEN_GUIDANCE);
+        // The code graph, when orbit has built one for this checkout.
+        if cwd.is_some_and(crate::graphify::has_graph) {
+            system_prompt.push(crate::graphify::CLAUDE_GRAPHIFY_GUIDANCE);
+        }
     }
     if let Some(prompt) = additional {
         system_prompt.push(prompt);
@@ -1897,6 +1905,37 @@ mod tests {
         assert!(prompts[0].contains("All work in this session must be scoped"));
         assert!(prompts[0].contains(pr_url));
         assert!(prompts[0].contains("/w/orbit-worktrees/fix"));
+    }
+
+    /// A checkout with a graphify graph tells Claude to query it; one
+    /// without says nothing about it.
+    #[test]
+    fn spawn_command_mentions_the_code_graph_only_where_one_exists() {
+        let all = test_registry();
+        let claude = test_harness(&all, AgentKind::Claude);
+        let system_prompt = |cwd: &Path| {
+            let (_, args, _) = agent_spawn_command_with(
+                &claude,
+                None,
+                Some(cwd),
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+            );
+            args.windows(2)
+                .find(|pair| pair[0] == "--append-system-prompt")
+                .map(|pair| pair[1].clone())
+                .expect("a system prompt")
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!system_prompt(tmp.path()).contains("graphify"));
+
+        std::fs::create_dir_all(tmp.path().join(crate::graphify::OUT_DIR)).unwrap();
+        std::fs::write(crate::graphify::graph_json(tmp.path()), "{}").unwrap();
+        assert!(system_prompt(tmp.path()).contains(crate::graphify::CLAUDE_GRAPHIFY_GUIDANCE));
     }
 
     #[test]

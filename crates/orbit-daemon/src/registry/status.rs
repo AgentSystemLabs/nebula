@@ -87,6 +87,19 @@ impl Daemon {
         }
     }
 
+    /// Bring the code graph of `agent_id`'s checkout up to date.
+    fn refresh_graph_for(&self, agent_id: &AgentId) {
+        let worktree = self
+            .store
+            .get_agent(agent_id)
+            .ok()
+            .flatten()
+            .and_then(|agent| self.store.get_worktree(&agent.worktree_id).ok().flatten());
+        if let Some(worktree) = worktree {
+            crate::graphify::refresh(&worktree.path);
+        }
+    }
+
     pub(super) fn apply_status_effects(&self, agent_id: &AgentId, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
@@ -104,6 +117,11 @@ impl Daemon {
                         changed_at,
                         unseen,
                     });
+                    // A finished turn is when code most likely changed:
+                    // refresh that checkout's graph (no-op without graphify).
+                    if status == AgentStatus::Finished {
+                        self.refresh_graph_for(agent_id);
+                    }
                 }
                 Effect::SaveSessionId(sid) => {
                     if let Err(e) = self.store.set_agent_session_id(agent_id, Some(&sid)) {

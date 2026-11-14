@@ -41,6 +41,10 @@ pub struct ProjectFile {
     /// The OPEN COMMAND, fired with `Shift+Enter`.
     #[serde(default)]
     pub open: Option<String>,
+    /// `false` keeps orbit from building a graphify code graph for this
+    /// project (the `graphify` setting turns it off everywhere).
+    #[serde(default)]
+    pub graphify: Option<bool>,
 }
 
 /// Which of the file's commands a caller wants.

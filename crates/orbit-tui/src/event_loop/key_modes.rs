@@ -643,6 +643,7 @@ fn handle_tool_action(app: &mut App, action: crate::keymap::Action, out: &mut Ve
         Action::GitDiff => open_diff_view(app),
         Action::CommentPullRequest => open_pr_comment(app),
         Action::OpenRepo => open_repo_in_browser(app),
+        Action::OpenGraph => open_graph(app),
         // The grid takes this itself (`launcher::handle_action`); it
         // reaches here over a full-screen session the keys got past, which
         // is still the selected session's card.
