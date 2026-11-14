@@ -1,5 +1,5 @@
 > [!WARNING]
-> **Work in progress.** nebula is built for one person's workflow — mine — and it changes fast as I iterate on it.
+> **Work in progress.** orbit is built for one person's workflow — mine — and it changes fast as I iterate on it.
 > Expect breaking changes between releases: keys that move, screens that get redrawn, features that come and go
 > without notice. If it's close to what you want, fork or clone it and bend it into what you need it to be.
 
@@ -7,15 +7,15 @@
 
 *"Whatever you do, work heartily, as for the Lord and not for men."* — Colossians 3:23 (ESV)
 
-# nebula
+# orbit
 
 **Mission control for your coding agents.**
 
 Run **Claude Code**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build** and **OpenCode** across every project and git WORKTREE you own — from one
 terminal, one keyboard, one grid. They keep working when you close it.
 
-[![Release](https://img.shields.io/github/v/release/AgentSystemLabs/nebula?style=flat-square&color=e8c547&label=release)](https://github.com/AgentSystemLabs/nebula/releases)
-[![Build](https://img.shields.io/github/actions/workflow/status/AgentSystemLabs/nebula/release.yml?style=flat-square&label=build)](https://github.com/AgentSystemLabs/nebula/actions)
+[![Release](https://img.shields.io/github/v/release/AmenAdem/Orbit?style=flat-square&color=e8c547&label=release)](https://github.com/AmenAdem/Orbit/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/AmenAdem/Orbit/release.yml?style=flat-square&label=build)](https://github.com/AmenAdem/Orbit/actions)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square)](#install)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?style=flat-square)](https://www.rust-lang.org)
@@ -23,10 +23,10 @@ terminal, one keyboard, one grid. They keep working when you close it.
 [**Keys**](docs/keys.md) · [**Commands**](docs/commands.md) · [**Sessions**](docs/sessions.md) · [**Configuration**](docs/configuration.md) · [**How it works**](docs/how-it-works.md)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh
 ```
 
-<img src="assets/screenshot.png" alt="nebula: project tabs with status dots across the top, a band of session cards per checkout, and the running session's terminal under them" width="100%">
+<img src="assets/screenshot.png" alt="orbit: project tabs with status dots across the top, a band of session cards per checkout, and the running session's terminal under them" width="100%">
 
 </div>
 
@@ -36,9 +36,9 @@ curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install
 
 <div align="center">
 
-<a href="https://youtu.be/ZBPqH36BPgI"><img src="https://i.ytimg.com/vi/ZBPqH36BPgI/maxresdefault.jpg" alt="Video: A Complete Walkthrough of Nebula — click to watch on YouTube" width="80%"></a>
+<a href="https://youtu.be/ZBPqH36BPgI"><img src="https://i.ytimg.com/vi/ZBPqH36BPgI/maxresdefault.jpg" alt="Video: A Complete Walkthrough of Orbit — click to watch on YouTube" width="80%"></a>
 
-**[▶ A Complete Walkthrough of Nebula](https://youtu.be/ZBPqH36BPgI)** — what nebula is, why it exists, and a full tour of it running.
+**[▶ A Complete Walkthrough of Orbit](https://youtu.be/ZBPqH36BPgI)** — what orbit is, why it exists, and a full tour of it running.
 
 </div>
 
@@ -49,7 +49,7 @@ a permission prompt, which one finished, and which one is still thinking — so 
 every time, and read the screens. Start a fourth and you aren't running more agents, you're doing a worse
 job of watching the ones you have.
 
-nebula replaces the reading with a grid and a color. Every SESSION is a CARD — its name, what it runs on,
+orbit replaces the reading with a grid and a color. Every SESSION is a CARD — its name, what it runs on,
 the last thing you asked it — with a STATUS DOT that says what it's doing; the cards sit in a BAND per
 checkout under a row of PROJECT TABS, and every tab carries its sessions' dots with a count, so a red `●1`
 on a tab tells you exactly where to look without opening anything.
@@ -67,12 +67,12 @@ on a tab tells you exactly where to look without opening anything.
 | **A task box, not a picker** | `p` opens the QUICK PROMPT: type the task, `Enter`, and an agent is working on it. The row over the box spells out the launch — `project orbit-api ^P · worktree main ^T · harness claude Tab · model opus high ^O` — and each of those is a picker you can open without losing the text. `Space` on a card is the same box for a session already running: its next turn, sent straight down its PTY, without stepping into it. |
 | **Real git WORKTREES, one keystroke** | `Ctrl+N` in the box flips the launch onto a fresh `git worktree` — the frame turns green and names the branch it will cut — and every card in that checkout sits in its own BAND, with the branch, its uncommitted changes and its pull request on the rule above them. Two agents in two directories never collide. A WORKTREE HOOK in git config lets a project claim a port or a route when a checkout is created and release it when it is deleted. |
 | **The root checkout on any branch, no shell** | `c` on a root-branch card lists every branch and remote branch, fuzzy-filtered as you type; `Enter` switches, or creates the branch when nothing matches. Uncommitted changes? The BRANCH SWITCHER asks first — stash them, bring them along, commit them, or discard them — the way an IDE would. |
-| **Agents that drive nebula back** | Tell a Claude SESSION *"do this in a worktree"* and it runs `nebula worktree`, then restarts itself resumed inside the new checkout. Say *"show me the file"* or *"show the diagram"* and `nebula open` puts text, images and Mermaid diagrams in front of you in a tabbed modal. Say *"start a new nebula session that…"* and `nebula spawn` has a second agent working beside it before you look. Say *"check what the research session found"* and it can run `nebula sessions`, `nebula read research`, or `nebula ask research "which library?"` to pull context from that session. |
-| **Every open pull request, in place** | nebula asks `gh` what's open on the repo. A band whose branch has a pull request names it on its rule — `↗ #57 Move the token store to sqlite  ready` — in red once GitHub says it no longer merges or a check failed, purple once it's merged; the header counts `3 prs · 5 issues`. `v` lists them and reads the one under the cursor — description, checks, the whole conversation — `Ctrl+g` for its diff, `Ctrl+c` to comment without leaving the keyboard, `Enter` for a PR SESSION in the pull request's own checkout, `Shift+V` on a card sends its pull request to the browser. |
+| **Agents that drive orbit back** | Tell a Claude SESSION *"do this in a worktree"* and it runs `orbit worktree`, then restarts itself resumed inside the new checkout. Say *"show me the file"* or *"show the diagram"* and `orbit open` puts text, images and Mermaid diagrams in front of you in a tabbed modal. Say *"start a new orbit session that…"* and `orbit spawn` has a second agent working beside it before you look. Say *"check what the research session found"* and it can run `orbit sessions`, `orbit read research`, or `orbit ask research "which library?"` to pull context from that session. |
+| **Every open pull request, in place** | orbit asks `gh` what's open on the repo. A band whose branch has a pull request names it on its rule — `↗ #57 Move the token store to sqlite  ready` — in red once GitHub says it no longer merges or a check failed, purple once it's merged; the header counts `3 prs · 5 issues`. `v` lists them and reads the one under the cursor — description, checks, the whole conversation — `Ctrl+g` for its diff, `Ctrl+c` to comment without leaving the keyboard, `Enter` for a PR SESSION in the pull request's own checkout, `Shift+V` on a card sends its pull request to the browser. |
 | **Every open issue, one key from an agent** | `i` lists the project's open GitHub issues, newest first, filtered as you type, and reads the one under the cursor — description, labels, comments. `Enter` opens the QUICK PROMPT for it, `Shift+Tab` launches one of your AGENT PRESETS on it, `Ctrl+e` edits its title and description in place; the issue's URL travels with the session as context on every spawn, so the harness knows what it is fixing. `Shift+I` on the card opens the issue it came from. |
 | **Diff, find, grep, browse** | `g` opens the DIFF VIEWER with REVIEWED MARKS, `f` the FILE FINDER, `F` a `git grep`, `b` the TREE BROWSER — all scoped to the card's WORKTREE, all one key from anywhere. Markdown previews are rendered pages, Mermaid fences become diagrams when `mmdc` is installed, and image files preview inline instead of as binary blobs. |
 | **`/` finds anything, anywhere** | The PALETTE spans every PROJECT on the machine, each session listed with its project in front of it. Before you type it is that overview, sorted by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `.` / `,` cycle that same attention order with no modal at all, one session per press, every project included. Open pull requests are rows too. |
-| **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. `nebula sbx` does the same into a local Docker container, so agents run sandboxed. Your settings and agent presets go along, and `nebula config export` / `import` back them up. |
+| **It follows you to other machines** | `orbit ssh <host>` opens orbit there, installing it if missing. `orbit tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. `orbit sbx` does the same into a local Docker container, so agents run sandboxed. Your settings and agent presets go along, and `orbit config export` / `import` back them up. |
 
 ## Supported harnesses
 
@@ -95,44 +95,44 @@ re-checks through the login shell at launch.
 macOS or Linux — the same command installs and updates:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh
 ```
 
 It downloads the prebuilt binary for your platform from the latest GitHub release into `~/.local/bin`
-(override with `NEBULA_INSTALL_DIR`), falling back to `cargo install --git` when no release matches.
-Afterwards, `nebula upgrade` runs that same script for you; it refuses to clobber a local `cargo build`
+(override with `ORBIT_INSTALL_DIR`), falling back to `cargo install --git` when no release matches.
+Afterwards, `orbit upgrade` runs that same script for you; it refuses to clobber a local `cargo build`
 (pass `--force` if you mean it). Upgrading with a DAEMON running is safe: an idle one — nothing live in
 it — is shut down for you, so the next launch comes up on the new binary. A DAEMON with live SESSIONS is
 restarted in place onto the new binary: every agent keeps running, mid-turn or not, and relaunching
-`nebula` picks them back up with their scrollback (`nebula reload` does the same by hand, say after a
+`orbit` picks them back up with their scrollback (`orbit reload` does the same by hand, say after a
 `make install`). Only a DAEMON from a release before that existed is left on the old binary until you
-`nebula kill` and relaunch — and when the new build speaks a different protocol, `nebula upgrade` says
-so and offers that restart for you. `nebula --version` (`-V`) says which binary you are on.
+`orbit kill` and relaunch — and when the new build speaks a different protocol, `orbit upgrade` says
+so and offers that restart for you. `orbit --version` (`-V`) says which binary you are on.
 
-WSL2 is supported as Linux. WSL1 is not: it lacks the Linux kernel behavior nebula's DAEMON relies on
-for its Unix socket, pidfile lock, and PTYs, so nebula reports that directly and tells you to convert
+WSL2 is supported as Linux. WSL1 is not: it lacks the Linux kernel behavior orbit's DAEMON relies on
+for its Unix socket, pidfile lock, and PTYs, so orbit reports that directly and tells you to convert
 the distro with `wsl.exe --set-version <distro> 2`.
 
 > **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, or `opencode`.
-> nebula spawns them; it doesn't ship them.
+> orbit spawns them; it doesn't ship them.
 >
-> Four commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
-> exit if there is no OpenSSH client (`ssh`), `nebula sbx` needs `docker`, and `nebula browser` needs
-> `ttyd` on your `PATH` — for `nebula tunnel` it is the *remote* host that needs it. The TUI itself
+> Four commands each want one more binary, and only those commands: `orbit ssh` and `orbit tunnel`
+> exit if there is no OpenSSH client (`ssh`), `orbit sbx` needs `docker`, and `orbit browser` needs
+> `ttyd` on your `PATH` — for `orbit tunnel` it is the *remote* host that needs it. The TUI itself
 > needs none of them.
 
 ## Quickstart
 
-**1. Add a repo.** nebula is project-first, and a PROJECT is just a git checkout:
+**1. Add a repo.** orbit is project-first, and a PROJECT is just a git checkout:
 
 ```sh
-nebula add ~/code/my-app       # or, from inside the repo: nebula add .
+orbit add ~/code/my-app       # or, from inside the repo: orbit add .
 ```
 
-**2. Open the TUI.** A bare `nebula` launches it and auto-starts the DAEMON:
+**2. Open the TUI.** A bare `orbit` launches it and auto-starts the DAEMON:
 
 ```sh
-nebula
+orbit
 ```
 
 It opens on the GRID — no modal, ever, on launch. With no PROJECTS yet you get the SPLASH: launched from
@@ -152,11 +152,11 @@ box empty and the CLI starts bare, its pane yours to type the first prompt into.
 keep retyping as an AGENT PRESET (`e`) and it becomes one keystroke; a plain shell is `t`.
 
 Codex model and effort choices follow your installed Codex CLI automatically, including newly
-released models. Nebula reads `$CODEX_HOME/models_cache.json` (default `~/.codex`) at startup,
+released models. Orbit reads `$CODEX_HOME/models_cache.json` (default `~/.codex`) at startup,
 then refreshes from `codex app-server` in the background every 15 minutes. Each model offers
 its own supported effort levels. If discovery fails, the last catalog stays available and
 `default` always lets Codex choose. To maintain a custom static list, set
-`harnesses.codex.catalog` to `null` and `harnesses.codex.models` in your Nebula config.
+`harnesses.codex.catalog` to `null` and `harnesses.codex.models` in your Orbit config.
 
 <div align="center"><img src="assets/quick-prompt.png" alt="The quick prompt over the grid: a task typed in, the details row naming the project, worktree, harness and model, and the frame turned green because Ctrl+N pointed the launch at a fresh worktree" width="100%"></div>
 
@@ -176,12 +176,12 @@ gets its next instructions one card at a time.
 
 **6. Walk away.** `q` asks first — a CONFIRM DIALOG reading *Leave the TUI? Sessions keep running in the
 daemon.* that `Enter` accepts and a second `Ctrl+C` walks straight through. The DAEMON still owns every
-PTY — come back with `nebula` an hour later and each SESSION is exactly where you left it, scrollback
+PTY — come back with `orbit` an hour later and each SESSION is exactly where you left it, scrollback
 replayed.
 
 A new SESSION starts on a default name and AUTO-TITLE renames it from your first prompt — `Fix Login
 Redirect`, not `agent-3`; `r` renames it whenever you like. A Claude SESSION's own name
-is the same name: `/rename` inside Claude Code retitles the card, and a name set in nebula reaches
+is the same name: `/rename` inside Claude Code retitles the card, and a name set in orbit reaches
 Claude's prompt box and `/resume` picker on your next prompt.
 
 ## Read the dots, not the screens
@@ -196,12 +196,12 @@ Claude's prompt box and `/resume` picker on your next prompt.
 | ● magenta | terminated — process died mid-run |
 | ○ | disconnected — the DAEMON restarted while the agent was live |
 
-A Cursor SESSION never goes red: nebula runs `cursor-agent --force` and Cursor reports no permission
+A Cursor SESSION never goes red: orbit runs `cursor-agent --force` and Cursor reports no permission
 event, so waiting-on-you is not detectable there. A Muse SESSION never goes red either yet: `muse`
 has no managed hooks, so its status is process-based until a hook dialect is mapped. Grok Build also uses process-based status,
 with no managed hooks or automatic capture of its session ID yet. Model and effort IDs can be
 set through `harnesses.grok` in config.json; the CLI supplies their defaults when unset. An OpenCode
-SESSION does go red: nebula passes no `--auto`, so `opencode` keeps its own permission prompts, and its
+SESSION does go red: orbit passes no `--auto`, so `opencode` keeps its own permission prompts, and its
 managed plugin reports each one (and each `question` the agent asks you) as it opens and closes.
 
 The PROJECT TABS ROLL UP their sessions: each tab carries one dot per state its sessions are in, with
@@ -209,7 +209,7 @@ the count and no word at all — red waiting on you, blue finished unread, yello
 and left out where a state is empty — so a quiet project is its bare name, and a `●2` in red on a tab
 you aren't looking at is the whole message.
 
-A dot going blue while you were looking elsewhere is easy to miss, so nebula marks the moment and then
+A dot going blue while you were looking elsewhere is easy to miss, so orbit marks the moment and then
 keeps count. The moment: a card's name sweeps — a bright band crossing it — in yellow while it runs and in
 red while it waits on you, for as long as either lasts; a turn that finishes unread sweeps blue for about
 five seconds and then holds still, and the project's tab name sweeps in the loudest of its sessions'
@@ -232,17 +232,17 @@ owns both; `off` silences the pair. See [Configuration](docs/configuration.md).
 
 ## Where the status actually comes from
 
-nebula doesn't poll the agents and it doesn't guess from the screen. At spawn it merges MANAGED HOOKS
+orbit doesn't poll the agents and it doesn't guess from the screen. At spawn it merges MANAGED HOOKS
 into the WORKTREE's `.claude/settings.local.json`, `.cursor/hooks.json` or `~/.codex/hooks.json` — tagged
-`_nebulaManaged`, your own hooks preserved, rebuilt every spawn — and each one is a fail-soft `curl` to
+`_orbitManaged`, your own hooks preserved, rebuilt every spawn — and each one is a fail-soft `curl` to
 the DAEMON's loopback HOOK RECEIVER, authenticated with a per-boot BEARER TOKEN. Pi has no shell hooks,
-so it gets one managed extension at `~/.pi/agent/extensions/nebula.ts` that posts the same events, and
-OpenCode gets one managed plugin at `~/.config/opencode/plugins/nebula.ts` that does the same. For the one event no CLI
+so it gets one managed extension at `~/.pi/agent/extensions/orbit.ts` that posts the same events, and
+OpenCode gets one managed plugin at `~/.config/opencode/plugins/orbit.ts` that does the same. For the one event no CLI
 reports — a turn you cancelled with `Esc` — the PROGRESS SCANNER reads the CLI's own OSC 9;4 progress
 escapes straight off the PTY, a signal that survives the cancel and stays busy while a permission prompt
 is open.
 
-## Teach nebula a new agent CLI
+## Teach orbit a new agent CLI
 
 The seven built-ins are just rows in a table, and the table is open. One block in `config.json` adds
 a CLI everywhere at once: the box's `Tab` picker, the `e` presets, spawn, resume, and the Agents tab, which
@@ -261,22 +261,22 @@ grows it a section to tune without hand-editing.
 }
 ```
 
-`program` is the only required row: the binary nebula launches, resolved on PATH through your login
+`program` is the only required row: the binary orbit launches, resolved on PATH through your login
 shell. A new id starts enabled, takes the id as its label, boots fresh every launch (no resume), and
-hides the Effort row until you map effort. `nebula config harnesses` prints the effective rows to copy
+hides the Effort row until you map effort. `orbit config harnesses` prints the effective rows to copy
 from, and a block that stops making sense refuses its launches with the reason while everything else
 keeps working. Ids use lowercase letters, digits and hyphens, and must not collide with a built-in.
 
 `hooks` names a built-in dialect, not your own scripts: `claude`, `codex`, `cursor`, `pi` or `opencode`. At spawn
-nebula installs that dialect's MANAGED HOOKS for the session (the same `.claude/settings.local.json`,
+orbit installs that dialect's MANAGED HOOKS for the session (the same `.claude/settings.local.json`,
 `.cursor/hooks.json`, `~/.codex/hooks.json`, pi extension or OpenCode plugin the built-in gets), so a CLI that speaks
 that protocol reports status, prompts and permission waits exactly like the real thing. A
 Claude-compatible CLI with `"hooks": "claude"` even gets title sync and auto-title. Leave `hooks` out
 and the sessions stay process-based: running while the PTY is live, never red. Either way your own
-hooks are preserved (nebula's entries are tagged `_nebulaManaged`) and the merge is rebuilt every
+hooks are preserved (orbit's entries are tagged `_orbitManaged`) and the merge is rebuilt every
 spawn.
 
-One boundary to know: `nebula ssh` syncs `config.json` to the remote, but exec-capable harness keys
+One boundary to know: `orbit ssh` syncs `config.json` to the remote, but exec-capable harness keys
 never travel with it: each machine runs only the programs its own files name. Full row reference
 (resume styles, effort mapping, system-prompt passing, clearing a row with `null`): [Configuration](docs/configuration.md),
 "The harness registry".
@@ -286,27 +286,27 @@ never travel with it: each machine runs only the programs its own files name. Fu
 | | |
 |---|---|
 | [**Keys**](docs/keys.md) | Every default binding, the grid's own keys (tabs, bands, cards, the pane), the WORKTREE views (`g` `f` `F` `b` `i` `v`), the chips and readouts, and the mouse. All of it rebindable. |
-| [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `rename`, `worktree`, `spawn`, `open`, `config`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
+| [**Commands**](docs/commands.md) | The `orbit` CLI: `add`, `rename`, `worktree`, `spawn`, `open`, `config`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
 | [**Sessions**](docs/sessions.md) | The QUICK PROMPT and the GRID, the NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the FOLLOW-UP COMPOSER, RECENT PROMPTS, the ISSUES MODAL, the PULL REQUESTS MODAL. |
 | [**Orchestrator**](docs/orchestrator.md) | The chat-first orchestrator session, privileged commands, status strip, review modal and mobile default. |
-| [**Configuration**](docs/configuration.md) | `config.json` and `config.local.json`, backup and restore, the SETTINGS OVERLAY, the HOTKEYS TAB, the `.nebula.json` PROJECT FILE (**Run** and **Open** in the project's menu, `Shift+Enter` opens it), compatibility rules, logs and environment overrides. |
+| [**Configuration**](docs/configuration.md) | `config.json` and `config.local.json`, backup and restore, the SETTINGS OVERLAY, the HOTKEYS TAB, the `.orbit.json` PROJECT FILE (**Run** and **Open** in the project's menu, `Shift+Enter` opens it), compatibility rules, logs and environment overrides. |
 | [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |
 | [**Architecture**](ARCHITECTURE.md) | Process model, the IPC CODEC and the crate layout. |
 
 ## Building
 
 ```sh
-cargo build --release     # → target/release/nebula (~11 MB)
+cargo build --release     # → target/release/orbit (~11 MB)
 cargo test                # unit + end-to-end suite (spawns real daemons/PTYs)
 ```
 
-`nebula-core` (shared protocol/entities), `nebula-daemon` (PTYs, SQLite, HOOK RECEIVER, STATUS MACHINE),
-`nebula-tui` (ratatui client), `nebula` (the binary). `vendor/vt100` is a patched copy of the terminal
+`orbit-core` (shared protocol/entities), `orbit-daemon` (PTYs, SQLite, HOOK RECEIVER, STATUS MACHINE),
+`orbit-tui` (ratatui client), `orbit` (the binary). `vendor/vt100` is a patched copy of the terminal
 parser wired in through `[patch.crates-io]`: rows scrolled out of a top-anchored scroll region go to the
 SCROLLBACK RING instead of being discarded, so wheel-up over a codex SESSION has something to show.
 
 Screenshots: `make shot SCENE=readme-grid` renders the README's hero from a scripted demo — an isolated
-nebula, stand-in agents, a stub `gh` — into `design-screenshots/`; the scenes live in `scripts/shot/scenes/`.
+orbit, stand-in agents, a stub `gh` — into `design-screenshots/`; the scenes live in `scripts/shot/scenes/`.
 
 Releases: push a `v*` tag (`git tag v0.1.0 && git push --tags`) and CI builds mac (arm/intel) and linux (x64/arm64, static musl) binaries and
 attaches them to a GitHub release — which is what `install.sh` downloads.
@@ -322,5 +322,5 @@ MIT — see [LICENSE](LICENSE).
 
 <div align="center">
 <br>
-<sub>If nebula saves you a tab, a ⭐ helps other people find it.</sub>
+<sub>If orbit saves you a tab, a ⭐ helps other people find it.</sub>
 </div>

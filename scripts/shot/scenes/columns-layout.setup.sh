@@ -2,7 +2,7 @@
 # on the README's orbit-api project, using the same seeded sessions as the
 # nested-layout scene so the three columns show projects, PR-backed worktrees
 # and sessions beside the pane.
-NEBULA_SHOT_PANE="${NEBULA_SHOT_PANE:-right}"
+ORBIT_SHOT_PANE="${ORBIT_SHOT_PANE:-right}"
 . "$HERE/scenes/nested-layout.setup.sh"
 python3 - <<'PY'
 import json, os

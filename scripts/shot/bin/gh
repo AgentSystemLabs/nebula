@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""A stand-in `gh` for the SCREENSHOT HARNESS: answers the four calls nebula's GIT POLL and PR PREVIEW
-make from canned JSON under $NEBULA_GH_FIXTURES, so a screenshot never needs a network, a token or a
-real repository. Anything else is "couldn't ask" (exit 1) — exactly what nebula treats as no PR.
+"""A stand-in `gh` for the SCREENSHOT HARNESS: answers the four calls orbit's GIT POLL and PR PREVIEW
+make from canned JSON under $ORBIT_GH_FIXTURES, so a screenshot never needs a network, a token or a
+real repository. Anything else is "couldn't ask" (exit 1) — exactly what orbit treats as no PR.
 
   gh api graphql … pullRequests …         → fixtures/pr-list.json, rows in `gh pr list --json` shape, handed back as
                                             the open list's GraphQL answer (a row's `statusCheckRollup` checks
@@ -19,7 +19,7 @@ import json
 import os
 import sys
 
-FIX = os.environ.get("NEBULA_GH_FIXTURES") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures")
+FIX = os.environ.get("ORBIT_GH_FIXTURES") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures")
 
 
 def emit(name):

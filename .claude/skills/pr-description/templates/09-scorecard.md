@@ -13,7 +13,7 @@
 | <Idle RSS, daemon> | <610 MB> | <90 MB> | **−85 %** | `ps -o rss` |
 | Tests | <631> | <687> | +56 | `cargo test --workspace` |
 | Lines (net) | | | <+846 −346> | `git diff --stat origin/main` |
-| PROTOCOL VERSION | <31> | <32> | +1 | `nebula_core::protocol` |
+| PROTOCOL VERSION | <31> | <32> | +1 | `orbit_core::protocol` |
 
 ## ✨ What changed <a id="what-changed"></a>
 
@@ -25,7 +25,7 @@
 
 | <Caption: the screen after the change — or the FOOTER showing the new number> |
 |---|
-| ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<after>.png) |
+| ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<after>.png) |
 
 ## 🧭 Where the time goes <a id="where-the-time-goes"></a>
 
@@ -74,7 +74,7 @@ flowchart LR
 ## 📝 Notes <a id="notes"></a>
 
 - <Merge state, conflicts.>
-- <A PROTOCOL VERSION bump means `nebula kill` on the old daemon before the new TUI attaches.>
+- <A PROTOCOL VERSION bump means `orbit kill` on the old daemon before the new TUI attaches.>
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 

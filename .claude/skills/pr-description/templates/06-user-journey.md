@@ -18,9 +18,9 @@
 
 | Step 1 — <caption> | Step 2 — <caption> |
 |---|---|
-| ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/step-1.png) | ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/step-2.png) |
+| ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/step-1.png) | ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/step-2.png) |
 | **Step 3 — <caption>** | **Step 4 — <caption>** |
-| ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/step-3.png) | ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/step-4.png) |
+| ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/step-3.png) | ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/step-4.png) |
 
 ## 🧭 Under the hood <a id="under-the-hood"></a>
 
@@ -63,7 +63,7 @@ sequenceDiagram
 
 - **Step 1–2.** <Mechanism: the overlay or picker, the request type, three sentences; files with a clause each.>
 - **Step 3–4.** <Mechanism: the daemon-side state, the hook route, the TUI field it feeds.>
-- **Files.** `crates/nebula-tui/src/<file>.rs` — <clause>; `crates/nebula-daemon/src/<file>.rs` — <clause>.
+- **Files.** `crates/orbit-tui/src/<file>.rs` — <clause>; `crates/orbit-daemon/src/<file>.rs` — <clause>.
 - **Gate.** <`make ci` green — N tests, including the e2e that walks this journey; or what did not run and why.>
 
 ## 📝 Notes <a id="notes"></a>

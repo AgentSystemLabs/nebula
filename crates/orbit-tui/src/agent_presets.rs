@@ -1,0 +1,437 @@
+//! AGENT PRESETS: saved launch definitions — an AGENT KIND, a MODEL / EFFORT
+//! choice, optional prefix / postfix text, and whether to ask for a task at
+//! all — that `e` lists for the checkout under the cursor. Launching one asks for an
+//! optional task (or, with `skip_task`, nothing) and hands the CLI
+//! `prefix + task + postfix` as its positional starting prompt.
+//!
+//! A plain JSON list in the DATA DIR beside `config.json`, in list order.
+//! A missing or malformed file reads as empty — like the SSH HOSTS FILE it
+//! is a convenience store, never load-bearing. Writes go through a temp
+//! file + rename so a crash mid-write cannot truncate the list. The list is
+//! read entry by entry, and a save keeps what this build can't read — a
+//! preset for a harness a newer orbit added, a field it has no name for —
+//! so an older orbit sharing the file never deletes a newer one's presets.
+
+use orbit_core::AgentKind;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPreset {
+    /// The row's label; unique (case-insensitively) within the list.
+    pub name: String,
+    /// The CLI the preset launches.
+    #[serde(default)]
+    pub kind: AgentKind,
+    /// Registry id when `kind` is [`AgentKind::Custom`].
+    #[serde(default)]
+    pub custom_harness: Option<String>,
+    /// Launch model; None = follow the Settings → Agents default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Launch effort; None = follow the Settings → Agents default.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Text sent before the task (may be empty).
+    #[serde(default)]
+    pub prefix: String,
+    /// Text sent after the task (may be empty).
+    #[serde(default)]
+    pub postfix: String,
+    /// Launch without asking for a task: Enter on the preset starts the CLI
+    /// on prefix + postfix alone — a "commit and push" preset has nothing
+    /// left to say. Off, the task is still asked for, but optional.
+    #[serde(default)]
+    pub skip_task: bool,
+}
+
+impl AgentPreset {
+    /// `claude · opus · high` / `codex · gpt-5.5` / `cursor` — the kind plus
+    /// whichever of model and effort the preset pins.
+    pub fn spec_label(&self) -> String {
+        let harness = self
+            .custom_harness
+            .as_deref()
+            .unwrap_or_else(|| self.kind.as_str());
+        let mut parts = vec![harness.to_string()];
+        parts.extend(
+            self.model
+                .iter()
+                .map(|model| crate::config::model_label(self.kind, model)),
+        );
+        parts.extend(self.effort.iter().cloned());
+        parts.join(" · ")
+    }
+
+    /// True when the preset wraps the task in any text at all.
+    pub fn has_wrapping(&self) -> bool {
+        !self.prefix.trim().is_empty() || !self.postfix.trim().is_empty()
+    }
+
+    /// The starting prompt: prefix, task and postfix — each trimmed, empty
+    /// parts skipped — joined by a blank line. Empty when all three are:
+    /// the launch then has no starting prompt at all.
+    pub fn compose(&self, task: &str) -> String {
+        [self.prefix.as_str(), task, self.postfix.as_str()]
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+/// Which side of the task a preset's text goes: a PREFIX before it, a
+/// POSTFIX after it, or both. The PRESET EDITOR shows one box per side —
+/// its Text row picks — and **Preset text** (Settings → Sessions,
+/// [`crate::config::Config::preset_text`]) is what a new preset starts on:
+/// prefix alone by default, the framing most people reach for and one box
+/// to fill. Never stored on the preset — a side is what it holds, so the
+/// form derives it ([`PresetText::for_preset`]) and an older orbit reads
+/// the file unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetText {
+    Prefix,
+    Postfix,
+    Both,
+}
+
+impl PresetText {
+    /// In cycle order, as the Text row and the setting step them.
+    pub const ALL: [PresetText; 3] = [PresetText::Prefix, PresetText::Postfix, PresetText::Both];
+    /// What a config that never set `preset_text` means.
+    pub const DEFAULT: PresetText = PresetText::Prefix;
+
+    /// The label the setting stores and both rows show.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PresetText::Prefix => "prefix",
+            PresetText::Postfix => "postfix",
+            PresetText::Both => "prefix & postfix",
+        }
+    }
+
+    /// A label back to its side, case-insensitively and trimmed; `both` is
+    /// accepted for a hand edit. None for anything else.
+    pub fn parse(value: &str) -> Option<PresetText> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("both") {
+            return Some(PresetText::Both);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|side| side.as_str().eq_ignore_ascii_case(value))
+    }
+
+    pub fn has_prefix(self) -> bool {
+        matches!(self, PresetText::Prefix | PresetText::Both)
+    }
+
+    pub fn has_postfix(self) -> bool {
+        matches!(self, PresetText::Postfix | PresetText::Both)
+    }
+
+    /// The side (or sides) two flags name; None when neither is set.
+    pub fn of_sides(prefix: bool, postfix: bool) -> Option<PresetText> {
+        match (prefix, postfix) {
+            (true, true) => Some(PresetText::Both),
+            (true, false) => Some(PresetText::Prefix),
+            (false, true) => Some(PresetText::Postfix),
+            (false, false) => None,
+        }
+    }
+
+    /// What the editor shows for a stored preset under the `default`
+    /// setting: every side the preset already holds text on, plus the
+    /// side(s) the setting names — so nothing saved is ever hidden, and a
+    /// blank preset opens the way a new one would.
+    pub fn for_preset(preset: &AgentPreset, default: PresetText) -> PresetText {
+        Self::of_sides(
+            !preset.prefix.trim().is_empty() || default.has_prefix(),
+            !preset.postfix.trim().is_empty() || default.has_postfix(),
+        )
+        .unwrap_or(default)
+    }
+}
+
+pub fn load() -> Vec<AgentPreset> {
+    load_from(&store_path())
+}
+
+/// Persist the whole list, in order.
+pub fn save(presets: &[AgentPreset]) -> std::io::Result<()> {
+    save_to(&store_path(), presets)
+}
+
+pub(crate) fn store_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(path) = PRESETS_PATH_OVERRIDE.with(|p| p.borrow().clone()) {
+            return path;
+        }
+    }
+    orbit_core::paths::data_dir().join(orbit_core::paths::PRESETS_FILE_NAME)
+}
+
+fn load_from(path: &Path) -> Vec<AgentPreset> {
+    orbit_core::settings::read_list(path).0
+}
+
+/// The `name` a raw preset entry carries, as the file spells it.
+pub(crate) fn entry_name(entry: &Value) -> Option<&str> {
+    entry.get("name")?.as_str()
+}
+
+/// Write `presets` in order. Each keeps the fields its stored entry (same
+/// name) had that this build doesn't know, and every stored entry this build
+/// can't read goes after them unless a preset now holds its name.
+fn save_to(store: &Path, presets: &[AgentPreset]) -> std::io::Result<()> {
+    let stored = orbit_core::settings::read_array(store)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let named = |name: &str| {
+        stored
+            .iter()
+            .find(|entry| entry_name(entry).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+    };
+    let mut entries = Vec::with_capacity(presets.len());
+    for preset in presets {
+        let Value::Object(known) = serde_json::to_value(preset)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+        else {
+            unreachable!("a preset serializes to a JSON object");
+        };
+        let mut entry = named(&preset.name)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        entry.extend(known);
+        entries.push(Value::Object(entry));
+    }
+    for entry in &stored {
+        let unreadable = serde_json::from_value::<AgentPreset>(entry.clone()).is_err();
+        let taken = entry_name(entry)
+            .is_some_and(|n| presets.iter().any(|p| p.name.eq_ignore_ascii_case(n)));
+        if unreadable && !taken {
+            entries.push(entry.clone());
+        }
+    }
+    orbit_core::settings::write_json(store, &Value::Array(entries))
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRESETS_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test hook (the `with_config_path` pattern): route this thread's preset
+/// store at `path` for the duration of `f`.
+#[cfg(test)]
+pub fn with_presets_path<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
+    PRESETS_PATH_OVERRIDE.with(|slot| {
+        let prev = slot.replace(Some(path));
+        let out = f();
+        slot.replace(prev);
+        out
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent_presets.json");
+        (dir, path)
+    }
+
+    fn preset(name: &str, kind: AgentKind) -> AgentPreset {
+        AgentPreset {
+            name: name.into(),
+            kind,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            prefix: String::new(),
+            postfix: String::new(),
+            skip_task: false,
+        }
+    }
+
+    #[test]
+    fn missing_or_malformed_file_reads_empty() {
+        let (_dir, path) = store();
+        assert!(load_from(&path).is_empty());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_from(&path).is_empty());
+    }
+
+    #[test]
+    fn save_round_trips_in_order_and_leaves_no_temp_file() {
+        let (_dir, path) = store();
+        let presets = vec![
+            AgentPreset {
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                prefix: "Be strict.".into(),
+                postfix: "Run the tests.".into(),
+                ..preset("reviewer", AgentKind::Claude)
+            },
+            AgentPreset {
+                skip_task: true,
+                ..preset("scratch", AgentKind::Codex)
+            },
+        ];
+        save_to(&path, &presets).unwrap();
+        assert_eq!(load_from(&path), presets);
+        assert!(!path.with_extension("json.tmp").exists());
+        // A rewrite replaces, never appends.
+        save_to(&path, &presets[1..]).unwrap();
+        assert_eq!(load_from(&path), presets[1..].to_vec());
+    }
+
+    /// A preset for a harness this build has never heard of — a newer
+    /// orbit's — survives a save, and so does a field this build doesn't know.
+    #[test]
+    fn a_save_keeps_what_a_newer_orbit_wrote() {
+        let (_dir, path) = store();
+        std::fs::write(
+            &path,
+            r#"[
+                {"name": "reviewer", "kind": "codex", "pinned": true},
+                {"name": "future", "kind": "antigravity", "model": "x"}
+            ]"#,
+        )
+        .unwrap();
+        let mut presets = load_from(&path);
+        assert_eq!(presets.len(), 1, "only the readable preset lists");
+        presets[0].prefix = "Be strict.".into();
+        presets.push(preset("scratch", AgentKind::Claude));
+        save_to(&path, &presets).unwrap();
+
+        let saved: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let names: Vec<&str> = saved.iter().filter_map(entry_name).collect();
+        assert_eq!(names, ["reviewer", "scratch", "future"]);
+        assert_eq!(saved[0]["pinned"], true);
+        assert_eq!(saved[0]["prefix"], "Be strict.");
+        assert_eq!(saved[2]["kind"], "antigravity");
+        assert_eq!(load_from(&path).len(), 2);
+    }
+
+    #[test]
+    fn a_name_only_record_deserializes_with_defaults() {
+        let (_dir, path) = store();
+        std::fs::write(&path, r#"[{"name": "old"}]"#).unwrap();
+        let presets = load_from(&path);
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].name, "old");
+        assert_eq!(presets[0].kind, AgentKind::Claude);
+        assert_eq!(presets[0].model, None);
+        assert!(presets[0].prefix.is_empty() && presets[0].postfix.is_empty());
+        assert!(!presets[0].skip_task, "an old record still asks for a task");
+    }
+
+    #[test]
+    fn compose_skips_empty_parts_and_trims() {
+        let mut p = preset("p", AgentKind::Claude);
+        assert_eq!(p.compose(""), "", "nothing at all composes to nothing");
+        assert_eq!(p.compose("  do it \n"), "do it");
+        p.prefix = "PRE\n".into();
+        assert_eq!(p.compose("do it"), "PRE\n\ndo it");
+        p.postfix = "  POST".into();
+        assert_eq!(p.compose("do it"), "PRE\n\ndo it\n\nPOST");
+        assert_eq!(p.compose(" \n"), "PRE\n\nPOST", "the task is optional");
+        p.prefix = "   ".into();
+        assert_eq!(p.compose("line1\nline2"), "line1\nline2\n\nPOST");
+        assert!(p.has_wrapping());
+        p.postfix.clear();
+        assert!(!p.has_wrapping());
+    }
+
+    #[test]
+    fn preset_text_labels_round_trip_and_both_is_an_alias() {
+        for side in PresetText::ALL {
+            assert_eq!(PresetText::parse(side.as_str()), Some(side));
+            assert_eq!(
+                PresetText::parse(&format!(" {} ", side.as_str().to_uppercase())),
+                Some(side)
+            );
+        }
+        assert_eq!(PresetText::parse(" both "), Some(PresetText::Both));
+        assert_eq!(PresetText::parse("suffix"), None);
+        assert_eq!(PresetText::parse(""), None);
+        assert_eq!(PresetText::DEFAULT, PresetText::Prefix);
+        assert!(PresetText::Prefix.has_prefix() && !PresetText::Prefix.has_postfix());
+        assert!(!PresetText::Postfix.has_prefix() && PresetText::Postfix.has_postfix());
+        assert!(PresetText::Both.has_prefix() && PresetText::Both.has_postfix());
+        assert_eq!(PresetText::of_sides(false, false), None);
+    }
+
+    /// A stored side is never hidden: the form shows what the preset holds
+    /// on top of what the setting names, and a blank preset follows the
+    /// setting alone.
+    #[test]
+    fn for_preset_shows_every_side_with_text_and_the_setting_for_the_rest() {
+        use PresetText::*;
+        let blank = preset("p", AgentKind::Claude);
+        let pre = AgentPreset {
+            prefix: "PRE".into(),
+            ..blank.clone()
+        };
+        let post = AgentPreset {
+            postfix: "POST".into(),
+            ..blank.clone()
+        };
+        let both = AgentPreset {
+            prefix: "PRE".into(),
+            postfix: "POST".into(),
+            ..blank.clone()
+        };
+        assert_eq!(PresetText::for_preset(&blank, Prefix), Prefix);
+        assert_eq!(PresetText::for_preset(&blank, Postfix), Postfix);
+        assert_eq!(PresetText::for_preset(&blank, Both), Both);
+        assert_eq!(PresetText::for_preset(&pre, Prefix), Prefix);
+        assert_eq!(
+            PresetText::for_preset(&pre, Postfix),
+            Both,
+            "the prefix it holds stays on screen"
+        );
+        assert_eq!(
+            PresetText::for_preset(&post, Prefix),
+            Both,
+            "the postfix it holds stays on screen"
+        );
+        assert_eq!(PresetText::for_preset(&post, Postfix), Postfix);
+        assert_eq!(PresetText::for_preset(&both, Prefix), Both);
+        let spaces = AgentPreset {
+            postfix: "  \n".into(),
+            ..blank
+        };
+        assert_eq!(
+            PresetText::for_preset(&spaces, Prefix),
+            Prefix,
+            "whitespace is no text"
+        );
+    }
+
+    #[test]
+    fn spec_label_names_only_what_is_pinned() {
+        assert_eq!(preset("p", AgentKind::Cursor).spec_label(), "cursor");
+        let full = AgentPreset {
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            ..preset("p", AgentKind::Claude)
+        };
+        assert_eq!(full.spec_label(), "claude · opus · high");
+        let model_only = AgentPreset {
+            model: Some("gpt-5.5".into()),
+            ..preset("p", AgentKind::Codex)
+        };
+        assert_eq!(model_only.spec_label(), "codex · gpt-5.5");
+    }
+}

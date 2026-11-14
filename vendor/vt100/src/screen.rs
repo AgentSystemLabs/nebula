@@ -59,7 +59,7 @@ pub struct Screen {
     attrs: crate::attrs::Attrs,
     saved_attrs: crate::attrs::Attrs,
 
-    // Nebula patch: OSC 8 hyperlinks. `link` is the one open now (0 is
+    // Orbit patch: OSC 8 hyperlinks. `link` is the one open now (0 is
     // none); a cell stores its link as an index into `links`, 1-based.
     link: u16,
     links: Vec<String>,
@@ -131,7 +131,7 @@ impl Screen {
         self.grid().scrollback()
     }
 
-    /// NEBULA PATCH: rows held in the primary screen's scrollback —
+    /// ORBIT PATCH: rows held in the primary screen's scrollback —
     /// whichever screen is showing, since a full-screen program parked
     /// over a long shell history still holds that history.
     #[must_use]
@@ -139,14 +139,14 @@ impl Screen {
         self.grid.scrollback_rows()
     }
 
-    /// NEBULA PATCH: drop the primary screen's scrollback and release its
+    /// ORBIT PATCH: drop the primary screen's scrollback and release its
     /// memory. The visible screen, the cursor and every mode are untouched,
     /// so output parsed afterwards lands exactly as it would have.
     pub fn clear_scrollback(&mut self) {
         self.grid.clear_scrollback();
     }
 
-    /// NEBULA PATCH: the HISTORY LINE of the top visible row of whichever
+    /// ORBIT PATCH: the HISTORY LINE of the top visible row of whichever
     /// screen is showing — visible row `r` is history line
     /// `history_base() + r`. A row keeps its history line as the view
     /// scrolls and as later output pushes it into the scrollback (see
@@ -157,13 +157,13 @@ impl Screen {
         self.grid().history_base()
     }
 
-    /// NEBULA PATCH: one past the last history line of the screen showing.
+    /// ORBIT PATCH: one past the last history line of the screen showing.
     #[must_use]
     pub fn history_end(&self) -> u64 {
         self.grid().history_end()
     }
 
-    /// NEBULA PATCH: `contents_between`, with the rows named by HISTORY
+    /// ORBIT PATCH: `contents_between`, with the rows named by HISTORY
     /// LINE instead of visible row — so a selection that scrolled off the
     /// screen while it was being made, or was made across more rows than
     /// the screen holds, still reads back whole. Lines the grid no longer
@@ -635,7 +635,7 @@ impl Screen {
         self.grid().visible_cell(crate::grid::Pos { row, col })
     }
 
-    /// Returns the OSC 8 hyperlink `cell` was printed under (Nebula patch).
+    /// Returns the OSC 8 hyperlink `cell` was printed under (Orbit patch).
     #[must_use]
     pub fn hyperlink(&self, cell: &crate::Cell) -> Option<&str> {
         let idx = usize::from(cell.link()).checked_sub(1)?;

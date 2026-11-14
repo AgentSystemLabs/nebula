@@ -22,7 +22,7 @@ Closes #<N>. <One sentence: what was wrong, and what is true now.>
 
 | Before (#<N>) | After |
 |---|---|
-| ![<alt: the bug on screen>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/before.png) | ![<alt: fixed>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/after.png) |
+| ![<alt: the bug on screen>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/before.png) | ![<alt: fixed>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/after.png) |
 
 ## 🔁 State <a id="state"></a>
 

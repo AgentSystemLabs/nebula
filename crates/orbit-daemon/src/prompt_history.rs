@@ -1,0 +1,336 @@
+//! RECENT PROMPTS — the last few prompts typed into a session, kept on
+//! its row so its card can say what the session was last asked to do,
+//! not only what it was named after its first prompt.
+//!
+//! The `UserPromptSubmit` hook payload carries the prompt on every CLI
+//! orbit manages (Claude and Codex as `prompt`, Cursor's
+//! `beforeSubmitPrompt` the same, pi and OpenCode through their managed
+//! extension and plugin). The
+//! hook receiver condenses it here — one line, whitespace collapsed,
+//! clipped past [`MAX_PROMPT_CHARS`] — before it crosses the daemon's
+//! channel, so a pasted file never rides the wire whole. The store keeps
+//! the newest [`RECENT_PROMPTS_KEPT`] per session and the row's
+//! `recent_prompts` reaches every TUI as an ordinary upsert.
+//!
+//! Prompts nobody typed are left out: the ones orbit itself composes
+//! (the PR SESSION scope, the `orbit worktree` relocation notice —
+//! anything opening with `[orbit]`) and the ones a CLI injects into its
+//! own turn queue and then reports through the very same hook — a
+//! sibling session's message, a background task or subagent handing back,
+//! an idle notice the session had asked for. See [`INJECTED_PREFIXES`].
+
+use std::sync::Arc;
+
+use orbit_core::{AgentId, PromptEntry};
+
+use crate::registry::Daemon;
+
+/// The longest condensed prompt the store keeps. The SESSIONS PANEL shows
+/// far less, but a wider terminal or a later reader should see the whole
+/// sentence.
+pub const MAX_PROMPT_CHARS: usize = 200;
+
+/// What a prompt nobody typed opens with. `[orbit]` marks the prompts
+/// orbit composes itself; the rest are the envelopes a CLI wraps around
+/// something it injected into its own turn queue — Claude reports those
+/// through `UserPromptSubmit` exactly as it reports a typed prompt, so
+/// the shape of the opening is all there is to tell them apart. They are
+/// traffic between agents, not a record of what the session was asked to
+/// do, and a panel showing them says `<cross-session-message from="uds:`
+/// where the user's own sentence belongs.
+const INJECTED_PREFIXES: &[&str] = &[
+    "[orbit]",
+    "[Cross-session idle notice]",
+    "<cross-session-message",
+    "<task-notification",
+    "<agent-message",
+];
+
+/// Whether a prompt was injected rather than typed — see
+/// [`INJECTED_PREFIXES`]. Takes an already condensed line, so the leading
+/// whitespace is gone and the marker is at the front if it is anywhere.
+pub fn is_injected(text: &str) -> bool {
+    INJECTED_PREFIXES.iter().any(|p| text.starts_with(p))
+}
+
+/// One line of the prompt: control characters become spaces (an escape
+/// sequence pasted into a prompt must not reach the panel — the same rule
+/// `sanitize_title` applies to the row's name), whitespace runs (newlines
+/// included) collapse to single spaces, and the result is clipped with an
+/// ellipsis past [`MAX_PROMPT_CHARS`]. `None` for a blank prompt or one
+/// nobody typed ([`is_injected`]).
+pub fn condense(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut text = String::new();
+    for word in cleaned.split_whitespace() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(word);
+    }
+    if text.is_empty() || is_injected(&text) {
+        return None;
+    }
+    if text.chars().count() > MAX_PROMPT_CHARS {
+        let mut clipped: String = text.chars().take(MAX_PROMPT_CHARS - 1).collect();
+        clipped.push('…');
+        return Some(clipped);
+    }
+    Some(text)
+}
+
+impl Daemon {
+    /// Append a condensed prompt to the session's history and push the
+    /// row to every subscriber. A row that is gone (or was never there —
+    /// a prewarm spare's id) is silently nothing to record.
+    pub fn record_prompt(self: &Arc<Self>, id: &AgentId, text: String) {
+        let entry = PromptEntry {
+            text,
+            submitted_at: orbit_core::clock::now_ms(),
+        };
+        match self.store.push_prompt(id, &entry) {
+            Ok(true) => self.try_broadcast_agent(id),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(agent = %id, error = %e, "prompt not recorded"),
+        }
+    }
+
+    /// Empty the session's history and push the row to every subscriber —
+    /// the CLI started a new conversation (`Effect::ConversationChanged`),
+    /// so the prompts it held describe one that is gone. A missing row is
+    /// silently nothing.
+    pub fn clear_prompts(&self, id: &AgentId) {
+        match self.store.clear_prompts(id) {
+            Ok(true) => self.try_broadcast_agent(id),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(agent = %id, error = %e, "prompts not cleared"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn condense_makes_one_trimmed_line() {
+        assert_eq!(
+            condense("  fix the\n\n   login   redirect\t\n").as_deref(),
+            Some("fix the login redirect")
+        );
+        assert_eq!(condense("one"), Some("one".into()));
+    }
+
+    #[test]
+    fn condense_drops_blank_and_orbit_authored_prompts() {
+        assert_eq!(condense(""), None);
+        assert_eq!(condense("  \n\t "), None);
+        assert_eq!(
+            condense("[orbit] This session now runs inside the worktree `x`"),
+            None
+        );
+        assert_eq!(condense("\n  [orbit] anything"), None);
+        // Only the opening marker counts: a user mentioning orbit stays.
+        assert_eq!(
+            condense("why does [orbit] show a red dot").as_deref(),
+            Some("why does [orbit] show a red dot")
+        );
+    }
+
+    /// The CLI reports what it injected into its own turn queue through
+    /// the same `UserPromptSubmit` hook a typed prompt rides, so every
+    /// envelope it opens with has to be dropped here or it lands on the
+    /// row as if the user had asked for it.
+    #[test]
+    fn condense_drops_prompts_the_cli_injected() {
+        for injected in [
+            r#"<cross-session-message from="uds:/tmp/cc-socks/20873.sock"> heads up"#,
+            "<task-notification> <task-id>bujca919a</task-id>",
+            r#"<agent-message from="abc050de25492f3a9"> [Subagent hand-back]"#,
+            r#"[Cross-session idle notice] "Some Session" is idle now"#,
+        ] {
+            assert_eq!(condense(injected), None, "{injected}");
+            // The newline the envelope really arrives with is collapsed
+            // before the marker is looked for, not after.
+            assert_eq!(condense(&format!("\n{injected}\n\nmore")), None);
+        }
+        // A user writing about one is still the user writing.
+        assert_eq!(
+            condense("why do the cards print <cross-session-message>").as_deref(),
+            Some("why do the cards print <cross-session-message>")
+        );
+    }
+
+    /// A terminal escape typed or pasted into a prompt is drawn as text,
+    /// never sent to the terminal: control characters become spaces before
+    /// the whitespace collapse, as the row's title already has them.
+    #[test]
+    fn condense_turns_control_characters_into_spaces() {
+        assert_eq!(
+            condense("set the\x1b]0;title\x07 tab").as_deref(),
+            Some("set the ]0;title tab")
+        );
+        assert_eq!(condense("\x1b\x07\r"), None);
+    }
+
+    #[test]
+    fn condense_clips_long_prompts_on_a_char_boundary() {
+        let long = "é".repeat(MAX_PROMPT_CHARS + 50);
+        let out = condense(&long).unwrap();
+        assert_eq!(out.chars().count(), MAX_PROMPT_CHARS);
+        assert!(out.ends_with('…'));
+        let exact = "x".repeat(MAX_PROMPT_CHARS);
+        assert_eq!(condense(&exact).as_deref(), Some(exact.as_str()));
+    }
+
+    /// A daemon over an in-memory store holding one row, `a1`.
+    fn daemon_with_one_agent() -> (Arc<Daemon>, AgentId) {
+        use crate::hooks::HookEnv;
+        use crate::store::Store;
+        use orbit_core::{Agent, AgentKind, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .insert_project(&Project {
+                id: ProjectId("p1".into()),
+                name: "p".into(),
+                repo_path: "/tmp/p".into(),
+                sort_order: 0,
+            })
+            .unwrap();
+        store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("w1".into()),
+                project_id: ProjectId("p1".into()),
+                path: "/tmp/p".into(),
+                branch: "main".into(),
+                is_main: true,
+                sort_order: 0,
+            })
+            .unwrap();
+        let id = AgentId("a1".into());
+        store
+            .insert_agent(&Agent {
+                id: id.clone(),
+                worktree_id: WorktreeId("w1".into()),
+                name: "agent-1".into(),
+                status: AgentStatus::Fresh,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: 0,
+                alive: false,
+                issue_url: None,
+                role: orbit_core::AgentRole::Worker,
+                recent_prompts: Vec::new(),
+            })
+            .unwrap();
+        let daemon = Daemon::new(
+            store,
+            HookEnv {
+                port: 0,
+                token: String::new(),
+            },
+        );
+        (daemon, id)
+    }
+
+    /// The whole path past the hook: a recorded prompt lands on the row
+    /// and reaches subscribers as the row's upsert; an unknown id is
+    /// silent.
+    #[tokio::test]
+    async fn record_prompt_upserts_the_row_with_its_history() {
+        use orbit_core::{Entity, ServerEvent};
+        let (daemon, id) = daemon_with_one_agent();
+        let mut events = daemon.events.subscribe();
+
+        daemon.record_prompt(&id, "fix the login redirect".into());
+        match events.try_recv() {
+            Ok(ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            }) => {
+                assert_eq!(a.id, id);
+                assert_eq!(a.recent_prompts.len(), 1);
+                assert_eq!(a.recent_prompts[0].text, "fix the login redirect");
+                assert!(a.recent_prompts[0].submitted_at > 0);
+            }
+            other => panic!("expected the row's upsert, got {other:?}"),
+        }
+
+        daemon.record_prompt(&AgentId("ghost".into()), "nothing".into());
+        assert!(events.try_recv().is_err(), "an unknown id is silent");
+    }
+
+    /// `/clear` keeps the session id but not the conversation: the
+    /// prompts typed before it leave the store and every TUI's row.
+    #[tokio::test]
+    async fn clear_prompts_empties_the_history_and_upserts_the_row() {
+        use orbit_core::{Entity, ServerEvent};
+        let (daemon, id) = daemon_with_one_agent();
+        daemon.record_prompt(&id, "fix the login redirect".into());
+        daemon.record_prompt(&id, "now the logout".into());
+        let mut events = daemon.events.subscribe();
+
+        daemon.clear_prompts(&id);
+        match events.try_recv() {
+            Ok(ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            }) => {
+                assert_eq!(a.id, id);
+                assert!(a.recent_prompts.is_empty());
+            }
+            other => panic!("expected the row's upsert, got {other:?}"),
+        }
+        let stored = daemon.store.get_agent(&id).unwrap().unwrap();
+        assert!(stored.recent_prompts.is_empty());
+
+        daemon.clear_prompts(&AgentId("ghost".into()));
+        assert!(events.try_recv().is_err(), "an unknown id is silent");
+    }
+
+    /// The hook path end to end: a prompt under one conversation, then
+    /// the next one under a new id — Cursor after `/clear`, OpenCode after
+    /// `/new` — leaves only the new prompt; a `SessionStart` that keeps the
+    /// id (`resume`, `compact`) leaves the history alone.
+    #[test]
+    fn a_new_conversation_id_drops_the_old_prompts() {
+        use crate::status::HookEvent;
+        let (daemon, id) = daemon_with_one_agent();
+        let prompts = || {
+            daemon
+                .store
+                .get_agent(&id)
+                .unwrap()
+                .unwrap()
+                .recent_prompts
+                .into_iter()
+                .map(|p| p.text)
+                .collect::<Vec<_>>()
+        };
+        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("c1".into()));
+        daemon.record_prompt(&id, "fix the login redirect".into());
+        for source in ["resume", "compact"] {
+            daemon.apply_hook_event(
+                &id,
+                HookEvent::SessionStart {
+                    source: Some(source.into()),
+                },
+                Some("c1".into()),
+            );
+        }
+        assert_eq!(prompts(), ["fix the login redirect"]);
+
+        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, Some("c2".into()));
+        daemon.record_prompt(&id, "now the logout".into());
+        assert_eq!(prompts(), ["now the logout"]);
+    }
+}

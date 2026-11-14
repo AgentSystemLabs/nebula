@@ -4,16 +4,16 @@
 FIXTURES="$WORK/fixtures"; mkdir -p "$FIXTURES"
 cp "$HERE/fixtures/pr-list.json" "$HERE/fixtures/pr-39.json" "$HERE/fixtures/pr-view-feature-x.json" "$HERE/fixtures/user" "$FIXTURES/"
 cat > "$FIXTURES/pr-view-wheel-one-line.json" <<'JSON'
-{"number": 37, "url": "https://github.com/AgentSystemLabs/nebula/pull/37", "title": "Wheel scroll steps one line a notch", "state": "OPEN", "isDraft": false,
+{"number": 37, "url": "https://github.com/AmenAdem/Orbit/pull/37", "title": "Wheel scroll steps one line a notch", "state": "OPEN", "isDraft": false,
  "comments": [], "reviews": []}
 JSON
 cat > "$FIXTURES/pr-37.json" <<'JSON'
-{"number": 37, "url": "https://github.com/AgentSystemLabs/nebula/pull/37", "title": "Wheel scroll steps one line a notch", "state": "OPEN", "isDraft": false,
+{"number": 37, "url": "https://github.com/AmenAdem/Orbit/pull/37", "title": "Wheel scroll steps one line a notch", "state": "OPEN", "isDraft": false,
  "author": {"login": "webdevcody"}, "baseRefName": "main", "headRefName": "wheel-one-line",
  "body": "One notch of the wheel scrolls one line, the way every other list in the app does.",
  "additions": 12, "deletions": 4, "changedFiles": 1, "comments": [], "reviews": []}
 JSON
-export NEBULA_GH_FIXTURES="$FIXTURES"
+export ORBIT_GH_FIXTURES="$FIXTURES"
 mkdir -p "$WORK/data"
 cat > "$WORK/data/config.json" <<'JSON'
 {"prewarm_agents": false, "prewarm_sessions": false}

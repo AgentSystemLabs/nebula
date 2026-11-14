@@ -9,7 +9,7 @@ JSON
 for checkout in "$DEMO" "$WORK"/demo-worktrees/*; do
   cat > "$checkout/cargo-test" <<'SH'
 #!/bin/sh
-printf '\033[1;32m   Compiling\033[0m nebula-tui v0.40.1\n'
+printf '\033[1;32m   Compiling\033[0m orbit-tui v0.40.1\n'
 printf '\033[1;32m    Finished\033[0m `test` profile in \033[33m10.31s\033[0m\n'
 printf 'test result: \033[32mok\033[0m. \033[1m1208 passed\033[0m; \033[31m0 failed\033[0m; 0 ignored\n'
 SH

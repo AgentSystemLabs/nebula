@@ -1,18 +1,18 @@
 #!/bin/sh
-# nebula installer — installs or updates the `nebula` binary.
+# orbit installer — installs or updates the `orbit` binary.
 #
-#   curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh
 #
 # Grabs the prebuilt binary for this platform from the latest GitHub release,
 # falling back to `cargo install --git` when no release (or no matching asset)
 # exists. Running it again updates in place.
 #
 # Environment overrides:
-#   NEBULA_INSTALL_DIR   install destination (default: ~/.local/bin)
+#   ORBIT_INSTALL_DIR   install destination (default: ~/.local/bin)
 set -eu
 
-REPO="AgentSystemLabs/nebula"
-INSTALL_DIR="${NEBULA_INSTALL_DIR:-$HOME/.local/bin}"
+REPO="AmenAdem/Orbit"
+INSTALL_DIR="${ORBIT_INSTALL_DIR:-$HOME/.local/bin}"
 
 say() { printf '%s\n' "$*"; }
 err() {
@@ -36,26 +36,26 @@ detect_target() {
         *) return 1 ;;
         esac
         ;;
-    *) err "nebula runs on macOS and Linux only (the daemon needs unix sockets)" ;;
+    *) err "orbit runs on macOS and Linux only (the daemon needs unix sockets)" ;;
     esac
 }
 
 install_from_release() {
-    url="https://github.com/$REPO/releases/latest/download/nebula-$1.tar.gz"
+    url="https://github.com/$REPO/releases/latest/download/orbit-$1.tar.gz"
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     say "downloading $url"
-    curl -fsSL "$url" -o "$tmp/nebula.tar.gz" || return 1
-    tar -xzf "$tmp/nebula.tar.gz" -C "$tmp"
+    curl -fsSL "$url" -o "$tmp/orbit.tar.gz" || return 1
+    tar -xzf "$tmp/orbit.tar.gz" -C "$tmp"
     mkdir -p "$INSTALL_DIR"
-    install -m 755 "$tmp/nebula" "$INSTALL_DIR/nebula"
+    install -m 755 "$tmp/orbit" "$INSTALL_DIR/orbit"
 }
 
 install_from_source() {
     command -v cargo >/dev/null 2>&1 ||
         err "no prebuilt binary available and cargo is not installed — get Rust from https://rustup.rs and re-run"
     say "building from source (this takes a few minutes)…"
-    cargo install --git "https://github.com/$REPO" nebula --locked --force
+    cargo install --git "https://github.com/$REPO" orbit --locked --force
 }
 
 main() {
@@ -64,9 +64,9 @@ main() {
     installed=""
     if target=$(detect_target); then
         if install_from_release "$target"; then
-            installed="$INSTALL_DIR/nebula"
+            installed="$INSTALL_DIR/orbit"
         else
-            reason="couldn't download nebula-$target from the latest release"
+            reason="couldn't download orbit-$target from the latest release"
         fi
     else
         reason="no prebuilt binary for $(uname -s) $(uname -m)"
@@ -75,10 +75,10 @@ main() {
     if [ -z "$installed" ]; then
         say "$reason — building from source instead"
         install_from_source
-        installed="$HOME/.cargo/bin/nebula"
+        installed="$HOME/.cargo/bin/orbit"
     fi
 
-    version=$("$installed" --version 2>/dev/null || echo nebula)
+    version=$("$installed" --version 2>/dev/null || echo orbit)
     say "installed $version → $installed"
 
     bin_dir=$(dirname "$installed")
@@ -88,15 +88,15 @@ main() {
     esac
 
     # Replacing the file doesn't touch an already-running daemon: sessions keep
-    # running on the old binary until it's restarted. `nebula reload` restarts
+    # running on the old binary until it's restarted. `orbit reload` restarts
     # it in place, sessions and all; a daemon from before reload existed can
-    # only be restarted by `nebula kill`, which stops every session. `nebula
+    # only be restarted by `orbit kill`, which stops every session. `orbit
     # upgrade` handles this itself and suppresses the note via
-    # NEBULA_UPGRADE_HANDOFF.
-    if [ -z "${NEBULA_UPGRADE_HANDOFF:-}" ] && pgrep -f 'nebula daemon' >/dev/null 2>&1; then
-        say "note: a nebula daemon from the previous version is still running."
-        say "      run 'nebula reload' to move it onto the new one (sessions keep running);"
-        say "      a daemon too old for that needs 'nebula kill' (stops all sessions)."
+    # ORBIT_UPGRADE_HANDOFF.
+    if [ -z "${ORBIT_UPGRADE_HANDOFF:-}" ] && pgrep -f 'orbit daemon' >/dev/null 2>&1; then
+        say "note: a orbit daemon from the previous version is still running."
+        say "      run 'orbit reload' to move it onto the new one (sessions keep running);"
+        say "      a daemon too old for that needs 'orbit kill' (stops all sessions)."
     fi
 }
 

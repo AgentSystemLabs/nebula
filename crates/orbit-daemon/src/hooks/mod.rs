@@ -1,0 +1,967 @@
+//! Agent-CLI hook receiver: a loopback-only HTTP endpoint the shell hook
+//! one-liners POST to (`/api/hooks/claude`, `/api/hooks/codex`,
+//! `/api/hooks/cursor`, `/api/hooks/pi` and `/api/hooks/opencode`). Codex
+//! mirrors Claude's hook
+//! events and payload shape; cursor speaks its own dialect, but its
+//! installer translates event names into the `hookEvent` query param and
+//! the payload fields are aliased here (`conversation_id`, `subagent_id`,
+//! `workspace_roots`); pi has no shell hooks at all — its managed extension
+//! (`pi_extension.rs`) maps pi's events onto the same names and POSTs
+//! Claude-shaped payloads, and so does OpenCode's managed plugin
+//! (`opencode_plugin.rs`) — so one handler serves all five. Fail-soft on
+//! both sides — a malformed payload still gets a 200 so a broken hook never
+//! faults the user's agent turn.
+//!
+//! The Claude `UserPromptSubmit` reply is also the one channel back into
+//! the CLI: its `hookSpecificOutput` carries the AUTO-TITLE instruction
+//! while a session is untitled, and a `sessionTitle` whenever the row's
+//! name is not the one Claude holds (CLAUDE TITLE SYNC, `session_title.rs`).
+
+pub mod installer;
+pub mod opencode_plugin;
+pub mod pi_extension;
+
+use crate::session_title::TranscriptRef;
+use crate::status::HookEvent;
+use crate::store::Store;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::post;
+use axum::Router;
+use orbit_core::AgentId;
+use serde::Deserialize;
+use std::sync::Arc;
+use subtle::ConstantTimeEq;
+use tokio::sync::mpsc;
+
+/// The auto-title instruction, in the one wording every channel that
+/// carries it uses: the UserPromptSubmit context injection (claude/codex)
+/// and cursor's always-on project rule. Repeats on every prompt until a
+/// title sticks, so it has to read sanely on a session that already has one.
+pub const AUTO_TITLE_INSTRUCTION: &str = "[orbit] Before addressing the \
+user's request, run this shell command exactly once:\n\n  orbit rename \
+<title>\n\nReplace <title> with 3-4 Title Case words describing the user's \
+request, unquoted (example: orbit rename Fix Login Redirect). If it reports \
+the session is already titled, accept that and move on. Then continue with \
+the request. Don't mention the rename to the user.";
+
+/// The instruction as a UserPromptSubmit hook's stdout. Codex only reads
+/// injected context out of this JSON envelope (its hook output schema is
+/// strict — bare text is discarded); Claude Code documents the same shape
+/// as the equivalent of bare text, so both CLIs share one body.
+pub fn auto_title_injection() -> String {
+    user_prompt_reply(true, None)
+}
+
+/// The UserPromptSubmit reply body: the AUTO-TITLE instruction when one is
+/// due, a `sessionTitle` for Claude to take as its own session name when
+/// the row's name differs from it (verified on Claude Code 2.1.261: it
+/// renames and persists exactly as `/rename` does), or nothing at all —
+/// an empty body is the only other thing that may reach the CLI's stdout.
+pub fn user_prompt_reply(instruction: bool, session_title: Option<&str>) -> String {
+    if !instruction && session_title.is_none() {
+        return String::new();
+    }
+    let mut output = serde_json::Map::new();
+    output.insert("hookEventName".into(), "UserPromptSubmit".into());
+    if instruction {
+        output.insert("additionalContext".into(), AUTO_TITLE_INSTRUCTION.into());
+    }
+    if let Some(title) = session_title {
+        output.insert("sessionTitle".into(), title.into());
+    }
+    serde_json::json!({ "hookSpecificOutput": output }).to_string()
+}
+
+/// Diagnostic bodies for the route whose responses a hook discards. Never
+/// sent where a body would reach the model's context (see `HookDialect`).
+pub const HOOK_OK: &str = r#"{"ok": true}"#;
+pub const HOOK_NOT_OK: &str = r#"{"ok": false}"#;
+
+/// What a CLI's hook command does with this server's response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookDialect {
+    /// Claude and Codex: the UserPromptSubmit hook pipes the body to the
+    /// CLI's stdout, where it lands in the model's context — so on that
+    /// event the body must be empty or the instruction, never diagnostics.
+    /// Pi's extension reads the same body out of the envelope and appends
+    /// it to the run's system prompt, and so does OpenCode's plugin.
+    Injectable,
+    /// Cursor: every hook answers with its own gating JSON and drops the
+    /// body, so the `{"ok": …}` diagnostics can stay.
+    Plain,
+}
+
+/// Which CLI a route serves. Beyond the dialect, only Claude persists a
+/// session title of its own and reads `sessionTitle` from a hook reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookCli {
+    Claude,
+    Codex,
+    Cursor,
+    Pi,
+    OpenCode,
+}
+
+impl HookCli {
+    fn dialect(self) -> HookDialect {
+        match self {
+            HookCli::Claude | HookCli::Codex | HookCli::Pi | HookCli::OpenCode => {
+                HookDialect::Injectable
+            }
+            HookCli::Cursor => HookDialect::Plain,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct HookEnv {
+    pub port: u16,
+    pub token: String,
+}
+
+pub struct HookServerState {
+    token: String,
+    tx: mpsc::Sender<HookDelivery>,
+    /// Read-only peek at agent rows: drives the auto-title injection
+    /// decision without a round-trip through the daemon's drain loop.
+    store: Arc<Store>,
+}
+
+/// One accepted hook POST, decoded for the daemon's drain loop.
+#[derive(Debug)]
+pub struct HookDelivery {
+    pub agent_id: AgentId,
+    pub event: HookEvent,
+    pub session_id: Option<String>,
+    /// The CLI's working directory as reported in the payload (Claude Code
+    /// sends it on every event); drives cwd-based agent re-homing. Absent
+    /// when the CLI doesn't report it — re-homing simply never triggers.
+    pub cwd: Option<String>,
+    /// Where Claude keeps this session's transcript — and beside it the
+    /// title `/rename` persists (see `session_title`). Claude route only.
+    pub transcript: Option<TranscriptRef>,
+    /// The submitted prompt, condensed for the row's RECENT PROMPTS
+    /// (`prompt_history::condense`). Only a `UserPromptSubmit` carries
+    /// one, and only when the payload had a non-blank, user-written one.
+    pub prompt: Option<String>,
+    /// One unambiguous PR in a foreground completed assistant answer.
+    pub reported_pr: Option<String>,
+}
+
+/// Permissive payload: every field optional, unknown fields ignored. Hook
+/// payload shapes are Claude-version-dependent; drift must degrade to
+/// "status stops updating", never to an error.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct HookPayload {
+    pub hook_event_name: Option<String>,
+    pub last_assistant_message: Option<String>,
+    pub session_id: Option<String>,
+    /// The prompt text on `UserPromptSubmit` — Claude, Codex and Cursor
+    /// (`beforeSubmitPrompt`) all name it `prompt`, and pi's extension
+    /// posts it under the same key.
+    pub prompt: Option<String>,
+    /// Claude's transcript file; its directory is where the session title
+    /// lives (`<dir>/<session_id>/custom-title.json`).
+    pub transcript_path: Option<String>,
+    /// Cursor names the resumable chat id `conversation_id` (== its
+    /// `session_id`, but only the alias is guaranteed on every event).
+    pub conversation_id: Option<String>,
+    pub notification_type: Option<String>,
+    pub tool_name: Option<String>,
+    pub agent_id: Option<String>,
+    /// Cursor's name for the subagent id in subagentStart/subagentStop.
+    pub subagent_id: Option<String>,
+    pub source: Option<String>,
+    pub exit_code: Option<i32>,
+    pub cwd: Option<String>,
+    /// Cursor sends no `cwd`; its first workspace root plays the role.
+    pub workspace_roots: Option<Vec<String>>,
+}
+
+impl HookPayload {
+    fn session_id(&self) -> Option<String> {
+        self.session_id
+            .clone()
+            .or_else(|| self.conversation_id.clone())
+    }
+
+    fn cwd(&self) -> Option<String> {
+        self.cwd
+            .clone()
+            .or_else(|| self.workspace_roots.as_ref()?.first().cloned())
+    }
+
+    fn subagent_id(&self) -> Option<String> {
+        self.agent_id.clone().or_else(|| self.subagent_id.clone())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HookQuery {
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+    #[serde(rename = "hookEvent")]
+    pub hook_event: String,
+}
+
+pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent> {
+    Some(match hook_event {
+        "UserPromptSubmit" => HookEvent::UserPromptSubmit,
+        "Stop" => HookEvent::Stop,
+        "SessionStart" => HookEvent::SessionStart {
+            source: payload.source.clone(),
+        },
+        "PermissionRequest" => HookEvent::PermissionRequest {
+            subagent_id: payload.subagent_id(),
+        },
+        "Notification" => HookEvent::Notification {
+            notification_type: payload.notification_type.clone(),
+        },
+        "PreToolUse" => HookEvent::PreToolUse {
+            tool_name: payload.tool_name.clone(),
+            subagent_id: payload.subagent_id(),
+        },
+        "PostToolUse" => HookEvent::PostToolUse {
+            tool_name: payload.tool_name.clone(),
+            subagent_id: payload.subagent_id(),
+        },
+        "SubagentStart" => HookEvent::SubagentStart {
+            subagent_id: payload.subagent_id(),
+        },
+        "SubagentStop" => HookEvent::SubagentStop {
+            subagent_id: payload.subagent_id(),
+        },
+        _ => return None,
+    })
+}
+
+/// A hook receiver an earlier image of the daemon was serving: its
+/// listening socket, open across the exec, and the token every live agent
+/// already carries in its environment.
+pub struct InheritedHooks {
+    pub listener: std::net::TcpListener,
+    pub token: String,
+}
+
+/// Serve the hook route — on 127.0.0.1:0 with a fresh bearer token, or on
+/// what an IN-PLACE RESTART inherited. Returns the env (port + token), the
+/// receiving end of the event pipe, and the listener's fd for the next
+/// restart to carry.
+pub async fn start_hook_server(
+    store: Arc<Store>,
+    inherited: Option<InheritedHooks>,
+) -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>, std::os::fd::RawFd)> {
+    use std::os::fd::AsRawFd;
+    let (listener, token) = match inherited {
+        Some(InheritedHooks { listener, token }) => {
+            listener.set_nonblocking(true)?;
+            (tokio::net::TcpListener::from_std(listener)?, token)
+        }
+        None => (
+            tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+            generate_token(),
+        ),
+    };
+    let port = listener.local_addr()?.port();
+    let fd = listener.as_raw_fd();
+    let (tx, rx) = mpsc::channel(256);
+
+    let state = Arc::new(HookServerState {
+        token: token.clone(),
+        tx,
+        store,
+    });
+    // Claude and Codex UserPromptSubmit hooks pipe this server's response
+    // body to the CLI's stdout, where it lands in the model's context —
+    // that's the auto-title instruction channel; pi's extension and
+    // OpenCode's plugin carry the same body into the run's system prompt.
+    // Cursor's dialect has no
+    // such channel (its hooks answer with their own gating JSON), so it
+    // takes the plain route.
+    let app = Router::new()
+        .route("/api/hooks/claude", post(receive_claude_hook))
+        .route("/api/hooks/codex", post(receive_codex_hook))
+        .route("/api/hooks/cursor", post(receive_cursor_hook))
+        .route("/api/hooks/pi", post(receive_pi_hook))
+        .route("/api/hooks/opencode", post(receive_opencode_hook))
+        .with_state(state);
+
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = %e, "hook http server died");
+        }
+    });
+
+    Ok((HookEnv { port, token }, rx, fd))
+}
+
+fn generate_token() -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Claude route: the UserPromptSubmit hook command pipes this response's
+/// body to stdout, so it must be empty or the reply envelope — never
+/// diagnostic JSON.
+async fn receive_claude_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Claude, state, query, headers, body).await
+}
+
+/// Codex route: the same injectable dialect as Claude's, minus the
+/// session-title exchange Codex has no equivalent of.
+async fn receive_codex_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Codex, state, query, headers, body).await
+}
+
+/// Cursor route: every hook command answers cursor with its own gating JSON
+/// and discards this body, so the `{"ok": ...}` diagnostics stay.
+async fn receive_cursor_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Cursor, state, query, headers, body).await
+}
+
+/// `/api/hooks/pi`: pi's managed extension POSTs Claude-shaped payloads
+/// and unwraps the injectable reply body into the run's system prompt.
+async fn receive_pi_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Pi, state, query, headers, body).await
+}
+
+/// `/api/hooks/opencode`: OpenCode's managed plugin POSTs Claude-shaped
+/// payloads and carries the injectable reply body into the turn's system
+/// prompt through OpenCode's system-transform hook.
+async fn receive_opencode_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::OpenCode, state, query, headers, body).await
+}
+
+async fn receive_hook(
+    cli: HookCli,
+    state: Arc<HookServerState>,
+    query: HookQuery,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    // On this path the response body reaches the model's context, so every
+    // outcome (auth failure included) must answer with empty-or-instruction.
+    let injectable =
+        cli.dialect() == HookDialect::Injectable && query.hook_event == "UserPromptSubmit";
+    let quiet_or = |status: StatusCode, diag: &str| {
+        let body = if injectable {
+            String::new()
+        } else {
+            diag.to_string()
+        };
+        (status, body)
+    };
+
+    let authorized = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
+        .unwrap_or(false);
+    if !authorized {
+        return quiet_or(StatusCode::UNAUTHORIZED, HOOK_NOT_OK);
+    }
+
+    // Parse failures still 200 — never fault a hook.
+    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
+    let Some(event) = parse_event(&query.hook_event, &payload) else {
+        return quiet_or(StatusCode::OK, HOOK_NOT_OK);
+    };
+    let agent_id = AgentId(query.agent_id.clone());
+    // A Claude tool can launch codex exec with the parent's ORBIT_*
+    // environment. Its start/stop hooks must not adopt or finish that row.
+    if cli == HookCli::Codex {
+        if let Ok(Some(agent)) = state.store.get_agent(&agent_id) {
+            if agent.kind != orbit_core::AgentKind::Codex {
+                return quiet_or(StatusCode::OK, HOOK_NOT_OK);
+            }
+        }
+    }
+    tracing::debug!(agent = %agent_id, event = ?event, "hook received");
+    // A subagent's tool traffic reports the payload's cwd too, but that is
+    // the Task's position, not the session's — an isolated subagent working
+    // in a scratch checkout must never drag the row out from under the
+    // conversation. Only foreground payloads carry a cwd onward, and only
+    // from events whose cwd is the conversation's (not a Notification,
+    // which a subagent sends unstamped — `HookEvent::reports_session_cwd`).
+    let cwd = payload
+        .cwd()
+        .filter(|_| payload.subagent_id().is_none() && event.reports_session_cwd());
+    // Only Claude persists a session title of its own beside a transcript.
+    let transcript = match cli {
+        HookCli::Claude => TranscriptRef::from_payload(
+            payload.transcript_path.as_deref(),
+            payload.session_id.as_deref(),
+        ),
+        HookCli::Codex | HookCli::Cursor | HookCli::Pi | HookCli::OpenCode => None,
+    };
+    // The prompt rides only its own event, condensed here so the channel
+    // never carries a pasted file whole.
+    let prompt = match event {
+        HookEvent::UserPromptSubmit => payload
+            .prompt
+            .as_deref()
+            .and_then(crate::prompt_history::condense),
+        _ => None,
+    };
+    let reported_pr = if matches!(event, HookEvent::Stop) && payload.subagent_id().is_none() {
+        payload
+            .last_assistant_message
+            .as_deref()
+            .and_then(orbit_core::github_url::reported_pr_url)
+    } else {
+        None
+    };
+    let _ = state
+        .tx
+        .send(HookDelivery {
+            agent_id: agent_id.clone(),
+            event,
+            session_id: payload.session_id(),
+            cwd,
+            transcript,
+            prompt,
+            reported_pr,
+        })
+        .await;
+
+    if injectable {
+        // Prompt submitted on a still-untitled session: hand the CLI the
+        // titling instruction. Unknown ids (prewarm, stale env) and store
+        // errors degrade to no injection.
+        let inject = state
+            .store
+            .agent_auto_title_pending(&agent_id)
+            .unwrap_or(false);
+        // A titled row whose name Claude doesn't hold yet: hand Claude the
+        // name as its own session title (Claude only — Codex has no such
+        // field). Never while the instruction is pending: the agent's
+        // `orbit rename` is about to settle the name.
+        let session_title = match cli {
+            HookCli::Claude => state
+                .store
+                .agent_title_state(&agent_id)
+                .ok()
+                .flatten()
+                .and_then(|s| {
+                    // Custom rows on the Claude dialect title-push like
+                    // Claude; any other custom row stays quiet (see
+                    // `TitleState::to_push`, which resolves the dialect).
+                    s.to_push().map(str::to_string)
+                }),
+            HookCli::Codex | HookCli::Cursor | HookCli::Pi | HookCli::OpenCode => None,
+        };
+        return (
+            StatusCode::OK,
+            user_prompt_reply(inject, session_title.as_deref()),
+        );
+    }
+    (StatusCode::OK, HOOK_OK.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orbit_core::{Agent, AgentKind, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
+
+    /// Minimal raw HTTP/1.1 POST (Connection: close), so the real response
+    /// body — what the hook one-liner pipes to the CLI's stdout — is under
+    /// test, not a re-implementation of the handler's logic.
+    async fn http_post(port: u16, path_query: &str, token: &str, body: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let req = format!(
+            "POST {path_query} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let status: u16 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    fn seeded_store() -> Arc<Store> {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .insert_project(&Project {
+                id: ProjectId("p1".into()),
+                name: "p".into(),
+                repo_path: "/tmp/p".into(),
+                sort_order: 0,
+            })
+            .unwrap();
+        store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("w1".into()),
+                project_id: ProjectId("p1".into()),
+                path: "/tmp/p".into(),
+                branch: "main".into(),
+                is_main: true,
+                sort_order: 0,
+            })
+            .unwrap();
+        let agent = |id: &str| Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId("w1".into()),
+            name: "agent-1".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: false,
+            issue_url: None,
+            role: orbit_core::AgentRole::Worker,
+            recent_prompts: Vec::new(),
+        };
+        store
+            .insert_agent_with_auto_title(&agent("pending"), true)
+            .unwrap();
+        store.insert_agent(&agent("titled")).unwrap();
+        store
+            .insert_agent_with_auto_title(
+                &Agent {
+                    kind: AgentKind::Codex,
+                    ..agent("codex")
+                },
+                true,
+            )
+            .unwrap();
+        // A row the user (or AUTO-TITLE) named, that Claude doesn't hold yet.
+        store
+            .insert_agent(&Agent {
+                name: "Fix Login".into(),
+                ..agent("named")
+            })
+            .unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn nested_codex_hooks_do_not_drive_a_claude_session() {
+        let (env, mut rx, _) = start_hook_server(seeded_store(), None).await.unwrap();
+        for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+            let (status, _) = http_post(
+                env.port,
+                &format!("/api/hooks/codex?agentId=titled&hookEvent={event}"),
+                &env.token,
+                r#"{"session_id":"nested-codex"}"#,
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    /// The reply's `sessionTitle` is how a orbit-side name reaches
+    /// Claude: sent on the Claude route for a settled name Claude doesn't
+    /// hold, never for a default name, never on the Codex route, and no
+    /// longer once Claude holds it. The delivery carries the transcript
+    /// ref (Claude only) that the reverse direction reads from.
+    #[tokio::test]
+    async fn claude_prompt_reply_pushes_the_row_name_as_session_title() {
+        let store = seeded_store();
+        let (env, mut rx, _) = start_hook_server(store.clone(), None).await.unwrap();
+        let payload = r#"{"session_id":"s1","transcript_path":"/t/p/s1.jsonl"}"#;
+
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=named&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, user_prompt_reply(false, Some("Fix Login")));
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["hookSpecificOutput"]["sessionTitle"], "Fix Login");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert!(
+            parsed["hookSpecificOutput"]
+                .get("additionalContext")
+                .is_none(),
+            "no instruction for a titled row: {body}"
+        );
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(
+            delivery.transcript,
+            TranscriptRef::from_payload(Some("/t/p/s1.jsonl"), Some("s1"))
+        );
+
+        // Codex: same dialect, but no title exchange and no transcript.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/codex?agentId=codex&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, auto_title_injection());
+        assert!(rx.recv().await.unwrap().transcript.is_none());
+
+        // Other Claude events deliver the transcript too (the sync reads on
+        // every hook) but keep the diagnostic body.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=named&hookEvent=Stop",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, HOOK_OK);
+        assert!(rx.recv().await.unwrap().transcript.is_some());
+
+        // Once Claude holds the name, the reply goes quiet again.
+        store
+            .adopt_claude_title(&AgentId("named".into()), "Fix Login")
+            .unwrap();
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=named&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, "");
+
+        // A pending row still gets only the instruction — its name is the
+        // default, and the agent's `orbit rename` is about to replace it.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, auto_title_injection());
+        assert!(!body.contains("sessionTitle"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_injects_title_instruction_only_while_pending() {
+        let store = seeded_store();
+        let (env, mut rx, _) = start_hook_server(store.clone(), None).await.unwrap();
+        let payload = r#"{"session_id":"s1"}"#;
+
+        // Untitled session: the instruction rides the response body (and the
+        // status delivery still flows).
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200);
+        // The instruction rides codex's strict JSON envelope, which claude
+        // reads as the documented equivalent of bare text.
+        assert_eq!(body, auto_title_injection());
+        assert!(body.contains("hookSpecificOutput"), "envelope: {body}");
+        assert!(body.contains("orbit rename"), "instruction: {body}");
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.agent_id.as_str(), "pending");
+        assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
+
+        // Codex shares the injectable dialect, and so do pi's extension
+        // and OpenCode's plugin, which unwrap the same envelope.
+        for route in ["codex", "pi", "opencode"] {
+            let (_, body) = http_post(
+                env.port,
+                &format!(
+                    "/api/hooks/{route}?agentId={}&hookEvent=UserPromptSubmit",
+                    if route == "codex" { "codex" } else { "pending" }
+                ),
+                &env.token,
+                payload,
+            )
+            .await;
+            assert_eq!(body, auto_title_injection(), "{route}");
+        }
+
+        // Titled session: strictly empty — anything else would leak into
+        // the model's context.
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, ""));
+
+        // Unknown agent (prewarm/stale env): same silence.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=ghost&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, "");
+
+        // Other events keep their diagnostic body (discarded by the hooks).
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=Stop",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, HOOK_OK);
+
+        // Cursor's dialect can't inject — no instruction even while pending.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/cursor?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, HOOK_OK);
+
+        // Bad token on the injectable path: 401 and an EMPTY body, so a
+        // misconfigured hook can't inject diagnostics as context.
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=UserPromptSubmit",
+            "wrong-token",
+            payload,
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (401, ""));
+    }
+
+    #[tokio::test]
+    async fn bash_tool_use_carries_cwd_but_subagent_traffic_does_not() {
+        let store = seeded_store();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
+
+        // The mid-turn position signal: a Bash call that just `cd`ed into a
+        // fresh worktree, long before the turn's Stop.
+        let (status, _) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=PostToolUse",
+            &env.token,
+            r#"{"session_id":"s1","tool_name":"Bash","cwd":"/w/feat"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.cwd.as_deref(), Some("/w/feat"));
+        assert_eq!(
+            delivery.event,
+            HookEvent::PostToolUse {
+                tool_name: Some("Bash".into()),
+                subagent_id: None,
+            }
+        );
+
+        // Same event from a Task subagent (claude stamps `agent_id` on
+        // subagent tool traffic): the status delivery still flows, but the
+        // cwd is dropped so an isolated subagent can't re-home the row.
+        let (status, _) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=PostToolUse",
+            &env.token,
+            r#"{"session_id":"s1","tool_name":"Bash","cwd":"/w/scratch","agent_id":"sub-1"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let delivery = rx.recv().await.unwrap();
+        assert!(delivery.cwd.is_none(), "subagent cwd: {:?}", delivery.cwd);
+    }
+
+    #[tokio::test]
+    async fn codex_foreground_stop_captures_the_reported_pr_only() {
+        // A Codex row: Codex hooks on any other kind of session are dropped
+        // (`nested_codex_hooks_do_not_drive_a_claude_session`), and the
+        // `recv` below would wait forever.
+        let (env, mut rx, _) = start_hook_server(seeded_store(), None).await.unwrap();
+        for (event, extra, expected) in [
+            ("Stop", "", true),
+            ("UserPromptSubmit", "", false),
+            ("Stop", ",\"agent_id\":\"child\"", false),
+        ] {
+            let body = format!(
+                r#"{{"session_id":"s1","last_assistant_message":"Opened [PR](https://github.com/other/game/pull/384)."{extra}}}"#
+            );
+            let (status, _) = http_post(
+                env.port,
+                &format!("/api/hooks/codex?agentId=codex&hookEvent={event}"),
+                &env.token,
+                &body,
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                rx.recv().await.unwrap().reported_pr.is_some(),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    /// Claude builds a Notification's payload with no subagent context, so a
+    /// Task subagent's notification arrives unstamped, its `cwd` the
+    /// subagent's checkout. It still drives status, but carries no cwd on,
+    /// so it can't re-home the session into that checkout.
+    #[tokio::test]
+    async fn a_notification_carries_no_cwd() {
+        let store = seeded_store();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
+        let (status, _) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=Notification",
+            &env.token,
+            r#"{"session_id":"s1","notification_type":"permission_prompt","cwd":"/w/.claude/worktrees/agent-a1b2"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let delivery = rx.recv().await.unwrap();
+        assert!(matches!(delivery.event, HookEvent::Notification { .. }));
+        assert!(
+            delivery.cwd.is_none(),
+            "notification cwd: {:?}",
+            delivery.cwd
+        );
+    }
+
+    /// The prompt reaches the drain loop condensed, on its own event
+    /// only, and never for a blank or orbit-written one.
+    #[tokio::test]
+    async fn user_prompt_submit_carries_the_condensed_prompt() {
+        let store = seeded_store();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
+        let post = |event: &'static str, body: &'static str| {
+            let port = env.port;
+            let token = env.token.clone();
+            async move {
+                http_post(
+                    port,
+                    &format!("/api/hooks/claude?agentId=titled&hookEvent={event}"),
+                    &token,
+                    body,
+                )
+                .await
+            }
+        };
+
+        post(
+            "UserPromptSubmit",
+            r#"{"session_id":"s1","prompt":"  fix the\n\n login   redirect \n"}"#,
+        )
+        .await;
+        assert_eq!(
+            rx.recv().await.unwrap().prompt.as_deref(),
+            Some("fix the login redirect")
+        );
+
+        // Blank, absent and orbit-authored prompts record nothing, but
+        // the status delivery still flows.
+        for body in [
+            r#"{"session_id":"s1","prompt":"   "}"#,
+            r#"{"session_id":"s1"}"#,
+            r#"{"session_id":"s1","prompt":"[orbit] This session now runs inside a worktree"}"#,
+        ] {
+            post("UserPromptSubmit", body).await;
+            let delivery = rx.recv().await.unwrap();
+            assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
+            assert!(delivery.prompt.is_none(), "{body}");
+        }
+
+        // Another event with a prompt field is not a prompt.
+        post("Stop", r#"{"session_id":"s1","prompt":"leftover"}"#).await;
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.event, HookEvent::Stop);
+        assert!(delivery.prompt.is_none());
+    }
+
+    #[test]
+    fn payload_parses_cwd_and_tolerates_unknown_fields() {
+        let payload: HookPayload = serde_json::from_str(
+            r#"{"session_id":"s1","cwd":"/w/feat","transcript_path":"/x.jsonl","novel":1}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.cwd.as_deref(), Some("/w/feat"));
+        assert_eq!(payload.session_id.as_deref(), Some("s1"));
+        // Absent cwd stays None (codex/cursor payloads may not send it).
+        let payload: HookPayload = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert!(payload.cwd.is_none());
+    }
+
+    #[test]
+    fn cursor_payload_aliases_map_to_claude_fields() {
+        // Real cursor-agent payload shape: conversation_id + workspace_roots,
+        // no cwd; session_id happens to be present too but the aliases must
+        // carry the day when it is not.
+        let payload: HookPayload = serde_json::from_str(
+            r#"{"conversation_id":"c1","workspace_roots":["/w/feat","/w/extra"],
+                "hook_event_name":"stop","status":"completed"}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.session_id().as_deref(), Some("c1"));
+        assert_eq!(payload.cwd().as_deref(), Some("/w/feat"));
+        // Explicit session_id wins over the alias.
+        let payload: HookPayload =
+            serde_json::from_str(r#"{"session_id":"s1","conversation_id":"c1"}"#).unwrap();
+        assert_eq!(payload.session_id().as_deref(), Some("s1"));
+        // subagent_id alias feeds the SubagentStart/Stop events.
+        let payload: HookPayload =
+            serde_json::from_str(r#"{"subagent_id":"sub-1","conversation_id":"c1"}"#).unwrap();
+        assert_eq!(payload.subagent_id().as_deref(), Some("sub-1"));
+        match parse_event("SubagentStart", &payload) {
+            Some(HookEvent::SubagentStart { subagent_id }) => {
+                assert_eq!(subagent_id.as_deref(), Some("sub-1"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+}

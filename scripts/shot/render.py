@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ANSI (tmux `capture-pane -e`) → PNG, one cell per glyph, with Pillow.
 
-Understands the SGR codes nebula emits through crossterm: reset, bold, dim, underline, reverse, 16
+Understands the SGR codes orbit emits through crossterm: reset, bold, dim, underline, reverse, 16
 colours, 256-colour and truecolour foreground/background. Everything else is ignored, never fatal.
     python3 render.py capture.ansi out.png [--cols 190] [--rows 50] [--font /System/Library/Fonts/Menlo.ttc] [--size 13]
 """

@@ -1,6 +1,6 @@
 use unicode_width::UnicodeWidthChar as _;
 
-// chosen to make the size of the cell struct 32 bytes (Nebula patch: 20, not
+// chosen to make the size of the cell struct 32 bytes (Orbit patch: 20, not
 // upstream's 22, to make room for `link` without growing the cell)
 const CONTENT_BYTES: usize = 20;
 
@@ -14,7 +14,7 @@ pub struct Cell {
     contents: [u8; CONTENT_BYTES],
     len: u8,
     attrs: crate::attrs::Attrs,
-    /// Nebula patch: the OSC 8 hyperlink the cell was printed under, as an
+    /// Orbit patch: the OSC 8 hyperlink the cell was printed under, as an
     /// index into `Screen`'s link table; 0 is none.
     link: u16,
 }

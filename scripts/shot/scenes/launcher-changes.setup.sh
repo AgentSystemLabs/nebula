@@ -6,7 +6,7 @@
 mv "$RUNTIME/agent" "$RUNTIME/agent-inner"
 cat > "$RUNTIME/agent" <<'AGENT'
 #!/bin/sh
-n=$(( $(cat "$NEBULA_SHOT_COUNTER" 2>/dev/null || echo 0) + 1 ))
+n=$(( $(cat "$ORBIT_SHOT_COUNTER" 2>/dev/null || echo 0) + 1 ))
 case "$n" in
   1) printf 'a\n' > session.rs; printf 'b\n' > cookie.rs; printf 'c\n' > redirect.rs ;;
   2) printf 'x\n' > CHANGELOG.md ;;

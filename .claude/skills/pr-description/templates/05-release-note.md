@@ -26,13 +26,13 @@
 
 ## 🚧 Heads up <a id="heads-up"></a>
 
-<What the user must do to upgrade, one line: a PROTOCOL VERSION bump means `nebula kill` on the old daemon before the new TUI attaches. Delete the section when nothing needs them.>
+<What the user must do to upgrade, one line: a PROTOCOL VERSION bump means `orbit kill` on the old daemon before the new TUI attaches. Delete the section when nothing needs them.>
 
 ## 📸 Screenshots <a id="screenshots"></a>
 
 | 🚀 <group one> | 🔔 <group two> |
 |---|---|
-| ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<one>.png) | ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<two>.png) |
+| ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<one>.png) | ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<two>.png) |
 
 ## 🧭 Diagram <a id="diagram"></a>
 

@@ -1,10 +1,10 @@
 ---
 name: release
-description: "Cut a nebula release — verify the tree is green, commit, bump the workspace version, tag, push, and replace the auto-generated GitHub release notes with a real changelog. Use when the user says \"do a release\", \"cut a release\", \"release this\", \"ship it\", \"commit and push and release\", \"commit, push, release\", asks for a new version, or asks to write or rewrite the release notes / release description for a tag. Also use when they ask what the release process is."
+description: "Cut a orbit release — verify the tree is green, commit, bump the workspace version, tag, push, and replace the auto-generated GitHub release notes with a real changelog. Use when the user says \"do a release\", \"cut a release\", \"release this\", \"ship it\", \"commit and push and release\", \"commit, push, release\", asks for a new version, or asks to write or rewrite the release notes / release description for a tag. Also use when they ask what the release process is."
 user-invocable: true
 ---
 
-Nebula releases are tag-driven: pushing a `v*` tag makes `.github/workflows/release.yml` build the
+Orbit releases are tag-driven: pushing a `v*` tag makes `.github/workflows/release.yml` build the
 cross-compile matrix and publish a GitHub release with the binaries attached. Everything before the tag
 push is your job; everything after it is CI's, except the changelog, which CI gets wrong.
 
@@ -69,15 +69,15 @@ guess until a green run proves it.
 worktree and run that same test: if it fails there too, it is pre-existing and not a release blocker —
 say so in your report rather than silently ignoring it. Run that check in the *same* worktree (or in a
 scratch worktree with its **own** `CARGO_TARGET_DIR`): two worktrees built into one target dir share the
-`nebula` bin's unit hash, the base build overwrites `debug/nebula`, and every E2E run after it in the
+`orbit` bin's unit hash, the base build overwrites `debug/orbit`, and every E2E run after it in the
 release worktree exercises `origin/main`'s binary until you `cargo clean -p` the workspace crates (v0.18.0). Two known-environmental patterns in this repo:
 
 - *Every* `e2e_tui`/`e2e_pty` test failing with "daemon did not come up … daemon.log: No such file or
-  directory" is orphan-daemon starvation. Dozens of stale `target/debug/nebula daemon --foreground`
+  directory" is orphan-daemon starvation. Dozens of stale `target/debug/orbit daemon --foreground`
   processes accumulate over days and starve new test daemons. Check with
-  `pgrep -f "target/debug/nebula daemon" | wc -l`.
+  `pgrep -f "target/debug/orbit daemon" | wc -l`.
 - A single `e2e_tui` timeout waiting for footer text is usually a stale expectation in
-  `crates/nebula/tests/e2e_tui.rs` (e.g. `FOOTER_TERMINAL_LOCKED = "Ctrl+q: sessions"` while the footer
+  `crates/orbit/tests/e2e_tui.rs` (e.g. `FOOTER_TERMINAL_LOCKED = "Ctrl+q: sessions"` while the footer
   renders `^q: sessions`), not a regression.
 
 Under zsh, quote shell separators (`echo '-----'`): a bare `=====` is `=cmd` expansion and sinks the
@@ -113,22 +113,22 @@ version = "0.3.0"
 
 Every member crate inherits it. The `Release vX.Y.Z` commit also carries:
 
-- **`Cargo.lock`** — it pins all four workspace members (`nebula`, `nebula-core`, `nebula-daemon`,
-  `nebula-tui`) by version and CI builds `--locked`. `cargo check --workspace` rewrites it.
-- **`docs/commands.md`** — the `nebula --version` example (`nebula 0.3.0`) near the top.
-- **A config fixture** — `crates/nebula-core/fixtures/config-X.Y.Z.json`, added to `CONFIG_FIXTURES`
-  in `crates/nebula-tui/src/config.rs`. It is the `config.json` this release writes with every value
+- **`Cargo.lock`** — it pins all four workspace members (`orbit`, `orbit-core`, `orbit-daemon`,
+  `orbit-tui`) by version and CI builds `--locked`. `cargo check --workspace` rewrites it.
+- **`docs/commands.md`** — the `orbit --version` example (`orbit 0.3.0`) near the top.
+- **A config fixture** — `crates/orbit-core/fixtures/config-X.Y.Z.json`, added to `CONFIG_FIXTURES`
+  in `crates/orbit-tui/src/config.rs`. It is the `config.json` this release writes with every value
   off its default, so `config_files_from_earlier_releases_still_load_every_key` holds every later
   build to it. Start from the previous release's fixture and add each key introduced since (diff the
   `pub struct Config` fields against it), set to a non-default value (v0.27.0 added
   `"ssh_sync_config": false`). `docs/configuration.md`'s compatibility rules promise one per release.
-  `crates/nebula-daemon/src/config.rs` has its own single-fixture test for the daemon's keys, pinned
+  `crates/orbit-daemon/src/config.rs` has its own single-fixture test for the daemon's keys, pinned
   to 0.26.0; move it only when a daemon key changes.
 
 ```bash
 cargo check --workspace   # rewrites Cargo.lock
-cargo test -p nebula-tui config_files_from_earlier_releases
-git add Cargo.toml Cargo.lock docs/commands.md crates/nebula-core/fixtures crates/nebula-tui/src/config.rs
+cargo test -p orbit-tui config_files_from_earlier_releases
+git add Cargo.toml Cargo.lock docs/commands.md crates/orbit-core/fixtures crates/orbit-tui/src/config.rs
 git commit -m "Release v0.3.0"
 ```
 
@@ -179,7 +179,7 @@ above the previous tag, one of them user-facing, and writing from the dirty diff
 shipped it silently. Read each commit's `--stat` to sort product changes from `.claude/`-only or
 release-bump commits, which never make the notes.
 
-- **A one-line opener.** `**Nebula vX.Y.Z is out.**` then the release in half a sentence, naming the
+- **A one-line opener.** `**Orbit vX.Y.Z is out.**` then the release in half a sentence, naming the
   headline items in the order the groups below use.
 - **Benefit groups, not "Features" / "Fixes".** `###` headers, one emoji each, named for what the user
   gets. Reuse these when they fit and coin one when they do not: `🚀 Launch faster`,
@@ -196,8 +196,8 @@ release-bump commits, which never make the notes.
   (`agent_presets.json` beside `config.json`). Keys and identifiers in backticks; the emoji stays on
   the header, never on the bullet. Credit contributors inline: `Thanks @handle (#NN).`
 - **`### ⚠️ Heads up`** for what the user must do to upgrade — a protocol version bump and
-  `nebula kill` — as one line. Compare `PROTOCOL_VERSION` in `crates/nebula-core/src/protocol.rs` at
-  the two tags (`git show v<last>:crates/nebula-core/src/protocol.rs | grep PROTOCOL_VERSION`); omit
+  `orbit kill` — as one line. Compare `PROTOCOL_VERSION` in `crates/orbit-core/src/protocol.rs` at
+  the two tags (`git show v<last>:crates/orbit-core/src/protocol.rs | grep PROTOCOL_VERSION`); omit
   the group when nothing needs doing.
 - **The install line last**, in a fenced block.
 
@@ -206,21 +206,21 @@ make. The v0.16.0 notes, condensed to two groups, as the template:
 
 ````bash
 gh release edit v0.16.0 --notes "$(cat <<'EOF'
-**Nebula v0.16.0 is out.** Presets, a done sound, self-sorting lists, hideable panels, and a fix for sessions that went green too soon.
+**Orbit v0.16.0 is out.** Presets, a done sound, self-sorting lists, hideable panels, and a fix for sessions that went green too soon.
 
 ### 🚀 Launch faster
 - **Agent presets** (`e` in the Sessions column). Save a name, harness, model, effort, and optional prefix/postfix once; `a` adds, `e` / `d` edit or delete. `Enter` takes the task in the wrapped editor and launches the CLI with *prefix + task + postfix* as its first prompt, so the agent is already working when the pane opens. Stored in `agent_presets.json` beside `config.json`.
 - **Disable the CLIs you don't use.** Agents tab: `claude_enabled` / `codex_enabled` / `cursor_enabled` (at least one stays on). Disabled CLIs vanish from the new-session menu, PR launch and context menu.
 
 ### 🔔 Know when it's done
-- **A done sound.** A ding when a turn finishes. Settings › Sessions › `done_sound`: a macOS system sound like Glass (default), `bell`, or `off`. Always the bell over `nebula ssh` and off macOS.
+- **A done sound.** A ding when a turn finishes. Settings › Sessions › `done_sound`: a macOS system sound like Glass (default), `bell`, or `off`. Always the bell over `orbit ssh` and off macOS.
 - **No more early green.** Claude Code 2.1 runs the Agent tool in the background, and its idle notification was read as "turn over". Sessions now stay RUNNING while subagents are tracked, with a 30-minute quiet grace so a killed worker can't wedge the row.
 
 ### ⚠️ Heads up
-Protocol version is now **32** — run `nebula kill` on an older daemon before the new TUI attaches.
+Protocol version is now **32** — run `orbit kill` on an older daemon before the new TUI attaches.
 
 ```
-curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh
 ```
 EOF
 )"
@@ -230,7 +230,7 @@ Keep the `'EOF'` quoted so zsh does not command-substitute the backticks in the 
 notes to a file and pass `--notes-file` — the safer form when the notes run long. Show the user the
 finished notes in your reply, not only on GitHub.
 
-Writing to the API needs an account with write access to `AgentSystemLabs/nebula`. Check first:
+Writing to the API needs an account with write access to `AmenAdem/Orbit`. Check first:
 
 ```bash
 gh auth status
@@ -240,7 +240,7 @@ Two accounts are usually logged in. `webdevcody` is the admin; `codyseibert` has
 with "must be a collaborator". If the wrong one is active:
 `gh auth switch --hostname github.com --user webdevcody`.
 
-The repo slug is **`AgentSystemLabs/nebula`** — never `webdevcody/nebula`.
+The repo slug is **`AmenAdem/Orbit`** — never `webdevcody/orbit`.
 
 ## 8. Confirm and report
 

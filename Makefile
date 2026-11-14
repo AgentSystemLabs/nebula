@@ -15,10 +15,10 @@
 #                 and whatever those still depend on)
 
 PREFIX      ?= $(HOME)/.cargo/bin
-RELEASE_BIN := target/release/nebula
-DEBUG_BIN   := target/debug/nebula
+RELEASE_BIN := target/release/orbit
+DEBUG_BIN   := target/debug/orbit
 
-# The dev instance is a second, complete nebula: its own socket, DB, and
+# The dev instance is a second, complete orbit: its own socket, DB, and
 # settings — and one *per checkout*, so the main clone and every worktree can
 # run at the same time. Sharing them is worse than a port clash: two checkouts
 # on one runtime dir means the second TUI silently attaches to the first's
@@ -30,8 +30,8 @@ DEBUG_BIN   := target/debug/nebula
 # runtime dir takes the hash alone — it holds a unix socket, and SUN_LEN (104
 # bytes on macOS) is not a budget a long worktree name should be spending.
 DEV_SLOT    := $(shell printf '%s' '$(CURDIR)' | shasum | cut -c1-8)
-DEV_RUNTIME := /tmp/nebula-dev-$(DEV_SLOT)
-DEV_DATA    := $(HOME)/.nebula-dev/$(notdir $(CURDIR))-$(DEV_SLOT)
+DEV_RUNTIME := /tmp/orbit-dev-$(DEV_SLOT)
+DEV_DATA    := $(HOME)/.orbit-dev/$(notdir $(CURDIR))-$(DEV_SLOT)
 # `make dev SEED=0` skips the first-run copy and starts the dev instance empty.
 SEED ?= 1
 # `make prune KEEP=1` keeps only the newest build of every crate (default 3: the
@@ -41,7 +41,7 @@ KEEP ?= 3
 # including the warm-slot prewarm, which launches one before you create any
 # agent at all. Unset (the default) means real agents, exactly like production.
 AGENT ?=
-# Left empty on purpose: `nebula browser` then takes 7681 when it is free and
+# Left empty on purpose: `orbit browser` then takes 7681 when it is free and
 # a free port otherwise, printing which — so a `make browser` per checkout all
 # serve at once. `make browser PORT=8080` pins it (and fails if 8080 is taken,
 # which is what you want when you have an ssh tunnel pointed at it).
@@ -49,8 +49,8 @@ PORT ?=
 
 # Every dev-instance run goes through this: its own socket dir and its own DB,
 # so nothing here can touch the real daemon's state.
-DEV_ENV = NEBULA_RUNTIME_DIR=$(DEV_RUNTIME) NEBULA_DATA_DIR=$(DEV_DATA) \
-	$(if $(AGENT),NEBULA_AGENT_CMD=$(AGENT))
+DEV_ENV = ORBIT_RUNTIME_DIR=$(DEV_RUNTIME) ORBIT_DATA_DIR=$(DEV_DATA) \
+	$(if $(AGENT),ORBIT_AGENT_CMD=$(AGENT))
 
 .DEFAULT_GOAL := help
 .PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill prune cycle check fmt lint test ci clean shot perf
@@ -66,8 +66,8 @@ dev: dev-prep ## Run the latest code in an isolated instance (own daemon + data)
 	-@$(DEV_ENV) $(DEBUG_BIN)
 	@$(MAKE) --no-print-directory dev-stop
 
-# `nebula browser` shells out to ttyd and serves *this* binary
-# (`current_exe`, not whatever `nebula` is on PATH), so the tab gets the build
+# `orbit browser` shells out to ttyd and serves *this* binary
+# (`current_exe`, not whatever `orbit` is on PATH), so the tab gets the build
 # below rather than the installed release. ttyd hands its environment to the
 # command it runs, so $(DEV_ENV) reaches the TUI in the tab and the browser
 # instance stays as isolated as `make dev`. Needs ttyd on PATH — the binary
@@ -89,7 +89,7 @@ dev-prep:
 	@# Also load-bearing: on macOS the first exec of a freshly relinked binary
 	@# pays for signature validation and can stall for seconds. Paying it here
 	@# keeps the daemon spawn inside the TUI's 3s connect deadline
-	@# (nebula-tui/src/ipc.rs) instead of failing with "daemon did not come up".
+	@# (orbit-tui/src/ipc.rs) instead of failing with "daemon did not come up".
 	@$(DEBUG_BIN) --version >/dev/null
 	@$(if $(filter 0,$(SEED)),true,$(MAKE) --no-print-directory dev-seed)
 
@@ -98,21 +98,21 @@ dev-prep:
 # settings, minus `agents` and `terminals`: those rows are the live sessions
 # the real daemon owns, and the dev daemon must not resume them. `.backup`
 # reads the WAL, so the copy is consistent even with the real daemon running.
-# The real dir is where `directories::ProjectDirs::from("dev","nebula","nebula")`
-# puts it (nebula-core/src/paths.rs); keep the two in step.
+# The real dir is where `directories::ProjectDirs::from("dev","orbit","orbit")`
+# puts it (orbit-core/src/paths.rs); keep the two in step.
 dev-seed: ## Copy real projects/settings into the dev instance (only if it has no DB yet)
-	@[ ! -e $(DEV_DATA)/nebula.db ] || exit 0; \
+	@[ ! -e $(DEV_DATA)/orbit.db ] || exit 0; \
 	case "$$(uname -s)" in \
-		Darwin) real="$$HOME/Library/Application Support/dev.nebula.nebula";; \
-		*)      real="$${XDG_DATA_HOME:-$$HOME/.local/share}/nebula";; \
+		Darwin) real="$$HOME/Library/Application Support/dev.orbit.orbit";; \
+		*)      real="$${XDG_DATA_HOME:-$$HOME/.local/share}/orbit";; \
 	esac; \
-	if [ ! -f "$$real/nebula.db" ]; then \
-		echo "no real nebula data at $$real — dev instance starts empty"; exit 0; fi; \
+	if [ ! -f "$$real/orbit.db" ]; then \
+		echo "no real orbit data at $$real — dev instance starts empty"; exit 0; fi; \
 	if ! command -v sqlite3 >/dev/null 2>&1; then \
 		echo "sqlite3 not on PATH — dev instance starts empty"; exit 0; fi; \
 	mkdir -p $(DEV_DATA); \
-	sqlite3 "$$real/nebula.db" ".backup '$(DEV_DATA)/nebula.db'"; \
-	sqlite3 $(DEV_DATA)/nebula.db "DELETE FROM agents; DELETE FROM terminals;"; \
+	sqlite3 "$$real/orbit.db" ".backup '$(DEV_DATA)/orbit.db'"; \
+	sqlite3 $(DEV_DATA)/orbit.db "DELETE FROM agents; DELETE FROM terminals;"; \
 	for f in config.json config.local.json reviewed.json; do \
 		if [ -f "$$real/$$f" ]; then cp "$$real/$$f" $(DEV_DATA)/; fi; \
 	done; \
@@ -121,37 +121,37 @@ dev-seed: ## Copy real projects/settings into the dev instance (only if it has n
 dev-reset: dev-stop ## Wipe this checkout's dev data; the next `make dev` re-seeds it
 	rm -rf $(DEV_DATA)
 
-# The SCREENSHOT HARNESS: an isolated nebula against a demo repo, a stand-in `gh`, a private tmux,
+# The SCREENSHOT HARNESS: an isolated orbit against a demo repo, a stand-in `gh`, a private tmux,
 # captured to design-screenshots/<scene>.{txt,ansi,png}. `KEYS="Tab j"` walks somewhere first;
 # scenes live in scripts/shot/scenes/. Needs tmux; Pillow is installed into a venv on first run.
 shot: ## Screenshot the debug TUI with demo data (SCENE=open-prs KEYS="…")
 	scripts/shot/shot.sh $(SCENE)
 
 # The LATENCY HARNESS: the same isolation as `make shot`, against a clone of this repository, with the
-# INPUT LATENCY PROBE on (NEBULA_PERF_LOG). Drives scripts/perf/scenario.steps — every view, modal and
+# INPUT LATENCY PROBE on (ORBIT_PERF_LOG). Drives scripts/perf/scenario.steps — every view, modal and
 # verb — and prints per step how long the key held the loop, how long it waited for its frame, how long
-# the screen took to settle, and the TUI's and daemon's peak RSS. `make perf BIN=target/release/nebula`
+# the screen took to settle, and the TUI's and daemon's peak RSS. `make perf BIN=target/release/orbit`
 # measures the release build; `python3 scripts/perf/report.py BEFORE AFTER` compares two runs.
 perf: ## Measure input latency per action in the debug TUI (BIN=… OUT=… PERF_DUMP=1)
 	cargo build -q
 	scripts/perf/run.sh
 
 # Slots accumulate: a worktree you deleted leaves its DB behind under
-# ~/.nebula-dev. This lists every one with its daemon's state, so you can see
+# ~/.orbit-dev. This lists every one with its daemon's state, so you can see
 # what is still running and `rm -rf` what is not.
 dev-ls: ## List every checkout's dev instance and whether its daemon is up
-	@for d in $(HOME)/.nebula-dev/*-*/; do \
+	@for d in $(HOME)/.orbit-dev/*-*/; do \
 		[ -d "$$d" ] || continue; \
 		slot=$${d%/}; slot=$${slot##*-}; \
-		pidfile=/tmp/nebula-dev-$$slot/daemon.pid; \
+		pidfile=/tmp/orbit-dev-$$slot/daemon.pid; \
 		state=stopped; \
 		if [ -f "$$pidfile" ] && ps -p "$$(cat $$pidfile 2>/dev/null)" -o command= 2>/dev/null \
-			| grep -q 'nebula daemon'; then state=running; fi; \
+			| grep -q 'orbit daemon'; then state=running; fi; \
 		printf '  %-8s %-40s %s\n' "$$state" "$$(basename $$d)" "$$d"; \
 	done
 
 # The pidfile outlives the process it names, so confirm the pid is still a
-# nebula daemon before signalling it — otherwise a recycled pid means killing
+# orbit daemon before signalling it — otherwise a recycled pid means killing
 # some unrelated process of the user's. SIGTERM (not KILL) so the daemon runs
 # its normal shutdown and takes its PTY children with it.
 dev-stop: ## Stop the dev daemon (it detaches, so quitting the TUI leaves it running)
@@ -159,7 +159,7 @@ dev-stop: ## Stop the dev daemon (it detaches, so quitting the TUI leaves it run
 	[ -f $$pidfile ] || exit 0; \
 	pid=$$(cat $$pidfile 2>/dev/null); \
 	case "$$pid" in ''|*[!0-9]*) exit 0;; esac; \
-	if ps -p $$pid -o command= 2>/dev/null | grep -q 'nebula daemon'; then \
+	if ps -p $$pid -o command= 2>/dev/null | grep -q 'orbit daemon'; then \
 		kill $$pid 2>/dev/null || true; \
 	fi
 
@@ -173,27 +173,27 @@ build: ## Release build
 # for that inode no longer matches the new contents — every exec then dies
 # with SIGKILL (exit 137). A fresh inode forces signature re-validation.
 install: build ## Install to $(PREFIX) — warns if the live daemon is now stale
-	cp $(RELEASE_BIN) $(PREFIX)/nebula.new
-	mv $(PREFIX)/nebula.new $(PREFIX)/nebula
-	@$(PREFIX)/nebula --version
-	@$(PREFIX)/nebula _stale-daemon-note
+	cp $(RELEASE_BIN) $(PREFIX)/orbit.new
+	mv $(PREFIX)/orbit.new $(PREFIX)/orbit
+	@$(PREFIX)/orbit --version
+	@$(PREFIX)/orbit _stale-daemon-note
 
 kill: ## Stop every session and the daemon — the cutover step after `make install`
-	$(PREFIX)/nebula kill
+	$(PREFIX)/orbit kill
 
 # Every distinct build configuration gets its own hash under target/: a
 # version bump at release re-hashes every workspace crate, and `cargo build`,
 # `cargo test`, `cargo check` and `cargo clippy` each hash separately again.
 # On macOS every hash also keeps its object files beside the binary
 # (`split-debuginfo=unpacked`, the dev default) — ~200MB per build of
-# nebula_tui alone — and nothing ever removes the old ones: ten days of
+# orbit_tui alone — and nothing ever removes the old ones: ten days of
 # sessions grew target/ to 41GB and filled the disk (2026-08-29). This keeps
 # the newest KEEP builds of every crate, plus every build those depend on, and
 # drops the rest, under cargo's own build lock so it waits for a running build
 # instead of deleting under it. The dependency walk matters: one build holds
 # several hashes under one crate name (thiserror 1 and 2, a build script's
 # compile and run), and evicting those made every `make cycle` recompile
-# nix, thiserror, ratatui and the nebula crates above them. `make clean` is
+# nix, thiserror, ratatui and the orbit crates above them. `make clean` is
 # still the full reset.
 prune: ## Drop stale build artifacts — all but the newest KEEP (3) builds of every crate and their deps
 	python3 scripts/prune-target.py --keep $(KEEP)
@@ -204,10 +204,10 @@ prune: ## Drop stale build artifacts — all but the newest KEEP (3) builds of e
 # STALE DAEMON NOTE `install` just printed says as much); then `prune`, now
 # that the release build just made is the newest and the killed sessions
 # hold no build lock; then `dev`, which builds the debug binary and hands the
-# terminal to the isolated dev instance. `nebula kill` exits 0 and says "no
-# nebula daemon running" when there is nothing to stop, so the first run on a
+# terminal to the isolated dev instance. `orbit kill` exits 0 and says "no
+# orbit daemon running" when there is nothing to stop, so the first run on a
 # cold machine goes through too. The kill stops every real session — run
-# this from a terminal outside nebula, not from a session it would take down
+# this from a terminal outside orbit, not from a session it would take down
 # with it. Recipe lines rather than prerequisites so `make -j` cannot
 # reorder the four.
 cycle: ## Install, kill the real daemon, prune stale builds, run the dev instance — re-run whenever

@@ -1231,91 +1231,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nebula"
-version = "0.46.0"
-dependencies = [
- "anyhow",
- "clap",
- "nebula-core",
- "nebula-daemon",
- "nebula-tui",
- "portable-pty",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "vt100",
-]
-
-[[package]]
-name = "nebula-core"
-version = "0.46.0"
-dependencies = [
- "directories",
- "rmp-serde",
- "serde",
- "serde_bytes",
- "serde_json",
- "tempfile",
- "tokio",
- "ulid",
-]
-
-[[package]]
-name = "nebula-daemon"
-version = "0.46.0"
-dependencies = [
- "anyhow",
- "axum",
- "nebula-core",
- "nix 0.31.3",
- "parking_lot",
- "portable-pty",
- "rand 0.10.2",
- "rmp-serde",
- "rusqlite",
- "serde",
- "serde_bytes",
- "serde_json",
- "subtle",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "vt100",
-]
-
-[[package]]
-name = "nebula-fuzzy"
-version = "0.46.0"
-
-[[package]]
-name = "nebula-tui"
-version = "0.46.0"
-dependencies = [
- "anyhow",
- "base64",
- "crossterm",
- "futures",
- "image",
- "libc",
- "nebula-core",
- "nebula-fuzzy",
- "portable-pty",
- "pulldown-cmark",
- "ratatui",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tui-term",
- "unicode-width",
- "vt100",
-]
-
-[[package]]
 name = "nix"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1423,6 +1338,91 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "orbit"
+version = "0.46.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "orbit-core",
+ "orbit-daemon",
+ "orbit-tui",
+ "portable-pty",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vt100",
+]
+
+[[package]]
+name = "orbit-core"
+version = "0.46.0"
+dependencies = [
+ "directories",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "orbit-daemon"
+version = "0.46.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "nix 0.31.3",
+ "orbit-core",
+ "parking_lot",
+ "portable-pty",
+ "rand 0.10.2",
+ "rmp-serde",
+ "rusqlite",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "vt100",
+]
+
+[[package]]
+name = "orbit-fuzzy"
+version = "0.46.0"
+
+[[package]]
+name = "orbit-tui"
+version = "0.46.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "crossterm",
+ "futures",
+ "image",
+ "libc",
+ "orbit-core",
+ "orbit-fuzzy",
+ "portable-pty",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tui-term",
+ "unicode-width",
+ "vt100",
+]
 
 [[package]]
 name = "ordered-float"

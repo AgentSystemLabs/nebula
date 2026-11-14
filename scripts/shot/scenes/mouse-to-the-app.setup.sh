@@ -28,4 +28,4 @@ cat > "$RUNTIME/agent" <<AGENT
 exec python3 "$RUNTIME/mouse-stub.py"
 AGENT
 chmod +x "$RUNTIME/agent"
-export NEBULA_AGENT_CMD="$RUNTIME/agent"
+export ORBIT_AGENT_CMD="$RUNTIME/agent"

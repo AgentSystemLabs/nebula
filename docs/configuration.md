@@ -5,17 +5,17 @@
 CONFIG.JSON is the settings file, in the DATA DIR beside the SQLITE STORE — hand-editable, and
 what the `s` SETTINGS OVERLAY writes:
 
-- **macOS**: `~/Library/Application Support/dev.nebula.nebula/config.json`
-- **Linux**: `~/.local/share/nebula/config.json`
-- `NEBULA_CONFIG_FILE` moves that one file — into a dotfiles checkout, say — and leaves everything
+- **macOS**: `~/Library/Application Support/dev.orbit.orbit/config.json`
+- **Linux**: `~/.local/share/orbit/config.json`
+- `ORBIT_CONFIG_FILE` moves that one file — into a dotfiles checkout, say — and leaves everything
   else where it is. A save writes through a symlink instead of replacing it, so linking `config.json`
   into a repo works as well.
-- `NEBULA_DATA_DIR` moves the whole directory, config included (tests, parallel instances).
-- `nebula config path` prints where each settings file is.
+- `ORBIT_DATA_DIR` moves the whole directory, config included (tests, parallel instances).
+- `orbit config path` prints where each settings file is.
 
 CONFIG.LOCAL.JSON, beside it in the DATA DIR, has the same keys and wins over `config.json` one key at
 a time. It is for what only makes sense on this machine — an editor a remote box lacks,
-`prewarm_agents: false` on a small one — and it is never exported, never sent over `nebula ssh`, and
+`prewarm_agents: false` on a small one — and it is never exported, never sent over `orbit ssh`, and
 never written by an import. Create it by hand with just the keys to pin; after that the overlay
 writes a key it holds back into it, so changing that setting here keeps it local, and every other key
 into `config.json`:
@@ -24,7 +24,7 @@ into `config.json`:
 { "editor": "nano", "prewarm_agents": false }
 ```
 
-Both halves of nebula read the two files. The TUI owns most keys; the DAEMON owns
+Both halves of orbit read the two files. The TUI owns most keys; the DAEMON owns
 `worktree_base_branch`, `session_idle_timeout`, `prewarm_agents` and `prewarm_sessions`, reads
 `custom_harnesses` and `harnesses` beside the TUI (spawn and resume go through them), and reads one
 key out of each `projects` entry, `run_command`. Each side
@@ -36,7 +36,7 @@ ignored rather than failing the operation that read it. The overlay patches only
 and leaves everything else in the JSON untouched, so hand-written fields survive a save. See
 [Compatibility rules](#compatibility-rules) for why.
 
-Files beside it in the DATA DIR: `nebula.db` (the SQLITE STORE), `config.local.json` (above),
+Files beside it in the DATA DIR: `orbit.db` (the SQLITE STORE), `config.local.json` (above),
 `agent_presets.json` (AGENT PRESETS), `cursor_models.json` (the cached `cursor-agent --list-models` answer, refreshed after 24h),
 `ssh_hosts.json` (the SSH HOSTS FILE), `reviewed.json` (REVIEWED MARKS). All but the database are
 convenience stores: missing or malformed reads as empty.
@@ -49,7 +49,7 @@ exists only in the file, so it is hand-edit-only. Most rows toggle or cycle on `
 `Enter` instead, pre-filled with the stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
 prompt**, **Claude**, **Codex**, **Cursor**, **Pi**, **Muse**, **Grok Build** and **OpenCode** headers, so a harness's rows read `Enabled` / `Model` /
 `Effort` under its name rather than repeating it. The **Project** tab is the one tab whose rows are
-not nebula's but one project's: the project the grid is scoped to, named with its path on
+not orbit's but one project's: the project the grid is scoped to, named with its path on
 the tab's first line, and each row there reads and writes that project's own entry under `projects`
 — so the same row shows a different value on the next project over. The **Experimental** tab holds
 behaviors that change how the tree is worked; every switch there is off by default.
@@ -57,50 +57,50 @@ behaviors that change how the tree is worked; every switch there is off by defau
 | Key | Type | Default | Overlay | What it does |
 |---|---|---|---|---|
 | `palette_enter_attaches` | bool | `true` | General | `Enter` on a PALETTE (`/`) session attaches and focuses the TERMINAL PANE. Off, `Enter` only lands on the card and previews it — except on a session that NEEDS FEEDBACK (the red row), which attaches either way, since the only thing to do with a jump to a question is answer it. `Ctrl+o` / `Ctrl+f` still pick open / focus explicitly either way. The `.` / `,` attention jump lands the same way this setting says, red rows included. |
-| `git_init_on_create` | bool | `true` | — (retired) | Through 0.37, **git init new projects** (Settings → General): DAEMON-owned, off left a directory the ADD PROJECT BROWSER (`o`) created without a repository, and the add then failed. Every project is a git repository now: a folder the browser creates is always `git init`ed, and opening an existing folder in no repository asks in a CONFIRM DIALOG whether to `git init` it — `y` inits it and opens it, `n` leaves it alone. So nothing reads the key and no tab edits it; the TUI still loads and writes it back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
-| `worktree_base_branch` | string | `""` | General | DAEMON-owned WORKTREE BASE BRANCH: where every new WORKTREE nobody named a base for starts — a bare `nebula worktree`, the QUICK PROMPT's auto-created one (`nebula worktree --base` always wins). Empty, shown as `auto` in the overlay, is origin's own default branch: `origin/HEAD` freshly fetched, normally `origin/main`. A name — `master`, `develop` — is resolved the way `--base` resolves one: origin is fetched and origin's copy of that branch (`origin/master`) is the start point, untracked, never the checkout's local branch of that name, which is only as new as its last pull; a branch origin lacks that the checkout has locally is used as named. The setting is one name for every project, so a repo with no branch of that name at all does not fail the `n`: it falls back to `origin/HEAD` as if the key were empty, and `daemon.log` says which repo ignored it. A leading `origin/` is dropped (`origin/master` means `master`); a tag or SHA is not a branch and falls back too — name those with `--base`. Typed, not cycled: `Enter` on the row opens a prompt, an empty answer puts `auto` back. |
-| `editor` | string | `"vim"` | General | The EDITOR the FILE FINDER (`f`), TREE BROWSER (`b`), find-in-files (`Shift+F`) and ⌥click launch, invoked as `<editor> +<line> <file>`. The overlay cycles `vim`, `nvim`, `nano`, `emacs`, `hx`; any command passes through verbatim, so a hand edit can name one the picker doesn't. `NEBULA_EDITOR` overrides it for the process. |
+| `git_init_on_create` | bool | `true` | — (retired) | Through 0.37, **git init new projects** (Settings → General): DAEMON-owned, off left a directory the ADD PROJECT BROWSER (`o`) created without a repository, and the add then failed. Every project is a git repository now: a folder the browser creates is always `git init`ed, and opening an existing folder in no repository asks in a CONFIRM DIALOG whether to `git init` it — `y` inits it and opens it, `n` leaves it alone. So nothing reads the key and no tab edits it; the TUI still loads and writes it back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `worktree_base_branch` | string | `""` | General | DAEMON-owned WORKTREE BASE BRANCH: where every new WORKTREE nobody named a base for starts — a bare `orbit worktree`, the QUICK PROMPT's auto-created one (`orbit worktree --base` always wins). Empty, shown as `auto` in the overlay, is origin's own default branch: `origin/HEAD` freshly fetched, normally `origin/main`. A name — `master`, `develop` — is resolved the way `--base` resolves one: origin is fetched and origin's copy of that branch (`origin/master`) is the start point, untracked, never the checkout's local branch of that name, which is only as new as its last pull; a branch origin lacks that the checkout has locally is used as named. The setting is one name for every project, so a repo with no branch of that name at all does not fail the `n`: it falls back to `origin/HEAD` as if the key were empty, and `daemon.log` says which repo ignored it. A leading `origin/` is dropped (`origin/master` means `master`); a tag or SHA is not a branch and falls back too — name those with `--base`. Typed, not cycled: `Enter` on the row opens a prompt, an empty answer puts `auto` back. |
+| `editor` | string | `"vim"` | General | The EDITOR the FILE FINDER (`f`), TREE BROWSER (`b`), find-in-files (`Shift+F`) and ⌥click launch, invoked as `<editor> +<line> <file>`. The overlay cycles `vim`, `nvim`, `nano`, `emacs`, `hx`; any command passes through verbatim, so a hand edit can name one the picker doesn't. `ORBIT_EDITOR` overrides it for the process. |
 | `close_finder_on_open` | bool | `true` | General | Opening a file closes the FILE FINDER behind the editor modal, so quitting the editor is one Esc instead of two. Off leaves the results underneath. Never touches the TREE BROWSER (its editor is its own preview pane) or ⌥click. |
-| `ssh_sync_config` | bool | `true` | General | SETTINGS SYNC: `nebula ssh` and `nebula tunnel` send this machine's `config.json` and AGENT PRESETS along, and the remote nebula merges them into its own settings before it starts — so a remote is set up the way this machine is on every connect, without reconfiguring it. Its `config.local.json` still wins there, and its projects, sessions and SSH HOSTS FILE stay its own. `--no-sync-config` leaves the settings behind for one connection. See [Backup, restore and other machines](#backup-restore-and-other-machines). |
-| `skip_session_naming` | bool | `false` | — (retired) | Through 0.30, **Skip starting prompt**: on, new AGENTS launched straight from the NEW SESSION PICKER instead of stopping at a task box first. Every launch now goes through the QUICK PROMPT (`p`, or `n` after its harness pick), whose `Enter` on an empty box starts the CLI bare, so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
-| `confirm_on_archive` | bool | `false` | — (retired) | Through 0.34, **Confirm on archive**: on, `a` and the row menu's **Archive** asked in a CONFIRM DIALOG before archiving a session; off, the default, archived at once. 0.35 through 0.42 asked every time. The row is back, on `ask_before_archive`: a new key, because every file an earlier build saved holds this one's old default `false`, which read under the new meaning would have turned the confirm off for nearly everyone. So this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `ssh_sync_config` | bool | `true` | General | SETTINGS SYNC: `orbit ssh` and `orbit tunnel` send this machine's `config.json` and AGENT PRESETS along, and the remote orbit merges them into its own settings before it starts — so a remote is set up the way this machine is on every connect, without reconfiguring it. Its `config.local.json` still wins there, and its projects, sessions and SSH HOSTS FILE stay its own. `--no-sync-config` leaves the settings behind for one connection. See [Backup, restore and other machines](#backup-restore-and-other-machines). |
+| `skip_session_naming` | bool | `false` | — (retired) | Through 0.30, **Skip starting prompt**: on, new AGENTS launched straight from the NEW SESSION PICKER instead of stopping at a task box first. Every launch now goes through the QUICK PROMPT (`p`, or `n` after its harness pick), whose `Enter` on an empty box starts the CLI bare, so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `confirm_on_archive` | bool | `false` | — (retired) | Through 0.34, **Confirm on archive**: on, `a` and the row menu's **Archive** asked in a CONFIRM DIALOG before archiving a session; off, the default, archived at once. 0.35 through 0.42 asked every time. The row is back, on `ask_before_archive`: a new key, because every file an earlier build saved holds this one's old default `false`, which read under the new meaning would have turned the confirm off for nearly everyone. So this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
 | `ask_before_archive` | bool | `true` | Sessions | CONFIRM ON ARCHIVE: on, the default, `a` and a card's right-click **Archive** ask in a CONFIRM DIALOG before archiving the session — it names the session and says `u` brings it back; `Enter` or `y` archives, `Esc` or `n` keeps it — so a letter aimed at an agent that lands on the grid archives nothing. Off archives at once, and a held `a` archives one card, as a held `u` unarchives one (on a terminal with the kitty keyboard protocol). The retired `confirm_on_archive` is never read in its place. See [Sessions](sessions.md#the-grid). |
 | `session_idle_timeout` | string | `"5m"` | Sessions | DAEMON-owned IDLE TIMEOUT: how long a session in a WORKTREE no client is viewing goes unwatched before the IDLE REAPER kills its PTY. See the values below. |
-| `done_sound` | string | `"Glass"` | Sessions | The DONE SOUND rung when a turn reaches FINISHED: `off`, `bell` (the terminal BEL — silent in Ghostty unless its `bell-features` include `audio`), or a macOS system sound from `/System/Library/Sounds` played with `afplay` (`Glass`, `Ping`, `Pop`, `Hero`, …). Over `nebula ssh` and off macOS it is always the bell. |
-| `feedback_sound` | string | `"Sosumi"` | Sessions | The FEEDBACK SOUND rung when a turn stops at NEEDS FEEDBACK — a permission prompt or a question — with the same values and fallbacks as `done_sound`, and a different default so red and green sound different from the next room. It never rings for the session whose pane you are locked into typing at while the terminal window has focus: that prompt is already under your hands. The one switch for the DESKTOP NOTIFICATION too: while the terminal window is in the background (from the focus reports nebula asks the terminal for — tmux needs `focus-events on`), each session that goes red is also named in a desktop notification (`osascript` on macOS, `notify-send` on Linux; never over `nebula ssh`, where the desktop is the wrong machine's; a notifier that is missing or fails is a debug line, not an error). `off` silences the sound and the notification together. |
+| `done_sound` | string | `"Glass"` | Sessions | The DONE SOUND rung when a turn reaches FINISHED: `off`, `bell` (the terminal BEL — silent in Ghostty unless its `bell-features` include `audio`), or a macOS system sound from `/System/Library/Sounds` played with `afplay` (`Glass`, `Ping`, `Pop`, `Hero`, …). Over `orbit ssh` and off macOS it is always the bell. |
+| `feedback_sound` | string | `"Sosumi"` | Sessions | The FEEDBACK SOUND rung when a turn stops at NEEDS FEEDBACK — a permission prompt or a question — with the same values and fallbacks as `done_sound`, and a different default so red and green sound different from the next room. It never rings for the session whose pane you are locked into typing at while the terminal window has focus: that prompt is already under your hands. The one switch for the DESKTOP NOTIFICATION too: while the terminal window is in the background (from the focus reports orbit asks the terminal for — tmux needs `focus-events on`), each session that goes red is also named in a desktop notification (`osascript` on macOS, `notify-send` on Linux; never over `orbit ssh`, where the desktop is the wrong machine's; a notifier that is missing or fails is a debug line, not an error). `off` silences the sound and the notification together. |
 | `preset_text` | string | `"prefix"` | Sessions | PRESET TEXT: which side of the task a new AGENT PRESET's text goes — `prefix` (one box, sent before the task), `postfix` (one box, sent after it) or `prefix & postfix` (both, the form every preset had through 0.32). The PRESET EDITOR opens a new preset with the box(es) named here, and its **Text** row changes one preset — a side the row leaves out saves blank; editing a stored preset also shows any side that already holds text, so nothing saved is ever hidden. Prefix alone by default: the framing most people reach for, and one box to fill. A hand-edited `both` reads as `prefix & postfix`; anything else as the default. See [Sessions](sessions.md#agent-presets). |
 | `delete_empty_worktree` | bool | `false` | Sessions | DELETE EMPTIED WORKTREE: what the delete of a linked WORKTREE's last live card asks — the last session's `d`, the last terminal's close, or a `D` that takes them all. Off, the default, that card's own CONFIRM DIALOG carries the question too, before anything is deleted (`Delete agent 'x'? Its session and history go away.` then `Nothing else is left in worktree 'feature': delete it from disk too?`), with three answers: `Enter` or `y` deletes the card and then the worktree, the same forced delete the band's own `d` runs; `n` deletes the card and keeps the empty checkout; `Esc` cancels and keeps the card alive. On, the question is not asked: the dialog is the card's ordinary two-way confirm, its message saying the worktree goes with it, and `Enter` deletes both — unless archived sessions are still filed under the checkout, whose history the delete would take: those always get the three-way question, which says how many go with it. The ROOT WORKTREE is never offered either way, and archiving a session (`a`) never counts as emptying: an archived card is still filed under its checkout. With `show_all_worktrees` on, off asks nothing — the emptied worktree keeps its band — and on still deletes the worktree with its last card. See [Sessions](sessions.md#the-grid). |
-| `auto_cleanup_merged` | bool | `false` | Sessions | AUTO-CLEAN MERGED WORKTREES: off by default. On, when a linked worktree's branch PR is safely detected as merged, nebula asks the DAEMON to archive idle sessions in that checkout and remove the worktree from disk with `git worktree remove` (not forced). Safety gates: never the ROOT WORKTREE, never the repository default branch, never a branch that is the base of an open PR, only a MERGED PR whose head branch matches and whose head SHA is still the checkout's HEAD, never a checkout with uncommitted or untracked files, never a checkout with a running terminal or a session mid-turn. A skipped cleanup flashes why; a cleanup flashes `cleaned up <branch>: PR #<n> merged`. |
+| `auto_cleanup_merged` | bool | `false` | Sessions | AUTO-CLEAN MERGED WORKTREES: off by default. On, when a linked worktree's branch PR is safely detected as merged, orbit asks the DAEMON to archive idle sessions in that checkout and remove the worktree from disk with `git worktree remove` (not forced). Safety gates: never the ROOT WORKTREE, never the repository default branch, never a branch that is the base of an open PR, only a MERGED PR whose head branch matches and whose head SHA is still the checkout's HEAD, never a checkout with uncommitted or untracked files, never a checkout with a running terminal or a session mid-turn. A skipped cleanup flashes why; a cleanup flashes `cleaned up <branch>: PR #<n> merged`. |
 | `show_all_worktrees` | bool | `true` | Sessions | SHOW ALL WORKTREES: every checkout of the project gets a BAND on the grid, one with nothing running in it too. It is on by default. Off, the grid is only what is running: a checkout with no session or terminal has no band. On, such a checkout is an EMPTY BAND — its rule over one line, `nothing running · p: new session · t: terminal · d: delete worktree` — which `j`/`k` walk onto, where `p`/`n`/`t` start work, and where `d` (or **Delete worktree** in its right-click menu) deletes the worktree behind its own confirm (`Delete worktree 'feature' from disk?`); the ROOT WORKTREE's band has no `d`. On also means deleting a worktree's last card never asks about the worktree, so the emptied band stays until its own `d` — unless `delete_empty_worktree` is on, which still deletes the worktree with its last card. The ARCHIVED VIEW never shows an empty band. See [Sessions](sessions.md#the-grid). |
 | `appearance` | string | `"auto"` | Appearance | APPEARANCE: the dark or the light palette. `auto` asks the terminal for its background color at startup (OSC 11, with `COLORFGBG` as the fallback for a terminal that doesn't answer) and draws the light palette on a light background, the dark one otherwise; `dark` and `light` force one. In the light palette every THEME keeps its hues at a weight that reads on white, the FOCUSED PANEL TINT and the card washes mix toward white instead of black, and `black_background` paints white. Anything off the list reads as `auto`. |
 | `theme` | string | `"default"` | Appearance | The THEME: `default`, `ocean`, `forest`, `rose`, `amber`, `lavender`, `coral`, `slate`, `sand`, `mono`. An unknown name falls back to `default`. |
 | `animations` | bool | `true` | Appearance | Master switch for the STATUS SWEEP (running and needs-feedback rows for as long as they last; an unread finish and a just-merged checkout for about five seconds) and the SPLASH's motion. Off trades them for fewer repaints on a constrained machine. |
-| `focus_tint` | bool | `true` | — (retired) | Through 0.34, **Focused panel tint**: whether the FOCUSED PANEL TINT — the faint accent wash behind whatever keys land in, the card under the cursor while the grid has them and the session pane while it does — was painted at all. It always is now: the wash is the one cue that says which surface keys land in (the cursor's card itself now wears a heavy accent frame over the selection fill instead — brighter while the grid has the keys, a shade darker while the pane does — so the grid still names the session the pane reads), so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
-| `show_workspaces` | bool | `true` | — (retired) | Through 0.33, **Workspaces bar** (Settings → Appearance): whether the bar of WORKSPACE tabs was drawn across the top. Workspaces are gone — every project is in the one list the PROJECT TABS open from — so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `focus_tint` | bool | `true` | — (retired) | Through 0.34, **Focused panel tint**: whether the FOCUSED PANEL TINT — the faint accent wash behind whatever keys land in, the card under the cursor while the grid has them and the session pane while it does — was painted at all. It always is now: the wash is the one cue that says which surface keys land in (the cursor's card itself now wears a heavy accent frame over the selection fill instead — brighter while the grid has the keys, a shade darker while the pane does — so the grid still names the session the pane reads), so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `show_workspaces` | bool | `true` | — (retired) | Through 0.33, **Workspaces bar** (Settings → Appearance): whether the bar of WORKSPACE tabs was drawn across the top. Workspaces are gone — every project is in the one list the PROJECT TABS open from — so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
 | `black_background` | bool | `true` | Appearance | BLACK BACKGROUND (**Solid background** in the overlay): paint the whole window pure black — pure white under the light `appearance` — grid, cards, session pane, overlays — instead of leaving it on the terminal's own background (a dark gray in a stock Ghostty). Only cells nothing else colored change: selection fills, the FOCUSED PANEL TINT and the colors a session draws itself sit on top as before. Off keeps the terminal's background, transparency or image included. |
 | `hide_card_marks` | bool | `false` | Appearance | **Card marks** (`shown` / `hidden`): leave the `▶` (a RUN TERMINAL) and the `❯` (a plain shell) off the front of each terminal card's name on the GRID, and the `›` off the front of each session card's last prompt, so the name or prompt starts where the mark was. The pane's title still shows the terminal glyph. Off keeps them. A config written under the old key, `hide_terminal_glyphs`, still reads. |
 | `highlight_current_card` | bool | `true` | Appearance | **Highlight current card** (`on` / `off`): the card under the cursor on the GRID, the one the pane reads, trades its gray fill for a very faint wash of the colour its frame would have unselected (red asking, yellow running, blue finished and unread). The wash breathes slowly while the card has something going on; a quiet card or a terminal gets a still, faint accent wash, as every card does with the animations off. It stays lit while you type in the pane and fades further when the PROJECT TABS have the keys. Off keeps the plain gray fill, dimmed whenever the keys leave the grid. |
 | `session_pane` | string | `"right"` | Appearance | Where the PANE that reads the card under the cursor sits: `right` (down the right of the cards, full height, half the width until its edge is dragged) or `bottom` (under the GRID, full width). The SIDE BUTTON just before the `×` on the pane's header flips it in one click — `⬓` down the right, `◨` along the bottom — and writes this same key. Its edge facing the cards is dragged the same way on both sides — a `┃` grip beside the cards, a `━` grip under them — and the width and the height are remembered apart, so switching sides never turns one into the other. A window too narrow for the pane and a column of cards side by side lays it out along the bottom until there is room (and draws no side button). Anything off the list — `left` from older builds included — reads as `right`. |
 | `worktree_layout` | string | `"cards"` | Appearance | How the launcher lays out work: `cards` (a row of cards under each worktree's band rule), `list` (a compact list — every session and terminal one line under the rule, stacked: its status dot and name, what it runs on, and its last prompt or the shell's last line, with how long since it moved at the right). A band in the list starts collapsed, showing only its 3 most recent sessions — plus the one the cursor is on, wherever it sits — and a `▾ 2 more · Tab: see all 5` line under them; `Tab` (or a click on that line) opens the band to every entry, and `Tab` or `Esc` folds it back. `j`/`k` walk the lines as one column across the bands. `nested` is the third, and `columns` is the fourth: projects, worktrees and sessions as side-by-side columns that reuse the same rows and pane instead of cards. `nested` is: one thread per worktree, the one that moved last on top, the first prompt run its root row and every later prompt and terminal a one-line child under it; in the project's root checkout every session and terminal is a row of its own instead. Each row is a fold caret, the title in its status color (no status dot), and fixed PR and age columns at the right, with `1 sub` on a collapsed thread that has children. No worktree header and no card border: a DETAIL STRIP pinned under the list shows the selected row's harness, checkout, pull request and changes. Threads start collapsed except the one holding the selection; `l`/`→` expands a collapsed root, `h`/`←` collapses an expanded one, and `h`/`←` on a child moves to the root. `j`/`k` walk the visible rows and `Enter` opens the selected one. Anything off the list reads as `cards`. |
-| `inline_graphics` | string | `"auto"` | Appearance | INLINE GRAPHICS: how file tabs and the tree browser render local images and Mermaid diagrams. Choices are `auto`, `kitty`, `iterm`, `sixel`, `halfblocks`, and `off`. `off` shows source or a one-line hint instead of pixels. The enabled choices currently use the portable Unicode half-block renderer, so images work in native terminals, `nebula browser`/ttyd and over `nebula ssh`; the protocol names are accepted as stable config values for native protocol renderers to attach to later. Mermaid rendering also needs `mmdc` (`@mermaid-js/mermaid-cli`) on PATH; without it, nebula shows the diagram source plus an install hint. |
+| `inline_graphics` | string | `"auto"` | Appearance | INLINE GRAPHICS: how file tabs and the tree browser render local images and Mermaid diagrams. Choices are `auto`, `kitty`, `iterm`, `sixel`, `halfblocks`, and `off`. `off` shows source or a one-line hint instead of pixels. The enabled choices currently use the portable Unicode half-block renderer, so images work in native terminals, `orbit browser`/ttyd and over `orbit ssh`; the protocol names are accepted as stable config values for native protocol renderers to attach to later. Mermaid rendering also needs `mmdc` (`@mermaid-js/mermaid-cli`) on PATH; without it, orbit shows the diagram source plus an install hint. |
 | `expand_all_worktrees` | bool | `false` | Appearance | **Expand all worktrees** (`on` / `off`): lay every band on the GRID out open at once — each worktree's sessions and terminals wrapped into rows under its rule (in the `list` layout, every entry listed) — instead of one band opened at a time with `Tab`. With it on there is no accordion: `Tab` and a second click on a band's rule open and fold nothing (the footer says so), and `j`/`k` walk down every worktree's rows as one column. The band `Tab` last opened is kept and is open again once this is off. |
-| `hide_card_prompt` | bool | `false` | — (retired) | Through 0.40, **Card prompt** (Settings → Appearance, `shown` / `hidden`): `hidden` left the last prompt off every session card on the GRID. Every card shows it now, so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `hide_card_prompt` | bool | `false` | — (retired) | Through 0.40, **Card prompt** (Settings → Appearance, `shown` / `hidden`): `hidden` left the last prompt off every session card on the GRID. Every card shows it now, so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
 | `card_issue_number` | bool | `true` | Appearance | Show the `#15` of the GitHub issue a session was started from (an issue session, launched out of the issues modal) at the right end of its card on the GRID (**Card issue number**, `on` / `off`). The number is a link: a click lands the cursor on the card and opens the issue in the browser, as `⇧I` does. Cards not started from an issue are unchanged. |
 | `hide_draft_prs` | bool | `false` | Appearance | Leave draft pull requests out of the grid's PR & ISSUE COUNTS and the PALETTE's (`/`) pull-request rows, so browsing what's open shows only the rows asking for a reviewer; the PULL REQUESTS MODAL lists drafts either way. A view filter, not a fetch filter: the open-list lookup still fetches the drafts and the PR CACHE still holds them, so `shown` brings them back at once and a draft marked ready joins the rows on the refresh that says so. Sessions and the pull request under their cards are never hidden. |
 | `source_control_graph` | bool | `false` | Appearance | **Show commit graph**: when on, the `g` DIFF VIEWER adds a read-only GRAPH section under CHANGES, listing HEAD plus local and remote branches, ahead/behind markers, commit details, and commit files that unfold in place. Off by default: the `g` view is just CHANGES plus the diff pane, and opening it runs no `git log` or `rev-list` work. |
 | `diff_inline` | bool | `false` | Appearance | **Diff layout** (`split` / `inline`): how the `g` DIFF VIEWER lays out a file's changes — `split` puts the old file left and the new one right, numbered on both sides; `inline` reads the one-column unified diff. `Ctrl+s` inside the viewer flips it and writes the choice back here. A diff pane under 90 columns reads inline either way. Replaces the layout the TUI's own state used to remember: a `Ctrl+s` left on unified by an older build is carried into this key once. |
-| `card_line_changes` | bool | `false` | — (retired) | Through 0.37, **Card line counts** (Settings → Appearance): on, each GRID card followed its checkout's changed-file count with the lines behind it. Every card does now — `↳ feat +3 files +120 -45`, the added in the DIFF VIEWER's green and the removed in its red, counted as the DIFF VIEWER shows them (tracked files against HEAD, staged or not, and every line of an untracked file as added; a binary file, or an untracked one over 1 MiB, adds nothing) by one `git diff --numstat` beside each `git status` the file count already runs; on a narrow card the word `files` goes first, then the lines, before the branch gives up a letter — so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
-| `projects` | object | `{}` | Project | PROJECT SETTINGS: one entry per project set up differently from the rest, keyed by the project's repo path exactly as the DAEMON stores it, holding that project's rows from the **Project** tab — `{"projects": {"/Users/me/src/app": {"run_command": "npm run dev", "open_command": "open http://localhost:3000"}}}`. Two rows: **Run command** (`run_command`, string, default `""`) is the RUN COMMAND **Run** (a card's or the project tab's right-click menu) starts in *that project's* worktrees — the same shell line a `.nebula.json` `run` would carry, and the way to set one without committing a file; while it is set, **Run** runs it and never opens the file, and empty (shown as `.nebula.json`) hands the decision back to the checkout's PROJECT FILE, so a project that has one needs nothing here. Typed, not cycled: `Enter` opens a prompt titled with the project, an empty answer puts `.nebula.json` back. The DAEMON reads it fresh at each **Run**. **Open command** (`open_command`, string, default `""`) is its twin for the OPEN COMMAND `Shift+Enter` / `Shift+O` fires on that project's worktrees — `open http://localhost:3000`, say — with the same precedence over the file's `open` and the same prompt; the TUI reads it fresh at each press, since it runs on the machine you are sitting at. The tab edits the selected project and names it on its first line; with no project in the tree its rows read `n/a`. A project with no entry reads as the defaults (an empty command in each row), and an entry that only repeats them is dropped on save, so the map names only the projects that differ; an empty `run_command` or `open_command` is left out of an entry rather than written; a key inside an entry this build doesn't know — the retired `hide_root_worktree` an older build wrote among them — is carried through a save. To the file's rules the map is one key: a value in it this build can't read costs the whole map, not one project. |
-| `hide_root_worktree` | bool | `false` | — (retired) | Through 0.27 one switch for every project (**Hide root worktree**, Settings → Experimental), then through 0.35 the fallback for a project whose `projects` entry had no **Hide root worktree** row of its own: on, that project's ROOT WORKTREE was left out of everything the grid launched into. The root is always listed now — a launch that must not land in the shared checkout cuts a fresh worktree instead (`^N` in the QUICK PROMPT, or `quick_prompt_new_worktree`) — so this build never reads the key, here or inside an entry, and no tab edits it; both are still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `card_line_changes` | bool | `false` | — (retired) | Through 0.37, **Card line counts** (Settings → Appearance): on, each GRID card followed its checkout's changed-file count with the lines behind it. Every card does now — `↳ feat +3 files +120 -45`, the added in the DIFF VIEWER's green and the removed in its red, counted as the DIFF VIEWER shows them (tracked files against HEAD, staged or not, and every line of an untracked file as added; a binary file, or an untracked one over 1 MiB, adds nothing) by one `git diff --numstat` beside each `git status` the file count already runs; on a narrow card the word `files` goes first, then the lines, before the branch gives up a letter — so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `projects` | object | `{}` | Project | PROJECT SETTINGS: one entry per project set up differently from the rest, keyed by the project's repo path exactly as the DAEMON stores it, holding that project's rows from the **Project** tab — `{"projects": {"/Users/me/src/app": {"run_command": "npm run dev", "open_command": "open http://localhost:3000"}}}`. Two rows: **Run command** (`run_command`, string, default `""`) is the RUN COMMAND **Run** (a card's or the project tab's right-click menu) starts in *that project's* worktrees — the same shell line a `.orbit.json` `run` would carry, and the way to set one without committing a file; while it is set, **Run** runs it and never opens the file, and empty (shown as `.orbit.json`) hands the decision back to the checkout's PROJECT FILE, so a project that has one needs nothing here. Typed, not cycled: `Enter` opens a prompt titled with the project, an empty answer puts `.orbit.json` back. The DAEMON reads it fresh at each **Run**. **Open command** (`open_command`, string, default `""`) is its twin for the OPEN COMMAND `Shift+Enter` / `Shift+O` fires on that project's worktrees — `open http://localhost:3000`, say — with the same precedence over the file's `open` and the same prompt; the TUI reads it fresh at each press, since it runs on the machine you are sitting at. The tab edits the selected project and names it on its first line; with no project in the tree its rows read `n/a`. A project with no entry reads as the defaults (an empty command in each row), and an entry that only repeats them is dropped on save, so the map names only the projects that differ; an empty `run_command` or `open_command` is left out of an entry rather than written; a key inside an entry this build doesn't know — the retired `hide_root_worktree` an older build wrote among them — is carried through a save. To the file's rules the map is one key: a value in it this build can't read costs the whole map, not one project. |
+| `hide_root_worktree` | bool | `false` | — (retired) | Through 0.27 one switch for every project (**Hide root worktree**, Settings → Experimental), then through 0.35 the fallback for a project whose `projects` entry had no **Hide root worktree** row of its own: on, that project's ROOT WORKTREE was left out of everything the grid launched into. The root is always listed now — a launch that must not land in the shared checkout cuts a fresh worktree instead (`^N` in the QUICK PROMPT, or `quick_prompt_new_worktree`) — so this build never reads the key, here or inside an entry, and no tab edits it; both are still loaded and written back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
 | `hide_projects` | bool | `false` | — | In `worktree_layout = "columns"`, hides the Projects column; outside columns it is ignored. Kept under the old key for compatibility with the pre-grid panel layout. If all three column hide keys are on, Sessions is shown as the fallback. |
 | `hide_worktrees` | bool | `false` | — | In `worktree_layout = "columns"`, hides the Worktrees column; outside columns it is ignored. Kept under the old key for compatibility. |
 | `hide_sessions` | bool | `false` | — | In `worktree_layout = "columns"`, hides the Sessions column; outside columns it is ignored. Kept under the old key for compatibility. |
 | `recent_prompts` | bool | `false` | — | In `worktree_layout = "columns"`, shows recent prompt snippets on session rows; cards still show their normal prompt preview regardless. Kept under the old key for compatibility. |
 | `recent_prompts_count` | integer | `3` | — | In `worktree_layout = "columns"`, how many recent prompt snippets to join onto a session row when `recent_prompts` is on. |
-| `show_key_combos` | bool | `false` | — (retired) | Through 0.37, **Key combo display** (Settings → Experimental): on, each key pressed on the grid was spelled at the bottom left of the screen with what it did. The KEY COMBO DISPLAY is always on now, whatever the key says — every press shows, `j - Move down`, and clears itself three seconds on ([Keys](keys.md#chips-and-readouts)) — so this build never reads it and no tab edits it; it is still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `show_key_combos` | bool | `false` | — (retired) | Through 0.37, **Key combo display** (Settings → Experimental): on, each key pressed on the grid was spelled at the bottom left of the screen with what it did. The KEY COMBO DISPLAY is always on now, whatever the key says — every press shows, `j - Move down`, and clears itself three seconds on ([Keys](keys.md#chips-and-readouts)) — so this build never reads it and no tab edits it; it is still loaded and written back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
 | `confirm_drag_move` | bool | `true` | Sessions | CONFIRM DRAG MOVE: a session card dragged onto another worktree's band or another PROJECT TAB asks before the session moves (the move restarts its CLI there, resumed on the same conversation). Off, the drop moves it at once. The MOVE PICKER (`m`) never asks. See [Keys](keys.md). |
 | `remember_harness` | bool | `false` | Experimental | REMEMBER HARNESS: a launch walked through the NEW SESSION PICKER (`n`), the PR SESSION picker or the QUICK PROMPT's `Tab` picker makes its harness the default the next launch starts on — the picker opens on that row and `p` launches it — and a model or effort drilled into through the submenus becomes that harness's own Model / Effort default. It writes the Agents tab's own rows (`quick_prompt_kind`, `<kind>_model`, `<kind>_effort`), so the tab always shows what the next launch will be; a pick that already is the default writes nothing, and an AGENT PRESET launch changes nothing, its harness being the preset's. Off, a pick is one session's: the NEW SESSION PICKER keeps opening on the `quick_prompt_kind` harness and the PR SESSION picker on its first row. See [Sessions](sessions.md#the-new-session-picker). |
-| `pr_issue_counts` | bool | `true` | — (retired) | Through 0.37, **PR & issue counts** (Settings → Experimental): off, the GRID's header dropped the `3 prs · 2 issues` beside the session count and the other projects' issues were never swept. The header always counts now — what is waiting on a repo is read off it without opening `v` or `i`, a click on either count opens that list, a count is left out until its list has landed, and a list cut off at the fetch cap counts `100+` — so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
+| `pr_issue_counts` | bool | `true` | — (retired) | Through 0.37, **PR & issue counts** (Settings → Experimental): off, the GRID's header dropped the `3 prs · 2 issues` beside the session count and the other projects' issues were never swept. The header always counts now — what is waiting on a repo is read off it without opening `v` or `i`, a click on either count opens that list, a count is left out until its list has landed, and a list cut off at the fetch cap counts `100+` — so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older orbit sharing the file ([Compatibility rules](#compatibility-rules)). |
 | `quick_prompt_kind` | string | `"claude"` | Agents | Which AGENT KIND the QUICK PROMPT (`p`) launches: `claude`, `codex`, `cursor`, `pi`, `muse`, `grok` or `opencode`. Its model and effort come from that kind's own defaults below, so this is one name, not a third pair. A kind switched off here is stepped around. The NEW SESSION PICKER opens on it too, and with **Remember harness** on (Experimental) every picker-walked launch rewrites it. |
 | `quick_prompt_focus` | bool | `false` | Agents | QUICK PROMPT FOCUS: whether a QUICK PROMPT launch enters and locks the new session's TERMINAL PANE. Off, the keys stay on the grid, and where the cursor goes is `follow_new_session`'s. On, it outranks that key: a launch that enters the new session's pane has to go there. Only the QUICK PROMPT reads it — every other launch takes the pane. |
 | `follow_new_session` | bool | `true` | Agents | FOLLOW NEW SESSION (**Follow new**): a QUICK PROMPT launch lands the cursor on the new session's card — the grid scrolls to keep it on screen and the pane shows it, the keys still on the grid — so a run of launches can be watched going up. It selects the card and no more: entering its terminal is `quick_prompt_focus`'s. It covers every QUICK PROMPT: `p`, `n`'s box, `Shift+P` on a card, and the boxes the ISSUES MODAL and the PULL REQUESTS MODAL open. Off, the cursor, the pane and the keys stay on the card you were on while the new session's card goes up in its band — first in it, stand-in rows first for a launch that cuts a fresh worktree — and the footer names the branch it went to (`started a session in feat`): the BACKGROUND LAUNCH's stillness, in the project on screen. A launch with no card under the cursor — the aim let go with `Esc`, an empty band, an empty grid — has nothing to keep and lands on its new card either way; so does every launch while `quick_prompt_focus` is on. Terminals (`t`) always come up in the pane. |
@@ -125,7 +125,7 @@ behaviors that change how the tree is worked; every switch there is off by defau
 | `muse_effort` | string | `"default"` | Agents | Reserved until the `muse` CLI documents a reasoning flag. Stored, never sent. |
 | `opencode_model` | string | `"default"` | Agents | Default `--model` for new OpenCode sessions: a `provider/model` id passed verbatim (`opencode models` lists what your machine has credentials for). The overlay lists a few well-known ids (`opencode/big-pickle`, `anthropic/claude-sonnet-5`, …); a hand-edited one passes through. `"default"` means don't pass the flag, so OpenCode opens on its own last-picked model. There is no `opencode_effort`: OpenCode has no effort flag (reasoning is a per-model variant picked inside its TUI), so its Agents section has no Effort row. |
 | `custom_harnesses` | array | `[]` | Agents | Extra CLIs the NEW SESSION PICKER offers after the built-ins, each with its own Agents tab section (Enabled and Model rows). Each entry is `{id, program}` plus options: `label` (picker text, defaults to the id), `enabled` (default `true`), `model` (default `"default"` = the CLI's pick, else passed verbatim), `model_flag` (default `"--model"`), and `hooks` (a built-in dialect the program speaks: `claude`, `codex`, `cursor`, `pi` or `opencode` — with one set the sessions report status, prompts and permission waits exactly like that harness, including title sync and auto-title for `claude`; without one they stay process-based, running while the PTY is live and never waiting-on-you). Ids use lowercase letters, digits and hyphens and must not collide with a built-in. Legacy: new harnesses belong in `harnesses`, where they also gain resume, effort, system-prompt and hook-dialect rows. Invalid entries never launch — the picker hides them and the daemon refuses them with the reason. |
-| `harnesses` | object | `{}` | Agents | The harness registry: per-harness deltas over the compiled-in known harnesses (Claude, Codex, Cursor, Pi, Muse, Grok Build, OpenCode), and whole new third-party CLIs. The Agents tab grows one section per entry — Enabled, Model, and Effort rows while the harness offers effort — and the `n` picker, `e` presets, spawn, resume and hooks all read the merged rows. A hand edit that breaks one entry refuses its launches with the reason, never the whole file. Run `nebula config harnesses` to print the effective rows to copy from. |
+| `harnesses` | object | `{}` | Agents | The harness registry: per-harness deltas over the compiled-in known harnesses (Claude, Codex, Cursor, Pi, Muse, Grok Build, OpenCode), and whole new third-party CLIs. The Agents tab grows one section per entry — Enabled, Model, and Effort rows while the harness offers effort — and the `n` picker, `e` presets, spawn, resume and hooks all read the merged rows. A hand edit that breaks one entry refuses its launches with the reason, never the whole file. Run `orbit config harnesses` to print the effective rows to copy from. |
 | `keybindings` | object | `{}` | Hotkeys | KEYMAP overrides, keyed by action id, valued with a comma-separated chord list: `{"git_diff": "ctrl+g, g"}`. An empty string deliberately unbinds; unknown ids are ignored. Only rows that differ from the defaults are written. |
 | `prewarm_agents` | bool | `true` | Sessions | DAEMON-owned PREWARM POOL: keep one booted agent CLI standing by in the selected WORKTREE, so creating a session there adopts it and feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes), and that spare is a real session as far as the CLI is concerned — Claude's own `/list-agents` lists it beside the sessions you made, named after the directory (`my-repo-3f`), and the memory modal (`Shift+M`) groups it under **warm spares**. Off drains the pool on the DAEMON's next sweep (within 30 s). |
 | `prewarm_sessions` | bool | `true` | Sessions | DAEMON-owned SESSION PREWARM: boot a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** Off — for a machine with less memory to spare — landing on a worktree boots nothing: a session forks only when your cursor lands on its row or you attach to it, one at a time; sessions already up stay until the IDLE REAPER takes them. |
@@ -152,7 +152,7 @@ is what bounds the cost of both when they are left on.
 ### The harness registry
 
 The seven known harnesses ship compiled in, and `harnesses` edits them per field — or adds a new
-CLI outright. Only your deltas go in the file; `nebula config harnesses` prints the effective rows
+CLI outright. Only your deltas go in the file; `orbit config harnesses` prints the effective rows
 to copy from. Disabling one is one line, and adding a CLI is one block: picker, presets, spawn,
 resume, hooks and the Agents tab section all follow, with no rebuild.
 
@@ -176,17 +176,17 @@ stops making sense (an empty program, a resume flag plus a resume subcommand, an
 refuses its launches with the reason while every other harness keeps working. The per-harness keys
 the Agents tab edits (`claude_model`, `codex_enabled`, …) keep working as a fallback wherever the
 map stays silent. Omit the map entirely and you get every built-in, enabled, with its defaults —
-including ones a later nebula adds. Like every other object key, a `harnesses` map in
+including ones a later orbit adds. Like every other object key, a `harnesses` map in
 `config.local.json` replaces the whole map from `config.json` rather than merging per harness,
 so keep machine-specific overrides in one layer.
 
 `launch_args` is an array of arguments placed before resume subcommands and session options.
 Codex defaults to `["--no-daemon"]`: its hooks and tool shells need the current session's
-`NEBULA_*` environment for status updates and automatic naming. A shared Codex background server
-keeps its own startup environment, which can belong to another session or have no Nebula context.
+`ORBIT_*` environment for status updates and automatic naming. A shared Codex background server
+keeps its own startup environment, which can belong to another session or have no Orbit context.
 Other harnesses default to `[]`; Codex-compatible wrappers can opt in explicitly. Setting
 `"codex": {"launch_args": []}` removes the flag for older CLIs, with the risk of missing or
-misdirected hooks when a shared server is used. Hook trust review still applies; Nebula does not
+misdirected hooks when a shared server is used. Hook trust review still applies; Orbit does not
 bypass it.
 
 Grok Build is enabled by default and launches `grok`. Its Enabled toggle is stored under
@@ -226,7 +226,7 @@ conversation there.
   (`auto_cleanup_merged`, off by default), the done sound (`done_sound`: a ding
   when a turn finishes — a macOS system sound such as `Glass`, the default; `bell` for the terminal
   bell, which Ghostty keeps silent unless its `bell-features` include `audio`; or `off`. Over
-  `nebula ssh` and off macOS it is always the bell), the feedback sound (`feedback_sound`: the same
+  `orbit ssh` and off macOS it is always the bell), the feedback sound (`feedback_sound`: the same
   choices, `Sosumi` by default, rung when a turn stops to ask you — and, while the terminal window
   is in the background, a desktop notification naming the session and its worktree; `off` silences
   both), and which side of the task a new AGENT PRESET's text goes (`preset_text`: `prefix`, the
@@ -236,7 +236,7 @@ conversation there.
   `/` searches every tab at once, for when you know the setting or hotkey but not its tab.
 - **Every grid key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
   and writes overrides into the same file (`"keybindings": {"git_diff": "ctrl+g, g"}`); an empty value
-  unbinds. Because nebula is always a guest inside Terminal.app / Ghostty / tmux, the tab says at bind
+  unbinds. Because orbit is always a guest inside Terminal.app / Ghostty / tmux, the tab says at bind
   time when a chord probably won't survive the trip — `⌘` anything, `^⇧` without the kitty protocol,
   `^←` on stock macOS. `Ctrl+q` is the one exception to all of it: it unlocks a terminal no matter what
   you bind, since unbinding your way out would trap you in the session.
@@ -244,9 +244,9 @@ conversation there.
 ## Backup, restore and other machines
 
 ```sh
-nebula config path                  # where each settings file is
-nebula config export ~/backups      # write ~/backups/nebula-settings.json
-nebula config import ~/backups      # merge it back in, here or on a new machine
+orbit config path                  # where each settings file is
+orbit config export ~/backups      # write ~/backups/orbit-settings.json
+orbit config import ~/backups      # merge it back in, here or on a new machine
 ```
 
 A SETTINGS BUNDLE is one JSON file holding `config.json`, `agent_presets.json` and `ssh_hosts.json`,
@@ -254,7 +254,7 @@ each exactly as the file has it, under a marker key:
 
 ```json
 {
-  "nebula_bundle": 1,
+  "orbit_bundle": 1,
   "exported_by": "0.27.0",
   "config": { "theme": "ocean", "keybindings": { "git_diff": "ctrl+g" } },
   "agent_presets": [{ "name": "reviewer", "kind": "claude", "prefix": "Be strict." }],
@@ -262,7 +262,7 @@ each exactly as the file has it, under a marker key:
 }
 ```
 
-- **Export** writes to stdout, to a file, or to `nebula-settings.json` inside a folder you name. It
+- **Export** writes to stdout, to a file, or to `orbit-settings.json` inside a folder you name. It
   never carries `config.local.json`, the database, the logs or the PR and model caches.
 - **Import** takes an export, a bare `config.json`, `agent_presets.json` or `ssh_hosts.json`, a folder
   holding any of them (a dotfiles folder, a copy of an old data dir), or `-` for stdin. It merges
@@ -272,13 +272,13 @@ each exactly as the file has it, under a marker key:
   exists but can't be read fails the import before anything is written. Changes apply without a
   restart.
 - **Copying the file works too.** Both halves re-read `config.json` on every use, so a backup copied
-  over it — or to wherever `NEBULA_CONFIG_FILE` points — applies at once, with no import and no
+  over it — or to wherever `ORBIT_CONFIG_FILE` points — applies at once, with no import and no
   restart.
-- **Over ssh** (`ssh_sync_config`, on by default), `nebula ssh` and `nebula tunnel` export
-  `config.json` and the presets into the one ssh command they already run, and the remote nebula
+- **Over ssh** (`ssh_sync_config`, on by default), `orbit ssh` and `orbit tunnel` export
+  `config.json` and the presets into the one ssh command they already run, and the remote orbit
   imports them before it starts, saying what changed on stderr. Sync is one way: the machine you
   connect from wins key by key on each connect, so a setting the remote should keep goes in the
-  remote's `config.local.json`. A remote nebula too old to know about the bundle ignores it and starts
+  remote's `config.local.json`. A remote orbit too old to know about the bundle ignores it and starts
   as before. The bundle travels base64-encoded in the remote command, so that machine's process list
   shows it while ssh starts. Settings hold no credentials, but a preset's prefix text travels too.
   A bundle over 64 KiB is not sent (a real one is a few KiB), and the connection goes ahead without
@@ -286,12 +286,12 @@ each exactly as the file has it, under a marker key:
 
 ### Compatibility rules
 
-Two nebula versions share these files all the time: a remote a few releases behind the machine that
+Two orbit versions share these files all the time: a remote a few releases behind the machine that
 connects to it, a backup restored into a newer build. Every setting follows these rules so neither
 version breaks the other:
 
 1. **Keys are only ever added.** A released key keeps its name, its type and its meaning. A new
-   meaning gets a new key, and nebula keeps reading and writing the old one for older builds. A
+   meaning gets a new key, and orbit keeps reading and writing the old one for older builds. A
    key renamed with its row (`hide_terminal_glyphs` became `hide_card_marks` in 0.40) is read under
    both names and written back under the new one alone, so a build older than the rename sees that
    one setting at its default.
@@ -301,21 +301,21 @@ version breaks the other:
 3. **One bad value costs one key.** A value a build can't read takes its default in that build, is
    logged, and stays as stored unless that setting is changed on that machine. Preset and host
    entries work the same way: one this build can't read, such as a preset for a harness a newer
-   nebula added, is kept through a save rather than deleted.
+   orbit added, is kept through a save rather than deleted.
 4. **Choices fall back when used, not when read.** Values like `theme` and `quick_prompt_kind` stay
    plain strings, and a name a build doesn't know falls back to the default where it is used.
-5. **Old files are tested.** `crates/nebula-core/fixtures/config-<version>.json` holds every key a
+5. **Old files are tested.** `crates/orbit-core/fixtures/config-<version>.json` holds every key a
    release wrote, each set to something other than its default, and the test suite checks that every
    one still loads as written and survives a save. Each release adds its own fixture.
 
 `config.json` carries no version number. An older build could only refuse a newer file or ignore the
 number, and the keys a file holds already tell a newer build everything it needs. The bundle's
-`nebula_bundle` marks the file and never gates it: sections are only ever added, and a reader leaves
+`orbit_bundle` marks the file and never gates it: sections are only ever added, and a reader leaves
 one it doesn't know alone.
 
-## The project file (`.nebula.json`)
+## The project file (`.orbit.json`)
 
-The PROJECT FILE tells nebula how a repository is run. Commit it at the repo root, beside
+The PROJECT FILE tells orbit how a repository is run. Commit it at the repo root, beside
 `package.json` or `Cargo.toml`, and every checkout of the project carries it:
 
 ```json
@@ -340,14 +340,14 @@ Both keys are optional shell command lines, and both run in the selected worktre
   starts another.
 - **`open`** — the OPEN COMMAND. `Shift+Enter` on a worktree fires it once, from the TUI rather than
   the DAEMON, since what it opens — a browser tab, an editor — belongs on the machine you are sitting
-  at. It runs through `$SHELL -c` with its output discarded, and nebula does not wait for it. The key
+  at. It runs through `$SHELL -c` with its output discarded, and orbit does not wait for it. The key
   answers from any card: the worktree is the one whose band the cursor is on.
   `Shift+Enter` needs the KITTY PROTOCOL (Ghostty, kitty); Terminal.app sends it as a plain `Enter` and
   tmux flattens it to one, so `Shift+O` and `Alt+Enter` (the `ESC` `CR` a mapped Shift+Enter sends, which
   tmux passes through) are bound beside it, and a card's right-click menu has **Open**. See
   [Keys](keys.md#full-keymap) for teaching Terminal.app the real key.
 
-The file is read fresh at every press, so an edit applies on the next **Run** or `Shift+Enter`. Nebula looks
+The file is read fresh at every press, so an edit applies on the next **Run** or `Shift+Enter`. Orbit looks
 in the worktree's own checkout first, so a branch can carry commands of its own, and falls back to the
 project's main checkout, so a worktree cut before the file was committed still runs. The first file found
 is the whole answer: a worktree's file with no `open` does not borrow the main checkout's. A missing
@@ -362,25 +362,25 @@ file is not consulted for that command; empty, the file decides as above. They a
 settings, so each project can run and open its own way, and the footer names both places when neither
 has the command. See `projects` in [Every setting](#every-setting).
 
-Unlike the WORKTREE HOOKS below, which nebula runs on its own and so never takes from a checkout,
+Unlike the WORKTREE HOOKS below, which orbit runs on its own and so never takes from a checkout,
 nothing in the PROJECT FILE runs until you press its key on that worktree — the same trust as typing the
 command into a shell there.
 
 ## Worktree hooks
 
 A checkout often owns things outside its own directory — a dev-server port, a Caddy or nginx route, a
-docker compose project, a database — that nebula knows nothing about. WORKTREE HOOKS are two
+docker compose project, a database — that orbit knows nothing about. WORKTREE HOOKS are two
 executables of yours the DAEMON runs after it creates or deletes a worktree, so a project can provision
 and release those itself. They are the one setting that is not in CONFIG.JSON: a hook is per
 repository, so it lives in git config, read fresh at each use:
 
 ```sh
-git config nebula.worktreeCreateHook /absolute/path/to/worktree-setup
-git config nebula.worktreeDeleteHook /absolute/path/to/worktree-cleanup
+git config orbit.worktreeCreateHook /absolute/path/to/worktree-setup
+git config orbit.worktreeDeleteHook /absolute/path/to/worktree-cleanup
 ```
 
 Git resolves the key the usual way, so `git config --global` sets one script for every project and a
-repo's own `.git/config` overrides it. Nebula never reads a hook from a file inside the checkout — a
+repo's own `.git/config` overrides it. Orbit never reads a hook from a file inside the checkout — a
 committed hook would run whatever a clone brought with it, which is why git refuses working-tree hooks
 too. Keep the executable outside the worktrees it serves; the delete hook runs after its checkout is
 gone.
@@ -391,25 +391,25 @@ What a hook gets:
   path. The value is spawned directly as an executable — no shell — so a space in either path arrives
   intact.
 - **The main checkout as its working directory**, since the deleted directory no longer exists.
-- **Environment**: `NEBULA_HOOK` (`worktree-create` or `worktree-delete`, so one script can serve
-  both keys), `NEBULA_WORKTREE_BRANCH` and `NEBULA_WORKTREE_ID`.
+- **Environment**: `ORBIT_HOOK` (`worktree-create` or `worktree-delete`, so one script can serve
+  both keys), `ORBIT_WORKTREE_BRANCH` and `ORBIT_WORKTREE_ID`.
 
 When they run, and what a failure means:
 
-- **Only after a nebula operation that succeeded.** The create hook fires once the checkout exists and
-  its row is in every client — `nebula worktree`, the QUICK PROMPT's fresh
+- **Only after a orbit operation that succeeded.** The create hook fires once the checkout exists and
+  its row is in every client — `orbit worktree`, the QUICK PROMPT's fresh
   worktree, a PR SESSION's checkout. The delete hook fires once `git worktree remove` (forced or not)
   and the row drop went through, including a checkout you had already `rm -rf`'d by hand. A delete
-  that fails or is cancelled runs nothing. Worktrees created or removed outside nebula, which WORKTREE
+  that fails or is cancelled runs nothing. Worktrees created or removed outside orbit, which WORKTREE
   SYNC merely notices, run nothing either.
 - **Skipped while the directory is still there.** When git had already stopped tracking a checkout
-  and nebula leaves the untracked directory alone, the delete hook does not run against live files;
+  and orbit leaves the untracked directory alone, the delete hook does not run against live files;
   the warning says so.
 - **Hooks never overlap.** They run under the DAEMON's worktree lock, so a create of a path waits
   for the delete hook still releasing it, and `Shift+D`'s batch runs its hooks one after another. A
   stuck hook holds the next worktree operation for at most the timeout; keystrokes never wait on it.
 - **A hook only reports.** It exits non-zero, cannot start, or runs past the timeout (30 s; then it
-  and every process it started are killed) — nebula shows a one-line warning naming the hook and the
+  and every process it started are killed) — orbit shows a one-line warning naming the hook and the
   last line it wrote to stderr, and logs the tail of its output in `daemon.log`. The worktree stays
   created or deleted, because it already was. Nothing is retried.
 - **It may start something that outlives it.** A hook that launches a dev server in the background
@@ -435,14 +435,14 @@ caddy reload --config /etc/caddy/Caddyfile
 ## Logs
 
 `daemon.log` and `tui.log` live in the state dir, which is not the DATA DIR on Linux and *is* on
-macOS — the `directories` crate has no state dir there, so nebula falls back to `<DATA DIR>/state`:
+macOS — the `directories` crate has no state dir there, so orbit falls back to `<DATA DIR>/state`:
 
-- **macOS**: `~/Library/Application Support/dev.nebula.nebula/state/`
-- **Linux**: `~/.local/state/nebula/`
-- With `NEBULA_DATA_DIR` set, always `$NEBULA_DATA_DIR/state/`, so a test or a parallel instance keeps
+- **macOS**: `~/Library/Application Support/dev.orbit.orbit/state/`
+- **Linux**: `~/.local/state/orbit/`
+- With `ORBIT_DATA_DIR` set, always `$ORBIT_DATA_DIR/state/`, so a test or a parallel instance keeps
   its logs beside its own data.
 
-`NEBULA_LOG=debug` for more. No `daemon.log` at all means the DAEMON never started.
+`ORBIT_LOG=debug` for more. No `daemon.log` at all means the DAEMON never started.
 
 ## Environment variables
 
@@ -450,25 +450,25 @@ Knobs worth reaching for by hand:
 
 | Var | Default | What it does |
 |---|---|---|
-| `NEBULA_LOG` | — | `RUST_LOG`-style tracing filter for both the DAEMON and the TUI. |
-| `NEBULA_EDITOR` | — | Editor command the file modals open, ahead of the `editor` setting. |
-| `NEBULA_CONFIG_FILE` | `<DATA DIR>/config.json` | Moves `config.json` alone — into a dotfiles checkout, say — leaving the database, logs and `config.local.json` in the DATA DIR. Give an absolute or `~/` path. The DAEMON reads it from its own environment, so after changing it run `nebula kill` and relaunch. |
+| `ORBIT_LOG` | — | `RUST_LOG`-style tracing filter for both the DAEMON and the TUI. |
+| `ORBIT_EDITOR` | — | Editor command the file modals open, ahead of the `editor` setting. |
+| `ORBIT_CONFIG_FILE` | `<DATA DIR>/config.json` | Moves `config.json` alone — into a dotfiles checkout, say — leaving the database, logs and `config.local.json` in the DATA DIR. Give an absolute or `~/` path. The DAEMON reads it from its own environment, so after changing it run `orbit kill` and relaunch. |
 
 Overrides for tests and parallel instances — real, but not things a normal install needs:
 
 | Var | Default | What it does |
 |---|---|---|
-| `NEBULA_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/nebula`, else `/tmp/nebula-<uid>` | The RUNTIME DIR holding the DAEMON SOCKET and pidfile. |
-| `NEBULA_DATA_DIR` | the platform app-support dir | The DATA DIR holding the database, config and logs. |
-| `NEBULA_AGENT_CMD` | — | Replaces every agent CLI with one command line, taken verbatim (tests stand in `/bin/sh` or a stub script). |
-| `NEBULA_INSTALL_URL` | the published install script | The URL `nebula upgrade` / `nebula ssh` fetch. |
-| `NEBULA_UPDATE_CHECK_SECS` | `3600` | How often the TUI asks GitHub whether a newer release is published, for the FOOTER's `⇡ vX.Y.Z` indicator (one `curl` to the release page's redirect, no `gh` token); `0` turns it off. See [Keys](keys.md#chips-and-readouts). |
-| `NEBULA_IDLE_REAP_MS` | `15000` | IDLE REAPER sweep period in ms. This is how often it looks, not how long a session may idle — that is `session_idle_timeout`. |
-| `NEBULA_WORKTREE_SYNC_MS` | `2000` | WORKTREE SYNC probe period in ms: how often the DAEMON reconciles `git worktree list` so worktrees made outside nebula appear. |
-| `NEBULA_HOOK_TIMEOUT_MS` | `30000` | How long a WORKTREE HOOK may run before the DAEMON kills it and warns; tests shorten it. |
+| `ORBIT_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/orbit`, else `/tmp/orbit-<uid>` | The RUNTIME DIR holding the DAEMON SOCKET and pidfile. |
+| `ORBIT_DATA_DIR` | the platform app-support dir | The DATA DIR holding the database, config and logs. |
+| `ORBIT_AGENT_CMD` | — | Replaces every agent CLI with one command line, taken verbatim (tests stand in `/bin/sh` or a stub script). |
+| `ORBIT_INSTALL_URL` | the published install script | The URL `orbit upgrade` / `orbit ssh` fetch. |
+| `ORBIT_UPDATE_CHECK_SECS` | `3600` | How often the TUI asks GitHub whether a newer release is published, for the FOOTER's `⇡ vX.Y.Z` indicator (one `curl` to the release page's redirect, no `gh` token); `0` turns it off. See [Keys](keys.md#chips-and-readouts). |
+| `ORBIT_IDLE_REAP_MS` | `15000` | IDLE REAPER sweep period in ms. This is how often it looks, not how long a session may idle — that is `session_idle_timeout`. |
+| `ORBIT_WORKTREE_SYNC_MS` | `2000` | WORKTREE SYNC probe period in ms: how often the DAEMON reconciles `git worktree list` so worktrees made outside orbit appear. |
+| `ORBIT_HOOK_TIMEOUT_MS` | `30000` | How long a WORKTREE HOOK may run before the DAEMON kills it and warns; tests shorten it. |
 
-`NEBULA_AGENT_ID`, `NEBULA_API_URL` and `NEBULA_API_TOKEN` are set *by* the DAEMON on every agent
+`ORBIT_AGENT_ID`, `ORBIT_API_URL` and `ORBIT_API_TOKEN` are set *by* the DAEMON on every agent
 PTY (and scrubbed from plain terminals) so hooks can reach the HOOK RECEIVER — never something you
-set yourself. `NEBULA_IMPORT_BUNDLE` is likewise set *by* `nebula ssh` and `nebula tunnel` in the
-remote command: the SETTINGS BUNDLE the remote nebula merges at startup and removes from its
+set yourself. `ORBIT_IMPORT_BUNDLE` is likewise set *by* `orbit ssh` and `orbit tunnel` in the
+remote command: the SETTINGS BUNDLE the remote orbit merges at startup and removes from its
 environment before it starts anything. For all of these, empty and unset mean the same thing: use the default.

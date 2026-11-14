@@ -1,0 +1,648 @@
+//! The command-line surface: every `orbit` subcommand, its arguments, and the
+//! help each one prints. `main.rs` owns only the dispatch and the logging.
+//!
+//! Two rules keep `--help` readable, and both are load-bearing:
+//!
+//! * **Every doc comment is two paragraphs.** `clap_derive` takes the first
+//!   paragraph as `about` and the whole comment as `long_about`, and the root's
+//!   command list only ever renders `about` — so paragraph one is a single
+//!   sentence under ~60 characters that has to stand alone, and the prose after
+//!   the blank line is what `orbit <command> --help` shows.
+//! * **Examples are `after_help`**, which `after_long_help` falls back to, so
+//!   one string serves both `-h` and `--help`. Clap runs it through the same
+//!   wrapper as everything else: keep every line under ~78 characters or the
+//!   hand-aligned columns reflow into a mess on a narrow terminal.
+//!
+//! Wrapping itself comes from clap's `wrap_help` feature (see Cargo.toml).
+//! Without it `StyledStr::wrap` compiles to a no-op and no width setting here
+//! does anything at all.
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "orbit",
+    version,
+    max_term_width = 100,
+    about = "Terminal multiplexer for Claude Code agents",
+    long_about = "Terminal multiplexer for Claude Code agents.\n\n\
+        Orbit keeps a tree — projects hold worktrees, worktrees hold sessions — \
+        and a background daemon owns every PTY in it. \
+        Agents keep running after the TUI quits, and their scrollback is replayed \
+        when you come back.\n\n\
+        A bare `orbit` opens the TUI. The commands below drive the same tree from \
+        a shell; `rename`, `worktree`, `spawn` and `open` are the ones an agent \
+        runs on your behalf from inside a session.",
+    after_help = ROOT_EXAMPLES
+)]
+pub(crate) struct Cli {
+    #[command(subcommand)]
+    pub(crate) command: Option<Command>,
+    /// Directory to add as a project — shorthand for `orbit add <dir>`.
+    ///
+    /// A directory whose name collides with a subcommand needs the long form
+    /// (`orbit add browser`) or a `./` prefix.
+    pub(crate) dir: Option<String>,
+}
+
+const ROOT_EXAMPLES: &str = "\
+Examples:
+  orbit                            open the TUI (auto-starts the daemon)
+  orbit add ~/code/my-app          register a project
+  orbit browser --port 8080        serve this TUI in a browser tab
+
+Run `orbit <command> --help` for a command's flags and examples.";
+
+/// `--kind` for `orbit spawn`: one of the agent CLIs orbit runs. A bare
+/// `custom` is never accepted: custom harnesses carry a registry id the
+/// flag cannot name, so they launch from the TUI picker and presets.
+fn parse_agent_kind(s: &str) -> Result<orbit_core::AgentKind, String> {
+    orbit_core::AgentKind::parse(s).ok_or_else(|| {
+        format!(
+            "unknown harness `{s}` — expected one of {} (custom harnesses launch from the TUI)",
+            orbit_core::AgentKind::ALL
+                .iter()
+                .filter(|k| **k != orbit_core::AgentKind::Custom)
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+fn parse_review_tab(s: &str) -> Result<orbit_core::ReviewTabKind, String> {
+    match s {
+        "terminal" => Ok(orbit_core::ReviewTabKind::Terminal),
+        "diff" => Ok(orbit_core::ReviewTabKind::Diff),
+        "history" => Ok(orbit_core::ReviewTabKind::History),
+        "pr" | "pull-request" | "pull_request" => Ok(orbit_core::ReviewTabKind::PullRequest),
+        _ => Err("expected terminal, diff, history or pr".into()),
+    }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum Command {
+    /// Register a git checkout as a project.
+    ///
+    /// Adds a directory to the project list, named after the repository's
+    /// root directory. Bare `orbit <dir>` is the same
+    /// command, so `orbit .` and `orbit add .` do the same thing.
+    #[command(after_help = ADD_EXAMPLES)]
+    Add {
+        /// Path to a git repository (default: the current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Run the daemon that owns every session.
+    ///
+    /// The daemon holds every PTY, the store, git and agent status. The TUI
+    /// auto-spawns it detached, so you rarely run this by hand — reach for it
+    /// when you want to watch what the daemon is doing. Set ORBIT_LOG to
+    /// change the log level.
+    #[command(after_help = DAEMON_EXAMPLES)]
+    Daemon {
+        /// Stay attached to the terminal instead of logging to file.
+        #[arg(long)]
+        foreground: bool,
+        /// Take over the sessions a restarting daemon wrote to this file.
+        #[arg(long, hide = true, value_name = "STATE")]
+        adopt: Option<std::path::PathBuf>,
+    },
+    /// Shut the running daemon down (stops all sessions).
+    ///
+    /// Asks the daemon to exit cleanly; every session it owns stops with it.
+    /// A daemon from a build on another protocol can't take that request, so
+    /// it gets SIGTERM instead, which it handles the same clean way.
+    /// Quitting the TUI does not do this — the daemon outlives its clients on
+    /// purpose — so this is how you stop everything. To move onto a newly
+    /// installed binary without stopping anything, use `orbit reload`.
+    #[command(after_help = KILL_EXAMPLES)]
+    Kill,
+    /// Move the daemon onto the installed binary, keeping every session.
+    ///
+    /// Restarts the running daemon in place: it execs the `orbit` binary
+    /// this command runs from, and every session — agents mid-turn included —
+    /// keeps running, its scrollback intact. Open TUIs lose their connection;
+    /// relaunch `orbit` to pick the sessions back up. `orbit upgrade` does
+    /// this on its own after installing. Needs a daemon from a build that
+    /// has this command; an older one can only be restarted by `orbit kill`.
+    #[command(after_help = RELOAD_EXAMPLES)]
+    Reload,
+    /// Title the session this command runs inside.
+    ///
+    /// Run from inside a orbit agent session: it titles that session's row.
+    /// Agents run it themselves to auto-title on your first prompt. Without
+    /// --force it only fills in a title that is still missing, so an agent
+    /// can never overwrite a name you chose.
+    #[command(after_help = RENAME_EXAMPLES)]
+    Rename {
+        /// The new title; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        title: Vec<String>,
+        /// Replace an existing title instead of only filling in a missing one.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Move this session into a worktree of its project.
+    ///
+    /// Run from inside a orbit agent session; agents run it when you ask them
+    /// to work in a worktree. Creates the git worktree when the branch has
+    /// none, re-homes the session onto it at once, and restarts the session
+    /// resumed inside the new checkout as soon as the current turn ends.
+    #[command(after_help = WORKTREE_EXAMPLES)]
+    Worktree {
+        /// Branch name; several words are joined with hyphens, none at all
+        /// gets a random `<adj>-<noun>-<verb>` one.
+        name: Vec<String>,
+        /// Start point for a new branch (default: the `worktree_base_branch`
+        /// setting, else origin's default branch, fetched).
+        ///
+        /// A branch name origin has means origin's copy of it, fetched first:
+        /// `main` is `origin/main`, never this checkout's local branch. A tag,
+        /// a SHA or a branch origin lacks is used as named. Refused when the
+        /// branch already exists, since it already has a start point.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+    },
+    /// Start another agent session beside this one.
+    ///
+    /// Run from inside a orbit agent session; agents run it when you ask for
+    /// a new orbit session. The new session starts in the same worktree (or
+    /// the one `--worktree` names), on the task you name as its first
+    /// prompt, and shows up on the grid on its own — this session carries
+    /// on untouched.
+    #[command(after_help = SPAWN_EXAMPLES)]
+    Spawn {
+        /// The task the new session starts on; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        task: Vec<String>,
+        /// Harness for the new session: claude, codex, cursor, pi, muse,
+        /// grok or opencode.
+        ///
+        /// Defaults to the harness this session is running.
+        #[arg(long, value_name = "KIND", value_parser = parse_agent_kind)]
+        kind: Option<orbit_core::AgentKind>,
+        /// Model for the new session (defaults to the inherited model).
+        #[arg(long)]
+        model: Option<String>,
+        /// Reasoning effort for the new session (defaults to the inherited effort).
+        #[arg(long)]
+        effort: Option<String>,
+        /// Start the session in this project's worktree on BRANCH instead,
+        /// creating the worktree when the branch has none; spaces become
+        /// hyphens.
+        #[arg(long, value_name = "BRANCH")]
+        worktree: Option<String>,
+        /// Start point for a new `--worktree` branch, resolved as
+        /// `orbit worktree --base` resolves it (default: the
+        /// `worktree_base_branch` setting, else origin's default branch).
+        /// Refused when the branch already exists.
+        #[arg(long, value_name = "REF", requires = "worktree")]
+        base: Option<String>,
+    },
+    /// Show files to the user inside this orbit.
+    ///
+    /// Run from inside a orbit agent session; agents run it only when you
+    /// ask to see a file, image, mockup or diagram, never unprompted.
+    /// Opens text, supported local images and Mermaid diagrams; other
+    /// binaries are refused.
+    /// The files open in orbit's file tabs — a modal with one tab per file,
+    /// the focused one previewed, Enter editing it — in every orbit
+    /// attached to this daemon, and this session carries on untouched.
+    #[command(after_help = OPEN_EXAMPLES)]
+    Open {
+        /// The files to show, relative to the current directory or absolute.
+        #[arg(required = true, num_args = 1.., value_name = "FILE")]
+        files: Vec<String>,
+    },
+    /// List every session across every project.
+    ///
+    /// Prints the session id/name, project, worktree branch, harness, status
+    /// and a one-line recent summary. Agents run this when you refer to
+    /// another orbit session by name and they need its exact id.
+    #[command(after_help = SESSIONS_EXAMPLES)]
+    Sessions {
+        /// Print JSON instead of compact text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read another session's recent context.
+    ///
+    /// Resolves a session by id or unambiguous fuzzy name, then prints clean
+    /// recent conversation text. Claude transcript text is preferred when
+    /// available; otherwise orbit falls back to stripped PTY scrollback.
+    #[command(after_help = READ_EXAMPLES)]
+    Read {
+        /// Session id or unambiguous fuzzy name.
+        session: String,
+        /// Number of recent text lines to print.
+        #[arg(long, default_value_t = 200)]
+        lines: u32,
+    },
+    /// Ask another session a question and print its answer.
+    ///
+    /// Sends a labelled prompt into the target agent, waits for that turn to
+    /// finish, and prints only the answer text captured from the target's
+    /// output. If the target is busy, the default is to wait until it is idle
+    /// before sending; --no-wait fails fast instead.
+    #[command(after_help = ASK_EXAMPLES)]
+    Ask {
+        /// Target agent id or unambiguous fuzzy name.
+        session: String,
+        /// Question text; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        question: Vec<String>,
+        /// Total seconds to wait for queueing and the answer turn.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Fail instead of queueing when the target is currently busy.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Coordinate projects from the orchestrator session.
+    ///
+    /// These commands are for the pinned orchestrator agent only. They are
+    /// refused by the daemon unless the current ORBIT_AGENT_ID belongs to
+    /// the persisted orchestrator row.
+    #[command(after_help = ORCHESTRATOR_EXAMPLES)]
+    Orchestrator {
+        #[command(subcommand)]
+        command: OrchestratorCommand,
+    },
+    /// Back up, restore or locate this machine's settings.
+    ///
+    /// Settings live in `config.json` — the portable file an export, an
+    /// import and `orbit ssh` carry — with `config.local.json` over it for
+    /// what only makes sense on this machine, beside `agent_presets.json` and
+    /// `ssh_hosts.json`. An export is one JSON file holding all but the local
+    /// layer; an import merges one in. Changes apply without a restart.
+    #[command(after_help = CONFIG_EXAMPLES)]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Serve this TUI in a web browser via ttyd.
+    ///
+    /// Runs ttyd in front of a orbit TUI and opens a tab on it, so a phone or
+    /// another machine can drive this orbit. Needs ttyd on PATH
+    /// (`brew install ttyd`); Ctrl+C takes the server down. It listens on
+    /// loopback unless --bind or --public widens it.
+    #[command(after_help = BROWSER_EXAMPLES)]
+    Browser {
+        /// Port for ttyd to listen on.
+        ///
+        /// Omit to take 7681 when it's free and a free one otherwise — so a
+        /// checkout per worktree can each serve at once. `--port 0` always
+        /// picks a free one; a port named explicitly is used or the command
+        /// fails, which is what you want behind an ssh tunnel.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Address to listen on (default 127.0.0.1).
+        ///
+        /// Name a specific interface address to reach this orbit from another
+        /// host — e.g. `--bind 10.0.1.7`. See --public for every interface.
+        #[arg(long, value_name = "ADDR", conflicts_with = "public")]
+        bind: Option<std::net::IpAddr>,
+        /// Listen on every interface (0.0.0.0).
+        ///
+        /// For a orbit on a remote box. This serves a live, writable terminal
+        /// to anything that can reach the port — put a firewall, security
+        /// group, or VPN in front of it, and consider --credential.
+        #[arg(long)]
+        public: bool,
+        /// HTTP basic auth for the served terminal, as USER:PASSWORD.
+        ///
+        /// ttyd asks for it in the browser tab. Worth adding to any bind wider
+        /// than loopback, on top of whatever guards the port itself.
+        #[arg(long, value_name = "USER:PASSWORD")]
+        credential: Option<String>,
+        /// Serve the URL but do not open a desktop browser.
+        ///
+        /// For a machine with no desktop to open it on — `orbit tunnel` runs
+        /// the remote half this way.
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// Open orbit on a remote host over ssh.
+    ///
+    /// Connects with ssh and runs orbit there, installing it on the remote
+    /// first when it is missing, so what you drive is the remote's own daemon
+    /// and sessions. This machine's `config.json` and agent presets ride
+    /// along and are merged into the remote's settings, where its own
+    /// `config.local.json` still wins. Destinations are remembered for the
+    /// TUI's host picker (`Shift+H`).
+    #[command(after_help = SSH_EXAMPLES)]
+    Ssh {
+        /// ssh destination, passed verbatim (e.g. user@server).
+        host: String,
+        /// Remote directory to start in (default: remote $HOME).
+        path: Option<String>,
+        /// Leave this machine's settings behind for this connection.
+        ///
+        /// The `ssh_sync_config` setting turns the forward off for good.
+        #[arg(long)]
+        no_sync_config: bool,
+    },
+    /// Open orbit inside a local Docker sandbox.
+    ///
+    /// Starts a Docker container and runs orbit in it, installing it there
+    /// first as `orbit ssh` does, so agents work inside the container and
+    /// never see this machine's files. The container is kept: the next
+    /// `orbit sbx` finds its daemon, sessions and clones where you left
+    /// them. A NAME gets a sandbox of its own, `orbit-sbx-NAME`; remove
+    /// one with `docker rm -f`. Settings ride along as for `orbit ssh`.
+    #[command(after_help = SBX_EXAMPLES)]
+    Sbx {
+        /// A separate sandbox, e.g. one per client (default: `orbit-sbx`).
+        name: Option<String>,
+        /// Image to create the container from (default:
+        /// buildpack-deps:bookworm-scm).
+        ///
+        /// Only read when the container is created; recreate it to change.
+        #[arg(long)]
+        image: Option<String>,
+    },
+    /// Open a remote host's orbit in a browser tab here.
+    ///
+    /// One ssh tunnel does the whole thing: it installs orbit on the remote
+    /// if missing, runs `orbit browser` on the remote's own loopback,
+    /// forwards the port, and opens the local URL. Nothing is exposed on the
+    /// remote's network — the tunnel is the only way in — so it needs no
+    /// --credential. A `orbit browser` already serving that port is reused
+    /// rather than treated as a clash. Needs ttyd on the remote; Ctrl+C takes
+    /// both ends down.
+    #[command(after_help = TUNNEL_EXAMPLES)]
+    Tunnel {
+        /// ssh destination, passed verbatim (e.g. user@server).
+        host: String,
+        /// Remote directory to start in (default: remote $HOME).
+        path: Option<String>,
+        /// Local end of the tunnel, and the port the browser opens.
+        ///
+        /// Omit to take 7681 when it is free and a free port otherwise;
+        /// `--port 0` always picks a free one.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Port the remote serves on (default: the same number as --port).
+        ///
+        /// Name one when something on the remote already holds that port.
+        #[arg(long, value_name = "PORT")]
+        remote_port: Option<u16>,
+        /// Leave this machine's settings behind for this connection.
+        ///
+        /// By default `config.json` and the agent presets ride along, as they
+        /// do for `orbit ssh`; the `ssh_sync_config` setting turns that off
+        /// for good.
+        #[arg(long)]
+        no_sync_config: bool,
+    },
+    /// Install the latest published orbit over this one.
+    ///
+    /// Runs the install script for the newest release, then moves a running
+    /// daemon onto the new binary in place (see `orbit reload`): every
+    /// session keeps running. A daemon from before in-place restarts can't
+    /// be moved; its sessions keep running on the old binary until you
+    /// restart it with `orbit kill` (which stops all sessions), and when the
+    /// new build can't attach to it, upgrade says so and offers that restart.
+    #[command(after_help = UPGRADE_EXAMPLES)]
+    Upgrade {
+        /// Upgrade even when running from a local cargo build.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Installer hook: print the cutover note only when a live daemon is on
+    /// a different build than this binary (see `make install` / install.sh).
+    #[command(hide = true, name = "_stale-daemon-note")]
+    StaleDaemonNote,
+    /// Upgrade hook: print the protocol version this binary speaks, so the
+    /// `orbit upgrade` that installed it can tell whether it will still
+    /// attach to the daemon left running.
+    #[command(hide = true, name = "_protocol-version")]
+    ProtocolVersion,
+    /// Upgrade hook: print the oldest protocol version this binary can
+    /// attach to, paired with `_protocol-version` for compatibility checks.
+    #[command(hide = true, name = "_protocol-min-compatible-version")]
+    ProtocolMinCompatibleVersion,
+    /// Reload hook: print the newest restart-state version this binary
+    /// reads, so a daemon asked to restart onto it knows it can.
+    #[command(hide = true, name = "_restart-version")]
+    RestartVersion,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum OrchestratorCommand {
+    /// List every project, worktree and session.
+    List {
+        /// Print JSON instead of compact text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read recent bounded output from a session.
+    Read {
+        /// Agent id, or terminal:<id> for a terminal.
+        session: String,
+        /// Max bytes to read from the PTY ring (capped by the daemon).
+        #[arg(long, default_value_t = 8192)]
+        bytes: u32,
+    },
+    /// Send a follow-up prompt to another local agent.
+    Send {
+        /// Target agent id.
+        session: String,
+        /// Prompt text; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        prompt: Vec<String>,
+    },
+    /// Spawn an agent in any project or worktree.
+    Spawn {
+        /// Project id or visible project name.
+        #[arg(long)]
+        project: String,
+        /// Worktree id or branch. Existing checkouts are reused; a missing
+        /// branch is cut using orbit's normal worktree base rules.
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Start point when a new worktree has to be cut.
+        #[arg(long)]
+        base: Option<String>,
+        /// Harness for the new session.
+        #[arg(long, value_name = "KIND", value_parser = parse_agent_kind, default_value = "claude")]
+        kind: orbit_core::AgentKind,
+        /// Model for the new session.
+        #[arg(long)]
+        model: Option<String>,
+        /// Reasoning effort for the new session.
+        #[arg(long)]
+        effort: Option<String>,
+        /// Prompt text; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        task: Vec<String>,
+    },
+    /// Open the tabbed review modal in every attached TUI.
+    Review {
+        /// Agent id, or terminal:<id> for a terminal.
+        session: String,
+        /// Tabs to open. Repeats allowed; default is terminal, diff, history, pr.
+        #[arg(long = "tab", value_parser = parse_review_tab)]
+        tabs: Vec<orbit_core::ReviewTabKind>,
+    },
+}
+
+const ADD_EXAMPLES: &str = "\
+Examples:
+  orbit add .                     add the repo you are standing in
+  orbit add ~/code/my-app         add one by path
+  orbit ~/code/my-app             the same, without the subcommand";
+
+const DAEMON_EXAMPLES: &str = "\
+Examples:
+  orbit daemon --foreground       run it attached, logs on stdout
+  ORBIT_LOG=debug orbit daemon --foreground
+                                   the same, at debug level";
+
+const KILL_EXAMPLES: &str = "\
+Examples:
+  orbit kill                      stop the daemon and every session";
+
+const RELOAD_EXAMPLES: &str = "\
+Examples:
+  orbit reload                    restart the daemon, sessions and all
+  make install && orbit reload    cut over to a local build";
+
+const RENAME_EXAMPLES: &str = "\
+Examples:
+  orbit rename Fix Login Redirect   title this session
+  orbit rename --force Auth Rework  replace a title already set";
+
+const WORKTREE_EXAMPLES: &str = "\
+Examples:
+  orbit worktree fix-login-redirect  branch off the configured base and move there
+  orbit worktree fix login redirect  the same; the words are slugified
+  orbit worktree                     invent a random branch name
+  orbit worktree hotfix --base v0.21.0
+                                      branch from a named start point";
+
+const SPAWN_EXAMPLES: &str = "\
+Examples:
+  orbit spawn \"port the tests to the new fixture\"
+  orbit spawn --kind codex \"review the diff on this branch\"
+  orbit spawn --worktree fix-login \"fix the login redirect\"
+                                   start it in that branch's worktree, made if new
+  orbit spawn --worktree hotfix --base v0.21.0 \"backport the fix\"";
+
+const OPEN_EXAMPLES: &str = "\
+Examples:
+  orbit open README.md                one tab
+  orbit open mockup.png flow.mmd      image and diagram previews
+  orbit open src/main.rs docs/keys.md a tab each, in this order";
+
+const SESSIONS_EXAMPLES: &str = "\
+Examples:
+  orbit sessions
+  orbit sessions --json";
+
+const READ_EXAMPLES: &str = "\
+Examples:
+  orbit read research
+  orbit read 01HZY8QHA4AYM7M4XTA2G3KC9B --lines 80";
+
+const ASK_EXAMPLES: &str = "\
+Examples:
+  orbit ask research \"which library did you recommend?\"
+  orbit ask \"feature spike\" \"summarize your Redis findings\" --timeout 60
+  orbit ask research \"are you idle?\" --no-wait";
+
+const ORCHESTRATOR_EXAMPLES: &str = "\
+Examples:
+  orbit orchestrator list --json
+  orbit orchestrator read agent-2 --bytes 12000
+  orbit orchestrator send agent-2 \"continue after the test failure\"
+  orbit orchestrator spawn --project orbit --worktree fix-auth \"fix the login redirect\"
+  orbit orchestrator review agent-2 --tab diff --tab terminal";
+
+const BROWSER_EXAMPLES: &str = "\
+Examples:
+  orbit browser                   serve on 127.0.0.1:7681, open a tab
+  orbit browser --port 8080       take a specific port
+  orbit browser --no-open         serve only; print the URL
+  orbit browser --public --credential me:secret
+                                   reachable off-box, behind basic auth";
+
+const SSH_EXAMPLES: &str = "\
+Examples:
+  orbit ssh user@server           open the remote's orbit
+  orbit ssh user@server /srv/app  start in a directory there
+  orbit ssh user@server --no-sync-config
+                                   keep this machine's settings here";
+
+const SBX_EXAMPLES: &str = "\
+Examples:
+  orbit sbx                       open orbit in the orbit-sbx container
+  orbit sbx client-a              a separate sandbox, orbit-sbx-client-a
+  orbit sbx --image node:22       create it from another image
+  docker rm -f orbit-sbx          throw the default sandbox away";
+
+const CONFIG_EXAMPLES: &str = "\
+Examples:
+  orbit config path               where each settings file lives
+  orbit config export ~/backups   write ~/backups/orbit-settings.json
+  orbit config import ~/backups   merge it back in, here or elsewhere";
+
+const TUNNEL_EXAMPLES: &str = "\
+Examples:
+  orbit tunnel user@server           the remote's TUI in a tab here
+  orbit tunnel user@server /srv/app  start in a directory there
+  orbit tunnel user@server --port 9000
+                                      pick the local end of the tunnel";
+
+const UPGRADE_EXAMPLES: &str = "\
+Examples:
+  orbit upgrade                   install the latest release
+  orbit upgrade --force           do it over a local cargo build";
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Print where each settings file lives.
+    ///
+    /// `ORBIT_CONFIG_FILE` moves `config.json` alone — into a dotfiles
+    /// checkout, say; `ORBIT_DATA_DIR` moves them all.
+    #[command(after_help = "Example:\n  orbit config path")]
+    Path,
+    /// Write this machine's settings to one JSON file.
+    ///
+    /// Carries `config.json`, the agent presets and the ssh host list, never
+    /// `config.local.json`. Keys and presets this build doesn't know are
+    /// carried as they are, so a newer orbit's settings survive the trip.
+    #[command(
+        after_help = "Examples:\n  orbit config export > orbit-settings.json\n  \
+                            orbit config export ~/backups   writes ~/backups/orbit-settings.json"
+    )]
+    Export {
+        /// File, or existing folder, to write (default: stdout; `-` too).
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
+    /// Merge a settings backup into this machine's settings.
+    ///
+    /// Takes an export, a bare `config.json`, `agent_presets.json` or
+    /// `ssh_hosts.json`, a folder holding any of them, or `-` for stdin. Keys
+    /// the file sets replace this machine's and keys it lacks are left alone;
+    /// presets merge by name and hosts by destination. `config.local.json` is
+    /// never written, and still wins.
+    #[command(
+        after_help = "Examples:\n  orbit config import orbit-settings.json\n  \
+                            orbit config import ~/dotfiles/orbit   a folder holding config.json"
+    )]
+    Import {
+        /// The file, the folder, or `-` for stdin.
+        #[arg(value_name = "SOURCE")]
+        source: String,
+    },
+    /// Print the effective harness registry: every harness orbit knows —
+    /// the built-ins, `custom_harnesses` entries and `harnesses` map ids —
+    /// with the program, flags, resume shape, hook dialect and defaults a
+    /// launch actually uses. Copy a row into config.json `harnesses` to
+    /// override it.
+    #[command(after_help = "Example:\n  orbit config harnesses")]
+    Harnesses,
+}

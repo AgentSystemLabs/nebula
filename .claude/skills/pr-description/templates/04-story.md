@@ -21,7 +21,7 @@
 
 | <Caption: what this shows> |
 |---|
-| ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<after>.png) |
+| ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<after>.png) |
 
 <!-- A before shot too, if the problem was visible: make it a two-column table. -->
 

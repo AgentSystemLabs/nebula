@@ -39,7 +39,7 @@
 
 | <What this shows — the screen after the change> |
 |---|
-| ![<alt: the SESSIONS PANEL with …>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<after>.png) |
+| ![<alt: the SESSIONS PANEL with …>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<after>.png) |
 
 <!-- Captured with the SCREENSHOT HARNESS at 190x50; hosted on the pr-assets branch (skill step 4). -->
 
@@ -88,7 +88,7 @@ flowchart LR
 ## 📝 Notes <a id="notes"></a>
 
 - <Merge state: `origin/main` (vX.Y.Z) is merged in; conflicts and what they broke, or "none".>
-- <Anything the user must do to upgrade — a PROTOCOL VERSION bump means `nebula kill` first.>
+- <Anything the user must do to upgrade — a PROTOCOL VERSION bump means `orbit kill` first.>
 - Closes #<N>.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

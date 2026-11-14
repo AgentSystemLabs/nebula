@@ -18,8 +18,8 @@
 
 | Before | After |
 |---|---|
-| ![<alt: … before>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<thing-one>-before.png) | ![<alt: … after>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<thing-one>-after.png) |
-| ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<thing-two>-before.png) | ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<thing-two>-after.png) |
+| ![<alt: … before>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<thing-one>-before.png) | ![<alt: … after>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<thing-one>-after.png) |
+| ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<thing-two>-before.png) | ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<thing-two>-after.png) |
 
 <!-- The "before" shot comes from an origin/main build in the SCREENSHOT HARNESS; same size, same demo data, same cursor position. -->
 

@@ -13,7 +13,7 @@ pub struct Grid {
     scrollback: std::collections::VecDeque<crate::row::Row>,
     scrollback_len: usize,
     scrollback_offset: usize,
-    // NEBULA PATCH: rows that have fallen off the front of `scrollback`
+    // ORBIT PATCH: rows that have fallen off the front of `scrollback`
     // since this grid was made. With it every row the grid has ever held
     // has a HISTORY LINE number that never changes — see `history_base`.
     scrollback_dropped: u64,
@@ -200,7 +200,7 @@ impl Grid {
         self.scrollback_offset
     }
 
-    // NEBULA PATCH: how many rows the scrollback holds, and a way to let
+    // ORBIT PATCH: how many rows the scrollback holds, and a way to let
     // them go. The TUI keeps the screens of recently shown sessions for an
     // instant return; a long history is tens of megabytes of cells it does
     // not need for that, and drops — a full replay brings it back if the
@@ -219,7 +219,7 @@ impl Grid {
         self.scrollback_offset = rows.min(self.scrollback.len());
     }
 
-    // NEBULA PATCH: HISTORY LINES. Every row this grid has held — dropped
+    // ORBIT PATCH: HISTORY LINES. Every row this grid has held — dropped
     // off the ring, in the scrollback, or on the drawing screen — is
     // numbered from 0 (the first row ever scrolled out) upward, and keeps
     // its number as the view scrolls and as new output pushes it up into
@@ -617,7 +617,7 @@ impl Grid {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
-            // NEBULA PATCH: upstream only saves scrolled-out rows when no
+            // ORBIT PATCH: upstream only saves scrolled-out rows when no
             // DECSTBM region is active. Real terminals also keep rows that
             // scroll out of a TOP-ANCHORED region (top == row 0) — ratatui
             // inline-viewport apps (codex) insert chat history exactly that
@@ -665,7 +665,7 @@ impl Grid {
         self.pos.row >= self.scroll_top && self.pos.row <= self.scroll_bottom
     }
 
-    // NEBULA PATCH: no longer used by scroll_up; kept to minimize the diff
+    // ORBIT PATCH: no longer used by scroll_up; kept to minimize the diff
     // from upstream 0.16.2.
     #[allow(dead_code)]
     fn scroll_region_active(&self) -> bool {

@@ -15,7 +15,7 @@ for extra in api-server web-app; do
 done
 # shot.sh registers the demo with `$BIN add`; this wrapper registers the other two first.
 REAL_BIN="$BIN"
-cat > "$RUNTIME/nebula" <<WRAP
+cat > "$RUNTIME/orbit" <<WRAP
 #!/bin/sh
 if [ "\$1" = add ]; then
   "$REAL_BIN" add "$WORK/api-server" >/dev/null
@@ -23,31 +23,31 @@ if [ "\$1" = add ]; then
 fi
 exec "$REAL_BIN" "\$@"
 WRAP
-chmod +x "$RUNTIME/nebula"
-BIN="$RUNTIME/nebula"
+chmod +x "$RUNTIME/orbit"
+BIN="$RUNTIME/orbit"
 cp -R "$HERE/fixtures" "$WORK/fx"
-export NEBULA_GH_FIXTURES="$WORK/fx"
-export NEBULA_SHOT_BIN="$REAL_BIN" NEBULA_SHOT_COUNTER="$RUNTIME/launches"
+export ORBIT_GH_FIXTURES="$WORK/fx"
+export ORBIT_SHOT_BIN="$REAL_BIN" ORBIT_SHOT_COUNTER="$RUNTIME/launches"
 cat > "$RUNTIME/agent" <<'AGENT'
 #!/bin/sh
-n=$(cat "$NEBULA_SHOT_COUNTER" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$NEBULA_SHOT_COUNTER"
+n=$(cat "$ORBIT_SHOT_COUNTER" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$ORBIT_SHOT_COUNTER"
 post() {
-  curl -sS -m 3 -X POST -H "Authorization: Bearer $NEBULA_API_TOKEN" -H 'Content-Type: application/json' \
-    -d "$2" "$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=$1" >/dev/null 2>&1
+  curl -sS -m 3 -X POST -H "Authorization: Bearer $ORBIT_API_TOKEN" -H 'Content-Type: application/json' \
+    -d "$2" "$ORBIT_API_URL/api/hooks/claude?agentId=$ORBIT_AGENT_ID&hookEvent=$1" >/dev/null 2>&1
 }
 say() { printf '%s\r\n' "$@"; }
 case "$n" in
   1) title="Login redirect loop"
      post UserPromptSubmit "{\"session_id\":\"shot-1\",\"prompt\":\"Fix the login redirect loop when the session cookie has expired\"}"
-     printf '{"number": 57, "url": "https://github.com/AgentSystemLabs/nebula/pull/57", "title": "Fix the login redirect loop on expired cookies", "state": "OPEN", "isDraft": false, "comments": [], "reviews": []}' \
-       > "$NEBULA_GH_FIXTURES/pr-view-$(basename "$PWD").json"
+     printf '{"number": 57, "url": "https://github.com/AmenAdem/Orbit/pull/57", "title": "Fix the login redirect loop on expired cookies", "state": "OPEN", "isDraft": false, "comments": [], "reviews": []}' \
+       > "$ORBIT_GH_FIXTURES/pr-view-$(basename "$PWD").json"
      say "> Fix the login redirect loop when the session cookie has expired" "" \
          "⏺ Read(src/auth/session.rs)" "  ⎿  Read 214 lines" "" \
          "⏺ The redirect fires before the expired cookie is cleared, so the" \
          "  login page sees a session and bounces back. Clearing it first." "" \
          "⏺ Update(src/auth/session.rs)" "  ⎿  Updated with 6 additions and 2 removals" "" \
          "⏺ Bash(cargo test auth::)" "  ⎿  test result: ok. 24 passed; 0 failed" "" \
-         "⏺ Bash(gh pr create --fill)" "  ⎿  https://github.com/AgentSystemLabs/nebula/pull/57" "" \
+         "⏺ Bash(gh pr create --fill)" "  ⎿  https://github.com/AmenAdem/Orbit/pull/57" "" \
          "✻ Watching CI… (2m 14s · esc to interrupt)" ;;
   2) title="Changelog by date"
      post UserPromptSubmit "{\"session_id\":\"shot-2\",\"prompt\":\"Sort the changelog entries by date, newest first\"}"
@@ -63,8 +63,8 @@ case "$n" in
          "  Do you want to proceed?" "  ❯ 1. Yes" "    2. Yes, and don't ask again for cargo build" "    3. No"
      sleep 0.3; post PermissionRequest "{\"session_id\":\"shot-3\"}" ;;
 esac
-"$NEBULA_SHOT_BIN" rename "$title" >/dev/null 2>&1 || true
+"$ORBIT_SHOT_BIN" rename "$title" >/dev/null 2>&1 || true
 exec /bin/cat
 AGENT
 chmod +x "$RUNTIME/agent"
-export NEBULA_AGENT_CMD="$RUNTIME/agent"
+export ORBIT_AGENT_CMD="$RUNTIME/agent"

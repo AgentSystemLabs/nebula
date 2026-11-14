@@ -16,7 +16,7 @@
     "name": "quick-prompt"
    }
   ],
-  "body": "Open `p`, type a task, press `Shift+Tab`, then `Esc`.\n\nExpected: the box comes back with the text.\nActual: the box comes back empty about one time in five \u2014 it looks like a race with the git poll repainting the overlay.\n\n### Steps to reproduce\n1. `p`\n2. type `fix the login redirect`\n3. `Shift+Tab`, `Esc`\n\nnebula 0.26.0, Ghostty 1.2, macOS 15."
+  "body": "Open `p`, type a task, press `Shift+Tab`, then `Esc`.\n\nExpected: the box comes back with the text.\nActual: the box comes back empty about one time in five \u2014 it looks like a race with the git poll repainting the overlay.\n\n### Steps to reproduce\n1. `p`\n2. type `fix the login redirect`\n3. `Shift+Tab`, `Esc`\n\norbit 0.26.0, Ghostty 1.2, macOS 15."
  },
  {
   "number": 60,
@@ -56,7 +56,7 @@
  {
   "number": 55,
   "url": "https://github.com/AgentSystemLabs/demo/issues/55",
-  "title": "`nebula upgrade` should print the release notes it is about to install",
+  "title": "`orbit upgrade` should print the release notes it is about to install",
   "author": {
    "login": "jsato"
   },

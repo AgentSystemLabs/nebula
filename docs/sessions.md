@@ -18,7 +18,7 @@ time (no resume mapping), and — unless it names a built-in hook dialect — st
 while the PTY is live, green when it ends, never red. `→` on any row drills
 into model and reasoning-effort submenus (Cursor's model is a family such as `claude-opus-5-thinking`, and
 its effort list follows the family, `-fast` variants included — `cursor-agent --list-models` bakes both
-into the id, so nebula launches `--model claude-opus-5-thinking-high-fast`; the list is a built-in seed
+into the id, so orbit launches `--model claude-opus-5-thinking-high-fast`; the list is a built-in seed
 merged with `--list-models`, cached in `cursor_models.json` beside `config.json` and refreshed daily;
 Pi's model is a fuzzy `--model` pattern — `opus`, `sonnet`, or a `provider/id` you set in `config.json` —
 and its effort is the `--thinking` level, `off` through `max`).
@@ -27,22 +27,22 @@ The menu and those submenus take type-ahead: letters narrow the rows to their fu
 Claude row — and on any row of the Claude model and effort lists under it, whose title then reads
 `Claude model · cloud` — `Tab` toggles Cloud mode, the footer naming the key and the state it is in
 (`Tab: cloud off`): enter the task in the wrapped editor
-(`Shift+Enter`, `Option+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud=<task>` — the value binds
+(`Shift+Enter`, `Option+Enter` or `Ctrl+J` adds a line) and orbit launches `claude --cloud=<task>` — the value binds
 with `=` and never a space, because `--cloud` takes an *optional* value, so a separate argv item starting
 with `--` would be read as another Claude flag instead. The CLI creates the session, prints its URL and
-exits — nebula reads the session id off that output, and that is where the local side ends. The agent
+exits — orbit reads the session id off that output, and that is where the local side ends. The agent
 runs in Claude's cloud sandbox, not in a terminal here, so the row wears a `cloud` badge and its pane is
 the **CLOUD SESSION PANEL** instead of a terminal: a line saying so, and the session's
 `https://claude.ai/code/session_…` link, underlined. The card reads like any other card's: the task
 you typed is its first prompt (the `›` line, and every message you later **Send to cloud session**
 joins the RECENT PROMPTS behind it), and the row takes the title Claude Cloud gives the session —
 the `Created cloud session:` line of the same output — as its name, since no hook ever reaches
-nebula from the sandbox to let the session title itself; a name you typed stands, and `r` renames
+orbit from the sandbox to let the session title itself; a name you typed stands, and `r` renames
 it whenever you like. `Enter` on the row — or a click on the link — opens
 the page in the browser. Nothing is attached, teleported or re-homed on your behalf, the checkout never
 switches branch, and **Attach** and **Restart** are not offered: there is no local session behind the
 row, and the daemon refuses to boot a bare `claude` in its name. To steer the cloud agent without a
-browser, pick **Send to cloud session** from the card's right-click menu — the same wrapped editor — and nebula
+browser, pick **Send to cloud session** from the card's right-click menu — the same wrapped editor — and orbit
 runs `claude -p <message> --cloud=<id>`; the reply lands on the session's page, the CLI never returns
 one. Otherwise `Enter` on a row opens the QUICK PROMPT set to that harness, model and effort, aimed
 at the checkout under the cursor: type the task and `Enter` launches it, or send the box empty and
@@ -65,8 +65,8 @@ is spawned with no permission flag at all and keeps its normal prompts — it st
 things it is configured to ask about. Codex is spawned with `--yolo` and Cursor with `--force`, so
 **neither of those two ever stops to ask**: they edit files and run commands on their own judgment for
 the life of the SESSION, and nothing in the picker or the settings overlay softens that. Pi has no
-permission gate to begin with — nebula passes no flag, and it runs its tools as it sees fit. Muse is
-the same: no flag mapped yet. OpenCode keeps its own permission prompts: nebula passes no `--auto`, so it
+permission gate to begin with — orbit passes no flag, and it runs its tools as it sees fit. Muse is
+the same: no flag mapped yet. OpenCode keeps its own permission prompts: orbit passes no `--auto`, so it
 stops and asks like Claude does, and a `permissions_flag` of `--auto` in its `harnesses` entry is how you
 opt out of that. Pick the
 harness with that in mind, especially in the ROOT WORKTREE.
@@ -80,19 +80,19 @@ and an approved permission prompt shows up as the gated tool running, whichever 
 has no `Notification` hook and no `AskUserQuestion` tool, but its native `PermissionRequest` is
 installed, so the red state stays reachable there (and, with no `PostToolUse` to say you approved,
 a Codex row stays red until the turn ends). Cursor has no `PermissionRequest` hook to install, and
-since nebula runs it with `--force` it never stops for a permission prompt: its hooks are
+since orbit runs it with `--force` it never stops for a permission prompt: its hooks are
 `sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart` and `subagentStop`, which is busy versus
 idle. The one thing a Cursor SESSION does stop for is its `AskQuestion` dialog, and Cursor fires no
-hook for that tool, so nebula reads the dialog off the SESSION's screen instead: the row goes red
+hook for that tool, so orbit reads the dialog off the SESSION's screen instead: the row goes red
 while the question is up and back to yellow a moment after you answer or skip it. Pi has no shell hooks at all:
-nebula installs one managed extension (`~/.pi/agent/extensions/nebula.ts`, inert outside nebula) that
+orbit installs one managed extension (`~/.pi/agent/extensions/orbit.ts`, inert outside orbit) that
 posts pi's `session_start`, `before_agent_start`, `agent_end` and `ask_question` tool events as
 `SessionStart`, `UserPromptSubmit`, `Stop` and `PreToolUse` / `PostToolUse`, and any blocking prompt an
 extension raises mid-run as `PermissionRequest` — so a Pi row goes yellow, red while its `ask_question`
 tool waits on you, and green when the run ends, a cancelled run included. Muse has no hooks at all yet:
 its row is yellow while the PTY is live and green when the process ends, and it never goes red. OpenCode
-runs TypeScript plugins, so nebula installs one managed plugin (`~/.config/opencode/plugins/nebula.ts`,
-inert outside nebula) that posts OpenCode's `chat.message` as `UserPromptSubmit`, its `session.status`
+runs TypeScript plugins, so orbit installs one managed plugin (`~/.config/opencode/plugins/orbit.ts`,
+inert outside orbit) that posts OpenCode's `chat.message` as `UserPromptSubmit`, its `session.status`
 / `session.idle` as `Stop`, `permission.asked` / `permission.replied` as `PermissionRequest` and the
 gated tool's `PostToolUse`, and its `question` tool's `question.asked` / `question.replied` as
 `PreToolUse` / `PostToolUse` — so an OpenCode row goes yellow, red while a permission or a question
@@ -205,7 +205,7 @@ The text is the prompt as you typed it, not a paraphrase. The DAEMON reads it of
 managed extension and OpenCode's managed plugin post the same field), collapses its whitespace and keeps the first 200 characters,
 so a pasted file shows as its opening line. It costs the agent nothing — no extra turn, no tool call,
 nothing added to its context — which is why it is the prompt and not a summary the model wrote.
-Prompts nebula composes itself, such as a PR SESSION's scope or the note a `nebula worktree`
+Prompts orbit composes itself, such as a PR SESSION's scope or the note a `orbit worktree`
 relocation reopens on, are left out, and so are blank ones. A click on the line lands on the card,
 archived cards show none, and a session created before the feature simply has nothing to show until
 its next prompt. Starting a new conversation in the same session — `/clear` or `/new` in Claude,
@@ -215,7 +215,7 @@ session's name stays either way.
 
 ## The GRID
 
-nebula opens on a GRID of session cards — no modal over it, ever, on any launch. Starting a session
+orbit opens on a GRID of session cards — no modal over it, ever, on any launch. Starting a session
 is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing you type is the task.
 
 - **The box** starts on the selected project and in the checkout under the cursor — the worktree
@@ -265,7 +265,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   the Nth from the left opens that project's sessions, on the card you last left it on — its session
   back in the pane — or its first card on a first visit. A project with no sessions yet — a folder
   just opened, or any other — opens on the empty grid with the pane folded away, however it was
-  opened (a tab, the `+`, a `/` jump), so the nebula has the whole body — or, with **Show all
+  opened (a tab, the `+`, a `/` jump), so the orbit has the whole body — or, with **Show all
   worktrees** on, the project's EMPTY BANDS do, the pane folded all the same; whatever the pane was
   reading, a session or a terminal, runs on in the project you left and is never shown here. A
   project with only a terminal in it opens on that terminal's card, the pane reading it.
@@ -282,9 +282,9 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   down, or `Esc` — hands the keys back to the cards of the project on screen. The `×` on a tab, or `x` for the one the
   grid is on (the one under the header's cursor while it has the keys), closes it and the grid
   moves to the tab that slides into its place. Closing a tab
-  changes nothing about the project — its sessions run on. Closing the last tab puts nebula back on
+  changes nothing about the project — its sessions run on. Closing the last tab puts orbit back on
   the splash it opens on before there is any project, where `+` lists every project, `Enter` opens
-  the repo nebula was started in and `o` another folder; the splash stays across a restart. The
+  the repo orbit was started in and `o` another folder; the splash stays across a restart. The
   tabs are remembered across restarts. Each tab carries its project's STATUS DOTS right of the name — one
   per state its sessions are in, carrying that state's count and no word at all: red waiting on
   you, blue an unread finish, yellow mid-turn, in that fixed order and left out where a state is
@@ -317,7 +317,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   worktree's own confirm; the root's band says no `d`, since the root is never deleted. With the
   setting on, deleting a worktree's last card never asks about the worktree: the band stays,
   empty, until its own `d` — unless **Delete emptied worktree** is on, which still deletes the
-  worktree with its last card. "Nothing running" counts nebula's own sessions only: an agent
+  worktree with its last card. "Nothing running" counts orbit's own sessions only: an agent
   whose session lives in another checkout can be working in this one through absolute paths.
   So every confirm that would take a worktree off disk first runs the **DELETE CHECK** and lists
   what it finds under the question — processes whose working directory is inside the checkout
@@ -370,7 +370,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   on a row kept under the cards while there is more past the bottom — the row stays as air once the
   grid is scrolled to its end, and neither appears on a grid that fits.
   Turn on **Auto-clean merged worktrees** in Settings → Sessions (`auto_cleanup_merged`) to have
-  nebula remove linked checkouts after their PR lands. It is off by default and guarded: the ROOT
+  orbit remove linked checkouts after their PR lands. It is off by default and guarded: the ROOT
   WORKTREE, the repo's default branch, branches used as the base of open PRs, dirty checkouts,
   checkouts with untracked files, moved heads, running terminals and sessions mid-turn are skipped
   with a short notice instead.
@@ -409,7 +409,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   time, as with the cards. A band that already lists everything has nothing to open, and `Tab`
   there says so. `j` and `k` walk the lines as one column, off a band's last line onto the next
   band's first; `Enter` and a click work on a line as on a card.
-- **The columns layout.** **Worktree layout** → `columns` brings back the project/worktree/session shape as one of the existing worktree layouts, not a separate Layout setting. The body is three row lists beside the same session pane: PROJECTS on the left, WORKTREES in the middle, SESSIONS on the right. `Tab`/`Shift+Tab` (or left/right focus keys) move between columns, `j`/`k` walk the focused column, and `Enter` uses the same project, worktree, PR/issue, session, link and terminal actions as the rest of nebula. PR and issue rows still read in the pane, missing project folders still use the locate flow, AskQuestion/needs-feedback rows keep the red status dot, and moving a session uses the `m` picker; card drag is a grid-only gesture and is disabled in columns. The old `hide_projects`, `hide_worktrees`, `hide_sessions`, `recent_prompts` and `recent_prompts_count` config keys are read only for this layout.
+- **The columns layout.** **Worktree layout** → `columns` brings back the project/worktree/session shape as one of the existing worktree layouts, not a separate Layout setting. The body is three row lists beside the same session pane: PROJECTS on the left, WORKTREES in the middle, SESSIONS on the right. `Tab`/`Shift+Tab` (or left/right focus keys) move between columns, `j`/`k` walk the focused column, and `Enter` uses the same project, worktree, PR/issue, session, link and terminal actions as the rest of orbit. PR and issue rows still read in the pane, missing project folders still use the locate flow, AskQuestion/needs-feedback rows keep the red status dot, and moving a session uses the `m` picker; card drag is a grid-only gesture and is disabled in columns. The old `hide_projects`, `hide_worktrees`, `hide_sessions`, `recent_prompts` and `recent_prompts_count` config keys are read only for this layout.
 - **The nested layout.** **Worktree layout** → `nested` draws the grid as a list of threads, one
   per worktree, with no header, no card border and no blank line between threads. Threads are
   sorted by their latest prompt, the one that moved last on top. The first prompt run in a
@@ -442,7 +442,7 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   a CONFIRM DIALOG that counts and lists what goes, `a` included with **Confirm on archive** off,
   since a closed shell does not come back with `u`. On a child, or a root with nothing under it,
   each takes the one row. The root checkout's thread goes the same way (its checkout stays); with
-  nothing left anywhere in the project, the grid is the welcome nebula opens on, even with **Show
+  nothing left anywhere in the project, the grid is the welcome orbit opens on, even with **Show
   all worktrees** on.
 - **Every worktree open.** Settings → Appearance → **Expand all worktrees** (`expand_all_worktrees`,
   off by default) lays every band out open at once — each worktree's sessions and terminals wrapped
@@ -551,7 +551,7 @@ STATUS DOT gives way to a square `▪` — the session is filed, and the status 
 being a job the moment it was — and the color comes off the whole card: the name goes muted and
 drops its bold, and the harness row goes with it. The ARCHIVED VIEW's bands are the checkouts the
 filed sessions were in, with no terminals under them — a terminal is never archived. The badge on the right counts from when the session was archived (`2h ago`), not
-from its last turn — a session archived before nebula kept that stamp simply has no badge. Under the
+from its last turn — a session archived before orbit kept that stamp simply has no badge. Under the
 cursor the whole card lifts a step, so the one you are about to unarchive stays legible on the
 selection fill, and with color off entirely the two shapes still tell the grids apart. No card says
 the word `archived`: the header says it once, for all of them.
@@ -674,7 +674,7 @@ are saved once; answers naming multiple PRs do not guess which one to track.
 User prompts and subagent answers do not create links.
 
 The checkout's own branch PR takes precedence. When GitHub confirms that
-branch has no PR, Nebula checks the most recently reported PR by URL, keeps
+branch has no PR, Orbit checks the most recently reported PR by URL, keeps
 its link and state across restarts, and colors an idle checkout purple when
 it has merged. Running or waiting-for-feedback sessions keep their usual
 status colors. Network failures retain the last known state.

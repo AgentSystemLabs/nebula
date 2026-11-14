@@ -8,4 +8,4 @@ echo "caddy: no site block for $(basename "$2")" >&2
 exit 1
 HOOK
 chmod +x "$RUNTIME/hooks/worktree-cleanup"
-git -C "$DEMO" config nebula.worktreeDeleteHook "$RUNTIME/hooks/worktree-cleanup"
+git -C "$DEMO" config orbit.worktreeDeleteHook "$RUNTIME/hooks/worktree-cleanup"

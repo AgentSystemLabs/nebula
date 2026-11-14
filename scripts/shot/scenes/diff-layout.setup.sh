@@ -6,4 +6,4 @@ git -C "$DEMO" -c user.name=shot -c user.email=shot@example.invalid commit -q -m
 sed -i '' -e 's/^line 31 .*/line 31 — retry with backoff/' -e 's/^line 33 .*/line 33 — log the attempt/' \
   -e '/^line 34 /a\
 an added line after 34' "$DEMO/server.rs"
-export NEBULA_EDITOR=vim
+export ORBIT_EDITOR=vim

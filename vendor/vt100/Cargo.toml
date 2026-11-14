@@ -1,5 +1,5 @@
 # Vendored from crates.io vt100 0.16.2 (MIT, https://github.com/doy/vt100-rust)
-# with Nebula patches. First, see src/grid.rs `scroll_up`: lines scrolled out of a
+# with Orbit patches. First, see src/grid.rs `scroll_up`: lines scrolled out of a
 # TOP-ANCHORED DECSTBM region on the primary screen are pushed into scrollback
 # (upstream discards them). Ratatui inline-viewport apps (codex) insert chat
 # history that way, and real terminals keep those lines; without the patch the
@@ -15,7 +15,7 @@ rust-version = "1.70"
 name = "vt100"
 version = "0.16.2"
 authors = ["Jesse Luehrs <doy@tozt.net>"]
-description = "Library for parsing terminal data (Nebula-patched)"
+description = "Library for parsing terminal data (Orbit-patched)"
 license = "MIT"
 repository = "https://github.com/doy/vt100-rust"
 

@@ -6,7 +6,7 @@ version bump at release re-hashes every workspace crate, and `cargo build`,
 `cargo test`, `cargo check` and `cargo clippy` each resolve features a little
 differently and hash separately again. On macOS each hash also keeps every
 object file beside its binary (`split-debuginfo=unpacked`, the dev default),
-~200MB per build of nebula_tui alone — and nothing ever removes the old ones.
+~200MB per build of orbit_tui alone — and nothing ever removes the old ones.
 Ten days of SESSIONS grew target/ to 41GB and filled the disk.
 
 This keeps the newest KEEP hashes of every crate (by the newest mtime among
@@ -19,7 +19,7 @@ hashes under one crate name — two versions of a crate (thiserror 1 and 2),
 a build script's compile and its run, a crate built for both host and target.
 A bare newest-KEEP rule evicted those out of the build that had just finished,
 and the next build recompiled them and everything above them (nix → portable-pty
-→ nebula-daemon, thiserror → ratatui → nebula-tui). Each unit's
+→ orbit-daemon, thiserror → ratatui → orbit-tui). Each unit's
 .fingerprint/<name>-<hash>/<kind>.json lists its deps by their fingerprint value,
 which is the hex in that dep's own <kind> file, so the walk needs no cargo
 invocation. That layout is cargo-internal: if it stops parsing, the profile is

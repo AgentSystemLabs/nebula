@@ -37,7 +37,7 @@
 
 | ✨ <Feature one> | 🐛 <Fix, after> |
 |---|---|
-| ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<feature-one>.png) | ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<fix-after>.png) |
+| ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<feature-one>.png) | ![<alt>](https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch>/<fix-after>.png) |
 
 ## 🧭 Diagram <a id="diagram"></a>
 

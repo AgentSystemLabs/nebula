@@ -207,7 +207,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             [b"2", s] => {
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
-            // Nebula patch: OSC 8 hyperlinks. vte splits on every `;`, so a
+            // Orbit patch: OSC 8 hyperlinks. vte splits on every `;`, so a
             // URI that contains one arrives in pieces; join them back.
             [b"8", _params, uri @ ..] => {
                 let uri = uri.join(&b';');

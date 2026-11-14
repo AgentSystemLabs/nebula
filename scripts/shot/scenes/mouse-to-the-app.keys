@@ -1,6 +1,6 @@
 # A quick prompt on the root checkout launches the stand-in agent (see the .setup.sh), which asks for
 # the mouse. A click and then a drag typed into the pane reach it as SGR reports instead of arming
-# nebula's own drag-selection.
+# orbit's own drag-selection.
 Tab
 Tab
 p

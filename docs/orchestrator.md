@@ -2,7 +2,7 @@
 
 <sub>[← README](../README.md) · [Keys](keys.md) · [Commands](commands.md) · [Sessions](sessions.md) · [Configuration](configuration.md) · [How it works](how-it-works.md)</sub>
 
-The ORCHESTRATOR view is a chat-first way to run nebula. Instead of moving
+The ORCHESTRATOR view is a chat-first way to run orbit. Instead of moving
 from project to project and opening each worktree by hand, the user keeps one
 pinned agent session in front of them and asks it to coordinate the rest.
 
@@ -27,15 +27,15 @@ pinned agent session in front of them and asks it to coordinate the rest.
 ## Agent-facing commands
 
 The orchestrator receives extra guidance in its system prompt. These commands
-use the same CLI-over-socket pattern as `nebula spawn`, `nebula worktree` and
-`nebula open`, but they are daemon-gated to the persisted orchestrator session:
+use the same CLI-over-socket pattern as `orbit spawn`, `orbit worktree` and
+`orbit open`, but they are daemon-gated to the persisted orchestrator session:
 
 ```sh
-nebula orchestrator list [--json]
-nebula orchestrator read <session-id> [--bytes N]
-nebula orchestrator send <session-id> <prompt>
-nebula orchestrator spawn --project <project-id-or-name> [--worktree <branch-or-id>] <prompt>
-nebula orchestrator review <session-id> [--tab terminal|diff|history|pr]...
+orbit orchestrator list [--json]
+orbit orchestrator read <session-id> [--bytes N]
+orbit orchestrator send <session-id> <prompt>
+orbit orchestrator spawn --project <project-id-or-name> [--worktree <branch-or-id>] <prompt>
+orbit orchestrator review <session-id> [--tab terminal|diff|history|pr]...
 ```
 
 The text format is compact and model-friendly. `--json` prints stable IDs and
@@ -47,7 +47,7 @@ recent terminal output, not full transcript export.
 
 The socket is already same-user only, but orchestrator commands are still
 privileged: they can message other agents and open review UI in every client.
-Every orchestrator request carries the caller's `NEBULA_AGENT_ID`; the daemon
+Every orchestrator request carries the caller's `ORBIT_AGENT_ID`; the daemon
 checks that:
 
 1. the caller exists,
@@ -67,7 +67,7 @@ way to show what was approved and why.
 
 The robust first design is **poll-on-demand plus visible chips**, not injected
 prompts. The daemon already broadcasts status changes to every TUI, and the
-orchestrator can call `nebula orchestrator list --json` whenever it needs a
+orchestrator can call `orbit orchestrator list --json` whenever it needs a
 fresh state read. The TUI status strip updates immediately from the same
 events. This avoids writing unsolicited text into an idle chat box, avoids
 races with a model mid-turn, and still gives the user an always-visible feed of

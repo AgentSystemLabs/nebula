@@ -39,7 +39,7 @@ PY
 cat > "$DEMO/diagram.mmd" <<'EOF'
 flowchart LR
   User["User asks Claude"] --> File["Claude writes mockup.png"]
-  File --> Open["nebula open mockup.png"]
+  File --> Open["orbit open mockup.png"]
   Open --> Preview["inline image preview"]
 EOF
 

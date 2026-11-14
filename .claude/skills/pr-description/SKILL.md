@@ -1,6 +1,6 @@
 ---
 name: pr-description
-description: "Write a pull request description for the current branch in nebula's house style — a clickable table of contents, benefit-grouped sections a reader can scan, screenshots of the change, a mermaid diagram of the change, a risk read in the pr-reviewer's order, and a technical overview — from one of ten templates, then open or update the PR with gh pr create --body-file. Use when the user says \"write the PR description\", \"draft the PR\", \"open a PR\", \"describe this PR\", \"pr body\", \"pr text\", or asks what a PR should look like."
+description: "Write a pull request description for the current branch in orbit's house style — a clickable table of contents, benefit-grouped sections a reader can scan, screenshots of the change, a mermaid diagram of the change, a risk read in the pr-reviewer's order, and a technical overview — from one of ten templates, then open or update the PR with gh pr create --body-file. Use when the user says \"write the PR description\", \"draft the PR\", \"open a PR\", \"describe this PR\", \"pr body\", \"pr text\", or asks what a PR should look like."
 user-invocable: true
 ---
 
@@ -10,7 +10,7 @@ for the *why* behind a change. Write for all three: high level first, a picture 
 the mechanism at the bottom where only the reviewer scrolls.
 
 This skill produces the **body**. The title follows the commit-subject rule: what a
-*user* now gets, not what the diff did ("Workspaces as a top tab bar, and one nebula instance per
+*user* now gets, not what the diff did ("Workspaces as a top tab bar, and one orbit instance per
 checkout", never "feat(tui): add tabs").
 
 ## What every PR body carries — no exceptions
@@ -65,7 +65,7 @@ run in this headless session — please run the test suite before merging"), nev
 
 PR #16 is the reference shape: an opening paragraph that says what landed and why in two sentences,
 `##` sections named for what the user gets, bullets with a **bold lead-in** and the key or setting in
-backticks, a `## Notes` section for merge state and the gate, the footer. Name nebula's mechanisms by
+backticks, a `## Notes` section for merge state and the gate, the footer. Name orbit's mechanisms by
 their capitalised names (DAEMON, TUI, HOOK RECEIVER) so the PRs rhyme.
 
 ## Steps
@@ -111,10 +111,10 @@ Never screenshot the real DAEMON's screen — someone else is working in it. Use
 HARNESS: `make shot SCENE=<name> KEYS="Tab j"` (`scripts/shot/shot.sh`) builds the debug binary — into the
 repo's own `target/`, so do not export `CARGO_TARGET_DIR` for it, and start `cargo build` in the
 background while gathering the facts or the first shot waits on a full rebuild — then runs
-an isolated nebula against a demo repo with a stand-in `gh` (`scripts/shot/fixtures/` — add a fixture
+an isolated orbit against a demo repo with a stand-in `gh` (`scripts/shot/fixtures/` — add a fixture
 or a `scripts/shot/scenes/<name>.keys` file for the screen the PR needs), drives it in a private tmux
 and writes `design-screenshots/<name>.{txt,ansi,png}`. Its traps are encoded in the script (short
-`NEBULA_RUNTIME_DIR`, `NEBULA_AGENT_CMD=/bin/cat`, one Bash call per drive, `capture-pane -epN`).
+`ORBIT_RUNTIME_DIR`, `ORBIT_AGENT_CMD=/bin/cat`, one Bash call per drive, `capture-pane -epN`).
 
 Take the "before" shot from an `origin/main` build only when the template asks for a pair. Crop
 nothing; the whole screen at `190x50` is the house frame, and `design-screenshots/` shows the look.
@@ -136,7 +136,7 @@ git -C "$R" worktree remove "$W"
 ```
 
 Then reference each image as
-`https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch-name>/<name>.png`.
+`https://raw.githubusercontent.com/AmenAdem/Orbit/pr-assets/<branch-name>/<name>.png`.
 Two images side by side is a two-column table with one `![…](url)` per cell — GitHub scales them to
 the cell. Give every image alt text that says what it shows; a text search of the PR keeps the alt
 text, not the pixels.
@@ -154,7 +154,7 @@ One diagram that shows the change, ten to twenty nodes at most. Choose by shape:
 - a status or mode that gained or lost a transition (RUNNING → FINISHED → UNSEEN) → `stateDiagram-v2`
 - crates or modules touched → `flowchart` with the changed nodes given a `classDef` fill
 
-Name nodes by real identifiers; quote any label with punctuation (`A["nebula kill"]`). Keep
+Name nodes by real identifiers; quote any label with punctuation (`A["orbit kill"]`). Keep
 the fence exactly ```` ```mermaid ```` — a language tag GitHub does not know renders as text.
 
 ### 6. Write the body to a file, and fix the anchors

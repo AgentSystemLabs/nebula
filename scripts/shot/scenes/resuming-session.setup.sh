@@ -6,20 +6,20 @@ mkdir -p "$WORK/data"
 cat > "$WORK/data/config.json" <<'JSON'
 {"prewarm_agents": false, "prewarm_sessions": false, "session_idle_timeout": "2s"}
 JSON
-export NEBULA_IDLE_REAP_MS=500
-export NEBULA_SHOT_BIN="$BIN" NEBULA_SHOT_COUNTER="$RUNTIME/launches"
+export ORBIT_IDLE_REAP_MS=500
+export ORBIT_SHOT_BIN="$BIN" ORBIT_SHOT_COUNTER="$RUNTIME/launches"
 cat > "$RUNTIME/agent" <<'AGENT'
 #!/bin/sh
-n=$(cat "$NEBULA_SHOT_COUNTER" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$NEBULA_SHOT_COUNTER"
+n=$(cat "$ORBIT_SHOT_COUNTER" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$ORBIT_SHOT_COUNTER"
 post() {
-  curl -sS -m 3 -X POST -H "Authorization: Bearer $NEBULA_API_TOKEN" -H 'Content-Type: application/json' \
-    -d "$2" "$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=$1" >/dev/null 2>&1
+  curl -sS -m 3 -X POST -H "Authorization: Bearer $ORBIT_API_TOKEN" -H 'Content-Type: application/json' \
+    -d "$2" "$ORBIT_API_URL/api/hooks/claude?agentId=$ORBIT_AGENT_ID&hookEvent=$1" >/dev/null 2>&1
 }
 if [ "$n" = 1 ]; then
   post UserPromptSubmit '{"session_id":"shot-1","prompt":"Fix the login redirect loop"}'
   sleep 0.15
   post Stop '{"session_id":"shot-1"}'
-  "$NEBULA_SHOT_BIN" rename "Login redirect loop" >/dev/null 2>&1 || true
+  "$ORBIT_SHOT_BIN" rename "Login redirect loop" >/dev/null 2>&1 || true
   printf '> Fix the login redirect loop\r\n\r\n  Done.\r\n'
   exec /bin/cat
 fi
@@ -28,4 +28,4 @@ printf '\0337\033[r\0338\033[?25h\033[?25l\033[?2004h\033[?2031h\033[?1004h\033]
 exec sleep 600
 AGENT
 chmod +x "$RUNTIME/agent"
-export NEBULA_AGENT_CMD="$RUNTIME/agent"
+export ORBIT_AGENT_CMD="$RUNTIME/agent"

@@ -4,11 +4,11 @@ description: "Review a pull request by reading alone — its diff, description, 
 user-invocable: true
 ---
 
-A pull request review here answers one question first: **what happens to the people running nebula
-in production if this merges?** Nebula is a DAEMON that owns every agent PTY on a developer's box,
+A pull request review here answers one question first: **what happens to the people running orbit
+in production if this merges?** Orbit is a DAEMON that owns every agent PTY on a developer's box,
 speaks to its TUI over an unauthenticated DAEMON SOCKET, installs MANAGED HOOKS into the user's own
 `~/.claude`, `~/.codex`, `~/.cursor` and `~/.pi`, spawns `claude` / `codex` / `cursor-agent` / `pi`
-with a composed argv and system prompt, runs `curl | sh` on remote hosts over NEBULA SSH, and migrates
+with a composed argv and system prompt, runs `curl | sh` on remote hosts over ORBIT SSH, and migrates
 a SQLITE STORE on every user's disk at the first launch of a new binary. A wrong line in the wrong
 place is not a bug report; it is every user's sessions gone, or every user's shell running someone
 else's script. So the review weighs security and merge risk first and hardest, performance second, and
@@ -45,7 +45,7 @@ Forbidden, whatever the PR is — when a review seems to need one of these, it n
 
 - `cargo` anything, including `cargo check`, `cargo fmt --check`, `cargo clippy`, `cargo metadata`
   and `cargo tree` — build scripts and proc-macros run under all of them; `make` anything; the
-  `nebula` binary or anything under `target/`; INSTALL.SH; `python3`, `node`, `sh`, `bash`, `source`
+  `orbit` binary or anything under `target/`; INSTALL.SH; `python3`, `node`, `sh`, `bash`, `source`
   on any file the PR adds or changes — reading a script means `cat`, not `sh -n`.
 - `gh pr checkout`, `git checkout`, `git switch`, `git merge`, `git rebase`, `git apply`,
   `git cherry-pick`, `git stash`, `git worktree add`, `git reset` — nothing that moves the SHARED
@@ -66,7 +66,7 @@ with no argument); otherwise the PR this SESSION was opened on (a PR SESSION car
 system prompt). No PR → ask for the number; never pick one from `gh pr list`.
 
 ```bash
-N=<number>; R=AgentSystemLabs/nebula; S=<scratchpad>
+N=<number>; R=AmenAdem/Orbit; S=<scratchpad>
 gh pr view $N --repo $R --json number,title,url,body,author,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeable,additions,deletions,changedFiles,files,commits,reviews,comments,statusCheckRollup > $S/pr.json
 gh pr diff $N --repo $R > $S/pr.diff
 gh pr checks $N --repo $R > $S/pr.checks 2>&1 || true      # exit 8 = pending; the output is still the answer
@@ -100,8 +100,8 @@ reviewer pushed back on the last time it changed.
 ### 3. Read the diff, then the code around it
 
 Read `pr.diff` hunk by hunk in risk order: `.github/`, INSTALL.SH, `Cargo.toml` / `Cargo.lock`,
-`build.rs`; then `nebula-daemon/src/server.rs`, `hooks/`, `registry.rs` (spawn, argv, system prompt),
-`store.rs` (`MIGRATIONS`), `nebula-core/src/protocol.rs` (PROTOCOL VERSION), `sibling.rs`, `ssh.rs`,
+`build.rs`; then `orbit-daemon/src/server.rs`, `hooks/`, `registry.rs` (spawn, argv, system prompt),
+`store.rs` (`MIGRATIONS`), `orbit-core/src/protocol.rs` (PROTOCOL VERSION), `sibling.rs`, `ssh.rs`,
 `tunnel.rs`, `upgrade.rs`, `browser.rs`, `paths.rs`, `lifecycle.rs`; then the TUI; then docs.
 A hunk is not a unit of meaning: for every function the diff touches, `git show
 <headRefOid>:<path>` the whole function and `git show $(cat $S/pr.base):<path>` its previous shape —
@@ -110,7 +110,7 @@ contract moved.
 
 ### 4. Security and production-merge risk — first and heaviest
 
-Ask of each hunk: who can reach it, and what can it reach. Nebula's surfaces, with the facts a review
+Ask of each hunk: who can reach it, and what can it reach. Orbit's surfaces, with the facts a review
 can lean on:
 
 - **DAEMON SOCKET.** `handle_client` (`server.rs`) checks only the PROTOCOL VERSION, then honours every
@@ -127,28 +127,28 @@ can lean on:
   checks), and every write into the user's own `~/.claude/settings*.json`, `~/.codex/hooks.json`,
   `~/.cursor/hooks.json`, `~/.pi/agent/extensions/` — the MANAGED HOOKS installers merge into files the
   user also edits; a bug there corrupts the user's real configuration on every spawn.
-- **Network and remote execution.** NEBULA BROWSER (`--bind`, `--public`, `--credential`), NEBULA
-  TUNNEL, NEBULA SSH, NEBULA UPGRADE, INSTALL.SH, `NEBULA_INSTALL_URL` — the install URL is what runs
+- **Network and remote execution.** ORBIT BROWSER (`--bind`, `--public`, `--credential`), ORBIT
+  TUNNEL, ORBIT SSH, ORBIT UPGRADE, INSTALL.SH, `ORBIT_INSTALL_URL` — the install URL is what runs
   on every remote cold start. Anything that widens a listener, weakens or skips a credential, or adds
   a fetch-and-execute.
 - **Secrets.** Tokens or task text into argv (visible in `ps`), the DAEMON LOG, the SQLITE STORE, a
   hook payload, a PR body, a Cloud task argument.
 - **State every user carries.** A MIGRATION runs once, irreversibly, on every user's SQLITE STORE at
   the first launch of the new binary; a PROTOCOL VERSION bump makes every running DAEMON refuse the new
-  TUI until NEBULA KILL, which stops every live session. Both are production impact to state plainly,
+  TUI until ORBIT KILL, which stops every live session. Both are production impact to state plainly,
   with the rollback path or its absence.
 - **Supply chain.** New crates (why, how maintained, what they pull in), `build.rs`, new or changed
   workflows (`pull_request_target`, `permissions:`, secrets, unpinned actions), INSTALL.SH.
 - **Scope drift.** Files touched that the description does not account for.
 
 For each finding: `path:line` on the PR's side of the diff, who triggers it, what it reaches, the blast
-radius on a box running nebula, and whether it is *confirmed by reading* or *suspected*. Rank Blocker /
+radius on a box running orbit, and whether it is *confirmed by reading* or *suspected*. Rank Blocker /
 Should fix / Nit within the section. Nothing found is a valid result and is written as "nothing found —
 looked at ‹the surfaces this diff touches›", never as silence.
 
 ### 5. Performance — second
 
-Weigh by how often the path runs, not by how the code looks. Hot in nebula: the TUI draw (every frame,
+Weigh by how often the path runs, not by how the code looks. Hot in orbit: the TUI draw (every frame,
 `ui.rs` and everything it calls), the event-loop drain, the PTY byte path into the VENDORED VT100, the
 ATTACH replay of the 1 MB SCROLLBACK RING, the 2 s WORKTREE SYNC (stat-only by design — a `git` call
 per tick is a regression), the GIT POLL (`gh` calls share the user's token with every Claude SESSION on
@@ -166,7 +166,7 @@ The patterns are written down; check the diff against them rather than against t
   `ui.rs` or `registry.rs` where a new module beside it would do; a `match` that gained arms it should
   have delegated.
 - **Reuse before re-implementation** — `git grep` for the helper before flagging: `shell_single_quote`
-  (`ssh.rs`), `fit` / `wrap` (`pr_preview.rs`), `nebula_core::env` for every env var name, named
+  (`ssh.rs`), `fit` / `wrap` (`pr_preview.rs`), `orbit_core::env` for every env var name, named
   literals over magic numbers, `with_default_config` / `with_config_path` in any test that touches
   CONFIG.JSON (a test that pins neither reads, and through a saving key writes, the developer's real
   file).
@@ -212,7 +212,7 @@ or tests a PR here) and the prior reviews. Nothing was built, run or checked out
 What the description claims · what the diff touches · anything outside the claim.
 
 ### ❓ Unsettled by reading
-- <the exact check a human should run — `cargo test -p nebula-daemon store::`, a manual step — and
+- <the exact check a human should run — `cargo test -p orbit-daemon store::`, a manual step — and
   which result would change the verdict>
 
 <the harness footer, verbatim, after a blank line>

@@ -13,4 +13,4 @@ printf 'Resume with: claude --teleport session_01SQugK2HDyk33coSrfqFJk4\r\n'
 exit 0
 AGENT
 chmod +x "$RUNTIME/agent"
-export NEBULA_AGENT_CMD="$RUNTIME/agent"
+export ORBIT_AGENT_CMD="$RUNTIME/agent"

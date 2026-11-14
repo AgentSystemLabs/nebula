@@ -2,32 +2,32 @@
   "hooks": {
     "beforeSubmitPrompt": [
       {
-        "_nebulaManaged": true,
-        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+        "_orbitManaged": true,
+        "command": "if [ -z \"$ORBIT_AGENT_ID\" ] || [ -z \"$ORBIT_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $ORBIT_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$ORBIT_API_URL/api/hooks/cursor?agentId=$ORBIT_AGENT_ID&hookEvent=UserPromptSubmit\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
       }
     ],
     "sessionStart": [
       {
-        "_nebulaManaged": true,
-        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=SessionStart\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+        "_orbitManaged": true,
+        "command": "if [ -z \"$ORBIT_AGENT_ID\" ] || [ -z \"$ORBIT_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $ORBIT_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$ORBIT_API_URL/api/hooks/cursor?agentId=$ORBIT_AGENT_ID&hookEvent=SessionStart\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
       }
     ],
     "stop": [
       {
-        "_nebulaManaged": true,
-        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=Stop\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+        "_orbitManaged": true,
+        "command": "if [ -z \"$ORBIT_AGENT_ID\" ] || [ -z \"$ORBIT_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $ORBIT_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$ORBIT_API_URL/api/hooks/cursor?agentId=$ORBIT_AGENT_ID&hookEvent=Stop\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
       }
     ],
     "subagentStart": [
       {
-        "_nebulaManaged": true,
-        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=SubagentStart\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+        "_orbitManaged": true,
+        "command": "if [ -z \"$ORBIT_AGENT_ID\" ] || [ -z \"$ORBIT_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $ORBIT_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$ORBIT_API_URL/api/hooks/cursor?agentId=$ORBIT_AGENT_ID&hookEvent=SubagentStart\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
       }
     ],
     "subagentStop": [
       {
-        "_nebulaManaged": true,
-        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=SubagentStop\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+        "_orbitManaged": true,
+        "command": "if [ -z \"$ORBIT_AGENT_ID\" ] || [ -z \"$ORBIT_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $ORBIT_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$ORBIT_API_URL/api/hooks/cursor?agentId=$ORBIT_AGENT_ID&hookEvent=SubagentStop\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
       }
     ]
   },

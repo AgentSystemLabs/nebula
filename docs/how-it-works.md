@@ -2,16 +2,16 @@
 
 <sub>[← README](../README.md) · [Keys](keys.md) · [Commands](commands.md) · [Sessions](sessions.md) · [Configuration](configuration.md) · [How it works](how-it-works.md)</sub>
 
-- **Relative links in the host terminal.** On local sessions, nebula reports the displayed
+- **Relative links in the host terminal.** On local sessions, orbit reports the displayed
   agent or shell's checkout root through OSC 7, so the host terminal can resolve relative
   file links. With no attached session it reports the selected checkout; on exit it restores
-  nebula's launch directory. This follows checkout changes, not `cd` inside a child shell.
+  orbit's launch directory. This follows checkout changes, not `cd` inside a child shell.
   SSH sessions leave the host's directory unchanged rather than label remote paths as local.
-- **Detached daemon (tmux-style).** A background `nebula` daemon owns every PTY, so agents keep running
-  when the TUI closes. The TUI is a client that attaches over a unix socket (`$XDG_RUNTIME_DIR/nebula/`
-  or `/tmp/nebula-<uid>/`, mode 0700). Quit the TUI, relaunch later, and your sessions are still alive
+- **Detached daemon (tmux-style).** A background `orbit` daemon owns every PTY, so agents keep running
+  when the TUI closes. The TUI is a client that attaches over a unix socket (`$XDG_RUNTIME_DIR/orbit/`
+  or `/tmp/orbit-<uid>/`, mode 0700). Quit the TUI, relaunch later, and your sessions are still alive
   with scrollback replayed. When the daemon swaps the process under a session you are looking at — a
-  restart, or the `nebula worktree` relocation at the end of a turn — the pane is rebound to the new
+  restart, or the `orbit worktree` relocation at the end of a turn — the pane is rebound to the new
   one on its own. Moving the cursor onto a live session — a card in the grid, or a worktree or
   project switch that brings one back — attaches it on the keypress; only a session the
   idle reaper took waits a moment, so that walking past its row doesn't boot a CLI. The screens of the
@@ -30,7 +30,7 @@
   read while the list is checked rather than after — on a ten-thousand-file checkout `g` went from
   260 ms of frozen UI to a list in 2 ms and a diff in 60. It reads the row after the cursor ahead and
   keeps what it has read (2 MB at most, gone with the modal), so `↓` paints the next diff on the
-  keypress and re-reads it behind. List filters rank with `nebula-fuzzy`, a crate of its own only so
+  keypress and re-reads it behind. List filters rank with `orbit-fuzzy`, a crate of its own only so
   that a dev build compiles it optimised: 27 ms a keystroke over ten thousand paths became 5. `git grep` waits 40 ms for the
   next character, streams, and is killed at 200 hits or when the query moves on. A browser `open` and
   a clipboard `pbcopy` are started and left to finish. Rename, archive, unarchive, delete and close
@@ -41,15 +41,15 @@
   paints at 60 fps; a key that only goes to the PTY paints nothing of its own; and the DAEMON flushes
   PTY output that breaks a silence at once instead of holding it 5 ms to coalesce. A typed character
   echoes in 2 ms in a release build (3.5 ms in a debug one), where it was 20 (25).
-- **…and that is measured, not felt.** `NEBULA_PERF_LOG=<file>` turns on the INPUT LATENCY PROBE: one
+- **…and that is measured, not felt.** `ORBIT_PERF_LOG=<file>` turns on the INPUT LATENCY PROBE: one
   JSON line per input (how long its handler held the loop), per frame (draw time, what it showed, and
   how long each input waited for it) and per DAEMON event. `make perf` drives the real TUI through
   every view, modal and verb inside a private tmux — isolated daemon, a clone of this repository as
   the checkout, a stand-in agent with a full 1 MB ring — and prints handler / paint / settle / echo
   per step plus the peak RSS of the TUI and the DAEMON; `python3 scripts/perf/report.py BEFORE AFTER`
   compares two runs. A change to anything on a key path is judged by that table.
-- **Every pane is the same truecolor terminal.** A session paints nebula's own grid, not the terminal
-  nebula runs in, so the daemon tells each child `TERM=xterm-256color` and `COLORTERM=truecolor` and
+- **Every pane is the same truecolor terminal.** A session paints orbit's own grid, not the terminal
+  orbit runs in, so the daemon tells each child `TERM=xterm-256color` and `COLORTERM=truecolor` and
   drops any `NO_COLOR` / `FORCE_COLOR` it inherited. An agent launch runs through your login shell
   (`$SHELL -l -i -c 'unset …; export …; claude …'`) so it sees your real PATH — and your aliases and
   functions: a `claude` that `.zshrc` reroutes through a wrapper launches exactly as it does when typed
@@ -59,19 +59,19 @@
   the TUI around it stays coloured; the TUI still honours its own `NO_COLOR` on the way out, so a user
   who wants none keeps none.
 - **Client and DAEMON must agree on the PROTOCOL VERSION.** IPC frames are positional msgpack, so any
-  change to the shared types bumps `PROTOCOL_VERSION` (`crates/nebula-core/src/protocol.rs`) and the
+  change to the shared types bumps `PROTOCOL_VERSION` (`crates/orbit-core/src/protocol.rs`) and the
   handshake refuses a mismatched pair — the DAEMON answers `Incompatible`, the TUI bails, and the
   VERSION SKEW message names both binaries. Which side is stale decides the fix, and getting it
-  backwards costs an afternoon: when the DAEMON is the *older* build, `nebula kill` and relaunch is the
+  backwards costs an afternoon: when the DAEMON is the *older* build, `orbit kill` and relaunch is the
   whole remedy (it stops every live session on the way). A DAEMON that can't take the `Shutdown`
   request gets SIGTERM instead, at the pid the kernel reports on the other end of the socket or, when
   it can't say, at the pid in its pidfile — which can't come first, because macOS's tmp cleaner deletes
   regular files in `/tmp` after three idle days but spares sockets, so the DAEMON touches its pidfile
-  hourly and puts it back if it vanishes. When the DAEMON is *ahead* of the `nebula` you
-  just ran, `nebula kill` does nothing for you — a live instance respawns its DAEMON from its own
+  hourly and puts it back if it vanishes. When the DAEMON is *ahead* of the `orbit` you
+  just ran, `orbit kill` does nothing for you — a live instance respawns its DAEMON from its own
   binary, so the skew survives every restart, and the fix is to install the DAEMON's build over yours
   (`make install` from that checkout) instead. The usual shape in a checkout is a `make dev` DAEMON out
-  of `target/debug` while your PATH still finds an older `nebula` from the last `make install`.
+  of `target/debug` while your PATH still finds an older `orbit` from the last `make install`.
 - **RECENCY ORDER stamps every row.** A session is stamped when it last did anything, a worktree carries
   the newest stamp of its sessions, and a project the newest of its worktrees — which is why the lists
   sort themselves most-recent-first. The one fixed seat is the ROOT WORKTREE, always the first worktree
@@ -79,20 +79,20 @@
 - **Projects → worktrees → sessions.** All work happens in the main checkout or a git worktree.
   Worktrees are real (`git worktree add/remove`), created under
   `<repo>/../<repo-name>-worktrees/<branch>` and branched from the freshly fetched `origin/HEAD`
-  unless `nebula worktree --base` names another start — a branch origin has means origin's fetched
+  unless `orbit worktree --base` names another start — a branch origin has means origin's fetched
   copy, so `--base main` is `origin/main` and never the checkout's local `main` (no `origin`, or a
   fetch that fails: the checkout's HEAD). The `worktree_base_branch` SETTING (Settings → General)
   is a standing `--base` for every worktree nobody names one for — `master` for a repo whose
   default branch is not what origin says, or that has no origin — resolved the same way, and
   falling back to `origin/HEAD` in a repo that has no branch of that name.
-- **Worktrees made outside nebula show up anyway — WORKTREE SYNC.** Every 2 s the DAEMON mtime-probes
+- **Worktrees made outside orbit show up anyway — WORKTREE SYNC.** Every 2 s the DAEMON mtime-probes
   the git files a worktree operation touches — the repo's shared `.git/HEAD`, the `.git/worktrees`
   directory, and each linked checkout's own `HEAD` — and only when the newest of those stamps has moved,
   or a registered checkout's directory has disappeared, does it spend a `git worktree list` and
   reconcile the rows. So an agent that runs `git worktree add` itself, a `git checkout` you did in
   another terminal, or a worktree someone removed (with `git worktree remove` or a plain `rm -rf`)
   lands on the grid within a couple of seconds without a restart, while an idle repo costs nothing but a few
-  `stat` calls (`NEBULA_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
+  `stat` calls (`ORBIT_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
   100 ms). This structural sync is the *only* git polling the DAEMON does — the pull request lookups
   further down are the TUI's own.
 - **The root checkout changes branch in place — the BRANCH SWITCHER.** `c` on a root-branch card (or
@@ -104,7 +104,7 @@
   WORKTREE SYNC above then sees the moved `.git/HEAD` and confirms the branch from the DAEMON's side.
   Linked worktrees don't switch: each is named after the branch it was cut for.
 - **A worktree's outside resources are yours to hook — WORKTREE HOOKS.** `git config
-  nebula.worktreeCreateHook` / `nebula.worktreeDeleteHook` name an executable the DAEMON runs after it
+  orbit.worktreeCreateHook` / `orbit.worktreeDeleteHook` name an executable the DAEMON runs after it
   creates or removes a checkout, from the main repository, with the repo path and the worktree path as
   its two arguments — so a project can claim a dev-server port or a Caddy route on create and release
   it on delete. The hook runs after the git operation and the row change have gone through, still
@@ -112,7 +112,7 @@
   releasing it — and under a 30 s timeout that kills the hook and everything it started; a failure is
   a warning in every client, never a rolled-back create or delete. Per repo in git config rather than in CONFIG.JSON, and never a file inside the
   checkout. See [Configuration](configuration.md#worktree-hooks).
-- **A worktree runs its own project — the PROJECT FILE.** A committed `.nebula.json` names a `run` and
+- **A worktree runs its own project — the PROJECT FILE.** A committed `.orbit.json` names a `run` and
   an `open` command; the Project tab of the SETTINGS OVERLAY can hold either instead, per project in
   `config.json`, and wins over the file while it is set. **Run** in a card's or the project tab's
   right-click menu has the DAEMON start `run` in a RUN TERMINAL — a terminal row
@@ -121,7 +121,7 @@
   card's green `▶`; **Stop run** kills the process tree and drops the row. The idle reaper and the prewarm
   sweep leave that terminal alone, and a run that exits on its own keeps its PTY, so an attach replays
   the ending instead of respawning — a command starts only when you pick **Run**. `Shift+Enter` (or `Shift+O`) runs `open`
-  once, from the TUI. See [Configuration](configuration.md#the-project-file-nebulajson).
+  once, from the TUI. See [Configuration](configuration.md#the-project-file-orbitjson).
 - **Agents boot `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, `opencode`, or a custom registry program.** Creating an agent (`n`) first asks which CLI to
   run, then opens the QUICK PROMPT set to it, and the launch spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
   `claude --cloud=<task>`; because Claude accepts that description as a process argument, don't put
@@ -131,37 +131,37 @@
   Restored agents resume with `claude --resume <session-id>` /
   `codex resume <session-id>` / `cursor-agent --resume <session-id>` (falling back to a fresh session
   when the old one is gone) / `pi --session-id <session-id>` (which creates a missing id instead of
-  dying) / `opencode --session <session-id>` / `grok --resume <session-id>` (nebula does not capture
+  dying) / `opencode --session <session-id>` / `grok --resume <session-id>` (orbit does not capture
   Grok's id yet, so there is rarely one to resume); `muse` always boots fresh (no resume flag mapped yet). A session's id is saved only once a turn has run in it — the CLI writes the transcript a
   resume reads on the first prompt — so a CLI booted and never used resumes as nothing. Claude
   ids are checked against the transcripts on disk before the spawn, and one with none boots fresh;
   any resume that exits with an error within 10 s of its spawn is respawned fresh, unless its Claude
   transcript is still there (then the id is kept, and the pane shows why the CLI quit). A Claude
   session sent to Claude's own background (`/background`) is the exception to resuming: its worker
-  keeps the pane's `NEBULA_*` env, so hooks — and the forked session id — still land on the same
+  keeps the pane's `ORBIT_*` env, so hooks — and the forked session id — still land on the same
   row, but `claude --resume` refuses a session that runs in the background. When Claude holds a job
   dir for the id (`~/.claude/jobs/<first 8 of the id>/`), the DAEMON asks `claude agents --json`
   before the spawn, and an id listed as a `background` session opens as `claude attach <id>`
   instead — the live conversation, which detaching (Ctrl+Z) or archiving the row leaves running. A
   refused resume the job-dir look missed is asked about the same way and re-opened attached. An AGENT created from the PULL REQUESTS MODAL also receives the PR URL and a PR-only
   work rule — Claude and Pi through `--append-system-prompt` and Grok Build through `--rules` on every spawn, Codex, Cursor, Muse and OpenCode as the first prompt of
-  their cold spawn (their transcripts carry it through a resume); nebula persists that URL. An AGENT
+  their cold spawn (their transcripts carry it through a resume); orbit persists that URL. An AGENT
   launched from the ISSUES MODAL (`i`) carries the GitHub issue's URL the same way — persisted with
   the row, rebuilt into an issue-context rule on every spawn and resume — so the harness knows which
   issue the session is for (see [Sessions](sessions.md#the-issues-modal-and-issue-sessions)).
-- **Status via agent-CLI hooks, not MCP.** At agent spawn, nebula merges managed hooks into the
+- **Status via agent-CLI hooks, not MCP.** At agent spawn, orbit merges managed hooks into the
   worktree's `.claude/settings.local.json` (Claude Code) or `.cursor/hooks.json` (Cursor CLI), and into
   `~/.codex/hooks.json` (Codex — codex records hook approvals against the hook file's path, so a
-  per-worktree file would re-prompt forever; from its home, you approve nebula's hooks once at codex's
-  "Hooks need review" prompt and every later worktree is silent). Groups are tagged `_nebulaManaged`,
+  per-worktree file would re-prompt forever; from its home, you approve orbit's hooks once at codex's
+  "Hooks need review" prompt and every later worktree is silent). Groups are tagged `_orbitManaged`,
   user hooks preserved, rebuilt each spawn. Each hook is a fail-soft curl to the daemon's loopback HTTP
   endpoint, authenticated with a per-boot bearer token injected into the agent's environment only.
 - **…plus the progress bar, for the cancel no hook reports.** Escaping out of a turn fires no `Stop` and
-  suppresses the idle notification that normally un-sticks one, so nebula also reads the CLI's terminal
+  suppresses the idle notification that normally un-sticks one, so orbit also reads the CLI's terminal
   progress-bar escapes (OSC 9;4) straight off the PTY. That signal survives a cancel, and it stays busy
   while a permission prompt is open — so it can't mark an agent done while it is actually waiting on you.
 - **Codex's terminal lifecycle also reports completion.** Codex 0.163.0 uses OSC 7501 with
-  `state=working:app=codex` and `state=idle:app=codex` rather than OSC 9;4. Nebula reads these through
+  `state=working:app=codex` and `state=idle:app=codex` rather than OSC 9;4. Orbit reads these through
   the same busy/idle path, so a finished response leaves yellow even when its hooks are awaiting trust.
   `blocked` counts as busy; `clear` releases terminal ownership and is ignored. Completion still goes
   through the STOP GATE when subagents are tracked.
@@ -170,7 +170,7 @@
   keyboard, and that is the notification which un-sticks a turn that ended without a `Stop` — a
   rejected prompt, an escape mid-turn. Since Claude Code 2.1 the Agent tool runs subagents in the
   *background*, so it also fires while workers are still going: the foreground turn ended and the input
-  box came back, but the session is anything but done. So nebula treats an IDLE PROMPT as a hold —
+  box came back, but the session is anything but done. So orbit treats an IDLE PROMPT as a hold —
   exactly the hold a gated `Stop` gets — whenever any subagent is still tracked, and only a set that
   has gone quiet is ever presumed orphaned and finished on the strength of it.
 - **The STOP GATE's four graces, on a 30 s tick.** A `Stop` (or an IDLE PROMPT) is held while
@@ -185,13 +185,13 @@
   An individually tracked subagent older than 2 h is dropped from the set outright.
 - **Answering is a hook too — just not its own.** Approving a permission prompt fires nothing: the
   gated tool simply runs, and its `PostToolUse` is the first word that you said yes. So the
-  `PostToolUse` group is unmatched — every tool's end reaches nebula — and a tool event from the same
+  `PostToolUse` group is unmatched — every tool's end reaches orbit — and a tool event from the same
   origin as the open dialog (the foreground turn, or the one subagent whose prompt it was) moves the
   row from red back to yellow; another subagent's traffic says nothing about a dialog it did not
   raise. An `AskUserQuestion` is answered only by that tool's own `PostToolUse`: Claude runs a question
   alongside the other calls of the response that asked it, so a read-only `Bash` or `Read` batched
   beside it finishes with the question still on screen, and its tool events leave the row red. The
-  one signal nebula treats with suspicion is Claude's `permission_prompt` notification: Claude sends
+  one signal orbit treats with suspicion is Claude's `permission_prompt` notification: Claude sends
   it from a timer once a dialog has sat 6 s with no keystroke, detached from the turn, and its
   question dialog sends the same type — so one can land just *after* the answer that closed the
   dialog. Inside 5 s of the row leaving red that notification is taken as the echo it is and
@@ -211,15 +211,15 @@
   model of each Cursor session and watches for the dialog's key legend: it goes red the moment the
   legend is drawn and back to running once the legend has stayed gone for 150 ms — long enough that
   a repaint split across two PTY reads is not mistaken for a close. Pi runs TypeScript extensions
-  instead of shell hooks, so nebula writes one managed extension into its global agent dir
-  (`~/.pi/agent/extensions/nebula.ts`, or `$PI_CODING_AGENT_DIR/extensions/` — global because pi loads
+  instead of shell hooks, so orbit writes one managed extension into its global agent dir
+  (`~/.pi/agent/extensions/orbit.ts`, or `$PI_CODING_AGENT_DIR/extensions/` — global because pi loads
   those without the trust prompt a per-project `.pi/extensions/` raises) that maps pi's events onto the
   same names: `session_start` → `SessionStart`, `before_agent_start` → `UserPromptSubmit`,
   `agent_end` → `Stop` (it fires on an abort too, so a cancelled pi turn goes green on its own), the
   `ask_question` tool's start and end → `PreToolUse` / `PostToolUse`, and a blocking extension prompt
-  mid-run → `PermissionRequest`. The file is env-guarded, so a `pi` you run outside nebula loads it and
-  does nothing. OpenCode runs TypeScript plugins the same way, so nebula writes one managed plugin into
-  its global config dir (`~/.config/opencode/plugins/nebula.ts`, or `$XDG_CONFIG_HOME/opencode/plugins/`
+  mid-run → `PermissionRequest`. The file is env-guarded, so a `pi` you run outside orbit loads it and
+  does nothing. OpenCode runs TypeScript plugins the same way, so orbit writes one managed plugin into
+  its global config dir (`~/.config/opencode/plugins/orbit.ts`, or `$XDG_CONFIG_HOME/opencode/plugins/`
   — globbed at startup with no trust prompt, and always on the list whatever `OPENCODE_CONFIG_DIR` adds)
   that maps its server events onto the same names: `chat.message` → `UserPromptSubmit` (the typed text
   along for RECENT PROMPTS), `session.status` idle / `session.idle` → `Stop` (an abort ends the same way,
@@ -230,30 +230,30 @@
   own next tool event. The file is env-guarded like pi's.
 - **Sessions title themselves.** Create a session with the default name and the agent renames it after
   your first prompt — a 3-4 word title describing the ask (e.g. `Fix Login Redirect`), via a
-  `nebula rename <title>` command the CLI runs in its own turn (no extra API calls, no MCP server).
+  `orbit rename <title>` command the CLI runs in its own turn (no extra API calls, no MCP server).
   Claude Code and Codex get the instruction injected through the `UserPromptSubmit` hook response — as
   `hookSpecificOutput.additionalContext`, the one envelope both read (the daemon sends it only while the
   session is untitled) — Pi's extension reads the same envelope and appends it to that run's system
   prompt, and OpenCode's plugin carries it into the turn's system prompt through OpenCode's
-  system-transform hook; Cursor gets a managed `.cursor/rules/nebula-title.mdc` project rule instead,
+  system-transform hook; Cursor gets a managed `.cursor/rules/orbit-title.mdc` project rule instead,
   since its hooks can't inject context. Titling is one-shot and never clobbers a name you typed or set
-  with `r` — a late agent attempt is politely declined. `nebula rename --force` overrides.
+  with `r` — a late agent attempt is politely declined. `orbit rename --force` overrides.
 - **A Claude session's own name and its row stay tied.** `/rename <name>` inside Claude Code retitles
   the row within a moment — the same name then shows on the session's card, Claude's prompt box, its
   `/resume` picker and `/rc` list, and survives a restart. Claude fires no hook for `/rename`; it
   rewrites the window title (`✳ <name>`) and writes `custom-title.json` beside the transcript, so the
   DAEMON reads that file when the PTY's title changes (and on every hook), and adopts a title Claude
-  did not hold before as if you had pressed `r`. The other way round, a name set in nebula — typed at
+  did not hold before as if you had pressed `r`. The other way round, a name set in orbit — typed at
   creation, set with `r`, or chosen by AUTO-TITLE — reaches Claude on your next prompt through the
   same `UserPromptSubmit` hook reply, as `hookSpecificOutput.sessionTitle`. Whichever side changed
-  last wins; a name you set in nebula is never undone by re-reading Claude's older one. Claude only —
+  last wins; a name you set in orbit is never undone by re-reading Claude's older one. Claude only —
   Codex and Cursor have no session name of their own.
 - **A Claude session's card names the model it is on.** Switch with `/model` inside Claude Code and
   the card follows within a second (`claude Opus 5.5` → `claude Fable 5.2`, `(1M context)` kept for
   the 1M context window). Claude fires no hook for that either; it writes `Set model to …` into the transcript at
   once, and a `model` line naming the exact id with each session's first prompt. The DAEMON checks the
   size of every live session's transcript each second and reads only what was appended since. The
-  new model is what the row stores, so a restart or resume comes back on it and `nebula spawn`
+  new model is what the row stores, so a restart or resume comes back on it and `orbit spawn`
   inherits it. A session launched on the default model gets its model named after the first prompt.
   Built-in Claude only; a row on an exact id (a Bedrock id from `claude_models`) keeps it while
   Claude stays in that family.
@@ -262,7 +262,7 @@
   model submenu, the AGENTS TAB, presets) prints Claude Code's own name instead: `Fable 5.2`,
   `Opus 5.5 (1M context)`. The names come from the catalog Claude Code's `/model` picker is drawn
   from, which it caches under `~/.claude/cache/model-catalog/`; the TUI reads the newest file at
-  start and again every ten minutes, so a new release is named without an update to nebula. An
+  start and again every ten minutes, so a new release is named without an update to orbit. An
   alias follows the provider Claude Code is pointed at (`CLAUDE_CODE_USE_BEDROCK` and its siblings,
   from the environment or `settings.json`'s `env`). An id the catalog does not name — a Bedrock
   ARN, a gateway path, anything on a machine where Claude Code has cached no catalog — prints as
@@ -283,13 +283,13 @@
   ISSUES MODAL for that project, as `v` and `i` do. See [Configuration](configuration.md#every-setting).
 - **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree"
   or "do this in a new worktree" and
-  it runs `nebula worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
-  `<repo>/.claude/worktrees/` on a `worktree-*` branch). nebula creates the checkout in its usual
+  it runs `orbit worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
+  `<repo>/.claude/worktrees/` on a `worktree-*` branch). orbit creates the checkout in its usual
   `<repo-name>-worktrees/<branch>` spot — or takes the existing one for that branch — re-homes the
   session's row under it at once, and the moment that turn ends restarts the CLI resumed inside the
   worktree, opening with a note saying where it now runs, so the conversation carries on there without
-  you typing anything. Claude learns the rule from a short `--append-system-prompt` nebula passes at
-  spawn, plus a `Bash(nebula worktree:*)` permission so the command never prompts; Pi gets the same
+  you typing anything. Claude learns the rule from a short `--append-system-prompt` orbit passes at
+  spawn, plus a `Bash(orbit worktree:*)` permission so the command never prompts; Pi gets the same
   appended prompt and reopens on the same note, and Grok Build gets it through `--rules`. Codex, Cursor, Muse and OpenCode have no system-prompt flag to learn
   the rule from, but run the same command when you ask. Codex then reopens on the same note —
   `codex resume <id> --cd <worktree> "<note>"`, the `--cd` because Codex otherwise reopens a resumed
@@ -302,19 +302,19 @@
   CLIs that take the note (Claude, Codex, Pi) open instead on one saying the conversation could not be
   carried over, and the agent asks you to restate the request rather than guessing at it. (Pi creates a
   missing session instead of failing, so a lost Pi session is not detected.)
-- **Ask the agent for another session and it starts one.** Tell a Claude session "start a new nebula
-  session that fixes the login redirect" and it runs `nebula spawn "<task>"`: the daemon starts a second
+- **Ask the agent for another session and it starts one.** Tell a Claude session "start a new orbit
+  session that fixes the login redirect" and it runs `orbit spawn "<task>"`: the daemon starts a second
   agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse|grok|opencode`
   names another — opening on that task as its first prompt, so it is working before you look. The new
   card appears on the grid on its own (default name, so it titles itself), and the session you
   asked from is untouched: no restart, no focus change. Ask for that separate session "on branch
   fix-login" or say "spin up another agent in a new worktree" and the agent adds `--worktree <branch>`:
   the session starts in the project's worktree on
-  that branch — cut first, from the same base `nebula worktree` uses, when there is none — while the
+  that branch — cut first, from the same base `orbit worktree` uses, when there is none — while the
   one you asked from stays in its own checkout. Claude learns this from the same appended system
-  prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission.
-- **Ask the agent to show you a file, image or diagram and it opens in nebula.** Say "open it",
-  "show me the examples" or "show the diagram" and the session runs `nebula open <file>…`; every TUI
+  prompt as the worktree rule, plus a `Bash(orbit spawn:*)` permission.
+- **Ask the agent to show you a file, image or diagram and it opens in orbit.** Say "open it",
+  "show me the examples" or "show the diagram" and the session runs `orbit open <file>…`; every TUI
   attached to the daemon raises its file tabs on them — a modal with one tab per file, the focused one
   previewed with syntax highlighting, rendered Markdown, inline images or Mermaid diagrams, `Enter`
   editing it in place — so the agent puts the file in front of you instead of pasting it into the
@@ -325,8 +325,8 @@
   fetching) and drawn with the inline graphics setting's portable half-block renderer; Mermaid uses a
   local `mmdc` when one is on PATH and otherwise shows the source plus a one-line install hint. The
   daemon only checks the caller is a known session and passes the agent's checkout along as the
-  editor's working directory. Same appended prompt, plus a `Bash(nebula open:*)` permission.
-- **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
+  editor's working directory. Same appended prompt, plus a `Bash(orbit open:*)` permission.
+- **Everything persists in SQLite** (`~/.local/share/orbit/orbit.db` or the platform equivalent):
   projects, worktrees, agents (with kind + CLI session ids), links, and your last selection.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI in the selected worktree
   before you ask for one, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
@@ -342,13 +342,13 @@
   off drains its spares on the next sweep — and a warm spare nobody claims inside 15 min is reaped on
   its own, because it holds real memory and its context goes stale. A spare is a bare CLI at its
   prompt, so the CLI's own session list (Claude's `/list-agents`) shows it beside your sessions,
-  named after the directory. The IDLE REAPER's check is a 15 s sweep (`NEBULA_IDLE_REAP_MS`), so the real
+  named after the directory. The IDLE REAPER's check is a 15 s sweep (`ORBIT_IDLE_REAP_MS`), so the real
   latency is the timeout plus up to 15 s more; `session_idle_timeout` also takes `"off"`, which
   switches reaping off entirely.
 
 ## Pull requests
 
-nebula finds the pull request on each branch with `gh` and shows it on the band's rule and on its
+orbit finds the pull request on each branch with `gh` and shows it on the band's rule and on its
 cards' `#42 title` line. The row outlives
 the pull request: once it is merged or closed the row stays, badged `merged` or `closed` (an open one is
 badged `ready` — ready for review, the state and nothing more — and a draft is dimmed and badged `draft`;
@@ -359,16 +359,16 @@ you are about to archive or delete, and the PR is what you check first. A merged
 checkout's band: purple dot and purple branch name, so the checkout to
 delete stands out from across the room (a session still running or asking there keeps its yellow or red —
 that is not a checkout to pull out from under it). The name sweeps the way a running row's does for about
-five seconds after nebula sees the merge land, then holds still in solid purple — nothing about a landed
+five seconds after orbit sees the merge land, then holds still in solid purple — nothing about a landed
 checkout is live, so it says so once; one found already merged (last run's cache, a first lookup) never
-sweeps, and a merged checkout left lying around costs an idle nebula no repaints. Jump to it with
+sweeps, and a merged checkout left lying around costs an idle orbit no repaints. Jump to it with
 `/` and the pane reads the pull request — description, stats, conversation — exactly as the PULL REQUESTS
 MODAL does (whose list retires a pull request on merge, and which `hide_draft_prs` never thins — the
 modal lists drafts too); `g` shows its diff. Manual link
 attachment is gone; links an earlier version saved stay in the database, so no data is discarded,
 though the grid draws none of them.
 
-This is the one part of nebula the TUI asks for itself rather than the DAEMON: every `gh pr view`,
+This is the one part of orbit the TUI asks for itself rather than the DAEMON: every `gh pr view`,
 open-list query (`gh api graphql`) and `gh pr diff` — and the ISSUES MODAL's `gh issue list`, `gh issue view` and `gh issue comment` — is spawned by the client, which is why the lookups stop the moment you
 quit, and why a machine with no `gh` — or one that is unauthenticated, or pointed at a checkout with no
 remote — just shows no rows instead of an error. The selected project is asked about most: its

@@ -15,10 +15,10 @@ titles = [
     "Memory overlay polls the daemon", "Update check runs off the tick", "Grep opens at the matched line",
 ]
 rows = [
-    {"number": 80 - i, "title": t, "url": "https://github.com/AgentSystemLabs/nebula/pull/%d" % (80 - i),
+    {"number": 80 - i, "title": t, "url": "https://github.com/AmenAdem/Orbit/pull/%d" % (80 - i),
      "isDraft": i % 9 == 8, "headRefName": "pr-%d" % (80 - i)}
     for i, t in enumerate(titles)
 ]
 json.dump(rows, open(sys.argv[1], "w"), indent=2)
 PY
-export NEBULA_GH_FIXTURES="$FIX"
+export ORBIT_GH_FIXTURES="$FIX"
