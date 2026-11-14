@@ -1688,7 +1688,7 @@ fn draw_terminal_body(
         // strip over it already says which key opens a terminal here.
         None if app.launcher_active() => (Vec::new(), Vec::new()),
         None => {
-            draw_empty_terminal_hero(f, inner, th);
+            draw_empty_terminal_hero(f, inner, th, &app.chrome.keymap);
             (Vec::new(), Vec::new())
         }
     }
@@ -1812,7 +1812,13 @@ fn draw_terminal_selection(f: &mut Frame, app: &App, screen: &vt100::Screen, inn
     }
 }
 
-fn draw_empty_terminal_hero(f: &mut Frame, inner: Rect, th: Theme) {
+fn draw_empty_terminal_hero(f: &mut Frame, inner: Rect, th: Theme, keymap: &crate::keymap::Keymap) {
+    let shown = |a: crate::keymap::Action, fallback: &str| {
+        keymap
+            .shown_first(a)
+            .map(|c| c.display())
+            .unwrap_or_else(|| fallback.to_string())
+    };
     let key = |k: &str, label: &str| {
         vec![
             Span::styled(
@@ -1828,9 +1834,9 @@ fn draw_empty_terminal_hero(f: &mut Frame, inner: Rect, th: Theme) {
     hint.push(sep());
     hint.extend(key("n", "new agent"));
     hint.push(sep());
-    hint.extend(key("/", "jump"));
+    hint.extend(key(&shown(crate::keymap::Action::Palette, "/"), "jump"));
     hint.push(sep());
-    hint.extend(key("?", "help"));
+    hint.extend(key(&shown(crate::keymap::Action::Help, "?"), "help"));
     let mut lines = vec![Line::from("")];
     let blank = inner.height.saturating_sub(6) / 2;
     for _ in 0..blank {

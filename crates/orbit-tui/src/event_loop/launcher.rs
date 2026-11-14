@@ -4013,7 +4013,7 @@ mod tests {
             let locked = || {
                 let mut app = two_sessions();
                 draw(&mut app);
-                key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+                key(&mut app, KeyCode::Left, KeyModifiers::NONE);
                 key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
                 if app.pane.term.is_none() {
                     app.pane.term = Some(crate::app::AttachedTerm::new(
@@ -4165,25 +4165,25 @@ mod tests {
                 ),
                 "{screen}"
             );
-            keys(&mut app, &[KeyCode::Char('j'), KeyCode::Char('j')]);
+            keys(&mut app, &[KeyCode::Down, KeyCode::Down]);
             assert_eq!(
                 app.selected_worktree().map(|w| w.id.clone()),
                 Some(WorktreeId("w3".into()))
             );
             assert!(app.selected_session_row().is_none(), "no card to be on");
             // Past the last band nothing moves, and back up is `feat`.
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             assert_eq!(
                 app.selected_worktree().map(|w| w.id.clone()),
                 Some(WorktreeId("w3".into()))
             );
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(
                 app.selected_worktree().map(|w| w.id.clone()),
                 Some(WorktreeId("w2".into()))
             );
             // Tab has no cards to open, and says so.
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(app.launcher.launcher_expanded, None);
             assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_SESSIONS));
@@ -4204,7 +4204,7 @@ mod tests {
 
             let mut by_key = with_empty_band();
             draw_tall(&mut by_key);
-            keys(&mut by_key, &[KeyCode::Char('j'), KeyCode::Char('j')]);
+            keys(&mut by_key, &[KeyCode::Down, KeyCode::Down]);
             let sent = key(&mut by_key, KeyCode::Char('d'), KeyModifiers::NONE);
             assert!(is_worktree_confirm(&by_key), "{:?}", by_key.modals.overlay);
             assert!(sent.is_empty(), "asked first: {sent:?}");
@@ -4267,7 +4267,7 @@ mod tests {
             let mut by_key = with_empty_band_on_a_pull_request();
             let screen = screen_text(&draw_tall(&mut by_key));
             assert!(screen.contains("d: delete worktree"), "{screen}");
-            keys(&mut by_key, &[KeyCode::Char('j'), KeyCode::Char('j')]);
+            keys(&mut by_key, &[KeyCode::Down, KeyCode::Down]);
             assert_eq!(
                 by_key.selected_worktree().map(|w| w.id.clone()),
                 Some(WorktreeId("w3".into()))
@@ -4501,11 +4501,11 @@ mod tests {
             assert!(app.launcher.launcher_pane_hidden, "the pane is folded away");
 
             let mut sent = Vec::new();
-            for (turn, step) in [("first", 'h'), ("second", 'l')] {
+            for (turn, step) in [("first", KeyCode::Left), ("second", KeyCode::Right)] {
                 // Along the row to the other card of the root band (which
                 // takes the aim back, the fold having let it go), then
                 // prompt it.
-                key(&mut app, KeyCode::Char(step), KeyModifiers::NONE);
+                key(&mut app, step, KeyModifiers::NONE);
                 let id = app.selected_session().map(|a| a.id.clone()).unwrap();
                 key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
                 type_text(&mut app, turn);
@@ -4904,11 +4904,11 @@ mod tests {
             );
 
             // Alone in its band, the card has nowhere to walk.
-            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
-            key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a1"));
 
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a2"), "the next band down");
             assert_eq!(
                 pane(&app),
@@ -4920,11 +4920,11 @@ mod tests {
                 Some("demo"),
                 "the walk stays inside the project the grid is scoped to"
             );
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a2"), "the last band stays");
 
             app.chrome.flash = None;
-            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Left, KeyModifiers::NONE);
             assert_eq!(
                 selected(&app).as_deref(),
                 Some("a2"),
@@ -4933,14 +4933,14 @@ mod tests {
             assert_eq!(app.launcher.launcher_expanded, None, "without opening it");
             assert_eq!(app.chrome.flash, None, "and says nothing of it");
 
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a1"));
             assert_eq!(
                 pane(&app),
                 Some(SessionRef::Agent(AgentId("a1".into()))),
                 "and swaps with the cursor"
             );
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(
                 selected(&app).as_deref(),
                 Some("a1"),
@@ -4979,7 +4979,7 @@ mod tests {
 
             // One band open at a time: Tab on another closes the first.
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             assert_eq!(
                 selected(&app).as_deref(),
                 Some("a2"),
@@ -5030,7 +5030,7 @@ mod tests {
 
             // Back to the row's start: `h` stops there.
             for _ in 0..8 {
-                key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+                key(&mut app, KeyCode::Left, KeyModifiers::NONE);
             }
             assert_eq!(at(&app), Some(0), "h stops at the first card");
             assert!(
@@ -5062,7 +5062,7 @@ mod tests {
 
             // `l` walks them one at a time, the pane following.
             for (i, card) in cards.iter().enumerate().skip(1) {
-                key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+                key(&mut app, KeyCode::Right, KeyModifiers::NONE);
                 assert_eq!(at(&app), Some(i), "l onto card {i}");
                 assert_eq!(pane(&app).as_ref(), Some(card), "the pane follows");
                 assert!(
@@ -5070,7 +5070,7 @@ mod tests {
                     "at the band level still"
                 );
             }
-            key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(at(&app), Some(last), "l stops at the last card");
             draw(&mut app);
             assert!(
@@ -5180,7 +5180,7 @@ mod tests {
             }
             draw(&mut app);
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            let out = key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            let out = key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             assert!(
                 out.iter()
                     .any(|r| matches!(r, ClientRequest::MarkAgentSeen { id }
@@ -5203,7 +5203,7 @@ mod tests {
         with_default_config(|| {
             let mut app = two_sessions();
             draw(&mut app);
-            keys(&mut app, &[KeyCode::Esc, KeyCode::Char('j')]);
+            keys(&mut app, &[KeyCode::Esc, KeyCode::Down]);
             let text = buffer_text(&draw(&mut app));
             assert!(
                 text.contains("polish-nav  ↳ feat"),
@@ -5230,7 +5230,7 @@ mod tests {
             );
 
             // And the walk keeps swapping it.
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             let text = buffer_text(&draw(&mut app));
             assert!(
                 text.contains("agent-1  ⌂ main"),
@@ -5280,7 +5280,7 @@ mod tests {
                 "the hatch is back to the cards"
             );
             assert!(!app.pane.term_locked);
-            keys(&mut app, &[KeyCode::Esc, KeyCode::Char('k')]);
+            keys(&mut app, &[KeyCode::Esc, KeyCode::Up]);
             assert_eq!(
                 selected(&app).as_deref(),
                 Some("a1"),
@@ -5929,7 +5929,7 @@ mod tests {
                     "{way}"
                 );
 
-                key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+                key(&mut app, KeyCode::Down, KeyModifiers::NONE);
                 let text = buffer_text(&draw(&mut app));
                 assert!(!super::has_pane(&app), "{way}: no band to aim at: {text}");
                 assert_eq!(reading(&app), None, "{way}");
@@ -6433,7 +6433,7 @@ mod tests {
 
             // A click on the lit tab changes nothing — not even the card
             // the cursor was walked to.
-            key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Right, KeyModifiers::NONE);
             let before = tab_state(&app);
             draw(&mut app);
             let (x, y) = crumb_cell(&app, HitTarget::LauncherTab(ProjectId("p1".into())));
@@ -6627,10 +6627,7 @@ mod tests {
     fn a_tab_comes_back_on_the_card_it_was_left_on() {
         with_default_config(|| {
             let mut app = two_tabs();
-            keys(
-                &mut app,
-                &[KeyCode::Char('h'), KeyCode::Char('h'), KeyCode::Char('l')],
-            );
+            keys(&mut app, &[KeyCode::Left, KeyCode::Left, KeyCode::Right]);
             assert_eq!(selected(&app).as_deref(), Some("a1"), "demo's second card");
 
             keys(&mut app, &[KeyCode::Char('['), KeyCode::Char(']')]);
@@ -6721,7 +6718,7 @@ mod tests {
                 app.nav.sel_worktree,
                 app.nav.sel_session,
             );
-            keys(&mut app, &[KeyCode::Char('j'), KeyCode::Char('l')]);
+            keys(&mut app, &[KeyCode::Down, KeyCode::Right]);
             assert_eq!(
                 (
                     app.nav.sel_project,
@@ -6777,7 +6774,7 @@ mod tests {
     /// `feat` checkout — the next band down, its one card under the
     /// cursor as the band's remembered card.
     fn to_feat(app: &mut App) {
-        key(app, KeyCode::Char('j'), KeyModifiers::NONE);
+        key(app, KeyCode::Down, KeyModifiers::NONE);
     }
 
     /// Press `code` with no modifiers, once per entry.
@@ -6861,7 +6858,7 @@ mod tests {
                 (th.accent, true, true),
                 "the keys are on the root band"
             );
-            keys(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
+            keys(&mut app, &[KeyCode::Up, KeyCode::Up]);
             assert_eq!(
                 app.launcher.launcher_tab_cursor,
                 Some(ProjectId("p1".into()))
@@ -6932,7 +6929,7 @@ mod tests {
             );
             let before = tab_state(&app);
 
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(
                 app.launcher.launcher_tab_cursor, None,
                 "one press stays put"
@@ -6945,7 +6942,7 @@ mod tests {
                 "{:?}",
                 app.chrome.flash
             );
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(
                 app.launcher.launcher_tab_cursor,
                 Some(ProjectId("p1".into())),
@@ -6953,7 +6950,7 @@ mod tests {
             );
             assert_eq!(tab_state(&app), before, "nothing opened");
 
-            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Left, KeyModifiers::NONE);
             assert_eq!(
                 app.launcher.launcher_tab_cursor,
                 Some(ProjectId("p2".into()))
@@ -7011,7 +7008,7 @@ mod tests {
         with_default_config(|| {
             let mut app = two_tabs();
             draw(&mut app);
-            keys(&mut app, &[KeyCode::Esc, KeyCode::Char('j')]);
+            keys(&mut app, &[KeyCode::Esc, KeyCode::Down]);
             assert_eq!(selected(&app).as_deref(), Some("a2"), "the second band");
             assert_eq!(app.launcher.launcher_tab_cursor, None);
 
@@ -7042,14 +7039,11 @@ mod tests {
     fn j_j_from_the_tabs_goes_back_down_to_the_card_left() {
         with_default_config(|| {
             let mut app = two_tabs();
-            keys(
-                &mut app,
-                &[KeyCode::Char('h'), KeyCode::Char('h'), KeyCode::Char('l')],
-            );
+            keys(&mut app, &[KeyCode::Left, KeyCode::Left, KeyCode::Right]);
             assert_eq!(selected(&app).as_deref(), Some("a1"), "the second card");
-            keys(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
+            keys(&mut app, &[KeyCode::Up, KeyCode::Up]);
 
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             assert_eq!(
                 app.launcher.launcher_tab_cursor,
                 Some(ProjectId("p1".into()))
@@ -7062,7 +7056,7 @@ mod tests {
                 "{:?}",
                 app.chrome.flash
             );
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             assert_eq!(app.launcher.launcher_tab_cursor, None);
             assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
             assert_eq!(selected(&app).as_deref(), Some("a1"), "the card it was on");
@@ -7071,9 +7065,9 @@ mod tests {
             keys(
                 &mut app,
                 &[
-                    KeyCode::Char('k'),
-                    KeyCode::Char('k'),
-                    KeyCode::Char('h'),
+                    KeyCode::Up,
+                    KeyCode::Up,
+                    KeyCode::Left,
                     KeyCode::Down,
                     KeyCode::Down,
                 ],
@@ -7084,10 +7078,7 @@ mod tests {
 
             // And back up and over to demo, which comes up on the card it
             // was left on rather than its first.
-            keys(
-                &mut app,
-                &[KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('l')],
-            );
+            keys(&mut app, &[KeyCode::Up, KeyCode::Up, KeyCode::Right]);
             assert_eq!(tab_state(&app).0.as_deref(), Some("demo"));
             assert_eq!(selected(&app).as_deref(), Some("a1"));
         });
@@ -7101,14 +7092,8 @@ mod tests {
     fn esc_or_another_key_hands_the_keys_back_to_the_cards() {
         with_default_config(|| {
             let mut app = two_tabs();
-            keys(
-                &mut app,
-                &[KeyCode::Char('h'), KeyCode::Char('h'), KeyCode::Char('l')],
-            );
-            keys(
-                &mut app,
-                &[KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('h')],
-            );
+            keys(&mut app, &[KeyCode::Left, KeyCode::Left, KeyCode::Right]);
+            keys(&mut app, &[KeyCode::Up, KeyCode::Up, KeyCode::Left]);
             assert!(app.launcher.launcher_tab_cursor.is_some());
             let walked = tab_state(&app);
             assert_eq!(walked.0.as_deref(), Some("web"));
@@ -7121,10 +7106,7 @@ mod tests {
                 "and the card is still selected"
             );
 
-            keys(
-                &mut app,
-                &[KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('p')],
-            );
+            keys(&mut app, &[KeyCode::Up, KeyCode::Up, KeyCode::Char('p')]);
             assert_eq!(app.launcher.launcher_tab_cursor, None);
             launch(&app);
         });
@@ -7138,11 +7120,11 @@ mod tests {
     fn a_click_on_a_tab_from_the_header_is_enter_on_it() {
         with_default_config(|| {
             let up = [
-                KeyCode::Char('h'),
-                KeyCode::Char('h'),
-                KeyCode::Char('l'),
-                KeyCode::Char('k'),
-                KeyCode::Char('k'),
+                KeyCode::Left,
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Up,
+                KeyCode::Up,
             ];
             let mut by_key = two_tabs();
             keys(&mut by_key, &up);
@@ -7165,7 +7147,7 @@ mod tests {
             // Onto the other tab: `h` and Enter, or a click on it.
             let mut by_key = two_tabs();
             keys(&mut by_key, &up);
-            keys(&mut by_key, &[KeyCode::Char('h'), KeyCode::Enter]);
+            keys(&mut by_key, &[KeyCode::Left, KeyCode::Enter]);
 
             let mut by_click = two_tabs();
             keys(&mut by_click, &up);
@@ -7199,16 +7181,11 @@ mod tests {
     fn x_in_the_header_closes_the_tab_under_its_cursor() {
         with_default_config(|| {
             let mut app = two_tabs();
-            keys(&mut app, &[KeyCode::Char('h'), KeyCode::Char('h')]);
+            keys(&mut app, &[KeyCode::Left, KeyCode::Left]);
             let before = tab_state(&app);
             keys(
                 &mut app,
-                &[
-                    KeyCode::Char('k'),
-                    KeyCode::Char('k'),
-                    KeyCode::Char('h'),
-                    KeyCode::Char('x'),
-                ],
+                &[KeyCode::Up, KeyCode::Up, KeyCode::Left, KeyCode::Char('x')],
             );
             assert_eq!(
                 app.launcher.launcher_tabs,
@@ -7237,11 +7214,11 @@ mod tests {
     fn the_delete_keys_in_the_header_ask_before_closing_the_tab() {
         with_default_config(|| {
             let up = [
-                KeyCode::Char('h'),
-                KeyCode::Char('h'),
-                KeyCode::Char('k'),
-                KeyCode::Char('k'),
-                KeyCode::Char('h'),
+                KeyCode::Left,
+                KeyCode::Left,
+                KeyCode::Up,
+                KeyCode::Up,
+                KeyCode::Left,
             ];
             let mut by_x = two_tabs();
             keys(&mut by_x, &up);
@@ -7307,7 +7284,7 @@ mod tests {
 
             // Down on the cards the same key is the card's own delete.
             let mut app = two_tabs();
-            keys(&mut app, &[KeyCode::Char('h'), KeyCode::Char('h')]);
+            keys(&mut app, &[KeyCode::Left, KeyCode::Left]);
             key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
             assert!(
                 matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
@@ -7326,14 +7303,14 @@ mod tests {
     fn the_header_cursor_is_drawn_on_its_tab() {
         with_default_config(|| {
             let mut app = two_tabs();
-            keys(&mut app, &[KeyCode::Char('h'), KeyCode::Char('h')]);
+            keys(&mut app, &[KeyCode::Left, KeyCode::Left]);
             let terminal = draw(&mut app);
             assert_eq!(tab_cursor_drawn(&app, &terminal), "");
 
-            keys(&mut app, &[KeyCode::Char('k'), KeyCode::Char('k')]);
+            keys(&mut app, &[KeyCode::Up, KeyCode::Up]);
             let terminal = draw(&mut app);
             assert_eq!(tab_cursor_drawn(&app, &terminal), "demo");
-            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Left, KeyModifiers::NONE);
             let terminal = draw(&mut app);
             assert_eq!(tab_cursor_drawn(&app, &terminal), "web");
             assert!(
@@ -7809,7 +7786,7 @@ mod tests {
             );
             assert!(app.chrome.release_watch.is_some(), "and the key is watched");
 
-            key_kind(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, Release);
+            key_kind(&mut app, KeyCode::Left, KeyModifiers::NONE, Release);
             assert!(
                 app.chrome.release_watch.is_some(),
                 "another key let go changes nothing"
@@ -7817,7 +7794,7 @@ mod tests {
             key_kind(&mut app, KeyCode::Char('u'), KeyModifiers::NONE, Repeat);
             assert_eq!(cards(&app), ["a9", "a2"], "the held `u` is still swallowed");
 
-            key_kind(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, Repeat);
+            key_kind(&mut app, KeyCode::Left, KeyModifiers::NONE, Repeat);
             assert_eq!(
                 selected(&app).as_deref(),
                 Some("a9"),
@@ -7828,7 +7805,7 @@ mod tests {
                 "with the watch still on"
             );
 
-            key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert!(
                 app.chrome.release_watch.is_none(),
                 "a fresh press of anything ends it"
@@ -8164,7 +8141,7 @@ mod tests {
         with_default_config(|| {
             let mut by_key = two_sessions();
             draw_at(&mut by_key, 130, 50);
-            keys(&mut by_key, &[KeyCode::Esc, KeyCode::Char('j')]);
+            keys(&mut by_key, &[KeyCode::Esc, KeyCode::Down]);
 
             let mut by_click = two_sessions();
             draw_at(&mut by_click, 130, 50);
@@ -8298,7 +8275,7 @@ mod tests {
             for app in [&mut by_left, &mut by_right] {
                 draw(app);
                 key(app, KeyCode::Char('~'), KeyModifiers::NONE);
-                keys(app, &[KeyCode::Esc, KeyCode::Char('j')]);
+                keys(app, &[KeyCode::Esc, KeyCode::Down]);
                 assert!(
                     app.launcher.launcher_pane_hidden,
                     "a key walking the bands leaves the fold be"
@@ -8424,19 +8401,19 @@ mod tests {
                 "the top of the grid has scrolled off"
             );
 
-            // A key walks the cursor a row — `k` up, or `j` down from the
+            // A key walks the cursor a row — ↑ up, or ↓ down from the
             // top row — and the frame brings the card it lands on whole
             // back on screen: the scroll is the keys' again.
             let (row, _) = pb.content.as_ref().unwrap().row_of(a1).expect("a1's row");
-            let step = if row == 0 { 'j' } else { 'k' };
-            key(&mut app, KeyCode::Char(step), KeyModifiers::NONE);
+            let step = if row == 0 { KeyCode::Down } else { KeyCode::Up };
+            key(&mut app, step, KeyModifiers::NONE);
             draw_narrow(&mut app);
             assert!(
                 !app.launcher.launcher_scroll_held,
                 "the keys took the scroll back"
             );
             let at = crate::launcher::card_cursor(&app, &bands[band]).expect("on a card");
-            assert_ne!(at, a1, "{step} walked the cursor");
+            assert_ne!(at, a1, "{step:?} walked the cursor");
             assert!(
                 whole(&app, at),
                 "the card under the cursor is whole on screen"
@@ -10314,8 +10291,8 @@ mod tests {
             let mut app = two_sessions();
             draw(&mut app);
             let before = (selected(&app), app.selected_project().map(|p| p.id.clone()));
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(
                 (selected(&app), app.selected_project().map(|p| p.id.clone())),
                 before
@@ -10774,7 +10751,7 @@ mod tests {
             assert_eq!(app.chrome.flash, None, "nothing moved, nothing said");
 
             // A step along the bands takes the aim back.
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             assert!(!app.launcher.launcher_unaimed, "a step re-aimed the grid");
         });
     }
@@ -11174,11 +11151,11 @@ mod tests {
             super::select_card(&mut app, bands[0].cards[0].sref(), &mut Vec::new());
             let at = |band, card| Some(crate::launcher::CardRef { band, card });
             for want in [at(0, 1), at(0, 2), at(1, 0), at(1, 0)] {
-                key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+                key(&mut app, KeyCode::Down, KeyModifiers::NONE);
                 draw(&mut app);
                 assert_eq!(cursor_card(&app), want);
             }
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(cursor_card(&app), at(0, 2), "onto the last line above");
         });
     }
@@ -11299,12 +11276,12 @@ mod tests {
             super::select_card(&mut app, bands[0].cards[0].sref(), &mut Vec::new());
             let at = |band, card| Some(crate::launcher::CardRef { band, card });
             for (code, want) in [
-                (KeyCode::Char('l'), at(0, 1)),
-                (KeyCode::Char('j'), at(0, 4)),
-                (KeyCode::Char('j'), at(1, 0)),
-                (KeyCode::Char('j'), at(1, 0)),
-                (KeyCode::Char('k'), at(0, 3)),
-                (KeyCode::Char('k'), at(0, 0)),
+                (KeyCode::Right, at(0, 1)),
+                (KeyCode::Down, at(0, 4)),
+                (KeyCode::Down, at(1, 0)),
+                (KeyCode::Down, at(1, 0)),
+                (KeyCode::Up, at(0, 3)),
+                (KeyCode::Up, at(0, 0)),
             ] {
                 key(&mut app, code, KeyModifiers::NONE);
                 draw_tall(&mut app);
@@ -11378,7 +11355,7 @@ mod tests {
             let mut by_key = list_of_five();
             draw(&mut by_key);
             super::select_card(&mut by_key, bands[0].cards[0].sref(), &mut Vec::new());
-            key(&mut by_key, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut by_key, KeyCode::Down, KeyModifiers::NONE);
             assert_eq!(cursor_card(&by_key), cursor_card(&app));
 
             draw(&mut app);
@@ -11690,7 +11667,7 @@ mod tests {
             assert_eq!(child_title.fg, th.ok, "a live terminal is green");
             assert!(!child_title.modifier.contains(Modifier::BOLD));
 
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             let term = draw_tall(&mut app);
             let main = drawn_entries(&app, 0);
             let buf = term.backend().buffer();
@@ -11824,10 +11801,10 @@ mod tests {
             let mut app = nested();
             draw_tall(&mut app);
             let at = |band, card| Some(CardRef { band, card });
-            let j = |app: &mut App| key(app, KeyCode::Char('j'), KeyModifiers::NONE);
-            let k = |app: &mut App| key(app, KeyCode::Char('k'), KeyModifiers::NONE);
-            let h = |app: &mut App| key(app, KeyCode::Char('h'), KeyModifiers::NONE);
-            let l = |app: &mut App| key(app, KeyCode::Char('l'), KeyModifiers::NONE);
+            let j = |app: &mut App| key(app, KeyCode::Down, KeyModifiers::NONE);
+            let k = |app: &mut App| key(app, KeyCode::Up, KeyModifiers::NONE);
+            let h = |app: &mut App| key(app, KeyCode::Left, KeyModifiers::NONE);
+            let l = |app: &mut App| key(app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(cursor_card(&app), at(0, 0));
             j(&mut app);
             assert_eq!(cursor_card(&app), at(0, 1), "the terminal under it");
@@ -11884,7 +11861,7 @@ mod tests {
         with_default_config(|| {
             let mut app = nested();
             draw_tall(&mut app);
-            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Left, KeyModifiers::NONE);
             assert!(app.band_folded(&crate::launcher::bands(&app)[0]));
             key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(
@@ -11900,7 +11877,7 @@ mod tests {
 
             let mut child = nested();
             draw_tall(&mut child);
-            key(&mut child, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut child, KeyCode::Down, KeyModifiers::NONE);
             key(&mut child, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(
                 reading(&child),
@@ -11917,12 +11894,12 @@ mod tests {
         with_default_config(|| {
             let mut app = nested();
             draw_tall(&mut app);
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(
                 app.launcher.launcher_tab_cursor, None,
                 "one press stays put"
             );
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(
                 app.launcher.launcher_tab_cursor,
                 Some(ProjectId("p1".into()))
@@ -11974,7 +11951,7 @@ mod tests {
             assert_eq!(head.y, above.bottom(), "no blank row above it");
 
             // polish-nav, and on to the empty worktree.
-            keys(&mut app, &[KeyCode::Char('j'); 2]);
+            keys(&mut app, &[KeyCode::Down; 2]);
             assert_eq!(
                 app.selected_worktree().map(|w| w.id.0.clone()).as_deref(),
                 Some("w3")
@@ -11989,8 +11966,8 @@ mod tests {
                 screen_text(&term).contains("agent    nothing running"),
                 "the detail strip says so too"
             );
-            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
-            key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert!(app.launcher.launcher_folded.is_empty());
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_SESSIONS));
@@ -12060,7 +12037,7 @@ mod tests {
     fn d_on_a_threads_root_deletes_everything_nested_under_it() {
         with_default_config(|| {
             let mut app = nested_with_children();
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             assert!(
                 matches!(&app.modals.overlay, Some(Overlay::Confirm(c))
@@ -12070,7 +12047,7 @@ mod tests {
             );
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
             let Some(Overlay::Confirm(c)) = &app.modals.overlay else {
                 panic!("the root asks: {:?}", app.modals.overlay);
@@ -12272,7 +12249,7 @@ mod tests {
             assert!(root.starts_with("▾ ↳ agent-1"), "{root:?}");
             let screen = screen_text(&term);
             assert!(
-                screen.contains("jk move  Enter open  p sub-prompt"),
+                screen.contains("↑↓ move  Enter open  p sub-prompt"),
                 "{screen}"
             );
 
@@ -12282,10 +12259,10 @@ mod tests {
                 .launcher
                 .launcher_folded
                 .contains(&WorktreeId("w1".into())));
-            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Left, KeyModifiers::NONE);
             assert_eq!(drawn_after(&mut app, 0).len(), 2, "h does not fold");
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
-            key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            key(&mut app, KeyCode::Left, KeyModifiers::NONE);
             assert_eq!(cursor_card(&app), Some(CardRef { band: 0, card: 0 }));
         });
     }
@@ -12313,7 +12290,7 @@ mod tests {
             let order = crate::launcher::thread_order(&crate::launcher::bands(&app)[0]);
             assert_eq!(order.len(), 5);
             for _ in 0..order.len() - 1 {
-                key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+                key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             draw_at(&mut app, 80, 9);
             let last = order.len() - 1;
@@ -12629,9 +12606,9 @@ mod tests {
             let mut app = nested_root();
             super::select(&mut app, AgentId("a1".into()), &mut Vec::new());
             draw_tall(&mut app);
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a6"));
-            key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Up, KeyModifiers::NONE);
             assert_eq!(selected(&app).as_deref(), Some("a1"));
 
             key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
@@ -12666,11 +12643,11 @@ mod tests {
             assert!(lines[3].starts_with("pr       #141 open"), "{lines:#?}");
             assert!(lines[3].ends_with("v open PR"), "{lines:#?}");
             assert!(
-                screen_text(&term).contains("jk move  Enter open  p sub-prompt"),
+                screen_text(&term).contains("↑↓ move  Enter open  p sub-prompt"),
                 "the footer's three verbs"
             );
 
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             let term = draw_tall(&mut app);
             let lines = strip_lines(&term);
             assert!(
@@ -12683,7 +12660,7 @@ mod tests {
             assert!(lines[3].starts_with("pr       #141 open"));
             assert_eq!(app.chrome.body_area, body, "the list keeps its height");
 
-            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Down, KeyModifiers::NONE);
             let lines = strip_lines(&draw_tall(&mut app));
             assert_eq!(lines[0], "agent-1", "no changes, nothing at the right");
             assert_eq!(lines[2], "worktree main");

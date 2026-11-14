@@ -41,14 +41,13 @@ const DUST_LIGHT: &[u8] = &[189, 183, 177, 141, 135, 99, 92, 54];
 /// white doesn't wash out.
 const MARK_LIGHT: &[u8] = &[55, 56, 92, 127, 162, 161];
 
-/// 5-row block bitmaps for N E B U L A.
+/// 5-row block bitmaps for O R B I T.
 const LETTERS: &[&[&str; 5]] = &[
-    &["#...#", "##..#", "#.#.#", "#..##", "#...#"],
-    &["####", "#...", "###.", "#...", "####"],
+    &[".##.", "#..#", "#..#", "#..#", ".##."],
+    &["###.", "#..#", "###.", "#.#.", "#..#"],
     &["###.", "#..#", "###.", "#..#", "###."],
-    &["#..#", "#..#", "#..#", "#..#", ".##."],
-    &["#...", "#...", "#...", "#...", "####"],
-    &[".##.", "#..#", "####", "#..#", "#..#"],
+    &["###", ".#.", ".#.", ".#.", "###"],
+    &["#####", "..#..", "..#..", "..#..", "..#.."],
 ];
 
 fn hash(x: i32, y: i32, salt: u32) -> u32 {
@@ -212,6 +211,12 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         )));
         lines.push(Line::from(""));
     }
+    let help = app
+        .chrome
+        .keymap
+        .shown_first(crate::keymap::Action::Help)
+        .map(|c| c.display())
+        .unwrap_or_else(|| "?".into());
     let key = |k: &str, label: &str| {
         vec![
             Span::styled(
@@ -234,7 +239,7 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
             None => hint.extend(key("n / o", "create your first project")),
         }
         hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
-        hint.extend(key("?", "help"));
+        hint.extend(key(&help, "help"));
     } else if app.launcher.projects_closed {
         // Every tab closed: the projects are all still there, so `+`
         // lists them; Enter still opens the repo orbit was started in.
@@ -252,7 +257,7 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
         hint.extend(key("o", "another folder"));
         hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
-        hint.extend(key("?", "help"));
+        hint.extend(key(&help, "help"));
     }
     lines.push(Line::from(hint));
 

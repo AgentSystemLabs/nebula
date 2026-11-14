@@ -1382,7 +1382,7 @@ fn splash_footer_lists_only_keys_that_work() {
     seed_tree(&mut app);
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
     let text = buffer_text(&terminal);
-    assert!(text.contains("new session"), "{text}");
+    assert!(text.contains("new task"), "{text}");
     assert!(!text.contains("open a folder"), "{text}");
 }
 
@@ -1742,7 +1742,7 @@ fn a_slow_or_interrupted_second_tap_at_the_edge_stays_put() {
     let mut app = App::new();
     let mut out = Vec::new();
     let l = |app: &mut App, out: &mut Vec<ClientRequest>| {
-        press(app, KeyCode::Char('l'), KeyModifiers::NONE, out)
+        press(app, KeyCode::Right, KeyModifiers::NONE, out)
     };
 
     app.nav.focus = Focus::Sessions;
@@ -1761,7 +1761,7 @@ fn a_slow_or_interrupted_second_tap_at_the_edge_stays_put() {
     );
     assert!(app.chrome.edge_tap.is_some(), "but the late one arms again");
 
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     assert!(
         app.chrome.edge_tap.is_none(),
         "any other key breaks the pair"
@@ -10799,7 +10799,7 @@ fn switching_contexts_restores_the_remembered_session() {
     app.nav.focus = Focus::Worktrees;
     handle_key(
         &mut app,
-        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         &mut out,
     );
     assert!(app.pane.term.is_some(), "clamped move keeps the pane");
@@ -13061,17 +13061,17 @@ fn settings_j_k_move_selection() {
     let mut app = App::new();
     let mut out = Vec::new();
     open_settings_on(&mut app, 0, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     let Some(Overlay::Settings(view)) = &app.modals.overlay else {
         panic!("settings closed");
     };
     assert_eq!(view.selected, 1);
-    press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
     let Some(Overlay::Settings(view)) = &app.modals.overlay else {
         panic!("settings closed");
     };
     assert_eq!(view.selected, 0);
-    press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
     let Some(Overlay::Settings(view)) = &app.modals.overlay else {
         panic!("settings closed");
     };
@@ -13083,8 +13083,8 @@ fn settings_reopens_on_last_focused_row() {
     let mut app = App::new();
     let mut out = Vec::new();
     open_settings_on(&mut app, 0, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
     press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
     let Some(Overlay::Settings(view)) = &app.modals.overlay else {
@@ -13249,12 +13249,12 @@ fn settings_hl_cycles_session_idle_timeout_and_persists() {
             crate::config::locate(crate::config::SettingKind::SessionIdleTimeout).unwrap();
         open_settings_on(&mut app, tab, &mut out);
         for _ in 0..row {
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
-        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
         let cfg = crate::config::Config::load();
         assert_eq!(cfg.session_idle_timeout, "15m");
-        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
         let cfg = crate::config::Config::load();
         assert_eq!(cfg.session_idle_timeout, "5m");
     });
@@ -13276,14 +13276,14 @@ fn settings_worktree_base_branch_is_typed_through_a_prompt() {
         let (tab, row) = crate::config::locate(WorktreeBaseBranch).unwrap();
         open_settings_on(&mut app, tab, &mut out);
         for _ in 0..row {
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
         let saved = |path: &std::path::Path| -> serde_json::Value {
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
 
         // ←/→: nothing to cycle, the overlay stays and explains.
-        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
         let view = settings_view(&app);
         assert_eq!(view.selected, row);
         assert!(
@@ -13445,11 +13445,11 @@ fn agents_tab_renders_its_harness_groups() {
 
     // Headers and blanks are not rows the cursor can land on: five ↓
     // from the first row reach Claude's Enabled row, not a header.
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     let (_, claude_enabled) = locate_agent("claude", HarnessField::Enabled).unwrap();
     assert_eq!(settings_view(&app).selected, claude_enabled);
 
@@ -13638,13 +13638,13 @@ fn settings_search_results_walk_across_tabs() {
     let mut tabs = std::collections::BTreeSet::new();
     for _ in 0..200 {
         tabs.insert(settings_view(&app).tab);
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     }
     assert!(tabs.len() > 2, "j crossed tabs: {tabs:?}");
     while (settings_view(&app).tab, settings_view(&app).selected) != first {
-        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
     }
-    press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
     assert!(
         settings_view(&app).typing,
         "↑ off the first match is the field"
@@ -13702,7 +13702,7 @@ fn up_from_the_top_row_parks_on_the_strip_where_arrows_move_tabs() {
         assert!(!settings_view(&app).on_tabs);
         // In the list, → cycles the selected setting's value.
         for _ in 0..editor_row {
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
         press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
         assert_eq!(crate::config::Config::load().editor, "nvim");
@@ -13731,12 +13731,12 @@ fn each_tab_remembers_its_own_cursor_row() {
     let mut app = App::new();
     let mut out = Vec::new();
     open_settings_on(&mut app, 0, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     assert_eq!(settings_view(&app).selected, 2);
     press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
     assert_eq!(settings_view(&app).selected, 0, "a fresh tab starts at 0");
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
     assert_eq!(settings_view(&app).selected, 2, "back where we left it");
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
@@ -13777,7 +13777,7 @@ fn rebinding_an_action_takes_effect_and_persists() {
         open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
         let row = crate::keymap::index_of(crate::keymap::Action::Help).unwrap();
         for _ in 0..row {
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(settings_view(&app).capturing(), "waiting for a key");
@@ -13814,7 +13814,7 @@ fn a_duplicate_chord_warns_before_it_is_taken() {
         open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
         let row = crate::keymap::index_of(crate::keymap::Action::Help).unwrap();
         for _ in 0..row {
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         // `g` is Git diff's — capturing it must not silently steal it.
@@ -13827,14 +13827,14 @@ fn a_duplicate_chord_warns_before_it_is_taken() {
         assert!(!view.capturing(), "the capture is paused on the warning");
         assert_eq!(
             app.chrome.keymap.label(crate::keymap::Action::Help),
-            "?",
+            "h ?",
             "nothing changed yet"
         );
 
         // Esc leaves it where it was.
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         assert_eq!(app.chrome.keymap.label(crate::keymap::Action::GitDiff), "g");
-        assert_eq!(app.chrome.keymap.label(crate::keymap::Action::Help), "?");
+        assert_eq!(app.chrome.keymap.label(crate::keymap::Action::Help), "h ?");
     });
 }
 
@@ -13847,7 +13847,7 @@ fn confirming_a_duplicate_moves_the_chord_off_its_old_action() {
         open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
         let row = crate::keymap::index_of(crate::keymap::Action::Help).unwrap();
         for _ in 0..row {
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
@@ -13966,7 +13966,7 @@ fn a_capture_takes_keys_the_overlay_would_normally_use() {
         open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
         let row = crate::keymap::index_of(crate::keymap::Action::Metrics).unwrap();
         for _ in 0..row {
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         // 'q' would close the overlay; here it is just a key.
@@ -14089,7 +14089,7 @@ fn a_hand_edited_duplicate_is_called_out_on_the_row() {
         open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
         let row = crate::keymap::index_of(crate::keymap::Action::GitDiff).unwrap();
         for _ in 0..row {
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -14375,13 +14375,13 @@ fn metrics_enter_opens_selected_session() {
     };
     hse(&mut app, ServerEvent::Metrics { req_id, snapshot });
     terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     let Some(Overlay::Metrics(view)) = &app.modals.overlay else {
         panic!("metrics closed");
     };
     assert_eq!(view.selected, 2, "j walks down to the ui row");
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     let Some(Overlay::Metrics(view)) = &app.modals.overlay else {
         panic!("metrics closed");
     };
@@ -18246,7 +18246,7 @@ fn the_project_tab_run_command_is_typed_into_the_selected_projects_entry() {
         );
 
         // ←/→: nothing to cycle, the overlay stays and explains.
-        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
         let view = settings_view(&app);
         assert_eq!(view.selected, row);
         assert!(
@@ -20243,7 +20243,7 @@ fn hosts_enter_quits_with_the_selected_destination() {
         let mut app = App::new();
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT, &mut out);
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(app.chrome.should_quit, "Enter hands off by quitting");
         assert!(app.modals.overlay.is_none());
@@ -20753,7 +20753,7 @@ fn a_click_into_the_pane_is_enter_on_it() {
                 if app.selected_session().map(|a| a.id) == Some(reaped.clone()) {
                     break;
                 }
-                press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+                press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
             }
             assert_eq!(
                 app.selected_session().map(|a| a.id),
@@ -21809,8 +21809,8 @@ fn key_combo_display_spells_each_press_with_what_it_did() {
     seed_tree(&mut app);
     let mut out = Vec::new();
     assert!(app.chrome.key_combo.is_none(), "nothing pressed yet");
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-    assert_eq!(combo_text(&app).as_deref(), Some("j - Move down"));
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    assert_eq!(combo_text(&app).as_deref(), Some("↓ - Move down"));
     press(
         &mut app,
         KeyCode::Char('d'),
@@ -21818,10 +21818,10 @@ fn key_combo_display_spells_each_press_with_what_it_did() {
         &mut out,
     );
     assert_eq!(combo_text(&app).as_deref(), Some("^d - Half page down"));
-    press(&mut app, KeyCode::Char(';'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
     assert_eq!(
         combo_text(&app).as_deref(),
-        Some(";"),
+        Some("k"),
         "an unbound key shows bare: it did nothing, and the watcher sees that"
     );
 
@@ -21876,11 +21876,11 @@ fn key_combo_display_never_echoes_what_is_typed_into_a_locked_pane() {
     app.pane.term_locked = true;
     let mut out = Vec::new();
     for code in [
-        KeyCode::Char('h'),
+        KeyCode::Left,
         KeyCode::Char('u'),
         KeyCode::Char('n'),
         KeyCode::Enter,
-        KeyCode::Char('j'),
+        KeyCode::Down,
     ] {
         press(&mut app, code, KeyModifiers::NONE, &mut out);
     }
@@ -21919,8 +21919,8 @@ fn the_key_combo_display_shows_whatever_the_retired_key_says() {
     };
     apply_config(&mut app, &cfg);
     let mut out = Vec::new();
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-    assert_eq!(combo_text(&app).as_deref(), Some("j - Move down"));
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    assert_eq!(combo_text(&app).as_deref(), Some("↓ - Move down"));
     apply_config(&mut app, &cfg);
     assert!(
         app.chrome.key_combo.is_some(),
@@ -21969,19 +21969,19 @@ fn key_combo_display_sits_on_the_footers_padding_row_at_the_left() {
     let mut app = App::new();
     seed_tree(&mut app);
     let mut out = Vec::new();
-    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
     draw_frame(&mut terminal, &mut app).unwrap();
     let text = buffer_text(&terminal);
     let rows: Vec<&str> = text.lines().collect();
     assert_eq!(
         rows[28].trim_end(),
-        "  j  - Move down",
+        "  ↓  - Move down",
         "the row above the bar, at the far left"
     );
     assert!(rows[29].contains("orbit v"), "the bar itself is untouched");
     let cell = &terminal.backend().buffer()[(2, 28)];
-    assert_eq!(cell.symbol(), "j");
+    assert_eq!(cell.symbol(), "↓");
     assert_eq!(cell.bg, app.chrome.theme.sel_bg, "the key sits in a keycap");
     assert_eq!(cell.fg, app.chrome.theme.accent);
 

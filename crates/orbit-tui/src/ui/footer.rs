@@ -214,17 +214,19 @@ fn launcher_tabs_footer_hint(app: &App, th: Theme) -> FooterHint {
     )
 }
 
-fn launcher_grid_footer_hint(app: &App, th: Theme) -> FooterHint {
+fn launcher_grid_footer_hint(app: &App, _th: Theme) -> FooterHint {
     let k = |a| key_hint(app, a);
+    // Arrows read as arrows to everyone; the old vim letters are gone from
+    // the defaults, so the hint never asks anyone to know what `hjkl` is.
     let move_keys = format!(
         "{}{}{}{}",
-        k(Action::FocusLeft),
-        k(Action::MoveDown),
         k(Action::MoveUp),
+        k(Action::MoveDown),
+        k(Action::FocusLeft),
         k(Action::FocusRight),
     );
     if app.launcher.launcher_nested && !app.launcher.show_archived {
-        let walk = format!("{}{}", k(Action::MoveDown), k(Action::MoveUp));
+        let walk = format!("{}{}", k(Action::MoveUp), k(Action::MoveDown));
         return FooterHint {
             hints: Span::raw(""),
             key_bar: Some(vec![
@@ -234,34 +236,39 @@ fn launcher_grid_footer_hint(app: &App, th: Theme) -> FooterHint {
             ]),
         };
     }
-    let text = if app.launcher.show_archived {
-        format!(
-            "{move_keys}: move  {}: unarchive  {}: delete  {}: back to live sessions  {}: jump  {}: help  {}: quit",
-            k(Action::Unarchive),
-            k(Action::Delete),
-            k(Action::ToggleArchived),
-            k(Action::Palette),
-            k(Action::Help),
-            k(Action::Quit),
-        )
+    // A short bar of the keys that matter on the grid, each with a plain
+    // word — everything else is one `h` away, in the help.
+    let keys = if app.launcher.show_archived {
+        vec![
+            (move_keys, "move"),
+            (k(Action::Unarchive), "restore"),
+            (k(Action::Delete), "delete"),
+            (k(Action::ToggleArchived), "back"),
+            (k(Action::Palette), "jump"),
+            (k(Action::Help), "all keys"),
+            (k(Action::Quit), "quit"),
+        ]
     } else {
-        format!(
-            "{move_keys}: move  {}: open  {}: new session  {}{}: project tabs  {}: terminals  {}: archive  {}: archived  {}: diff  {}: jump  {}: settings  {}: help  {}: quit",
-            k(Action::Activate),
-            k(Action::QuickPrompt),
-            k(Action::PrevProjectTab),
-            k(Action::NextProjectTab),
-            k(Action::PaneTabs),
-            k(Action::Archive),
-            k(Action::ToggleArchived),
-            k(Action::GitDiff),
-            k(Action::Palette),
-            k(Action::Settings),
-            k(Action::Help),
-            k(Action::Quit),
-        )
+        vec![
+            (move_keys, "move"),
+            (k(Action::Activate), "open"),
+            (k(Action::QuickPrompt), "new task"),
+            (k(Action::FollowUp), "follow-up"),
+            (k(Action::Palette), "jump"),
+            (
+                format!("{}{}", k(Action::PrevProjectTab), k(Action::NextProjectTab)),
+                "projects",
+            ),
+            (k(Action::GitDiff), "diff"),
+            (k(Action::Settings), "settings"),
+            (k(Action::Help), "all keys"),
+            (k(Action::Quit), "quit"),
+        ]
     };
-    dim_hint(text, th)
+    FooterHint {
+        hints: Span::raw(""),
+        key_bar: Some(keys),
+    }
 }
 
 fn pane_footer_hint(app: &App, th: Theme) -> FooterHint {
@@ -350,22 +357,11 @@ fn pane_footer_hint(app: &App, th: Theme) -> FooterHint {
 fn locked_terminal_footer_hint(app: &App) -> String {
     format!(
         "{}: {}  {}  ⌥click: open link",
-        if app.launcher_grid() {
-            app.chrome
-                .keymap
-                .chords(Action::ToggleLauncherPane)
-                .iter()
-                .find(|c| !crate::key_combo::is_text_key(c))
-                .map(|c| c.display())
-        } else {
-            None
-        }
-        .or_else(|| app
-            .chrome
+        app.chrome
             .keymap
             .first(Action::UnlockTerminal)
-            .map(|c| c.display()))
-        .unwrap_or_else(|| "^q".into()),
+            .map(|c| c.display())
+            .unwrap_or_else(|| "^q".into()),
         if app.launcher_grid() {
             "back to the card"
         } else if app.launcher_active() && app.pane.collapsed {
@@ -439,7 +435,10 @@ fn append_footer_hint(
                 if i > 0 {
                     spans.push(Span::raw("  "));
                 }
-                spans.push(Span::styled(key, Style::default().fg(th.text)));
+                spans.push(Span::styled(
+                    key,
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ));
                 spans.push(Span::styled(
                     format!(" {does}"),
                     Style::default().fg(th.muted),

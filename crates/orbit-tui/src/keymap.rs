@@ -218,7 +218,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Step to the card on the left, stopping at the row's first",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["h", "left"],
+        defaults: &["left"],
     },
     ActionSpec {
         action: Action::FocusRight,
@@ -227,7 +227,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Step to the card on the right, stopping at the row's last",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["l", "right"],
+        defaults: &["right"],
     },
     ActionSpec {
         action: Action::MoveDown,
@@ -236,7 +236,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Move the cursor down a row of cards; twice from the project tabs, into the one under their cursor",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["j", "down"],
+        defaults: &["down"],
     },
     ActionSpec {
         action: Action::MoveUp,
@@ -245,7 +245,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Move the cursor up a row of cards, stopping at the first; twice there, up to the project tabs",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["k", "up"],
+        defaults: &["up"],
     },
     ActionSpec {
         action: Action::HalfPageDown,
@@ -281,7 +281,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Search every project, worktree and session at once",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["/"],
+        defaults: &["j", "/"],
     },
     ActionSpec {
         action: Action::NextAttention,
@@ -290,7 +290,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Jump to the next session in the palette's attention order (needs feedback, running, unseen, then recency) in any project, wrapping",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["."],
+        defaults: &[";", "."],
     },
     ActionSpec {
         action: Action::PrevAttention,
@@ -308,7 +308,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Open the project on the tab to the right of this one in the header, stopping at the last",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["]"],
+        defaults: &[">", "]"],
     },
     ActionSpec {
         action: Action::PrevProjectTab,
@@ -317,7 +317,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Open the project on the tab to the left, stopping at the first",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["["],
+        defaults: &["<", "["],
     },
     project_tab_slot!(1, "project_tab_1", "Project tab 1", "cmd+1", "1"),
     project_tab_slot!(2, "project_tab_2", "Project tab 2", "cmd+2", "2"),
@@ -631,7 +631,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         // sends the same NUL it sends for ^Space. So the bare `~` is bound
         // beside them — the shift of the `` ` `` that walks the pane's
         // tabs, which is the key everything else about the pane is on.
-        defaults: &["ctrl+`", "ctrl+~", "~"],
+        defaults: &["z", "ctrl+`", "ctrl+~", "~"],
     },
     ActionSpec {
         action: Action::ToggleOrchestratorView,
@@ -658,7 +658,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Walk the cursor through the terminal cards of its checkout, one after another and back round to the first — the pane reads each",
         group: "GENERAL",
         scope: Scope::Global,
-        defaults: &["`"],
+        defaults: &["w", "`"],
     },
     ActionSpec {
         action: Action::Hosts,
@@ -694,7 +694,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Toggle the keyboard help overlay",
         group: "GENERAL",
         scope: Scope::Global,
-        defaults: &["?"],
+        defaults: &["h", "?"],
     },
     ActionSpec {
         action: Action::Quit,
