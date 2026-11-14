@@ -52,7 +52,13 @@ same time without editing the same files.
 
 ## 2. Install and run
 
-Orbit is built from this repository. You need Rust (`rustup`, on your PATH) and the `claude` CLI.
+**What you need:** `git` and the `claude` CLI, plus **`uv`** and **`npm`**. Orbit fetches the tools it
+integrates through those two on first use — graphify through `uvx`, agent-browser through `npx` — so
+there is nothing else to install. Run **`orbit doctor`** to see what your machine has and what each
+missing piece would unlock; `orbit doctor --fix` fetches those tools right away instead of on first
+use. (`gh` is the one optional extra worth installing yourself, for pull requests and issues.)
+
+To build Orbit from this repository you also need Rust (`rustup`, on your PATH).
 
 **Try your latest code without touching anything else** — an isolated copy with its own daemon and
 data:
@@ -194,8 +200,10 @@ is installed.
 
 ### The code graph (graphify)
 
-With the [graphify](https://github.com/Graphify-Labs/graphify) CLI installed (`uv tool install graphifyy`),
-Orbit keeps a **knowledge graph of your code** for every checkout, with nothing to set up:
+Orbit keeps a **knowledge graph of your code** for every checkout using
+[graphify](https://github.com/Graphify-Labs/graphify), with nothing to set up — it only needs `uv`
+(it runs graphify through `uvx`, which fetches it on first use; an installed `graphify` is used
+instead when there is one):
 
 - It is built when you add a project or create a worktree, and refreshed after every Claude turn.
   It uses code analysis only — no LLM, no cost — and takes a few seconds (incremental after that).
@@ -363,6 +371,8 @@ orbit read <session>      # print a session's recent output
 orbit ask <session> "…"   # ask a session something and print the answer
 orbit kill                # stop the daemon and every session
 orbit reload              # move the daemon onto a new build, keeping sessions
+orbit doctor              # what's installed, what's missing, what each tool unlocks
+orbit doctor --fix        # fetch graphify and agent-browser now (through uv / npm)
 orbit config path         # where the settings files are
 orbit config export       # back up settings
 orbit ssh <host>          # open Orbit on another machine

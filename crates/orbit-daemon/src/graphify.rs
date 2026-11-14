@@ -1,6 +1,7 @@
 //! GRAPHIFY: a code knowledge graph kept up to date for every checkout.
 //!
-//! When the `graphify` CLI is installed, the DAEMON runs `graphify update
+//! When graphify is installed — or `uv` is, which fetches it on demand
+//! (`uvx --from graphifyy graphify`) — the DAEMON runs `graphify update
 //! <checkout>` — AST extraction only, no LLM, a few seconds on a large repo
 //! and incremental after that — whenever a project is added, a worktree is
 //! created, and an agent's turn finishes (the moment code most likely
@@ -9,7 +10,7 @@
 //! `.gitignore` edit), so it never shows in a diff.
 //!
 //! Claude sessions in a checkout that has a graph are told to query it
-//! before searching broadly ([`CLAUDE_GRAPHIFY_GUIDANCE`]), and the
+//! before searching broadly ([`claude_guidance`]), and the
 //! read-only query commands are pre-approved alongside orbit's own.
 //!
 //! Off switches: `"graphify": false` in config.json for every project, or in
@@ -32,13 +33,42 @@ pub const OUT_DIR: &str = "graphify-out";
 const RUN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Appended to Claude's system prompt in a checkout that has a graph.
-pub const CLAUDE_GRAPHIFY_GUIDANCE: &str = "[orbit] This checkout has a code knowledge graph \
-built by graphify in `graphify-out/` (orbit refreshes it automatically after every turn — never run \
-`graphify update` yourself). For questions about structure — where something lives, how parts \
-connect, what a change would affect — query the graph before searching file by file:\n\n  graphify \
-query \"<question>\"\n  graphify explain \"<symbol or file>\"\n  graphify path \"<A>\" \"<B>\"\n  graphify \
-affected \"<symbol>\"\n\nthen read the specific files it points to. `graphify-out/GRAPH_REPORT.md` \
-summarises the architecture. Fall back to ordinary search when the graph has no answer.";
+/// `graphify` is how a shell types the tool here: `graphify`, or
+/// `uvx --from graphifyy graphify` when uv fetches it on demand.
+pub fn claude_guidance(graphify: &str) -> String {
+    format!(
+        "[orbit] This checkout has a code knowledge graph built by graphify in `graphify-out/` \
+(orbit refreshes it automatically after every turn — never update it yourself). For questions \
+about structure — where something lives, how parts connect, what a change would affect — query \
+the graph before searching file by file:\n\n  {graphify} query \"<question>\"\n  {graphify} \
+explain \"<symbol or file>\"\n  {graphify} path \"<A>\" \"<B>\"\n  {graphify} affected \"<symbol>\"\n\n\
+then read the specific files it points to. `graphify-out/GRAPH_REPORT.md` summarises the \
+architecture. Fall back to ordinary search when the graph has no answer."
+    )
+}
+
+/// How a shell types graphify on this machine (`graphify` when nothing
+/// resolves, so the guidance still reads sensibly).
+pub fn shell_command() -> String {
+    orbit_core::tools::graphify()
+        .map(|g| g.shell)
+        .unwrap_or_else(|| "graphify".into())
+}
+
+/// The guidance for `checkout`, when it has a graph.
+pub fn guidance_for(checkout: &Path) -> Option<String> {
+    has_graph(checkout).then(|| claude_guidance(&shell_command()))
+}
+
+/// Pre-approved permission rules for graphify's read-only queries, spelled
+/// the way this machine runs it.
+pub fn allow_rules() -> Vec<String> {
+    let graphify = shell_command();
+    ["query", "explain", "path", "affected", "god-nodes"]
+        .iter()
+        .map(|sub| format!("Bash({graphify} {sub}:*)"))
+        .collect()
+}
 
 /// The graph's own file, whose presence means a checkout has a graph.
 pub fn graph_json(checkout: &Path) -> PathBuf {
@@ -50,14 +80,10 @@ pub fn has_graph(checkout: &Path) -> bool {
     graph_json(checkout).is_file()
 }
 
-/// The `graphify` executable, if a runnable copy is installed.
-pub fn program() -> Option<PathBuf> {
-    orbit_core::tools::find("graphify")
-}
-
-/// Whether orbit should keep a graph for `checkout`: the setting is on, the
-/// checkout's `.orbit.json` doesn't opt out, and the CLI is installed.
-pub fn wanted(checkout: &Path) -> Option<PathBuf> {
+/// How to run graphify for `checkout`, when orbit should keep a graph
+/// there: the setting is on, the checkout's `.orbit.json` doesn't opt out,
+/// and graphify is installed or uv can fetch it.
+pub fn wanted(checkout: &Path) -> Option<orbit_core::tools::Invocation> {
     if !crate::config::Config::load().graphify {
         return None;
     }
@@ -66,7 +92,7 @@ pub fn wanted(checkout: &Path) -> Option<PathBuf> {
             return None;
         }
     }
-    program()
+    orbit_core::tools::graphify()
 }
 
 #[derive(Default)]
@@ -84,7 +110,7 @@ fn running() -> &'static Mutex<HashMap<PathBuf, Slot>> {
 /// does nothing when graphify is off, missing, or there is no runtime to
 /// run on. A call while a run is in flight schedules one rerun.
 pub fn refresh(checkout: &Path) {
-    let Some(program) = wanted(checkout) else {
+    let Some(graphify) = wanted(checkout) else {
         return;
     };
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -102,7 +128,7 @@ pub fn refresh(checkout: &Path) {
     handle.spawn(async move {
         exclude_from_git(&checkout).await;
         loop {
-            run_once(&program, &checkout).await;
+            run_once(&graphify, &checkout).await;
             let mut map = running().lock().unwrap_or_else(|e| e.into_inner());
             match map.get_mut(&checkout) {
                 Some(slot) if slot.again => slot.again = false,
@@ -115,11 +141,13 @@ pub fn refresh(checkout: &Path) {
     });
 }
 
-async fn run_once(program: &Path, checkout: &Path) {
+async fn run_once(graphify: &orbit_core::tools::Invocation, checkout: &Path) {
     if !checkout.is_dir() {
         return;
     }
-    let child = tokio::process::Command::new(program)
+    // The first uvx run downloads graphify, so the timeout covers that too.
+    let child = tokio::process::Command::new(&graphify.program)
+        .args(&graphify.prefix)
         .arg("update")
         .arg(checkout)
         .current_dir(checkout)

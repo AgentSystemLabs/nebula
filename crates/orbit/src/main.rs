@@ -1,5 +1,6 @@
 mod browser;
 mod cli;
+mod doctor;
 mod sbx;
 mod ssh;
 mod tunnel;
@@ -133,6 +134,7 @@ fn main() -> Result<()> {
             sync_config: !no_sync_config,
         }),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
+        Some(Command::Doctor { fix }) => doctor::run(fix),
         Some(Command::StaleDaemonNote) => {
             if orbit_daemon::lifecycle::daemon_is_stale() {
                 println!("note: the running daemon was built from older code.");

@@ -117,11 +117,13 @@ pub(crate) fn open_graph(app: &mut App) {
     let build = !html.is_file();
     let open = move || {
         if build {
-            let Some(graphify) = orbit_core::tools::find("graphify") else {
-                return "graphify isn't installed — `uv tool install graphifyy`, then press k again"
+            // An installed graphify, or uv fetching it on demand.
+            let Some(graphify) = orbit_core::tools::graphify() else {
+                return "the code graph needs uv — install it (docs.astral.sh/uv), then press k again"
                     .to_string();
             };
-            let built = std::process::Command::new(graphify)
+            let built = graphify
+                .command()
                 .arg("update")
                 .arg(&root)
                 .current_dir(&root)

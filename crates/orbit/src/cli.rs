@@ -410,6 +410,20 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Check what this machine has and what's missing.
+    ///
+    /// Lists what Orbit needs, what's missing, and what each missing tool
+    /// would unlock. Required: git and claude (and curl). Orbit fetches the tools it
+    /// integrates through uv and npm on first use — graphify via uvx,
+    /// agent-browser via npx — so those two runners are all you install.
+    /// Exits non-zero when something required is missing.
+    #[command(after_help = DOCTOR_EXAMPLES)]
+    Doctor {
+        /// Fetch graphify and agent-browser (with its browser) now, through
+        /// uv and npm, instead of on first use. Never installs anything else.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Installer hook: print the cutover note only when a live daemon is on
     /// a different build than this binary (see `make install` / install.sh).
     #[command(hide = true, name = "_stale-daemon-note")]
@@ -599,6 +613,11 @@ const UPGRADE_EXAMPLES: &str = "\
 Examples:
   orbit upgrade                   install the latest release
   orbit upgrade --force           do it over a local cargo build";
+
+const DOCTOR_EXAMPLES: &str = "\
+Examples:
+  orbit doctor                    what's installed, what's missing
+  orbit doctor --fix              fetch graphify and agent-browser now";
 
 #[derive(Subcommand)]
 pub(crate) enum ConfigCommand {

@@ -154,13 +154,6 @@ const CLAUDE_ALLOW_RULES: &[&str] = &[
     "Bash(orbit sessions:*)",
     "Bash(orbit read:*)",
     "Bash(orbit ask:*)",
-    // graphify's read-only graph queries, which the graphify guidance tells
-    // Claude to prefer over broad searching (crate::graphify).
-    "Bash(graphify query:*)",
-    "Bash(graphify explain:*)",
-    "Bash(graphify path:*)",
-    "Bash(graphify affected:*)",
-    "Bash(graphify god-nodes:*)",
 ];
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
@@ -214,12 +207,20 @@ fn managed_group(endpoint: &str, event: &str, matcher: Option<&str>) -> Value {
 /// `<cwd>/.claude/settings.local.json`, plus the permission rule that lets
 /// the auto-title `orbit rename` run unprompted.
 pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
+    // orbit's own commands, plus graphify's read-only graph queries spelled
+    // the way this machine runs graphify (crate::graphify::allow_rules).
+    let graphify = crate::graphify::allow_rules();
+    let rules: Vec<&str> = CLAUDE_ALLOW_RULES
+        .iter()
+        .copied()
+        .chain(graphify.iter().map(String::as_str))
+        .collect();
     install_managed_hooks(
         &cwd.join(CLAUDE_DIR),
         CLAUDE_SETTINGS_FILE,
         "claude",
         CLAUDE_EVENTS,
-        CLAUDE_ALLOW_RULES,
+        &rules,
     )
 }
 

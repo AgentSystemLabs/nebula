@@ -597,8 +597,8 @@ fn agent_spawn_command_with(
             first.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE.to_string());
             first.push(crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE.to_string());
             first.push(crate::open_files::CLAUDE_OPEN_GUIDANCE.to_string());
-            if cwd.is_some_and(crate::graphify::has_graph) {
-                first.push(crate::graphify::CLAUDE_GRAPHIFY_GUIDANCE.to_string());
+            if let Some(note) = cwd.and_then(crate::graphify::guidance_for) {
+                first.push(note);
             }
         }
         if let Some(prompt) = additional_system_prompt {
@@ -633,6 +633,9 @@ fn push_system_prompt(
     cwd: Option<&Path>,
     additional: Option<&str>,
 ) {
+    let graph_note = cwd
+        .filter(|_| guidance)
+        .and_then(crate::graphify::guidance_for);
     let mut system_prompt = Vec::new();
     if guidance {
         system_prompt.push(CLAUDE_WORKTREE_GUIDANCE);
@@ -640,8 +643,8 @@ fn push_system_prompt(
         system_prompt.push(crate::sibling::CLAUDE_SESSION_CONTEXT_GUIDANCE);
         system_prompt.push(crate::open_files::CLAUDE_OPEN_GUIDANCE);
         // The code graph, when orbit has built one for this checkout.
-        if cwd.is_some_and(crate::graphify::has_graph) {
-            system_prompt.push(crate::graphify::CLAUDE_GRAPHIFY_GUIDANCE);
+        if let Some(note) = graph_note.as_deref() {
+            system_prompt.push(note);
         }
     }
     if let Some(prompt) = additional {
@@ -1935,7 +1938,9 @@ mod tests {
 
         std::fs::create_dir_all(tmp.path().join(crate::graphify::OUT_DIR)).unwrap();
         std::fs::write(crate::graphify::graph_json(tmp.path()), "{}").unwrap();
-        assert!(system_prompt(tmp.path()).contains(crate::graphify::CLAUDE_GRAPHIFY_GUIDANCE));
+        let with_graph = system_prompt(tmp.path());
+        assert!(with_graph.contains("graphify-out/"), "{with_graph}");
+        assert!(with_graph.contains(&format!("{} query", crate::graphify::shell_command())));
     }
 
     #[test]
