@@ -104,7 +104,7 @@ pub enum Action {
     SwitchBranch,
     /// `Shift+Enter` / `Shift+O` / `Alt+Enter`, on the grid: fire the
     /// selected worktree's OPEN COMMAND — the project's **Open command**
-    /// setting, else its `.orbit.json` `open` (`open http://localhost:3000`,
+    /// setting, else its `.orbit/config.json` `open` (`open http://localhost:3000`,
     /// say). Three chords because only the kitty protocol carries a shifted
     /// Enter: Terminal.app sends a plain one and tmux flattens it, while
     /// `ESC CR` — what `/terminal-setup` gives Shift+Enter in VS Code, and
@@ -464,7 +464,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::OpenWorktree,
         id: "open_worktree",
         label: "Open checkout in editor",
-        hint: "Open the selected checkout outside orbit, usually in your editor: its project's Open command (Settings → Project), else .orbit.json \"open\" — e.g. open http://localhost:3000 (⇧Enter needs the kitty protocol; ⇧O arrives everywhere; ⌥Enter is the ESC CR that VS Code's Shift+Enter setup sends and tmux passes through)",
+        hint: "Open the selected checkout outside orbit, usually in your editor: its project's Open command (Settings → Project), else .orbit/config.json \"open\" — e.g. open http://localhost:3000 (⇧Enter needs the kitty protocol; ⇧O arrives everywhere; ⌥Enter is the ESC CR that VS Code's Shift+Enter setup sends and tmux passes through)",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["shift+enter", "shift+o", "alt+enter"],

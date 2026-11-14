@@ -112,6 +112,12 @@ pub enum Answer {
     /// The outcome of something a key started and did not wait for, in the
     /// footer's words (`Shift+G`: which page was opened, or why not).
     Flash(String),
+    /// The SKILL PICKER's rows for one checkout: the project's workflows
+    /// and every Claude skill found on disk (`skills::load_catalog`).
+    Skills {
+        checkout: std::path::PathBuf,
+        catalog: crate::skills::Catalog,
+    },
 }
 
 /// A view's way onto the blocking pool and back. Cheap to clone — the

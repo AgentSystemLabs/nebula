@@ -43,6 +43,8 @@ pub mod quick_prompt;
 pub mod remote;
 pub mod review;
 pub mod review_modal;
+pub mod skill_picker;
+pub mod skills;
 pub mod splash;
 pub mod syntax;
 pub mod terminal_replay;

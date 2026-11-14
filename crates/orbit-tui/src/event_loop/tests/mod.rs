@@ -7549,7 +7549,7 @@ fn a_run_ack_ahead_of_its_terminal_names_the_command_when_it_lands() {
 }
 
 /// `Shift+Enter` on a worktree fires its OPEN COMMAND — the project's
-/// **Open command** setting first, else `.orbit.json`'s `open` — and
+/// **Open command** setting first, else `.orbit/config.json`'s `open` — and
 /// with neither says where to put one, without Enter's drill-in. The
 /// key answers from the Sessions panel too, where the cursor's
 /// worktree is just as much the context, and `Shift+O` beside it.
@@ -7568,7 +7568,7 @@ fn shift_enter_on_a_worktree_fires_its_open_command() {
         assert!(
             flash.contains("no open command")
                 && flash.contains("Settings")
-                && flash.contains(".orbit.json"),
+                && flash.contains(".orbit/config.json"),
             "names both places: {flash}"
         );
         assert_eq!(app.nav.focus, Focus::Worktrees, "not Enter's drill-in");
@@ -18271,7 +18271,7 @@ pub(super) fn worktree_branches(app: &App) -> Vec<String> {
 /// the project, pre-filled with its stored command; Enter there writes
 /// `run_command` into that project's entry (and nothing else), the
 /// row reads it back, the tab on another project still reads
-/// `.orbit.json`; ←/→ only explain themselves; Esc keeps the old
+/// `.orbit/config.json`; ←/→ only explain themselves; Esc keeps the old
 /// value; an empty Enter puts the file back and drops the key. With
 /// no project in the tree the row reads `n/a`, and Enter opens nothing
 /// and says why.
@@ -18328,7 +18328,7 @@ fn the_project_tab_run_command_is_typed_into_the_selected_projects_entry() {
         let screen = draw_to_string(&mut app, 100, 40);
         assert!(screen.contains("Run command"), "{screen}");
         assert!(
-            screen.contains("[.orbit.json]"),
+            screen.contains("[.orbit/config.json]"),
             "unset reads as the file: {screen}"
         );
 
@@ -18402,7 +18402,7 @@ fn the_project_tab_run_command_is_typed_into_the_selected_projects_entry() {
         open_on_row(&mut app, &mut out);
         let screen = draw_to_string(&mut app, 100, 40);
         assert!(screen.contains("/tmp/other"), "{screen}");
-        assert!(screen.contains("[.orbit.json]"), "{screen}");
+        assert!(screen.contains("[.orbit/config.json]"), "{screen}");
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
 
         // An empty Enter is the way back to the file — the entry goes.
@@ -18416,7 +18416,7 @@ fn the_project_tab_run_command_is_typed_into_the_selected_projects_entry() {
         assert_eq!(saved(&path)["projects"], serde_json::json!({}));
         let view = settings_view(&app);
         assert!(
-            matches!(&view.notice, Some((t, _)) if t.contains(".orbit.json")),
+            matches!(&view.notice, Some((t, _)) if t.contains(".orbit/config.json")),
             "back to the file: {:?}",
             view.notice
         );
@@ -21542,6 +21542,7 @@ fn overlay_label(overlay: &Overlay) -> &'static str {
         Overlay::BranchSwitch(_) => "BranchSwitch",
         Overlay::Review(_) => "Review",
         Overlay::ProjectPicker(_) => "ProjectPicker",
+        Overlay::SkillPicker(_) => "SkillPicker",
     }
 }
 
@@ -23028,5 +23029,247 @@ fn performance_probe_many_sessions_draw() {
             "2001-session palette: {:.3} ms/open",
             began.elapsed().as_secs_f64() * 50.0
         );
+    });
+}
+
+// ---- the SKILL PICKER ----
+
+/// A fake `~/.claude` with three personal skills, `a-skill`, `b-skill`
+/// and `c-skill`.
+fn fake_claude_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    for name in ["a-skill", "b-skill", "c-skill"] {
+        let dir = home.path().join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: does {name}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    home
+}
+
+fn skill_picker_view(app: &App) -> &crate::skill_picker::SkillPickerView {
+    match &app.modals.overlay {
+        Some(Overlay::SkillPicker(v)) => v,
+        other => panic!("expected the skill picker, got {other:?}"),
+    }
+}
+
+fn quick_box(app: &App) -> (String, Vec<String>) {
+    match &app.modals.overlay {
+        Some(Overlay::Prompt(p)) => match &p.kind {
+            PromptKind::QuickPrompt(launch) => {
+                (p.input.as_str().to_string(), launch.skills.skills.clone())
+            }
+            other => panic!("not a quick prompt: {other:?}"),
+        },
+        other => panic!("expected the box, got {other:?}"),
+    }
+}
+
+/// `Ctrl+S` in the QUICK PROMPT opens the picker; ticking and Enter come
+/// back to the box with its text intact and the skills on its launch.
+#[test]
+fn ctrl_s_picks_skills_and_enter_returns_to_the_box_with_text_and_skills() {
+    let home = fake_claude_home();
+    crate::skills::with_claude_home(home.path().to_path_buf(), || {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.nav.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            ctrl(&mut app, 's', &mut out);
+            assert_eq!(skill_picker_view(&app).list.matches.len(), 3);
+            press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+            assert_eq!(skill_picker_view(&app).chosen, ["a-skill", "b-skill"]);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let (text, skills) = quick_box(&app);
+            assert_eq!(text, "Fix auth");
+            assert_eq!(skills, ["a-skill", "b-skill"]);
+            assert!(out.is_empty(), "nothing sent: {out:?}");
+        });
+    });
+}
+
+/// `/` typed first into an empty box opens the picker; Esc with nothing
+/// ticked puts a literal `/` in the box. A `/` in a box with text types.
+#[test]
+fn slash_on_an_empty_box_opens_the_picker_and_esc_types_it_after_all() {
+    let home = fake_claude_home();
+    crate::skills::with_claude_home(home.path().to_path_buf(), || {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.nav.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+            assert!(skill_picker_view(&app).from_slash);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            let (text, skills) = quick_box(&app);
+            assert_eq!(text, "/");
+            assert!(skills.is_empty());
+
+            // Not first any more: a plain character.
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+            assert_eq!(quick_box(&app).0, "//");
+        });
+    });
+}
+
+/// Esc clears the filter first, then cancels with the box as it was.
+#[test]
+fn esc_in_the_skill_picker_clears_the_filter_then_cancels() {
+    let home = fake_claude_home();
+    crate::skills::with_claude_home(home.path().to_path_buf(), || {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.nav.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "hi"));
+            ctrl(&mut app, 's', &mut out);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+            assert_eq!(skill_picker_view(&app).list.matches.len(), 1);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert_eq!(skill_picker_view(&app).list.matches.len(), 3);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert_eq!(quick_box(&app), ("hi".to_string(), Vec::new()));
+        });
+    });
+}
+
+/// The FOLLOW-UP composer's `Ctrl+S`: the pick comes back with the text
+/// and goes down the PTY in front of the turn.
+#[test]
+fn ctrl_s_in_the_follow_up_composer_prefixes_the_turn_with_the_skills() {
+    let home = fake_claude_home();
+    crate::skills::with_claude_home(home.path().to_path_buf(), || {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert!(paste_into_overlay(&mut app, "do it"));
+        ctrl(&mut app, 's', &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(follow_up_text(&app).as_deref(), Some("do it"));
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let sent = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::Input { data, .. } if data != b"\r" => Some(data.clone()),
+                _ => None,
+            })
+            .expect("the turn was sent");
+        let sent = String::from_utf8_lossy(&sent).to_string();
+        assert!(sent.contains("`b-skill`"), "{sent}");
+        assert!(sent.ends_with("do it") || sent.contains("do it"), "{sent}");
+    });
+}
+
+/// `Ctrl+W` names the selection and saves it in the project's main
+/// checkout, keeping the file's other keys.
+#[test]
+fn ctrl_w_saves_the_selection_as_a_workflow_keeping_other_keys() {
+    let home = fake_claude_home();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".orbit")).unwrap();
+    std::fs::write(
+        repo.path().join(".orbit/config.json"),
+        r#"{"run":"make","extra":1}"#,
+    )
+    .unwrap();
+    crate::skills::with_claude_home(home.path().to_path_buf(), || {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.tree.projects[0].repo_path = repo.path().to_path_buf();
+            app.tree.worktrees[0].path = repo.path().to_path_buf();
+            app.nav.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            ctrl(&mut app, 's', &mut out);
+            press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+            ctrl(&mut app, 'w', &mut out);
+            assert!(skill_picker_view(&app).naming.is_some());
+            assert!(paste_into_overlay(&mut app, "feature"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(skill_picker_view(&app).naming.is_none());
+            assert!(app
+                .chrome
+                .flash
+                .as_deref()
+                .is_some_and(|f| f.contains("saved workflow 'feature'")));
+            let saved: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(repo.path().join(".orbit/config.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved["run"], "make");
+            assert_eq!(saved["extra"], 1);
+            assert_eq!(
+                saved["workflows"]["feature"]["skills"],
+                serde_json::json!(["a-skill"])
+            );
+        });
+    });
+}
+
+/// INPUT PARITY: `Space` on a row and a click on that row tick the same
+/// skill and leave the picker the same.
+#[test]
+fn skill_picker_space_and_click_tick_the_same_row() {
+    let home = fake_claude_home();
+    crate::skills::with_claude_home(home.path().to_path_buf(), || {
+        with_default_config(|| {
+            let build = || {
+                let mut app = App::new();
+                let mut out = Vec::new();
+                seed_tree(&mut app);
+                app.nav.focus = Focus::Sessions;
+                press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+                ctrl(&mut app, 's', &mut out);
+                if let Some(Overlay::SkillPicker(v)) = &mut app.modals.overlay {
+                    v.list.list_area = ratatui::layout::Rect::new(2, 3, 60, 10);
+                    v.area = ratatui::layout::Rect::new(0, 0, 80, 20);
+                }
+                app
+            };
+            let digest = |app: &App, out: &[ClientRequest]| {
+                let v = skill_picker_view(app);
+                format!(
+                    "{:?}|{}|{}|{:?}|{:?}",
+                    v.chosen,
+                    v.list.cursor,
+                    v.list.query.as_str(),
+                    app.chrome.flash,
+                    out
+                )
+            };
+            let mut by_key = build();
+            let mut out_key = Vec::new();
+            press(&mut by_key, KeyCode::Down, KeyModifiers::NONE, &mut out_key);
+            press(&mut by_key, KeyCode::Down, KeyModifiers::NONE, &mut out_key);
+            press(
+                &mut by_key,
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                &mut out_key,
+            );
+
+            let mut by_mouse = build();
+            let mut out_mouse = Vec::new();
+            click(&mut by_mouse, 5, 5, &mut out_mouse);
+            assert_eq!(skill_picker_view(&by_mouse).chosen, ["c-skill"]);
+            assert_eq!(digest(&by_key, &out_key), digest(&by_mouse, &out_mouse));
+        });
     });
 }

@@ -43,6 +43,7 @@ pub(crate) fn overlay_area(overlay: &Overlay) -> Rect {
         Overlay::BranchSwitch(v) => v.area,
         Overlay::Review(v) => v.area,
         Overlay::ProjectPicker(v) => v.area,
+        Overlay::SkillPicker(v) => v.area,
     }
 }
 
@@ -79,6 +80,9 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
             app.modals.overlay = None;
             crate::quick_prompt::reopen(app, back.launch, &back.text);
         }
+        // The SKILL PICKER owes its box back too, as it was — a click
+        // outside is the cancel, not the confirm.
+        Some(Overlay::SkillPicker(_)) => crate::skill_picker::cancel(app),
         // Nothing to unwind on the way out.
         Some(
             Overlay::Help(_)

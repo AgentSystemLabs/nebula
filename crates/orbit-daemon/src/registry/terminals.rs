@@ -68,7 +68,7 @@ impl Daemon {
     // ---- run terminals ----
 
     /// `r` on a worktree: start its RUN COMMAND — the project's
-    /// `run_command` setting (Settings → Project), else `.orbit.json`'s
+    /// `run_command` setting (Settings → Project), else `.orbit/config.json`'s
     /// `run`, read fresh from the worktree's checkout, else the main
     /// checkout's — in the worktree's RUN TERMINAL. A run that already
     /// exited lends its row; one still going is the answer as it stands,

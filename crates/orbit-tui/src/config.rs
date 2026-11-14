@@ -95,7 +95,7 @@ pub use orbit_core::harness::DEFAULT_CHOICE;
 /// `""`, never this word.
 pub const AUTO_CHOICE: &str = "auto";
 /// What the Project tab's **Run command** row shows while it is empty:
-/// the checkout's `.orbit.json` is what `r` reads then.
+/// the checkout's `.orbit/config.json` is what `r` reads then.
 pub const PROJECT_FILE_CHOICE: &str = orbit_core::project_file::FILE_NAME;
 
 // The static model/effort lists live in the core registry table now
@@ -813,13 +813,13 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::RunCommand,
                 label: "Run command",
-                hint: "Shell line a menu's Run starts in this project's worktrees (empty = its .orbit.json \"run\")",
+                hint: "Shell line a menu's Run starts in this project's worktrees (empty = its .orbit/config.json \"run\")",
                 group: "",
             },
             SettingSpec {
                 kind: SettingKind::OpenCommand,
                 label: "Open command",
-                hint: "Shell line ⇧Enter / ⇧O runs to open a worktree of this project, e.g. open http://localhost:3000 (empty = its .orbit.json \"open\")",
+                hint: "Shell line ⇧Enter / ⇧O runs to open a worktree of this project, e.g. open http://localhost:3000 (empty = its .orbit/config.json \"open\")",
                 group: "",
             },
         ]),
@@ -1551,7 +1551,7 @@ pub struct Config {
 #[serde(default)]
 pub struct ProjectSettings {
     /// The RUN COMMAND a menu's **Run** starts in this project's
-    /// worktrees, typed on the Project tab. Empty — the default, shown as `.orbit.json` — is
+    /// worktrees, typed on the Project tab. Empty — the default, shown as `.orbit/config.json` — is
     /// the checkout's PROJECT FILE `run`, where the command lived before
     /// the row existed; set, it wins over the file. The DAEMON reads it
     /// (`orbit-daemon/src/config.rs`); the TUI only edits it. Left out
@@ -1561,7 +1561,7 @@ pub struct ProjectSettings {
     pub run_command: String,
     /// The OPEN COMMAND `Shift+Enter` / `Shift+O` fires on this project's
     /// worktrees, typed on the Project tab — `open http://localhost:3000`,
-    /// say. Empty (shown as `.orbit.json`) is the checkout's PROJECT FILE
+    /// say. Empty (shown as `.orbit/config.json`) is the checkout's PROJECT FILE
     /// `open`; set, it wins over the file. The TUI both edits and runs it
     /// (`event_loop::open_worktree`): what it opens belongs on the machine
     /// the user sits at, never the DAEMON's. Left out of the file while
@@ -1594,7 +1594,7 @@ impl ProjectSettings {
     }
 
     /// The stored text of a typed PROJECT TAB row as its prompt pre-fills
-    /// it — `""` for an unset row, never the `.orbit.json` the overlay
+    /// it — `""` for an unset row, never the `.orbit/config.json` the overlay
     /// shows in its place. Empty for a row that is not typed.
     pub fn text_value(&self, kind: SettingKind) -> String {
         match kind {
@@ -4522,7 +4522,7 @@ mod tests {
 
     /// **Run command** on the Project tab: a typed row (Enter prompts,
     /// ←/→ and cycle change nothing) kept per repo path as `run_command`,
-    /// shown as `.orbit.json` while empty — the file decides then — and
+    /// shown as `.orbit/config.json` while empty — the file decides then — and
     /// left out of the file while empty, so an entry with nothing else in
     /// it is dropped rather than written.
     #[test]
@@ -4540,7 +4540,10 @@ mod tests {
             cfg.project(demo).value_label(SettingKind::RunCommand),
             PROJECT_FILE_CHOICE
         );
-        assert_eq!(cfg.value_label(SettingKind::RunCommand), ".orbit.json");
+        assert_eq!(
+            cfg.value_label(SettingKind::RunCommand),
+            ".orbit/config.json"
+        );
         assert_eq!(cfg.project_text_value(demo, SettingKind::RunCommand), "");
 
         // The tab's cycle never touches a typed row.
@@ -4608,7 +4611,7 @@ mod tests {
 
     /// **Open command** on the Project tab: the same typed per-project row
     /// as Run command, right under it, kept as `open_command` — what
-    /// `Shift+Enter` / `Shift+O` runs before looking at `.orbit.json`.
+    /// `Shift+Enter` / `Shift+O` runs before looking at `.orbit/config.json`.
     /// Its own key, so setting it leaves `run_command` alone; empty drops
     /// it from the entry.
     #[test]
@@ -4629,7 +4632,10 @@ mod tests {
             cfg.project(demo).value_label(SettingKind::OpenCommand),
             PROJECT_FILE_CHOICE
         );
-        assert_eq!(cfg.value_label(SettingKind::OpenCommand), ".orbit.json");
+        assert_eq!(
+            cfg.value_label(SettingKind::OpenCommand),
+            ".orbit/config.json"
+        );
 
         // A typed row: cycling its tab row changes nothing, and the
         // top-level setter is not its.

@@ -919,7 +919,8 @@ fn apply_preset_to_quick_prompt(
     let launch = crate::quick_prompt::QuickLaunch::of_preset(back.launch.target, preset, &cfg)
         .with_issue(back.launch.issue)
         .with_pr(back.launch.pr)
-        .with_under(back.launch.under);
+        .with_under(back.launch.under)
+        .with_skills(back.launch.skills);
     if launch_now {
         crate::event_loop::submit_prompt_now(app, PromptKind::QuickPrompt(launch), out);
     } else {

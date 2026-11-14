@@ -191,10 +191,14 @@ fn overlay_footer_hint(app: &App, overlay: &Overlay, th: Theme) -> FooterHint {
         Overlay::Prompt(p) if matches!(p.kind, crate::app::PromptKind::QuickPrompt(_)) => {
             quick_prompt_footer_hint(app, th)
         }
+        Overlay::Prompt(p) if matches!(p.kind, crate::app::PromptKind::FollowUp { .. }) => {
+            dim_hint("Enter: send  ^S: skills  Esc: close", th)
+        }
         Overlay::ProjectPicker(_) => dim_hint(
             "type: filter projects  ↑/↓: move  Enter: aim the box there  Esc: clear/back to the box",
             th,
         ),
+        Overlay::SkillPicker(view) => dim_hint(crate::skill_picker::footer_hint(view), th),
         _ => dim_hint("Esc: close  Enter: confirm", th),
     }
 }
@@ -211,12 +215,12 @@ fn quick_prompt_footer_hint(app: &App, th: Theme) -> FooterHint {
         .and_then(crate::quick_prompt::modal_under)
     {
         Some(crate::quick_prompt::ModalUnder::Issues(_)) => {
-            "Enter: launch  ⇧Tab: preset  Esc: back to issues"
+            "Enter: launch  ⇧Tab: preset  ^S: skills  Esc: back to issues"
         }
         Some(crate::quick_prompt::ModalUnder::PullRequests(_)) => {
-            "Enter: launch  ⇧Tab: preset  Esc: back to pull requests"
+            "Enter: launch  ⇧Tab: preset  ^S: skills  Esc: back to pull requests"
         }
-        None => "Enter: launch  ⇧Tab: preset  Esc: back to sessions",
+        None => "Enter: launch  ⇧Tab: preset  ^S: skills  Esc: back to sessions",
     };
     dim_hint(hint, th)
 }

@@ -12,6 +12,7 @@ docs go deeper on each topic; start here.
 3. [Your first session](#3-your-first-session)
 4. [Reading the screen](#4-reading-the-screen)
 5. [The everyday loop](#5-the-everyday-loop)
+   - [Picking skills and workflows](#picking-skills-and-workflows)
 6. [Worktrees: parallel work without collisions](#6-worktrees-parallel-work-without-collisions)
 7. [Reviewing what an agent did](#7-reviewing-what-an-agent-did)
    - [The code graph (graphify)](#the-code-graph-graphify)
@@ -174,8 +175,32 @@ key, so you can change it without losing what you typed:
 | `Ctrl+N` | run it in a **new worktree** (the frame turns green) |
 | `Tab` | the harness (Claude, …) |
 | `Ctrl+O` | the model and effort |
+| `Ctrl+S` | pick the Claude **skills** this task should use (or type `/` first in an empty box) |
 | `Shift+Tab` | apply a preset |
 | `Esc` | close — what you typed is kept for next time |
+
+### Picking skills and workflows
+
+With a hundred skills installed, Claude sometimes reaches for the wrong one. Press **`Ctrl+S`** in the
+task box (or in the follow-up box that `Space` opens on a card) — or type **`/`** as the first
+character of an empty box — and tick exactly the skills this prompt should use:
+
+| In the picker | Does |
+|---|---|
+| type | filter by name |
+| `Space` (or a click) | tick / untick a skill; on a workflow row, its whole set |
+| `Enter` | back to the box, text intact, with the ticks kept |
+| `Ctrl+W` | save the ticked skills as a **workflow** — asks for a name |
+| `Esc` | clear the filter, then go back to the box as it was |
+
+Workflows sit at the top of the list, then skills labelled **personal** (`~/.claude/skills`),
+**project** (`.claude/skills`) and **plugin** (from enabled plugins). The box title shows what is ticked,
+and when you send, Orbit puts one line in front of your prompt telling Claude to load those skills with
+the Skill tool first. If you close a `/` picker with nothing ticked, the `/` goes into the box, so real
+slash commands still work.
+
+Workflows are saved in the project's `.orbit/config.json` under `workflows` — commit it to share them.
+See [Configuration](configuration.md#the-project-file-orbitconfigjson).
 
 ## 6. Worktrees: parallel work without collisions
 
@@ -226,7 +251,7 @@ or uses a copy you already have):
 - **`k`** opens the graph in your browser (and builds it first if there isn't one yet).
 
 To turn it off: `"graphify": false` in `config.json` for every project, or in a project's
-`.orbit.json` for just that one.
+`.orbit/config.json` for just that one.
 
 ### Browser testing
 
@@ -290,7 +315,7 @@ start sessions across all your projects for you. See [Orchestrator](orchestrator
 
 ## 11. Running and opening your project
 
-Commit a `.orbit.json` at the root of a repository to tell Orbit how to run it:
+Commit a `.orbit/config.json` (a root `.orbit.json` still works) at the root of a repository to tell Orbit how to run it:
 
 ```json
 {
@@ -428,9 +453,6 @@ For more detail, set `ORBIT_LOG=debug` before starting.
 
 These are planned for this fork and **not built yet**:
 
-- **Skill picker** — `Ctrl+S` in the task box lists your Claude skills (personal, project and
-  plugins); tick several, and Claude is told to use exactly those. Saved **workflows** per project
-  (e.g. "feature" = spec + incremental + tests) tick a whole set in one go.
 - **Command palette** — `:` and type what you want ("diff", "rename"); see the action and its key,
   `Enter` runs it. No more remembering keys.
 - **Calmer view with many sessions** — a filter for "needs me / active only", and a compact layout that

@@ -474,7 +474,7 @@ pub enum ClientRequest {
         id: TerminalId,
     },
     /// `r` on a worktree: start the project's RUN COMMAND — the `run` of
-    /// the `.orbit.json` in that checkout, else the main checkout's, read
+    /// the `.orbit/config.json` in that checkout, else the main checkout's, read
     /// fresh — in the worktree's RUN TERMINAL, a login shell running that
     /// line and nothing else. An exited run's row is reused; a run still
     /// going is left alone and named in the reply, so a second client's

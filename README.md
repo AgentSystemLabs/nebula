@@ -295,7 +295,7 @@ never travel with it: each machine runs only the programs its own files name. Fu
 | [**Commands**](docs/commands.md) | The `orbit` CLI: `add`, `rename`, `worktree`, `spawn`, `open`, `config`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
 | [**Sessions**](docs/sessions.md) | The QUICK PROMPT and the GRID, the NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the FOLLOW-UP COMPOSER, RECENT PROMPTS, the ISSUES MODAL, the PULL REQUESTS MODAL. |
 | [**Orchestrator**](docs/orchestrator.md) | The chat-first orchestrator session, privileged commands, status strip, review modal and mobile default. |
-| [**Configuration**](docs/configuration.md) | `config.json` and `config.local.json`, backup and restore, the SETTINGS OVERLAY, the HOTKEYS TAB, the `.orbit.json` PROJECT FILE (**Run** and **Open** in the project's menu, `Shift+Enter` opens it), compatibility rules, logs and environment overrides. |
+| [**Configuration**](docs/configuration.md) | `config.json` and `config.local.json`, backup and restore, the SETTINGS OVERLAY, the HOTKEYS TAB, the `.orbit/config.json` PROJECT FILE (**Run** and **Open** in the project's menu, `Shift+Enter` opens it), compatibility rules, logs and environment overrides. |
 | [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |
 | [**Architecture**](ARCHITECTURE.md) | Process model, the IPC CODEC and the crate layout. |
 
