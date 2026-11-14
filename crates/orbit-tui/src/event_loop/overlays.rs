@@ -37,6 +37,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             crate::review_modal::handle_key(app, key);
         }
         Overlay::ProjectPicker(_) => launcher::handle_picker_key(app, key),
+        Overlay::SkillPicker(_) => crate::skill_picker::handle_key(app, key),
         Overlay::Menu(_) => handle_menu_key(app, key, out),
         Overlay::Prompt(_) => handle_prompt_key(app, key, out),
         Overlay::Confirm(_) => handle_confirm_key(app, key, out),
@@ -311,6 +312,35 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
                 }
                 app.modals.overlay = None;
                 submit_prompt(app, prompt, out);
+            }
+            // `^S` in the QUICK PROMPT or the FOLLOW-UP box: the SKILL
+            // PICKER, which hands the box back with its text and the
+            // ticked skills on it. Free in both: the line editor leaves
+            // ^S alone.
+            KeyCode::Char('s' | 'S')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(
+                        prompt.kind,
+                        PromptKind::QuickPrompt(_) | PromptKind::FollowUp { .. }
+                    ) =>
+            {
+                if let Some(back) = crate::skill_picker::skills_for(prompt) {
+                    crate::skill_picker::open(app, back, false);
+                }
+            }
+            // `/` as the first thing typed into an empty QUICK PROMPT opens
+            // the same picker; cancelled with nothing ticked, the `/` goes
+            // into the box after all, so slash commands still type.
+            KeyCode::Char('/')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && prompt.input.is_empty()
+                    && matches!(prompt.kind, PromptKind::QuickPrompt(_)) =>
+            {
+                if let Some(back) = crate::skill_picker::skills_for(prompt) {
+                    crate::skill_picker::open(app, back, true);
+                }
             }
             // The LAUNCHER VIEW's box chords: `^P` the project, `^T` the
             // checkout in it, `^O` the model, and a `^N` that flips between

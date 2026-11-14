@@ -37,6 +37,9 @@ pub(crate) fn paste_into_overlay(app: &mut App, text: &str) -> bool {
     if matches!(&app.modals.overlay, Some(Overlay::PullRequests(_))) {
         return crate::pr_modal::paste(app, text);
     }
+    if matches!(&app.modals.overlay, Some(Overlay::SkillPicker(_))) {
+        return crate::skill_picker::paste(app, text);
+    }
     let Some(overlay) = &mut app.modals.overlay else {
         return false;
     };

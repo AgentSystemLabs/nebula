@@ -2766,6 +2766,7 @@ mod tests {
             pr: None,
             under: None,
             cloud: false,
+            skills: Default::default(),
         });
         let cloud = PromptKind::CloudMessage {
             id: orbit_core::AgentId::from("a".to_string()),

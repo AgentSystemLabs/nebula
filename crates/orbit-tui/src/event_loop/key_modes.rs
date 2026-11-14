@@ -513,7 +513,7 @@ fn handle_create_or_rename_action(
                 }
             }
             // Nothing on the Worktrees panel is renamed, so `r` is RUN
-            // there: the checkout's `.orbit.json` RUN COMMAND, started or
+            // there: the checkout's `.orbit/config.json` RUN COMMAND, started or
             // stopped. The KEY COMBO DISPLAY says which, not "Rename".
             Focus::Worktrees => {
                 let running = app

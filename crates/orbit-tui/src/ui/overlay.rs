@@ -21,6 +21,7 @@ impl Overlay {
     fn draw(self, f: &mut Frame, app: &mut App) {
         match self {
             Overlay::ProjectPicker(picker) => draw_project_picker_overlay(f, app, picker),
+            Overlay::SkillPicker(view) => draw_skill_picker_overlay(f, app, *view),
             Overlay::Menu(menu) => draw_menu_overlay(f, app, menu),
             Overlay::Confirm(confirm) => draw_confirm_overlay(f, app, confirm),
             Overlay::Prompt(prompt) if prompt.is_multiline() => {
@@ -108,6 +109,145 @@ fn draw_project_picker_overlay(
         draw_multiline_prompt(f, app, &box_behind, true);
     }
     launcher_view::draw_project_picker(f, app, &picker)
+}
+
+/// Fixed (width, height) of the SKILL PICKER: wide enough for a skill's
+/// name, where it came from and the start of its description on one row.
+const SKILL_PICKER_SIZE: (u16, u16) = (96, 26);
+
+/// The SKILL PICKER over the box it was opened from: the box drawn dim
+/// underneath (a QUICK PROMPT's, as `^P` draws it), the query row, then a
+/// row per workflow and skill — `[x]`, the name, its source and its
+/// description, dim.
+fn draw_skill_picker_overlay(
+    f: &mut Frame,
+    app: &mut App,
+    view: crate::skill_picker::SkillPickerView,
+) {
+    use crate::skill_picker::{PickRow, SkillsFor};
+    let th = app.chrome.theme;
+    if let SkillsFor::Quick(back) = &view.back {
+        let box_behind = crate::quick_prompt::backdrop_box(back);
+        draw_multiline_prompt(f, app, &box_behind, true);
+    }
+    let area = centered_rect(f.area(), SKILL_PICKER_SIZE.0, SKILL_PICKER_SIZE.1);
+    let ticked = view.chosen.len();
+    let title = match (view.loaded, ticked) {
+        (false, _) => " Skills (reading…) ".to_string(),
+        (true, 0) => " Skills ".to_string(),
+        (true, n) => format!(" Skills · {n} ticked "),
+    };
+    let inner = render_modal_frame(f, area, title, th);
+    if let Some(query_area) = row_rect(inner, 0) {
+        let line = match &view.naming {
+            Some(name) => {
+                let mut spans = vec![Span::styled(
+                    "save as workflow: ",
+                    Style::default().fg(th.accent),
+                )];
+                spans.extend(input_spans(
+                    name,
+                    (query_area.width as usize).saturating_sub(18),
+                    th.accent,
+                    th,
+                ));
+                Line::from(spans)
+            }
+            None => search_line(
+                &view.list.query,
+                "type to filter skills — Space ticks, Enter is done",
+                query_area,
+                th,
+            ),
+        };
+        f.render_widget(Paragraph::new(line), query_area);
+    }
+    let mut list_inner = below_first_row(inner);
+    if let Some(error) = &view.error {
+        if let Some(row) = row_rect(list_inner, 0) {
+            let text = truncate(
+                &format!("workflows unreadable: {error}"),
+                row.width as usize,
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(text, Style::default().fg(th.err))),
+                row,
+            );
+            list_inner = below_first_row(list_inner);
+        }
+    }
+    if view.list.matches.is_empty() {
+        let text = if !view.loaded {
+            "reading skills…"
+        } else if view.list.items.is_empty() {
+            "no skills found in ~/.claude/skills, .claude/skills or enabled plugins"
+        } else {
+            NO_MATCHES
+        };
+        empty_list_row(f, list_inner, text, th);
+    }
+    let width = (list_inner.width as usize).saturating_sub(2);
+    let start = view.list.window_start(list_inner.height as usize);
+    for (row, (i, m)) in view.list.matches.iter().enumerate().skip(start).enumerate() {
+        let Some(row_area) = row_rect(list_inner, row) else {
+            break;
+        };
+        let item = &view.list.items[m.item];
+        let (on, tag, detail) = match item {
+            PickRow::Workflow(w) => (
+                view.workflow_on(w),
+                "workflow".to_string(),
+                format!(
+                    "{} skill{}: {}",
+                    w.skills.len(),
+                    if w.skills.len() == 1 { "" } else { "s" },
+                    w.skills.join(", ")
+                ),
+            ),
+            PickRow::Skill(s) => (
+                view.is_chosen(&s.name),
+                s.source.label().to_string(),
+                s.description.clone(),
+            ),
+        };
+        let check = if on { "[x] " } else { "[ ] " };
+        let name = item.label();
+        let shown = truncate(name, width.saturating_sub(4).min(width / 2).max(8));
+        let positions = visible_positions(&m.positions, &shown, name);
+        let mut spans = vec![Span::styled(
+            check,
+            Style::default().fg(if on { th.ok } else { th.dim }),
+        )];
+        let mut label = label_highlight_spans(&shown, positions, false, None, 0, th.text, th);
+        if matches!(item, PickRow::Workflow(_)) {
+            for s in &mut label {
+                s.style = s.style.add_modifier(Modifier::BOLD);
+            }
+        }
+        spans.extend(label);
+        let used = 4 + shown.chars().count();
+        let tag_text = format!("  {tag}");
+        if used + tag_text.chars().count() < width {
+            spans.push(Span::styled(
+                tag_text.clone(),
+                Style::default().fg(th.muted),
+            ));
+            let used = used + tag_text.chars().count();
+            let room = width.saturating_sub(used + 2);
+            if room > 3 && !detail.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", truncate(&detail, room)),
+                    Style::default().fg(th.dim),
+                ));
+            }
+        }
+        render_row(f, row_area, spans, i == view.list.cursor, true, th);
+    }
+    if let Some(Overlay::SkillPicker(v)) = &mut app.modals.overlay {
+        v.area = area;
+        v.list.list_area = list_inner;
+        v.list.sync_scroll(list_inner.height as usize);
+    }
 }
 
 fn draw_menu_overlay(f: &mut Frame, app: &mut App, menu: crate::app::ContextMenu) {

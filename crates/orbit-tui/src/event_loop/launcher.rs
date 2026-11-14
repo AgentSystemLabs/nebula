@@ -4440,7 +4440,7 @@ mod tests {
             key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
             assert!(
                 matches!(&app.modals.overlay, Some(Overlay::Prompt(p))
-                    if p.kind == PromptKind::FollowUp { id: id.clone() }),
+                    if p.kind == PromptKind::FollowUp { id: id.clone(), skills: Default::default() }),
                 "the box is aimed at the card under the cursor: {:?}",
                 app.modals.overlay
             );
@@ -4584,7 +4584,7 @@ mod tests {
 
             assert!(
                 matches!(&app.modals.overlay, Some(Overlay::Prompt(p))
-                    if p.kind == PromptKind::FollowUp { id: id.clone() }),
+                    if p.kind == PromptKind::FollowUp { id: id.clone(), skills: Default::default() }),
                 "the menu row opened the box too: {:?}",
                 app.modals.overlay
             );

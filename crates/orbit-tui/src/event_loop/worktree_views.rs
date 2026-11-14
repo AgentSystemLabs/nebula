@@ -289,11 +289,11 @@ pub(crate) fn open_selected_worktree(app: &mut App) {
 /// the twin of the DAEMON's line for `r`.
 const NO_OPEN_COMMAND: &str =
     "no open command for this worktree — set one in Settings (s) → Project, \
-                               or add .orbit.json with {\"open\": \"open http://localhost:3000\"}";
+                               or add .orbit/config.json with {\"open\": \"open http://localhost:3000\"}";
 
 /// Run `worktree`'s OPEN COMMAND once and say so: the project's **Open
 /// command** setting (Settings → Project) when it is set, else the
-/// checkout's `.orbit.json` `open`. The TUI runs it, not the DAEMON: it
+/// checkout's `.orbit/config.json` `open`. The TUI runs it, not the DAEMON: it
 /// opens a browser or an editor on the machine the user is sitting at.
 pub(crate) fn open_worktree(app: &mut App, worktree: &orbit_core::Worktree) {
     let main = app
@@ -659,6 +659,9 @@ pub(crate) fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) 
         }
         Answer::Flash(message) => app.chrome.flash = Some(message),
         Answer::ClientRss(bytes) => land_client_rss(app, bytes),
+        Answer::Skills { checkout, catalog } => {
+            crate::skill_picker::land_catalog(app, checkout, catalog)
+        }
         Answer::Slow { ticket } => match &mut app.modals.overlay {
             Some(Overlay::Diff(view)) => crate::git_diff::diff_slow(view, ticket),
             Some(Overlay::Tree(view)) => view.preview_slow(ticket),

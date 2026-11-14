@@ -3,7 +3,18 @@
 use super::*;
 
 pub(crate) fn open_follow_up(app: &mut App, id: AgentId, text: String) {
-    open_prompt(app, PromptKind::FollowUp { id });
+    open_follow_up_with(app, id, crate::skills::SkillPick::default(), text);
+}
+
+/// The FOLLOW-UP box for `id` with `skills` ticked and `text` in it — how
+/// the SKILL PICKER and a booting session hand the box back.
+pub(crate) fn open_follow_up_with(
+    app: &mut App,
+    id: AgentId,
+    skills: crate::skills::SkillPick,
+    text: String,
+) {
+    open_prompt(app, PromptKind::FollowUp { id, skills });
     if let Some(Overlay::Prompt(prompt)) = &mut app.modals.overlay {
         prompt.input = crate::text_input::TextInput::multiline_with_text(text);
     }
@@ -97,14 +108,18 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
             "message for the cloud agent".into(),
             String::new(),
         ),
-        PromptKind::FollowUp { id } => (
+        PromptKind::FollowUp { id, skills } => (
             format!(
-                "Follow-up · {}",
+                "Follow-up · {}{}",
                 app.tree
                     .agents
                     .iter()
                     .find(|a| &a.id == id)
-                    .map_or("session", |a| a.name.as_str())
+                    .map_or("session", |a| a.name.as_str()),
+                skills
+                    .label()
+                    .map(|label| format!(" · {label}"))
+                    .unwrap_or_default()
             )
             .into(),
             "the agent's next turn — Enter sends it straight to its CLI".into(),
@@ -173,10 +188,10 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
                     "branch new worktrees start from (empty = auto: origin's default branch)"
                 }
                 crate::config::SettingKind::RunCommand => {
-                    "shell line r runs in this project's worktrees (empty = the checkout's .orbit.json \"run\")"
+                    "shell line r runs in this project's worktrees (empty = the checkout's .orbit/config.json \"run\")"
                 }
                 crate::config::SettingKind::OpenCommand => {
-                    "shell line Shift+Enter / Shift+O runs to open a worktree of this project (empty = the checkout's .orbit.json \"open\")"
+                    "shell line Shift+Enter / Shift+O runs to open a worktree of this project (empty = the checkout's .orbit/config.json \"open\")"
                 }
                 _ => "value (empty = default)",
             };

@@ -99,7 +99,7 @@ const RUN_TERMINAL_NAME: &str = "run";
 /// places a RUN COMMAND can come from.
 const NO_RUN_COMMAND: &str =
     "no run command for this worktree — set one in Settings (s) → Project, \
-                              or add .orbit.json with {\"run\": \"npm run dev\"}";
+                              or add .orbit/config.json with {\"run\": \"npm run dev\"}";
 /// Why a RUN TERMINAL with nothing left to replay will not attach — its
 /// run ended before a DAEMON restart, typically.
 const RUN_NOT_RUNNING: &str = "this run has stopped — press r on its worktree to start it again";
@@ -945,7 +945,7 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
 }
 
 /// [`login_shell_wrap`] for a line that is already shell syntax — a RUN
-/// TERMINAL's `.orbit.json` `run`, pipes and `&&` and all — behind the
+/// TERMINAL's `.orbit/config.json` `run`, pipes and `&&` and all — behind the
 /// same prelude.
 fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
     let mut cmdline = reopen_pane_tty();
@@ -2482,7 +2482,7 @@ mod tests {
     }
 
     /// A project whose main checkout is a fresh directory, registered with
-    /// `daemon`, for the RUN TERMINAL tests to write `.orbit.json` into.
+    /// `daemon`, for the RUN TERMINAL tests to write `.orbit/config.json` into.
     fn run_worktree(daemon: &Daemon) -> (tempfile::TempDir, Worktree) {
         let dir = tempfile::tempdir().unwrap();
         let project = Project {
@@ -2512,7 +2512,7 @@ mod tests {
         let missing = daemon.start_run(&worktree.id).unwrap_err();
         assert!(
             missing.to_string().contains("Settings (s) → Project")
-                && missing.to_string().contains(".orbit.json"),
+                && missing.to_string().contains(".orbit/config.json"),
             "names both places: {missing}"
         );
         assert!(daemon
@@ -2552,7 +2552,7 @@ mod tests {
     }
 
     /// The project's `run_command` setting (Settings → Project) is what
-    /// `r` runs when it is set, over whatever `.orbit.json` says; blank,
+    /// `r` runs when it is set, over whatever `.orbit/config.json` says; blank,
     /// the file decides as before; a project's setting is its own; and a
     /// file that won't parse is still that file's error, not "no command".
     #[tokio::test]

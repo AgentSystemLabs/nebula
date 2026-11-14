@@ -56,7 +56,7 @@ pub struct Config {
     pub projects: BTreeMap<PathBuf, ProjectConfig>,
     /// GRAPHIFY: keep a code knowledge graph (`graphify-out/`) up to date in
     /// every checkout when the `graphify` CLI is installed, and point Claude
-    /// at it. On by default; a checkout's `.orbit.json` can opt out alone.
+    /// at it. On by default; a checkout's `.orbit/config.json` can opt out alone.
     pub graphify: bool,
 }
 
@@ -67,7 +67,7 @@ pub struct Config {
 #[serde(default)]
 pub struct ProjectConfig {
     /// The RUN COMMAND a menu's **Run** starts in this project's
-    /// worktrees, typed into Settings → Project. Empty means the checkout's `.orbit.json`
+    /// worktrees, typed into Settings → Project. Empty means the checkout's `.orbit/config.json`
     /// `run`, as before the row existed.
     pub run_command: String,
 }
@@ -124,7 +124,7 @@ impl Config {
 
     /// The RUN COMMAND set for the project checked out at `repo_path` in
     /// Settings → Project, trimmed; None when the project has no entry or
-    /// the row is empty, which means the checkout's `.orbit.json` decides.
+    /// the row is empty, which means the checkout's `.orbit/config.json` decides.
     pub fn run_command(&self, repo_path: &Path) -> Option<&str> {
         self.projects
             .get(repo_path)

@@ -14,7 +14,7 @@
 //! read-only query commands are pre-approved alongside orbit's own.
 //!
 //! Off switches: `"graphify": false` in config.json for every project, or in
-//! a checkout's `.orbit.json` for that one. A missing CLI is simply a no-op.
+//! a checkout's `.orbit/config.json` for that one. A missing CLI is simply a no-op.
 //!
 //! Runs never overlap for one checkout: a refresh asked for while one is
 //! running is folded into a single rerun when it ends.
@@ -81,7 +81,7 @@ pub fn has_graph(checkout: &Path) -> bool {
 }
 
 /// How to run graphify for `checkout`, when orbit should keep a graph
-/// there: the setting is on, the checkout's `.orbit.json` doesn't opt out,
+/// there: the setting is on, the checkout's `.orbit/config.json` doesn't opt out,
 /// and graphify is installed or uv can fetch it.
 pub fn wanted(checkout: &Path) -> Option<orbit_core::tools::Invocation> {
     if !crate::config::Config::load().graphify {

@@ -91,6 +91,13 @@ pub struct QuickLaunch {
     /// without launching. A launch closes it, the new session's card being
     /// what there is to see. Kept across the box's pickers, as the issue is.
     pub under: Option<ModalUnder>,
+    /// The Claude skills `Ctrl+S`'s SKILL PICKER ticked for this launch,
+    /// and the text of the workflows they came from: [`compose`] puts a
+    /// line naming them in front of the task. Kept across the box's other
+    /// pickers — they change what runs, not what it should use.
+    ///
+    /// [`compose`]: QuickLaunch::compose
+    pub skills: crate::skills::SkillPick,
 }
 
 /// A modal a QUICK PROMPT box stands on ([`QuickLaunch::under`]), as it
@@ -143,6 +150,10 @@ pub(crate) fn held_return(overlay: &Overlay) -> Option<QuickReturn> {
     match overlay {
         Overlay::ProjectPicker(picker) => Some(picker.back.clone()),
         Overlay::AgentPresets(view) => view.quick.clone(),
+        Overlay::SkillPicker(view) => match &view.back {
+            crate::skill_picker::SkillsFor::Quick(back) => Some((**back).clone()),
+            crate::skill_picker::SkillsFor::FollowUp { .. } => None,
+        },
         Overlay::Menu(menu) => {
             let mut menu = menu;
             loop {
@@ -329,7 +340,16 @@ impl QuickLaunch {
             pr: None,
             under: None,
             cloud: false,
+            skills: crate::skills::SkillPick::default(),
         }
+    }
+
+    /// The same launch, with the skills `skills` names. What every
+    /// picker's return trip does to the launch it rebuilt, so a `Tab` or
+    /// `Shift+Tab` pick keeps the skills ticked before it.
+    pub fn with_skills(mut self, skills: crate::skills::SkillPick) -> Self {
+        self.skills = skills;
+        self
     }
 
     /// The same launch, standing on the modal `under` (or on none). What
@@ -425,12 +445,14 @@ impl QuickLaunch {
     }
 
     /// The STARTING PROMPT this launch sends for `task`: the text itself,
-    /// or the preset's prefix + task + postfix.
+    /// or the preset's prefix + task + postfix — with the line naming the
+    /// picked skills in front when there are any (`SkillPick::wrap`).
     pub fn compose(&self, task: &str) -> String {
-        match &self.preset {
+        let text = match &self.preset {
             Some(preset) => preset.compose(task),
             None => task.to_string(),
-        }
+        };
+        self.skills.wrap(&text)
     }
 
     /// The dialog's title: the issue (when the box is for one), the preset
@@ -441,7 +463,8 @@ impl QuickLaunch {
     /// `Quick prompt · new worktree yellow-fox-jumps (claude)`,
     /// `Quick prompt · issue #15 · reviewer (claude · opus)`,
     /// `Quick prompt · PR #42 · reviewer (claude · opus)`,
-    /// `Quick prompt (claude · cloud · opus)`.
+    /// `Quick prompt (claude · cloud · opus)`,
+    /// `Quick prompt · skills: tdd, incremental (claude)`.
     pub fn title(&self) -> String {
         let harness = self.custom.as_deref().unwrap_or_else(|| self.kind.as_str());
         let model = self
@@ -466,6 +489,7 @@ impl QuickLaunch {
         if let QuickTarget::NewWorktree { branch, .. } = &self.target {
             head.push(format!("new worktree {branch}"));
         }
+        head.extend(self.skills.label());
         format!("{} ({})", head.join(" · "), opts.join(" · "))
     }
 

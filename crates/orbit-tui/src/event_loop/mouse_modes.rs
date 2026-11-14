@@ -49,6 +49,10 @@ fn handle_overlay_mouse(
         Overlay::Menu(_) => handle_menu_mouse(app, mouse, mouse_pos, out),
         Overlay::Prompt(_) => handle_prompt_mouse(app, mouse, mouse_pos, out),
         Overlay::ProjectPicker(_) => handle_project_picker_mouse(app, mouse, mouse_pos, out),
+        Overlay::SkillPicker(_) => {
+            crate::skill_picker::handle_mouse(app, mouse, mouse_pos);
+            true
+        }
         Overlay::Diff(_) => handle_diff_mouse(app, mouse, mouse_pos, out),
         Overlay::Palette(_) => handle_palette_mouse(app, mouse, mouse_pos, out),
         Overlay::Files(_) => handle_files_mouse(app, mouse, mouse_pos, out),

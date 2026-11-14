@@ -112,7 +112,7 @@
   releasing it — and under a 30 s timeout that kills the hook and everything it started; a failure is
   a warning in every client, never a rolled-back create or delete. Per repo in git config rather than in CONFIG.JSON, and never a file inside the
   checkout. See [Configuration](configuration.md#worktree-hooks).
-- **A worktree runs its own project — the PROJECT FILE.** A committed `.orbit.json` names a `run` and
+- **A worktree runs its own project — the PROJECT FILE.** A committed `.orbit/config.json` (or the older `.orbit.json`) names a `run` and
   an `open` command; the Project tab of the SETTINGS OVERLAY can hold either instead, per project in
   `config.json`, and wins over the file while it is set. **Run** in a card's or the project tab's
   right-click menu has the DAEMON start `run` in a RUN TERMINAL — a terminal row

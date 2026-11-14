@@ -810,6 +810,9 @@ pub enum PromptKind {
     /// is usually one line, but never only one line.
     FollowUp {
         id: AgentId,
+        /// The skills `Ctrl+S` ticked for this turn: a line naming them
+        /// goes in front of the text sent (`SkillPick::wrap`).
+        skills: crate::skills::SkillPick,
     },
     /// A comment to post on the pull request under the cursor — a
     /// PROJECT OPEN PRS GROUP row or the Sessions panel's PR ROW — with
@@ -2192,6 +2195,8 @@ pub enum Overlay {
     Review(crate::review_modal::ReviewView),
     /// `^P` in the LAUNCHER VIEW's box: the PROJECT PICKER.
     ProjectPicker(crate::launcher::ProjectPicker),
+    /// `^S` in the QUICK PROMPT or FOLLOW-UP box: the SKILL PICKER.
+    SkillPicker(Box<crate::skill_picker::SkillPickerView>),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -4410,6 +4415,10 @@ pub struct JobState {
     /// This TUI process's own RSS, sampled alongside each metrics request
     /// (the daemon can't see us).
     pub client_rss_bytes: u64,
+    /// The SKILL PICKER's last catalog per checkout path, shown the moment
+    /// the picker opens while a fresh read is on its way
+    /// (`skill_picker::land_catalog`).
+    pub skill_catalogs: HashMap<PathBuf, crate::skills::Catalog>,
 }
 
 pub struct App {

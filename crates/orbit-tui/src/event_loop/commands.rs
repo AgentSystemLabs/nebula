@@ -64,14 +64,23 @@ fn prompt_value_or_cancel(app: &mut App, prompt: PromptDialog) -> Option<(Prompt
             // it gets the same ceiling — a long prefix can push a valid
             // task over it.
             PromptKind::AgentPresetTask { preset, .. } => Some(preset.compose(&value)),
-            PromptKind::QuickPrompt(launch) if launch.preset.is_some() => {
+            // The picked skills' line and workflow text ride it too.
+            PromptKind::QuickPrompt(launch)
+                if launch.preset.is_some() || !launch.skills.is_empty() =>
+            {
                 Some(launch.compose(&value))
             }
+            PromptKind::FollowUp { skills, .. } if !skills.is_empty() => Some(skills.wrap(&value)),
             _ => None,
         } {
             (composed.len() > MAX_CLOUD_PROMPT_BYTES).then(|| {
+                let what = match &prompt.kind {
+                    PromptKind::QuickPrompt(launch) if launch.preset.is_none() => "skills + task",
+                    PromptKind::FollowUp { .. } => "skills + follow-up",
+                    _ => "prefix + task + postfix",
+                };
                 format!(
-                    "prefix + task + postfix is too long (max {} KiB)",
+                    "{what} is too long (max {} KiB)",
                     MAX_CLOUD_PROMPT_BYTES / 1024
                 )
             })
@@ -254,9 +263,12 @@ fn dispatch_prompt(
         // The turn goes down the PTY where the session stands: the pane
         // is not swapped, not unfolded and not focused, so one card after
         // another can be prompted without ever stepping into a session.
-        PromptKind::FollowUp { id } => {
-            if matches!(send_turn(app, &id, &value, out), TurnSent::Booting) {
-                open_follow_up(app, id, value);
+        // The skills `Ctrl+S` ticked go in front of the turn, one line
+        // naming them (`SkillPick::wrap`); none, and it goes as typed.
+        PromptKind::FollowUp { id, skills } => {
+            let turn = skills.wrap(&value);
+            if matches!(send_turn(app, &id, &turn, out), TurnSent::Booting) {
+                open_follow_up_with(app, id, skills, value);
             }
         }
         PromptKind::RenameAgent { id } => optimistic::rename_agent(app, id, value, out),
@@ -613,7 +625,8 @@ pub(crate) fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<C
                 // The Claude row's `Tab` toggle rides the pick: the box
                 // comes back a CLAUDE CLOUD one, where it can be one.
                 .with_cloud(cloud)
-                .with_under(back.launch.under.clone());
+                .with_under(back.launch.under.clone())
+                .with_skills(back.launch.skills.clone());
                 if back.from_box {
                     crate::quick_prompt::reopen(app, launch, &back.text);
                 } else {

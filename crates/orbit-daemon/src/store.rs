@@ -258,7 +258,7 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agents ADD COLUMN issue_url TEXT;
     ",
     // 26: the command a RUN TERMINAL runs (`r` on a worktree starts
-    // `.orbit.json`'s `run`). Nullable: every existing terminal stays a
+    // `.orbit/config.json`'s `run`). Nullable: every existing terminal stays a
     // plain shell tab.
     "
     ALTER TABLE terminals ADD COLUMN run_command TEXT;
@@ -881,7 +881,7 @@ impl Store {
         self.delete_by_id("terminals", id.as_str())
     }
 
-    /// Point a RUN TERMINAL at the command it runs next: `.orbit.json` is
+    /// Point a RUN TERMINAL at the command it runs next: `.orbit/config.json` is
     /// read fresh at every `r`, so a restart picks up an edited file.
     pub fn set_terminal_run_command(&self, id: &TerminalId, command: &str) -> Result<()> {
         self.conn.lock().execute(
