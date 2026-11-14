@@ -1341,7 +1341,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orbit"
-version = "0.47.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-core"
-version = "0.47.0"
+version = "1.0.0"
 dependencies = [
  "directories",
  "libc",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-daemon"
-version = "0.47.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1398,11 +1398,11 @@ dependencies = [
 
 [[package]]
 name = "orbit-fuzzy"
-version = "0.47.0"
+version = "1.0.0"
 
 [[package]]
 name = "orbit-tui"
-version = "0.47.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
