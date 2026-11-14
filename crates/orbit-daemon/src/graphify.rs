@@ -1,7 +1,7 @@
 //! GRAPHIFY: a code knowledge graph kept up to date for every checkout.
 //!
-//! When graphify is installed — or `uv` is, which fetches it on demand
-//! (`uvx --from graphifyy graphify`) — the DAEMON runs `graphify update
+//! When graphify is installed — or `uv` is, and orbit installs graphify
+//! once per machine (`uv tool install graphifyy`) — the DAEMON runs `graphify update
 //! <checkout>` — AST extraction only, no LLM, a few seconds on a large repo
 //! and incremental after that — whenever a project is added, a worktree is
 //! created, and an agent's turn finishes (the moment code most likely
@@ -33,8 +33,8 @@ pub const OUT_DIR: &str = "graphify-out";
 const RUN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Appended to Claude's system prompt in a checkout that has a graph.
-/// `graphify` is how a shell types the tool here: `graphify`, or
-/// `uvx --from graphifyy graphify` when uv fetches it on demand.
+/// `graphify` is how a shell types the tool here: the bare name, or its
+/// full path when its directory isn't on PATH.
 pub fn claude_guidance(graphify: &str) -> String {
     format!(
         "[orbit] This checkout has a code knowledge graph built by graphify in `graphify-out/` \
@@ -47,10 +47,11 @@ architecture. Fall back to ordinary search when the graph has no answer."
     )
 }
 
-/// How a shell types graphify on this machine (`graphify` when nothing
-/// resolves, so the guidance still reads sensibly).
+/// How a shell types graphify on this machine (`graphify` until it is
+/// installed, so the guidance still reads sensibly).
 pub fn shell_command() -> String {
-    orbit_core::tools::graphify()
+    orbit_core::tools::GRAPHIFY
+        .installed()
         .map(|g| g.shell)
         .unwrap_or_else(|| "graphify".into())
 }
@@ -80,19 +81,19 @@ pub fn has_graph(checkout: &Path) -> bool {
     graph_json(checkout).is_file()
 }
 
-/// How to run graphify for `checkout`, when orbit should keep a graph
-/// there: the setting is on, the checkout's `.orbit.json` doesn't opt out,
-/// and graphify is installed or uv can fetch it.
-pub fn wanted(checkout: &Path) -> Option<orbit_core::tools::Invocation> {
+/// Whether orbit should keep a graph for `checkout`: the setting is on, the
+/// checkout's `.orbit.json` doesn't opt out, and graphify is installed or
+/// uv is there to install it (once per machine).
+pub fn wanted(checkout: &Path) -> bool {
     if !crate::config::Config::load().graphify {
-        return None;
+        return false;
     }
     if let Ok(Some(file)) = orbit_core::project_file::read(checkout) {
         if file.graphify == Some(false) {
-            return None;
+            return false;
         }
     }
-    orbit_core::tools::graphify()
+    orbit_core::tools::GRAPHIFY.available()
 }
 
 #[derive(Default)]
@@ -110,9 +111,9 @@ fn running() -> &'static Mutex<HashMap<PathBuf, Slot>> {
 /// does nothing when graphify is off, missing, or there is no runtime to
 /// run on. A call while a run is in flight schedules one rerun.
 pub fn refresh(checkout: &Path) {
-    let Some(graphify) = wanted(checkout) else {
+    if !wanted(checkout) {
         return;
-    };
+    }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
@@ -127,6 +128,27 @@ pub fn refresh(checkout: &Path) {
     }
     handle.spawn(async move {
         exclude_from_git(&checkout).await;
+        // The installed copy — installed now, once per machine, when it is
+        // missing (blocking, so off the async workers).
+        let graphify = tokio::task::spawn_blocking(|| orbit_core::tools::GRAPHIFY.ensure()).await;
+        let graphify = match graphify {
+            Ok(Ok(graphify)) => graphify,
+            Ok(Err(why)) => {
+                tracing::warn!("graphify: {why}");
+                running()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&checkout);
+                return;
+            }
+            Err(_) => {
+                running()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&checkout);
+                return;
+            }
+        };
         loop {
             run_once(&graphify, &checkout).await;
             let mut map = running().lock().unwrap_or_else(|e| e.into_inner());
@@ -145,9 +167,7 @@ async fn run_once(graphify: &orbit_core::tools::Invocation, checkout: &Path) {
     if !checkout.is_dir() {
         return;
     }
-    // The first uvx run downloads graphify, so the timeout covers that too.
     let child = tokio::process::Command::new(&graphify.program)
-        .args(&graphify.prefix)
         .arg("update")
         .arg(checkout)
         .current_dir(checkout)

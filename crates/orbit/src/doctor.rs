@@ -2,13 +2,13 @@
 //! missing piece would unlock — so a new user sees their setup in one place.
 //!
 //! Orbit asks for little: `git` and `claude` to work at all, then `uv` and
-//! `npm`, through which it fetches the tools it integrates (graphify via
-//! `uvx`, agent-browser via `npx`) on first use. `--fix` does those fetches
-//! now — graphify into uv's cache, agent-browser and its Chrome for Testing
-//! into npm's — and nothing else: it never installs system packages.
+//! `npm`, through which it installs the tools it integrates — once per
+//! machine, the first time each is needed (`uv tool install graphifyy`,
+//! `npm install -g agent-browser`). `--fix` does those installs now instead,
+//! and nothing else: it never installs system packages.
 
 use anyhow::Result;
-use orbit_core::tools::{self, Invocation, Via};
+use orbit_core::tools::{self, Tool};
 use std::path::PathBuf;
 
 /// One line of the report.
@@ -28,20 +28,22 @@ fn tool(name: &'static str, unlocks: &'static str, get: &'static str) -> Row {
     }
 }
 
-fn integration(
-    name: &'static str,
-    found: Option<Invocation>,
-    unlocks: &'static str,
-    get: &'static str,
-) -> Row {
+/// An integrated tool: installed, or installed once on first use when the
+/// package manager is here, or missing that package manager.
+fn integration(tool: &Tool, unlocks: &'static str, needs: &'static str) -> Row {
+    let found = match tool.installed() {
+        Some(at) => Some(tidy(&at.program)),
+        None if tool.installer_program().is_some() => Some(format!(
+            "not yet — installed once when first needed (`{}`)",
+            tool.install_hint()
+        )),
+        None => None,
+    };
     Row {
-        name,
-        found: found.map(|i| match i.via {
-            Via::Installed => tidy(&i.program),
-            _ => i.describe(),
-        }),
+        name: tool.name,
+        found,
         unlocks,
-        get,
+        get: needs,
     }
 }
 
@@ -90,30 +92,28 @@ pub fn run(fix: bool) -> Result<()> {
     let runners = [
         tool(
             "uv",
-            "fetches graphify for you",
+            "installs graphify for you",
             "curl -LsSf https://astral.sh/uv/install.sh | sh",
         ),
         tool(
-            "npx",
-            "fetches agent-browser for you",
+            "npm",
+            "installs agent-browser for you",
             "install Node.js (npm comes with it)",
         ),
     ];
     section(
-        "Tool runners (Orbit fetches its tools through these)",
+        "Package managers (Orbit installs its tools through these, once)",
         &runners,
     );
 
     let integrations = [
         integration(
-            "graphify",
-            tools::graphify(),
+            &tools::GRAPHIFY,
             "the code graph Claude queries, `k`",
             "needs uv (above)",
         ),
         integration(
-            "agent-browser",
-            tools::agent_browser(),
+            &tools::AGENT_BROWSER,
             "browser testing for Claude",
             "needs npm (above)",
         ),
@@ -148,43 +148,41 @@ pub fn run(fix: bool) -> Result<()> {
         std::process::exit(1);
     }
     if fix {
-        println!("Everything required is installed, and the tools Orbit fetches are ready.");
+        println!("Everything required is installed, and the tools Orbit integrates are ready.");
     } else {
-        println!("Everything required is installed. `orbit doctor --fix` fetches graphify and agent-browser (with its browser) now instead of on first use.");
+        println!("Everything required is installed. `orbit doctor --fix` installs graphify and agent-browser now instead of when first needed.");
     }
     Ok(())
 }
 
-/// Fetch through uv / npm now what Orbit would otherwise fetch on first use.
+/// Install now, once, what Orbit would otherwise install when first needed.
 fn prefetch() {
-    match tools::graphify() {
-        Some(graphify) => {
-            println!("Fetching graphify ({}) …", graphify.shell);
-            report(graphify.command().arg("--help"), "graphify");
+    for tool in [&tools::GRAPHIFY, &tools::AGENT_BROWSER] {
+        if tool.installed().is_some() {
+            println!("  ✓ {} already installed", tool.name);
+            continue;
         }
-        None => println!("Skipping graphify: install uv first."),
+        println!("Installing {} (`{}`) …", tool.name, tool.install_hint());
+        match tool.ensure() {
+            Ok(at) => println!("  ✓ {} installed at {}", tool.name, tidy(&at.program)),
+            Err(why) => println!("  ✗ {why}"),
+        }
     }
-    match tools::agent_browser() {
-        Some(browser) => {
+    // agent-browser's browser download is its own one-time step; it is a
+    // no-op when the browser is already there.
+    if let Some(browser) = tools::AGENT_BROWSER.installed() {
+        let ok = browser
+            .command()
+            .arg("install")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            println!("  ✓ agent-browser's browser is ready");
+        } else {
             println!(
-                "Fetching agent-browser and its browser ({} install) …",
-                browser.shell
+                "  ✗ agent-browser couldn't download its browser — run `agent-browser install`"
             );
-            report(browser.command().arg("install"), "agent-browser");
         }
-        None => println!("Skipping agent-browser: install Node.js (npm) first."),
-    }
-}
-
-fn report(command: &mut std::process::Command, what: &str) {
-    // Progress goes straight to the terminal; only the outcome is ours.
-    let quiet_stdout = what == "graphify";
-    if quiet_stdout {
-        command.stdout(std::process::Stdio::null());
-    }
-    match command.status() {
-        Ok(status) if status.success() => println!("  ✓ {what} ready"),
-        Ok(status) => println!("  ✗ {what}: exited with {status}"),
-        Err(e) => println!("  ✗ {what}: could not start ({e})"),
     }
 }

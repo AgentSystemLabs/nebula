@@ -28,7 +28,7 @@ orbit ssh <host>           open orbit on a remote host over ssh
 orbit tunnel <host>        open a remote host's orbit in a tab here
 orbit sbx [name]           open orbit inside a local Docker sandbox
 orbit upgrade              install the latest published orbit
-orbit doctor [--fix]       check this machine's setup; --fix fetches graphify and agent-browser
+orbit doctor [--fix]       check this machine's setup; --fix installs graphify and agent-browser
 ```
 
 ## The TUI

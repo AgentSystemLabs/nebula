@@ -413,14 +413,14 @@ pub(crate) enum Command {
     /// Check what this machine has and what's missing.
     ///
     /// Lists what Orbit needs, what's missing, and what each missing tool
-    /// would unlock. Required: git and claude (and curl). Orbit fetches the tools it
-    /// integrates through uv and npm on first use — graphify via uvx,
-    /// agent-browser via npx — so those two runners are all you install.
+    /// would unlock. Required: git and claude (and curl). Orbit installs the tools it
+    /// integrates through uv and npm, once per machine, the first time each
+    /// is needed — so those two package managers are all you install.
     /// Exits non-zero when something required is missing.
     #[command(after_help = DOCTOR_EXAMPLES)]
     Doctor {
-        /// Fetch graphify and agent-browser (with its browser) now, through
-        /// uv and npm, instead of on first use. Never installs anything else.
+        /// Install graphify and agent-browser (with its browser) now, through
+        /// uv and npm, instead of when first needed. Installs nothing else.
         #[arg(long)]
         fix: bool,
     },
@@ -617,7 +617,7 @@ Examples:
 const DOCTOR_EXAMPLES: &str = "\
 Examples:
   orbit doctor                    what's installed, what's missing
-  orbit doctor --fix              fetch graphify and agent-browser now";
+  orbit doctor --fix              install graphify and agent-browser now";
 
 #[derive(Subcommand)]
 pub(crate) enum ConfigCommand {
