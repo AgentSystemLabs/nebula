@@ -299,8 +299,23 @@ fn dev_build() -> Option<PathBuf> {
     } else {
         dir
     };
-    let is_target_dir = matches!(dir.file_name()?.to_str()?, "debug" | "release");
-    is_target_dir.then_some(exe)
+    if matches!(dir.file_name()?.to_str()?, "debug" | "release") {
+        return Some(exe);
+    }
+    // Newer cargo (the build-dir layout) runs test binaries from
+    // `<target>/<profile>/build/<pkg>/<hash>/out/`, so look for the profile
+    // dir further up — but only inside a real cargo target dir, which carries
+    // a CACHEDIR.TAG, so an install under some unrelated `release/` folder is
+    // never mistaken for a dev build.
+    let in_target = exe.ancestors().skip(1).any(|dir| {
+        matches!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("debug" | "release")
+        ) && dir
+            .parent()
+            .is_some_and(|target| target.join("CACHEDIR.TAG").is_file())
+    });
+    in_target.then_some(exe)
 }
 
 #[cfg(test)]
