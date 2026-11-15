@@ -426,17 +426,32 @@ fn tui_help_modal_grouped_keymap() {
     let mut tui = TuiHarness::spawn();
     tui.wait_for_text("create your first project");
 
-    // The grouped two-column keymap: every section header on screen at
-    // once (the old single list clipped its tail on short terminals).
+    // The grouped keymap: at 120 columns it lays out in three columns with
+    // every section header on screen at once, nothing to scroll.
     tui.send(b"?");
-    tui.wait_for_text("NAVIGATE & SEARCH");
-    tui.wait_for_text("CHECKOUTS & GITHUB");
-    tui.wait_for_text("SESSIONS");
-    tui.wait_for_text("TERMINAL & MOUSE");
-    tui.wait_for_text("GENERAL");
+    tui.wait_for_text("Keyboard shortcuts");
+    for section in [
+        "Move around",
+        "Find",
+        "Sessions",
+        "Review code",
+        "GitHub",
+        "Terminal & mouse",
+        "General",
+        "Typing in a field",
+    ] {
+        tui.wait_for_text(section);
+    }
 
-    tui.send(ESC); // closes
-    tui.wait_for_gone("NAVIGATE & SEARCH");
+    // `/` filters it down to what matches.
+    tui.send(b"/graph");
+    tui.wait_for_text("2 shortcuts");
+    tui.wait_for_gone("Move around");
+
+    tui.send(ESC); // clears the filter…
+    tui.wait_for_text("Move around");
+    tui.send(ESC); // …and then closes
+    tui.wait_for_gone("Keyboard shortcuts");
 }
 
 /// `orbit open` typed into a live session's shell — the stand-in agent is
@@ -531,7 +546,7 @@ fn tui_manual_link_add_is_unavailable() {
     tui.send(b"?");
     // If Shift+L still opened a prompt, this `?` would type into it instead
     // of opening HELP OVERLAY, so this heading proves the key was a no-op.
-    tui.wait_for_text("NAVIGATE & SEARCH");
+    tui.wait_for_text("Keyboard shortcuts");
     tui.wait_for_gone("attach a link");
 }
 

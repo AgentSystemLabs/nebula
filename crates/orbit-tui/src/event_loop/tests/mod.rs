@@ -21089,6 +21089,67 @@ fn help_click_outside_closes_and_inside_stays() {
     assert!(app.chrome.dirty);
 }
 
+fn help_view(app: &App) -> &crate::app::HelpView {
+    match &app.modals.overlay {
+        Some(Overlay::Help(view)) => view,
+        other => panic!("help is not open: {other:?}"),
+    }
+}
+
+/// The HELP OVERLAY's filter: `/` gives it the keys, so `q` types instead
+/// of closing; Enter keeps the filter and hands the keys back; Esc clears a
+/// filter before it closes anything.
+#[test]
+fn help_filters_on_slash_and_esc_clears_before_closing() {
+    let mut app = App::new();
+    let mut out = Vec::new();
+    press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+    assert!(help_view(&app).typing);
+    for c in "quit".chars() {
+        press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+    }
+    assert_eq!(help_view(&app).query.as_str(), "quit", "q typed, not quit");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+    assert!(!help_view(&app).typing);
+    assert_eq!(help_view(&app).query.as_str(), "quit", "Enter keeps it");
+
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+    assert_eq!(help_view(&app).query.as_str(), "", "first Esc clears");
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+    assert!(app.modals.overlay.is_none(), "second Esc closes");
+}
+
+/// Scrolling stops at both ends of what the last draw measured, from the
+/// keys and the wheel alike; `s` goes to the Hotkeys tab.
+#[test]
+fn help_scrolls_within_its_body_and_s_opens_hotkeys() {
+    let mut app = App::new();
+    let mut out = Vec::new();
+    press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let max = help_view(&app).max_scroll;
+    assert!(max > 0, "a short screen has more below");
+
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+    assert_eq!(help_view(&app).scroll, 0, "nothing above the top");
+    press(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT, &mut out);
+    assert_eq!(help_view(&app).scroll, max);
+    press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+    assert_eq!(help_view(&app).scroll, max, "nothing below the bottom");
+    handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 40, 10), &mut out);
+    assert_eq!(help_view(&app).scroll, max.saturating_sub(3));
+
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+    match &app.modals.overlay {
+        Some(Overlay::Settings(_)) => {
+            assert_eq!(app.modals.settings_tab, crate::config::hotkeys_tab())
+        }
+        other => panic!("expected settings, got {other:?}"),
+    }
+}
+
 #[test]
 fn confirm_click_outside_cancels_without_confirming() {
     let mut app = App::new();

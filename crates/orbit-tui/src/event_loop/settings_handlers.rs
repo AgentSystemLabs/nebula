@@ -620,6 +620,19 @@ pub(crate) fn open_harness_settings(app: &mut App, kind: AgentKind, custom: Opti
     )));
 }
 
+/// Settings parked on its Hotkeys tab, cursor in the rows — where the help
+/// overlay's `s` goes, since every key it lists is rebound there.
+pub(crate) fn open_hotkeys_settings(app: &mut App) {
+    let tab = crate::config::hotkeys_tab();
+    app.modals.settings_tab = tab;
+    app.modals.settings_on_tabs = false;
+    app.modals.overlay = Some(Overlay::Settings(SettingsView::new(
+        tab,
+        app.settings_row(tab),
+        false,
+    )));
+}
+
 /// Put the settings overlay back up on its remembered tab and row, no
 /// questions asked. `open_settings` is the from-the-panels entry that
 /// checks the memory's age first; this one is for mid-visit round trips

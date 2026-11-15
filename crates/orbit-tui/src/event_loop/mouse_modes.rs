@@ -82,6 +82,22 @@ fn handle_overlay_mouse(
         }
         Overlay::Settings(_) => handle_settings_mouse(app, mouse, mouse_pos, out),
         Overlay::Metrics(_) => handle_metrics_mouse(app, mouse, mouse_pos, out),
+        // The wheel scrolls the help; anything else inside it is swallowed.
+        Overlay::Help(_) => {
+            if let Some(Overlay::Help(view)) = &mut app.modals.overlay {
+                let step: i32 = match mouse.kind {
+                    MouseEventKind::ScrollDown => 3,
+                    MouseEventKind::ScrollUp => -3,
+                    _ => 0,
+                };
+                if step != 0 {
+                    view.scroll =
+                        (view.scroll as i32 + step).clamp(0, view.max_scroll as i32) as u16;
+                    app.chrome.dirty = true;
+                }
+            }
+            true
+        }
         _ => true,
     }
 }

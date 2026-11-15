@@ -748,11 +748,20 @@ pub struct ConfirmDialog {
     pub area: Rect,
 }
 
-/// The `?` keymap overlay. Carries nothing but its drawn rect, so a click
-/// outside the box can close it.
+/// The `?` keymap overlay: its `/` filter and how far the body is
+/// scrolled, plus what the last draw measured — the box, for a click
+/// outside it, and how far there is to scroll.
 #[derive(Debug, Clone, Default)]
 pub struct HelpView {
     pub area: Rect,
+    /// The filter; empty shows every shortcut.
+    pub query: crate::text_input::TextInput,
+    /// Keys go to the filter (after `/`) rather than to scrolling.
+    pub typing: bool,
+    pub scroll: u16,
+    /// Set by the draw: the furthest `scroll` can go, and one screenful.
+    pub max_scroll: u16,
+    pub page: u16,
 }
 
 #[derive(Debug, Clone, PartialEq)]

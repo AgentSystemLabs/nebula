@@ -51,19 +51,63 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
 
 fn handle_help_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let _ = &mut *out;
-    let Some(overlay) = &mut app.modals.overlay else {
-        return;
+    let help_chord = app.chrome.keymap.lookup(
+        crate::keymap::Scope::Global,
+        &crate::keymap::KeyChord::from_event(&key),
+    ) == Some(crate::keymap::Action::Help);
+    let Some(Overlay::Help(view)) = &mut app.modals.overlay else {
+        unreachable!("overlay dispatcher passed the wrong overlay");
     };
-    match overlay {
-        Overlay::Help(_) => {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
-            ) {
-                app.modals.overlay = None;
+    app.chrome.dirty = true;
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let page = view.page.max(1);
+    let scroll_by = |view: &mut crate::app::HelpView, delta: i32| {
+        view.scroll = (view.scroll as i32 + delta).clamp(0, view.max_scroll as i32) as u16;
+    };
+    // Scrolling works the same whether or not the filter has the keys.
+    match key.code {
+        KeyCode::Down => return scroll_by(view, 1),
+        KeyCode::Up => return scroll_by(view, -1),
+        KeyCode::PageDown => return scroll_by(view, page as i32),
+        KeyCode::PageUp => return scroll_by(view, -(page as i32)),
+        _ => {}
+    }
+    if view.typing {
+        match key.code {
+            // Esc empties the filter and hands the keys back; Enter keeps it.
+            KeyCode::Esc => {
+                view.query.clear();
+                view.typing = false;
+                view.scroll = 0;
+            }
+            KeyCode::Enter => view.typing = false,
+            _ => {
+                if view.query.handle_key(&key).changed() {
+                    view.scroll = 0;
+                }
             }
         }
-        _ => unreachable!("overlay dispatcher passed the wrong overlay"),
+        return;
+    }
+    match key.code {
+        KeyCode::Char('/') => view.typing = true,
+        // Esc clears a filter first, then closes.
+        KeyCode::Esc if !view.query.is_empty() => {
+            view.query.clear();
+            view.scroll = 0;
+        }
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.modals.overlay = None,
+        _ if help_chord => app.modals.overlay = None,
+        KeyCode::Char('d') if ctrl => scroll_by(view, (page / 2).max(1) as i32),
+        KeyCode::Char('u') if ctrl => scroll_by(view, -((page / 2).max(1) as i32)),
+        KeyCode::Char('j') => scroll_by(view, 1),
+        KeyCode::Char('k') => scroll_by(view, -1),
+        KeyCode::Char(' ') => scroll_by(view, page as i32),
+        KeyCode::Home | KeyCode::Char('g') => view.scroll = 0,
+        KeyCode::End | KeyCode::Char('G') => view.scroll = view.max_scroll,
+        // Straight to where every key on this sheet is rebound.
+        KeyCode::Char('s') => open_hotkeys_settings(app),
+        _ => {}
     }
 }
 

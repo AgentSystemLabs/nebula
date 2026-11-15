@@ -453,7 +453,7 @@ Every key is rebindable in Settings → Hotkeys.
 |---|---|
 | `o` | open a folder as a new project |
 | `s` | settings |
-| `h` (or `?`) | help: every key |
+| `h` (or `?`) | help: every key, grouped by job; `/` filters it, `s` goes to rebinding |
 | `F10` | orchestrator view |
 | `⇧H` | SSH hosts |
 | `⇧M` | memory usage |

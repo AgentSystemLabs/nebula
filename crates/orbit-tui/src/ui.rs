@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 mod footer;
+mod help;
 mod launcher_view;
 mod overlay;
 mod rows;
@@ -192,9 +193,6 @@ const PATH_PROMPT_W: u16 = 72;
 /// Narrowest a confirm dialog gets, so a short question still reads as one.
 const CONFIRM_MIN_W: u16 = 52;
 /// Widths of the modals whose height follows their content.
-const HELP_W: u16 = 92;
-/// The help overlay's key column: chords past it are dropped whole.
-const HELP_KEY_W: usize = 14;
 const SETTINGS_W: u16 = 84;
 const MEMORY_W: u16 = 74;
 const HOSTS_W: u16 = 64;
