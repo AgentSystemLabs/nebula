@@ -54,6 +54,33 @@ same time without editing the same files.
 
 ## 2. Install and run
 
+Orbit runs on macOS and Linux (Windows through WSL2). Pick one way to install:
+
+**Homebrew**
+
+```sh
+brew tap amenadem/orbit https://github.com/AmenAdem/Orbit
+brew install amenadem/orbit/orbit
+```
+
+Type the full name `amenadem/orbit/orbit`: a plain `brew install orbit` installs an unrelated Mac app.
+
+**Install script** (no Homebrew needed)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh
+```
+
+It puts the prebuilt binary in `~/.local/bin` (`ORBIT_INSTALL_DIR` changes that) and prints the line
+to add to your shell if that folder isn't on your PATH.
+
+Then run **`orbit`**; the daemon starts by itself. `orbit --version` says which release you have.
+
+**Updating.** When a new release is out, the footer shows `⇡ vX.Y.Z` beside the version. Run
+**`orbit upgrade`**. It uses `brew upgrade` on a Homebrew install and the install script otherwise,
+then moves the running daemon onto the new binary **without stopping any session**. After a plain
+`brew upgrade`, run `orbit reload` to do that last step yourself.
+
 **What you need:** `git` and the `claude` CLI, plus **`uv`** and **`npm`**. Orbit installs the tools it
 integrates through those two — **once per machine**, the first time each is needed
 (`uv tool install graphifyy`, `npm install -g agent-browser`) — and uses the installed copy from then
@@ -62,7 +89,9 @@ on. Run **`orbit doctor`** to see what your machine has and what each missing pi
 downloads one the first time, which can take a few minutes; it never happens again.
 (`gh` is the one optional extra worth installing yourself, for pull requests and issues.)
 
-To build Orbit from this repository you also need Rust (`rustup`, on your PATH).
+### Building from source
+
+Only needed if you work on Orbit itself. You also need Rust (`rustup`, on your PATH).
 
 **Try your latest code without touching anything else** — an isolated copy with its own daemon and
 data:
@@ -75,17 +104,15 @@ make dev-reset            # wipe the dev copy's data and start fresh
 
 Quitting `make dev` also stops its daemon and its sessions.
 
-**Install it for real use:**
+**Install your own build for everyday use:**
 
 ```sh
 make install PREFIX=$HOME/.local/bin   # build a release and put `orbit` in ~/.local/bin
-orbit                                  # open the TUI (the daemon starts by itself)
+orbit reload                           # move a running daemon onto it, sessions kept
 ```
 
-(`make install` alone targets `~/.cargo/bin`, which a Homebrew rustup doesn't create.)
-
-After installing a new build while sessions are running, `orbit reload` moves the daemon onto the new
-binary without stopping any session.
+(`make install` alone targets `~/.cargo/bin`, which a Homebrew rustup doesn't create.) Don't mix this
+with a Homebrew install: whichever `orbit` comes first on your PATH wins.
 
 ## 3. Your first session
 
@@ -251,6 +278,18 @@ or uses a copy you already have):
   `affected`) before searching file by file — those commands are pre-approved, so no prompts.
 - **`k`** opens the graph in your browser (and builds it first if there isn't one yet).
 
+**Is it working?** Any of these tells you:
+
+- the checkout has a `graphify-out/` folder with `GRAPH_REPORT.md` and `graph.json` in it;
+- `k` opens the graph;
+- Claude runs `graphify query "…"` (or `explain`, `path`, `affected`) before searching files;
+- `orbit doctor` shows `✓ graphify`.
+
+The files in `graphify-out/cache/` change after every turn; `graph.json` only changes when the code
+did. A checkout that already existed when you added the project gets its graph after its first
+Claude turn, or straight away with `k`. Claude is told about the graph when a session starts, so a
+session started before its checkout's first graph was built won't know about it; a new session will.
+
 To turn it off: `"graphify": false` in `config.json` for every project, or in a project's
 `.orbit/config.json` for just that one.
 
@@ -348,7 +387,8 @@ Press **`s`**. Each tab is a list; `Enter` or `←`/`→` change a row. Suggeste
 | Appearance | **Theme**, **Session pane: right/bottom** | taste |
 | Hotkeys | any action | rebind any key; it warns before taking one already in use |
 
-Settings live in `~/Library/Application Support/dev.orbit.orbit/config.json`. `orbit config export`
+Settings live in `~/Library/Application Support/dev.orbit.orbit/config.json` on macOS and
+`~/.local/share/orbit/config.json` on Linux (`orbit config path` prints it). `orbit config export`
 backs them up; `orbit config import <file>` restores them.
 
 ## 13. Key reference
@@ -386,6 +426,7 @@ Every key is rebindable in Settings → Hotkeys.
 | `m` | move the session to another worktree |
 | `⇧P` | duplicate the session |
 | `t` | new shell terminal |
+| `⇧T` | a shell in a new Ghostty tab, outside Orbit |
 | `w` | cycle the pane through this checkout's terminals |
 | `z` | hide / show the pane |
 | `Ctrl+F` | full-screen session |
@@ -428,6 +469,8 @@ orbit read <session>      # print a session's recent output
 orbit ask <session> "…"   # ask a session something and print the answer
 orbit kill                # stop the daemon and every session
 orbit reload              # move the daemon onto a new build, keeping sessions
+orbit upgrade             # install the latest release (through brew on a Homebrew install)
+orbit --version           # which release you're running
 orbit doctor              # what's installed, what's missing, what each tool unlocks
 orbit doctor --fix        # install graphify and agent-browser now (once, through uv / npm)
 orbit config path         # where the settings files are
@@ -442,7 +485,9 @@ The full list, with every flag: [Commands](commands.md), or `orbit <command> --h
 | Problem | Fix |
 |---|---|
 | A card's dot stays gray while Claude works | the status hooks didn't install. Check `.claude/settings.local.json` in that checkout has entries tagged `_orbitManaged`, and that `curl` is on your PATH |
-| "daemon did not come up" | run `orbit kill`, then `orbit` again. Logs: `~/Library/Application Support/dev.orbit.orbit/state/daemon.log` |
+| "daemon did not come up" | run `orbit kill`, then `orbit` again. Logs: `~/Library/Application Support/dev.orbit.orbit/state/daemon.log` (Linux: `~/.local/state/orbit/`) |
+| The footer shows `⇡ vX.Y.Z` | a newer release is out: `orbit upgrade` |
+| `brew install orbit` installed some other app | that's an unrelated cask with the same name: `brew uninstall --cask orbit`, then `brew install amenadem/orbit/orbit` |
 | A change I built isn't there | the old daemon is still running: `orbit reload` (or `orbit kill` then `orbit`) |
 | `path must be shorter than SUN_LEN` | the socket folder path is too long for macOS; set `ORBIT_RUNTIME_DIR` to a short path such as `/tmp/orbit` |
 | `k` says graphify couldn't start, or no graph appears | an old copy of `graphify` may come first on your PATH (`which -a graphify`); Orbit skips copies whose Python is gone, but remove stale ones or run `uv tool upgrade graphifyy` |
