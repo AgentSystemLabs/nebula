@@ -1999,7 +1999,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(crate::graphify::OUT_DIR)).unwrap();
         std::fs::write(crate::graphify::graph_json(tmp.path()), "{}").unwrap();
         let with_graph = system_prompt(tmp.path());
-        assert!(with_graph.contains("graphify-out/"), "{with_graph}");
+        assert!(with_graph.contains(".orbit/local/graph/"), "{with_graph}");
         assert!(with_graph.contains(&format!("{} query", crate::graphify::shell_command())));
     }
 

@@ -54,9 +54,10 @@ pub struct Config {
     /// TUI's Project tab owns the map; the daemon reads the one key in it
     /// that is its to act on, through [`Config::run_command`].
     pub projects: BTreeMap<PathBuf, ProjectConfig>,
-    /// GRAPHIFY: keep a code knowledge graph (`graphify-out/`) up to date in
-    /// every checkout when the `graphify` CLI is installed, and point Claude
-    /// at it. On by default; a checkout's `.orbit/config.json` can opt out alone.
+    /// GRAPHIFY: keep a code knowledge graph (`.orbit/local/graph/`) up to
+    /// date in every checkout when the `graphify` CLI is installed, and point
+    /// Claude at it. On by default; a project's `.orbit/config.json` can opt
+    /// out alone.
     pub graphify: bool,
     /// BROWSER TESTING: Claude sessions test web pages through agent-browser
     /// subagents (Haiku for quick checks, Sonnet for multi-step flows)
@@ -72,7 +73,7 @@ pub struct Config {
 #[serde(default)]
 pub struct ProjectConfig {
     /// The RUN COMMAND a menu's **Run** starts in this project's
-    /// worktrees, typed into Settings → Project. Empty means the checkout's `.orbit/config.json`
+    /// worktrees, typed into Settings → Project. Empty means the project's `.orbit/config.json`
     /// `run`, as before the row existed.
     pub run_command: String,
 }

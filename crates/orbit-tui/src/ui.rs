@@ -564,7 +564,16 @@ fn draw_multiline_prompt(
             let header = launcher_view::target_line(launch, &label, row.width, th);
             f.render_widget(header.line, row);
             toggle_area = header.toggle.map(|at| cols(row, at)).unwrap_or_default();
-            3
+            // Every ticked skill, named under the question: the title has
+            // no room for more than a few, and the pick must be readable.
+            let skill_rows = launcher_view::skills_lines(launch, row.width, 2, th);
+            let skill_count = skill_rows.len() as u16;
+            for (i, line) in skill_rows.into_iter().enumerate() {
+                if let Some(r) = row_rect(inner, 3 + i) {
+                    f.render_widget(Paragraph::new(line), r);
+                }
+            }
+            3 + skill_count
         }
         None => {
             // The QUICK PROMPT's target row above the label: the toggle

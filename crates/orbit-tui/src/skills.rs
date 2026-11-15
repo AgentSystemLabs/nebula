@@ -181,22 +181,15 @@ pub fn with_claude_home<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
 
 /// Everything the picker lists for `checkout`, a checkout of the project
 /// whose main checkout (and repo root) is `main`: the workflows of the
-/// main checkout's project file with the checkout's own file's laid over
-/// them by name — saving writes to the main checkout, and a branch with a
-/// file of its own still sees what was saved — then every skill.
+/// main checkout's project file — the one file a project has, and where
+/// saving writes — then every skill.
 pub fn load_catalog(claude_home: &Path, checkout: &Path, main: &Path) -> Catalog {
     let mut workflows: BTreeMap<String, orbit_core::project_file::Workflow> = BTreeMap::new();
     let mut error = None;
-    let mut dirs = vec![main];
-    if checkout != main {
-        dirs.push(checkout);
-    }
-    for dir in dirs {
-        match orbit_core::project_file::read(dir) {
-            Ok(Some(file)) => workflows.extend(file.workflows),
-            Ok(None) => {}
-            Err(e) => error = Some(e),
-        }
+    match orbit_core::project_file::read(main) {
+        Ok(Some(file)) => workflows.extend(file.workflows),
+        Ok(None) => {}
+        Err(e) => error = Some(e),
     }
     Catalog {
         workflows: workflows
@@ -653,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn the_catalog_merges_the_main_checkouts_workflows_with_the_worktrees() {
+    fn the_catalog_lists_the_main_checkouts_workflows_only() {
         let home = tempfile::tempdir().unwrap();
         let main = tempfile::tempdir().unwrap();
         let worktree = tempfile::tempdir().unwrap();
@@ -662,9 +655,10 @@ mod tests {
             r#"{"run": "x", "workflows": {"feature": {"skills": ["a"], "text": "go"},
                 "fix": {"skills": ["b"]}}}"#,
         );
+        // A worktree's own copy of the file is ignored, broken or not.
         write(
             &worktree.path().join(".orbit/config.json"),
-            r#"{"workflows": {"fix": {"skills": ["c"]}}}"#,
+            r#"{"workflows": {"fix": {"skills": ["c"]}, "extra": {}}}"#,
         );
         let catalog = load_catalog(home.path(), worktree.path(), main.path());
         assert_eq!(catalog.error, None);
@@ -678,14 +672,22 @@ mod tests {
                 },
                 Workflow {
                     name: "fix".into(),
-                    skills: vec!["c".into()],
+                    skills: vec!["b".into()],
                     text: None,
                 },
             ]
         );
         write(&worktree.path().join(".orbit/config.json"), "{");
+        assert_eq!(
+            load_catalog(home.path(), worktree.path(), main.path()).error,
+            None
+        );
+        write(&main.path().join(".orbit/config.json"), "{");
         let broken = load_catalog(home.path(), worktree.path(), main.path());
-        assert!(broken.error.is_some());
-        assert_eq!(broken.workflows.len(), 2, "the main checkout's still list");
+        assert!(
+            broken.error.is_some(),
+            "the main checkout's file is the one that counts"
+        );
+        assert!(broken.workflows.is_empty());
     }
 }

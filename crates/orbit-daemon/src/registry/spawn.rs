@@ -586,6 +586,12 @@ impl Daemon {
             login_shell_wrap(&orbit_core::shell::user_shell(), &program, &args)
         };
 
+        // A checkout with no graph yet — one from before the graph moved
+        // into `.orbit/local/`, or graphify installed since — gets one built
+        // now rather than after this session's first finished turn.
+        if !crate::graphify::has_graph(&worktree.path) {
+            crate::graphify::refresh(&worktree.path);
+        }
         let spec = SpawnSpec {
             program,
             args,
@@ -597,6 +603,7 @@ impl Daemon {
                     format!("http://127.0.0.1:{}", self.hook_env.port),
                 ),
                 (env::API_TOKEN.into(), self.hook_env.token.clone()),
+                graph_env(&worktree.path),
             ],
             scrub_env: env::AGENT_SESSION_VARS,
             cols,
@@ -818,7 +825,7 @@ impl Daemon {
             program,
             args,
             cwd: worktree.path.clone(),
-            env: vec![],
+            env: vec![graph_env(&worktree.path)],
             scrub_env: env::AGENT_SESSION_VARS,
             cols,
             rows,
@@ -828,4 +835,17 @@ impl Daemon {
         self.install_session(session.clone());
         Ok(session)
     }
+}
+
+/// `GRAPHIFY_OUT` for a session in `checkout`: graphify's commands there —
+/// an agent's `graphify query`, one typed into a terminal — read and write
+/// the checkout's `.orbit/local/graph/` instead of graphify's default
+/// `graphify-out/`, wherever in the checkout the command runs.
+fn graph_env(checkout: &std::path::Path) -> (String, String) {
+    (
+        crate::graphify::OUT_ENV.into(),
+        crate::graphify::out_dir(checkout)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }

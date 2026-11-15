@@ -113,7 +113,8 @@ pub(crate) fn open_graph(app: &mut App) {
         app.chrome.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
-    let html = root.join("graphify-out").join("graph.html");
+    let out = root.join(orbit_core::project_file::GRAPH_DIR);
+    let html = out.join("graph.html");
     let build = !html.is_file();
     let open = move || {
         if build {
@@ -128,6 +129,7 @@ pub(crate) fn open_graph(app: &mut App) {
                 .arg("update")
                 .arg(&root)
                 .current_dir(&root)
+                .env("GRAPHIFY_OUT", &out)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -303,7 +305,7 @@ pub(crate) fn open_worktree(app: &mut App, worktree: &orbit_core::Worktree) {
         .iter()
         .find(|p| p.id == worktree.project_id)
         .map_or_else(|| worktree.path.clone(), |p| p.repo_path.clone());
-    let command = match open_command_for(&worktree.path, &main) {
+    let command = match open_command_for(&main) {
         Ok(command) => command,
         Err(msg) => {
             app.chrome.flash = Some(msg);
@@ -318,25 +320,18 @@ pub(crate) fn open_worktree(app: &mut App, worktree: &orbit_core::Worktree) {
 
 /// The OPEN COMMAND for a checkout, resolved the way the DAEMON resolves
 /// `r`'s: the project's `open_command` setting, read fresh so an edit
-/// applies on the next press, else the PROJECT FILE's `open` — the
-/// worktree's own checkout, then the project's main one. Err is the footer
+/// applies on the next press, else the PROJECT FILE's `open`, read from the
+/// project's main checkout whichever worktree asked. Err is the footer
 /// line: nothing set in either place, or a file that is there and won't
 /// parse.
-pub(crate) fn open_command_for(
-    worktree: &std::path::Path,
-    main: &std::path::Path,
-) -> Result<String, String> {
+pub(crate) fn open_command_for(main: &std::path::Path) -> Result<String, String> {
     let setting = crate::config::Config::load().project(main).open_command;
     let setting = setting.trim();
     if !setting.is_empty() {
         return Ok(setting.to_string());
     }
-    orbit_core::project_file::lookup(
-        worktree,
-        main,
-        orbit_core::project_file::ProjectCommand::Open,
-    )?
-    .ok_or_else(|| NO_OPEN_COMMAND.to_string())
+    orbit_core::project_file::lookup(main, orbit_core::project_file::ProjectCommand::Open)?
+        .ok_or_else(|| NO_OPEN_COMMAND.to_string())
 }
 
 /// Start an OPEN COMMAND through `$SHELL -c` in `cwd`, kept off the TUI's

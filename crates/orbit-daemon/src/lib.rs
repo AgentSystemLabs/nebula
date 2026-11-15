@@ -3,6 +3,7 @@ pub mod browser;
 pub mod claude_bg;
 pub mod config;
 pub mod git;
+pub mod graph_gate;
 pub mod graphify;
 pub mod handoff;
 pub mod hooks;
@@ -450,47 +451,11 @@ fn worktree_probe_stamp(repo_path: &std::path::Path) -> Option<WorktreeStamp> {
     })
 }
 
-/// The `.git` holding the repo's shared HEAD and per-worktree HEADs — the
-/// files the probe above watches.
-///
-/// `<checkout>/.git` is that directory in a normal checkout, but in a linked
-/// worktree it is a `gitdir:` file pointing at `<repo>/.git/worktrees/<name>`,
-/// whose own `commondir` points back at the shared `.git`. Following both is
-/// what lets a project rooted at a worktree (one added with `orbit add` from
-/// inside one) probe anything at all: joining `HEAD` onto a *file* reads
-/// nothing, and a stamp that is always `None` compares equal to itself on
-/// every tick, so the sync would never run again after the first.
-fn git_common_dir(repo_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let dot_git = repo_path.join(".git");
-    let git_dir = if std::fs::metadata(&dot_git).ok()?.is_dir() {
-        dot_git
-    } else {
-        let text = std::fs::read_to_string(&dot_git).ok()?;
-        rebase_on(repo_path, text.trim().strip_prefix("gitdir:")?.trim())
-    };
-    // A worktree gitdir has no HEAD history of the repo; `commondir` is the
-    // hop back to the `.git` that does. A normal checkout has no such file.
-    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
-        // git writes that hop relatively (`../..`), so the join keeps the
-        // parent components; canonicalizing folds them away, which is what
-        // makes the two checkouts of one repo answer with the same path
-        // rather than two spellings of it.
-        Ok(common) => rebase_on(&git_dir, common.trim()),
-        Err(_) => git_dir,
-    };
-    Some(std::fs::canonicalize(&common).unwrap_or(common))
-}
-
-/// Git writes these pointers as either an absolute path or one relative to the
-/// file that carries them.
-fn rebase_on(base: &std::path::Path, target: &str) -> std::path::PathBuf {
-    let target = std::path::PathBuf::from(target);
-    if target.is_absolute() {
-        target
-    } else {
-        base.join(target)
-    }
-}
+// The `.git` holding the repo's shared HEAD and per-worktree HEADs — the
+// files the probe above watches. In a linked worktree `.git` is a file, so
+// without following it a stamp that is always `None` compares equal to
+// itself on every tick, and the sync would never run again after the first.
+use orbit_core::git::{git_common_dir, rebase_on};
 
 #[cfg(test)]
 mod period_tests {

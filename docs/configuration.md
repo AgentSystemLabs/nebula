@@ -127,7 +127,7 @@ behaviors that change how the tree is worked; every switch there is off by defau
 | `custom_harnesses` | array | `[]` | Agents | Extra CLIs the NEW SESSION PICKER offers after the built-ins, each with its own Agents tab section (Enabled and Model rows). Each entry is `{id, program}` plus options: `label` (picker text, defaults to the id), `enabled` (default `true`), `model` (default `"default"` = the CLI's pick, else passed verbatim), `model_flag` (default `"--model"`), and `hooks` (a built-in dialect the program speaks: `claude`, `codex`, `cursor`, `pi` or `opencode` — with one set the sessions report status, prompts and permission waits exactly like that harness, including title sync and auto-title for `claude`; without one they stay process-based, running while the PTY is live and never waiting-on-you). Ids use lowercase letters, digits and hyphens and must not collide with a built-in. Legacy: new harnesses belong in `harnesses`, where they also gain resume, effort, system-prompt and hook-dialect rows. Invalid entries never launch — the picker hides them and the daemon refuses them with the reason. |
 | `harnesses` | object | `{}` | Agents | The harness registry: per-harness deltas over the compiled-in known harnesses (Claude, Codex, Cursor, Pi, Muse, Grok Build, OpenCode), and whole new third-party CLIs. The Agents tab grows one section per entry — Enabled, Model, and Effort rows while the harness offers effort — and the `n` picker, `e` presets, spawn, resume and hooks all read the merged rows. A hand edit that breaks one entry refuses its launches with the reason, never the whole file. Run `orbit config harnesses` to print the effective rows to copy from. |
 | `keybindings` | object | `{}` | Hotkeys | KEYMAP overrides, keyed by action id, valued with a comma-separated chord list: `{"git_diff": "ctrl+g, g"}`. An empty string deliberately unbinds; unknown ids are ignored. Only rows that differ from the defaults are written. |
-| `graphify` | bool | `true` | — | GRAPHIFY: keep a code knowledge graph (`graphify-out/`, kept out of git through `.git/info/exclude`) up to date in every checkout when graphify is installed, or `uv` is there to install it once per machine (`uv tool install graphifyy`) — built when a project is added or a worktree created, refreshed after each finished turn — and tell Claude sessions to query it before searching broadly. `k` opens it. A project's `.orbit/config.json` can opt out with `"graphify": false`. Does nothing without graphify or uv. |
+| `graphify` | bool | `true` | — | GRAPHIFY: keep a code knowledge graph (`.orbit/local/graph/`, kept out of git through `.git/info/exclude`) up to date in every checkout when graphify is installed, or `uv` is there to install it once per machine (`uv tool install graphifyy`) — built when a project is added or a worktree created, refreshed after each finished turn — and tell Claude sessions to query it before searching broadly. `k` opens it. A project's `.orbit/config.json` can opt out with `"graphify": false`. Does nothing without graphify or uv. |
 | `browser_testing` | bool | `true` | — | BROWSER TESTING: Claude sessions get two agent-browser subagents through `--agents` — `browser-check` on Haiku for quick single-page checks, `browser-test` on Sonnet for multi-step flows — and are told to hand browser work to them; the Claude in Chrome extension's tools are denied for that launch (`--disallowedTools`, nothing written to settings files) and agent-browser commands are pre-approved. Needs agent-browser installed, or `npm` there to install it once per machine (`npm install -g agent-browser`, started in the background the first time a Claude session spawns). Built-in Claude only. Does nothing without agent-browser or npm. |
 | `prewarm_agents` | bool | `true` | Sessions | DAEMON-owned PREWARM POOL: keep one booted agent CLI standing by in the selected WORKTREE, so creating a session there adopts it and feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes), and that spare is a real session as far as the CLI is concerned — Claude's own `/list-agents` lists it beside the sessions you made, named after the directory (`my-repo-3f`), and the memory modal (`Shift+M`) groups it under **warm spares**. Off drains the pool on the DAEMON's next sweep (within 30 s). |
 | `prewarm_sessions` | bool | `true` | Sessions | DAEMON-owned SESSION PREWARM: boot a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** Off — for a machine with less memory to spare — landing on a worktree boots nothing: a session forks only when your cursor lands on its row or you attach to it, one at a time; sessions already up stay until the IDLE REAPER takes them. |
@@ -358,12 +358,28 @@ below). Keys orbit does not know are ignored, and kept when orbit saves a workfl
   `Ctrl+W` in the picker saves the ticked skills here, in the project's *main* checkout, rewriting only
   this key and leaving every other key as it was. See [the guide](guide.md#picking-skills-and-workflows).
 
-The file is read fresh at every press, so an edit applies on the next **Run** or `Shift+Enter`. Orbit looks
-in the worktree's own checkout first, so a branch can carry commands of its own, and falls back to the
-project's main checkout, so a worktree cut before the file was committed still runs. The first file found
-is the whole answer: a worktree's file with no `open` does not borrow the main checkout's. A missing
-file, a missing key, or JSON that doesn't parse is a one-line footer message saying what to fix; unknown
-keys are ignored.
+The file is read fresh at every press, so an edit applies on the next **Run** or `Shift+Enter`. It is
+always read from the project's **main checkout**, whichever worktree you pressed the key on: a project has
+one file, an edit applies to every worktree at once, and a worktree cut before the file was committed
+still runs. A copy of the file inside a linked worktree is ignored — merge it to change what the project
+does. A missing file, a missing key, or JSON that doesn't parse is a one-line footer message saying what
+to fix; unknown keys are ignored.
+
+### The `.orbit/` folder
+
+`.orbit/` holds everything Orbit keeps inside a project:
+
+```text
+.orbit/
+├── config.json   committed — the project file above, shared with everyone on the project
+└── local/        git-excluded — what Orbit generates for one checkout
+    └── graph/    the graphify code graph (graph.json, GRAPH_REPORT.md, graph.html, cache/)
+                  and orbit-usage.jsonl, the graph gate's log
+```
+
+The top level is shared and meant to be committed. `local/` is never committed: Orbit adds
+`/.orbit/local/` to the repository's `.git/info/exclude` (local to your clone, so no tracked file
+changes), and each worktree has its own, since each holds different code.
 
 Both commands have a second home: **Run command** and **Open command** on the SETTINGS OVERLAY's
 Project tab (`s`), which keep them in `config.json` under the project's `projects` entry instead of in

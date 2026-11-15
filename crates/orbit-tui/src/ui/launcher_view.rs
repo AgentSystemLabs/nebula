@@ -3424,6 +3424,60 @@ pub(super) struct TargetLine {
     pub toggle: Option<(u16, u16)>,
 }
 
+/// The rows that name every skill `Ctrl+S` ticked for this launch, so the
+/// pick is readable in the box itself: `skills (4): tdd · review · …`,
+/// wrapped onto at most `max_rows` rows, the rest as `+N more`. Empty
+/// with nothing ticked.
+pub(super) fn skills_lines(
+    launch: &QuickLaunch,
+    width: u16,
+    max_rows: usize,
+    th: Theme,
+) -> Vec<Line<'static>> {
+    let names = &launch.skills.skills;
+    let width = usize::from(width);
+    if names.is_empty() || max_rows == 0 || width < 12 {
+        return Vec::new();
+    }
+    let head = format!("skills ({}): ", names.len());
+    let indent = " ".repeat(head.chars().count());
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = head;
+    let mut fresh = true; // nothing but the head or indent on this row yet
+    let mut shown = 0;
+    for name in names {
+        let piece = if fresh {
+            name.clone()
+        } else {
+            format!(" · {name}")
+        };
+        if !fresh && cur.chars().count() + piece.chars().count() > width {
+            if rows.len() + 1 >= max_rows {
+                break;
+            }
+            rows.push(std::mem::replace(&mut cur, indent.clone()));
+            cur.push_str(name);
+        } else {
+            cur.push_str(&piece);
+        }
+        fresh = false;
+        shown += 1;
+    }
+    rows.push(cur);
+    let hidden = names.len() - shown;
+    if hidden > 0 {
+        let tail = format!(" · +{hidden} more");
+        if let Some(last) = rows.last_mut() {
+            while last.chars().count() + tail.chars().count() > width && last.pop().is_some() {}
+            last.push_str(&tail);
+        }
+    }
+    let style = Style::default().fg(th.accent);
+    rows.into_iter()
+        .map(|r| Line::from(Span::styled(truncate(&r, width), style)))
+        .collect()
+}
+
 /// The view's box title: what Enter starts. The harness, the model and
 /// the effort are on [`detail_line`] under it, beside the chords that
 /// change them; what is left here is what the box is *for* — an issue, a

@@ -272,22 +272,37 @@ or uses a copy you already have):
 
 - It is built when you add a project or create a worktree, and refreshed after every Claude turn.
   It uses code analysis only — no LLM, no cost — and takes a few seconds (incremental after that).
-- It lives in `graphify-out/` inside the checkout and is kept out of git automatically (through
-  `.git/info/exclude`, so no tracked file changes).
+- It lives in `.orbit/local/graph/` inside the checkout and is kept out of git automatically (through
+  `.git/info/exclude`, so no tracked file changes). Orbit points graphify there with its
+  `GRAPHIFY_OUT` variable, which every Orbit session and terminal has set, so `graphify query` there
+  finds it. Outside Orbit, pass `--graph .orbit/local/graph/graph.json` or set
+  `GRAPHIFY_OUT=.orbit/local/graph`.
 - Claude sessions are told the graph exists and query it (`graphify query`, `explain`, `path`,
   `affected`) before searching file by file — those commands are pre-approved, so no prompts.
+- **The graph gate** makes that stick. Told is not enough: left alone, Claude reaches for `find`,
+  `grep`, Grep and Glob first. So in a checkout with a graph, a search made before any graph query
+  in a prompt is blocked with a message handing Claude the `graphify query` to run, and once it has
+  queried the graph every search works normally for the rest of that prompt. At most two searches
+  a prompt are blocked, so a session is never stuck. Filters such as `ps aux | grep x` are not
+  searches and always run.
+- **`orbit graph-usage`** shows whether it is working. Run it in the checkout and it prints the
+  graph queries, the searches that ran, how often a session was steered to the graph and how
+  often it then used it, plus the recent queries. The data comes from
+  `.orbit/local/graph/orbit-usage.jsonl`.
 - **`k`** opens the graph in your browser (and builds it first if there isn't one yet).
 
 **Is it working?** Any of these tells you:
 
-- the checkout has a `graphify-out/` folder with `GRAPH_REPORT.md` and `graph.json` in it;
+- the checkout has a `.orbit/local/graph/` folder with `GRAPH_REPORT.md` and `graph.json` in it;
 - `k` opens the graph;
 - Claude runs `graphify query "…"` (or `explain`, `path`, `affected`) before searching files;
+- `orbit graph-usage` in the checkout lists graph queries;
 - `orbit doctor` shows `✓ graphify`.
 
-The files in `graphify-out/cache/` change after every turn; `graph.json` only changes when the code
-did. A checkout that already existed when you added the project gets its graph after its first
-Claude turn, or straight away with `k`. Claude is told about the graph when a session starts, so a
+The files in `.orbit/local/graph/cache/` change after every turn; `graph.json` only changes when the
+code did. A checkout without a graph gets one when a session starts in it, or straight away with `k`.
+Earlier Orbit versions kept the graph in `graphify-out/`; Orbit no longer reads or writes it, so
+delete that folder once `.orbit/local/graph/` exists (unless you built it yourself with `/graphify`). Claude is told about the graph when a session starts, so a
 session started before its checkout's first graph was built won't know about it; a new session will.
 
 To turn it off: `"graphify": false` in `config.json` for every project, or in a project's
@@ -355,7 +370,8 @@ start sessions across all your projects for you. See [Orchestrator](orchestrator
 
 ## 11. Running and opening your project
 
-Commit a `.orbit/config.json` (a root `.orbit.json` still works) at the root of a repository to tell Orbit how to run it:
+Commit a `.orbit/config.json` (a root `.orbit.json` still works) at the root of a repository to tell Orbit how to run it.
+Orbit always reads it from the project's main checkout, so one file serves every worktree:
 
 ```json
 {
@@ -464,6 +480,7 @@ Every key is rebindable in Settings → Hotkeys.
 ```sh
 orbit                     # open the TUI
 orbit add <dir>           # add a repository as a project (orbit add . for the current one)
+orbit graph-usage [dir]   # how much Claude sessions use the code graph there
 orbit sessions            # list every session
 orbit read <session>      # print a session's recent output
 orbit ask <session> "…"   # ask a session something and print the answer

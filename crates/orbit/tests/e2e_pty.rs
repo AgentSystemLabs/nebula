@@ -364,7 +364,7 @@ async fn full_crud_attach_and_restart_persistence() {
         &mut c,
         &ClientRequest::Input {
             session: sref.clone(),
-            data: format!("pwd; echo {marker}\n").into_bytes(),
+            data: format!("pwd; echo \"graph=$GRAPHIFY_OUT\"; echo {marker}\n").into_bytes(),
         },
     )
     .await
@@ -382,6 +382,11 @@ async fn full_crud_attach_and_restart_persistence() {
     assert!(
         text.contains("repo"),
         "terminal cwd should be the worktree: {text}"
+    );
+    // graphify run here reads and writes the checkout's `.orbit/local/graph/`.
+    assert!(
+        text.contains("repo/.orbit/local/graph"),
+        "terminal env should carry GRAPHIFY_OUT: {text}"
     );
 
     // ---- TailOutput: the end of the ring, for the grid's terminal card ----

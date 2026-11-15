@@ -5,16 +5,20 @@
 //! <checkout>` — AST extraction only, no LLM, a few seconds on a large repo
 //! and incremental after that — whenever a project is added, a worktree is
 //! created, and an agent's turn finishes (the moment code most likely
-//! changed). The result lands in `<checkout>/graphify-out/`, which is kept
-//! out of git through the repository's own `info/exclude` (never a tracked
-//! `.gitignore` edit), so it never shows in a diff.
+//! changed). The result lands in `<checkout>/.orbit/local/graph/` — graphify
+//! is pointed there with its `GRAPHIFY_OUT` variable, on orbit's own runs
+//! and in every session orbit launches, so `graphify query` finds it too.
+//! `.orbit/local/` is kept out of git through the repository's own
+//! `info/exclude` (never a tracked `.gitignore` edit), so it never shows in
+//! a diff.
 //!
 //! Claude sessions in a checkout that has a graph are told to query it
 //! before searching broadly ([`claude_guidance`]), and the
 //! read-only query commands are pre-approved alongside orbit's own.
 //!
 //! Off switches: `"graphify": false` in config.json for every project, or in
-//! a checkout's `.orbit/config.json` for that one. A missing CLI is simply a no-op.
+//! the project's `.orbit/config.json` (its main checkout's) for that one. A
+//! missing CLI is simply a no-op.
 //!
 //! Runs never overlap for one checkout: a refresh asked for while one is
 //! running is folded into a single rerun when it ends.
@@ -26,7 +30,18 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Where graphify writes, relative to the checkout it was run on.
-pub const OUT_DIR: &str = "graphify-out";
+pub const OUT_DIR: &str = orbit_core::project_file::GRAPH_DIR;
+
+/// The variable graphify reads its output folder from (graphify ≥ 0.9),
+/// for every command: `update` writes there, `query` and friends read there.
+pub const OUT_ENV: &str = "GRAPHIFY_OUT";
+
+/// `checkout`'s graph folder, absolute — the `GRAPHIFY_OUT` value for any
+/// graphify run against it, so a session that `cd`s into a subfolder still
+/// queries the checkout's graph.
+pub fn out_dir(checkout: &Path) -> PathBuf {
+    checkout.join(OUT_DIR)
+}
 
 /// A run that takes longer than this is killed: a hung extractor must not
 /// pin a CPU forever, and the next refresh simply tries again.
@@ -37,12 +52,12 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(300);
 /// full path when its directory isn't on PATH.
 pub fn claude_guidance(graphify: &str) -> String {
     format!(
-        "[orbit] This checkout has a code knowledge graph built by graphify in `graphify-out/` \
+        "[orbit] This checkout has a code knowledge graph built by graphify in `.orbit/local/graph/` \
 (orbit refreshes it automatically after every turn — never update it yourself). For questions \
 about structure — where something lives, how parts connect, what a change would affect — query \
 the graph before searching file by file:\n\n  {graphify} query \"<question>\"\n  {graphify} \
 explain \"<symbol or file>\"\n  {graphify} path \"<A>\" \"<B>\"\n  {graphify} affected \"<symbol>\"\n\n\
-then read the specific files it points to. `graphify-out/GRAPH_REPORT.md` summarises the \
+then read the specific files it points to. `.orbit/local/graph/GRAPH_REPORT.md` summarises the \
 architecture. Fall back to ordinary search when the graph has no answer."
     )
 }
@@ -73,7 +88,7 @@ pub fn allow_rules() -> Vec<String> {
 
 /// The graph's own file, whose presence means a checkout has a graph.
 pub fn graph_json(checkout: &Path) -> PathBuf {
-    checkout.join(OUT_DIR).join("graph.json")
+    out_dir(checkout).join("graph.json")
 }
 
 /// True when the checkout has a graph — the condition for the guidance.
@@ -82,13 +97,15 @@ pub fn has_graph(checkout: &Path) -> bool {
 }
 
 /// Whether orbit should keep a graph for `checkout`: the setting is on, the
-/// checkout's `.orbit/config.json` doesn't opt out, and graphify is installed or
-/// uv is there to install it (once per machine).
+/// project's `.orbit/config.json` (its main checkout's, whichever worktree
+/// `checkout` is) doesn't opt out, and graphify is installed or uv is there
+/// to install it (once per machine).
 pub fn wanted(checkout: &Path) -> bool {
     if !crate::config::Config::load().graphify {
         return false;
     }
-    if let Ok(Some(file)) = orbit_core::project_file::read(checkout) {
+    let main = orbit_core::project_file::main_checkout(checkout);
+    if let Ok(Some(file)) = orbit_core::project_file::read(&main) {
         if file.graphify == Some(false) {
             return false;
         }
@@ -171,6 +188,7 @@ async fn run_once(graphify: &orbit_core::tools::Invocation, checkout: &Path) {
         .arg("update")
         .arg(checkout)
         .current_dir(checkout)
+        .env(OUT_ENV, out_dir(checkout))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -198,9 +216,10 @@ async fn run_once(graphify: &orbit_core::tools::Invocation, checkout: &Path) {
     }
 }
 
-/// Keep `graphify-out/` out of git for this checkout, unless something
-/// already ignores it: append it to the repository's `info/exclude`, which
-/// is local to the clone and shared by all its worktrees.
+/// Keep `.orbit/local/` — the graph and anything else orbit generates — out
+/// of git for this checkout, unless something already ignores it: append it
+/// to the repository's `info/exclude`, which is local to the clone and
+/// shared by all its worktrees.
 async fn exclude_from_git(checkout: &Path) {
     let git = |args: &[&str]| {
         tokio::process::Command::new("git")
@@ -212,8 +231,9 @@ async fn exclude_from_git(checkout: &Path) {
             .output()
     };
     // The trailing slash asks about the directory even before it exists, so
-    // a `graphify-out/` rule in .gitignore counts on a brand-new project.
-    match git(&["check-ignore", "-q", "graphify-out/"]).await {
+    // a `.orbit/local/` rule in .gitignore counts on a brand-new project.
+    let local = format!("{}/", orbit_core::project_file::LOCAL_DIR);
+    match git(&["check-ignore", "-q", &local]).await {
         Ok(out) if out.status.success() => return, // already ignored
         Ok(_) => {}
         Err(_) => return, // no git: nothing to keep out of
@@ -237,7 +257,9 @@ async fn exclude_from_git(checkout: &Path) {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str("# orbit: graphify's generated code graph\n/graphify-out/\n");
+    text.push_str(&format!(
+        "# orbit: files it generates for this checkout (the code graph)\n/{local}\n"
+    ));
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -284,7 +306,7 @@ mod tests {
         exclude_from_git(repo).await; // already ignored: nothing appended
 
         let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
-        assert_eq!(exclude.matches("/graphify-out/").count(), 1, "{exclude}");
+        assert_eq!(exclude.matches("/.orbit/local/").count(), 1, "{exclude}");
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(repo)
@@ -293,8 +315,31 @@ mod tests {
             .unwrap();
         assert!(
             String::from_utf8_lossy(&status.stdout).is_empty(),
-            "graphify-out must not show as untracked"
+            ".orbit/local must not show as untracked"
         );
+    }
+
+    /// Only `.orbit/local/` is hidden: the project file beside it is meant
+    /// to be committed, so git must still offer it.
+    #[tokio::test]
+    async fn the_project_file_stays_visible_beside_the_hidden_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        std::fs::create_dir_all(out_dir(repo)).unwrap();
+        std::fs::write(graph_json(repo), "{}").unwrap();
+        std::fs::write(repo.join(orbit_core::project_file::FILE_NAME), "{}").unwrap();
+
+        exclude_from_git(repo).await;
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert_eq!(status.trim(), "?? .orbit/config.json", "{status}");
     }
 
     #[tokio::test]
@@ -302,7 +347,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         git(repo, &["init", "-q"]);
-        std::fs::write(repo.join(".gitignore"), "graphify-out/\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), ".orbit/local/\n").unwrap();
         let before = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap_or_default();
         exclude_from_git(repo).await;
         let after = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap_or_default();

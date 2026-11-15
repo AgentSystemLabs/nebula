@@ -135,6 +135,7 @@ fn main() -> Result<()> {
         }),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
         Some(Command::Doctor { fix }) => doctor::run(fix),
+        Some(Command::GraphUsage { path, recent }) => graph_usage(path, recent),
         Some(Command::StaleDaemonNote) => {
             if orbit_daemon::lifecycle::daemon_is_stale() {
                 println!("note: the running daemon was built from older code.");
@@ -234,4 +235,36 @@ fn init_tui_logging() -> Result<()> {
     orbit_core::crashlog::install_panic_hook(log_path.clone());
     // stdout belongs to the UI — log to file only.
     init_file_logging(&log_path)
+}
+
+/// `orbit graph-usage`: print what the GRAPH GATE's log for a checkout adds up to.
+fn graph_usage(path: Option<std::path::PathBuf>, recent: usize) -> anyhow::Result<()> {
+    use orbit_daemon::graph_gate;
+    let start = match path {
+        Some(p) => p,
+        None => std::env::current_dir()?,
+    };
+    let start = start.canonicalize().unwrap_or(start);
+    let Some(root) = graph_gate::graph_root(&start) else {
+        anyhow::bail!(
+            "no code graph at or above {} — orbit builds one in .orbit/local/graph/ when graphify is on (`orbit doctor`)",
+            start.display()
+        );
+    };
+    let log = root
+        .join(orbit_daemon::graphify::OUT_DIR)
+        .join(graph_gate::USAGE_LOG);
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    if text.trim().is_empty() {
+        println!(
+            "no graph activity logged yet at {}\n\nThe log fills as Claude sessions started by this orbit search the checkout.",
+            log.display()
+        );
+        return Ok(());
+    }
+    print!(
+        "{}",
+        graph_gate::render(&graph_gate::summarize(&text, recent), &log)
+    );
+    Ok(())
 }

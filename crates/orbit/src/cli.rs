@@ -424,6 +424,23 @@ pub(crate) enum Command {
         #[arg(long)]
         fix: bool,
     },
+    /// How much Claude sessions really use the code graph here.
+    ///
+    /// Reads the GRAPH GATE's log for the checkout at PATH (default: the
+    /// current directory, or the nearest folder above it with a graph):
+    /// graph queries, searches that ran, the nudges orbit gave toward the
+    /// graph and how many were answered with a graph query.
+    #[command(
+        name = "graph-usage",
+        after_help = "Example:\n  orbit graph-usage ~/code/app"
+    )]
+    GraphUsage {
+        /// The checkout (or any folder inside it).
+        path: Option<std::path::PathBuf>,
+        /// How many recent graph queries to list.
+        #[arg(long, default_value_t = 10)]
+        recent: usize,
+    },
     /// Installer hook: print the cutover note only when a live daemon is on
     /// a different build than this binary (see `make install` / install.sh).
     #[command(hide = true, name = "_stale-daemon-note")]

@@ -12,6 +12,18 @@
 //! }
 //! ```
 //!
+//! THE `.orbit/` FOLDER holds everything orbit keeps inside a project:
+//!
+//! ```text
+//! .orbit/
+//! ├── config.json   committed — this file, shared with everyone on the project
+//! └── local/        git-excluded — what orbit generates for one checkout
+//!     └── graph/    the graphify code graph and its usage log
+//! ```
+//!
+//! The top level is shared; [`LOCAL_DIR`] is never committed (the DAEMON
+//! keeps it out of git through the repository's own `info/exclude`).
+//!
 //! `.orbit.json` at the root is the file's older home and is still read:
 //! a checkout holding only that one is answered from it, and one holding
 //! both is answered from `.orbit/config.json` alone.
@@ -22,11 +34,12 @@
 //! is the OPEN COMMAND: `Shift+Enter` on a worktree fires it once, from the
 //! TUI.
 //!
-//! The file is read fresh at every press — from the worktree's own checkout
-//! first, so a branch can carry commands of its own, and otherwise from the
-//! project's main checkout, so a file not yet merged into an older branch
-//! still applies. The first file found is the whole answer: a worktree's
-//! file that leaves `open` out does not borrow the main checkout's.
+//! ONE FILE PER PROJECT: the file is always read from the project's main
+//! checkout, fresh at every press, whichever worktree asked — so what a
+//! project is configured to do never depends on which branch a worktree
+//! has checked out, and an edit applies everywhere at once. A copy of the
+//! file inside a linked worktree is ignored. [`main_checkout`] finds the
+//! main checkout for a caller that only has a worktree's path.
 //!
 //! `workflows` is the one key orbit writes as well as reads: the SKILL
 //! PICKER's `Ctrl+W` saves a named skill set into the main checkout's
@@ -46,6 +59,16 @@ pub const FILE_NAME: &str = ".orbit/config.json";
 
 /// Where the file used to live, still read when [`FILE_NAME`] is absent.
 pub const LEGACY_FILE_NAME: &str = ".orbit.json";
+
+/// What orbit generates for one checkout, relative to its root: never
+/// committed, rebuilt at will.
+pub const LOCAL_DIR: &str = ".orbit/local";
+
+/// Where graphify writes a checkout's code graph, relative to its root —
+/// handed to graphify as `GRAPHIFY_OUT`.
+pub const GRAPH_DIR: &str = ".orbit/local/graph";
+
+pub use crate::git::main_checkout;
 
 /// One SKILL WORKFLOW: a named set of Claude skills to use for a kind of
 /// task, plus optional extra instructions sent with them.
@@ -187,46 +210,33 @@ pub fn write_workflow(main: &Path, name: &str, workflow: &Workflow) -> Result<Pa
     Ok(path)
 }
 
-/// The file that applies to a worktree, and the checkout it came from: the
-/// worktree's own, else the main checkout's.
-pub fn find(worktree: &Path, main: &Path) -> Result<Option<(PathBuf, ProjectFile)>, String> {
-    let mut dirs = vec![worktree];
-    if main != worktree {
-        dirs.push(main);
-    }
-    for dir in dirs {
-        if let Some(file) = read(dir)? {
-            return Ok(Some((dir.to_path_buf(), file)));
-        }
-    }
-    Ok(None)
+/// The project's file, read from its main checkout — the one place the
+/// project is configured, whichever worktree asks.
+pub fn find(main: &Path) -> Result<Option<ProjectFile>, String> {
+    read(main)
 }
 
-/// The command line `which` names for a worktree: Ok(None) when there is
-/// no file, or the file leaves the key out or blank, so a caller with a
-/// fallback of its own can take it; Err only for a file that is there and
-/// can't be read. The DAEMON's run path looks here after the project's
-/// own `run_command` setting.
-pub fn lookup(
-    worktree: &Path,
-    main: &Path,
-    which: ProjectCommand,
-) -> Result<Option<String>, String> {
-    Ok(find(worktree, main)?.and_then(|(_, file)| file.command(which).map(str::to_string)))
+/// The command line `which` names for the project whose main checkout is
+/// `main`: Ok(None) when there is no file, or the file leaves the key out
+/// or blank, so a caller with a fallback of its own can take it; Err only
+/// for a file that is there and can't be read. The DAEMON's run path looks
+/// here after the project's own `run_command` setting.
+pub fn lookup(main: &Path, which: ProjectCommand) -> Result<Option<String>, String> {
+    Ok(find(main)?.and_then(|file| file.command(which).map(str::to_string)))
 }
 
-/// The command line `which` names for a worktree, or the one-line reason
+/// The command line `which` names for the project, or the one-line reason
 /// there is none — short enough for the footer flash, and saying what to
 /// add.
-pub fn command(worktree: &Path, main: &Path, which: ProjectCommand) -> Result<String, String> {
+pub fn command(main: &Path, which: ProjectCommand) -> Result<String, String> {
     let key = which.key();
     let example = which.example();
-    match find(worktree, main)? {
-        Some((_, file)) => file.command(which).map(str::to_string).ok_or_else(|| {
+    match find(main)? {
+        Some(file) => file.command(which).map(str::to_string).ok_or_else(|| {
             format!("{FILE_NAME} has no \"{key}\" command — add \"{key}\": \"{example}\"")
         }),
         None => Err(format!(
-            "no {FILE_NAME} in this worktree — add one with {{\"{key}\": \"{example}\"}}"
+            "no {FILE_NAME} in this project's main checkout — add one with {{\"{key}\": \"{example}\"}}"
         )),
     }
 }
@@ -269,33 +279,10 @@ mod tests {
         let dir = TempDir::new().with_file(
             r#"{"run": "npm run dev", "open": " open http://localhost:3000 ", "later": 1}"#,
         );
-        let run = command(&dir.0, &dir.0, ProjectCommand::Run).unwrap();
-        let open = command(&dir.0, &dir.0, ProjectCommand::Open).unwrap();
+        let run = command(&dir.0, ProjectCommand::Run).unwrap();
+        let open = command(&dir.0, ProjectCommand::Open).unwrap();
         assert_eq!(run, "npm run dev");
         assert_eq!(open, "open http://localhost:3000", "trimmed");
-    }
-
-    #[test]
-    fn the_worktree_file_wins_over_the_main_checkout() {
-        let worktree = TempDir::new().with_file(r#"{"run": "bun dev"}"#);
-        let main = TempDir::new().with_file(r#"{"run": "npm run dev", "open": "open x"}"#);
-        assert_eq!(
-            command(&worktree.0, &main.0, ProjectCommand::Run).unwrap(),
-            "bun dev"
-        );
-        // The first file found is the whole answer — no borrowing a key.
-        let err = command(&worktree.0, &main.0, ProjectCommand::Open).unwrap_err();
-        assert!(err.contains("has no \"open\" command"), "{err}");
-    }
-
-    #[test]
-    fn a_worktree_without_a_file_falls_back_to_the_main_checkout() {
-        let worktree = TempDir::new();
-        let main = TempDir::new().with_file(r#"{"open": "open http://localhost:5173"}"#);
-        assert_eq!(
-            command(&worktree.0, &main.0, ProjectCommand::Open).unwrap(),
-            "open http://localhost:5173"
-        );
     }
 
     /// `lookup` is `command` without the message: nothing to run is
@@ -304,31 +291,31 @@ mod tests {
     #[test]
     fn lookup_reads_none_for_a_missing_file_or_key_and_keeps_the_parse_error() {
         let empty = TempDir::new();
-        assert_eq!(lookup(&empty.0, &empty.0, ProjectCommand::Run), Ok(None));
+        assert_eq!(lookup(&empty.0, ProjectCommand::Run), Ok(None));
         let blank = TempDir::new().with_file(r#"{"run": "   ", "open": "open x"}"#);
-        assert_eq!(lookup(&blank.0, &blank.0, ProjectCommand::Run), Ok(None));
+        assert_eq!(lookup(&blank.0, ProjectCommand::Run), Ok(None));
         assert_eq!(
-            lookup(&blank.0, &blank.0, ProjectCommand::Open),
+            lookup(&blank.0, ProjectCommand::Open),
             Ok(Some("open x".into()))
         );
         let broken = TempDir::new().with_file("{");
-        let err = lookup(&broken.0, &broken.0, ProjectCommand::Run).unwrap_err();
+        let err = lookup(&broken.0, ProjectCommand::Run).unwrap_err();
         assert!(err.contains(FILE_NAME), "{err}");
     }
 
     #[test]
     fn missing_file_blank_command_and_bad_json_say_what_to_fix() {
         let empty = TempDir::new();
-        let err = command(&empty.0, &empty.0, ProjectCommand::Run).unwrap_err();
+        let err = command(&empty.0, ProjectCommand::Run).unwrap_err();
         assert!(err.contains("no .orbit/config.json"), "{err}");
         assert!(err.contains(r#"{"run": "npm run dev"}"#), "{err}");
 
         let blank = TempDir::new().with_file(r#"{"run": "   "}"#);
-        let err = command(&blank.0, &blank.0, ProjectCommand::Run).unwrap_err();
+        let err = command(&blank.0, ProjectCommand::Run).unwrap_err();
         assert!(err.contains("has no \"run\" command"), "{err}");
 
         let broken = TempDir::new().with_file(r#"{"run": ["npm", "dev"]}"#);
-        let err = command(&broken.0, &broken.0, ProjectCommand::Run).unwrap_err();
+        let err = command(&broken.0, ProjectCommand::Run).unwrap_err();
         assert!(err.contains(FILE_NAME), "names the file: {err}");
         assert!(err.contains("invalid type"), "{err}");
     }
@@ -336,19 +323,13 @@ mod tests {
     #[test]
     fn the_legacy_file_is_still_read_and_the_new_one_wins_over_it() {
         let legacy = TempDir::new().with_legacy_file(r#"{"run": "old"}"#);
-        assert_eq!(
-            command(&legacy.0, &legacy.0, ProjectCommand::Run).unwrap(),
-            "old"
-        );
+        assert_eq!(command(&legacy.0, ProjectCommand::Run).unwrap(), "old");
         let both = TempDir::new()
             .with_legacy_file(r#"{"run": "old", "open": "open old"}"#)
             .with_file(r#"{"run": "new"}"#);
-        assert_eq!(
-            command(&both.0, &both.0, ProjectCommand::Run).unwrap(),
-            "new"
-        );
+        assert_eq!(command(&both.0, ProjectCommand::Run).unwrap(), "new");
         // The new file is the whole answer: no borrowing from the old.
-        assert!(command(&both.0, &both.0, ProjectCommand::Open).is_err());
+        assert!(command(&both.0, ProjectCommand::Open).is_err());
     }
 
     #[test]

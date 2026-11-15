@@ -297,7 +297,8 @@ pub struct SpawnSpec {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: std::path::PathBuf,
-    /// Extra env vars (ORBIT_* for agents). Plain terminals get none.
+    /// Extra env vars: ORBIT_* for agents, and `GRAPHIFY_OUT` for every
+    /// session in a checkout.
     pub env: Vec<(String, String)>,
     /// Env var names to scrub from the inherited environment. Only ever a
     /// fixed list (the agent-session vars), so it is borrowed, not built.

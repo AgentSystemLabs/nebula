@@ -103,7 +103,7 @@ impl Daemon {
             .map_or_else(|| worktree.path.clone(), |p| p.repo_path);
         let command = match config.run_command(&main) {
             Some(command) => command.to_string(),
-            None => project_file::lookup(&worktree.path, &main, ProjectCommand::Run)
+            None => project_file::lookup(&main, ProjectCommand::Run)
                 .map_err(anyhow::Error::msg)?
                 .context(NO_RUN_COMMAND)?,
         };

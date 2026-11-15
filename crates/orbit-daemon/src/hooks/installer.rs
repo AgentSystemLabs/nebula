@@ -285,6 +285,9 @@ fn install_claude_hooks_with(cwd: &Path, user_config: Option<&Path>) -> Result<(
     let mut root = load_hooks_root(&path)?;
     let root_obj = root_object_mut(&mut root, &path)?;
     merge_managed_hooks(root_obj, "claude", CLAUDE_EVENTS, &path)?;
+    if crate::graphify::wanted(cwd) {
+        add_graph_gate(root_obj, &path)?;
+    }
     for rule in &rules {
         ensure_permission_allow(root_obj, rule, &path)?;
     }
@@ -605,6 +608,43 @@ fn merge_managed_hooks(
     Ok(())
 }
 
+/// The tools the GRAPH GATE watches (`crate::graph_gate`).
+const GRAPH_GATE_MATCHER: &str = "Grep|Glob|Bash";
+
+/// The GRAPH GATE's hook command: POST the call to the gate route and
+/// print the daemon's answer — empty, or the deny envelope Claude reads —
+/// as the hook's stdout. Inert outside orbit, and fail-open: a daemon that
+/// does not answer prints nothing and the tool runs.
+fn graph_gate_command() -> String {
+    format!(
+        "if {}; then exit 0; fi; {} 2>/dev/null || true",
+        env_guard(),
+        daemon_post(
+            HOOK_CURL_TIMEOUT_SECS,
+            &format!("/api/hooks/claude/graph?agentId=${AGENT_ID}&hookEvent=PreToolUse"),
+        )
+    )
+}
+
+/// Add the GRAPH GATE's managed `PreToolUse` group. Runs after
+/// [`merge_managed_hooks`] stripped every managed `PreToolUse` group, so a
+/// reinstall never doubles it, and a checkout whose graphify was switched
+/// off simply loses it on the next spawn.
+fn add_graph_gate(root_obj: &mut Map<String, Value>, path: &Path) -> Result<()> {
+    let hooks = root_obj.entry("hooks").or_insert_with(|| json!({}));
+    let hooks_obj = object_mut(hooks, "\"hooks\"", path)?;
+    let groups = hooks_obj
+        .entry("PreToolUse".to_string())
+        .or_insert_with(|| json!([]));
+    let groups_arr = array_mut(groups, "hooks.PreToolUse", path)?;
+    groups_arr.push(json!({
+        "matcher": GRAPH_GATE_MATCHER,
+        "hooks": [{ "type": "command", "command": graph_gate_command() }],
+        "_orbitManaged": true,
+    }));
+    Ok(())
+}
+
 /// Cursor can't receive daemon-injected context (its hooks are gating-only,
 /// answering with their own JSON), so the auto-title instruction ships as a
 /// managed always-on project rule instead. The file is wholly orbit-owned
@@ -737,6 +777,27 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("hookEvent=PostToolUse"));
+    }
+
+    #[test]
+    fn graph_gate_is_one_group_beside_ask_user_question_across_reinstalls() {
+        let path = Path::new("settings.local.json");
+        let mut root = json!({});
+        for _ in 0..2 {
+            let obj = root.as_object_mut().unwrap();
+            merge_managed_hooks(obj, "claude", CLAUDE_EVENTS, path).unwrap();
+            add_graph_gate(obj, path).unwrap();
+        }
+        let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2, "{pre:?}");
+        assert_eq!(pre[0]["matcher"], json!("AskUserQuestion"));
+        assert_eq!(pre[1]["matcher"], json!(GRAPH_GATE_MATCHER));
+        assert_eq!(pre[1]["_orbitManaged"], json!(true));
+        let cmd = pre[1]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("/api/hooks/claude/graph?"), "{cmd}");
+        // The deny envelope has to reach Claude: stdout passes through.
+        assert!(!cmd.contains(">/dev/null 2>&1"), "{cmd}");
+        assert!(cmd.starts_with("if [ -z"), "env-guarded: {cmd}");
     }
 
     #[test]
@@ -961,7 +1022,9 @@ mod tests {
         let settings = read_settings(tmp.path());
         for (event, _) in CLAUDE_EVENTS {
             // One group per (event, matcher) pair.
-            let expected = CLAUDE_EVENTS.iter().filter(|(e, _)| e == event).count();
+            // Plus the GRAPH GATE's own group where graphify is on.
+            let expected = CLAUDE_EVENTS.iter().filter(|(e, _)| e == event).count()
+                + usize::from(*event == "PreToolUse" && crate::graphify::wanted(tmp.path()));
             assert_eq!(
                 settings["hooks"][*event].as_array().unwrap().len(),
                 expected,

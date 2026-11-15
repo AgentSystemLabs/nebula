@@ -135,6 +135,9 @@ pub struct HookServerState {
     /// Where status line reports land; answered from at once, since the
     /// reply is what Claude's status bar shows.
     usage: Arc<UsageBoard>,
+    /// Which sessions already queried the graph, or were nudged to, this
+    /// prompt (`crate::graph_gate`).
+    graph_gate: crate::graph_gate::GraphGate,
 }
 
 /// One accepted hook POST, decoded for the daemon's drain loop.
@@ -179,6 +182,9 @@ pub struct HookPayload {
     pub conversation_id: Option<String>,
     pub notification_type: Option<String>,
     pub tool_name: Option<String>,
+    /// The tool call's arguments on `PreToolUse` — the GRAPH GATE reads a
+    /// Bash call's `command` out of it.
+    pub tool_input: Option<serde_json::Value>,
     pub agent_id: Option<String>,
     /// Cursor's name for the subagent id in subagentStart/subagentStop.
     pub subagent_id: Option<String>,
@@ -299,6 +305,7 @@ pub async fn start_hook_server_with(
         tx,
         store,
         usage,
+        graph_gate: Default::default(),
     });
     // Claude and Codex UserPromptSubmit hooks pipe this server's response
     // body to the CLI's stdout, where it lands in the model's context —
@@ -309,6 +316,7 @@ pub async fn start_hook_server_with(
     // takes the plain route.
     let app = Router::new()
         .route("/api/hooks/claude", post(receive_claude_hook))
+        .route("/api/hooks/claude/graph", post(receive_graph_gate))
         .route("/api/hooks/codex", post(receive_codex_hook))
         .route("/api/hooks/cursor", post(receive_cursor_hook))
         .route("/api/hooks/pi", post(receive_pi_hook))
@@ -342,6 +350,47 @@ async fn receive_claude_hook(
     body: String,
 ) -> (StatusCode, String) {
     receive_hook(HookCli::Claude, state, query, headers, body).await
+}
+
+/// `/api/hooks/claude/graph`: the GRAPH GATE's `PreToolUse` hook on
+/// `Grep|Glob|Bash`. Its command prints this body as the hook's stdout,
+/// so every answer is empty (the tool runs) or the deny envelope — never
+/// diagnostics. Never touches the status pipeline: these calls are not
+/// status events.
+async fn receive_graph_gate(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    use crate::graph_gate::{classify, graph_root, record, reply, ToolKind};
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, String::new());
+    }
+    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
+    let tool = payload.tool_name.as_deref().unwrap_or("");
+    let kind = classify(tool, payload.tool_input.as_ref());
+    if kind == ToolKind::Other {
+        return (StatusCode::OK, String::new());
+    }
+    let Some(root) = payload
+        .cwd()
+        .and_then(|cwd| graph_root(std::path::Path::new(&cwd)))
+        .filter(|root| crate::graphify::wanted(root))
+    else {
+        return (StatusCode::OK, String::new());
+    };
+    let agent_id = AgentId(query.agent_id);
+    let verdict = state.graph_gate.decide(&agent_id, &kind);
+    record(
+        &root,
+        &agent_id,
+        &kind,
+        &verdict,
+        tool,
+        payload.tool_input.as_ref(),
+    );
+    (StatusCode::OK, reply(&verdict))
 }
 
 /// Codex route: the same injectable dialect as Claude's, minus the
@@ -458,6 +507,13 @@ async fn receive_hook(
         }
     }
     tracing::debug!(agent = %agent_id, event = ?event, "hook received");
+    // A prompt of the conversation's own starts a fresh GRAPH GATE turn.
+    if cli == HookCli::Claude
+        && matches!(event, HookEvent::UserPromptSubmit)
+        && payload.subagent_id().is_none()
+    {
+        state.graph_gate.new_turn(&agent_id);
+    }
     // A subagent's tool traffic reports the payload's cwd too, but that is
     // the Task's position, not the session's — an isolated subagent working
     // in a scratch checkout must never drag the row out from under the
@@ -633,6 +689,27 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    /// The GRAPH GATE route answers only with an empty body or the deny
+    /// envelope, and never feeds the status pipeline.
+    #[tokio::test]
+    async fn graph_gate_passes_non_searches_and_graphless_checkouts_silently() {
+        let (env, mut rx, _) = start_hook_server(seeded_store(), None).await.unwrap();
+        let route = "/api/hooks/claude/graph?agentId=titled&hookEvent=PreToolUse";
+        let graphless = tempfile::tempdir().unwrap();
+        let cwd = graphless.path().display();
+        for payload in [
+            format!(r#"{{"tool_name":"Bash","tool_input":{{"command":"ls"}},"cwd":"{cwd}"}}"#),
+            format!(r#"{{"tool_name":"Grep","tool_input":{{"pattern":"x"}},"cwd":"{cwd}"}}"#),
+            "not json".to_string(),
+        ] {
+            let (status, body) = http_post(env.port, route, &env.token, &payload).await;
+            assert_eq!((status, body.as_str()), (200, ""), "{payload}");
+        }
+        let (status, body) = http_post(env.port, route, "wrong", "{}").await;
+        assert_eq!((status, body.as_str()), (401, ""));
+        assert!(rx.try_recv().is_err(), "gate calls are not status events");
     }
 
     #[tokio::test]
