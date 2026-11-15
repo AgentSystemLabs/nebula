@@ -37,7 +37,7 @@ all of them and read the screens.
 
 Orbit replaces the reading with a grid and a colour. Every session is a **card** with a **status dot**;
 cards sit in a **band** per git checkout, under a row of **project tabs** that add up their sessions'
-dots. A red `●1` on a tab tells you exactly where to look, without opening anything.
+dots. A red `●1` (🔴) on a tab tells you exactly where to look, without opening anything.
 
 One Rust binary and a unix socket. No Electron, no browser, no server.
 
@@ -46,7 +46,7 @@ One Rust binary and a unix socket. No Electron, no browser, no server.
 | | |
 |---|---|
 | **One screen, every session** | Project tabs across the top, a band per worktree, a card per session, and the live terminal of the card under the cursor beside them. Arrow keys move; `Enter` steps into a session; `Ctrl+Q` steps back out. |
-| **Dots you read instead of screens** | ● yellow working, ● red **waiting on you**, ● blue finished and unread, ● green finished and seen — on every card and counted on every tab. Red plays a sound and sends a desktop notification. `;` jumps to the next session that needs you. |
+| **Dots you read instead of screens** | 🟡 yellow working, 🔴 red **waiting on you**, 🔵 blue finished and unread, 🟢 green finished and seen — on every card and counted on every tab. Red plays a sound and sends a desktop notification. `;` jumps to the next session that needs you. |
 | **A daemon that owns the sessions** | Quit Orbit, close the laptop, come back tomorrow: the sessions never stopped, and their output is replayed when you return. |
 | **A task box, not a picker** | `p`, type the task, `Enter` — Claude is working on it. `Ctrl+N` runs it in a fresh git worktree so parallel agents never edit the same files. `Space` on a card sends a running session its next instruction without opening it. |
 | **Skills, several at once** | In the task box press `Ctrl+S` (or type `/` first) for a list of every skill you have — personal, project and plugin. Tick as many as the task needs; save a set you reuse as a **workflow** in the project's `.orbit/config.json` — commit it and your team gets it too. |

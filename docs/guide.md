@@ -150,14 +150,14 @@ The pane (to the right or below the cards) shows the live terminal of the card u
 
 | Dot | Means |
 |---|---|
-| ● yellow | working on a turn |
-| ● red | **waiting on you** — a permission prompt or a question |
-| ● blue | finished, and you haven't looked yet |
-| ● green | finished, and you've seen it |
-| ● gray | never run yet |
-| ● magenta | the process died mid-run |
+| 🟡 yellow | working on a turn |
+| 🔴 red | **waiting on you** — a permission prompt or a question |
+| 🔵 blue | finished, and you haven't looked yet |
+| 🟢 green | finished, and you've seen it |
+| ⚪ gray | never run yet |
+| 🟣 magenta | the process died mid-run |
 
-Project tabs add their sessions up: `api ●1` in red means one session in that project is waiting on
+Project tabs add their sessions up: `api ●1` in red (🔴) means one session in that project is waiting on
 you, even while you look at another project. A red dot also plays a sound, and sends a desktop
 notification when the terminal window is in the background.
 
