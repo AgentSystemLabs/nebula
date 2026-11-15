@@ -3,28 +3,28 @@
 class Orbit < Formula
   desc "Mission control for your Claude Code sessions"
   homepage "https://github.com/AmenAdem/Orbit"
-  version "1.0.2"
+  version "1.0.3"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/AmenAdem/Orbit/releases/download/v1.0.2/orbit-aarch64-apple-darwin.tar.gz"
-      sha256 "16de6e634dfc4c0df9d1056da823a5a59b29b881a67f19f87b69dde975d95cd5"
+      url "https://github.com/AmenAdem/Orbit/releases/download/v1.0.3/orbit-aarch64-apple-darwin.tar.gz"
+      sha256 "b3ade1757f68302d6a543732788a7bc18bd6001c67b8301b2ea4d0d17815a657"
     end
     on_intel do
-      url "https://github.com/AmenAdem/Orbit/releases/download/v1.0.2/orbit-x86_64-apple-darwin.tar.gz"
-      sha256 "f25dc1d15b62cbae827672dd1a13bfaec87db867de5010c747ecba552cd33bef"
+      url "https://github.com/AmenAdem/Orbit/releases/download/v1.0.3/orbit-x86_64-apple-darwin.tar.gz"
+      sha256 "30d82d17d0489184cd1d9dc8f50e556fb965bff4f53b93d8a39557d49a78d438"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/AmenAdem/Orbit/releases/download/v1.0.2/orbit-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "f8eb7e2e90ddddb980e9f326be91d66623222b49644d21d6722341199fc256bc"
+      url "https://github.com/AmenAdem/Orbit/releases/download/v1.0.3/orbit-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "2f3bc8d22fc6eb23fd8a265ba3747c1f9dc05a23fefd8d0a60ab3a3738a7aa4b"
     end
     on_intel do
-      url "https://github.com/AmenAdem/Orbit/releases/download/v1.0.2/orbit-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "f2b1d9c80f66f5573430ae96689e72a34ea7a06f6d9e7cce00e97a668887dfab"
+      url "https://github.com/AmenAdem/Orbit/releases/download/v1.0.3/orbit-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "a45dd0529e52d1346e64c8abf031f85aca040227467e2caef863863fede268c9"
     end
   end
 
