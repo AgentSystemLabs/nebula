@@ -121,7 +121,7 @@
   card's green `▶`; **Stop run** kills the process tree and drops the row. The idle reaper and the prewarm
   sweep leave that terminal alone, and a run that exits on its own keeps its PTY, so an attach replays
   the ending instead of respawning — a command starts only when you pick **Run**. `Shift+Enter` (or `Shift+O`) runs `open`
-  once, from the TUI. See [Configuration](configuration.md#the-project-file-orbitjson).
+  once, from the TUI. See [Configuration](configuration.md#the-project-file-orbitconfigjson).
 - **Agents boot `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, `opencode`, or a custom registry program.** Creating an agent (`n`) first asks which CLI to
   run, then opens the QUICK PROMPT set to it, and the launch spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
   `claude --cloud=<task>`; because Claude accepts that description as a process argument, don't put

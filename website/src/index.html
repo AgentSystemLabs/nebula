@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+{{head}}
+</head>
+<body class="home">
+{{header}}
+<main id="main">
+
+  <!-- Hero: the pitch on the left, a live session board on the right -->
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <a class="release" href="{{repo}}/releases" rel="noopener"><span class="dot dot-green"></span>Version {{version}} is out</a>
+        <h1>Mission control for your Claude Code sessions.</h1>
+        <p class="lede">Run many Claude Code sessions across every project and git worktree, from one terminal. Each session gets a status dot, so you can see which one needs you without opening it. They keep running after you close Orbit.</p>
+
+        <div class="cmd" data-copy="curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh">
+          <span class="prompt" aria-hidden="true">$</span>
+          <code>curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh</code>
+          <button class="copy" type="button" aria-label="Copy install command">Copy</button>
+        </div>
+        <p class="cmd-note">For macOS and Linux. On Windows, run it inside WSL2.</p>
+
+        <div class="ctas">
+          <a class="btn btn-primary" href="#install">Install guide</a>
+          <a class="btn btn-ghost" href="/docs/guide/">Read the docs</a>
+        </div>
+      </div>
+
+      <div class="board" role="img" aria-label="A sketch of Orbit's session board: project tabs with status counts, and session cards whose status dots change as the sessions work, wait for you, and finish">
+        <div class="board-tabs">
+          <span class="btab on">orbit-api <span class="btab-counts" data-counts></span></span>
+          <span class="btab">relay-cli <b class="c-red">●1</b></span>
+          <span class="btab">atlas-web <b class="c-blue">●2</b></span>
+        </div>
+        <div class="band"><span class="band-name">main</span><span class="band-rule"></span><span class="c-green">+3</span> <span class="c-red">−1</span></div>
+        <div class="cards">
+          <div class="card sel" data-state="working"><span class="dot"></span><b>Daemon startup profile</b><span class="card-meta"><span class="card-state"></span><span>ctx 75%</span></span></div>
+          <div class="card" data-state="working"><span class="dot"></span><b>Changelog by date</b><span class="card-meta"><span class="card-state"></span><span>ctx 64%</span></span></div>
+        </div>
+        <div class="band"><span class="band-name">feat/auth-tokens</span><span class="band-rule"></span><span class="c-faint">#57 open</span></div>
+        <div class="cards">
+          <div class="card" data-state="seen"><span class="dot"></span><b>Rotate refresh tokens</b><span class="card-meta"><span class="card-state"></span><span>ctx 41%</span></span></div>
+          <div class="card" data-state="working"><span class="dot"></span><b>Write the token tests</b><span class="card-meta"><span class="card-state"></span><span>ctx 18%</span></span></div>
+        </div>
+        <div class="board-foot">
+          <span><kbd>p</kbd> new task</span>
+          <span class="hint-jump"><kbd>;</kbd> next that needs you</span>
+          <span class="board-limits">5h 23%&nbsp;&nbsp;wk 41%</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="wrap">
+      <figure class="window hero-shot">
+        <div class="window-bar" aria-hidden="true"><i></i><i></i><i></i><span>orbit</span></div>
+        <img src="/assets/screenshot.png" width="3280" height="2138" alt="Orbit: project tabs with status dots across the top, a band of session cards per checkout, and the running session's terminal beside them" fetchpriority="high">
+      </figure>
+    </div>
+  </section>
+
+  <!-- Why -->
+  <section class="section" id="why">
+    <div class="wrap why">
+      <div class="why-text">
+        <h2>Stop reading screens. Read a colour.</h2>
+        <p>You start three Claude sessions in three terminal tabs. Five minutes later you don't know which one is waiting on a permission prompt, which one finished, and which one is still thinking, so you tab through them all and read.</p>
+        <p>Orbit replaces the reading with a grid and a colour. Every session is a <strong>card</strong> with a <strong>status dot</strong>. Cards sit in a <strong>band</strong> per git checkout, under <strong>project tabs</strong> that add up their sessions' dots. A red count on a tab tells you exactly where to look.</p>
+        <p class="muted">One Rust binary and a unix socket. No Electron, no browser, no server.</p>
+      </div>
+      <ul class="legend" aria-label="What the dots mean">
+        <li><span class="dot dot-yellow"></span><div><b>Working</b><span>Claude is in the middle of a turn.</span></div></li>
+        <li><span class="dot dot-red"></span><div><b>Needs you</b><span>A permission prompt or a question. Orbit plays a sound and sends a notification.</span></div></li>
+        <li><span class="dot dot-blue"></span><div><b>Done, unread</b><span>The turn finished and you haven't looked yet.</span></div></li>
+        <li><span class="dot dot-green"></span><div><b>Done</b><span>Finished, and you've seen it.</span></div></li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section class="section" id="features">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Everything a day of parallel agents needs.</h2>
+        <p>Many sessions, many worktrees, one screen, and keys you can remember. The keycap beside each one is the key that opens it.</p>
+      </div>
+      <div class="features">
+        <article class="feature"><kbd>Enter</kbd><div><h3>One screen, every session</h3><p>Project tabs, a band per worktree, a card per session, and the live terminal of the card under the cursor beside them.</p></div></article>
+        <article class="feature"><kbd>;</kbd><div><h3>Dots instead of screens</h3><p>Every card and every tab counts its dots. Red sends a desktop notification, and <kbd>;</kbd> jumps to the next session that needs you.</p></div></article>
+        <article class="feature"><kbd>q</kbd><div><h3>Sessions outlive the window</h3><p>A daemon owns them. Quit Orbit, close the laptop, come back tomorrow: nothing stopped, and the output is replayed when you return.</p></div></article>
+        <article class="feature"><kbd>p</kbd><div><h3>A task box, not a picker</h3><p>Press <kbd>p</kbd>, type the task, press <kbd>Enter</kbd>. <kbd>Ctrl+N</kbd> runs it in a fresh git worktree so parallel agents never edit the same files.</p></div></article>
+        <article class="feature"><kbd>Ctrl+S</kbd><div><h3>Several skills per prompt</h3><p>Tick exactly the skills a prompt should use: personal, project or plugin. Save a set as a <strong>workflow</strong> and commit it for your team.</p></div></article>
+        <article class="feature"><kbd>s</kbd><div><h3>Limits and context at a glance</h3><p>The footer shows your plan's 5-hour and weekly use, and each card shows how full its context is: amber from 80%, red from 95%.</p></div></article>
+        <article class="feature"><kbd>k</kbd><div><h3>Code graph, built in</h3><p>A <a href="https://github.com/Graphify-Labs/graphify" rel="noopener">graphify</a> knowledge graph of every checkout, kept fresh without an LLM, so Claude queries it before grepping file by file.</p></div></article>
+        <article class="feature"><kbd>g</kbd><div><h3>Review without leaving</h3><p>A diff with reviewed marks, a full-screen git graph, a file finder, search in files and a file tree, all scoped to the card's checkout.</p></div></article>
+        <article class="feature"><kbd>v</kbd><div><h3>GitHub in place</h3><p>Every band shows its branch's pull request. Read, diff and comment on PRs, or start a session from an issue. Needs <code>gh</code>.</p></div></article>
+        <article class="feature"><kbd>F10</kbd><div><h3>Claude drives Orbit back</h3><p>Say <em>"do this in a worktree"</em> or <em>"start a session that writes the tests"</em>, and the session runs the right <code>orbit</code> command itself.</p></div></article>
+        <article class="feature"><kbd>h</kbd><div><h3>Keys you can remember</h3><p>Arrows to move, letters that mean something, nothing that needs ⌥ or a dead key on an AZERTY Mac. Every key can be rebound.</p></div></article>
+        <article class="feature"><kbd>doctor</kbd><div><h3>One-time setup check</h3><p><code>orbit doctor</code> shows what your machine has and what each missing piece unlocks. <code>--fix</code> installs the integrated tools once.</p></div></article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Gallery -->
+  <section class="section" id="tour">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>The views you'll use every day.</h2>
+      </div>
+      <div class="gallery">
+        <div class="gallery-tabs" role="tablist" aria-label="Screens">
+          <button role="tab" aria-selected="true" data-shot="quick-prompt"><b>Task box</b><span><kbd>p</kbd> type a task, <kbd>Ctrl+N</kbd> for a fresh worktree</span></button>
+          <button role="tab" aria-selected="false" data-shot="skills"><b>Skills per prompt</b><span><kbd>Ctrl+S</kbd> tick a workflow or single skills</span></button>
+          <button role="tab" aria-selected="false" data-shot="git-graph"><b>Git graph</b><span><kbd>l</kbd> branches, commits and messages</span></button>
+          <button role="tab" aria-selected="false" data-shot="follow-up"><b>Follow-up</b><span><kbd>Space</kbd> send the next turn without opening it</span></button>
+          <button role="tab" aria-selected="false" data-shot="palette"><b>Jump</b><span><kbd>j</kbd> any session, in any project</span></button>
+        </div>
+        <figure class="window gallery-view">
+          <div class="window-bar" aria-hidden="true"><i></i><i></i><i></i><span class="gallery-caption">Task box</span></div>
+          <img id="gallery-img" src="/assets/quick-prompt.png" width="3280" height="2138" loading="lazy" alt="The task box over the grid: a task typed in, the row naming the project, worktree, harness and model">
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- Install -->
+  <section class="section" id="install">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Install</h2>
+        <p>Pick your system. The same command installs and updates. Prebuilt binaries cover Apple Silicon and Intel Macs, and x86_64 and ARM64 Linux.</p>
+      </div>
+
+      <div class="install">
+        <div class="os-list" role="tablist" aria-label="Operating system" aria-orientation="vertical">
+          <button role="tab" id="tab-macos" aria-controls="panel-macos" aria-selected="true" data-os="macos">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M16.37 12.6c-.02-2.2 1.8-3.26 1.88-3.31-1.02-1.5-2.62-1.7-3.19-1.72-1.36-.14-2.65.8-3.34.8-.69 0-1.75-.78-2.88-.76-1.48.02-2.85.86-3.61 2.19-1.54 2.67-.39 6.63 1.11 8.8.73 1.06 1.6 2.25 2.75 2.2 1.1-.04 1.52-.71 2.85-.71 1.33 0 1.71.71 2.88.69 1.19-.02 1.94-1.08 2.67-2.14.84-1.23 1.19-2.42 1.2-2.48-.03-.01-2.3-.88-2.32-3.5ZM14.17 6.14c.61-.74 1.02-1.76.91-2.78-.88.04-1.94.59-2.57 1.32-.56.65-1.06 1.69-.93 2.69.98.08 1.98-.5 2.59-1.23Z"/></svg>
+            <span><b>macOS</b><small>Apple Silicon and Intel</small></span>
+          </button>
+          <button role="tab" id="tab-linux" aria-controls="panel-linux" aria-selected="false" data-os="linux">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2c-2.2 0-3.6 1.9-3.6 4.6 0 1.3.3 2.2-.3 3.3-.7 1.2-2.4 2.9-2.8 5.2-.2 1.1.1 1.8.6 2.2-.4.6-.6 1.3-.2 1.9.6.9 2.2.7 3.6 1.3 1 .4 1.9.6 2.7.2.8.4 1.7.2 2.7-.2 1.4-.6 3-.4 3.6-1.3.4-.6.2-1.3-.2-1.9.5-.4.8-1.1.6-2.2-.4-2.3-2.1-4-2.8-5.2-.6-1.1-.3-2-.3-3.3C15.6 3.9 14.2 2 12 2Zm-1.4 4.2c.4 0 .7.5.7 1.1s-.3 1.1-.7 1.1-.7-.5-.7-1.1.3-1.1.7-1.1Zm2.8 0c.4 0 .7.5.7 1.1s-.3 1.1-.7 1.1-.7-.5-.7-1.1.3-1.1.7-1.1ZM12 9.3c.9 0 2 .5 2 .9s-1.1 1.1-2 1.1-2-.7-2-1.1.9-.9 2-.9Z"/></svg>
+            <span><b>Linux</b><small>x86_64 and ARM64, static</small></span>
+          </button>
+          <button role="tab" id="tab-windows" aria-controls="panel-windows" aria-selected="false" data-os="windows">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 5.5 10.4 4.5v7H3v-6Zm8.4-1.1L21 3v8.5h-9.6V4.4ZM3 12.5h7.4v7L3 18.5v-6Zm8.4 0H21V21l-9.6-1.4v-7.1Z"/></svg>
+            <span><b>Windows</b><small>Through WSL2</small></span>
+          </button>
+          <button role="tab" id="tab-source" aria-controls="panel-source" aria-selected="false" data-os="source">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg>
+            <span><b>From source</b><small>Any platform with Rust</small></span>
+          </button>
+        </div>
+
+        <div class="os-panels">
+          <!-- macOS -->
+          <div class="os-panel" role="tabpanel" id="panel-macos" aria-labelledby="tab-macos" tabindex="0">
+            <ol class="steps">
+              <li>
+                <h3>Install what Orbit needs</h3>
+                <p>Git, uv and npm through <a href="https://brew.sh" rel="noopener">Homebrew</a>, then Claude Code itself. <code>gh</code> is optional, for pull requests and issues.</p>
+                <div class="code-block" data-copy="brew install git uv node gh">
+                  <pre><code><span class="c-faint">$</span> brew install git uv node gh</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <div class="code-block" data-copy="curl -fsSL https://claude.ai/install.sh | bash">
+                  <pre><code><span class="c-faint">$</span> curl -fsSL https://claude.ai/install.sh | bash</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <p class="note">Other ways to install Claude Code are in the <a href="https://code.claude.com/docs/en/setup" rel="noopener">official setup guide</a>. Run <code>claude</code> once to sign in.</p>
+              </li>
+              <li>
+                <h3>Install Orbit</h3>
+                <p>With Homebrew <span class="badge">recommended</span></p>
+                <div class="code-block" data-copy="brew tap amenadem/orbit https://github.com/AmenAdem/Orbit && brew install amenadem/orbit/orbit">
+                  <pre><code><span class="c-faint">$</span> brew tap amenadem/orbit https://github.com/AmenAdem/Orbit
+<span class="c-faint">$</span> brew install amenadem/orbit/orbit</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <p class="note warn">Type the full name <code>amenadem/orbit/orbit</code>. A plain <code>brew install orbit</code> installs an unrelated Mac app.</p>
+                <p>Or with the install script, into <code>~/.local/bin</code>:</p>
+                <div class="code-block" data-copy="curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh">
+                  <pre><code><span class="c-faint">$</span> curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+              </li>
+              <li>
+                <h3>Check your setup and start</h3>
+                <p><code>doctor --fix</code> installs graphify and agent-browser once.</p>
+                <div class="code-block" data-copy="orbit doctor --fix">
+                  <pre><code><span class="c-faint">$</span> orbit doctor --fix
+<span class="c-faint">$</span> cd ~/code/my-app && orbit</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+              </li>
+            </ol>
+          </div>
+
+          <!-- Linux -->
+          <div class="os-panel" role="tabpanel" id="panel-linux" aria-labelledby="tab-linux" tabindex="0" hidden>
+            <ol class="steps">
+              <li>
+                <h3>Install what Orbit needs</h3>
+                <p>Git, curl and npm from your package manager, uv from Astral, then Claude Code.</p>
+                <div class="code-block" data-copy="sudo apt update && sudo apt install -y git curl nodejs npm">
+                  <pre><code><span class="c-faint"># Debian, Ubuntu</span>
+<span class="c-faint">$</span> sudo apt update && sudo apt install -y git curl nodejs npm
+<span class="c-faint"># Fedora</span>
+<span class="c-faint">$</span> sudo dnf install -y git curl nodejs npm
+<span class="c-faint"># Arch</span>
+<span class="c-faint">$</span> sudo pacman -S git curl nodejs npm</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <div class="code-block" data-copy="curl -LsSf https://astral.sh/uv/install.sh | sh && curl -fsSL https://claude.ai/install.sh | bash">
+                  <pre><code><span class="c-faint">$</span> curl -LsSf https://astral.sh/uv/install.sh | sh
+<span class="c-faint">$</span> curl -fsSL https://claude.ai/install.sh | bash</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <p class="note">Optional: the <a href="https://cli.github.com" rel="noopener">GitHub CLI</a> (<code>gh</code>) for pull requests and issues.</p>
+              </li>
+              <li>
+                <h3>Install Orbit</h3>
+                <p>The script installs a static binary (x86_64 or aarch64) into <code>~/.local/bin</code>. Set <code>ORBIT_INSTALL_DIR</code> to put it somewhere else.</p>
+                <div class="code-block" data-copy="curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh">
+                  <pre><code><span class="c-faint">$</span> curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <p>If <code>~/.local/bin</code> isn't on your PATH yet, the installer says so. Add it to <code>~/.bashrc</code> or <code>~/.zshrc</code>:</p>
+                <div class="code-block" data-copy='export PATH="$HOME/.local/bin:$PATH"'>
+                  <pre><code><span class="c-faint">$</span> export PATH="$HOME/.local/bin:$PATH"</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <p class="note">Homebrew on Linux works too, with the same two commands as on macOS.</p>
+              </li>
+              <li>
+                <h3>Check your setup and start</h3>
+                <div class="code-block" data-copy="orbit doctor --fix">
+                  <pre><code><span class="c-faint">$</span> orbit doctor --fix
+<span class="c-faint">$</span> cd ~/code/my-app && orbit</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+              </li>
+            </ol>
+          </div>
+
+          <!-- Windows -->
+          <div class="os-panel" role="tabpanel" id="panel-windows" aria-labelledby="tab-windows" tabindex="0" hidden>
+            <p class="callout">Orbit's daemon needs unix sockets, so on Windows it runs inside <strong>WSL2</strong>, as Linux. Native Windows and WSL1 are not supported.</p>
+            <ol class="steps">
+              <li>
+                <h3>Turn on WSL2</h3>
+                <p>Run this in PowerShell <strong>as Administrator</strong>, then restart when it asks. It installs WSL2 with Ubuntu.</p>
+                <div class="code-block" data-copy="wsl --install">
+                  <pre><code><span class="c-faint">PS&gt;</span> wsl --install</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <p class="note">Already have WSL? Check it is version 2 with <code>wsl -l -v</code>, and convert with <code>wsl --set-version Ubuntu 2</code>.</p>
+              </li>
+              <li>
+                <h3>Inside Ubuntu, install what Orbit needs</h3>
+                <div class="code-block" data-copy="sudo apt update && sudo apt install -y git curl nodejs npm && curl -LsSf https://astral.sh/uv/install.sh | sh && curl -fsSL https://claude.ai/install.sh | bash">
+                  <pre><code><span class="c-faint">$</span> sudo apt update && sudo apt install -y git curl nodejs npm
+<span class="c-faint">$</span> curl -LsSf https://astral.sh/uv/install.sh | sh
+<span class="c-faint">$</span> curl -fsSL https://claude.ai/install.sh | bash</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+              </li>
+              <li>
+                <h3>Install Orbit and start</h3>
+                <div class="code-block" data-copy="curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh">
+                  <pre><code><span class="c-faint">$</span> curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh
+<span class="c-faint">$</span> orbit doctor --fix
+<span class="c-faint">$</span> cd ~/code/my-app && orbit</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <p class="note">Keep your repositories in the Linux filesystem (<code>~/code</code>), not under <code>/mnt/c</code>: git and file watching are much faster there. Windows Terminal is a good home for Orbit.</p>
+              </li>
+            </ol>
+          </div>
+
+          <!-- Source -->
+          <div class="os-panel" role="tabpanel" id="panel-source" aria-labelledby="tab-source" tabindex="0" hidden>
+            <ol class="steps">
+              <li>
+                <h3>Install Rust</h3>
+                <p>For any platform without a prebuilt binary, or to hack on Orbit. You also need git, make, and the tools listed below.</p>
+                <div class="code-block" data-copy="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh">
+                  <pre><code><span class="c-faint">$</span> curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+              </li>
+              <li>
+                <h3>Build and install</h3>
+                <div class="code-block" data-copy="git clone https://github.com/AmenAdem/Orbit.git && cd Orbit && make install PREFIX=$HOME/.local/bin">
+                  <pre><code><span class="c-faint">$</span> git clone https://github.com/AmenAdem/Orbit.git && cd Orbit
+<span class="c-faint">$</span> make install PREFIX=$HOME/.local/bin
+<span class="c-faint">$</span> orbit reload   <span class="c-faint"># move a running daemon onto the new build</span></code></pre><button class="copy" type="button">Copy</button>
+                </div>
+                <p>Or straight from git with cargo:</p>
+                <div class="code-block" data-copy="cargo install --git https://github.com/AmenAdem/Orbit orbit --locked">
+                  <pre><code><span class="c-faint">$</span> cargo install --git https://github.com/AmenAdem/Orbit orbit --locked</code></pre><button class="copy" type="button">Copy</button>
+                </div>
+              </li>
+              <li>
+                <h3>Working on Orbit itself?</h3>
+                <p><code>make dev</code> runs an isolated copy with its own daemon and data. See <a href="/docs/contributing/">Contributing</a>.</p>
+              </li>
+            </ol>
+          </div>
+        </div>
+      </div>
+
+      <div class="needs">
+        <div>
+          <h3>You need</h3>
+          <dl class="tools">
+            <div><dt><code>git</code></dt><dd>projects, worktrees, diffs</dd></div>
+            <div><dt><code>claude</code></dt><dd>the Claude Code CLI that Orbit runs</dd></div>
+            <div><dt><code>uv</code></dt><dd>installs graphify, for the code graph</dd></div>
+            <div><dt><code>npm</code></dt><dd>installs agent-browser, for browser testing</dd></div>
+          </dl>
+          <p class="note">Orbit installs graphify and agent-browser itself, once per machine. <code>orbit doctor</code> shows what's missing.</p>
+        </div>
+        <div>
+          <h3>Nice to have</h3>
+          <dl class="tools">
+            <div><dt><code>gh</code></dt><dd>pull requests and issues</dd></div>
+            <div><dt><code>mmdc</code></dt><dd>renders Mermaid diagrams in the viewer</dd></div>
+            <div><dt>Rust</dt><dd>only to build from source</dd></div>
+          </dl>
+        </div>
+        <div>
+          <h3>Runs on</h3>
+          <dl class="tools platforms">
+            <div><dt>macOS</dt><dd>Apple Silicon and Intel <span class="tag tag-ok">prebuilt</span></dd></div>
+            <div><dt>Linux</dt><dd>x86_64, aarch64 <span class="tag tag-ok">prebuilt</span></dd></div>
+            <div><dt>Windows</dt><dd>WSL2, as Linux <span class="tag tag-ok">supported</span></dd></div>
+            <div><dt>Windows</dt><dd>native or WSL1 <span class="tag tag-no">not supported</span></dd></div>
+            <div><dt>Others</dt><dd>with cargo <span class="tag">from source</span></dd></div>
+          </dl>
+        </div>
+      </div>
+
+      <div class="upkeep">
+        <div>
+          <h3>Updating</h3>
+          <p>When a release is out, Orbit's footer shows <code>⇡ vX.Y.Z</code>. One command updates and moves the running daemon onto the new binary, <strong>without stopping a session</strong>. After a plain <code>brew upgrade</code>, run <code>orbit reload</code> to do that last step yourself.</p>
+          <div class="code-block" data-copy="orbit upgrade">
+            <pre><code><span class="c-faint">$</span> orbit upgrade</code></pre><button class="copy" type="button">Copy</button>
+          </div>
+        </div>
+        <div>
+          <h3>Uninstalling</h3>
+          <p>Stop the daemon, then remove the binary the way you installed it. Settings and the session database live where <code>orbit config path</code> points; delete that folder too for a clean slate.</p>
+          <div class="code-block" data-copy="orbit kill">
+            <pre><code><span class="c-faint">$</span> orbit kill
+<span class="c-faint">$</span> rm ~/.local/bin/orbit                <span class="c-faint"># script install</span>
+<span class="c-faint">$</span> brew uninstall amenadem/orbit/orbit  <span class="c-faint"># Homebrew</span></code></pre><button class="copy" type="button">Copy</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Quickstart -->
+  <section class="section" id="quickstart">
+    <div class="wrap qs-grid">
+      <div>
+        <h2>Your first session.</h2>
+        <p class="section-lede">Open a terminal inside a repository and run <code>orbit</code>. Then:</p>
+        <ol class="qs">
+          <li>On the splash screen press <kbd>Enter</kbd> to open the repository you're in. Anywhere else, <kbd>o</kbd> browses for a folder.</li>
+          <li>Press <kbd>p</kbd>, type what you want done, press <kbd>Enter</kbd>. A card appears with a <span class="dot dot-yellow"></span> yellow dot.</li>
+          <li>Do something else. When the dot turns <span class="dot dot-blue"></span> blue or <span class="dot dot-red"></span> red, press <kbd>;</kbd> to land on it and <kbd>Enter</kbd> to step in. <kbd>Ctrl+Q</kbd> steps back out.</li>
+          <li><kbd>q</kbd> quits, and the sessions keep running. Run <code>orbit</code> again to pick them up.</li>
+        </ol>
+        <p class="muted">Sessions name themselves from your first prompt (<em>Fix Login Redirect</em>, not <em>agent-3</em>). Press <kbd>h</kbd> any time for every key.</p>
+      </div>
+      <div class="keys-card">
+        <h3>The keys that matter</h3>
+        <dl class="keys">
+          <div><dt><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></dt><dd>move between bands and cards</dd></div>
+          <div><dt><kbd>Enter</kbd><kbd>Ctrl+Q</kbd></dt><dd>step into a session, and back out</dd></div>
+          <div><dt><kbd>p</kbd><kbd>Space</kbd></dt><dd>new task, or a follow-up to the card</dd></div>
+          <div><dt><kbd>;</kbd><kbd>,</kbd></dt><dd>next or previous session that needs you</dd></div>
+          <div><dt><kbd>j</kbd></dt><dd>jump to any session</dd></div>
+          <div><dt><kbd>&lt;</kbd><kbd>&gt;</kbd><kbd>+</kbd></dt><dd>switch project, or list them all</dd></div>
+          <div><dt><kbd>g</kbd><kbd>l</kbd><kbd>k</kbd></dt><dd>diff, git graph, code graph</dd></div>
+          <div><dt><kbd>f</kbd><kbd>⇧F</kbd><kbd>b</kbd></dt><dd>find a file, search in files, file tree</dd></div>
+          <div><dt><kbd>v</kbd><kbd>i</kbd></dt><dd>pull requests, issues</dd></div>
+          <div><dt><kbd>s</kbd><kbd>h</kbd><kbd>q</kbd></dt><dd>settings, help, quit</dd></div>
+        </dl>
+        <a class="more" href="/docs/keys/">Every key, and the mouse</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Docs -->
+  <section class="section" id="docs">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Documentation</h2>
+        <p>Start with the user guide. The other pages go deeper on one topic each.</p>
+      </div>
+      <div class="doc-cards">{{docCards}}</div>
+    </div>
+  </section>
+
+  <!-- Contribute -->
+  <section class="section" id="contribute">
+    <div class="wrap contrib">
+      <div>
+        <h2>Open source, MIT, and young.</h2>
+        <p class="section-lede">Bug reports, doc fixes and focused pull requests are all welcome. Orbit moves fast, so small changes land quickest.</p>
+        <div class="ctas">
+          <a class="btn btn-primary" href="/docs/contributing/">Contributing guide</a>
+          <a class="btn btn-ghost" href="{{repo}}/issues/new" rel="noopener">Report a bug</a>
+        </div>
+      </div>
+      <ol class="contrib-steps">
+        <li><b>Fork and build an isolated copy</b><div class="code-block" data-copy="make dev"><pre><code><span class="c-faint">$</span> make dev   <span class="c-faint"># own daemon, own data</span></code></pre><button class="copy" type="button">Copy</button></div></li>
+        <li><b>Run the same gate CI runs</b><div class="code-block" data-copy="make ci"><pre><code><span class="c-faint">$</span> make ci    <span class="c-faint"># fmt, clippy -D warnings, tests</span></code></pre><button class="copy" type="button">Copy</button></div></li>
+        <li><b>Open a pull request</b><span>One topic per PR, with the docs updated alongside it and a screenshot for anything on screen.</span></li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- Author -->
+  <section class="section" id="author">
+    <div class="wrap author">
+      <article class="author-card">
+        <img class="avatar" src="https://avatars.githubusercontent.com/u/49451119?v=4&s=192" width="88" height="88" alt="Amen Adem Thabti" loading="lazy">
+        <div>
+          <h2>Amen Adem Thabti</h2>
+          <p class="author-meta">Developer, Tunisia</p>
+          <p>I build Orbit for the way I work every day: several Claude Code sessions at once, each in its own worktree, all on one screen. It started as a fork of nebula and has been reshaped around a Claude-first workflow, with skills per prompt, a built-in code graph, and keys that work on any keyboard.</p>
+          <div class="author-links">
+            <a class="btn btn-ghost" href="https://github.com/AmenAdem" rel="noopener">GitHub</a>
+            <a class="btn btn-ghost" href="https://thethabtiamenallah.tech" rel="noopener">Website</a>
+          </div>
+        </div>
+      </article>
+      <aside class="credit">
+        <h3>Built on nebula, by Cody Seibert</h3>
+        <p>Orbit is a fork of <a href="https://github.com/AgentSystemLabs/nebula" rel="noopener">nebula</a> (MIT). The daemon-and-client design, and a great deal of the code, come from there; the license keeps its copyright notice.</p>
+        <p class="muted">Also built with <a href="https://ratatui.rs" rel="noopener">ratatui</a>, <a href="https://github.com/Graphify-Labs/graphify" rel="noopener">graphify</a> and <a href="https://github.com/vercel-labs/agent-browser" rel="noopener">agent-browser</a>.</p>
+      </aside>
+    </div>
+  </section>
+</main>
+{{footer}}
+</body>
+</html>

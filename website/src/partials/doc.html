@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+{{head}}
+</head>
+<body class="docs-body">
+{{header}}
+<div class="wrap docs-layout">
+  <aside class="docs-side" aria-label="Documentation">
+    <button class="side-toggle" type="button" aria-expanded="false">Browse the docs</button>
+    <nav class="side-nav">{{sidebar}}</nav>
+  </aside>
+  <main id="main" class="docs-main">
+    <article class="prose">
+{{content}}
+    </article>
+    <p class="edit-link"><a href="{{editUrl}}" rel="noopener">Edit this page on GitHub</a> <span>· {{sourceFile}}</span></p>
+    {{pager}}
+  </main>
+  <aside class="docs-toc">{{toc}}</aside>
+</div>
+{{footer}}
+</body>
+</html>

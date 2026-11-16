@@ -12,7 +12,7 @@ keyboard, one screen. They keep working when you close it.
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square)](#install)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?style=flat-square)](https://www.rust-lang.org)
 
-[**User guide**](docs/guide.md) · [Keys](docs/keys.md) · [Commands](docs/commands.md) · [Configuration](docs/configuration.md) · [How it works](docs/how-it-works.md)
+[**Website**](https://orbit-tui.pages.dev) · [**User guide**](docs/guide.md) · [Keys](docs/keys.md) · [Commands](docs/commands.md) · [Configuration](docs/configuration.md) · [How it works](docs/how-it-works.md)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/AmenAdem/Orbit/main/install.sh | sh

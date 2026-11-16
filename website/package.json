@@ -1,0 +1,17 @@
+{
+  "name": "orbit-website",
+  "private": true,
+  "type": "module",
+  "description": "The Orbit landing page and docs site, built from ../docs and deployed to Cloudflare Pages.",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs && npx --yes serve@14.2.4 dist -l 4321",
+    "deploy": "node build.mjs && npx --yes wrangler@4.162.0 pages deploy dist --project-name orbit-tui --branch main"
+  },
+  "dependencies": {
+    "highlight.js": "11.12.0",
+    "marked": "18.2.0",
+    "marked-gfm-heading-id": "4.1.4",
+    "marked-highlight": "2.2.4"
+  }
+}

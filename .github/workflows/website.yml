@@ -1,0 +1,56 @@
+name: Website
+
+# Builds the site from docs/ and website/ and deploys it to Cloudflare Pages
+# (project "orbit-tui"). Needs two repository secrets:
+#   CLOUDFLARE_API_TOKEN   a token with the "Cloudflare Pages: Edit" permission
+#   CLOUDFLARE_ACCOUNT_ID  the account that owns the Pages project
+# Pull requests only build, so a broken docs link or template fails early.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "website/**"
+      - "assets/**"
+      - "ARCHITECTURE.md"
+      - "CONTRIBUTING.md"
+      - "Cargo.toml"
+      - ".github/workflows/website.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "website/**"
+      - "ARCHITECTURE.md"
+      - "CONTRIBUTING.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy to Cloudflare Pages
+        if: github.event_name != 'pull_request'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4.162.0 pages deploy dist --project-name orbit-tui --branch main --commit-dirty=true
