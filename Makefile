@@ -127,6 +127,16 @@ dev-reset: dev-stop ## Wipe this checkout's dev data; the next `make dev` re-see
 shot: ## Screenshot the debug TUI with demo data (SCENE=open-prs KEYS="…")
 	scripts/shot/shot.sh $(SCENE)
 
+# The README and website screenshots: each readme-* scene through the harness, then its capture drawn by
+# xterm.js in headless Chrome at 2x (scripts/shot/xterm/render.mjs) into assets/. Needs Google Chrome
+# and Node; `RENDER_ONLY=1` redraws the captures already in design-screenshots/ without re-running them.
+README_SHOTS := readme-grid:screenshot readme-quick-prompt-worktree:quick-prompt readme-skills:skills \
+	readme-git-graph:git-graph readme-follow-up:follow-up readme-palette:palette
+readme-shots: ## Retake the README/website screenshots into assets/ (RENDER_ONLY=1 to just redraw)
+	@[ -d scripts/shot/xterm/node_modules ] || (cd scripts/shot/xterm && npm ci --silent)
+	@if [ -z "$(RENDER_ONLY)" ]; then for p in $(README_SHOTS); do scripts/shot/shot.sh $${p%%:*}; done; fi
+	node scripts/shot/xterm/render.mjs $(foreach p,$(README_SHOTS),design-screenshots/$(word 1,$(subst :, ,$(p))).ansi assets/$(word 2,$(subst :, ,$(p))).png)
+
 # The LATENCY HARNESS: the same isolation as `make shot`, against a clone of this repository, with the
 # INPUT LATENCY PROBE on (ORBIT_PERF_LOG). Drives scripts/perf/scenario.steps — every view, modal and
 # verb — and prints per step how long the key held the loop, how long it waited for its frame, how long

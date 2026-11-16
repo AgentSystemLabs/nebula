@@ -70,3 +70,5 @@ F12
 Right
 space
 Also cover a token refreshed twice inside one second
+# let the KEY COMBO DISPLAY (3 s linger) clear before the capture
+wait 4

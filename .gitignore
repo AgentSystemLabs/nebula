@@ -13,3 +13,8 @@ design-screenshots/
 
 # python tooling under scripts/
 __pycache__/
+
+# website
+website/node_modules/
+website/dist/
+scripts/shot/xterm/node_modules/

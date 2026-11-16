@@ -18,3 +18,5 @@ space
 C-u
 F12
 F12
+# let the KEY COMBO DISPLAY (3 s linger) clear before the capture
+wait 4
